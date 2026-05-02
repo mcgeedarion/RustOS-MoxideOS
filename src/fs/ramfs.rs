@@ -1,1 +1,1 @@
-{{RAMFS}}
+//! Simple in-memory RAM filesystem.

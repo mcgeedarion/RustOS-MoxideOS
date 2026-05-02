@@ -1,1 +1,1 @@
-{{INITRAMFS}}
+//! initramfs (newc cpio) loader.

@@ -1,1 +1,1 @@
-{{FAT32}}
+//! FAT32 driver stub.

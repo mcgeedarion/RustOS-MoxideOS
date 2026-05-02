@@ -1,1 +1,1 @@
-{{PROCFS}}
+//! /proc virtual filesystem.

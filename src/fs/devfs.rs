@@ -1,1 +1,1 @@
-{{DEVFS}}
+//! /dev virtual filesystem.
