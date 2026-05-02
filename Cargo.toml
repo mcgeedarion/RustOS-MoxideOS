@@ -1,0 +1,21 @@
+[package]
+name = "rustos"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[dependencies]
+spin = { version = "0.9", features = ["mutex", "spin_mutex"] }
+bitflags = "2"
+
+[lib]
+name = "rustos"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
