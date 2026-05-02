@@ -1,0 +1,12 @@
+/dts-v1/;
+/ {
+  compatible = "sifive,fe310-g002";
+  #address-cells = <1>;
+  #size-cells = <1>;
+  cpus {
+    #address-cells = <1>;
+    #size-cells = <0>;
+    cpu@0 { reg = <0>; compatible = "riscv"; riscv,isa = "rv32imac"; };
+  };
+  memory@80000000 { reg = <0x80000000 0x4000000>; };
+};
