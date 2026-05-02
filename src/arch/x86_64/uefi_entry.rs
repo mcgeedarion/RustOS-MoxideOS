@@ -1,0 +1,1 @@
+//! UEFI firmware entry point.

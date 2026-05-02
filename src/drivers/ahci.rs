@@ -1,0 +1,1 @@
+//! AHCI SATA driver stub.
