@@ -62,7 +62,11 @@ struct FdMeta {
     pub owner_pid: i32,
 }
 
-static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
+static FD_META:  Mutex<BTreeMap<usize, FdMeta>>  = Mutex::new(BTreeMap::new());
+/// Maps fd# -> owning process pid (0 = unowned / legacy).
+static FD_OWNER: Mutex<BTreeMap<usize, usize>>   = Mutex::new(BTreeMap::new());
+
+// ── cloexec / nonblock / fl_flags ─────────────────────────────────────────
 
 pub fn set_cloexec(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().cloexec = val;
@@ -78,6 +82,22 @@ pub fn set_fl(fd: usize, flags: i32) {
 }
 pub fn close_fd_meta(fd: usize) {
     FD_META.lock().remove(&fd);
+    FD_OWNER.lock().remove(&fd);
+}
+
+// ── fd ownership (used by pidfd_getfd) ────────────────────────────────────
+
+/// Record that `fd` is owned by `pid`.
+pub fn set_fd_owner(fd: usize, pid: usize) {
+    FD_OWNER.lock().insert(fd, pid);
+}
+/// Return the owning pid of `fd`, or 0 if unowned (any process may access).
+pub fn fd_owner(fd: usize) -> usize {
+    FD_OWNER.lock().get(&fd).copied().unwrap_or(0)
+}
+/// Clear ownership record on close.
+pub fn clear_fd_owner(fd: usize) {
+    FD_OWNER.lock().remove(&fd);
 }
 
 /// Close all fds that have FD_CLOEXEC set (called from execve).
@@ -93,6 +113,13 @@ pub fn close_on_exec() {
 }
 
 fn sys_close_fd(fd: usize) {
+    // pidfd check first: pidfd fds (1024+) are not in the vfs FD_TABLE
+    if crate::fs::pidfd::is_pidfd(fd) {
+        crate::fs::pidfd::free(fd);
+        clear_fd_owner(fd);
+        close_fd_meta(fd);
+        return;
+    }
     if crate::fs::timerfd::is_timerfd(fd) { crate::fs::timerfd::sys_close_tfd(fd); return; }
     if crate::fs::signalfd::is_signalfd(fd) { crate::fs::signalfd::sys_close_sfd(fd); return; }
     if crate::fs::eventfd::is_eventfd(fd) { crate::fs::eventfd::sys_close_efd(fd); return; }
@@ -167,7 +194,7 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     r
 }
 
-/// Set O_NONBLOCK flag on fd (used by pipe2, socket creation).
+/// Set O_NONBLOCK flag on fd.
 pub fn set_nonblock(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().nonblock = val;
 }

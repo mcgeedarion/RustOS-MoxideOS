@@ -4,6 +4,7 @@ pub mod fat32;
 pub mod fcntl;
 pub mod initramfs;
 pub mod mount;
+pub mod pidfd;
 pub mod procfs;
 pub mod ramfs;
 pub mod sysfs;
