@@ -31,21 +31,15 @@ pub extern "C" fn child_first_run_hook() {
             None => { scheduler::procs_unlock(); return; }
         };
         let r = (pcb.child_tid_va, pcb.child_tid_val, pcb.ctx.fs_base);
-        // Zero the guard inside the lock: fire-once semantics.
         if pcb.child_tid_va != 0 { pcb.child_tid_va = 0; }
         r
     };
     scheduler::procs_unlock();
 
-    // CLONE_CHILD_SETTID: write child PID into child's userspace.
-    // SAFETY: tid_va validated at clone3 call-site; child CR3 is live.
     if tid_va > 0x1000 && tid_va < 0x0000_7FFF_FFFF_F000 {
         unsafe { (tid_va as *mut u32).write_volatile(tid_val); }
     }
 
-    // CLONE_SETTLS: re-apply FS.base via WRMSR(IA32_FS_BASE = 0xC000_0100).
-    // switch_to handles this on context switches, but a child that was
-    // enqueued and never switched still needs it applied on first run.
     if fs_base != 0 {
         unsafe {
             core::arch::asm!(
@@ -73,28 +67,26 @@ pub extern "C" fn child_first_run_hook() {
 #[naked]
 pub unsafe extern "C" fn sysret_trampoline() {
     core::arch::asm!(
-        // Align RSP to 16 bytes for the System V ABI before the call.
-        // Frame = 136 bytes => RSP % 16 == 8; subtract 8 to align.
         "sub rsp, 8",
         "call child_first_run_hook",
         "add rsp, 8",
-        // Pop SyscallFrame in push order (r15 was pushed first = lowest addr)
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "pop rax",      // 0: child return value written by do_fork
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop r10",
-        "pop r8",
-        "pop r9",
-        "pop rcx",      // user RIP  -> RCX for SYSRETQ
-        "pop r11",      // user RFLAGS -> R11 for SYSRETQ
-        "pop rsp",      // restore user RSP
+        // Pop SyscallFrame in reverse order (rip last, r15 first)
+        "mov r15, [rsp + 0*8]",
+        "mov r14, [rsp + 1*8]",
+        "mov r13, [rsp + 2*8]",
+        "mov r12, [rsp + 3*8]",
+        "mov rbp, [rsp + 4*8]",
+        "mov rbx, [rsp + 5*8]",
+        "mov rax, [rsp + 6*8]",
+        "mov rdi, [rsp + 7*8]",
+        "mov rsi, [rsp + 8*8]",
+        "mov rdx, [rsp + 9*8]",
+        "mov r10, [rsp + 10*8]",
+        "mov r8,  [rsp + 11*8]",
+        "mov r9,  [rsp + 12*8]",
+        "mov rcx, [rsp + 13*8]",
+        "mov r11, [rsp + 14*8]",
+        "mov rsp, [rsp + 15*8]",
         "swapgs",
         "sysretq",
         options(noreturn)
@@ -102,12 +94,9 @@ pub unsafe extern "C" fn sysret_trampoline() {
 }
 
 /// set_tid_address(tidptr_va) -> current TID  [NR 218]
-///
-/// Stores tidptr_va in pcb.clear_child_tid_va.  On exit the kernel
-/// zeroes that word and futex_wakes it so pthread_join unblocks.
 pub fn sys_set_tid_address(tidptr_va: usize) -> isize {
     let pid = scheduler::current_pid();
-    if pid == 0 { return -3; } // ESRCH
+    if pid == 0 { return -3; }
     let procs = scheduler::procs_lock();
     if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
         p.clear_child_tid_va = tidptr_va;
@@ -131,4 +120,115 @@ pub fn exit_clear_child_tid(pid: usize) {
         unsafe { (va as *mut u32).write_volatile(0); }
     }
     crate::proc::futex::futex_wake_addr(va, 1);
+}
+
+// ── SYSCALL entry ─────────────────────────────────────────────────────────
+
+/// Called from syscall_asm_entry with a pointer to the SyscallFrame
+/// on the kernel stack.  Dispatches, then runs check_pending_signal.
+///
+/// NR 15 (rt_sigreturn) is handled specially: it restores the frame
+/// in-place and skips check_pending so we don't re-enter signal delivery.
+#[no_mangle]
+pub extern "C" fn syscall_rust_entry(frame: *mut SyscallFrame) {
+    let frame = unsafe { &mut *frame };
+    let nr = frame.rax;
+    let a  = frame.rdi;
+    let b  = frame.rsi;
+    let c  = frame.rdx;
+    let d  = frame.r10;
+    let e  = frame.r8;
+    let f  = frame.r9;
+
+    if nr == 15 {
+        let ret = crate::proc::signal::sys_rt_sigreturn(frame);
+        frame.rax = ret as usize;
+        return;
+    }
+
+    let ret = crate::syscall::dispatch(nr, a, b, c, d, e, f);
+    frame.rax = ret as usize;
+
+    crate::proc::signal::check_pending_signal(frame);
+}
+
+/// Write the MSRs that configure the SYSCALL/SYSRET instruction pair.
+///
+/// STAR:  bits[47:32] = kernel CS (0x08), bits[63:48] = user CS-16 (0x1B)
+/// LSTAR: VA of the naked SYSCALL entry stub
+/// FMASK: RFLAGS bits to CLEAR on SYSCALL entry (bit 9 = IF)
+pub fn syscall_setup() {
+    use crate::arch::x86_64::cpu::{wrmsr, rdmsr, MSR_EFER, MSR_STAR, MSR_LSTAR, MSR_FMASK};
+    unsafe {
+        let efer = rdmsr(MSR_EFER);
+        wrmsr(MSR_EFER, efer | 1);                          // SCE enable
+        wrmsr(MSR_STAR, 0x001B_0008u64 << 32);              // CS selectors
+        wrmsr(MSR_LSTAR, syscall_asm_entry as u64);         // entry point
+        wrmsr(MSR_FMASK, 0x200);                            // clear IF
+    }
+}
+
+/// Naked SYSCALL entry — address loaded into LSTAR by syscall_setup().
+///
+/// On SYSCALL entry:
+///   RCX = user RIP,  R11 = user RFLAGS
+///   CS/SS = kernel selectors
+///   RSP   = user stack (not swapped automatically by CPU)
+///
+/// Per-CPU GS layout (set up by boot code):
+///   [GS:0]  kernel RSP  (top of this CPU's kernel stack)
+///   [GS:8]  temp user RSP scratch slot
+#[naked]
+#[no_mangle]
+pub unsafe extern "C" fn syscall_asm_entry() {
+    core::arch::asm!(
+        "swapgs",
+        "mov [gs:8], rsp",
+        "mov rsp, [gs:0]",
+        // Allocate SyscallFrame (17 × 8 = 136 bytes)
+        "sub rsp, {frame_size}",
+        // Save all fields by offset (matches SyscallFrame field order)
+        "mov [rsp + 0*8],  r15",
+        "mov [rsp + 1*8],  r14",
+        "mov [rsp + 2*8],  r13",
+        "mov [rsp + 3*8],  r12",
+        "mov [rsp + 4*8],  rbp",
+        "mov [rsp + 5*8],  rbx",
+        "mov [rsp + 6*8],  rax",   // syscall NR
+        "mov [rsp + 7*8],  rdi",
+        "mov [rsp + 8*8],  rsi",
+        "mov [rsp + 9*8],  rdx",
+        "mov [rsp + 10*8], r10",
+        "mov [rsp + 11*8], r8",
+        "mov [rsp + 12*8], r9",
+        "mov [rsp + 13*8], rcx",   // user RIP
+        "mov [rsp + 14*8], r11",   // user RFLAGS
+        "mov rax, [gs:8]",
+        "mov [rsp + 15*8], rax",   // user RSP
+        "mov [rsp + 16*8], rcx",   // rip copy
+        // Call Rust handler
+        "mov rdi, rsp",
+        "call syscall_rust_entry",
+        // Restore all regs from (possibly-modified) frame
+        "mov r15, [rsp + 0*8]",
+        "mov r14, [rsp + 1*8]",
+        "mov r13, [rsp + 2*8]",
+        "mov r12, [rsp + 3*8]",
+        "mov rbp, [rsp + 4*8]",
+        "mov rbx, [rsp + 5*8]",
+        "mov rax, [rsp + 6*8]",
+        "mov rdi, [rsp + 7*8]",
+        "mov rsi, [rsp + 8*8]",
+        "mov rdx, [rsp + 9*8]",
+        "mov r10, [rsp + 10*8]",
+        "mov r8,  [rsp + 11*8]",
+        "mov r9,  [rsp + 12*8]",
+        "mov rcx, [rsp + 13*8]",
+        "mov r11, [rsp + 14*8]",
+        "mov rsp, [rsp + 15*8]",   // restore user RSP (must be last)
+        "swapgs",
+        "sysretq",
+        frame_size = const core::mem::size_of::<SyscallFrame>(),
+        options(noreturn)
+    );
 }

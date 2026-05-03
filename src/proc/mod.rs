@@ -1,6 +1,7 @@
 pub mod clone;
 pub mod context;
 pub mod cow_fault;
+pub mod exit;
 pub mod fork;
 pub mod futex;
 pub mod process;
