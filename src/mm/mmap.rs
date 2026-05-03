@@ -53,7 +53,7 @@ pub struct Vma {
     pub kind:  VmaKind,
 }
 
-// ── Global VMA table (tgid/pid → vec of VMAs) ─────────────────────────────
+// ── Global VMA table (tgid/pid → vec of VMAs) ──────────────────────────────
 
 static VMAS: Mutex<BTreeMap<u32, Vec<Vma>>> = Mutex::new(BTreeMap::new());
 
@@ -73,6 +73,18 @@ pub fn find_vma(pid: u32, addr: usize) -> Option<Vma> {
     VMAS.lock().get(&pid)?.iter()
         .find(|v| v.start <= addr && addr < v.end)
         .cloned()
+}
+
+/// Clone all VMA entries from `src_key` into `dst_key`.
+/// Called by cow_fault::clone_for_fork to give the child its VMA list.
+pub fn clone_vmas(src_key: u32, dst_key: u32) {
+    let vmas: Vec<Vma> = {
+        let t = VMAS.lock();
+        t.get(&src_key).cloned().unwrap_or_default()
+    };
+    if !vmas.is_empty() {
+        VMAS.lock().insert(dst_key, vmas);
+    }
 }
 
 /// Remove all VMA entries for `pid` and unmap + free all anonymous physical
@@ -96,9 +108,8 @@ pub fn clear_vmas(pid: u32) {
     }
 }
 
-// ── mmap ──────────────────────────────────────────────────────────────
+// ── mmap ────────────────────────────────────────────────────────────────────
 
-/// Find a free virtual address region of `size` bytes starting above `hint`.
 fn find_free_region(hint: usize, size: usize, pid: u32) -> usize {
     let base = if hint != 0 { (hint + 0xFFF) & !0xFFF } else { 0x0000_7000_0000_0000usize };
     let t = VMAS.lock();
@@ -132,7 +143,6 @@ pub fn sys_mmap(
     let anon = flags & MAP_ANONYMOUS != 0 || fd == usize::MAX;
 
     if anon {
-        // Demand-zero: allocate pages now (simplifies page-fault handler)
         let pages = size / 4096;
         for i in 0..pages {
             let pa = match crate::mm::pmm::alloc_page() {
@@ -148,7 +158,6 @@ pub fn sys_mmap(
         return va as isize;
     }
 
-    // File-backed: check for memfd or DMA-BUF
     if crate::mm::memfd::is_memfd(fd) {
         return sys_mmap_memfd(va, size, prot, flags, fd, offset);
     }
@@ -156,7 +165,6 @@ pub fn sys_mmap(
         return sys_mmap_dmabuf(va, size, prot, fd);
     }
 
-    // Regular file-backed mapping: read file pages into RAM
     let pages = size / 4096;
     for i in 0..pages {
         let pa = match crate::mm::pmm::alloc_page() { Some(p) => p, None => return -12 };
@@ -237,7 +245,6 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
                 }
             }
         }
-        // Invalidate TLB entry
         unsafe { core::arch::asm!("invlpg [{v}]", v = in(reg) va, options(nostack)); }
         let _ = cr3;
     }
@@ -270,12 +277,12 @@ pub fn sys_brk(addr: usize) -> isize {
     addr as isize
 }
 
-// ── PTE flag helpers ─────────────────────────────────────────────────────
+// ── PTE flag helpers ────────────────────────────────────────────────────────
 
 fn pte_flags(prot: u32) -> u64 {
-    let mut f: u64 = 1; // Present
-    if prot & PROT_WRITE != 0 { f |= 1 << 1; } // Write
-    if prot & PROT_EXEC  == 0 { f |= 1 << 63; } // NX
-    f |= 1 << 2; // User
+    let mut f: u64 = 1;
+    if prot & PROT_WRITE != 0 { f |= 1 << 1; }
+    if prot & PROT_EXEC  == 0 { f |= 1 << 63; }
+    f |= 1 << 2;
     f
 }
