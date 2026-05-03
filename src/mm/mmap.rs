@@ -1,288 +1,209 @@
-//! Virtual memory area (VMA) tracker + mmap / munmap / mprotect / brk.
+//! Virtual Memory Area (VMA) tracker + mmap / munmap / mprotect / brk.
 //!
 //! Each process has a per-PCB VMA list stored in the scheduler's PCB.
 //!
 //! VMA kinds:
 //!   Anonymous   — zero-filled private memory (heap, stack, anon mmap)
-//!   FileBacked  — file-backed mapping (text, data, shared libs)
-//!   Memfd       — memory-file mapping
-//!   DmaBuf      — GPU DMA-BUF import
-//!
-//! Each mmap() call appends a Vma to the per-process list.  munmap() removes
-//! the intersecting VMAs (with split if partial).  The page-fault handler
-//! queries this list to decide whether to demand-zero or copy-on-write.
-//!
-//! Thread-group support:
-//!   All calls to current_pid() are wrapped as
-//!   thread::vma_pid(current_pid()) so all CLONE_VM threads in a group
-//!   see the same VMA namespace (keyed on the tgid).
+//!   FileBacked  — file-backed mmap (read from VFS on fault)
+//!   Fixed       — kernel-placed region (e.g. vsyscall)
 
 extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
-use alloc::collections::BTreeMap;
 
-// ── VMA descriptor ─────────────────────────────────────────────────────────
+// ── VMA descriptor ───────────────────────────────────────────────────────
 
-#[derive(Clone, PartialEq)]
-pub enum VmaKind {
-    Anonymous,
-    FileBacked { fd: usize, file_offset: usize },
-    Memfd      { fd: usize, offset_base: usize },
-    DmaBuf     { handle: u32 },
-}
+#[derive(Clone, Debug)]
+pub enum VmaKind { Anonymous, FileBacked(usize /*fd*/), Fixed }
 
-pub const PROT_READ:  u32 = 1;
-pub const PROT_WRITE: u32 = 2;
-pub const PROT_EXEC:  u32 = 4;
-pub const PROT_NONE:  u32 = 0;
-
-pub const MAP_SHARED:    u32 = 0x01;
-pub const MAP_PRIVATE:   u32 = 0x02;
-pub const MAP_FIXED:     u32 = 0x10;
-pub const MAP_ANONYMOUS: u32 = 0x20;
-pub const MAP_GROWSDOWN: u32 = 0x100;
-pub const MAP_POPULATE:  u32 = 0x08000;
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Vma {
     pub start: usize,
     pub end:   usize,
     pub prot:  u32,
     pub flags: u32,
     pub kind:  VmaKind,
+    pub file_offset: u64,
 }
 
-// ── Global VMA table (tgid/pid → vec of VMAs) ──────────────────────────────
+// ── Global VMA table (keyed by pid cast to u32) ──────────────────────────
 
-static VMAS: Mutex<BTreeMap<u32, Vec<Vma>>> = Mutex::new(BTreeMap::new());
+const MAX_PROCS: usize = 256;
+static VMA_TABLE: Mutex<[Vec<Vma>; MAX_PROCS]> =
+    Mutex::new([const { Vec::new() }; MAX_PROCS]);
+
+#[inline]
+fn pid_idx(pid: u32) -> usize { pid as usize % MAX_PROCS }
 
 pub fn insert_vma(pid: u32, vma: Vma) {
-    VMAS.lock().entry(pid).or_default().push(vma);
+    let mut t = VMA_TABLE.lock();
+    t[pid_idx(pid)].push(vma);
 }
 
 pub fn remove_vma(pid: u32, addr: usize, len: usize) {
-    let end = addr + len;
-    let mut t = VMAS.lock();
-    if let Some(list) = t.get_mut(&pid) {
-        list.retain(|v| v.end <= addr || v.start >= end);
-    }
+    let mut t = VMA_TABLE.lock();
+    let list  = &mut t[pid_idx(pid)];
+    list.retain(|v| !(v.start < addr + len && v.end > addr));
 }
 
 pub fn find_vma(pid: u32, addr: usize) -> Option<Vma> {
-    VMAS.lock().get(&pid)?.iter()
-        .find(|v| v.start <= addr && addr < v.end)
-        .cloned()
+    let t = VMA_TABLE.lock();
+    t[pid_idx(pid)].iter().find(|v| v.start <= addr && addr < v.end).cloned()
 }
 
-/// Clone all VMA entries from `src_key` into `dst_key`.
-/// Called by cow_fault::clone_for_fork to give the child its VMA list.
 pub fn clone_vmas(src_key: u32, dst_key: u32) {
-    let vmas: Vec<Vma> = {
-        let t = VMAS.lock();
-        t.get(&src_key).cloned().unwrap_or_default()
-    };
-    if !vmas.is_empty() {
-        VMAS.lock().insert(dst_key, vmas);
-    }
+    let mut t = VMA_TABLE.lock();
+    let src: Vec<Vma> = t[pid_idx(src_key)].clone();
+    t[pid_idx(dst_key)] = src;
 }
 
-/// Remove all VMA entries for `pid` and unmap + free all anonymous physical
-/// pages.  Called by execve() before installing the new address space so the
-/// page-fault handler never sees stale entries.
 pub fn clear_vmas(pid: u32) {
-    let vmas: Vec<Vma> = {
-        let mut t = VMAS.lock();
-        t.remove(&pid).unwrap_or_default()
-    };
-    for vma in &vmas {
-        let pages = (vma.end - vma.start) / 4096;
-        for i in 0..pages {
-            let va = vma.start + i * 4096;
-            if let Some(pa) = crate::arch::x86_64::paging::unmap_page(va) {
-                if pa != 0 && !matches!(vma.kind, VmaKind::FileBacked { .. }) {
-                    crate::mm::pmm::free_page(pa);
-                }
-            }
-        }
-    }
+    let mut t = VMA_TABLE.lock();
+    t[pid_idx(pid)].clear();
 }
 
-// ── mmap ────────────────────────────────────────────────────────────────────
+// ── PROT_* / MAP_* constants ─────────────────────────────────────────────
 
-fn find_free_region(hint: usize, size: usize, pid: u32) -> usize {
-    let base = if hint != 0 { (hint + 0xFFF) & !0xFFF } else { 0x0000_7000_0000_0000usize };
-    let t = VMAS.lock();
-    let list = match t.get(&pid) { Some(l) => l, None => return base };
-    let mut candidate = base;
-    'outer: loop {
-        for v in list {
-            if v.start < candidate + size && v.end > candidate {
-                candidate = (v.end + 0xFFF) & !0xFFF;
-                continue 'outer;
-            }
-        }
-        break candidate;
-    }
-}
+const PROT_READ:    u32 = 1;
+const PROT_WRITE:   u32 = 2;
+const PROT_EXEC:    u32 = 4;
+const MAP_SHARED:   u32 = 1;
+const MAP_PRIVATE:  u32 = 2;
+const MAP_FIXED:    u32 = 0x10;
+const MAP_ANON:     u32 = 0x20;
+const PAGE:         usize = 4096;
+
+// ── sys_mmap ─────────────────────────────────────────────────────────────
 
 pub fn sys_mmap(
-    addr:   usize,
-    length: usize,
-    prot:   u32,
-    flags:  u32,
-    fd:     usize,
-    offset: usize,
+    addr:   usize, length: usize, prot: u32, flags: u32,
+    fd:     usize, offset: usize,
 ) -> isize {
-    if length == 0 { return -22; }
-    let size   = (length + 0xFFF) & !0xFFF;
-    let pid    = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
-    let va     = if flags & MAP_FIXED != 0 && addr != 0 { addr }
-                 else { find_free_region(addr, size, pid) };
+    if length == 0 { return -22; } // EINVAL
+    let len = (length + PAGE - 1) & !(PAGE - 1);
 
-    let anon = flags & MAP_ANONYMOUS != 0 || fd == usize::MAX;
+    // Choose VA: MAP_FIXED uses addr; otherwise pick from 0x50000000
+    static NEXT_VA: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0x5000_0000);
+    let va = if flags & MAP_FIXED != 0 {
+        if addr == 0 { return -22; }
+        addr
+    } else {
+        let v = NEXT_VA.fetch_add(len + PAGE, core::sync::atomic::Ordering::Relaxed);
+        // Align to page
+        (v + PAGE - 1) & !(PAGE - 1)
+    };
 
-    if anon {
-        let pages = size / 4096;
-        for i in 0..pages {
-            let pa = match crate::mm::pmm::alloc_page() {
-                Some(p) => p, None => return -12,
-            };
-            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
-            let flags_pte = pte_flags(prot);
-            crate::arch::x86_64::paging::map_page(
-                crate::arch::x86_64::paging::current_cr3(),
-                va + i * 4096, pa, flags_pte);
-        }
-        insert_vma(pid, Vma { start: va, end: va + size, prot, flags, kind: VmaKind::Anonymous });
-        return va as isize;
-    }
+    let pte_flags = prot_to_pte(prot);
+    let cr3 = crate::arch::x86_64::paging::current_cr3();
 
-    if crate::mm::memfd::is_memfd(fd) {
-        return sys_mmap_memfd(va, size, prot, flags, fd, offset);
-    }
-    if crate::drivers::amdgpu_gem::is_gem_fd(fd) {
-        return sys_mmap_dmabuf(va, size, prot, fd);
-    }
-
-    let pages = size / 4096;
-    for i in 0..pages {
-        let pa = match crate::mm::pmm::alloc_page() { Some(p) => p, None => return -12 };
-        let file_off = offset + i * 4096;
-        let read_len = crate::fs::vfs::pread(fd, pa as *mut u8, 4096, file_off as i64)
-            .max(0) as usize;
-        if read_len < 4096 {
-            unsafe { core::ptr::write_bytes((pa + read_len) as *mut u8, 0, 4096 - read_len); }
-        }
-        let flags_pte = pte_flags(prot);
-        crate::arch::x86_64::paging::map_page(
-            crate::arch::x86_64::paging::current_cr3(),
-            va + i * 4096, pa, flags_pte);
-    }
-    insert_vma(pid, Vma {
-        start: va, end: va + size, prot, flags,
-        kind: VmaKind::FileBacked { fd, file_offset: offset },
-    });
-    va as isize
-}
-
-fn sys_mmap_memfd(va: usize, size: usize, prot: u32, flags: u32, fd: usize, offset: usize) -> isize {
-    let pid = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
-    let pages = size / 4096;
-    for i in 0..pages {
-        match crate::mm::memfd::map_page(fd, offset / 4096 + i) {
+    for page_va in (va..va+len).step_by(PAGE) {
+        match crate::mm::pmm::alloc_page() {
             Some(pa) => {
-                let flags_pte = pte_flags(if flags & MAP_SHARED != 0 { prot } else { prot });
-                crate::arch::x86_64::paging::map_page(
-                    crate::arch::x86_64::paging::current_cr3(),
-                    va + i * 4096, pa, flags_pte);
+                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+                crate::arch::x86_64::paging::map_page(cr3, page_va, pa, pte_flags);
             }
-            None => return -12,
+            None => return -12, // ENOMEM
         }
     }
+
+    let pid = crate::proc::scheduler::current_pid() as u32;
     insert_vma(pid, Vma {
-        start: va, end: va + size, prot, flags,
-        kind: VmaKind::Memfd { fd, offset_base: offset },
+        start: va, end: va + len,
+        prot, flags,
+        kind: if flags & MAP_ANON != 0 {
+            VmaKind::Anonymous
+        } else {
+            VmaKind::FileBacked(fd)
+        },
+        file_offset: offset as u64,
     });
+
     va as isize
 }
 
-fn sys_mmap_dmabuf(va: usize, size: usize, prot: u32, _flags: u32, fd: usize) -> isize {
-    let pid  = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
-    let handle = crate::drivers::amdgpu_gem::fd_to_handle(fd).unwrap_or(0);
-    if let Some(bo) = crate::drivers::gem::gem_lookup(handle) {
-        let pages = size.min(bo.size) / 4096;
-        for i in 0..pages {
-            let pa = bo.pa + i * 4096;
-            crate::arch::x86_64::paging::map_page(
-                crate::arch::x86_64::paging::current_cr3(),
-                va + i * 4096, pa, pte_flags(prot));
-        }
-    }
-    insert_vma(pid, Vma {
-        start: va, end: va + size, prot, flags: 0,
-        kind: VmaKind::DmaBuf { handle },
-    });
-    va as isize
-}
+// ── sys_munmap ────────────────────────────────────────────────────────────
 
 pub fn sys_munmap(addr: usize, length: usize) -> isize {
-    if addr & 0xFFF != 0 { return -22; }
-    let size  = (length + 0xFFF) & !0xFFF;
-    let pages = size / 4096;
-    let pid   = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
-    let cr3   = crate::arch::x86_64::paging::current_cr3();
-    for i in 0..pages {
-        let va = addr + i * 4096;
-        if let Some(pa) = crate::arch::x86_64::paging::unmap_page(va) {
-            if pa != 0 {
-                if let Some(vma) = find_vma(pid, va) {
-                    if matches!(vma.kind, VmaKind::Anonymous) {
-                        crate::mm::pmm::free_page(pa);
-                    }
-                } else {
-                    crate::mm::pmm::free_page(pa);
-                }
-            }
+    if addr & (PAGE - 1) != 0 { return -22; } // EINVAL: must be page-aligned
+    let len = (length + PAGE - 1) & !(PAGE - 1);
+    let cr3 = crate::arch::x86_64::paging::current_cr3();
+
+    for page_va in (addr..addr+len).step_by(PAGE) {
+        if let Some(pa) = crate::arch::x86_64::paging::unmap_page(page_va) {
+            crate::mm::pmm::free_page(pa);
         }
-        unsafe { core::arch::asm!("invlpg [{v}]", v = in(reg) va, options(nostack)); }
-        let _ = cr3;
     }
-    remove_vma(pid, addr, size);
+
+    let pid = crate::proc::scheduler::current_pid() as u32;
+    remove_vma(pid, addr, len);
     0
 }
 
-pub fn sys_brk(addr: usize) -> isize {
-    let pid = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
-    static BRK: spin::Mutex<BTreeMap<u32, usize>> = spin::Mutex::new(BTreeMap::new());
-    let mut brk = BRK.lock();
-    let cur = *brk.entry(pid).or_insert(0x0001_0000_0000usize);
-    if addr == 0 { return cur as isize; }
-    if addr > cur {
-        let size = (addr - cur + 0xFFF) & !0xFFF;
-        let pages = size / 4096;
-        for i in 0..pages {
-            let va = cur + i * 4096;
-            let pa = match crate::mm::pmm::alloc_page() { Some(p) => p, None => return cur as isize };
-            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
-            crate::arch::x86_64::paging::map_page(
-                crate::arch::x86_64::paging::current_cr3(), va, pa, 0x7);
+// ── sys_mprotect ──────────────────────────────────────────────────────────
+
+pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
+    if addr & (PAGE - 1) != 0 { return -22; } // EINVAL
+    let len     = (length + PAGE - 1) & !(PAGE - 1);
+    let cr3     = crate::arch::x86_64::paging::current_cr3();
+    let new_pte = prot_to_pte(prot);
+
+    for page_va in (addr..addr+len).step_by(PAGE) {
+        // Walk the page table; update flags on existing mappings.
+        if let Some(pa) = crate::arch::x86_64::paging::virt_to_phys(cr3, page_va) {
+            // Remap with new flags (map_page overwrites the leaf PTE).
+            crate::arch::x86_64::paging::map_page(cr3, page_va, pa, new_pte);
+            crate::arch::x86_64::paging::invlpg(page_va);
         }
-        insert_vma(pid, Vma {
-            start: cur, end: cur + size, prot: PROT_READ | PROT_WRITE, flags: MAP_ANONYMOUS | MAP_PRIVATE,
-            kind: VmaKind::Anonymous,
-        });
     }
-    *brk.entry(pid).or_insert(addr) = addr;
-    addr as isize
+
+    // Update VMA prot field.
+    let pid = crate::proc::scheduler::current_pid() as u32;
+    {
+        let mut t = VMA_TABLE.lock();
+        for v in t[pid_idx(pid)].iter_mut() {
+            if v.start < addr + len && v.end > addr {
+                v.prot = prot;
+            }
+        }
+    }
+    0
 }
 
-// ── PTE flag helpers ────────────────────────────────────────────────────────
+// ── sys_brk ───────────────────────────────────────────────────────────────
 
-fn pte_flags(prot: u32) -> u64 {
-    let mut f: u64 = 1;
-    if prot & PROT_WRITE != 0 { f |= 1 << 1; }
-    if prot & PROT_EXEC  == 0 { f |= 1 << 63; }
-    f |= 1 << 2;
+static mut BRK: usize = 0x2000_0000;
+
+pub fn sys_brk(addr: usize) -> isize {
+    unsafe {
+        if addr == 0 { return BRK as isize; }
+        if addr < BRK { return BRK as isize; } // never shrink below initial brk
+        let old = BRK;
+        let new = (addr + PAGE - 1) & !(PAGE - 1);
+        let cr3 = crate::arch::x86_64::paging::current_cr3();
+        for va in (old..new).step_by(PAGE) {
+            if let Some(pa) = crate::mm::pmm::alloc_page() {
+                core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
+                crate::arch::x86_64::paging::map_page(
+                    cr3, va, pa,
+                    crate::arch::x86_64::paging::PTE_PRESENT
+                    | crate::arch::x86_64::paging::PTE_WRITABLE
+                    | crate::arch::x86_64::paging::PTE_USER
+                    | crate::arch::x86_64::paging::PTE_NX,
+                );
+            }
+        }
+        BRK = new;
+        BRK as isize
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────
+
+fn prot_to_pte(prot: u32) -> u64 {
+    let mut f = crate::arch::x86_64::paging::PTE_PRESENT
+              | crate::arch::x86_64::paging::PTE_USER;
+    if prot & PROT_WRITE != 0 { f |= crate::arch::x86_64::paging::PTE_WRITABLE; }
+    if prot & PROT_EXEC  == 0 { f |= crate::arch::x86_64::paging::PTE_NX; }
     f
 }

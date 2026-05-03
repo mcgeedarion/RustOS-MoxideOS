@@ -1,42 +1,34 @@
-//! Thread-group management for CLONE_VM threads.
+//! Thread group (TGID) tracking and gettid.
 //!
-//! THREAD_GROUP maps every non-leader thread pid -> tgid.
-//! Processes not in this map use their own pid as the VMA key.
-//!
-//! vma_pid(pid) is the single call site used by mmap / munmap / brk /
-//! find_vma to route all address-space operations to the shared VMA
-//! namespace for the whole thread group.
+//! A process created by fork() has tgid == pid.
+//! Threads created by clone3(CLONE_THREAD) share the parent's tgid.
 
 extern crate alloc;
-use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use spin::Mutex;
 
-/// Maps thread_pid -> tgid.  Not present means the pid is its own leader.
-static THREAD_GROUP: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+struct TidEntry { pid: usize, tgid: usize }
 
-/// Register `thread_pid` as a member of `tgid`'s thread group.
-pub fn register_thread(thread_pid: usize, tgid: usize) {
-    THREAD_GROUP.lock().insert(thread_pid, tgid);
+static TID_TABLE: Mutex<Vec<TidEntry>> = Mutex::new(Vec::new());
+
+/// Register a new thread in group `tgid`.
+pub fn register_thread(pid: usize, tgid: usize) {
+    let mut t = TID_TABLE.lock();
+    // Remove any stale entry.
+    t.retain(|e| e.pid != pid);
+    t.push(TidEntry { pid, tgid });
 }
 
-/// Unregister `thread_pid` on thread exit.
-pub fn unregister_thread(thread_pid: usize) {
-    THREAD_GROUP.lock().remove(&thread_pid);
-}
-
-/// Resolve the VMA namespace key for `pid`.
-/// Threads return their tgid; standalone processes return their own pid.
-/// Cast to u32 matches the BTreeMap<u32, Vec<Vma>> key type in mmap.rs.
-pub fn vma_pid(pid: usize) -> u32 {
-    THREAD_GROUP.lock().get(&pid).copied().unwrap_or(pid) as u32
-}
-
-/// Return the tgid of `pid` (pid itself if it is a group leader).
+/// Look up the TGID for a pid. Falls back to pid itself (main thread).
 pub fn tgid_of(pid: usize) -> usize {
-    THREAD_GROUP.lock().get(&pid).copied().unwrap_or(pid)
+    let t = TID_TABLE.lock();
+    t.iter().find(|e| e.pid == pid).map_or(pid, |e| e.tgid)
 }
 
-/// True if `pid` is a non-leader thread.
-pub fn is_thread(pid: usize) -> bool {
-    THREAD_GROUP.lock().contains_key(&pid)
+/// VMA namespace key: threads share the parent's tgid as the VMA key.
+pub fn vma_pid(pid: usize) -> u32 { tgid_of(pid) as u32 }
+
+/// sys_gettid() [NR 186] — returns the calling thread's PID.
+pub fn sys_gettid() -> isize {
+    crate::proc::scheduler::current_pid() as isize
 }
