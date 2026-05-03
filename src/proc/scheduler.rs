@@ -89,22 +89,21 @@ pub fn schedule() {
 
 /// Repair SCHED.current after a Vec::remove(removed_idx) call.
 /// Must be called while the sched lock is ALREADY HELD (inside procs_lock).
-/// This is safe because procs_lock() holds the same SCHED_LOCK.
 pub fn fix_current_after_remove(removed_idx: usize) {
     unsafe {
         let len = SCHED.procs.len();
-        if len == 0 {
-            SCHED.current = 0;
-            return;
-        }
-        if removed_idx < SCHED.current {
-            // All entries at idx >= removed_idx shifted left by 1.
-            SCHED.current -= 1;
-        }
-        // removed_idx == current: next task now occupies same slot (correct).
-        // removed_idx >  current: no change needed.
-        if SCHED.current >= len {
-            SCHED.current = len - 1;
-        }
+        if len == 0 { SCHED.current = 0; return; }
+        if removed_idx < SCHED.current { SCHED.current -= 1; }
+        if SCHED.current >= len { SCHED.current = len - 1; }
     }
+}
+
+/// Return the ppid of `pid`.  Used by NR 110 (getppid).
+pub fn ppid_of(pid: usize) -> usize {
+    sched_lock();
+    let r = unsafe {
+        SCHED.procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.ppid)
+    };
+    sched_unlock();
+    r
 }

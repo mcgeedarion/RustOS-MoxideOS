@@ -1,7 +1,12 @@
-//! x86-64 Interrupt Descriptor Table.
+//! Interrupt Descriptor Table (IDT) setup and exception dispatch.
 //!
-//! Sets up a 256-entry IDT with:
-//!   vector 14 (#PF)  — page_fault_handler  (routed to cow_fault)
+//! ## Exception routing
+//!   vector 14 (#PF) — page_fault_handler:
+//!     1. P=0 + U=1  → mm::page_fault::handle_demand_fault (demand-zero/fill)
+//!     2. P=1+W=1+U=1→ proc::cow_fault::handle_cow_fault    (CoW write)
+//!     3. otherwise  → SIGSEGV to process, hlt on kernel fault
+//!   timer IRQ       — apic.rs wires timer_irq_handler
+//!   page_fault_handler  (routed to cow_fault)
 //!   all others       — generic_exception_handler (logs + halts)
 //!
 //! Call idt_init() once during kernel startup after the GDT is loaded.
@@ -44,73 +49,99 @@ struct IdtPointer { limit: u16, base: u64 }
 static mut IDT: [IdtEntry; 256] = [IdtEntry::zero(); 256];
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 
-/// Initialise and load the IDT. Idempotent.
+/// Initialise and load the IDT.
+/// Must be called after the GDT is in place (selector 0x08 = kernel code).
 pub fn idt_init() {
     if IDT_LOADED.swap(true, Ordering::SeqCst) { return; }
     unsafe {
-        IDT[14].set(page_fault_isr as usize, 0x8E);
-        for v in 0..256usize {
-            if v == 14 { continue; }
-            IDT[v].set(generic_isr as usize, 0x8E);
+        IDT[14].set(page_fault_asm as usize, 0x8E);
+        IDT[32].set(timer_irq_asm  as usize, 0x8E);
+        for i in 0usize..32 {
+            if i != 14 { IDT[i].set(generic_exc_asm as usize, 0x8E); }
         }
-        let idtr = IdtPointer {
-            limit: (core::mem::size_of_val(&IDT) - 1) as u16,
+        let ptr = IdtPointer {
+            limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base:  IDT.as_ptr() as u64,
         };
-        core::arch::asm!("lidt [{0}]", in(reg) &idtr, options(nostack));
+        core::arch::asm!("lidt [{p}]", p = in(reg) &ptr, options(nostack));
     }
 }
 
-// ── ISRs ─────────────────────────────────────────────────────────────────
-
-#[naked]
-#[no_mangle]
-unsafe extern "C" fn page_fault_isr() {
-    core::arch::asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "mov  rdi, cr2",
-        "mov  rsi, [rsp + 72]",
-        "call page_fault_handler",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
-        "add rsp, 8",
-        "iretq",
-        options(noreturn)
-    );
-}
+// ── Page-fault handler ───────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn page_fault_handler(faulting_va: usize, error_code: u64) {
+    // ── 1. Demand-zero / demand-fill (P=0, U=1) ───────────────────────────
+    // Not-present fault in user mode: try to back a VMA page.
+    if error_code & 0x1 == 0 && error_code & 0x4 != 0 {
+        if crate::mm::page_fault::handle_demand_fault(faulting_va) {
+            return;
+        }
+    }
+
+    // ── 2. CoW write fault (P=1, W=1, U=1) ───────────────────────────────
     if crate::proc::cow_fault::handle_cow_fault(faulting_va, error_code) {
         return;
     }
+
+    // ── 3. Genuine access violation ───────────────────────────────────────
+    let pid = crate::proc::scheduler::current_pid();
     crate::console::println!(
-        "SEGFAULT pid={} va={:#x} err={:#x}",
-        crate::proc::scheduler::current_pid(),
-        faulting_va,
-        error_code
+        "SIGSEGV pid={} va={:#x} err={:#x}",
+        pid, faulting_va, error_code
     );
+    if pid != 0 {
+        // Deliver SIGSEGV (11) to the faulting process.
+        // check_pending_signal at the next syscall return will call sys_exit.
+        crate::proc::signal::send_signal(pid, 11);
+        crate::proc::scheduler::schedule();
+        return;
+    }
+    // Kernel-mode fault: no recovery.
     loop { unsafe { core::arch::asm!("hlt", options(nostack)); } }
 }
 
 #[naked]
 #[no_mangle]
 unsafe extern "C" fn generic_isr() {
+    core::arch::asm!(
+        "add rsp, 8",
+        "iretq",
+        options(noreturn)
+    );
+}
+
+// ── ASM trampolines (read CR2, push error code, call Rust handler) ────────
+
+#[naked]
+unsafe extern "C" fn page_fault_asm() {
+    core::arch::asm!(
+        // error code is on stack; CR2 = faulting VA
+        "push rax",
+        "mov rax, cr2",
+        "xchg rax, [rsp+8]",  // error_code in rdx slot; faulting_va in rdi slot
+        "mov rsi, [rsp]",     // error_code
+        "mov rdi, rax",       // faulting_va
+        "add rsp, 16",
+        "call page_fault_handler",
+        "iretq",
+        options(noreturn)
+    );
+}
+
+#[naked]
+unsafe extern "C" fn timer_irq_asm() {
+    core::arch::asm!(
+        "push 0",
+        "call timer_irq_handler",
+        "add rsp, 8",
+        "iretq",
+        options(noreturn)
+    );
+}
+
+#[naked]
+unsafe extern "C" fn generic_exc_asm() {
     core::arch::asm!(
         "add rsp, 8",
         "iretq",

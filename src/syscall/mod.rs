@@ -3,14 +3,20 @@
 //! Called from arch/x86_64/syscall.rs -> syscall_rust_entry.
 //!
 //! ## Wired syscalls
+//!    NR   0  read              -> fs::io_syscalls::sys_read
+//!    NR   1  write             -> fs::io_syscalls::sys_write
+//!    NR   2  open              -> fs::io_syscalls::sys_open
+//!    NR   3  close             -> fs::io_syscalls::sys_close
 //!    NR   7  waitpid           -> proc::wait::sys_waitpid
 //!    NR  12  brk               -> mm::mmap::sys_brk
 //!    NR  13  rt_sigaction      -> proc::signal::sys_rt_sigaction
 //!    NR  14  rt_sigprocmask    -> proc::signal::sys_rt_sigprocmask
 //!    NR  15  rt_sigreturn      -> handled in syscall_rust_entry (frame ptr)
+//!    NR  39  getpid            -> scheduler::current_pid()
 //!    NR  59  execve            -> proc::exec::sys_execve (handled in syscall_rust_entry)
 //!    NR  60  exit              -> proc::exit::sys_exit
 //!    NR  61  wait4             -> proc::wait::sys_waitpid (compat)
+//!    NR 110  getppid           -> scheduler::ppid_of(current_pid())
 //!    NR 218  set_tid_address   -> arch::x86_64::syscall::sys_set_tid_address
 //!    NR 231  exit_group        -> proc::exit::sys_exit_group
 //!    NR 424  pidfd_send_signal -> fs::pidfd::sys_pidfd_send_signal
@@ -32,14 +38,20 @@ include!("socket_gaps.rs");
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
     match nr {
+        0   => crate::fs::io_syscalls::sys_read(a, b, c),
+        1   => crate::fs::io_syscalls::sys_write(a, b, c),
+        2   => crate::fs::io_syscalls::sys_open(a, b as u32, c as u32),
+        3   => crate::fs::io_syscalls::sys_close(a),
         7   => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
         12  => crate::mm::mmap::sys_brk(a),
         13  => crate::proc::signal::sys_rt_sigaction(a as u32, b, c, d),
         14  => crate::proc::signal::sys_rt_sigprocmask(a as u32, b, c, d),
         // NR 15 rt_sigreturn handled in syscall_rust_entry (needs frame ptr)
+        39  => crate::proc::scheduler::current_pid() as isize,
         // NR 59 execve handled in syscall_rust_entry (needs frame ptr)
         60  => crate::proc::exit::sys_exit(a as i32),
         61  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
+        110 => crate::proc::scheduler::ppid_of(crate::proc::scheduler::current_pid()) as isize,
         218 => crate::arch::x86_64::syscall::sys_set_tid_address(a),
         231 => crate::proc::exit::sys_exit_group(a as i32),
         424 => crate::fs::pidfd::sys_pidfd_send_signal(a, b as u32, c, d as u32),
