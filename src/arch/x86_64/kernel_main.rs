@@ -6,6 +6,7 @@
 //!   3.  syscall_setup()    — SYSCALL/SYSRET MSRs (LSTAR, STAR, FMASK)
 //!   4.  serial::init()     — COM1 UART for early console output
 //!   5.  virtio_blk::init() — VirtIO PCI block driver (ext2 disk)
+//!   5b. ext2::mount()      — Load ext2 image from disk into memory
 //!   6.  apic_init()        — Local APIC + periodic timer (enables interrupts)
 //!   7.  spawn_init()       — create PID 1, load /sbin/init or /bin/sh
 //!   8.  idle loop          — hlt until next timer tick
@@ -44,7 +45,12 @@ pub extern "C" fn kernel_main() -> ! {
     // 5. VirtIO block driver.
     virtio_blk::init();
     if virtio_blk::is_present() {
-        serial_println!("virtio-blk: disk found");
+        serial_println!("virtio-blk: disk found — mounting ext2");
+        if crate::fs::ext2::mount() {
+            serial_println!("ext2: root filesystem mounted");
+        } else {
+            serial_println!("ext2: mount failed — ramfs only");
+        }
     } else {
         serial_println!("virtio-blk: no disk — ramfs only");
     }
