@@ -1,7 +1,7 @@
-//! Kernel entry point — called by the bootloader after paging is enabled.
+//! Kernel entry point — called from _start after the CPU is in 64-bit long mode.
 //!
 //! ## Boot sequence
-//!   1.  gdt_init()         — GDT + TSS + GSBASE
+//!   1.  gdt_init()         — GDT + TSS + GSBASE (must be first)
 //!   2.  idt_init()         — IDT exception/IRQ vectors
 //!   3.  syscall_setup()    — SYSCALL/SYSRET MSRs (LSTAR, STAR, FMASK)
 //!   4.  serial::init()     — COM1 UART for early console output
@@ -9,9 +9,6 @@
 //!   6.  apic_init()        — Local APIC + periodic timer (enables interrupts)
 //!   7.  spawn_init()       — create PID 1, load /sbin/init or /bin/sh
 //!   8.  idle loop          — hlt until next timer tick
-//!
-//! The boot CPU runs this function at ring 0.  There is no separate
-//! init task for PID 0; the boot CPU becomes the idle task after spawn_init.
 
 use core::arch::asm;
 
@@ -23,11 +20,12 @@ use crate::arch::x86_64::{
     apic::apic_init,
 };
 use crate::drivers::virtio_blk;
-use crate::proc::exec::sys_execve_from_path;
+use crate::proc::exec::spawn_user_process;
 
-/// The C-callable kernel entry point.
-/// Bootloader must call this with a flat 64-bit address space,
-/// identity-mapped physical memory, and interrupts disabled.
+/// Kernel entry point. Bootloader jumps here with:
+///   - 64-bit long mode active
+///   - identity-mapped physical memory (PA == VA)
+///   - interrupts disabled (we enable them in apic_init)
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     // 1. GDT + TSS + per-CPU GSBASE.
@@ -39,77 +37,40 @@ pub extern "C" fn kernel_main() -> ! {
     // 3. SYSCALL/SYSRET MSRs.
     syscall_setup();
 
-    // 4. Serial console.
+    // 4. Serial console (COM1 / 0x3F8).
     serial::init();
-    kprintln!("rustos booting...");
+    serial_println!("rustos: booting...");
 
-    // 5. VirtIO block driver (needed before VFS open).
+    // 5. VirtIO block driver.
     virtio_blk::init();
     if virtio_blk::is_present() {
-        kprintln!("virtio-blk: disk found");
+        serial_println!("virtio-blk: disk found");
     } else {
-        kprintln!("virtio-blk: no disk — ramfs only");
+        serial_println!("virtio-blk: no disk — ramfs only");
     }
 
-    // 6. APIC timer — enables preemption. Must come after IDT.
+    // 6. APIC timer — enables preemption (calls sti).
     apic_init();
-    kprintln!("apic: timer started");
+    serial_println!("apic: timer started");
 
     // 7. Spawn PID 1.
-    spawn_init();
-
-    // 8. Idle loop — the boot CPU drops to a hlt loop.
-    kprintln!("kernel_main: entering idle loop");
-    loop {
-        unsafe { asm!("hlt", options(nostack, nomem)); }
-    }
-}
-
-/// Create PID 1 by loading /sbin/init (falling back to /bin/sh then /init).
-fn spawn_init() {
     const CANDIDATES: &[&str] = &["/sbin/init", "/bin/sh", "/init", "/bin/bash"];
+    let mut spawned = false;
     for path in CANDIDATES {
-        if try_exec_pid1(path) {
-            kprintln!("init: spawned PID 1 from {}", path);
-            return;
+        if spawn_user_process(path, &[path], &[]) {
+            serial_println!("init: spawned PID 1 from {}", path);
+            spawned = true;
+            break;
         }
     }
-    kprintln!("init: WARNING — no init binary found, running built-in shell");
-    // Fall back: enqueue a minimal kernel-space shell task.
-    crate::proc::scheduler::enqueue(make_idle_pcb());
-}
-
-/// Attempt to exec `path` as PID 1. Returns true on success.
-fn try_exec_pid1(path: &str) -> bool {
-    // Open the file through VFS to check it exists.
-    match crate::fs::vfs::open(path, 0) {
-        Ok(fd) => { crate::fs::vfs::close(fd); }
-        Err(_) => return false,
+    if !spawned {
+        serial_println!("init: WARNING — no init binary found in ramfs");
     }
-    // Create a fresh PCB and load the ELF.
-    crate::proc::exec::spawn_user_process(path, &[path], &[])
-}
 
-/// Create a placeholder idle PCB (PID 0) so the scheduler always has a task.
-fn make_idle_pcb() -> crate::proc::process::Pcb {
-    use crate::proc::process::{Pcb, State};
-    use crate::proc::context::Context;
-    use crate::proc::fork::SignalHandlers;
-    use crate::security::CapSet;
-    Pcb {
-        pid: 0, ppid: 0,
-        state: State::Ready,
-        exit_code: 0,
-        caps: CapSet::empty(),
-        pc: 0, sp: 0,
-        user_satp: 0, kernel_satp: 0, trapframe_pa: 0,
-        kstack_top: 0,
-        ctx: Context::zero(),
-        owned_pages: alloc::vec![],
-        child_tid_va: 0, child_tid_val: 0,
-        clear_child_tid_va: 0,
-        exit_signal: 17,
-        vfork_parent: 0,
-        signal_handlers: SignalHandlers::default(),
+    // 8. Idle: schedule on every timer tick, hlt between ticks.
+    serial_println!("kernel_main: idle loop");
+    loop {
+        unsafe { asm!("hlt", options(nostack, nomem)); }
+        crate::proc::scheduler::schedule();
     }
 }

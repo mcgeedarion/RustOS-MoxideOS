@@ -20,10 +20,19 @@
 //! All physical addresses are identity-mapped (PA == VA) in the kernel.
 //! CR3 holds the PA of the current PML4.
 
-const PRESENT:   u64 = 1 << 0;
-const WRITABLE:  u64 = 1 << 1;
-const USER:      u64 = 1 << 2;
-const COW_BIT:   u64 = 1 << 9;   // software-defined CoW marker
+// ── PTE flag constants (pub so loader/elf64.rs and others can reference them) ──
+
+pub const PTE_PRESENT:  u64 = 1 << 0;
+pub const PTE_WRITABLE: u64 = 1 << 1;
+pub const PTE_USER:     u64 = 1 << 2;
+pub const PTE_COW:      u64 = 1 << 9;  // software-defined CoW marker
+pub const PTE_NX:       u64 = 1 << 63; // No-Execute (IA32_EFER.NXE must be set)
+
+// Internal aliases for use within this file.
+const PRESENT:   u64 = PTE_PRESENT;
+const WRITABLE:  u64 = PTE_WRITABLE;
+const USER:      u64 = PTE_USER;
+const COW_BIT:   u64 = PTE_COW;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000; // bits [51:12]
 
 // ── CR3 helpers ───────────────────────────────────────────────────────────
@@ -137,7 +146,7 @@ unsafe fn walk_ro(cr3: usize, va: usize) -> Option<*mut u64> {
 pub fn map_page(cr3: usize, va: usize, pa: usize, flags: u64) {
     unsafe {
         let pte = walk_mut(cr3, va);
-        *pte = (pa as u64 & ADDR_MASK) | (flags & 0xFFF) | PRESENT;
+        *pte = (pa as u64 & ADDR_MASK) | (flags & !ADDR_MASK) | PRESENT;
     }
 }
 

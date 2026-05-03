@@ -22,6 +22,12 @@
 //!           frame.rax = 0
 //!           frame.r11 = 0x202  (IF=1)
 //!
+//! ## spawn_user_process (boot path)
+//!   Called from kernel_main before any syscall frame exists.
+//!   Opens the ELF, allocates a fresh CR3, loads segments, builds the
+//!   initial stack, creates a new PCB with pid=next_pid(), and enqueues
+//!   it in the scheduler. Returns true on success.
+//!
 //! ## Initial user stack layout (Linux ABI, grows downward)
 //!
 //!   high address (STACK_TOP)
@@ -44,6 +50,12 @@ use crate::fs::{elf, vfs};
 use crate::mm::{mmap, pmm};
 use crate::arch::x86_64::{paging, syscall::SyscallFrame};
 use crate::proc::{scheduler, thread};
+use crate::proc::process::{Pcb, State};
+use crate::proc::context::Context;
+use crate::proc::fork::SignalHandlers;
+use crate::security::CapSet;
+use crate::mm::kstack::alloc_kstack;
+use crate::arch::x86_64::gdt::update_rsp0;
 
 // ── constants ─────────────────────────────────────────────────────────────
 
@@ -54,7 +66,8 @@ const STACK_TOP:    usize = 0x0000_7FFF_FF00_0000;
 /// Load bias for the dynamic interpreter.
 const INTERP_BASE:  usize = 0x0060_0000;
 
-// ── AT_* auxv types ────────────────────────────────────────────────────────
+// ── AT_* auxv types ─────────────────────────────────────────────────
+
 const AT_NULL:   u64 =  0;
 const AT_PHDR:   u64 =  3;
 const AT_PHENT:  u64 =  4;
@@ -64,7 +77,139 @@ const AT_BASE:   u64 =  7;
 const AT_ENTRY:  u64 =  9;
 const AT_RANDOM: u64 = 25;
 
-// ── sys_execve [NR 59] ────────────────────────────────────────────────────
+// ── spawn_user_process (boot / kernel-initiated exec) ───────────────────
+
+/// Create a new user process from a VFS path.  Used at boot to spawn PID 1
+/// and can be called from the kernel at any time before the process runs.
+///
+/// Returns `true` if the process was successfully created and enqueued.
+pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
+    // 1. Read the ELF from VFS.
+    let fd = match vfs::open(path, vfs::O_RDONLY) {
+        Ok(fd) => fd,
+        Err(_) => return false,
+    };
+    let file_size = vfs::fstat(fd).unwrap_or(0);
+    if file_size == 0 { vfs::close(fd); return false; }
+    let mut data_buf = alloc::vec![0u8; file_size];
+    let n = vfs::pread(fd, data_buf.as_mut_ptr(), data_buf.len(), 0);
+    vfs::close(fd);
+    if n <= 0 { return false; }
+    let data = &data_buf[..n as usize];
+
+    // 2. Parse ELF.
+    let hdr = match elf::parse_elf_header(data) {
+        Ok(h)  => h,
+        Err(_) => return false,
+    };
+    let phdrs = elf::parse_phdrs(data, &hdr);
+
+    // 3. Fresh PML4.
+    let new_cr3 = match pmm::alloc_page() {
+        Some(p) => p,
+        None    => return false,
+    };
+    unsafe { core::ptr::write_bytes(new_cr3 as *mut u8, 0, PAGE_SIZE); }
+
+    // 4. Load segments.
+    let program_entry = match elf::load_elf_into(new_cr3, data, &hdr, &phdrs) {
+        Ok(e)  => e,
+        Err(_) => { pmm::free_page(new_cr3); return false; }
+    };
+
+    // 5. Optionally load dynamic linker.
+    let phdr_va = phdrs.iter()
+        .find(|ph| ph.p_type == elf::PT_PHDR)
+        .map_or(0, |ph| ph.p_vaddr as usize);
+
+    let (entry_va, interp_base_val) =
+        if let Some(interp_path) = elf::find_interp(data, &phdrs) {
+            match load_interpreter(new_cr3, interp_path) {
+                Ok(e) => (e, INTERP_BASE),
+                Err(_) => (program_entry, 0),
+            }
+        } else {
+            (program_entry, 0)
+        };
+
+    // 6. User stack.
+    let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
+    for i in 0..STACK_PAGES {
+        let va = stack_bottom + i * PAGE_SIZE;
+        let pa = match pmm::alloc_page() {
+            Some(p) => p,
+            None    => { pmm::free_page(new_cr3); return false; }
+        };
+        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+        // Present | Writable | User | NX
+        paging::map_page(new_cr3, va, pa,
+            paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER | paging::PTE_NX);
+    }
+
+    // 7. Build initial stack in the NEW address space.
+    //    We need to write into the user stack pages through their
+    //    identity-mapped PAs (PA == VA in the kernel).
+    let argv_strings: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
+    let envp_strings: Vec<String> = envp.iter().map(|s| String::from(*s)).collect();
+
+    let initial_rsp = match build_initial_stack(
+        new_cr3, STACK_TOP,
+        &argv_strings, &envp_strings,
+        &hdr, &phdrs, phdr_va,
+        entry_va, interp_base_val,
+    ) {
+        Ok(rsp) => rsp,
+        Err(_)  => { pmm::free_page(new_cr3); return false; }
+    };
+
+    // 8. Kernel stack for this process.
+    let kstack_top = alloc_kstack();
+
+    // 9. Build PCB.
+    let pid  = scheduler::next_pid();
+    let ppid = scheduler::current_pid(); // boot CPU is PID 0
+
+    // Context: on first schedule(), switch_to will jmp to sysret_trampoline
+    // which calls child_first_run_hook and then SYSRETQs to entry_va / rsp.
+    // We pre-fill ctx.rsp to the kernel stack top; the actual user RIP/RSP
+    // are stored in the PCB pc/sp fields and will be loaded by sysret_trampoline.
+    let mut ctx = Context::zero();
+    ctx.rsp = kstack_top;
+    ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize;
+
+    let pcb = Pcb {
+        pid,
+        ppid,
+        state: State::Ready,
+        exit_code: 0,
+        caps: CapSet::empty(),
+        pc:  entry_va,
+        sp:  initial_rsp,
+        user_satp:    new_cr3,
+        kernel_satp:  0,
+        trapframe_pa: 0,
+        kstack_top,
+        ctx,
+        owned_pages: alloc::vec![],
+        child_tid_va:       0,
+        child_tid_val:      0,
+        clear_child_tid_va: 0,
+        exit_signal:        17, // SIGCHLD
+        vfork_parent:       0,
+        signal_handlers:    SignalHandlers::default(),
+    };
+
+    // 10. Enqueue.
+    scheduler::enqueue(pcb);
+    true
+}
+
+/// Thin wrapper used by kernel_main — same as spawn_user_process.
+pub fn sys_execve_from_path(path: &str) -> bool {
+    spawn_user_process(path, &[path], &[])
+}
+
+// ── sys_execve [NR 59] ───────────────────────────────────────────────────
 
 /// sys_execve(filename_va, argv_va, envp_va) [NR 59]
 ///
@@ -85,7 +230,7 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
     }
 }
 
-// ── do_execve ─────────────────────────────────────────────────────────────
+// ── do_execve ───────────────────────────────────────────────────────────
 
 pub fn do_execve(path: &str, argv: &[String], envp: &[String],
                  frame: &mut SyscallFrame) -> Result<(), i32>
@@ -135,8 +280,8 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         let va = stack_bottom + i * PAGE_SIZE;
         let pa = pmm::alloc_page().ok_or(-12i32)?;
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
-        // Present | Writable | User | NX
-        paging::map_page(new_cr3, va, pa, 0x8000_0000_0000_0007);
+        paging::map_page(new_cr3, va, pa,
+            paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER | paging::PTE_NX);
     }
 
     // 7. Build initial stack layout, get initial_rsp
@@ -161,7 +306,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
             p.user_satp      = new_cr3;
             p.pc             = entry_va;
             p.sp             = initial_rsp;
-            p.signal_handlers = crate::proc::fork::SignalHandlers::default();
+            p.signal_handlers = SignalHandlers::default();
             let vfp = p.vfork_parent;
             p.vfork_parent   = 0;
             vfp
@@ -169,6 +314,16 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         scheduler::procs_unlock();
         vfp
     };
+
+    // Update TSS RSP0 + GSBASE for the current task's new kernel stack.
+    // (kstack_top is unchanged — execve keeps the same kernel stack.)
+    {
+        let procs = scheduler::procs_lock();
+        let kst = procs.iter().find(|p| p.pid == pid)
+            .map_or(0, |p| p.kstack_top);
+        scheduler::procs_unlock();
+        if kst != 0 { update_rsp0(kst); }
+    }
 
     // 11. Wake CLONE_VFORK parent
     if vfork_parent != 0 {
@@ -201,8 +356,7 @@ fn build_initial_stack(
     interp_base: usize,
 ) -> Result<usize, i32>
 {
-    // Pack all strings into a temporary buffer
-    let mut string_buf: Vec<u8>   = Vec::new();
+    let mut string_buf: Vec<u8>      = Vec::new();
     let mut argv_offsets: Vec<usize> = Vec::new();
     let mut envp_offsets: Vec<usize> = Vec::new();
 
@@ -219,12 +373,10 @@ fn build_initial_stack(
     let random_offset = string_buf.len();
     string_buf.extend_from_slice(&[0u8; 16]);
 
-    // Strings are placed just below stack_top
     let str_total      = (string_buf.len() + 15) & !15;
     let string_va_base = stack_top - str_total;
     let random_va      = string_va_base + random_offset;
 
-    // Auxv table
     let pt_load_count = phdrs.iter().filter(|p| p.p_type == elf::PT_LOAD).count();
     let auxv: &[(u64, u64)] = &[
         (AT_PHDR,   phdr_va as u64),
@@ -237,16 +389,12 @@ fn build_initial_stack(
         (AT_NULL,   0),
     ];
 
-    let argc = argv.len();
-    let envc = envp.len();
-    let ptrtable_words = 1 + (argc + 1) + (envc + 1) + auxv.len() * 2;
-    let ptrtable_bytes = ptrtable_words * 8;
+    let argc            = argv.len();
+    let ptrtable_words  = 1 + (argc + 1) + (envp.len() + 1) + auxv.len() * 2;
+    let ptrtable_bytes  = ptrtable_words * 8;
+    let rsp_raw         = string_va_base - ptrtable_bytes;
+    let initial_rsp     = rsp_raw & !0xF;
 
-    // Compute initial RSP: aligned down to 16 bytes
-    let rsp_raw    = string_va_base - ptrtable_bytes;
-    let initial_rsp = rsp_raw & !0xF;
-
-    // Write strings (identity-mapped PA == VA)
     unsafe {
         core::ptr::copy_nonoverlapping(
             string_buf.as_ptr(),
@@ -255,7 +403,6 @@ fn build_initial_stack(
         );
     }
 
-    // Write pointer table
     let mut wp = initial_rsp as *mut u64;
     unsafe {
         wp.write(argc as u64); wp = wp.add(1);
@@ -276,10 +423,8 @@ fn build_initial_stack(
     Ok(initial_rsp)
 }
 
-// ── load_interpreter ─────────────────────────────────────────────────────
+// ── load_interpreter ────────────────────────────────────────────────────────
 
-/// Load the dynamic linker ELF from `interp_path` into `cr3`.
-/// Returns the interpreter's adjusted entry VA.
 fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     let fd  = vfs::open(interp_path, vfs::O_RDONLY).map_err(|e| e)?;
     let sz  = vfs::fstat(fd).unwrap_or(0);
@@ -287,16 +432,15 @@ fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     let n   = vfs::pread(fd, buf.as_mut_ptr(), buf.len(), 0);
     vfs::close(fd);
     if n <= 0 { return Err(-8); }
-    let idata = &buf[..n as usize];
-    let ihdr  = elf::parse_elf_header(idata)?;
+    let idata  = &buf[..n as usize];
+    let ihdr   = elf::parse_elf_header(idata)?;
     let iphdrs = elf::parse_phdrs(idata, &ihdr);
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── string helpers ────────────────────────────────────────────────────────
+// ── string helpers ────────────────────────────────────────────────────────────
 
 /// Read a NUL-terminated C string from user VA `va`.
-/// Returns None on invalid address or if length exceeds 4096.
 pub fn read_cstr_safe(va: usize) -> Option<String> {
     if va < 0x1000 || va > 0x0000_7FFF_FFFF_F000 { return None; }
     let mut s = String::new();

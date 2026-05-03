@@ -3,6 +3,7 @@ pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod kernel_main;
 pub mod paging;
 pub mod serial;
 pub mod syscall;
