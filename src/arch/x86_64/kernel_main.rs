@@ -1,34 +1,40 @@
-//! Kernel entry point — called from _start after the CPU is in 64-bit long mode.
+//! Kernel entry point — called from _start (Multiboot2) or uefi_start (UEFI)
+//! after the CPU is in 64-bit long mode with interrupts disabled.
 //!
 //! ## Boot sequence
-//!   1.  gdt_init()         — GDT + TSS + GSBASE (must be first)
+//!   0.  heap_init()        — global allocator (must precede any alloc::)
+//!   1.  gdt_init()         — GDT + TSS + GSBASE (must be before first #GP)
 //!   2.  idt_init()         — IDT exception/IRQ vectors
 //!   3.  syscall_setup()    — SYSCALL/SYSRET MSRs (LSTAR, STAR, FMASK)
 //!   4.  serial::init()     — COM1 UART for early console output
-//!   5.  virtio_blk::init() — VirtIO PCI block driver (ext2 disk)
-//!   5b. ext2::mount()      — Load ext2 image from disk into memory
-//!   6.  apic_init()        — Local APIC + periodic timer (enables interrupts)
-//!   7.  spawn_init()       — create PID 1, load /sbin/init or /bin/sh
-//!   8.  idle loop          — hlt until next timer tick
+//!   5.  xsave::xsave_init()— XSAVE/FXSAVE feature detection
+//!   6.  acpi_init()        — RSDP → MADT: CPU list, I/O APIC addresses
+//!   7.  apic_init()        — Local APIC + periodic timer (enables interrupts)
+//!   8.  virtio_blk_init()  — virtio-blk block device at QEMU MMIO base
+//!   9.  mount_root()       — ext2 or ramfs
+//!  10.  spawn_init()       — PID 1 from /sbin/init, /bin/sh, or /init
+//!  11.  idle loop          — hlt between timer ticks
 
 use core::arch::asm;
-
 use crate::arch::x86_64::{
     gdt::gdt_init,
     idt::idt_init,
     syscall::syscall_setup,
     serial,
     apic::apic_init,
+    xsave::xsave_init,
 };
-use crate::drivers::virtio_blk;
+use crate::block::virtio_blk;
 use crate::proc::exec::spawn_user_process;
 
-/// Kernel entry point. Bootloader jumps here with:
-///   - 64-bit long mode active
-///   - identity-mapped physical memory (PA == VA)
-///   - interrupts disabled (we enable them in apic_init)
+/// QEMU virt machine virtio-blk MMIO base address.
+const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
+
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    // 0. Heap allocator — must be first; everything else may alloc.
+    crate::allocator::heap_init();
+
     // 1. GDT + TSS + per-CPU GSBASE.
     gdt_init();
 
@@ -40,14 +46,36 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 4. Serial console (COM1 / 0x3F8).
     serial::init();
-    serial_println!("rustos: booting...");
+    serial_println!("rustos: early boot");
 
-    // 5. VirtIO block driver.
-    virtio_blk::init();
-    if virtio_blk::is_present() {
-        serial_println!("virtio-blk: disk found — mounting ext2");
+    // 5. FP state save/restore (XSAVE or FXSAVE).
+    xsave_init();
+    serial_println!("xsave: init done");
+
+    // 6. ACPI: CPU topology + I/O APIC addresses.
+    let rsdp_pa = unsafe { crate::arch::x86_64::uefi_entry::RSDP_PHYS };
+    crate::acpi::acpi_init(rsdp_pa);
+    serial_println!("acpi: {} CPUs detected", crate::acpi::cpu_count());
+
+    // 7. Local APIC + timer — enables preemption (issues STI).
+    apic_init();
+    serial_println!("apic: timer started, interrupts enabled");
+
+    // 8. virtio-blk block device.
+    virtio_blk::virtio_blk_init(VIRTIO_BLK_MMIO_BASE);
+    serial_println!("virtio-blk: init");
+
+    // 9. Mount root filesystem.
+    let has_disk = {
+        // Quick check: attempt to read sector 0; if it returns all-zeros
+        // the disk isn't present but we won't crash.
+        let mut buf = [0u8; 512];
+        crate::block::virtio_blk::read_sector(0, &mut buf)
+    };
+    if has_disk {
+        serial_println!("virtio-blk: disk present");
         if crate::fs::ext2::mount() {
-            serial_println!("ext2: root filesystem mounted");
+            serial_println!("ext2: root mounted at /");
         } else {
             serial_println!("ext2: mount failed — ramfs only");
         }
@@ -55,26 +83,23 @@ pub extern "C" fn kernel_main() -> ! {
         serial_println!("virtio-blk: no disk — ramfs only");
     }
 
-    // 6. APIC timer — enables preemption (calls sti).
-    apic_init();
-    serial_println!("apic: timer started");
-
-    // 7. Spawn PID 1.
+    // 10. Spawn PID 1.
     const CANDIDATES: &[&str] = &["/sbin/init", "/bin/sh", "/init", "/bin/bash"];
     let mut spawned = false;
     for path in CANDIDATES {
         if spawn_user_process(path, &[path], &[]) {
-            serial_println!("init: spawned PID 1 from {}", path);
+            serial_println!("init: PID 1 spawned from {}", path);
             spawned = true;
             break;
         }
     }
     if !spawned {
-        serial_println!("init: WARNING — no init binary found in ramfs");
+        serial_println!("init: WARNING — no init binary found");
+        serial_println!("      drop a static /bin/sh ELF into the disk image");
     }
 
-    // 8. Idle: schedule on every timer tick, hlt between ticks.
-    serial_println!("kernel_main: idle loop");
+    // 11. Idle loop — schedule on every timer tick.
+    serial_println!("kernel_main: entering idle loop");
     loop {
         unsafe { asm!("hlt", options(nostack, nomem)); }
         crate::proc::scheduler::schedule();

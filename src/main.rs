@@ -1,34 +1,42 @@
-//! Kernel binary entry point.
-//! The bootloader (UEFI or multiboot2) jumps to _start in 64-bit long mode
-//! with a flat identity-mapped address space and interrupts disabled.
+//! Kernel binary entry points.
+//!
+//! ## UEFI path (default, matches x86_64.ld ENTRY)
+//!   Firmware → uefi_start()  (in arch/x86_64/uefi_entry.rs)
+//!            → kernel_main() (in arch/x86_64/kernel_main.rs)
+//!
+//! ## Multiboot2 / QEMU -kernel path
+//!   QEMU loads the ELF64, enters long mode, jumps to _start below.
+//!   _start sets RSP to __boot_stack_top and calls kernel_main().
+//!
+//! Both paths converge at kernel_main().
 
 #![no_std]
 #![no_main]
 extern crate rustos;
 
-/// Naked entry stub: set up a temporary stack then call kernel_main.
-/// The bootloader may not have set RSP to a valid kernel stack, so we
-/// load one explicitly before calling Rust code.
+/// Multiboot2 / QEMU entry stub.
+/// Sets up a temporary 16 KiB stack then calls kernel_main.
 #[no_mangle]
 #[naked]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::asm!(
-        // Temporary boot stack: 16 KiB of BSS.
         "lea rsp, [rip + __boot_stack_top]",
         "xor rbp, rbp",
+        // Clear RSDP_PHYS so acpi_init falls back to BIOS scan.
+        "mov qword ptr [rip + {rsdp}], 0",
         "call kernel_main",
-        // kernel_main is -> ! but if it ever returns, halt.
         "2: hlt",
         "jmp 2b",
+        rsdp = sym rustos::arch::x86_64::uefi_entry::RSDP_PHYS,
         options(noreturn)
     );
 }
 
-/// 16 KiB boot stack used before gdt_init() allocates a proper kstack.
+/// 16 KiB boot stack used before gdt_init() allocates a proper per-CPU kstack.
 #[link_section = ".bss"]
 static mut __BOOT_STACK: [u8; 16384] = [0u8; 16384];
 
-/// Symbol that _start loads into RSP.
+/// Symbol loaded into RSP by both _start and uefi_start.
 #[no_mangle]
 #[link_section = ".bss"]
 static __boot_stack_top: [u8; 0] = [];

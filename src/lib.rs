@@ -3,6 +3,8 @@
 #![allow(dead_code, unused_variables, unused_imports)]
 extern crate alloc;
 
+pub mod acpi;
+pub mod allocator;
 pub mod arch;
 pub mod block;
 pub mod console;
@@ -15,6 +17,7 @@ pub mod input;
 pub mod loader;
 pub mod mm;
 pub mod net;
+pub mod panic;
 pub mod proc;
 pub mod rand;
 pub mod security;
@@ -23,3 +26,4 @@ pub mod sync;
 pub mod syscall;
 pub mod uaccess;
 pub mod utils;
+pub mod wayland;
