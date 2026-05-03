@@ -1,1 +1,1 @@
-//! fcntl flags and file-descriptor control.
+FCNTL_CONTENT
