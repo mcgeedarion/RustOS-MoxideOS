@@ -4,6 +4,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::arch::{Arch, api::{Paging, Interrupts}};
 use crate::proc::process::{Pcb, State};
 use crate::proc::context::switch_to;
 
@@ -11,7 +12,7 @@ struct SchedState { procs: Vec<Pcb>, current: usize, next_pid: usize }
 static mut SCHED: SchedState = SchedState { procs: Vec::new(), current: 0, next_pid: 1 };
 static SCHED_LOCK: AtomicUsize = AtomicUsize::new(0);
 
-fn sched_lock()   { while SCHED_LOCK.compare_exchange(0,1,Ordering::Acquire,Ordering::Relaxed).is_err() { core::hint::spin_loop(); } }
+fn sched_lock()   { while SCHED_LOCK.compare_exchange(0,1,Ordering::Acquire,Ordering::Relaxed).is_err() { <Arch as crate::arch::api::Cpu>::spin_hint(); } }
 fn sched_unlock() { SCHED_LOCK.store(0, Ordering::Release); }
 
 pub fn current_pid() -> usize {
@@ -32,7 +33,6 @@ pub fn enqueue(pcb: Pcb) {
     sched_unlock();
 }
 
-/// Borrow the run-queue for reading/patching. Caller MUST call procs_unlock.
 pub fn procs_lock() -> &'static mut Vec<Pcb> {
     sched_lock();
     unsafe { &mut SCHED.procs }
@@ -40,7 +40,6 @@ pub fn procs_lock() -> &'static mut Vec<Pcb> {
 
 pub fn procs_unlock() { sched_unlock(); }
 
-/// Block current process and yield to the next ready task (CLONE_VFORK).
 pub fn suspend_current_until_child_exec(_child_pid: usize) {
     sched_lock();
     unsafe { SCHED.procs[SCHED.current].state = State::Blocked; }
@@ -48,7 +47,6 @@ pub fn suspend_current_until_child_exec(_child_pid: usize) {
     schedule();
 }
 
-/// Mark pid Ready (called by vfork child on exec/exit).
 pub fn wake_pid(pid: usize) {
     sched_lock();
     unsafe {
@@ -77,18 +75,20 @@ pub fn schedule() {
         SCHED.procs[nxt].state = State::Running;
         SCHED.current = nxt;
     }
-    let old_ctx = unsafe { &mut SCHED.procs[cur].ctx as *mut _ };
-    let new_ctx = unsafe { &    SCHED.procs[nxt].ctx as *const _ };
-    let new_cr3 = unsafe { SCHED.procs[nxt].user_satp };
+    let old_ctx  = unsafe { &mut SCHED.procs[cur].ctx as *mut _ };
+    let new_ctx  = unsafe { &    SCHED.procs[nxt].ctx as *const _ };
+    let new_cr3  = unsafe { SCHED.procs[nxt].user_satp };
     sched_unlock();
-    if new_cr3 != 0 {
-        unsafe { core::arch::asm!("mov cr3, {}", in(reg) new_cr3, options(nostack)); }
+
+    // Address-space switch via HAL.
+    let cur_cr3 = <Arch as Paging>::kernel_cr3();
+    if new_cr3 != 0 && new_cr3 != cur_cr3 {
+        <Arch as Paging>::load_cr3(new_cr3);
     }
+
     unsafe { switch_to(old_ctx, new_ctx); }
 }
 
-/// Repair SCHED.current after a Vec::remove(removed_idx) call.
-/// Must be called while the sched lock is ALREADY HELD (inside procs_lock).
 pub fn fix_current_after_remove(removed_idx: usize) {
     unsafe {
         let len = SCHED.procs.len();
@@ -98,7 +98,6 @@ pub fn fix_current_after_remove(removed_idx: usize) {
     }
 }
 
-/// Return the ppid of `pid`.  Used by NR 110 (getppid).
 pub fn ppid_of(pid: usize) -> usize {
     sched_lock();
     let r = unsafe {

@@ -22,11 +22,12 @@ pub unsafe extern "C" fn _start() -> ! {
     core::arch::asm!(
         "lea rsp, [rip + __boot_stack_top]",
         "xor rbp, rbp",
-        // Clear RSDP_PHYS so acpi_init falls back to BIOS scan.
         "mov qword ptr [rip + {rsdp}], 0",
         "call kernel_main",
         "2: hlt",
         "jmp 2b",
+        // Use arch-internal symbol — entry points are inherently arch-specific
+        // and remain the one legitimate direct arch import in main.rs.
         rsdp = sym rustos::arch::x86_64::uefi_entry::RSDP_PHYS,
         options(noreturn)
     );
