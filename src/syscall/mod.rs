@@ -8,6 +8,7 @@
 //!    NR 218  set_tid_address   -> arch::x86_64::syscall::sys_set_tid_address
 //!    NR 424  pidfd_send_signal -> fs::pidfd::sys_pidfd_send_signal
 //!    NR 434  pidfd_open        -> fs::pidfd::sys_pidfd_open
+//!    NR 435  clone3            -> proc::clone::sys_clone3
 //!    NR 438  pidfd_getfd       -> fs::pidfd::sys_pidfd_getfd
 
 #![allow(unused_variables, unused_imports)]
@@ -24,11 +25,12 @@ include!("socket_gaps.rs");
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
     match nr {
-        7  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
-        61 => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
+        7   => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
+        61  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
         218 => crate::arch::x86_64::syscall::sys_set_tid_address(a),
         424 => crate::fs::pidfd::sys_pidfd_send_signal(a, b as u32, c, d as u32),
         434 => crate::fs::pidfd::sys_pidfd_open(a, b as u32),
+        435 => crate::proc::clone::sys_clone3(a, b),
         438 => crate::fs::pidfd::sys_pidfd_getfd(a, b, c as u32),
         149 => sys_mlock_impl(a, b),
         150 => sys_munlock_impl(a, b),

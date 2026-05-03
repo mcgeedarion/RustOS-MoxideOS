@@ -11,13 +11,18 @@
 //! Each mmap() call appends a Vma to the per-process list.  munmap() removes
 //! the intersecting VMAs (with split if partial).  The page-fault handler
 //! queries this list to decide whether to demand-zero or copy-on-write.
+//!
+//! Thread-group support:
+//!   All calls to current_pid() are wrapped as
+//!   thread::vma_pid(current_pid()) so all CLONE_VM threads in a group
+//!   see the same VMA namespace (keyed on the tgid).
 
 extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 use alloc::collections::BTreeMap;
 
-// ── VMA descriptor ────────────────────────────────────────────────────────
+// ── VMA descriptor ─────────────────────────────────────────────────────────
 
 #[derive(Clone, PartialEq)]
 pub enum VmaKind {
@@ -48,7 +53,7 @@ pub struct Vma {
     pub kind:  VmaKind,
 }
 
-// ── Global VMA table (pid → vec of VMAs) ────────────────────────────────
+// ── Global VMA table (tgid/pid → vec of VMAs) ─────────────────────────────
 
 static VMAS: Mutex<BTreeMap<u32, Vec<Vma>>> = Mutex::new(BTreeMap::new());
 
@@ -91,7 +96,7 @@ pub fn clear_vmas(pid: u32) {
     }
 }
 
-// ── mmap ──────────────────────────────────────────────────────────────────
+// ── mmap ──────────────────────────────────────────────────────────────
 
 /// Find a free virtual address region of `size` bytes starting above `hint`.
 fn find_free_region(hint: usize, size: usize, pid: u32) -> usize {
@@ -120,7 +125,7 @@ pub fn sys_mmap(
 ) -> isize {
     if length == 0 { return -22; }
     let size   = (length + 0xFFF) & !0xFFF;
-    let pid    = crate::proc::scheduler::current_pid();
+    let pid    = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
     let va     = if flags & MAP_FIXED != 0 && addr != 0 { addr }
                  else { find_free_region(addr, size, pid) };
 
@@ -174,7 +179,7 @@ pub fn sys_mmap(
 }
 
 fn sys_mmap_memfd(va: usize, size: usize, prot: u32, flags: u32, fd: usize, offset: usize) -> isize {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
     let pages = size / 4096;
     for i in 0..pages {
         match crate::mm::memfd::map_page(fd, offset / 4096 + i) {
@@ -195,7 +200,7 @@ fn sys_mmap_memfd(va: usize, size: usize, prot: u32, flags: u32, fd: usize, offs
 }
 
 fn sys_mmap_dmabuf(va: usize, size: usize, prot: u32, _flags: u32, fd: usize) -> isize {
-    let pid  = crate::proc::scheduler::current_pid();
+    let pid  = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
     let handle = crate::drivers::amdgpu_gem::fd_to_handle(fd).unwrap_or(0);
     if let Some(bo) = crate::drivers::gem::gem_lookup(handle) {
         let pages = size.min(bo.size) / 4096;
@@ -217,7 +222,7 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
     if addr & 0xFFF != 0 { return -22; }
     let size  = (length + 0xFFF) & !0xFFF;
     let pages = size / 4096;
-    let pid   = crate::proc::scheduler::current_pid();
+    let pid   = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
     let cr3   = crate::arch::x86_64::paging::current_cr3();
     for i in 0..pages {
         let va = addr + i * 4096;
@@ -241,8 +246,7 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
 }
 
 pub fn sys_brk(addr: usize) -> isize {
-    // Lazy brk: just return the requested address (demand-zero on fault)
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::thread::vma_pid(crate::proc::scheduler::current_pid());
     static BRK: spin::Mutex<BTreeMap<u32, usize>> = spin::Mutex::new(BTreeMap::new());
     let mut brk = BRK.lock();
     let cur = *brk.entry(pid).or_insert(0x0001_0000_0000usize);
