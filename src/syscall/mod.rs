@@ -4,6 +4,7 @@
 //!
 //! ## Wired syscalls
 //!    NR   7  waitpid           -> proc::wait::sys_waitpid
+//!    NR  12  brk               -> mm::mmap::sys_brk
 //!    NR  13  rt_sigaction      -> proc::signal::sys_rt_sigaction
 //!    NR  14  rt_sigprocmask    -> proc::signal::sys_rt_sigprocmask
 //!    NR  15  rt_sigreturn      -> handled in syscall_rust_entry (frame ptr)
@@ -32,9 +33,10 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
     match nr {
         7   => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
+        12  => crate::mm::mmap::sys_brk(a),
         13  => crate::proc::signal::sys_rt_sigaction(a as u32, b, c, d),
         14  => crate::proc::signal::sys_rt_sigprocmask(a as u32, b, c, d),
-        // NR 15 execve handled in syscall_rust_entry (needs frame ptr)
+        // NR 15 rt_sigreturn handled in syscall_rust_entry (needs frame ptr)
         // NR 59 execve handled in syscall_rust_entry (needs frame ptr)
         60  => crate::proc::exit::sys_exit(a as i32),
         61  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
