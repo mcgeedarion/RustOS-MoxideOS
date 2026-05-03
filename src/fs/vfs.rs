@@ -37,7 +37,6 @@ pub fn lookup(name: &str) -> Option<Vec<u8>> {
 
 /// Create a directory entry in ramfs.
 pub fn mkdir(path: &str, _mode: u32) -> isize {
-    // Check if exists already.
     {
         let ram = RAMFS.lock();
         if ram.iter().any(|f| f.name == path) { return -17; } // EEXIST
@@ -46,7 +45,7 @@ pub fn mkdir(path: &str, _mode: u32) -> isize {
     0
 }
 
-/// Remove a file or empty directory from ramfs (no ext2 write support).
+/// Remove a file or empty directory from ramfs.
 pub fn unlink(path: &str) -> isize {
     let mut ram = RAMFS.lock();
     let before = ram.len();
@@ -74,6 +73,7 @@ pub struct Fd {
     pub pos:      usize,
     backing:      FdBacking,
     write_buf:    Option<Vec<u8>>,
+    pub path:     Option<String>,  // stored for getdents / fd_to_path
 }
 
 const MAX_FDS: usize = 64;
@@ -85,6 +85,13 @@ fn alloc_fd(fd: Fd) -> Option<usize> {
         if tbl[i].is_none() { tbl[i] = Some(fd); return Some(i); }
     }
     None
+}
+
+/// Return the path associated with an open fd (used by getdents).
+pub fn fd_to_path(fdno: usize) -> Option<String> {
+    let tbl = FD_TABLE.lock();
+    let fd = tbl.get(fdno)?.as_ref()?;
+    fd.path.clone()
 }
 
 pub fn open(path: &str, flags: u32) -> Result<usize, i32> {
@@ -112,7 +119,7 @@ pub fn open(path: &str, flags: u32) -> Result<usize, i32> {
         let data = crate::fs::sysfs::read(path).ok_or(-2i32)?;
         let name = alloc::format!("__sys_{}", path);
         create_file(&name, &data);
-        return alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None }).ok_or(-23);
+        return alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None, path: Some(String::from(path)) }).ok_or(-23);
     }
     if path.starts_with("/dev/input/") {
         if let Some(fd) = crate::fs::devfs::open_input(path) { return Ok(fd); }
@@ -122,7 +129,7 @@ pub fn open(path: &str, flags: u32) -> Result<usize, i32> {
             let data = crate::fs::devfs::readdir();
             let name = alloc::string::String::from("__dev_dir");
             create_file(&name, &data);
-            return alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None }).ok_or(-23);
+            return alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None, path: Some(String::from("/dev")) }).ok_or(-23);
         }
         return crate::fs::devfs::open(path).ok_or(-2);
     }
@@ -130,30 +137,31 @@ pub fn open(path: &str, flags: u32) -> Result<usize, i32> {
         let data = crate::fs::procfs::read(path).ok_or(-2i32)?;
         let name = alloc::format!("__proc_{}", path);
         create_file(&name, &data);
-        return alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None }).ok_or(-23);
+        return alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None, path: Some(String::from(path)) }).ok_or(-23);
     }
     let write = flags & (O_WRONLY | O_RDWR) != 0;
     let creat  = flags & O_CREAT != 0;
-    // Try ext2 first.
     if let Some(ino) = crate::fs::ext2::stat(path) {
-        return alloc_fd(Fd { flags, pos: 0, backing: FdBacking::Ext2(ino), write_buf: None }).ok_or(-23);
+        return alloc_fd(Fd { flags, pos: 0, backing: FdBacking::Ext2(ino), write_buf: None, path: Some(String::from(path)) }).ok_or(-23);
     }
     {
         let ram = RAMFS.lock();
         if ram.iter().any(|f| f.name == path) {
             drop(ram);
             let wb = if write { Some(if flags & O_TRUNC != 0 { Vec::new() } else { lookup(path).unwrap_or_default() }) } else { None };
-            return alloc_fd(Fd { flags, pos: 0, backing: FdBacking::Ramfs(String::from(path)), write_buf: wb }).ok_or(-23);
+            return alloc_fd(Fd { flags, pos: 0, backing: FdBacking::Ramfs(String::from(path)), write_buf: wb, path: Some(String::from(path)) }).ok_or(-23);
         }
     }
     if creat {
         create_file(path, &[]);
-        return alloc_fd(Fd { flags, pos: 0, backing: FdBacking::Ramfs(String::from(path)), write_buf: Some(Vec::new()) }).ok_or(-23);
+        return alloc_fd(Fd { flags, pos: 0, backing: FdBacking::Ramfs(String::from(path)), write_buf: Some(Vec::new()), path: Some(String::from(path)) }).ok_or(-23);
     }
     Err(-2)
 }
 
 pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
+    // Check pipe first.
+    if crate::fs::pipe::is_pipe_fd(fdno) { return crate::fs::pipe::pipe_read(fdno, buf); }
     if crate::fs::devfs::get_dev_fd(fdno).is_some() { return crate::fs::devfs::read(fdno, buf); }
     let mut tbl = FD_TABLE.lock();
     let fd = match tbl[fdno].as_mut() { Some(f) => f, None => return -9 };
@@ -173,6 +181,8 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
 }
 
 pub fn write(fdno: usize, buf: &[u8]) -> isize {
+    // Check pipe first.
+    if crate::fs::pipe::is_pipe_fd(fdno) { return crate::fs::pipe::pipe_write(fdno, buf); }
     if crate::fs::devfs::get_dev_fd(fdno).is_some() { return crate::fs::devfs::write(fdno, buf); }
     let mut tbl = FD_TABLE.lock();
     let fd = match tbl[fdno].as_mut() { Some(f) => f, None => return -9 };
@@ -219,6 +229,8 @@ pub fn seek(fdno: usize, offset: i64, whence: i32) -> isize {
 }
 
 pub fn close(fdno: usize) -> isize {
+    // Pipe close.
+    if crate::fs::pipe::pipe_close(fdno) { return 0; }
     if crate::fs::devfs::close_dev_fd(fdno) { return 0; }
     if fdno < 3 { return -9; }
     FD_TABLE.lock()[fdno] = None;
@@ -280,7 +292,6 @@ pub fn stat(path: &str, stat_va: usize) -> isize {
         unsafe { core::ptr::write(stat_va as *mut Stat, s); }
         return 0;
     }
-    // Check ext2 first.
     if let Some(ino) = crate::fs::ext2::stat(path) {
         let size = crate::fs::ext2::file_size(ino).unwrap_or(0) as i64;
         let is_dir = crate::fs::ext2::is_dir(path);
@@ -331,18 +342,25 @@ pub fn truncate(_fd: usize, _size: u64) -> isize { 0 }
 pub fn list_dir(fd: usize) -> Option<alloc::vec::Vec<DirEntry>> {
     let tbl = FD_TABLE.lock();
     let f = tbl.get(fd)?.as_ref()?;
-    match &f.backing {
-        FdBacking::Ramfs(name) => {
-            let prefix = name.clone();
-            let ram = RAMFS.lock();
-            let entries = ram.iter()
-                .filter(|e| e.name.starts_with(&*prefix) && e.name != &*prefix)
-                .map(|e| DirEntry { name: e.name.clone(), is_dir: e.is_dir })
-                .collect();
-            Some(entries)
-        }
-        _ => None,
-    }
+    let path = f.path.clone().unwrap_or_default();
+    drop(tbl);
+    let prefix = if path == "/" {
+        alloc::string::String::new()
+    } else {
+        alloc::format!("{}/", path.trim_end_matches('/'))
+    };
+    let ram = RAMFS.lock();
+    let entries: Vec<DirEntry> = ram.iter()
+        .filter(|e| {
+            if prefix.is_empty() {
+                !e.name.is_empty() && !e.name.starts_with('_')
+            } else {
+                e.name.starts_with(&*prefix) && e.name != path
+            }
+        })
+        .map(|e| DirEntry { name: e.name.clone(), is_dir: e.is_dir })
+        .collect();
+    Some(entries)
 }
 
 pub struct DirEntry { pub name: String, pub is_dir: bool }
@@ -375,12 +393,17 @@ pub fn dup_from(oldfd: usize, min_fd: usize) -> isize {
     -23
 }
 
+/// sys_dup(oldfd) [NR 32] — duplicate to lowest available fd.
+pub fn dup(oldfd: usize) -> isize {
+    dup_from(oldfd, 0)
+}
+
 fn alloc_fd_for_data(data: Vec<u8>) -> usize {
     let name = alloc::format!("__vfs_tmp_{}", crate::time::monotonic_ns());
     {
         let mut ram = RAMFS.lock();
         ram.push(RamfsInode { name: name.clone(), data, is_dir: false });
     }
-    let fd = Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None };
+    let fd = Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None, path: None };
     alloc_fd(fd).unwrap_or(0)
 }
