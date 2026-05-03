@@ -5,6 +5,7 @@ pub mod exec;
 pub mod exit;
 pub mod fork;
 pub mod futex;
+pub mod nanosleep;
 pub mod process;
 pub mod scheduler;
 pub mod signal;

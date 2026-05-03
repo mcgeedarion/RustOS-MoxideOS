@@ -7,15 +7,20 @@
 //!    NR   1  write             -> fs::io_syscalls::sys_write
 //!    NR   2  open              -> fs::io_syscalls::sys_open
 //!    NR   3  close             -> fs::io_syscalls::sys_close
+//!    NR   5  fstat             -> fs::stat_syscalls::sys_fstat
 //!    NR   7  waitpid           -> proc::wait::sys_waitpid
+//!    NR   8  lseek             -> fs::stat_syscalls::sys_lseek
+//!    NR   9  mmap              -> mm::mmap::sys_mmap
 //!    NR  12  brk               -> mm::mmap::sys_brk
 //!    NR  13  rt_sigaction      -> proc::signal::sys_rt_sigaction
 //!    NR  14  rt_sigprocmask    -> proc::signal::sys_rt_sigprocmask
 //!    NR  15  rt_sigreturn      -> handled in syscall_rust_entry (frame ptr)
+//!    NR  35  nanosleep         -> proc::nanosleep::sys_nanosleep
 //!    NR  39  getpid            -> scheduler::current_pid()
 //!    NR  59  execve            -> proc::exec::sys_execve (handled in syscall_rust_entry)
 //!    NR  60  exit              -> proc::exit::sys_exit
 //!    NR  61  wait4             -> proc::wait::sys_waitpid (compat)
+//!    NR  72  fcntl             -> fs::fcntl::sys_fcntl
 //!    NR 110  getppid           -> scheduler::ppid_of(current_pid())
 //!    NR 218  set_tid_address   -> arch::x86_64::syscall::sys_set_tid_address
 //!    NR 231  exit_group        -> proc::exit::sys_exit_group
@@ -42,15 +47,20 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         1   => crate::fs::io_syscalls::sys_write(a, b, c),
         2   => crate::fs::io_syscalls::sys_open(a, b as u32, c as u32),
         3   => crate::fs::io_syscalls::sys_close(a),
+        5   => crate::fs::stat_syscalls::sys_fstat(a, b),
         7   => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
+        8   => crate::fs::stat_syscalls::sys_lseek(a, b as i64, c as i32),
+        9   => crate::mm::mmap::sys_mmap(a, b, c as u32, d as u32, e, f),
         12  => crate::mm::mmap::sys_brk(a),
         13  => crate::proc::signal::sys_rt_sigaction(a as u32, b, c, d),
         14  => crate::proc::signal::sys_rt_sigprocmask(a as u32, b, c, d),
         // NR 15 rt_sigreturn handled in syscall_rust_entry (needs frame ptr)
+        35  => crate::proc::nanosleep::sys_nanosleep(a, b),
         39  => crate::proc::scheduler::current_pid() as isize,
         // NR 59 execve handled in syscall_rust_entry (needs frame ptr)
         60  => crate::proc::exit::sys_exit(a as i32),
         61  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
+        72  => crate::fs::fcntl::sys_fcntl(a, b as i32, c),
         110 => crate::proc::scheduler::ppid_of(crate::proc::scheduler::current_pid()) as isize,
         218 => crate::arch::x86_64::syscall::sys_set_tid_address(a),
         231 => crate::proc::exit::sys_exit_group(a as i32),

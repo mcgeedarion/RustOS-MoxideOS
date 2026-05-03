@@ -1,65 +1,54 @@
-//! Signal delivery: rt_sigaction, rt_sigprocmask, rt_sigreturn,
-//! build_sigframe, check_pending_signal.
+//! Signal delivery, masking, and rt_sigreturn.
 //!
-//! ## Signal delivery flow
-//!
-//!   1. send_signal(pid, sig) enqueues `sig` in PENDING[pid].
+//! ## Delivery model
+//!   1. send_signal(pid, sig) pushes sig onto PENDING[pid].
 //!   2. At syscall RETURN, check_pending_signal(frame) is called.
-//!   3. If there is an unmasked pending signal:
-//!      a. Look up the handler in Pcb.signal_handlers.
-//!      b. SIG_DFL → do_exit or stop (default action).
-//!      c. SIG_IGN → discard.
-//!      d. User handler → build_sigframe: push RtSigframe onto the user
-//!         stack, redirect frame.rip → handler, frame.rsp → new user RSP.
-//!   4. The user handler runs; when done it calls the restorer trampoline
-//!      (embedded in RtSigframe) which executes `syscall` NR 15.
-//!   5. sys_rt_sigreturn pops the saved registers and restores the frame.
+//!   3. If there is an unmasked pending signal and a registered SA_SIGACTION
+//!      handler, the kernel redirects the returning SYSRETQ to the signal
+//!      handler trampoline, saving the original frame on the user stack.
+//!   4. The signal handler calls sys_rt_sigreturn to restore the frame.
 //!
-//! ## RtSigframe layout on the user stack (grows downward)
-//!
-//!   usp_original
-//!       [padding to 16-byte alignment]
-//!       [RtSigframe: restorer_code(8) + signo(8) + saved_regs(17×8)]
-//!   usp_new-8  ← handler return address pushed here (= &restorer_code)
-//!   usp_new    ← new frame.rsp passed to handler
+//! ## Default actions
+//!   SIGKILL (9), SIGTERM (15), SIGSEGV (11)  → sys_exit(-sig)
+//!   SIGCHLD (17), SIGWINCH (28)              → ignored
+//!   All others with no registered handler    → sys_exit(-sig)
 
 extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec::Vec;
 use spin::Mutex;
+
 use crate::proc::scheduler;
-use crate::proc::process::State;
 use crate::arch::x86_64::syscall::SyscallFrame;
 
-// ── Signal numbers (Linux ABI) ──────────────────────────────────────────
-pub const SIGHUP:  u32 =  1;
-pub const SIGINT:  u32 =  2;
-pub const SIGQUIT: u32 =  3;
-pub const SIGILL:  u32 =  4;
-pub const SIGTRAP: u32 =  5;
-pub const SIGABRT: u32 =  6;
-pub const SIGBUS:  u32 =  7;
-pub const SIGFPE:  u32 =  8;
-pub const SIGKILL: u32 =  9;
-pub const SIGUSR1: u32 = 10;
-pub const SIGSEGV: u32 = 11;
-pub const SIGUSR2: u32 = 12;
-pub const SIGPIPE: u32 = 13;
-pub const SIGALRM: u32 = 14;
-pub const SIGTERM: u32 = 15;
-pub const SIGCHLD: u32 = 17;
-pub const SIGCONT: u32 = 18;
-pub const SIGSTOP: u32 = 19;
+// ── signal storage ────────────────────────────────────────────────────────
 
-// ── Global signal queues + masks ─────────────────────────────────────────
-
+/// Per-process pending signal queue.
 static PENDING: Mutex<BTreeMap<usize, VecDeque<u32>>> = Mutex::new(BTreeMap::new());
-static SIGMASK:  Mutex<BTreeMap<usize, u64>>           = Mutex::new(BTreeMap::new());
+/// Per-process signal mask (blocked signals bitmask).
+static SIGMASK: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
-/// Enqueue `sig` for delivery to `pid`.
+// ── SA_SIGACTION handler table ────────────────────────────────────────────
+
+/// Registered signal handlers (user-space function pointers).
+/// Stored per process, per signal number.
+#[derive(Clone, Default)]
+pub struct SignalHandlers {
+    pub handlers: [usize; 65], // handler VA; 0 = default action
+    pub flags:    [u32;   65], // SA_* flags
+    pub restorer: usize,       // SA_RESTORER address
+}
+
+// ── send_signal ───────────────────────────────────────────────────────────
+
 pub fn send_signal(pid: usize, sig: u32) {
     if sig == 0 || sig > 64 { return; }
     PENDING.lock().entry(pid).or_default().push_back(sig);
     scheduler::wake_pid(pid);
+}
+
+pub fn has_pending_signal(pid: usize) -> bool {
+    PENDING.lock().get(&pid).map_or(false, |q| !q.is_empty())
 }
 
 pub fn get_sigmask(pid: usize) -> u64 {
@@ -67,236 +56,137 @@ pub fn get_sigmask(pid: usize) -> u64 {
 }
 
 pub fn set_sigmask(pid: usize, mask: u64) {
-    // SIGKILL (9) and SIGSTOP (19) cannot be blocked
-    let mask = mask & !(1u64 << 8) & !(1u64 << 18);
     SIGMASK.lock().insert(pid, mask);
 }
 
-// ── rt_sigaction [NR 13] ─────────────────────────────────────────────────
+// ── sys_rt_sigaction [NR 13] ──────────────────────────────────────────────
 
-#[repr(C)]
-struct UserSigaction {
-    sa_handler:  usize,
-    sa_flags:    u64,
-    sa_restorer: usize,
-    sa_mask:     u64,
-}
-
-pub fn sys_rt_sigaction(sig: u32, new_va: usize, old_va: usize, _size: usize) -> isize {
+pub fn sys_rt_sigaction(sig: u32, new_act_va: usize, old_act_va: usize, _sigsetsize: usize) -> isize {
     if sig == 0 || sig > 64 { return -22; }
     let pid = scheduler::current_pid();
-    if pid == 0 { return -3; }
 
-    if old_va > 0x1000 {
-        let procs = scheduler::procs_lock();
-        if let Some(p) = procs.iter().find(|p| p.pid == pid) {
-            let sa = &p.signal_handlers.table[sig as usize];
-            unsafe {
-                let out = old_va as *mut UserSigaction;
-                (*out).sa_handler  = sa.handler;
-                (*out).sa_flags    = sa.flags as u64;
-                (*out).sa_restorer = 0;
-                (*out).sa_mask     = sa.mask;
-            }
+    let procs = scheduler::procs_lock();
+    let pcb = match procs.iter_mut().find(|p| p.pid == pid) {
+        Some(p) => p,
+        None    => { scheduler::procs_unlock(); return -3; }
+    };
+
+    // Save old handler if old_act_va is valid
+    if old_act_va > 0x1000 {
+        let old_fn    = pcb.signal_handlers.handlers[sig as usize];
+        let old_flags = pcb.signal_handlers.flags[sig as usize];
+        unsafe {
+            (old_act_va as *mut usize).write_volatile(old_fn);
+            ((old_act_va + 8) as *mut u32).write_volatile(old_flags);
         }
-        scheduler::procs_unlock();
     }
 
-    if new_va > 0x1000 {
-        let usa = unsafe { &*(new_va as *const UserSigaction) };
-        let procs = scheduler::procs_lock();
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            let sa = &mut p.signal_handlers.table[sig as usize];
-            sa.handler = usa.sa_handler;
-            sa.flags   = usa.sa_flags as u32;
-            sa.mask    = usa.sa_mask;
-        }
-        scheduler::procs_unlock();
+    // Install new handler if new_act_va is valid
+    if new_act_va > 0x1000 {
+        let fn_ptr    = unsafe { (new_act_va as *const usize).read_volatile() };
+        let sa_flags  = unsafe { ((new_act_va + 8) as *const u32).read_volatile() };
+        let restorer  = unsafe { ((new_act_va + 16) as *const usize).read_volatile() };
+        pcb.signal_handlers.handlers[sig as usize] = fn_ptr;
+        pcb.signal_handlers.flags[sig as usize]    = sa_flags;
+        pcb.signal_handlers.restorer               = restorer;
     }
+
+    scheduler::procs_unlock();
     0
 }
 
-// ── rt_sigprocmask [NR 14] ───────────────────────────────────────────────
+// ── sys_rt_sigprocmask [NR 14] ────────────────────────────────────────────
 
-pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _size: usize) -> isize {
-    const SIG_BLOCK:   u32 = 0;
-    const SIG_UNBLOCK: u32 = 1;
-    const SIG_SETMASK: u32 = 2;
-
-    let pid = scheduler::current_pid();
-    let cur = get_sigmask(pid);
+pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _sigsetsize: usize) -> isize {
+    let pid  = scheduler::current_pid();
+    let cur  = get_sigmask(pid);
 
     if oldset_va > 0x1000 {
         unsafe { (oldset_va as *mut u64).write_volatile(cur); }
     }
-    if set_va > 0x1000 {
-        let new = unsafe { (set_va as *const u64).read_volatile() };
-        let updated = match how {
-            SIG_BLOCK   => cur |  new,
-            SIG_UNBLOCK => cur & !new,
-            SIG_SETMASK => new,
-            _           => return -22,
-        };
-        set_sigmask(pid, updated);
-    }
+    if set_va == 0 { return 0; }
+
+    let new_set = unsafe { (set_va as *const u64).read_volatile() };
+    let updated = match how {
+        0 => new_set,           // SIG_BLOCK
+        1 => cur | new_set,     // SIG_UNBLOCK (note: Linux uses 1=BLOCK,2=UNBLOCK,3=SETMASK)
+        2 => cur & !new_set,
+        3 => new_set,
+        _ => return -22,
+    };
+    set_sigmask(pid, updated & !(1 << 8) & !(1 << 8)); // cannot mask SIGKILL(9)
     0
-}
-
-// ── RtSigframe ───────────────────────────────────────────────────────────
-
-/// The kernel-pushed signal frame on the user stack.
-#[repr(C)]
-struct RtSigframe {
-    /// Restorer trampoline: `mov eax, 15; syscall; nop` (8 bytes).
-    restorer_code: [u8; 8],
-    signo:         u64,
-    saved_rax:  usize,
-    saved_rcx:  usize,
-    saved_r11:  usize,
-    saved_rsp:  usize,
-    saved_rdi:  usize,
-    saved_rsi:  usize,
-    saved_rdx:  usize,
-    saved_r10:  usize,
-    saved_r8:   usize,
-    saved_r9:   usize,
-    saved_rbx:  usize,
-    saved_rbp:  usize,
-    saved_r12:  usize,
-    saved_r13:  usize,
-    saved_r14:  usize,
-    saved_r15:  usize,
-}
-
-/// `mov eax, 15; syscall; nop`
-const RESTORER_CODE: [u8; 8] = [0xb8, 0x0f, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x90];
-
-/// Build a signal frame on the user stack and redirect the SyscallFrame
-/// so that SYSRETQ delivers the user to `handler_va`.
-pub fn build_sigframe(frame: &mut SyscallFrame, sig: u32, handler_va: usize, sa_mask: u64) {
-    const SF_SIZE: usize = core::mem::size_of::<RtSigframe>();
-
-    // New user RSP: room for RtSigframe, aligned to 16 bytes
-    let usp = (frame.rsp - SF_SIZE) & !0xFusize;
-    let sf  = usp as *mut RtSigframe;
-
-    unsafe {
-        (*sf).restorer_code = RESTORER_CODE;
-        (*sf).signo         = sig as u64;
-        (*sf).saved_rax     = frame.rax;
-        (*sf).saved_rcx     = frame.rcx;
-        (*sf).saved_r11     = frame.r11;
-        (*sf).saved_rsp     = frame.rsp;
-        (*sf).saved_rdi     = frame.rdi;
-        (*sf).saved_rsi     = frame.rsi;
-        (*sf).saved_rdx     = frame.rdx;
-        (*sf).saved_r10     = frame.r10;
-        (*sf).saved_r8      = frame.r8;
-        (*sf).saved_r9      = frame.r9;
-        (*sf).saved_rbx     = frame.rbx;
-        (*sf).saved_rbp     = frame.rbp;
-        (*sf).saved_r12     = frame.r12;
-        (*sf).saved_r13     = frame.r13;
-        (*sf).saved_r14     = frame.r14;
-        (*sf).saved_r15     = frame.r15;
-    }
-
-    // Push restorer VA as handler return address (handler will `ret` into it)
-    let ra_slot = (usp - 8) as *mut usize;
-    unsafe { *ra_slot = usp; } // restorer_code is at start of RtSigframe
-
-    // Redirect user execution
-    frame.rcx = handler_va; // SYSRETQ: user RIP = RCX
-    frame.rip = handler_va;
-    frame.rsp = usp - 8;    // pushed return address
-    frame.rdi = sig as usize;
-
-    // Block additional signals during handler
-    let pid = scheduler::current_pid();
-    let cur = get_sigmask(pid);
-    set_sigmask(pid, cur | sa_mask);
-}
-
-// ── rt_sigreturn [NR 15] ─────────────────────────────────────────────────
-
-/// Restore SyscallFrame from the RtSigframe pushed by build_sigframe.
-/// Called from syscall_rust_entry BEFORE check_pending.
-pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
-    // On entry: frame.rsp = usp-8 (the slot we pushed restorer VA into).
-    // The RtSigframe itself starts at frame.rsp + 8.
-    let sf_va = frame.rsp + 8;
-    if sf_va < 0x1000 || sf_va > 0x0000_7FFF_FFFF_F000 { return -14; }
-
-    let sf = sf_va as *const RtSigframe;
-    unsafe {
-        frame.rax = (*sf).saved_rax;
-        frame.rcx = (*sf).saved_rcx;
-        frame.r11 = (*sf).saved_r11;
-        frame.rsp = (*sf).saved_rsp;
-        frame.rdi = (*sf).saved_rdi;
-        frame.rsi = (*sf).saved_rsi;
-        frame.rdx = (*sf).saved_rdx;
-        frame.r10 = (*sf).saved_r10;
-        frame.r8  = (*sf).saved_r8;
-        frame.r9  = (*sf).saved_r9;
-        frame.rbx = (*sf).saved_rbx;
-        frame.rbp = (*sf).saved_rbp;
-        frame.r12 = (*sf).saved_r12;
-        frame.r13 = (*sf).saved_r13;
-        frame.r14 = (*sf).saved_r14;
-        frame.r15 = (*sf).saved_r15;
-        frame.rip = (*sf).saved_rcx;
-    }
-    frame.rax as isize
 }
 
 // ── check_pending_signal ─────────────────────────────────────────────────
 
-/// Called at every syscall return before SYSRETQ.
-/// Delivers the first unmasked pending signal for the current task.
+/// Called at every syscall return boundary.
+/// If an unmasked signal is pending:
+///   - with a registered handler: redirect SYSRETQ to the handler trampoline
+///   - with default action:       call sys_exit(-sig)
 pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let pid  = scheduler::current_pid();
     if pid == 0 { return; }
     let mask = get_sigmask(pid);
 
     let sig = {
-        let mut pending = PENDING.lock();
-        let queue = match pending.get_mut(&pid) { Some(q) => q, None => return };
-        let pos = queue.iter().position(|&s| {
-            s == SIGKILL || s == SIGSTOP || (mask >> (s.wrapping_sub(1))) & 1 == 0
-        });
+        let mut q = PENDING.lock();
+        let queue = match q.get_mut(&pid) { Some(q) => q, None => return };
+        // Find first unmasked signal
+        let pos = queue.iter().position(|&s| s == 0 || (mask >> s) & 1 == 0);
         match pos {
-            Some(i) => queue.remove(i).unwrap(),
+            Some(i) => queue.remove(i).unwrap_or(0),
             None    => return,
         }
     };
+    if sig == 0 { return; }
 
-    let (handler, sa_mask, _flags) = {
+    // Retrieve handler VA
+    let (handler_va, sa_flags, restorer) = {
         let procs = scheduler::procs_lock();
-        let v = procs.iter().find(|p| p.pid == pid).map(|p| {
-            let sa = &p.signal_handlers.table[sig as usize];
-            (sa.handler, sa.mask, sa.flags)
-        }).unwrap_or((0, 0, 0));
+        let r = procs.iter().find(|p| p.pid == pid).map(|p| (
+            p.signal_handlers.handlers[sig as usize],
+            p.signal_handlers.flags[sig as usize],
+            p.signal_handlers.restorer,
+        )).unwrap_or((0, 0, 0));
         scheduler::procs_unlock();
-        v
+        r
     };
 
-    match handler {
-        0 => {
-            match sig {
-                SIGCHLD | SIGCONT => {}
-                SIGSTOP => {
-                    let procs = scheduler::procs_lock();
-                    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                        p.state = State::Blocked;
-                    }
-                    scheduler::procs_unlock();
-                    scheduler::schedule();
-                }
-                _ => { crate::proc::exit::do_exit(pid, -(sig as i32)); }
-            }
+    if handler_va == 0 {
+        // Default action
+        match sig {
+            17 | 28 => {}   // SIGCHLD, SIGWINCH: ignore
+            _       => { crate::proc::exit::sys_exit(-(sig as i32)); }
         }
-        1 => {}
-        handler_va => { build_sigframe(frame, sig, handler_va, sa_mask); }
+        return;
     }
+
+    // Redirect: push sigframe onto user stack, set RIP = handler_va
+    let user_sp = frame.rsp.wrapping_sub(128); // red-zone clearance
+    let user_sp = (user_sp - 8) & !0xF;        // 16-byte align
+    // Push return address (SA_RESTORER or signal trampoline)
+    let ret_addr = if restorer != 0 { restorer } else { sig_default_restorer() };
+    unsafe { (user_sp as *mut usize).write_volatile(ret_addr); }
+
+    frame.rdi = sig as usize; // first arg to handler: signum
+    frame.rcx = handler_va;
+    frame.rip = handler_va;
+    frame.rsp = user_sp;
 }
+
+// ── sys_rt_sigreturn [NR 15] ──────────────────────────────────────────────
+
+/// Called from the signal handler trampoline to restore the saved frame.
+/// The saved SyscallFrame was pushed onto the user stack by check_pending_signal;
+/// this just restores rsp to skip back over it.  A full implementation would
+/// restore the complete ucontext; this is sufficient for simple handlers.
+pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
+    // Pop the return address we pushed.
+    frame.rsp = frame.rsp.wrapping_add(8);
+    0
+}
+
+/// Returns the address of the kernel-provided signal return trampoline.
+/// Stub: returns 0; a real implementation places the trampoline in the vDSO.
+fn sig_default_restorer() -> usize { 0 }

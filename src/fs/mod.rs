@@ -9,6 +9,7 @@ pub mod mount;
 pub mod pidfd;
 pub mod procfs;
 pub mod ramfs;
+pub mod stat_syscalls;
 pub mod sysfs;
 pub mod vfs;
 pub mod vfs_ops;
