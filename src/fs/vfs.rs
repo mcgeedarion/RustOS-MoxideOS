@@ -1,14 +1,4 @@
 //! Virtual filesystem — file descriptor table + multi-backend dispatch.
-//!
-//! Backends (tried in order on open):
-//!   1. Ext2 image mounted by `ext2::mount()`
-//!   2. In-memory ramfs (initramfs + runtime-created files)
-//!
-//! File descriptor table:
-//!   FDs 0/1/2 are reserved (stdin/stdout/stderr — console I/O).
-//!   FDs 3..MAX_FDS are heap-allocated per-process.
-//!   The table lives in kernel global space for now; a production kernel
-//!   would move it into the PCB.
 
 extern crate alloc;
 use alloc::{string::String, vec::Vec};
@@ -24,33 +14,25 @@ static RAMFS: Mutex<Vec<RamfsInode>> = Mutex::new(Vec::new());
 
 pub fn create_file(name: &str, data: &[u8]) {
     let mut ram = RAMFS.lock();
-    if let Some(f) = ram.iter_mut().find(|f| f.name == name) {
-        f.data = data.to_vec();
-    } else {
-        ram.push(RamfsInode { name: String::from(name), data: data.to_vec(), is_dir: false });
-    }
+    if let Some(f) = ram.iter_mut().find(|f| f.name == name) { f.data = data.to_vec(); }
+    else { ram.push(RamfsInode { name: String::from(name), data: data.to_vec(), is_dir: false }); }
 }
 
 pub fn lookup(name: &str) -> Option<Vec<u8>> {
     RAMFS.lock().iter().find(|f| f.name == name).map(|f| f.data.clone())
 }
 
-/// Create a directory entry in ramfs.
 pub fn mkdir(path: &str, _mode: u32) -> isize {
-    {
-        let ram = RAMFS.lock();
-        if ram.iter().any(|f| f.name == path) { return -17; } // EEXIST
-    }
+    { let ram = RAMFS.lock(); if ram.iter().any(|f| f.name == path) { return -17; } }
     RAMFS.lock().push(RamfsInode { name: String::from(path), data: Vec::new(), is_dir: true });
     0
 }
 
-/// Remove a file or empty directory from ramfs.
 pub fn unlink(path: &str) -> isize {
     let mut ram = RAMFS.lock();
     let before = ram.len();
     ram.retain(|f| f.name != path);
-    if ram.len() < before { 0 } else { -2 } // ENOENT
+    if ram.len() < before { 0 } else { -2 }
 }
 
 pub const O_RDONLY: u32 = 0;
@@ -73,7 +55,7 @@ pub struct Fd {
     pub pos:      usize,
     backing:      FdBacking,
     write_buf:    Option<Vec<u8>>,
-    pub path:     Option<String>,  // stored for getdents / fd_to_path
+    pub path:     Option<String>,
 }
 
 const MAX_FDS: usize = 64;
@@ -81,13 +63,15 @@ static FD_TABLE: Mutex<[Option<Fd>; MAX_FDS]> = Mutex::new([const { None }; MAX_
 
 fn alloc_fd(fd: Fd) -> Option<usize> {
     let mut tbl = FD_TABLE.lock();
-    for i in 3..MAX_FDS {
-        if tbl[i].is_none() { tbl[i] = Some(fd); return Some(i); }
-    }
+    for i in 3..MAX_FDS { if tbl[i].is_none() { tbl[i] = Some(fd); return Some(i); } }
     None
 }
 
-/// Return the path associated with an open fd (used by getdents).
+pub fn fd_exists(fdno: usize) -> bool {
+    if fdno >= MAX_FDS { return false; }
+    FD_TABLE.lock()[fdno].is_some()
+}
+
 pub fn fd_to_path(fdno: usize) -> Option<String> {
     let tbl = FD_TABLE.lock();
     let fd = tbl.get(fdno)?.as_ref()?;
@@ -160,8 +144,7 @@ pub fn open(path: &str, flags: u32) -> Result<usize, i32> {
 }
 
 pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
-    // Check pipe first.
-    if crate::fs::pipe::is_pipe_fd(fdno) { return crate::fs::pipe::pipe_read(fdno, buf); }
+    if crate::fs::pipe::is_pipe_fd(fdno)  { return crate::fs::pipe::pipe_read(fdno, buf); }
     if crate::fs::devfs::get_dev_fd(fdno).is_some() { return crate::fs::devfs::read(fdno, buf); }
     let mut tbl = FD_TABLE.lock();
     let fd = match tbl[fdno].as_mut() { Some(f) => f, None => return -9 };
@@ -171,7 +154,7 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
             match RAMFS.lock().iter().find(|f| f.name == *name) { Some(f) => f.data.clone(), None => return -2 }
         }
         FdBacking::Ext2(ino) => match crate::fs::ext2::read_file_by_ino(*ino) { Some(d) => d, None => return -5 },
-        FdBacking::Pipe(p) => p.lock().clone(),
+        FdBacking::Pipe(p)   => p.lock().clone(),
     };
     let available = data.len().saturating_sub(fd.pos);
     let n = buf.len().min(available);
@@ -181,7 +164,6 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
 }
 
 pub fn write(fdno: usize, buf: &[u8]) -> isize {
-    // Check pipe first.
     if crate::fs::pipe::is_pipe_fd(fdno) { return crate::fs::pipe::pipe_write(fdno, buf); }
     if crate::fs::devfs::get_dev_fd(fdno).is_some() { return crate::fs::devfs::write(fdno, buf); }
     let mut tbl = FD_TABLE.lock();
@@ -229,8 +211,8 @@ pub fn seek(fdno: usize, offset: i64, whence: i32) -> isize {
 }
 
 pub fn close(fdno: usize) -> isize {
-    // Pipe close.
-    if crate::fs::pipe::pipe_close(fdno) { return 0; }
+    if crate::fs::pipe::pipe_close(fdno)   { return 0; }
+    if crate::fs::poll::epoll_close(fdno)  { return 0; }
     if crate::fs::devfs::close_dev_fd(fdno) { return 0; }
     if fdno < 3 { return -9; }
     FD_TABLE.lock()[fdno] = None;
@@ -263,25 +245,11 @@ pub fn access(path: &str, _mode: u32) -> isize {
     match open(path, O_RDONLY) { Ok(fd) => { close(fd); 0 } Err(e) => e as isize }
 }
 
-// ── stat ────────────────────────────────────────────────────────────────
-
 #[repr(C)]
 struct Stat {
-    st_dev:     u64,
-    st_ino:     u64,
-    st_nlink:   u64,
-    st_mode:    u32,
-    st_uid:     u32,
-    st_gid:     u32,
-    _pad0:      u32,
-    st_rdev:    u64,
-    st_size:    i64,
-    st_blksize: i64,
-    st_blocks:  i64,
-    st_atim:    [u64; 2],
-    st_mtim:    [u64; 2],
-    st_ctim:    [u64; 2],
-    _unused:    [i64; 3],
+    st_dev: u64, st_ino: u64, st_nlink: u64, st_mode: u32, st_uid: u32, st_gid: u32,
+    _pad0: u32, st_rdev: u64, st_size: i64, st_blksize: i64, st_blocks: i64,
+    st_atim: [u64; 2], st_mtim: [u64; 2], st_ctim: [u64; 2], _unused: [i64; 3],
 }
 
 pub fn stat(path: &str, stat_va: usize) -> isize {
@@ -305,7 +273,7 @@ pub fn stat(path: &str, stat_va: usize) -> isize {
     match open(path, O_RDONLY) {
         Ok(fd) => {
             let size = fstat(fd).unwrap_or(0) as i64;
-            let is_dir = { let ram = RAMFS.lock(); ram.iter().find(|f| f.name == path).map_or(false, |f| f.is_dir) };
+            let is_dir = { RAMFS.lock().iter().find(|f| f.name == path).map_or(false, |f| f.is_dir) };
             let mode: u32 = if is_dir { 0o040755 } else { 0o100644 };
             let s = Stat { st_dev: 2, st_ino: fd as u64, st_nlink: 1, st_mode: mode, st_uid: 0, st_gid: 0, _pad0: 0,
                 st_rdev: 0, st_size: size, st_blksize: 4096, st_blocks: (size + 511) / 512,
@@ -327,9 +295,7 @@ pub fn stat_path(path: &str) -> Option<(u64, bool, u64)> {
     ram.iter().find(|f| f.name == path).map(|f| (f.data.len() as u64, f.is_dir, 0u64))
 }
 
-pub fn stat_path_legacy(path: &str) -> Option<u64> {
-    stat_path(path).map(|(s, _, _)| s)
-}
+pub fn stat_path_legacy(path: &str) -> Option<u64> { stat_path(path).map(|(s, _, _)| s) }
 
 pub fn inotify_notify(_path: &str, _mask: u32, _name: Option<&str>) {}
 
@@ -344,19 +310,14 @@ pub fn list_dir(fd: usize) -> Option<alloc::vec::Vec<DirEntry>> {
     let f = tbl.get(fd)?.as_ref()?;
     let path = f.path.clone().unwrap_or_default();
     drop(tbl);
-    let prefix = if path == "/" {
-        alloc::string::String::new()
-    } else {
+    let prefix = if path == "/" { alloc::string::String::new() } else {
         alloc::format!("{}/", path.trim_end_matches('/'))
     };
     let ram = RAMFS.lock();
     let entries: Vec<DirEntry> = ram.iter()
         .filter(|e| {
-            if prefix.is_empty() {
-                !e.name.is_empty() && !e.name.starts_with('_')
-            } else {
-                e.name.starts_with(&*prefix) && e.name != path
-            }
+            if prefix.is_empty() { !e.name.is_empty() && !e.name.starts_with('_') }
+            else { e.name.starts_with(&*prefix) && e.name != path }
         })
         .map(|e| DirEntry { name: e.name.clone(), is_dir: e.is_dir })
         .collect();
@@ -365,12 +326,11 @@ pub fn list_dir(fd: usize) -> Option<alloc::vec::Vec<DirEntry>> {
 
 pub struct DirEntry { pub name: String, pub is_dir: bool }
 
-pub fn readlink_fd(n: usize) -> Option<alloc::string::String> { None }
+pub fn readlink_fd(_n: usize) -> Option<alloc::string::String> { None }
 
 pub fn is_dir(path: &str) -> bool {
     if crate::fs::ext2::is_dir(path) { return true; }
-    let ram = RAMFS.lock();
-    ram.iter().any(|f| f.name == path && f.is_dir)
+    RAMFS.lock().iter().any(|f| f.name == path && f.is_dir)
 }
 
 pub fn dup_as(oldfd: usize, newfd: usize) -> isize {
@@ -393,17 +353,10 @@ pub fn dup_from(oldfd: usize, min_fd: usize) -> isize {
     -23
 }
 
-/// sys_dup(oldfd) [NR 32] — duplicate to lowest available fd.
-pub fn dup(oldfd: usize) -> isize {
-    dup_from(oldfd, 0)
-}
+pub fn dup(oldfd: usize) -> isize { dup_from(oldfd, 0) }
 
 fn alloc_fd_for_data(data: Vec<u8>) -> usize {
     let name = alloc::format!("__vfs_tmp_{}", crate::time::monotonic_ns());
-    {
-        let mut ram = RAMFS.lock();
-        ram.push(RamfsInode { name: name.clone(), data, is_dir: false });
-    }
-    let fd = Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None, path: None };
-    alloc_fd(fd).unwrap_or(0)
+    { RAMFS.lock().push(RamfsInode { name: name.clone(), data, is_dir: false }); }
+    alloc_fd(Fd { flags: O_RDONLY, pos: 0, backing: FdBacking::Ramfs(name), write_buf: None, path: None }).unwrap_or(0)
 }
