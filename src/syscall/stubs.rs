@@ -11,8 +11,12 @@ use crate::arch::{Arch, api::{Paging, PageFlags}};
 
 // ── NR 18  pwrite64 ──────────────────────────────────────────────────────────────
 
+// Cap at 4 MiB to prevent unbounded kernel heap allocation from one syscall.
+const PWRITE_MAX: usize = 4 * 1024 * 1024;
+
 fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
+    let count = count.min(PWRITE_MAX);
     let mut buf = alloc::vec![0u8; count];
     if copy_from_user(&mut buf, buf_va).is_err() { return -14; }
     let old = crate::fs::vfs::seek(fd, 0, crate::fs::vfs::SEEK_CUR) as i64;
@@ -22,33 +26,72 @@ fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isi
     n
 }
 
-// ── NR 19  readv ──────────────────────────────────────────────────────────────────
+// ── NR 19  readv ────────────────────────────────────────────────────────────────
+
+// Small iovecs fit on the stack; larger ones get a single heap Vec that is
+// grown once to the maximum iov length and reused across iterations.
+const IOV_STACK_BUF: usize = 4096;
 
 fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     if iovcnt == 0 { return 0; }
-    if iovcnt > 1024 { return -22; } // EINVAL
-    // Validate the entire iovec array before touching any element.
+    if iovcnt > 1024 { return -22; }
     if !crate::uaccess::validate_user_ptr(iov_va, iovcnt * 16) { return -14; }
+
+    // Single heap allocation sized to the largest iov_len in the array,
+    // capped at 64 KiB per scatter element to bound worst-case alloc.
+    const IOV_MAX_LEN: usize = 64 * 1024;
+
+    // Scan the iovec array once to find the max len, then allocate once.
+    let mut max_len: usize = 0;
+    for i in 0..iovcnt {
+        let mut iov_buf = [0u8; 16];
+        if copy_from_user(&mut iov_buf, iov_va + i * 16).is_err() { return -14; }
+        let len = usize::from_le_bytes(iov_buf[8..16].try_into().unwrap());
+        if len > max_len { max_len = len; }
+    }
+    let max_len = max_len.min(IOV_MAX_LEN);
+
+    // Use a stack array for small iovecs, heap Vec for large ones.
+    let mut stack_buf = [0u8; IOV_STACK_BUF];
+    let mut heap_buf: alloc::vec::Vec<u8> = if max_len > IOV_STACK_BUF {
+        alloc::vec![0u8; max_len]
+    } else {
+        alloc::vec::Vec::new()
+    };
+
     let mut total: isize = 0;
     for i in 0..iovcnt {
-        // Copy one iovec {base: usize, len: usize} from user.
         let mut iov_buf = [0u8; 16];
         if copy_from_user(&mut iov_buf, iov_va + i * 16).is_err() { return -14; }
         let base = usize::from_le_bytes(iov_buf[0..8].try_into().unwrap());
         let len  = usize::from_le_bytes(iov_buf[8..16].try_into().unwrap());
         if len == 0 { continue; }
-        let mut buf = alloc::vec![0u8; len];
-        let n = crate::fs::vfs::read(fd, &mut buf);
+        let capped = len.min(IOV_MAX_LEN);
+
+        let n = if capped <= IOV_STACK_BUF {
+            let buf = &mut stack_buf[..capped];
+            let n = crate::fs::vfs::read(fd, buf);
+            if n > 0 {
+                if copy_to_user(base, &buf[..n as usize]).is_err() { return -14; }
+            }
+            n
+        } else {
+            let buf = &mut heap_buf[..capped];
+            let n = crate::fs::vfs::read(fd, buf);
+            if n > 0 {
+                if copy_to_user(base, &buf[..n as usize]).is_err() { return -14; }
+            }
+            n
+        };
+
         if n <= 0 { return if total > 0 { total } else { n }; }
-        // Write bytes read back to user iov buffer.
-        if copy_to_user(base, &buf[..n as usize]).is_err() { return -14; }
         total += n;
-        if (n as usize) < len { break; }
+        if (n as usize) < capped { break; }
     }
     total
 }
 
-// ── NR 24  sched_yield ──────────────────────────────────────────────────────────
+// ── NR 24  sched_yield ───────────────────────────────────────────────────────
 
 fn sys_sched_yield_impl() -> isize {
     crate::proc::scheduler::schedule();
@@ -72,10 +115,7 @@ fn sys_mremap_impl(old_addr: usize, old_size: usize, new_size: usize,
         return old_addr as isize;
     }
 
-    // Get current process CR3 via the Paging trait.
-    let cr3 = crate::proc::scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-    });
+    let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if cr3 == 0 { return -12; }
 
     let extend_start = old_addr + old_pages * PAGE;
@@ -112,9 +152,7 @@ fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
     const PAGE: usize = 4096;
     if advice == MADV_DONTNEED {
         let pid = crate::proc::scheduler::current_pid();
-        let cr3 = crate::proc::scheduler::with_procs(|procs| {
-            procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-        });
+        let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
         if cr3 == 0 { return 0; }
         let aligned = addr & !(PAGE - 1);
         let end     = (addr + length + PAGE - 1) & !(PAGE - 1);
@@ -166,7 +204,7 @@ fn sys_vfork_impl() -> isize {
     crate::proc::fork_syscall::sys_fork()
 }
 
-// ── NR 62  kill ───────────────────────────────────────────────────────────────
+// ── NR 62  kill ────────────────────────────────────────────────────────────────
 
 fn sys_kill_impl(pid: isize, sig: u32) -> isize {
     if sig == 0 { return 0; }
@@ -182,10 +220,9 @@ fn sys_kill_impl(pid: isize, sig: u32) -> isize {
     0
 }
 
-// ── NR 63  uname ──────────────────────────────────────────────────────────────
+// ── NR 63  uname ───────────────────────────────────────────────────────────────
 
 fn sys_uname_impl(buf_va: usize) -> isize {
-    // struct utsname: 6 fields × 65 bytes = 390 bytes.
     let mut kbuf = [0u8; 390];
     fn fill(kbuf: &mut [u8; 390], field: usize, s: &[u8]) {
         let off = field * 65;
@@ -248,7 +285,7 @@ fn sys_creat_impl(path_va: usize, _mode: u32) -> isize {
     }
 }
 
-// ── NR 86/88/89  link / symlink / readlink ───────────────────────────────────
+// ── NR 86/88/89  link / symlink / readlink ───────────────────────────────────────
 
 fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
     let old = match read_cstr_safe(old_va) { Some(s) => s, None => return -14 };
@@ -297,7 +334,7 @@ fn sys_umask_impl(mask: u32) -> isize {
     UMASK.swap(mask & 0o777, Ordering::Relaxed) as isize
 }
 
-// ── NR 96  gettimeofday ─────────────────────────────────────────────────────────
+// ── NR 96  gettimeofday ──────────────────────────────────────────────────────────
 
 fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     if tv_va == 0 { return 0; }
@@ -311,7 +348,7 @@ fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     0
 }
 
-// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ───────────────────────────
+// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ─────────────────────────────
 
 const RLIMIT_STACK:  u32 = 3;
 const RLIMIT_CORE:   u32 = 4;
@@ -397,14 +434,12 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
     0
 }
 
-// ── NR 131  sigaltstack ─────────────────────────────────────────────────────────
+// ── NR 131  sigaltstack ───────────────────────────────────────────────────────────
 
 use spin::Mutex as SpinMutex;
 extern crate alloc;
 use alloc::collections::BTreeMap;
 
-// ALTSTACK is keyed by pid (usize). Entries must be removed on process exit
-// by calling altstack_clear_pid(pid) from do_exit.
 static ALTSTACK: SpinMutex<BTreeMap<usize, [u8; 24]>> = SpinMutex::new(BTreeMap::new());
 
 /// Called from do_exit to prevent per-pid leak.
@@ -416,12 +451,11 @@ fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
         let saved = ALTSTACK.lock().get(&pid).copied();
         let mut buf = saved.unwrap_or_else(|| {
             let mut b = [0u8; 24];
-            // SS_DISABLE flag at offset 8
-            b[8..12].copy_from_slice(&2i32.to_le_bytes());
+            b[8..12].copy_from_slice(&2i32.to_le_bytes()); // SS_DISABLE
             b
         });
         if copy_to_user(old_ss_va, &buf).is_err() { return -14; }
-        let _ = buf; // suppress unused warning
+        let _ = buf;
     }
     if ss_va != 0 {
         let mut buf = [0u8; 24];
@@ -431,7 +465,7 @@ fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
     0
 }
 
-// ── NR 137/138  statfs / fstatfs ──────────────────────────────────────────────
+// ── NR 137/138  statfs / fstatfs ───────────────────────────────────────────────
 
 #[repr(C)]
 struct StatFs {
@@ -470,7 +504,7 @@ fn sys_fstatfs_impl(_fd: usize,    buf_va: usize) -> isize { fill_statfs(buf_va)
 
 fn sys_sync_impl() -> isize { 0 }
 
-// ── NR 185  prctl ────────────────────────────────────────────────────────────
+// ── NR 185  prctl ─────────────────────────────────────────────────────────────
 
 const PR_SET_NAME:        i32 = 15;
 const PR_GET_NAME:        i32 = 16;
@@ -480,7 +514,6 @@ const PR_SET_SECCOMP:     i32 = 22;
 const PR_SET_PDEATHSIG:   i32 = 1;
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 
-// PROC_NAME keyed by pid. Must be cleaned up on exit via proc_name_clear(pid).
 static PROC_NAME: SpinMutex<BTreeMap<usize, [u8; 16]>> = SpinMutex::new(BTreeMap::new());
 
 /// Called from do_exit to prevent per-pid leak.
@@ -491,7 +524,6 @@ fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isi
     match op {
         PR_SET_NAME => {
             let mut name = [0u8; 16];
-            // Copy at most 15 bytes (name is NUL-terminated, max 16 with NUL).
             if copy_from_user(&mut name[..15], a2).is_err() { return -14; }
             PROC_NAME.lock().insert(pid, name);
             0
@@ -568,23 +600,22 @@ fn sys_futex_impl(
     }
 }
 
-// ── NR 203/204  sched_setaffinity / sched_getaffinity ────────────────────────
+// ── NR 203/204  sched_setaffinity / sched_getaffinity ───────────────────────────
 
 fn sys_sched_getaffinity_impl(_pid: usize, cpusetsize: usize, mask_va: usize) -> isize {
     if cpusetsize == 0 { return -14; }
-    let sz  = cpusetsize.min(128); // cap at 1024-bit cpu mask
+    let sz  = cpusetsize.min(128);
     let mut buf = alloc::vec![0u8; sz];
-    if sz > 0 { buf[0] = 0x01; } // CPU 0 only
+    if sz > 0 { buf[0] = 0x01; }
     if copy_to_user(mask_va, &buf).is_err() { return -14; }
     0
 }
 fn sys_sched_setaffinity_impl(_pid: usize, _sz: usize, _mask: usize) -> isize { 0 }
 
-// ── NR 230  clock_getres ────────────────────────────────────────────────────────
+// ── NR 230  clock_getres ──────────────────────────────────────────────────────────
 
 fn sys_clock_getres_impl(_clkid: u32, res_va: usize) -> isize {
     if res_va != 0 {
-        // timespec { tv_sec: 0, tv_nsec: 1 }
         let mut buf = [0u8; 16];
         buf[8..16].copy_from_slice(&1i64.to_le_bytes());
         if copy_to_user(res_va, &buf).is_err() { return -14; }
@@ -592,20 +623,20 @@ fn sys_clock_getres_impl(_clkid: u32, res_va: usize) -> isize {
     0
 }
 
-// ── NR 234  tgkill ────────────────────────────────────────────────────────────
+// ── NR 234  tgkill ─────────────────────────────────────────────────────────────
 
 fn sys_tgkill_impl(_tgid: usize, tid: usize, sig: u32) -> isize {
     sys_kill_impl(tid as isize, sig)
 }
 
-// ── NR 247  waitid ────────────────────────────────────────────────────────────
+// ── NR 247  waitid ─────────────────────────────────────────────────────────────
 
 fn sys_waitid_impl(which: i32, id: i32, _infop: usize, options: u32) -> isize {
     let pid: isize = if which == 1 { id as isize } else { -1 };
     crate::proc::wait::sys_waitpid(pid, 0, options)
 }
 
-// ── NR 257-267  *at variants ─────────────────────────────────────────────────────
+// ── NR 257-267  *at variants ───────────────────────────────────────────────────────
 
 const AT_FDCWD: i32 = -100;
 
@@ -674,7 +705,7 @@ fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize)
     }
 }
 
-// ── NR 292  inotify_init1 ────────────────────────────────────────────────────────
+// ── NR 292  inotify_init1 ──────────────────────────────────────────────────────────
 
 fn sys_inotify_init1_impl(_flags: i32) -> isize {
     static IN_COUNTER: core::sync::atomic::AtomicUsize =
@@ -688,9 +719,9 @@ fn sys_inotify_init1_impl(_flags: i32) -> isize {
     }
 }
 
-// ── NR 318  getrandom ──────────────────────────────────────────────────────────
+// ── NR 318  getrandom ────────────────────────────────────────────────────────────
 
-const GETRANDOM_MAX: usize = 4096; // cap per-call; caller loops if needed
+const GETRANDOM_MAX: usize = 4096;
 
 fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
     if count == 0 { return 0; }
@@ -705,7 +736,7 @@ fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
     n as isize
 }
 
-// ── NR 319  memfd_create ─────────────────────────────────────────────────────────
+// ── NR 319  memfd_create ───────────────────────────────────────────────────────────
 
 fn sys_memfd_create_impl(name_va: usize, _flags: u32) -> isize {
     static MFD_CTR: core::sync::atomic::AtomicUsize =
