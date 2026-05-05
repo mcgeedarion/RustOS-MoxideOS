@@ -21,7 +21,7 @@ use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::proc::scheduler;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr, USER_SPACE_END};
 
-// ── Signal metadata ───────────────────────────────────────────────────────
+// ── Signal metadata ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct SigInfo {
@@ -39,13 +39,13 @@ const CLD_EXITED:  i32 = 1;
 const CLD_KILLED:  i32 = 2;
 const SEGV_MAPERR: i32 = 1;
 
-// ── Signal storage ─────────────────────────────────────────────────────────
+// ── Signal storage ─────────────────────────────────────────────────────────────────────
 
 static PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
     Mutex::new(BTreeMap::new());
 static SIGMASK: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
-// ── Alternate stack ─────────────────────────────────────────────────────────
+// ── Alternate stack ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 struct AltStack { ss_sp: usize, ss_flags: i32, ss_size: usize }
@@ -55,13 +55,19 @@ const SS_AUTODISARM: i32 = 0x80000000u32 as i32;
 
 static ALTSTACK: Mutex<BTreeMap<usize, AltStack>> = Mutex::new(BTreeMap::new());
 
-// ── SA_* flags ────────────────────────────────────────────────────────────────
+// ── SA_* flags ───────────────────────────────────────────────────────────────────────────
 
 const SA_ONSTACK:  u32 = 0x08000000;
 const SA_RESTORER: u32 = 0x04000000;
 const SA_NODEFER:  u32 = 0x40000000;
 
-// ── Handler table ─────────────────────────────────────────────────────────────
+// ── sigprocmask `how` constants (Linux ABI) ────────────────────────────────────────────────
+
+const SIG_BLOCK:   u32 = 0;
+const SIG_UNBLOCK: u32 = 1;
+const SIG_SETMASK: u32 = 2;
+
+// ── Handler table ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 pub struct SignalHandlers {
@@ -70,7 +76,7 @@ pub struct SignalHandlers {
     pub restorer: usize,
 }
 
-// ── Public API ───────────────────────────────────────────────────────────────
+// ── Public API ─────────────────────────────────────────────────────────────────────────
 
 pub fn send_signal(pid: usize, sig: u32) {
     send_signal_info(pid, SigInfo { sig, code: SI_KERNEL, ..Default::default() });
@@ -110,7 +116,7 @@ pub fn set_sigmask(pid: usize, mask: u64) {
     SIGMASK.lock().insert(pid, mask);
 }
 
-// ── sys_sigaltstack [NR 131] ──────────────────────────────────────────────────
+// ── sys_sigaltstack [NR 131] ──────────────────────────────────────────────────────────────
 
 pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -148,7 +154,7 @@ pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
     0
 }
 
-// ── sys_rt_sigaction [NR 13] ───────────────────────────────────────────────────
+// ── sys_rt_sigaction [NR 13] ───────────────────────────────────────────────────────────────
 
 pub fn sys_rt_sigaction(
     sig: u32, new_act_va: usize, old_act_va: usize, _sigsetsize: usize,
@@ -188,7 +194,7 @@ pub fn sys_rt_sigaction(
     0
 }
 
-// ── sys_rt_sigprocmask [NR 14] ────────────────────────────────────────────────
+// ── sys_rt_sigprocmask [NR 14] ──────────────────────────────────────────────────────────────
 
 pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _sz: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -204,16 +210,17 @@ pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _sz: usize)
     let new_set = u64::from_ne_bytes(set_bytes);
 
     let updated = match how {
-        0 => cur | new_set,
-        1 => cur & !new_set,
-        2 => new_set,
+        SIG_BLOCK   => cur | new_set,
+        SIG_UNBLOCK => cur & !new_set,
+        SIG_SETMASK => new_set,
         _ => return -22,
     };
+    // SIGKILL (9) and SIGSTOP (19) cannot be masked.
     set_sigmask(pid, updated & !((1u64 << 9) | (1u64 << 19)));
     0
 }
 
-// ── Signal frame layout ───────────────────────────────────────────────────────────
+// ── Signal frame layout ────────────────────────────────────────────────────────────────────────
 
 const UCONTEXT_SIZE:     usize = 256;
 const SIGINFO_SIZE:      usize = 80;
@@ -245,7 +252,7 @@ const REG_CSGSFS:  usize = 18;
 const REG_OLDMASK: usize = 21;
 const REG_CR2:     usize = 22;
 
-// ── check_pending_signal ────────────────────────────────────────────────────────
+// ── check_pending_signal ─────────────────────────────────────────────────────────────────────
 
 pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let pid = scheduler::current_pid();
@@ -255,15 +262,28 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let info = {
         let mut q = PENDING.lock();
         let queue = match q.get_mut(&pid) { Some(q) => q, None => return };
-        let pos = queue.iter().position(|s| s.sig > 0 && (mask >> s.sig) & 1 == 0);
-        match pos {
-            Some(i) => queue.remove(i).unwrap_or_default(),
-            None    => return,
+
+        // Fast path: front signal is unmasked (the common case).
+        // pop_front is O(1) on VecDeque.
+        if let Some(front) = queue.front() {
+            if front.sig > 0 && (mask >> front.sig) & 1 == 0 {
+                queue.pop_front().unwrap_or_default()
+            } else {
+                // Slow path: scan for first unmasked signal.
+                // VecDeque::remove(i) is O(n) but only reached when signals
+                // are masked, which is uncommon.
+                let pos = queue.iter().position(|s| s.sig > 0 && (mask >> s.sig) & 1 == 0);
+                match pos {
+                    Some(i) => queue.remove(i).unwrap_or_default(),
+                    None    => return,
+                }
+            }
+        } else {
+            return;
         }
     };
     if info.sig == 0 { return; }
 
-    // O(log n) handler lookup via with_proc.
     let (handler_va, sa_flags, restorer) = scheduler::with_proc(pid, |p| (
         p.signal_handlers.handlers[info.sig as usize],
         p.signal_handlers.flags[info.sig as usize],
@@ -354,7 +374,15 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let ret_addr = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
         restorer
     } else {
-        build_inline_trampoline(sp)
+        // build_inline_trampoline returns None if copy_to_user fails;
+        // re-enqueue the signal and bail out safely.
+        match build_inline_trampoline(sp) {
+            Some(va) => va,
+            None => {
+                PENDING.lock().entry(pid).or_default().push_front(info);
+                return;
+            }
+        }
     };
     kframe[UCONTEXT_SIZE + SIGINFO_SIZE..].copy_from_slice(&ret_addr.to_ne_bytes());
 
@@ -370,7 +398,7 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     frame.rsp = ret_va;
 }
 
-// ── sys_rt_sigreturn [NR 15] ────────────────────────────────────────────────────
+// ── sys_rt_sigreturn [NR 15] ───────────────────────────────────────────────────────────────
 
 pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
     let pid = scheduler::current_pid();
@@ -410,11 +438,13 @@ pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
     0
 }
 
-// ── Inline trampoline (fallback when SA_RESTORER not set) ─────────────────
+// ── Inline trampoline (fallback when SA_RESTORER not set) ──────────────────────────────
 
-fn build_inline_trampoline(sp: usize) -> usize {
+/// Write the rt_sigreturn trampoline below `sp` and return its VA.
+/// Returns None if copy_to_user fails (e.g. stack page not mapped).
+fn build_inline_trampoline(sp: usize) -> Option<usize> {
+    // mov rax, 15 (NR_rt_sigreturn); syscall
     const CODE: [u8; 9] = [0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
     let va = sp.wrapping_sub(16);
-    let _ = copy_to_user(va, &CODE);
-    va
+    copy_to_user(va, &CODE).ok().map(|_| va)
 }
