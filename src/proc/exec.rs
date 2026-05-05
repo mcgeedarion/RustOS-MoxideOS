@@ -10,7 +10,7 @@
 //!   6.  Alloc user stack pages into new_cr3
 //!   7.  clear_vmas(old) + free_old_address_space(old_cr3) + load_cr3(new_cr3)
 //!   8.  build_initial_stack (writes into new_cr3, now active) → initial_rsp
-//!   9.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent
+//!   9.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
 //!  10.  wake_pid(vfork_parent) if set
 //!  11.  Patch SyscallFrame for SYSRETQ delivery
 
@@ -55,7 +55,7 @@ const MAX_CSTR_LEN: usize = 4096;
 /// Maximum number of pointer-array entries for argv / envp.
 const MAX_CSTR_ARRAY: usize = 1024;
 
-// ── free_old_address_space ────────────────────────────────────────────────────
+// ── free_old_address_space ────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
@@ -180,7 +180,7 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let pcb = crate::proc::process::Pcb {
         pid,
         ppid,
-        tgid:        pid, // fresh process: tgid == pid
+        tgid:        pid,
         state:       crate::proc::process::State::Ready,
         exit_code:   0,
         caps:        CapSet::empty(),
@@ -198,6 +198,8 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         exit_signal:         17,
         vfork_parent:        0,
         signal_handlers:     SignalHandlers::default(),
+        // Record the executable path for /proc/<pid>/exe.
+        exe_path:            Some(String::from(path)),
     };
 
     scheduler::enqueue(pcb);
@@ -208,7 +210,7 @@ pub fn sys_execve_from_path(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ─────────────────────────────────────────────────────────
+// ── sys_execve [NR 59] ──────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
@@ -222,7 +224,7 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
     }
 }
 
-// ── do_execve ───────────────────────────────────────────────────────────────
+// ── do_execve ──────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(path: &str, argv: &[String], envp: &[String],
@@ -270,7 +272,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         );
     }
 
-    // O(log n) fetch of old CR3 — no scan.
     let old_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     let pid_key = thread::vma_pid(pid);
     mmap::clear_vmas(pid_key);
@@ -284,7 +285,9 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     )?;
 
-    // Single with_proc_mut: update PCB and extract vfork_parent atomically.
+    // Single with_proc_mut: update all PCB fields after point-of-no-return.
+    // exe_path is set here because this is the only place where both
+    // "ELF loaded successfully" and "path string" are simultaneously known.
     let vfork_parent = scheduler::with_proc_mut(pid, |p| {
         p.user_satp       = new_cr3;
         p.pc              = entry_va;
@@ -293,12 +296,12 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         p.vmas            = alloc::vec![];
         p.next_va         = crate::proc::process::Pcb::INITIAL_NEXT_VA;
         p.brk             = crate::proc::process::Pcb::INITIAL_BRK;
+        p.exe_path        = Some(String::from(path));
         let vfp            = p.vfork_parent;
         p.vfork_parent    = 0;
         vfp
     }).unwrap_or(0);
 
-    // update_rsp0 needs kstack_top — one O(log n) lookup.
     let kst = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
     if kst != 0 { update_rsp0(kst); }
 
@@ -313,7 +316,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     Ok(())
 }
 
-// ── build_initial_stack ───────────────────────────────────────────────────────────
+// ── build_initial_stack ────────────────────────────────────────────────────────────────────
 // CR3 must already be loaded to new_cr3 before calling this.
 // Writes directly to user VAs (valid because CR3 is active).
 
@@ -387,7 +390,7 @@ fn build_initial_stack(
     Ok(initial_rsp)
 }
 
-// ── load_interpreter ───────────────────────────────────────────────────────────────
+// ── load_interpreter ───────────────────────────────────────────────────────────────────────
 
 fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     let fd  = vfs::open(interp_path, vfs::O_RDONLY).map_err(|e| e)?;
@@ -402,7 +405,7 @@ fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── string helpers ────────────────────────────────────────────────────────────────
+// ── string helpers ────────────────────────────────────────────────────────────────────────
 
 /// Read a NUL-terminated string from user VA `va` into a kernel String.
 /// Uses copy_from_user to avoid raw user pointer dereference.
@@ -429,7 +432,7 @@ pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
     out
 }
 
-// ── clear_vmas helper (called from do_execve) ──────────────────────────────────────
+// ── clear_vmas helper (called from do_execve) ──────────────────────────────────────────
 
 pub fn clear_vmas(pid_key: u32) {
     crate::mm::mmap::clear_vmas_pub(pid_key as usize);

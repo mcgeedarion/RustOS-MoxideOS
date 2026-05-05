@@ -1,6 +1,7 @@
 //! Process Control Block (PCB) — authoritative per-process kernel struct.
 
 extern crate alloc;
+use alloc::string::String;
 use alloc::vec::Vec;
 use crate::mm::mmap::Vma;
 use crate::proc::context::Context;
@@ -55,6 +56,11 @@ pub struct Pcb {
     pub vfork_parent: usize,
     /// Per-process signal dispatch table.
     pub signal_handlers: SignalHandlers,
+
+    /// Path of the executable image currently running in this process.
+    /// Set by exec, inherited across fork/clone, used by /proc/<pid>/exe.
+    /// None for kernel threads or before the first successful execve.
+    pub exe_path: Option<String>,
 }
 
 impl Pcb {
