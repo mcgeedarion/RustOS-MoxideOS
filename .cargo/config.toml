@@ -5,5 +5,22 @@ target = "x86_64-unknown-none"
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 
+# ── x86_64 target ────────────────────────────────────────────────────────────
+# code-model=kernel: use 32-bit signed RIP-relative addressing throughout
+#   (no need for large-model GOT indirection in an identity-mapped kernel).
+# link-arg=-Tx86_64.ld: apply the kernel linker script on every build so
+#   load address, section layout, boot stack size, and _kernel_start are
+#   always in effect without passing the flag manually.
 [target.x86_64-unknown-none]
-rustflags = ["-C", "code-model=kernel"]
+rustflags = [
+  "-C", "code-model=kernel",
+  "-C", "link-arg=-Tx86_64.ld",
+]
+
+# ── RISC-V target ─────────────────────────────────────────────────────────────
+# link-arg=-Tlinker.ld: apply the RISC-V linker script so the kernel loads
+#   at 0x80200000 (OpenSBI handoff address) automatically.
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+  "-C", "link-arg=-Tlinker.ld",
+]
