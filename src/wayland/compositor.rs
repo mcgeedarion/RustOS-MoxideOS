@@ -1,3 +1,4 @@
+#![cfg(feature = "wayland")]
 //! wl_compositor and wl_surface objects.
 //!
 //! wl_compositor (v5) requests:
@@ -36,7 +37,7 @@ pub struct Surface {
     pub scale: i32,
 }
 
-// ── Frame callback queue ──────────────────────────────────────────────────
+// ── Frame callback queue ───────────────────────────────────────────────────
 
 pub struct PendingCallback {
     pub client_sock: usize,
@@ -46,8 +47,6 @@ pub struct PendingCallback {
 static PENDING_FRAME_CBS: Mutex<Vec<PendingCallback>> = Mutex::new(Vec::new());
 
 /// Called from the Wayland server loop after each vblank.
-/// Sends wl_callback.done (serial = lower 32 bits of vblank counter) to every
-/// pending frame callback, then clears the queue.
 pub fn fire_frame_callbacks(clients: &mut Vec<Client>) {
     let serial = (crate::drivers::amdgpu_irq::vblank_count() & 0xFFFF_FFFF) as u32;
     let cbs: Vec<PendingCallback> = {
@@ -65,14 +64,8 @@ pub fn fire_frame_callbacks(clients: &mut Vec<Client>) {
 
 pub fn handle_compositor(client: &mut Client, id: u32, msg: &super::WlMsg) {
     match msg.opcode {
-        0 => {
-            let new_id = read_u32(&msg.payload, 0);
-            client.objects.insert(new_id, ObjType::Surface(Surface::default()));
-        }
-        1 => {
-            let new_id = read_u32(&msg.payload, 0);
-            client.objects.insert(new_id, ObjType::Region);
-        }
+        0 => { let new_id = read_u32(&msg.payload, 0); client.objects.insert(new_id, ObjType::Surface(Surface::default())); }
+        1 => { let new_id = read_u32(&msg.payload, 0); client.objects.insert(new_id, ObjType::Region); }
         _ => {}
     }
 }
@@ -84,35 +77,27 @@ pub fn handle_surface(client: &mut Client, id: u32, msg: &super::WlMsg) {
     };
     match msg.opcode {
         0 => { /* destroy */ }
-        1 => { // attach(buffer, x, y)
+        1 => {
             let buf_id = read_u32(&msg.payload, 0);
-            let x      = read_u32(&msg.payload, 4) as i32;
-            let y      = read_u32(&msg.payload, 8) as i32;
             surf.attached_buffer = if buf_id == 0 { None } else { Some(buf_id) };
-            surf.x = x; surf.y = y;
+            surf.x = read_u32(&msg.payload, 4) as i32;
+            surf.y = read_u32(&msg.payload, 8) as i32;
         }
-        2 | 9 => { // damage / damage_buffer(x, y, w, h)
-            let x = read_u32(&msg.payload, 0) as i32;
-            let y = read_u32(&msg.payload, 4) as i32;
-            let w = read_u32(&msg.payload, 8) as i32;
-            let h = read_u32(&msg.payload, 12) as i32;
-            surf.damage.push((x, y, w, h));
+        2 | 9 => {
+            surf.damage.push((
+                read_u32(&msg.payload,  0) as i32,
+                read_u32(&msg.payload,  4) as i32,
+                read_u32(&msg.payload,  8) as i32,
+                read_u32(&msg.payload, 12) as i32,
+            ));
         }
-        3 => { // frame(callback_id) — defer to next vblank
+        3 => {
             let cb_id = read_u32(&msg.payload, 0);
             client.objects.insert(cb_id, ObjType::Callback(0));
-            PENDING_FRAME_CBS.lock().push(PendingCallback {
-                client_sock: client.sock_idx,
-                cb_id,
-            });
+            PENDING_FRAME_CBS.lock().push(PendingCallback { client_sock: client.sock_idx, cb_id });
         }
-        6 => { // commit
-            commit_surface(client, id);
-        }
-        8 => { // set_buffer_scale
-            let scale = read_u32(&msg.payload, 0) as i32;
-            surf.scale = scale.max(1);
-        }
+        6 => { commit_surface(client, id); }
+        8 => { surf.scale = (read_u32(&msg.payload, 0) as i32).max(1); }
         _ => {}
     }
 }
@@ -122,18 +107,14 @@ fn commit_surface(client: &mut Client, surf_id: u32) {
         Some(ObjType::Surface(s)) => (s.attached_buffer, s.damage.clone(), s.x, s.y),
         _ => return,
     };
-
     let buf_id = match buf_id { Some(b) => b, None => return };
-
     let (pa, width, height, stride) = match client.objects.get(&buf_id) {
         Some(ObjType::Buffer(b)) => (b.pa, b.width, b.height, b.stride),
         _ => return,
     };
-
     let gop = crate::drivers::gop::get_info();
     if gop.base == 0 { return; }
 
-    // If no damage regions posted, blit the full surface.
     let full = alloc::vec![(0i32, 0i32, width as i32, height as i32)];
     let regions: &[(i32,i32,i32,i32)] = if damage.is_empty() { &full } else { &damage };
 
@@ -144,24 +125,19 @@ fn commit_surface(client: &mut Client, surf_id: u32) {
         let copy_h = (*dh as u32).min(height.saturating_sub(src_y)).min(gop.height);
         let dst_x  = (x + *dx).max(0) as u32;
         let dst_y  = (y + *dy).max(0) as u32;
-
         for row in 0..copy_h {
             let src_off   = ((src_y + row) * stride + src_x * 4) as u64;
             let dst_off   = ((dst_y + row) * gop.stride + dst_x * 4) as u64;
-            let row_bytes = (copy_w * 4) as usize;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (pa + src_off) as *const u8,
                     (gop.base + dst_off) as *mut u8,
-                    row_bytes,
+                    (copy_w * 4) as usize,
                 );
             }
         }
     }
-
-    // wl_buffer.release so the client can reuse the buffer
     client.send(buf_id, 0, &[]);
-
     if let Some(ObjType::Surface(s)) = client.objects.get_mut(&surf_id) {
         s.damage.clear();
         s.committed = true;

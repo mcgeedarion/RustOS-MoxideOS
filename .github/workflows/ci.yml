@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C force-frame-pointers=yes"
+
+jobs:
+  build-and-smoke-test:
+    name: Build + QEMU smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Rust toolchain (nightly + bare-metal target) ────────────────────
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-none
+          components: rust-src, llvm-tools-preview
+
+      # ── Cargo cache ─────────────────────────────────────────────────────
+      - uses: Swatinem/rust-cache@v2
+
+      # ── System deps (QEMU + GRUB ISO tools) ─────────────────────────────
+      - name: Install QEMU and GRUB
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 grub-pc-bin grub-common xorriso mtools
+
+      # ── Build kernel (default features = no Wayland) ─────────────────────
+      - name: Build kernel (release)
+        run: |
+          cargo build \
+            --target x86_64-unknown-none \
+            --release \
+            2>&1 | tee build.log
+          # Fail if there are any 'error' lines the exit code missed
+          if grep -q '^error' build.log; then exit 1; fi
+
+      # ── Build with wayland feature (compile-only, no QEMU) ───────────────
+      - name: Build kernel with wayland feature
+        run: |
+          cargo build \
+            --target x86_64-unknown-none \
+            --release \
+            --features wayland \
+            2>&1 | tee build-wayland.log
+          if grep -q '^error' build-wayland.log; then exit 1; fi
+
+      # ── Assemble bootable ISO ────────────────────────────────────────────
+      - name: Assemble ISO
+        run: |
+          mkdir -p iso/boot/grub
+          cp target/x86_64-unknown-none/release/librustos.a iso/boot/kernel.elf
+          cat > iso/boot/grub/grub.cfg <<'EOF'
+          set timeout=0
+          set default=0
+          menuentry "rustos" {
+            multiboot2 /boot/kernel.elf
+            boot
+          }
+          EOF
+          grub-mkrescue -o rustos.iso iso/ 2>&1
+
+      # ── QEMU smoke test ──────────────────────────────────────────────────
+      # Boots the kernel in -nographic mode and expects the sentinel string
+      # "kernel_main reached" on serial output within 10 seconds.
+      # The sentinel should be emitted by kernel_main() before any driver
+      # init so the test is architecture-independent and fast.
+      - name: QEMU smoke test
+        timeout-minutes: 2
+        run: |
+          timeout 10 qemu-system-x86_64 \
+            -nographic \
+            -no-reboot \
+            -m 128M \
+            -serial stdio \
+            -cdrom rustos.iso \
+            2>&1 | tee qemu.log || true
+          if grep -q 'kernel_main reached' qemu.log; then
+            echo "SMOKE TEST PASSED"
+          else
+            echo "SMOKE TEST FAILED — sentinel not found in output:"
+            cat qemu.log
+            exit 1
+          fi
+
+      # ── Upload artefacts on failure ──────────────────────────────────────
+      - name: Upload build/boot logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            build.log
+            build-wayland.log
+            qemu.log

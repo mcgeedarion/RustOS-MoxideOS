@@ -26,4 +26,10 @@ pub mod sync;
 pub mod syscall;
 pub mod uaccess;
 pub mod utils;
+
+/// Wayland compositor subsystem.
+/// Enabled with `--features wayland` or `features = ["wayland"]` in Cargo.toml.
+/// Excluded from all default builds so the no_std kernel compiles cleanly
+/// without it, and CI smoke-tests run without Wayland code present.
+#[cfg(feature = "wayland")]
 pub mod wayland;
