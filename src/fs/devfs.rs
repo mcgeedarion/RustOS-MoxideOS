@@ -25,7 +25,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use spin::Mutex;
 
-// ── Device kind ───────────────────────────────────────────────────────────
+// ── Device kind ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DevKind {
@@ -37,7 +37,7 @@ pub enum DevKind {
     FdAlias(usize), // /dev/stdin→0, /dev/stdout→1, /dev/stderr→2
 }
 
-// ── Open device slot ──────────────────────────────────────────────────────
+// ── Open device slot ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct DevFd {
@@ -50,7 +50,7 @@ const DEV_TABLE_SIZE: usize = 64;
 static DEV_TABLE: Mutex<[Option<DevFd>; DEV_TABLE_SIZE]> =
     Mutex::new([const { None }; DEV_TABLE_SIZE]);
 
-// ── Path → DevKind mapping ────────────────────────────────────────────────
+// ── Path → DevKind mapping ───────────────────────────────────────────────────────────────
 
 fn path_to_kind(path: &str) -> Option<DevKind> {
     match path {
@@ -66,7 +66,7 @@ fn path_to_kind(path: &str) -> Option<DevKind> {
     }
 }
 
-// ── Internal fd allocation ────────────────────────────────────────────────
+// ── Internal fd allocation ───────────────────────────────────────────────────────────────
 
 const DEV_FD_BASE: usize = 0x4000_0000;
 
@@ -81,12 +81,11 @@ fn alloc_dev_fd(kind: DevKind, flags: u32) -> Option<usize> {
     None
 }
 
-// ── Public API (called from vfs.rs) ──────────────────────────────────────
+// ── Public API (called from vfs.rs) ───────────────────────────────────────────────────
 
 /// Try to open a /dev path. Returns a synthetic fd number or None.
 pub fn try_open(path: &str, flags: u32) -> Option<usize> {
     let kind = path_to_kind(path)?;
-    // FdAlias nodes redirect to the real fd.
     if let DevKind::FdAlias(fd) = kind { return Some(fd); }
     alloc_dev_fd(kind, flags)
 }
@@ -122,7 +121,6 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
             buf.len() as isize
         }
         DevKind::Tty              => {
-            // Read from serial console.
             let mut n = 0usize;
             for b in buf.iter_mut() {
                 match serial_read_byte() {
@@ -141,7 +139,6 @@ pub fn write(fdno: usize, buf: &[u8]) -> isize {
     let kind = match get_dev_fd(fdno) { Some(k) => k, None => return -9 };
     match kind {
         DevKind::Null | DevKind::Zero | DevKind::Random | DevKind::Tty => {
-            // Tty: forward to serial.
             if kind == DevKind::Tty {
                 for &b in buf { serial_write_byte(b); }
             }
@@ -152,28 +149,41 @@ pub fn write(fdno: usize, buf: &[u8]) -> isize {
     }
 }
 
-// ── Random number generation ──────────────────────────────────────────────
+// ── Random number generation ───────────────────────────────────────────────────────────────
 
 use core::sync::atomic::{AtomicU64, Ordering};
 static LFSR: AtomicU64 = AtomicU64::new(0xDEAD_BEEF_CAFE_1337);
 
+/// Fill `buf` with random bytes.
+/// Generates one u64 per 8-byte chunk (8× fewer RDRAND calls than per-byte);
+/// leftover tail bytes are filled from the last word.
 fn fill_random(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        // Try RDRAND first; fall back to LFSR.
-        let val: u64 = rdrand().unwrap_or_else(|| {
-            let s = LFSR.load(Ordering::Relaxed);
-            let s = s ^ (s << 13) ^ (s >> 7) ^ (s << 17);
-            LFSR.store(s, Ordering::Relaxed);
-            s
-        });
-        *b = val as u8;
+    let mut chunks = buf.chunks_exact_mut(8);
+    for chunk in chunks.by_ref() {
+        let word = next_random_u64();
+        chunk.copy_from_slice(&word.to_le_bytes());
     }
+    // Fill remainder (0–7 bytes) from one more word.
+    let rem = chunks.into_remainder();
+    if !rem.is_empty() {
+        let word = next_random_u64().to_le_bytes();
+        rem.copy_from_slice(&word[..rem.len()]);
+    }
+}
+
+#[inline]
+fn next_random_u64() -> u64 {
+    rdrand().unwrap_or_else(|| {
+        let s = LFSR.load(Ordering::Relaxed);
+        let s = s ^ (s << 13) ^ (s >> 7) ^ (s << 17);
+        LFSR.store(s, Ordering::Relaxed);
+        s
+    })
 }
 
 fn rdrand() -> Option<u64> {
     let mut val: u64 = 0;
     let mut ok: u8;
-    // Try up to 10 times (RDRAND can fail transiently).
     for _ in 0..10 {
         unsafe {
             core::arch::asm!(
@@ -189,13 +199,12 @@ fn rdrand() -> Option<u64> {
     None
 }
 
-// ── Serial I/O (COM1 = 0x3F8) ─────────────────────────────────────────────
+// ── Serial I/O (COM1 = 0x3F8) ───────────────────────────────────────────────────────────────
 
 const COM1: u16 = 0x3F8;
 
 fn serial_write_byte(b: u8) {
     unsafe {
-        // Wait for transmit holding register empty (bit 5 of LSR).
         loop {
             let lsr: u8;
             core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1 + 5, options(nostack));
@@ -209,7 +218,7 @@ fn serial_read_byte() -> Option<u8> {
     unsafe {
         let lsr: u8;
         core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1 + 5, options(nostack));
-        if lsr & 0x01 == 0 { return None; } // no data ready
+        if lsr & 0x01 == 0 { return None; }
         let data: u8;
         core::arch::asm!("in al, dx", out("al") data, in("dx") COM1, options(nostack));
         Some(data)
