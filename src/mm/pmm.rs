@@ -71,6 +71,23 @@ fn is_valid_pa(pa: usize) -> bool {
     pa != 0 && pa & (PAGE_SIZE - 1) == 0 && !is_kernel_page(pa)
 }
 
+// ── Initialisation ────────────────────────────────────────────────────────────────────────────────
+
+/// Initialise the physical memory manager.
+///
+/// The static bootstrap pool (`POOL`) is self-initialising — `BUMP` and
+/// `FREE_LIST` are valid the moment the BSS is zeroed by the boot stub.
+/// This function exists as a named call-site for `kernel_main` so that a
+/// future DTB/UEFI memory-map walk can be wired in here without touching
+/// the boot sequence.
+///
+/// Call this once, before any heap allocation.
+pub fn init() {
+    // Bootstrap pool needs no runtime init.
+    // When DTB parsing is available, call pmm_add_region() for each
+    // usable range discovered from the FDT passed in a1 by OpenSBI.
+}
+
 // ── Core allocator ─────────────────────────────────────────────────────────────────────────────────
 
 /// Allocate one 4096-byte page. Returns the physical (identity-mapped) address.
