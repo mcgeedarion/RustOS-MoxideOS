@@ -1,108 +1,133 @@
 //! Round-robin run queue and voluntary context-switch scheduler.
-//! Single-CPU. All mutations go through a spin-locked SchedState.
+//! Single-CPU. All mutations go through a SpinMutex<SchedState>.
 
 extern crate alloc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::arch::{Arch, api::{Paging, Interrupts}};
+use spin::Mutex;
+use crate::arch::{Arch, api::{Paging, Cpu}};
 use crate::proc::process::{Pcb, State};
 use crate::proc::context::switch_to;
 
-struct SchedState { procs: Vec<Pcb>, current: usize, next_pid: usize }
-static mut SCHED: SchedState = SchedState { procs: Vec::new(), current: 0, next_pid: 1 };
-static SCHED_LOCK: AtomicUsize = AtomicUsize::new(0);
+// ── State ─────────────────────────────────────────────────────────────────
 
-fn sched_lock()   { while SCHED_LOCK.compare_exchange(0,1,Ordering::Acquire,Ordering::Relaxed).is_err() { <Arch as crate::arch::api::Cpu>::spin_hint(); } }
-fn sched_unlock() { SCHED_LOCK.store(0, Ordering::Release); }
+struct SchedState {
+    procs:    Vec<Pcb>,
+    current:  usize,
+    next_pid: usize,
+}
+
+static SCHED: Mutex<SchedState> = Mutex::new(SchedState {
+    procs:    Vec::new(),
+    current:  0,
+    next_pid: 1,
+});
+
+// ── Simple queries ────────────────────────────────────────────────────────
 
 pub fn current_pid() -> usize {
-    sched_lock();
-    let p = unsafe { if SCHED.procs.is_empty() { 0 } else { SCHED.procs[SCHED.current].pid } };
-    sched_unlock(); p
+    let s = SCHED.lock();
+    if s.procs.is_empty() { 0 } else { s.procs[s.current].pid }
 }
 
 pub fn next_pid() -> usize {
-    sched_lock();
-    let p = unsafe { let n = SCHED.next_pid; SCHED.next_pid += 1; n };
-    sched_unlock(); p
+    let mut s = SCHED.lock();
+    let n = s.next_pid;
+    s.next_pid += 1;
+    n
 }
+
+pub fn ppid_of(pid: usize) -> usize {
+    let s = SCHED.lock();
+    s.procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.ppid)
+}
+
+// ── Queue management ──────────────────────────────────────────────────────
 
 pub fn enqueue(pcb: Pcb) {
-    sched_lock();
-    unsafe { SCHED.procs.push(pcb); }
-    sched_unlock();
+    SCHED.lock().procs.push(pcb);
 }
 
-pub fn procs_lock() -> &'static mut Vec<Pcb> {
-    sched_lock();
-    unsafe { &mut SCHED.procs }
+/// Run `f` with exclusive access to the process list.
+/// Replaces the old procs_lock() / procs_unlock() pair with a scoped
+/// RAII guard so callers can never forget to release the lock.
+pub fn with_procs<R>(f: impl FnOnce(&mut Vec<Pcb>) -> R) -> R {
+    f(&mut SCHED.lock().procs)
 }
 
-pub fn procs_unlock() { sched_unlock(); }
+// ── State transitions ─────────────────────────────────────────────────────
 
 pub fn suspend_current_until_child_exec(_child_pid: usize) {
-    sched_lock();
-    unsafe { SCHED.procs[SCHED.current].state = State::Blocked; }
-    sched_unlock();
+    {
+        let mut s = SCHED.lock();
+        let cur = s.current;
+        if !s.procs.is_empty() {
+            s.procs[cur].state = State::Blocked;
+        }
+    }
     schedule();
 }
 
 pub fn wake_pid(pid: usize) {
-    sched_lock();
-    unsafe {
-        if let Some(p) = SCHED.procs.iter_mut().find(|p| p.pid == pid) {
-            if p.state == State::Blocked { p.state = State::Ready; }
+    let mut s = SCHED.lock();
+    if let Some(p) = s.procs.iter_mut().find(|p| p.pid == pid) {
+        if p.state == State::Blocked {
+            p.state = State::Ready;
         }
     }
-    sched_unlock();
 }
 
-/// Round-robin: save current context and switch to next Ready task.
-pub fn schedule() {
-    sched_lock();
-    let len = unsafe { SCHED.procs.len() };
-    if len == 0 { sched_unlock(); return; }
-    let cur = unsafe { SCHED.current };
-    let mut nxt = (cur + 1) % len;
-    let mut found = false;
-    for _ in 0..len {
-        if unsafe { SCHED.procs[nxt].state == State::Ready } { found = true; break; }
-        nxt = (nxt + 1) % len;
-    }
-    if !found || nxt == cur { sched_unlock(); return; }
-    unsafe {
-        if SCHED.procs[cur].state == State::Running { SCHED.procs[cur].state = State::Ready; }
-        SCHED.procs[nxt].state = State::Running;
-        SCHED.current = nxt;
-    }
-    let old_ctx  = unsafe { &mut SCHED.procs[cur].ctx as *mut _ };
-    let new_ctx  = unsafe { &    SCHED.procs[nxt].ctx as *const _ };
-    let new_cr3  = unsafe { SCHED.procs[nxt].user_satp };
-    sched_unlock();
+pub fn fix_current_after_remove(removed_idx: usize) {
+    let mut s = SCHED.lock();
+    let len = s.procs.len();
+    if len == 0 { s.current = 0; return; }
+    if removed_idx < s.current { s.current -= 1; }
+    if s.current >= len        { s.current  = len - 1; }
+}
 
-    // Address-space switch via HAL.
+// ── Scheduler ─────────────────────────────────────────────────────────────
+
+/// Round-robin: find the next Ready task, switch context to it.
+/// Does nothing if there is only one runnable task or no tasks.
+pub fn schedule() {
+    // Phase 1: under the lock, decide who to switch to and capture raw
+    // pointers to the two Context objects.  Raw ptrs are valid for the
+    // lifetime of SCHED (static), so using them after dropping the guard
+    // is sound as long as we hold no other reference into SCHED.procs.
+    let (old_ctx, new_ctx, new_cr3) = {
+        let mut s = SCHED.lock();
+        let len = s.procs.len();
+        if len == 0 { return; }
+
+        let cur = s.current;
+        let mut nxt = (cur + 1) % len;
+        let mut found = false;
+
+        for _ in 0..len {
+            if s.procs[nxt].state == State::Ready {
+                found = true;
+                break;
+            }
+            nxt = (nxt + 1) % len;
+        }
+
+        if !found || nxt == cur { return; }
+
+        if s.procs[cur].state == State::Running {
+            s.procs[cur].state = State::Ready;
+        }
+        s.procs[nxt].state = State::Running;
+        s.current = nxt;
+
+        let old_ctx = &mut s.procs[cur].ctx as *mut _;
+        let new_ctx = &    s.procs[nxt].ctx as *const _;
+        let new_cr3 = s.procs[nxt].user_satp;
+        (old_ctx, new_ctx, new_cr3)
+    }; // lock released here
+
+    // Phase 2: address-space switch + context switch (no lock held).
     let cur_cr3 = <Arch as Paging>::kernel_cr3();
     if new_cr3 != 0 && new_cr3 != cur_cr3 {
         <Arch as Paging>::load_cr3(new_cr3);
     }
-
     unsafe { switch_to(old_ctx, new_ctx); }
-}
-
-pub fn fix_current_after_remove(removed_idx: usize) {
-    unsafe {
-        let len = SCHED.procs.len();
-        if len == 0 { SCHED.current = 0; return; }
-        if removed_idx < SCHED.current { SCHED.current -= 1; }
-        if SCHED.current >= len { SCHED.current = len - 1; }
-    }
-}
-
-pub fn ppid_of(pid: usize) -> usize {
-    sched_lock();
-    let r = unsafe {
-        SCHED.procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.ppid)
-    };
-    sched_unlock();
-    r
 }
