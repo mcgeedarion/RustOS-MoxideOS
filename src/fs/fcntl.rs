@@ -19,12 +19,13 @@
 //!   When set, the fd is closed across execve().  All fds created with
 //!   O_CLOEXEC / SFD_CLOEXEC / EFD_CLOEXEC / TFD_CLOEXEC already have
 //!   the flag set at creation.  fcntl(F_SETFD, FD_CLOEXEC) lets callers
-//!   set it retroactively — used by libraries that open fds before exec.
+//!   set it retroactively.
 
 extern crate alloc;
 use crate::fs::vfs;
 use crate::uaccess::{copy_to_user, validate_user_ptr};
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 // fcntl commands
@@ -57,20 +58,21 @@ pub const O_CLOEXEC:  i32 = 524288;
 // F_UNLCK value written into the l_type field of struct flock.
 const F_UNLCK: u16 = 2;
 
-// Per-fd metadata (cloexec flag, nonblock flag, file status flags, owner)
+/// Per-fd metadata.
+/// owner_pid doubles as the F_SETOWN target AND the fd ownership record
+/// previously held in the now-removed FD_OWNER map.
 #[derive(Clone, Default)]
 struct FdMeta {
     pub cloexec:   bool,
     pub nonblock:  bool,
     pub fl_flags:  i32,
-    pub owner_pid: i32,
+    pub owner_pid: i32,  // F_SETOWN / fd ownership (0 = unowned)
 }
 
-static FD_META:  Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
-/// Maps fd# -> owning process pid (0 = unowned / legacy).
-static FD_OWNER: Mutex<BTreeMap<usize, usize>>  = Mutex::new(BTreeMap::new());
+// Single map covers all per-fd metadata. Replaces the old FD_META + FD_OWNER pair.
+static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
 
-// ── cloexec / nonblock / fl_flags ────────────────────────────────────────────────
+// ── cloexec / nonblock / fl_flags ──────────────────────────────────────────────────
 pub fn set_cloexec(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().cloexec = val;
 }
@@ -83,47 +85,64 @@ pub fn get_fl(fd: usize) -> i32 {
 pub fn set_fl(fd: usize, flags: i32) {
     FD_META.lock().entry(fd).or_default().fl_flags = flags;
 }
+/// Remove all metadata for `fd`. Call on close.
 pub fn close_fd_meta(fd: usize) {
     FD_META.lock().remove(&fd);
-    FD_OWNER.lock().remove(&fd);
 }
 
-// ── fd ownership (used by pidfd_getfd) ─────────────────────────────────────────
+// ── fd ownership (used by pidfd_getfd) ───────────────────────────────────────────
+// owner_pid is stored in FdMeta; no separate FD_OWNER map.
 pub fn set_fd_owner(fd: usize, pid: usize) {
-    FD_OWNER.lock().insert(fd, pid);
+    FD_META.lock().entry(fd).or_default().owner_pid = pid as i32;
 }
 pub fn fd_owner(fd: usize) -> usize {
-    FD_OWNER.lock().get(&fd).copied().unwrap_or(0)
+    FD_META.lock().get(&fd).map(|m| m.owner_pid as usize).unwrap_or(0)
 }
 pub fn clear_fd_owner(fd: usize) {
-    FD_OWNER.lock().remove(&fd);
+    if let Some(m) = FD_META.lock().get_mut(&fd) {
+        m.owner_pid = 0;
+    }
 }
 
-/// Close all fds that have FD_CLOEXEC set (called from execve).
+// ── close_on_exec ─────────────────────────────────────────────────────────────────
+
+/// Close all fds with FD_CLOEXEC set (called from execve).
+/// Collects and removes cloexec entries in a single locked section to avoid
+/// repeated lock acquisitions from calling close_fd_meta per fd.
 pub fn close_on_exec() {
-    let cloexec_fds: alloc::vec::Vec<usize> = FD_META.lock()
-        .iter()
-        .filter(|(_, m)| m.cloexec)
-        .map(|(fd, _)| *fd)
-        .collect();
+    // Drain cloexec entries under one lock window.
+    let cloexec_fds: Vec<usize> = {
+        let mut meta = FD_META.lock();
+        let fds: Vec<usize> = meta.iter()
+            .filter(|(_, m)| m.cloexec)
+            .map(|(fd, _)| *fd)
+            .collect();
+        for fd in &fds { meta.remove(fd); }
+        fds
+    };
+    // Process the closed set outside the lock.
     for fd in cloexec_fds {
-        sys_close_fd(fd);
+        close_fd_no_meta(fd);
     }
 }
 
-fn sys_close_fd(fd: usize) {
-    if crate::fs::pidfd::is_pidfd(fd) {
-        crate::fs::pidfd::free(fd);
-        clear_fd_owner(fd);
-        close_fd_meta(fd);
-        return;
-    }
-    if crate::fs::timerfd::is_timerfd(fd)  { crate::fs::timerfd::sys_close_tfd(fd);    return; }
-    if crate::fs::signalfd::is_signalfd(fd) { crate::fs::signalfd::sys_close_sfd(fd);  return; }
-    if crate::fs::eventfd::is_eventfd(fd)   { crate::fs::eventfd::sys_close_efd(fd);   return; }
-    if crate::fs::pipe::is_pipe(fd)         { crate::fs::pipe::sys_close_pipe(fd);     return; }
+/// Close an fd without touching FD_META (caller has already removed the entry).
+fn close_fd_no_meta(fd: usize) {
+    if crate::fs::pidfd::is_pidfd(fd)         { crate::fs::pidfd::free(fd);                    return; }
+    if crate::fs::timerfd::is_timerfd(fd)     { crate::fs::timerfd::sys_close_tfd(fd);         return; }
+    if crate::fs::signalfd::is_signalfd(fd)   { crate::fs::signalfd::sys_close_sfd(fd);        return; }
+    if crate::fs::eventfd::is_eventfd(fd)     { crate::fs::eventfd::sys_close_efd(fd);         return; }
+    if crate::fs::pipe::is_pipe(fd)           { crate::fs::pipe::sys_close_pipe(fd);           return; }
     vfs::close(fd);
 }
+
+/// Close an fd and remove its metadata (used by sys_dup2 and sys_close_fd).
+fn sys_close_fd(fd: usize) {
+    close_fd_meta(fd);
+    close_fd_no_meta(fd);
+}
+
+// ── sys_fcntl ───────────────────────────────────────────────────────────────────
 
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     match cmd {
@@ -146,13 +165,9 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             0
         }
         F_GETLK => {
-            // Stub: report all locks as not held (F_UNLCK).
-            // Build the struct flock response in a kernel buffer and
-            // copy_to_user — never write raw to an unvalidated user pointer.
             if arg == 0 { return 0; }
             if !validate_user_ptr(arg, 32) { return -14; }
             let mut buf = [0u8; 32];
-            // l_type is the first field (u16 at offset 0); set to F_UNLCK.
             buf[0..2].copy_from_slice(&F_UNLCK.to_le_bytes());
             if copy_to_user(arg, &buf).is_err() { return -14; }
             0
@@ -179,11 +194,15 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     }
 }
 
+// ── dup2 / dup3 ───────────────────────────────────────────────────────────────────
+
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
     if oldfd == newfd { return oldfd as isize; }
+    // Close newfd (including its metadata) before duplicating.
     sys_close_fd(newfd);
     let r = vfs::dup_as(oldfd, newfd);
     if r >= 0 {
+        // Propagate cloexec flag from source to duplicate.
         let cloexec = is_cloexec(oldfd);
         set_cloexec(newfd, cloexec);
     }
@@ -196,6 +215,8 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     if r >= 0 && flags & O_CLOEXEC != 0 { set_cloexec(newfd, true); }
     r
 }
+
+// ── nonblock ───────────────────────────────────────────────────────────────────────
 
 pub fn set_nonblock(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().nonblock = val;

@@ -12,7 +12,6 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     if !validate_user_ptr(buf_va, count) { return -14; }
     let mut kbuf = alloc::vec![0u8; count];
     let n: isize;
-    // stdin (fd 0) → TTY line discipline
     if fd == 0 {
         n = crate::shell::tty::read_line(&mut kbuf);
     } else if crate::fs::devfs::get_dev_fd(fd).is_some() {
@@ -31,7 +30,6 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     if !validate_user_ptr(buf_va, count) { return -14; }
     let mut kbuf = alloc::vec![0u8; count];
     if copy_from_user(&mut kbuf, buf_va).is_err() { return -14; }
-    // stdout/stderr (fd 1/2) → TTY
     if fd == 1 || fd == 2 {
         return crate::shell::tty::write(&kbuf);
     }
@@ -59,8 +57,10 @@ pub fn sys_open(path_va: usize, flags: u32, _mode: u32) -> isize {
 pub fn sys_close(fd: usize) -> isize {
     if crate::fs::devfs::get_dev_fd(fd).is_some() {
         crate::fs::devfs::close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
         return 0;
     }
+    crate::fs::fcntl::close_fd_meta(fd);
     vfs::close(fd)
 }
 
@@ -68,7 +68,6 @@ pub fn sys_close(fd: usize) -> isize {
 pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
     if !validate_user_ptr(buf_va, count) { return -14; }
-    // Seek, read into kernel buffer, copy out.
     let saved = vfs::seek(fd, 0, vfs::SEEK_CUR) as i64;
     vfs::seek(fd, offset, vfs::SEEK_SET);
     let mut kbuf = alloc::vec![0u8; count];
@@ -82,18 +81,15 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
 /// sys_writev(fd, iov_va, iovcnt)  [NR 20]
 pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     if iovcnt == 0 { return 0; }
-    if iovcnt > 1024 { return -22; } // EINVAL
-    // Validate the entire iovec array before touching any element.
+    if iovcnt > 1024 { return -22; }
     if !validate_user_ptr(iov_va, iovcnt * 16) { return -14; }
     let mut total: isize = 0;
     for i in 0..iovcnt {
-        // Copy one {base: usize, len: usize} iovec from user.
         let mut iov_buf = [0u8; 16];
         if copy_from_user(&mut iov_buf, iov_va + i * 16).is_err() { return -14; }
         let base = usize::from_le_bytes(iov_buf[0..8].try_into().unwrap());
         let len  = usize::from_le_bytes(iov_buf[8..16].try_into().unwrap());
         if len == 0 { continue; }
-        // sys_write validates base/len internally via validate_user_ptr.
         let n = sys_write(fd, base, len);
         if n < 0 { return if total > 0 { total } else { n }; }
         total += n;
@@ -102,7 +98,8 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
 }
 
 /// sys_dup2(oldfd, newfd)  [NR 33]
+/// Delegates to fcntl::sys_dup2 so that the cloexec flag is propagated
+/// correctly — the old direct vfs::dup_as call bypassed that entirely.
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
-    if oldfd == newfd { return newfd as isize; }
-    vfs::dup_as(oldfd, newfd)
+    crate::fs::fcntl::sys_dup2(oldfd, newfd)
 }
