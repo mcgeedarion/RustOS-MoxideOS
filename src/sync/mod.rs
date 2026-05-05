@@ -2,8 +2,10 @@
 //!
 //! ## Contents
 //!
-//! - `futex`: sleep/wake wait-queue table backing the `futex(2)` syscall.
-//!   This is the core primitive that musl pthreads, malloc, and condvars
-//!   all depend on.  See `futex.rs` for the full design commentary.
+//! - `futex`:    sleep/wake wait-queue table backing the `futex(2)` syscall.
+//! - `mutex`:    simple kernel mutex (placeholder).
+//! - `spinlock`: raw spinlock (placeholder).
 
 pub mod futex;
+pub mod mutex;
+pub mod spinlock;
