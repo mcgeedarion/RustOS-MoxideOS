@@ -6,13 +6,11 @@
 //!
 //! A CLONE_VM child:
 //!   - Gets a fresh pid but shares user_satp (CR3) with its parent.
-//!   - Shares the parent's VMA namespace via thread::register_thread.
+//!   - Shares the parent's VMA list (both point to same logical address space).
 //!   - Gets a private kernel stack and Context.
 //!   - Starts at sysret_trampoline with rax=0 (child return value).
-//!   - Has child_tid_va written by child_first_run_hook on first-run.
 //!
-//! Non-CLONE_VM (fork / vfork) is handled by copying user_satp and
-//! owned_pages as before; this file only adds the CLONE_VM fast path.
+//! Non-CLONE_VM (fork / vfork) is handled by fork.rs.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -43,8 +41,7 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 pub const CLONE_DETACHED:       u64 = 0x0040_0000;
 pub const CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
 
-/// clone3_args userspace structure layout (64-bit).
-/// Matches Linux struct clone_args from <linux/sched.h>.
+/// clone3_args userspace structure (Linux ABI, <linux/sched.h>).
 #[repr(C)]
 pub struct CloneArgs {
     pub flags:        u64,
@@ -63,18 +60,20 @@ pub struct CloneArgs {
 // ── sys_clone3 ─────────────────────────────────────────────────────────────
 
 /// clone3(args_va, args_size) -> child_pid / -errno  [NR 435]
-///
-/// Parent returns child_pid > 0.
-/// Child returns 0 via sysret_trampoline (rax slot zeroed in SyscallFrame).
-pub fn sys_clone3(args_va: usize, _args_size: usize) -> isize {
-    // Validate the user pointer before dereferencing.
-    if args_va == 0 || args_va >= USER_SPACE_END
-        || args_va + core::mem::size_of::<CloneArgs>() > USER_SPACE_END
+pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
+    // Validate pointer and size per Linux clone3 ABI.
+    let clone_args_sz = core::mem::size_of::<CloneArgs>();
+    if args_va == 0
+        || args_va >= USER_SPACE_END
+        || args_va + clone_args_sz > USER_SPACE_END
     {
         return -14; // EFAULT
     }
-    let ca: &CloneArgs = unsafe { &*(args_va as *const CloneArgs) };
+    if args_size < clone_args_sz {
+        return -22; // EINVAL: caller's struct is too small
+    }
 
+    let ca: &CloneArgs = unsafe { &*(args_va as *const CloneArgs) };
     let flags       = ca.flags;
     let is_vm_clone = flags & CLONE_VM != 0;
 
@@ -83,19 +82,14 @@ pub fn sys_clone3(args_va: usize, _args_size: usize) -> isize {
 
     let kstack_top = match alloc_kstack() {
         Some(k) => k,
-        None    => return -12, // ENOMEM
+        None    => return -12,
     };
-
     let child_pid = scheduler::next_pid();
 
     let (child_cr3, child_tgid) = scheduler::with_procs(|procs| {
         let par_cr3 = procs.iter().find(|p| p.pid == parent_pid)
                           .map(|p| p.user_satp).unwrap_or(0);
-        if is_vm_clone {
-            (par_cr3, parent_tgid)
-        } else {
-            (par_cr3, child_pid)
-        }
+        if is_vm_clone { (par_cr3, parent_tgid) } else { (par_cr3, child_pid) }
     });
 
     let (parent_rip, parent_rflags) = scheduler::with_procs(|procs| {
@@ -104,11 +98,7 @@ pub fn sys_clone3(args_va: usize, _args_size: usize) -> isize {
              .unwrap_or((0, 0x202))
     });
 
-    let user_rsp = if ca.stack != 0 {
-        (ca.stack + ca.stack_size) as usize
-    } else {
-        0
-    };
+    let user_rsp = if ca.stack != 0 { (ca.stack + ca.stack_size) as usize } else { 0 };
 
     push_syscall_frame(kstack_top, parent_rip, parent_rflags, user_rsp);
 
@@ -119,23 +109,19 @@ pub fn sys_clone3(args_va: usize, _args_size: usize) -> isize {
         ..Context::zero()
     };
 
-    // CLONE_PARENT_SETTID: write child_pid into parent userspace VA.
+    // CLONE_PARENT_SETTID: write child_pid into parent userspace (via uaccess).
     if flags & CLONE_PARENT_SETTID != 0 {
-        let pid_bytes = (child_pid as u32).to_ne_bytes();
-        let _ = copy_to_user(ca.parent_tid as usize, &pid_bytes);
+        let _ = copy_to_user(ca.parent_tid as usize, &(child_pid as u32).to_ne_bytes());
     }
-
-    // CLONE_PIDFD: allocate pidfd and write fd# into parent VA.
+    // CLONE_PIDFD: allocate pidfd, write fd# into parent VA.
     if flags & CLONE_PIDFD != 0 {
         let fd = crate::fs::pidfd::alloc(child_pid);
-        let fd_bytes = (fd as i32).to_ne_bytes();
-        let _ = copy_to_user(ca.pidfd as usize, &fd_bytes);
+        let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
     }
 
     let child_ppid = if flags & CLONE_PARENT != 0 {
         scheduler::with_procs(|procs| {
-            procs.iter().find(|p| p.pid == parent_pid)
-                 .map(|p| p.ppid).unwrap_or(1)
+            procs.iter().find(|p| p.pid == parent_pid).map(|p| p.ppid).unwrap_or(1)
         })
     } else if flags & CLONE_THREAD != 0 {
         parent_tgid
@@ -159,40 +145,29 @@ pub fn sys_clone3(args_va: usize, _args_size: usize) -> isize {
         child.child_tid_va  = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
         child.child_tid_val = child_pid as u32;
         child.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
+        // CLONE_VM threads share the parent's VMA list; copy it for non-VM clones.
+        if !is_vm_clone {
+            // vmas already cloned from parent by the cloned() call above
+        } else {
+            // Thread: vmas are logically shared but we keep a copy in each PCB
+            // for simplicity (writes go through mmap which updates all threads
+            // sharing the same user_satp). Future work: use Arc<Mutex<Vec<Vma>>>.
+        }
         child
     });
 
-    if is_vm_clone {
-        thread::register_thread(child_pid, child_tgid);
-    }
+    if is_vm_clone { thread::register_thread(child_pid, child_tgid); }
     scheduler::enqueue(child_pcb);
-
-    if flags & CLONE_VFORK != 0 {
-        scheduler::suspend_current_until_child_exec(child_pid);
-    }
+    if flags & CLONE_VFORK != 0 { scheduler::suspend_current_until_child_exec(child_pid); }
 
     child_pid as isize
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Push a zeroed SyscallFrame (17 × 8 = 136 bytes) below kstack_top.
-/// sysret_trampoline pops this frame and issues SYSRETQ into user mode.
-///
-/// Frame slots (index → register):
-///   0–5  → r15–rbx (callee-saved, zeroed)
-///   6    → rax = 0  (child return value)
-///   7–12 → rdi–r9   (argument regs, zeroed)
-///   13   → rcx = rip  (SYSRETQ reads user RIP from RCX)
-///   14   → r11 = rflags
-///   15   → rsp = user_rsp
-///   16   → rip  (context-switch mirror)
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
-    const FRAME_SLOTS: usize = 17;
-    const FRAME_SZ:    usize = FRAME_SLOTS * 8;
+    const FRAME_SZ: usize = 17 * 8;
     let base = kstack_top - FRAME_SZ;
-
-    // Zero the entire frame first, then patch the non-zero slots.
     unsafe {
         core::ptr::write_bytes(base as *mut u8, 0, FRAME_SZ);
         let p = base as *mut usize;
@@ -204,10 +179,14 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
 }
 
 fn make_blank_pcb() -> Pcb {
+    use crate::proc::process::Pcb;
     Pcb {
         pid: 0, ppid: 0, state: State::Ready, exit_code: 0,
         caps: crate::security::CapSet,
         pc: 0, sp: 0, user_satp: 0, kernel_satp: 0, trapframe_pa: 0,
+        vmas: Vec::new(),
+        next_va: Pcb::INITIAL_NEXT_VA,
+        brk:     Pcb::INITIAL_BRK,
         kstack_top: 0, ctx: Context::zero(), owned_pages: Vec::new(),
         child_tid_va: 0, child_tid_val: 0, clear_child_tid_va: 0,
         exit_signal: 17, vfork_parent: 0,

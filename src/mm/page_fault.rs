@@ -1,29 +1,43 @@
 //! Demand-paging fault handler.
 //!
 //! Called from the arch IDT/trap handler when:
-//!   - error_code bit 0 (P) == 0   → page not present
-//!   - error_code bit 2 (U) == 1   → fault in user mode
+//!   - error_code bit 0 (P) == 0  — page not present
+//!   - error_code bit 2 (U) == 1  — fault in user mode
 //!
 //! Arch-neutral: uses arch::Arch (Paging trait) throughout.
 
 use crate::arch::{Arch, api::{Paging, PageFlags}};
-use crate::mm::mmap::{find_vma, VmaKind, PROT_WRITE, PROT_EXEC};
+use crate::mm::mmap::{VmaKind, PROT_WRITE, PROT_EXEC};
 use crate::mm::pmm::alloc_page;
-use crate::proc::{scheduler, thread};
+use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
 /// Try to resolve a not-present user fault at `faulting_va`.
-/// Returns true if the fault was handled; false if SIGSEGV should be sent.
+/// Returns `true` if the fault was handled; `false` if SIGSEGV should be sent.
 pub fn handle_demand_fault(faulting_va: usize) -> bool {
     let page_va = faulting_va & PAGE_MASK;
-    let pid     = thread::vma_pid(scheduler::current_pid());
 
-    let vma = match find_vma(pid, faulting_va) {
-        Some(v) => v,
-        None    => return false,
+    // Look up the faulting process's VMA list and CR3 in one lock window.
+    let (vma, user_cr3) = {
+        let pid = scheduler::current_pid();
+        let result = scheduler::with_procs(|procs| {
+            procs.iter().find(|p| p.pid == pid).and_then(|p| {
+                let vma = p.vmas.iter()
+                    .find(|v| v.start <= faulting_va && faulting_va < v.end)
+                    .cloned();
+                vma.map(|v| (v, p.user_satp))
+            })
+        });
+        match result {
+            Some(pair) => pair,
+            None       => return false,
+        }
     };
+
+    // Only map into the process's own address space, never kernel_cr3.
+    if user_cr3 == 0 { return false; }
 
     let pa = match alloc_page() {
         Some(p) => p,
@@ -41,14 +55,14 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             let _ = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_pos as i64);
         }
         VmaKind::Fixed => {
+            // Fixed kernel regions are pre-mapped; fault = access violation.
             crate::mm::pmm::free_page(pa);
             return false;
         }
     }
 
     let flags = prot_to_flags(vma.prot);
-    let cr3   = <Arch as Paging>::kernel_cr3();
-    <Arch as Paging>::map_page(cr3, page_va, pa, flags);
+    <Arch as Paging>::map_page(user_cr3, page_va, pa, flags);
     <Arch as Paging>::flush_va(page_va);
     true
 }
