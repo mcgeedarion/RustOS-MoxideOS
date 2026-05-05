@@ -1,10 +1,12 @@
 pub mod clone;
 pub mod context;
 pub mod cow_fault;
+pub mod cwd;
+pub mod dynlink;
 pub mod exec;
 pub mod exit;
 pub mod fork;
-pub mod futex;
+pub mod fork_syscall;
 pub mod nanosleep;
 pub mod process;
 pub mod scheduler;
