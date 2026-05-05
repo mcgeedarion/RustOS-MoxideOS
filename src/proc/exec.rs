@@ -55,7 +55,7 @@ const MAX_CSTR_LEN: usize = 4096;
 /// Maximum number of pointer-array entries for argv / envp.
 const MAX_CSTR_ARRAY: usize = 1024;
 
-// ── free_old_address_space ────────────────────────────────────────────────
+// ── free_old_address_space ────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
@@ -101,7 +101,7 @@ unsafe fn free_old_address_space(cr3: usize) {
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn free_old_address_space(_cr3: usize) {}
 
-// ── spawn_user_process ───────────────────────────────────────────────────
+// ── spawn_user_process ─────────────────────────────────────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
@@ -165,7 +165,10 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         Err(_)  => { unsafe { free_old_address_space(new_cr3); } return false; }
     };
 
-    let kstack_top = alloc_kstack();
+    let kstack_top = match alloc_kstack() {
+        Some(k) => k,
+        None    => { unsafe { free_old_address_space(new_cr3); } return false; }
+    };
     let pid  = scheduler::next_pid();
     let ppid = scheduler::current_pid();
 
@@ -175,27 +178,26 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     { ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize; }
 
     let pcb = crate::proc::process::Pcb {
-        pid, ppid,
-        state:               crate::proc::process::State::Ready,
-        exit_code:           0,
-        caps:                CapSet::empty(),
-        pc:                  entry_va,
-        sp:                  initial_rsp,
-        user_satp:           new_cr3,
-        kernel_satp:         0,
-        trapframe_pa:        0,
+        pid,
+        ppid,
+        tgid:        pid, // fresh process: tgid == pid
+        state:       crate::proc::process::State::Ready,
+        exit_code:   0,
+        caps:        CapSet::empty(),
+        pc:          entry_va,
+        sp:          initial_rsp,
+        user_satp:   new_cr3,
         kstack_top,
         ctx,
-        owned_pages:         alloc::vec![],
+        vmas:        alloc::vec![],
+        next_va:     crate::proc::process::Pcb::INITIAL_NEXT_VA,
+        brk:         crate::proc::process::Pcb::INITIAL_BRK,
         child_tid_va:        0,
         child_tid_val:       0,
         clear_child_tid_va:  0,
         exit_signal:         17,
         vfork_parent:        0,
         signal_handlers:     SignalHandlers::default(),
-        vmas:                alloc::vec![],
-        next_va:             0x0001_0000_0000,
-        brk:                 0,
     };
 
     scheduler::enqueue(pcb);
@@ -206,7 +208,7 @@ pub fn sys_execve_from_path(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ───────────────────────────────────────────────────
+// ── sys_execve [NR 59] ─────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
@@ -220,7 +222,7 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
     }
 }
 
-// ── do_execve ─────────────────────────────────────────────────────────────
+// ── do_execve ───────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(path: &str, argv: &[String], envp: &[String],
@@ -268,9 +270,8 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         );
     }
 
-    let old_cr3 = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-    });
+    // O(log n) fetch of old CR3 — no scan.
+    let old_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     let pid_key = thread::vma_pid(pid);
     mmap::clear_vmas(pid_key);
     if old_cr3 != 0 && old_cr3 != new_cr3 {
@@ -283,24 +284,22 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     )?;
 
-    let vfork_parent = scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.user_satp       = new_cr3;
-            p.pc              = entry_va;
-            p.sp              = initial_rsp;
-            p.signal_handlers = SignalHandlers::default();
-            let vfp            = p.vfork_parent;
-            p.vfork_parent    = 0;
-            p.vmas            = alloc::vec![];
-            p.next_va         = 0x0001_0000_0000;
-            p.brk             = 0;
-            vfp
-        } else { 0 }
-    });
+    // Single with_proc_mut: update PCB and extract vfork_parent atomically.
+    let vfork_parent = scheduler::with_proc_mut(pid, |p| {
+        p.user_satp       = new_cr3;
+        p.pc              = entry_va;
+        p.sp              = initial_rsp;
+        p.signal_handlers = SignalHandlers::default();
+        p.vmas            = alloc::vec![];
+        p.next_va         = crate::proc::process::Pcb::INITIAL_NEXT_VA;
+        p.brk             = crate::proc::process::Pcb::INITIAL_BRK;
+        let vfp            = p.vfork_parent;
+        p.vfork_parent    = 0;
+        vfp
+    }).unwrap_or(0);
 
-    let kst = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.kstack_top)
-    });
+    // update_rsp0 needs kstack_top — one O(log n) lookup.
+    let kst = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
     if kst != 0 { update_rsp0(kst); }
 
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
@@ -314,7 +313,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     Ok(())
 }
 
-// ── build_initial_stack ───────────────────────────────────────────────────
+// ── build_initial_stack ───────────────────────────────────────────────────────────
 // CR3 must already be loaded to new_cr3 before calling this.
 // Writes directly to user VAs (valid because CR3 is active).
 
@@ -368,7 +367,6 @@ fn build_initial_stack(
     let rsp_raw        = string_va_base - ptrtable_bytes;
     let initial_rsp    = rsp_raw & !0xF;
 
-    // CR3 is active — writes to user VAs land in the new address space.
     unsafe {
         core::ptr::copy_nonoverlapping(
             string_buf.as_ptr(),
@@ -389,7 +387,7 @@ fn build_initial_stack(
     Ok(initial_rsp)
 }
 
-// ── load_interpreter ──────────────────────────────────────────────────────
+// ── load_interpreter ───────────────────────────────────────────────────────────────
 
 fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     let fd  = vfs::open(interp_path, vfs::O_RDONLY).map_err(|e| e)?;
@@ -404,25 +402,19 @@ fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── string helpers ────────────────────────────────────────────────────────
+// ── string helpers ────────────────────────────────────────────────────────────────
 
 /// Read a NUL-terminated string from user VA `va` into a kernel String.
 /// Uses copy_from_user to avoid raw user pointer dereference.
-/// Returns None if the VA is out of range, copy fails, or no NUL within
-/// MAX_CSTR_LEN bytes.
 pub fn read_cstr_safe(va: usize) -> Option<String> {
     if va < 0x1000 || va > 0x0000_7FFF_FFFF_F000 { return None; }
     let mut buf = [0u8; MAX_CSTR_LEN];
-    // copy_from_user may copy fewer bytes if the region is partially mapped;
-    // we tolerate any partial success and scan for NUL in what we got.
     copy_from_user(&mut buf, va).ok()?;
     let nul = buf.iter().position(|&b| b == 0)?;
     String::from_utf8(buf[..nul].to_vec()).ok()
 }
 
 /// Read a NUL-pointer-terminated argv/envp array from user VA `array_va`.
-/// Each slot is a usize pointer; the array ends at a NULL entry.
-/// Uses copy_from_user for both the pointer slots and the strings.
 pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
     let mut out = Vec::new();
     if array_va < 0x1000 { return out; }
@@ -435,4 +427,10 @@ pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
         if let Some(s) = read_cstr_safe(ptr) { out.push(s); }
     }
     out
+}
+
+// ── clear_vmas helper (called from do_execve) ──────────────────────────────────────
+
+pub fn clear_vmas(pid_key: u32) {
+    crate::mm::mmap::clear_vmas_pub(pid_key as usize);
 }

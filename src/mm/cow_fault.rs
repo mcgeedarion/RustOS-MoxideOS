@@ -6,7 +6,7 @@ use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
 
-// ── clone_for_fork ───────────────────────────────────────────────────────
+// ── clone_for_fork ───────────────────────────────────────────────────────────
 
 /// Create a CoW copy of the parent's address space for a fork() child.
 /// Returns the child's CR3 physical address, or 0 on OOM.
@@ -23,7 +23,7 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
     child_cr3
 }
 
-// ── handle_cow_fault ──────────────────────────────────────────────────────
+// ── handle_cow_fault ─────────────────────────────────────────────────────
 
 /// Handle a write fault that may be a CoW page.
 /// Returns true if resolved; false if genuine access violation.
@@ -31,13 +31,9 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     // P=1, W=1, U=1  (x86-64 page-fault error code bits 0-2)
     if error_code & 0x7 != 0x7 { return false; }
 
-    // Get the current process's user CR3.
-    // The fault fires in user context so the faulting VA lives in the
-    // *user* address space — kernel_cr3() would have no mapping for it.
     let pid = scheduler::current_pid();
-    let cr3 = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-    });
+    // O(log n) fetch — this runs on every CoW write fault.
+    let cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if cr3 == 0 { return false; }
 
     let old_pa = match <Arch as Paging>::virt_to_phys(cr3, faulting_va) {
@@ -54,7 +50,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
 
     let new_pa = match pmm::alloc_page() {
         Some(p) => p,
-        None    => return false, // OOM: caller may send SIGKILL
+        None    => return false,
     };
 
     unsafe {
@@ -73,7 +69,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     true
 }
 
-// ── low-level PTE read (x86-64 4-level paging) ───────────────────────────
+// ── low-level PTE read (x86-64 4-level paging) ───────────────────────────────
 
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT:   u64 = 1;
