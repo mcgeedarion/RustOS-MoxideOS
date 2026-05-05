@@ -25,7 +25,7 @@ use crate::proc::process::State;
 use crate::proc::{scheduler, thread, wait};
 use crate::uaccess::copy_to_user;
 
-// ── clear_child_tid ────────────────────────────────────────────────────────────────────
+// ── clear_child_tid ────────────────────────────────────────────────────────────────────────────
 
 fn clear_child_tid(pid: usize) {
     let va = scheduler::with_proc_mut(pid, |p| {
@@ -38,24 +38,20 @@ fn clear_child_tid(pid: usize) {
     futex_wake_addr(va, 1);
 }
 
-// ── is_last_live_thread ────────────────────────────────────────────────────────────────
-//
-// Returns true if `pid` is the last non-Zombie thread in its thread group.
-// Requires a full scan — no pid-keyed shortcut possible here.
+// ── is_last_live_thread ─────────────────────────────────────────────────────────────────────
 
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
-    scheduler::with_procs(|procs| {
+    // Read-only scan: use with_procs_ro to avoid exposing &mut unnecessarily.
+    scheduler::with_procs_ro(|procs| {
         !procs.iter().any(|p| {
             p.pid != pid && p.tgid == tgid && p.state != State::Zombie
         })
     })
 }
 
-// ── zombify ────────────────────────────────────────────────────────────────────────────
+// ── zombify ───────────────────────────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
-    // Fetch kstack_top, mark Zombie, record exit_code, return vfork_parent
-    // — all in one lock window instead of two.
     let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p| {
         let ks = p.kstack_top;
         p.kstack_top = 0;
@@ -68,7 +64,7 @@ fn zombify(pid: usize, code: i32) -> usize {
     vfork_parent
 }
 
-// ── do_exit ─────────────────────────────────────────────────────────────────────────────
+// ── do_exit ────────────────────────────────────────────────────────────────────────────────
 
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
@@ -76,14 +72,10 @@ pub fn do_exit(pid: usize, code: i32) {
     clear_child_tid(pid);           // 1
     thread::unregister_thread(pid); // 2
 
-    // 3: Release per-pid entries in syscall-level tables.
-    //    futex_clear_pid prevents waiter leaks when a process exits while
-    //    blocked on a futex (e.g. SIGKILL mid-futex_wait).
     crate::syscall::altstack_clear_pid(pid);
     crate::syscall::proc_name_clear(pid);
     crate::sync::futex::futex_clear_pid(pid);
 
-    // 4: free address space only when the last live thread exits.
     if is_last_live_thread(pid, tgid) {
         let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
         free_address_space(pid, user_satp);
@@ -97,20 +89,20 @@ pub fn do_exit(pid: usize, code: i32) {
     loop { <Arch as Cpu>::halt(); }
 }
 
-// ── sys_exit [NR 60] ──────────────────────────────────────────────────────────────────────
+// ── sys_exit [NR 60] ───────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_exit(status: i32) -> isize {
     do_exit(scheduler::current_pid(), status);
     0
 }
 
-// ── sys_exit_group [NR 231] ──────────────────────────────────────────────────────────────────
+// ── sys_exit_group [NR 231] ────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
-    let siblings: alloc::vec::Vec<usize> = scheduler::with_procs(|procs| {
+    let siblings: alloc::vec::Vec<usize> = scheduler::with_procs_ro(|procs| {
         procs.iter()
             .filter(|p| p.pid != pid && p.tgid == tgid)
             .map(|p| p.pid)
@@ -123,7 +115,9 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::syscall::altstack_clear_pid(sibling);
         crate::syscall::proc_name_clear(sibling);
         crate::sync::futex::futex_clear_pid(sibling);
-        let _ = zombify(sibling, status);
+        // Wake the sibling's vfork parent if it is waiting.
+        let vfork_parent = zombify(sibling, status);
+        if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
         wait::notify_exit(sibling);
     }
 
