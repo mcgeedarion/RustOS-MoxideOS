@@ -23,24 +23,25 @@
 
 extern crate alloc;
 use crate::fs::vfs;
+use crate::uaccess::{copy_to_user, validate_user_ptr};
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 
 // fcntl commands
-pub const F_DUPFD:          i32 = 0;
-pub const F_GETFD:          i32 = 1;
-pub const F_SETFD:          i32 = 2;
-pub const F_GETFL:          i32 = 3;
-pub const F_SETFL:          i32 = 4;
-pub const F_GETLK:          i32 = 5;
-pub const F_SETLK:          i32 = 6;
-pub const F_SETLKW:         i32 = 7;
-pub const F_SETOWN:         i32 = 8;
-pub const F_GETOWN:         i32 = 9;
-pub const F_SETSIG:         i32 = 10;
-pub const F_DUPFD_CLOEXEC:  i32 = 1030;
-pub const F_ADD_SEALS:      i32 = 1033;
-pub const F_GET_SEALS:      i32 = 1034;
+pub const F_DUPFD:         i32 = 0;
+pub const F_GETFD:         i32 = 1;
+pub const F_SETFD:         i32 = 2;
+pub const F_GETFL:         i32 = 3;
+pub const F_SETFL:         i32 = 4;
+pub const F_GETLK:         i32 = 5;
+pub const F_SETLK:         i32 = 6;
+pub const F_SETLKW:        i32 = 7;
+pub const F_SETOWN:        i32 = 8;
+pub const F_GETOWN:        i32 = 9;
+pub const F_SETSIG:        i32 = 10;
+pub const F_DUPFD_CLOEXEC: i32 = 1030;
+pub const F_ADD_SEALS:     i32 = 1033;
+pub const F_GET_SEALS:     i32 = 1034;
 
 // fd flags
 pub const FD_CLOEXEC: i32 = 1;
@@ -53,6 +54,9 @@ pub const O_NONBLOCK: i32 = 2048;
 pub const O_APPEND:   i32 = 1024;
 pub const O_CLOEXEC:  i32 = 524288;
 
+// F_UNLCK value written into the l_type field of struct flock.
+const F_UNLCK: u16 = 2;
+
 // Per-fd metadata (cloexec flag, nonblock flag, file status flags, owner)
 #[derive(Clone, Default)]
 struct FdMeta {
@@ -62,12 +66,11 @@ struct FdMeta {
     pub owner_pid: i32,
 }
 
-static FD_META:  Mutex<BTreeMap<usize, FdMeta>>  = Mutex::new(BTreeMap::new());
+static FD_META:  Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
 /// Maps fd# -> owning process pid (0 = unowned / legacy).
-static FD_OWNER: Mutex<BTreeMap<usize, usize>>   = Mutex::new(BTreeMap::new());
+static FD_OWNER: Mutex<BTreeMap<usize, usize>>  = Mutex::new(BTreeMap::new());
 
-// ── cloexec / nonblock / fl_flags ─────────────────────────────────────────
-
+// ── cloexec / nonblock / fl_flags ────────────────────────────────────────────────
 pub fn set_cloexec(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().cloexec = val;
 }
@@ -85,17 +88,13 @@ pub fn close_fd_meta(fd: usize) {
     FD_OWNER.lock().remove(&fd);
 }
 
-// ── fd ownership (used by pidfd_getfd) ────────────────────────────────────
-
-/// Record that `fd` is owned by `pid`.
+// ── fd ownership (used by pidfd_getfd) ─────────────────────────────────────────
 pub fn set_fd_owner(fd: usize, pid: usize) {
     FD_OWNER.lock().insert(fd, pid);
 }
-/// Return the owning pid of `fd`, or 0 if unowned (any process may access).
 pub fn fd_owner(fd: usize) -> usize {
     FD_OWNER.lock().get(&fd).copied().unwrap_or(0)
 }
-/// Clear ownership record on close.
 pub fn clear_fd_owner(fd: usize) {
     FD_OWNER.lock().remove(&fd);
 }
@@ -113,17 +112,16 @@ pub fn close_on_exec() {
 }
 
 fn sys_close_fd(fd: usize) {
-    // pidfd check first: pidfd fds (1024+) are not in the vfs FD_TABLE
     if crate::fs::pidfd::is_pidfd(fd) {
         crate::fs::pidfd::free(fd);
         clear_fd_owner(fd);
         close_fd_meta(fd);
         return;
     }
-    if crate::fs::timerfd::is_timerfd(fd) { crate::fs::timerfd::sys_close_tfd(fd); return; }
-    if crate::fs::signalfd::is_signalfd(fd) { crate::fs::signalfd::sys_close_sfd(fd); return; }
-    if crate::fs::eventfd::is_eventfd(fd) { crate::fs::eventfd::sys_close_efd(fd); return; }
-    if crate::fs::pipe::is_pipe(fd) { crate::fs::pipe::sys_close_pipe(fd); return; }
+    if crate::fs::timerfd::is_timerfd(fd)  { crate::fs::timerfd::sys_close_tfd(fd);    return; }
+    if crate::fs::signalfd::is_signalfd(fd) { crate::fs::signalfd::sys_close_sfd(fd);  return; }
+    if crate::fs::eventfd::is_eventfd(fd)   { crate::fs::eventfd::sys_close_efd(fd);   return; }
+    if crate::fs::pipe::is_pipe(fd)         { crate::fs::pipe::sys_close_pipe(fd);     return; }
     vfs::close(fd);
 }
 
@@ -148,10 +146,15 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             0
         }
         F_GETLK => {
-            if arg != 0 {
-                unsafe { core::ptr::write_bytes(arg as *mut u8, 0, 32); }
-                unsafe { *(arg as *mut u16) = 2; } // F_UNLCK
-            }
+            // Stub: report all locks as not held (F_UNLCK).
+            // Build the struct flock response in a kernel buffer and
+            // copy_to_user — never write raw to an unvalidated user pointer.
+            if arg == 0 { return 0; }
+            if !validate_user_ptr(arg, 32) { return -14; }
+            let mut buf = [0u8; 32];
+            // l_type is the first field (u16 at offset 0); set to F_UNLCK.
+            buf[0..2].copy_from_slice(&F_UNLCK.to_le_bytes());
+            if copy_to_user(arg, &buf).is_err() { return -14; }
             0
         }
         F_SETLK | F_SETLKW => 0,
@@ -194,12 +197,9 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     r
 }
 
-/// Set O_NONBLOCK flag on fd.
 pub fn set_nonblock(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().nonblock = val;
 }
-
-/// Check whether O_NONBLOCK is set on fd.
 pub fn is_nonblock(fd: usize) -> bool {
     FD_META.lock().get(&fd).map(|m| m.nonblock).unwrap_or(false)
 }

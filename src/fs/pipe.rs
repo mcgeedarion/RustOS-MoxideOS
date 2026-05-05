@@ -7,8 +7,9 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
+use crate::uaccess::copy_to_user;
 
-// ── Pipe buffer ──────────────────────────────────────────────────────────
+// ── Pipe buffer ─────────────────────────────────────────────────────────────────
 
 const PIPE_BUF_CAP: usize = 65536;
 
@@ -19,7 +20,7 @@ struct PipeBuf {
 
 type SharedPipe = Arc<Mutex<PipeBuf>>;
 
-// ── Pipe FD table ─────────────────────────────────────────────────────
+// ── Pipe FD table ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum PipeEnd { Read, Write }
@@ -44,7 +45,7 @@ fn alloc_pipe_fd(pfd: PipeFd) -> Option<usize> {
     None
 }
 
-// ── Public query helpers ───────────────────────────────────────────────
+// ── Public query helpers ─────────────────────────────────────────────────────────
 
 pub fn is_pipe_fd(fdno: usize) -> bool {
     if fdno < PIPE_FD_BASE || fdno >= PIPE_FD_BASE + PIPE_TABLE_SIZE { return false; }
@@ -52,7 +53,6 @@ pub fn is_pipe_fd(fdno: usize) -> bool {
 }
 
 /// poll readiness for a pipe fd.
-/// Called from poll::fd_ready.
 pub fn pipe_poll(fdno: usize, events: u32) -> u32 {
     use crate::fs::poll::{POLLIN, POLLOUT, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM};
     let idx = fdno - PIPE_FD_BASE;
@@ -62,7 +62,7 @@ pub fn pipe_poll(fdno: usize, events: u32) -> u32 {
     match pfd.end {
         PipeEnd::Read => {
             if !inner.write_open && inner.data.is_empty() {
-                return POLLHUP; // writer closed, no data — EOF
+                return POLLHUP;
             }
             let mut r = 0u32;
             if events & POLLIN != 0 && !inner.data.is_empty() {
@@ -128,24 +128,32 @@ pub fn pipe_close(fdno: usize) -> bool {
     } else { false }
 }
 
-// ── sys_pipe / sys_pipe2 ───────────────────────────────────────────────
+// ── sys_pipe / sys_pipe2 ───────────────────────────────────────────────────────
 
 pub fn sys_pipe(pipefd_va: usize) -> isize { sys_pipe2(pipefd_va, 0) }
 
 pub fn sys_pipe2(pipefd_va: usize, _flags: u32) -> isize {
-    if pipefd_va == 0 || pipefd_va < 0x1000 { return -14; }
+    if !crate::uaccess::validate_user_ptr(pipefd_va, 8) { return -14; }
+
     let buf = Arc::new(Mutex::new(PipeBuf { data: Vec::new(), write_open: true }));
     let read_fd = match alloc_pipe_fd(PipeFd { buf: buf.clone(), end: PipeEnd::Read }) {
-        Some(fd) => fd, None => return -24,
+        Some(fd) => fd,
+        None => return -24, // EMFILE
     };
     let write_fd = match alloc_pipe_fd(PipeFd { buf, end: PipeEnd::Write }) {
         Some(fd) => fd,
         None => { pipe_close(read_fd); return -24; }
     };
-    unsafe {
-        let p = pipefd_va as *mut i32;
-        p.add(0).write_volatile(read_fd  as i32);
-        p.add(1).write_volatile(write_fd as i32);
+
+    // Write [read_fd, write_fd] as two i32 LE values via copy_to_user.
+    // On failure, close both fds to avoid leaking them.
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&(read_fd  as i32).to_le_bytes());
+    out[4..8].copy_from_slice(&(write_fd as i32).to_le_bytes());
+    if copy_to_user(pipefd_va, &out).is_err() {
+        pipe_close(read_fd);
+        pipe_close(write_fd);
+        return -14; // EFAULT
     }
     0
 }
