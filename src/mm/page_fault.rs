@@ -64,19 +64,24 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             // alloc_page() guarantees zero-filled pages; nothing more needed.
         }
         VmaKind::FileBacked(fd, base_offset) => {
-            // Zero first: alloc_page() zero-fills, but we document explicitly
-            // that pread may not fill the whole page.
+            // Zero first so any unread suffix (partial page at EOF) is clean.
             unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
 
             let file_off = (*base_offset + (page_va - vma.start) as u64) as i64;
             let n = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_off);
 
-            // Any result < PAGE_SIZE means the file could not back this page:
-            //   n <  0          — I/O error
-            //   n == 0          — EOF with no bytes read
-            //   0 < n < PAGE_SIZE — partial read (page extends beyond file end)
-            // All three cases require SIGBUS per POSIX.
-            if (n as usize) < PAGE_SIZE {
+            // Determine if the read fully satisfied the page:
+            //   n <  0              — I/O error (e.g. EBADF, EIO)
+            //   n == 0              — EOF with no bytes read
+            //   0 < n < PAGE_SIZE   — partial read (beyond end of file)
+            //   n == PAGE_SIZE      — full page — success
+            //
+            // NOTE: check n < 0 first. A negative isize cast directly to
+            // usize wraps to a value near usize::MAX (e.g. -5isize as usize
+            // == 0xFFFFFFFFFFFFFFFB), which is larger than PAGE_SIZE and
+            // would make the `< PAGE_SIZE` check pass incorrectly, silently
+            // mapping a zero page instead of delivering SIGBUS.
+            if n < 0 || (n as usize) < PAGE_SIZE {
                 free_page(pa);
                 send_signal_info(pid, SigInfo {
                     sig:  SIGBUS,
