@@ -19,8 +19,11 @@
 //!   _KERNEL_START = 0x400000 (load address from x86_64.ld).
 //!   _kernel_end   = extern symbol set by the linker.
 //!
-//! ## New functions added
-//!   pmm_add_region(base: u64, size: u64)  — feed a usable RAM range
+//! ## Functions
+//!   alloc_page()                          — allocate one page
+//!   free_page(pa)                         — return a page
+//!   reserve_bump_range(n) -> Option<usize>— allocate n contiguous bump pages
+//!   pmm_add_region(base, size)            — feed a usable RAM range
 //!   total_pages() -> usize                — total pages known to PMM
 //!   free_pages()  -> usize                — pages currently free
 
@@ -79,6 +82,31 @@ pub fn free_page(pa: usize) {
     FREE_LIST.lock().push(pa);
 }
 
+/// Reserve `n` **contiguous** pages from the bump pool in one atomic step.
+///
+/// Returns the base physical address of the range, or `None` if the pool
+/// would be exhausted.  Panics if the free list is already non-empty,
+/// which would indicate that `pmm_add_region` was called first (breaking
+/// the calling-order invariant required by `heap_init`).
+///
+/// Because this carves directly from POOL with a single fetch_add, all
+/// returned pages are physically adjacent with no gaps.
+pub fn reserve_bump_range(n: usize) -> Option<usize> {
+    // Enforce calling-order invariant: free list must be empty.
+    assert!(
+        FREE_LIST.lock().is_empty(),
+        "reserve_bump_range called after pmm_add_region — heap contiguity broken"
+    );
+    let idx = BUMP.fetch_add(n, Ordering::Relaxed);
+    if idx + n > POOL_PAGES {
+        // Roll back — no pages were handed out yet.
+        BUMP.fetch_sub(n, Ordering::Relaxed);
+        return None;
+    }
+    let pa = POOL.0.as_ptr() as usize + idx * PAGE_SIZE;
+    Some(pa)
+}
+
 // ── Memory map ingestion (Phase 2) ────────────────────────────────────────
 
 /// Register a usable physical memory region with the PMM.
@@ -101,20 +129,23 @@ pub fn pmm_add_region(base: u64, size: u64) {
     let end   = (base + size) & !(PAGE_SIZE as u64 - 1);
     if start >= end { return; }
 
-    let mut added = 0usize;
+    // Collect pages into a temporary Vec, then lock once to extend.
+    // This avoids acquiring and releasing the Mutex once per page
+    // (which would be ~1 million lock cycles for a 4 GiB region).
+    let mut batch: Vec<usize> = Vec::new();
     let mut pa = start;
     while pa + PAGE_SIZE as u64 <= end {
         let pa_end = pa + PAGE_SIZE as u64;
-        // Skip bootstrap pool.
         let in_pool = pa < pool_end && pa_end > pool_start;
-        // Skip kernel image.
         let in_kern = pa < kern_end  && pa_end > kern_start;
         if !in_pool && !in_kern {
-            FREE_LIST.lock().push(pa as usize);
-            added += 1;
+            batch.push(pa as usize);
         }
         pa += PAGE_SIZE as u64;
     }
+
+    let added = batch.len();
+    FREE_LIST.lock().extend(batch);
     TOTAL_PAGES.fetch_add(added, Ordering::Relaxed);
 }
 

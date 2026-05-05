@@ -62,6 +62,8 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
 
     let new_pa = match pmm::alloc_page() {
         Some(p) => p,
+        // OOM: leave the page read-only rather than killing the process
+        // immediately; the caller can send SIGKILL if desired.
         None    => return false,
     };
 
@@ -77,6 +79,10 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     let flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER;
     <Arch as Paging>::map_page(cr3, faulting_va & !0xFFF, new_pa, flags);
     <Arch as Paging>::flush_va(faulting_va & !0xFFF);
+
+    // Release the original physical page now that the VA points to new_pa.
+    // Failure to do this was a silent per-fault page leak.
+    pmm::free_page(old_pa);
 
     true
 }
