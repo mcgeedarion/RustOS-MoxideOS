@@ -1,31 +1,23 @@
 //! Physical memory manager (PMM) — Phase 2: real memory map support.
 //!
-//! ## Two-tier design (unchanged externally)
+//! ## Two-tier design
 //!
 //! Tier 1 — Static bootstrap pool (64 MiB hardcoded).
-//!   Used for all allocations that happen before pmm_add_region() is called
+//!   Used for all allocations before pmm_add_region() is called
 //!   (heap init, page tables, GDT/IDT structures).  The bump index walks
 //!   forward; pages freed during this phase go to the free list.
 //!
 //! Tier 2 — Free list fed by the boot memory map.
 //!   pmm_add_region(base, size) is called once per usable memory range
-//!   from the UEFI memory map or Multiboot2 mmap tag.  It pushes every
-//!   4 KiB-aligned page that doesn't overlap the kernel image onto the
-//!   free list, making all available RAM accessible to alloc_page().
+//!   from the UEFI memory map or Multiboot2 mmap tag.
 //!
 //! ## Kernel image reservation
-//!   We skip pages in [_KERNEL_START, _kernel_end) so we don't hand out
-//!   pages that the kernel binary currently occupies.
-//!   _KERNEL_START = 0x400000 (load address from x86_64.ld).
-//!   _kernel_end   = extern symbol set by the linker.
+//!   Pages in [_KERNEL_START, _kernel_end) are never handed out.
+//!   _KERNEL_START = 0x400000 (x86_64.ld load address).
 //!
-//! ## Functions
-//!   alloc_page()                          — allocate one page
-//!   free_page(pa)                         — return a page
-//!   reserve_bump_range(n) -> Option<usize>— allocate n contiguous bump pages
-//!   pmm_add_region(base, size)            — feed a usable RAM range
-//!   total_pages() -> usize                — total pages known to PMM
-//!   free_pages()  -> usize                — pages currently free
+//! ## Safety invariant
+//!   Every PA on the free list appears exactly once.
+//!   In debug builds, free_page() asserts this before pushing.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
@@ -34,7 +26,7 @@ use alloc::vec::Vec;
 
 // ── Bootstrap pool ────────────────────────────────────────────────────────
 
-const POOL_PAGES: usize = 16_384;   // 64 MiB static pool
+const POOL_PAGES: usize = 16_384; // 64 MiB static pool
 const PAGE_SIZE:  usize = 4096;
 
 #[repr(C, align(4096))]
@@ -42,104 +34,131 @@ struct Pool([u8; POOL_PAGES * PAGE_SIZE]);
 static POOL: Pool = Pool([0u8; POOL_PAGES * PAGE_SIZE]);
 static BUMP: AtomicUsize = AtomicUsize::new(0);
 
-// ── Free list (tier 2) ────────────────────────────────────────────────────
+// ── Free list ───────────────────────────────────────────────────────────────
 
 static FREE_LIST:   Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(POOL_PAGES);
 
-// ── Kernel image extent ───────────────────────────────────────────────────
+// ── Kernel image extent ────────────────────────────────────────────────────
 
 const KERNEL_START_PA: usize = 0x400000;
-extern "C" { static _end: u8; } // provided by x86_64.ld
+extern "C" { static _end: u8; }
 
 #[inline]
-fn kernel_end_pa() -> usize {
-    unsafe { &_end as *const u8 as usize }
+fn kernel_end_pa() -> usize { unsafe { &_end as *const u8 as usize } }
+
+/// True if `pa` falls inside the kernel binary image.
+#[inline]
+fn is_kernel_page(pa: usize) -> bool {
+    pa >= KERNEL_START_PA && pa < kernel_end_pa()
 }
 
-// ── Core allocator ────────────────────────────────────────────────────────
+/// True if `pa` is a valid, page-aligned physical address that the PMM
+/// is allowed to manage (non-zero, non-kernel).
+#[inline]
+fn is_valid_pa(pa: usize) -> bool {
+    pa != 0 && pa & (PAGE_SIZE - 1) == 0 && !is_kernel_page(pa)
+}
+
+// ── Core allocator ─────────────────────────────────────────────────────────
 
 /// Allocate one 4096-byte page. Returns the physical (identity-mapped) address.
 pub fn alloc_page() -> Option<usize> {
-    // Try free list first (tier 2 pages + returned tier 1 pages).
-    if let Some(pa) = FREE_LIST.lock().pop() {
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
-        return Some(pa);
-    }
-    // Fall back to bump pool.
-    let idx = BUMP.fetch_add(1, Ordering::Relaxed);
-    if idx >= POOL_PAGES {
-        BUMP.fetch_sub(1, Ordering::Relaxed);
-        return None;
-    }
-    let pa = POOL.0.as_ptr() as usize + idx * PAGE_SIZE;
+    // Try free list first (tier 2 + returned tier 1 pages).
+    let pa = if let Some(pa) = FREE_LIST.lock().pop() {
+        pa
+    } else {
+        let idx = BUMP.fetch_add(1, Ordering::Relaxed);
+        if idx >= POOL_PAGES {
+            BUMP.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        POOL.0.as_ptr() as usize + idx * PAGE_SIZE
+    };
+    // Zero the page after allocation so callers always get clean memory.
+    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
     Some(pa)
 }
 
 /// Return a page to the free list for reuse.
+///
+/// # Panics (debug builds only)
+/// Panics if `pa` is already on the free list (double-free detection).
+/// Also panics if `pa` is 0, not page-aligned, or inside the kernel image.
 pub fn free_page(pa: usize) {
-    if pa == 0 { return; }
-    FREE_LIST.lock().push(pa);
+    // Always-on bounds checks: these are cheap and catch obvious bugs in
+    // both debug and release builds.
+    if pa == 0 { return; } // silently ignore null
+    assert!(
+        pa & (PAGE_SIZE - 1) == 0,
+        "free_page: PA {:#x} is not page-aligned",
+        pa
+    );
+    assert!(
+        !is_kernel_page(pa),
+        "free_page: PA {:#x} is inside the kernel image [{:#x}, {:#x})",
+        pa, KERNEL_START_PA, kernel_end_pa()
+    );
+
+    let mut list = FREE_LIST.lock();
+
+    // Debug-only duplicate detection. Iterating the whole free list is O(n)
+    // but only active in debug builds where correctness matters more than
+    // throughput. In release builds the assert compiles away entirely.
+    #[cfg(debug_assertions)]
+    assert!(
+        !list.contains(&pa),
+        "free_page: double-free of PA {:#x}",
+        pa
+    );
+
+    list.push(pa);
 }
 
-/// Reserve `n` **contiguous** pages from the bump pool in one atomic step.
+/// Reserve `n` contiguous pages from the bump pool in one atomic step.
 ///
-/// Returns the base physical address of the range, or `None` if the pool
-/// would be exhausted.  Panics if the free list is already non-empty,
-/// which would indicate that `pmm_add_region` was called first (breaking
-/// the calling-order invariant required by `heap_init`).
-///
-/// Because this carves directly from POOL with a single fetch_add, all
-/// returned pages are physically adjacent with no gaps.
+/// Panics if the free list is already non-empty (pmm_add_region was called
+/// first, breaking the heap-contiguity invariant required by heap_init).
 pub fn reserve_bump_range(n: usize) -> Option<usize> {
-    // Enforce calling-order invariant: free list must be empty.
     assert!(
         FREE_LIST.lock().is_empty(),
         "reserve_bump_range called after pmm_add_region — heap contiguity broken"
     );
     let idx = BUMP.fetch_add(n, Ordering::Relaxed);
     if idx + n > POOL_PAGES {
-        // Roll back — no pages were handed out yet.
         BUMP.fetch_sub(n, Ordering::Relaxed);
         return None;
     }
-    let pa = POOL.0.as_ptr() as usize + idx * PAGE_SIZE;
-    Some(pa)
+    Some(POOL.0.as_ptr() as usize + idx * PAGE_SIZE)
 }
 
-// ── Memory map ingestion (Phase 2) ────────────────────────────────────────
+// ── Memory map ingestion ───────────────────────────────────────────────────
 
 /// Register a usable physical memory region with the PMM.
 ///
-/// Call once per "usable" entry from:
-///   - UEFI memory map  (EfiConventionalMemory, type 7)
-///   - Multiboot2 mmap  (entry type 1 = available)
-///
-/// Skips pages that overlap the static bootstrap pool or the kernel image.
-/// Safe to call multiple times with overlapping ranges (deduplication is
-/// not done — callers should only pass non-overlapping usable ranges).
+/// Skips pages overlapping the bootstrap pool, the kernel image, or
+/// that fail the is_valid_pa check (PA 0, non-aligned, etc.).
 pub fn pmm_add_region(base: u64, size: u64) {
     let pool_start = POOL.0.as_ptr() as u64;
     let pool_end   = pool_start + (POOL_PAGES * PAGE_SIZE) as u64;
     let kern_start = KERNEL_START_PA as u64;
     let kern_end   = kernel_end_pa() as u64;
 
-    // Align base up, end down to 4 KiB boundaries.
     let start = (base + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1);
     let end   = (base + size) & !(PAGE_SIZE as u64 - 1);
     if start >= end { return; }
 
-    // Collect pages into a temporary Vec, then lock once to extend.
-    // This avoids acquiring and releasing the Mutex once per page
-    // (which would be ~1 million lock cycles for a 4 GiB region).
+    // Build batch outside the lock to minimise lock hold time.
     let mut batch: Vec<usize> = Vec::new();
     let mut pa = start;
     while pa + PAGE_SIZE as u64 <= end {
-        let pa_end = pa + PAGE_SIZE as u64;
-        let in_pool = pa < pool_end && pa_end > pool_start;
-        let in_kern = pa < kern_end  && pa_end > kern_start;
-        if !in_pool && !in_kern {
-            batch.push(pa as usize);
+        let pa_end   = pa + PAGE_SIZE as u64;
+        let in_pool  = pa < pool_end  && pa_end > pool_start;
+        let in_kern  = pa < kern_end  && pa_end > kern_start;
+        let pa_usize = pa as usize;
+        // Apply the same validity checks as free_page so the list starts clean.
+        if !in_pool && !in_kern && is_valid_pa(pa_usize) {
+            batch.push(pa_usize);
         }
         pa += PAGE_SIZE as u64;
     }
@@ -149,19 +168,8 @@ pub fn pmm_add_region(base: u64, size: u64) {
     TOTAL_PAGES.fetch_add(added, Ordering::Relaxed);
 }
 
-// ── Diagnostics ───────────────────────────────────────────────────────────
+// ── Diagnostics ──────────────────────────────────────────────────────────────
 
-/// Total pages known to the PMM (pool + all added regions).
-pub fn total_pages() -> usize {
-    TOTAL_PAGES.load(Ordering::Relaxed)
-}
-
-/// Pages currently on the free list.
-pub fn free_pages() -> usize {
-    FREE_LIST.lock().len()
-}
-
-/// Bump pages allocated so far (from the static pool).
-pub fn pages_allocated() -> usize {
-    BUMP.load(Ordering::Relaxed)
-}
+pub fn total_pages()     -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
+pub fn free_pages()      -> usize { FREE_LIST.lock().len() }
+pub fn pages_allocated() -> usize { BUMP.load(Ordering::Relaxed) }
