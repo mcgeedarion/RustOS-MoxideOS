@@ -19,7 +19,7 @@ use spin::Mutex;
 
 use crate::proc::scheduler;
 use crate::arch::x86_64::syscall::SyscallFrame;
-use crate::uaccess::{copy_to_user, copy_from_user, USER_SPACE_END};
+use crate::uaccess::{copy_to_user, copy_from_user, validate_user_ptr, USER_SPACE_END};
 
 // ── Signal metadata ────────────────────────────────────────────────────
 
@@ -300,27 +300,37 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     }
 
     let sp = (sp.wrapping_sub(128).wrapping_sub(SIGNAL_FRAME_SIZE)) & !0xF;
+
+    // Validate that the entire signal frame fits in user space before touching it.
+    if !validate_user_ptr(sp, SIGNAL_FRAME_SIZE) {
+        // Can't deliver: re-queue the signal and bail.
+        PENDING.lock().entry(pid).or_default().push_front(info);
+        return;
+    }
+
     let uc_va  = sp;
     let si_va  = sp + UCONTEXT_SIZE;
     let ret_va = sp + UCONTEXT_SIZE + SIGINFO_SIZE;
 
-    unsafe { core::ptr::write_bytes(sp as *mut u8, 0, SIGNAL_FRAME_SIZE); }
+    // Build the entire signal frame in a kernel staging buffer, then
+    // copy it to user space in one call. This avoids direct writes to
+    // arbitrary user VAs if sp has been tampered with.
+    let mut kframe = [0u8; SIGNAL_FRAME_SIZE];
 
-    unsafe {
-        ((uc_va + 16) as *mut usize).write_unaligned(frame.rsp);
-        ((uc_va + 24) as *mut i32 ).write_unaligned(0);
-        ((uc_va + 32) as *mut usize).write_unaligned(0);
-    }
+    // ── ucontext_t ──────────────────────────────────────────────────────────
+    // uc_stack (offset 16): saved rsp
+    kframe[16..24].copy_from_slice(&frame.rsp.to_ne_bytes());
 
     macro_rules! wgreg {
         ($idx:expr, $val:expr) => {
-            unsafe { ((uc_va + greg_off($idx)) as *mut u64).write_unaligned($val as u64); }
+            let off = GREGS_OFFSET + $idx * 8;
+            kframe[off..off+8].copy_from_slice(&($val as u64).to_ne_bytes());
         };
     }
     wgreg!(REG_R8,      frame.r8);
     wgreg!(REG_R9,      frame.r9);
     wgreg!(REG_R10,     frame.r10);
-    wgreg!(REG_R11,     frame.r11);   // r11 = RFLAGS saved by SYSCALL hardware
+    wgreg!(REG_R11,     frame.r11);
     wgreg!(REG_R12,     frame.r12);
     wgreg!(REG_R13,     frame.r13);
     wgreg!(REG_R14,     frame.r14);
@@ -334,32 +344,39 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     wgreg!(REG_RCX,     frame.rcx);
     wgreg!(REG_RSP,     frame.rsp);
     wgreg!(REG_RIP,     frame.rip);
-    wgreg!(REG_EFL,     frame.r11);   // EFL = r11 (RFLAGS)
+    wgreg!(REG_EFL,     frame.r11);
     wgreg!(REG_CSGSFS,  0x002B_0033u64);
     wgreg!(REG_OLDMASK, mask);
     wgreg!(REG_CR2,     info.addr as u64);
+    // uc_sigmask (offset 240)
+    kframe[240..248].copy_from_slice(&mask.to_ne_bytes());
 
-    unsafe { ((uc_va + 240) as *mut u64).write_unaligned(mask); }
-
-    unsafe {
-        (si_va           as *mut i32).write_unaligned(info.sig as i32);
-        ((si_va + 4)     as *mut i32).write_unaligned(0);
-        ((si_va + 8)     as *mut i32).write_unaligned(info.code);
-        ((si_va + 16) as *mut i32).write_unaligned(info.pid as i32);
-        ((si_va + 20) as *mut i32).write_unaligned(info.uid as i32);
-        match info.sig {
-            17 => ((si_va + 24) as *mut i32).write_unaligned(info.status),
-            11 | 7 | 8 => ((si_va + 16) as *mut usize).write_unaligned(info.addr),
-            _ => {}
-        }
+    // ── siginfo_t (at UCONTEXT_SIZE offset) ─────────────────────────────────
+    let si = &mut kframe[UCONTEXT_SIZE..UCONTEXT_SIZE + SIGINFO_SIZE];
+    si[0..4].copy_from_slice(&(info.sig as i32).to_ne_bytes());
+    si[8..12].copy_from_slice(&info.code.to_ne_bytes());
+    match info.sig {
+        17 => si[24..28].copy_from_slice(&info.status.to_ne_bytes()),
+        11 | 7 | 8 => si[16..24].copy_from_slice(&info.addr.to_ne_bytes()),
+        _ => {}
     }
 
+    // ── return address ───────────────────────────────────────────────────────
     let ret_addr = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
         restorer
     } else {
+        // Build inline trampoline and return its VA.
+        // build_inline_trampoline now uses copy_to_user internally.
         build_inline_trampoline(sp)
     };
-    unsafe { (ret_va as *mut usize).write_volatile(ret_addr); }
+    kframe[UCONTEXT_SIZE + SIGINFO_SIZE..].copy_from_slice(&ret_addr.to_ne_bytes());
+
+    // Single copy_to_user for the entire frame.
+    if copy_to_user(sp, &kframe).is_err() {
+        // Re-queue and bail if the copy failed.
+        PENDING.lock().entry(pid).or_default().push_front(info);
+        return;
+    }
 
     frame.rdi = info.sig as usize;
     frame.rsi = si_va;
@@ -373,18 +390,23 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
 pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
     let pid = scheduler::current_pid();
     let uc_va = frame.rsp.wrapping_sub(UCONTEXT_SIZE + SIGINFO_SIZE);
-    if uc_va == 0 || uc_va >= USER_SPACE_END { return -14; }
+    if !validate_user_ptr(uc_va, UCONTEXT_SIZE + 8) { return -14; }
+
+    // Copy the entire ucontext into a kernel buffer before reading any field.
+    let mut kframe = [0u8; UCONTEXT_SIZE + 8];
+    if copy_from_user(&mut kframe, uc_va).is_err() { return -14; }
 
     macro_rules! rgreg {
-        ($idx:expr) => {
-            unsafe { ((uc_va + greg_off($idx)) as *const u64).read_unaligned() as usize }
-        };
+        ($idx:expr) => {{
+            let off = GREGS_OFFSET + $idx * 8;
+            usize::from_ne_bytes(kframe[off..off+8].try_into().unwrap())
+        }};
     }
 
     frame.r8     = rgreg!(REG_R8);
     frame.r9     = rgreg!(REG_R9);
     frame.r10    = rgreg!(REG_R10);
-    frame.r11    = rgreg!(REG_EFL);   // restore RFLAGS into r11
+    frame.r11    = rgreg!(REG_EFL);
     frame.r12    = rgreg!(REG_R12);
     frame.r13    = rgreg!(REG_R13);
     frame.r14    = rgreg!(REG_R14);
@@ -398,18 +420,19 @@ pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
     frame.rcx    = rgreg!(REG_RCX);
     frame.rsp    = rgreg!(REG_RSP);
     frame.rip    = rgreg!(REG_RIP);
-    // r11 already set to EFL above; rcx already set to RIP above
 
-    let old_mask = unsafe { ((uc_va + 240) as *const u64).read_unaligned() };
+    let old_mask = u64::from_ne_bytes(kframe[240..248].try_into().unwrap());
     set_sigmask(pid, old_mask);
     0
 }
 
-// ── Inline trampoline (fallback) ─────────────────────────────────────────────
+// ── Inline trampoline (fallback when SA_RESTORER not set) ─────────────────
 
 fn build_inline_trampoline(sp: usize) -> usize {
+    // `mov $15,%rax ; syscall` — rt_sigreturn NR
     const CODE: [u8; 9] = [0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
     let va = sp.wrapping_sub(16);
-    unsafe { core::ptr::copy_nonoverlapping(CODE.as_ptr(), va as *mut u8, CODE.len()); }
+    // Use copy_to_user so the write goes through the validated uaccess path.
+    let _ = copy_to_user(va, &CODE);
     va
 }

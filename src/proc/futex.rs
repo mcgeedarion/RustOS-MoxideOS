@@ -16,6 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::proc::{scheduler, process::State};
+use crate::uaccess::copy_from_user;
 
 /// Maps futex userspace address → list of blocked pids.
 static WAITERS: Mutex<BTreeMap<usize, Vec<usize>>> = Mutex::new(BTreeMap::new());
@@ -34,7 +35,13 @@ pub fn futex_wait(addr: usize, expected: u32) -> Result<(), isize> {
         let mut map = WAITERS.lock();
         // Re-read the futex word while holding WAITERS so a concurrent
         // futex_wake_addr cannot slip between our read and our enqueue.
-        let current = unsafe { (addr as *const u32).read_volatile() };
+        // Use copy_from_user instead of read_volatile for consistency
+        // with the validated uaccess path.
+        let mut val_bytes = [0u8; 4];
+        if copy_from_user(&mut val_bytes, addr).is_err() {
+            return Err(-14); // EFAULT
+        }
+        let current = u32::from_ne_bytes(val_bytes);
         if current != expected {
             return Err(-11); // EAGAIN: value changed before we could sleep
         }
@@ -56,16 +63,15 @@ pub fn futex_wait(addr: usize, expected: u32) -> Result<(), isize> {
 /// Wake up to `count` tasks waiting on `addr`.
 /// Safe to call from any context; does not hold the scheduler lock.
 pub fn futex_wake_addr(addr: usize, count: usize) {
-    // Drain waiters from the map while holding only WAITERS lock.
     let to_wake: Vec<usize> = {
         let mut map = WAITERS.lock();
         let list = match map.get_mut(&addr) { Some(l) => l, None => return };
         let n = count.min(list.len());
         list.drain(..n).collect()
-    }; // WAITERS lock released before wake_pid acquires scheduler lock
+    };
 
     for pid in to_wake {
-        scheduler::wake_pid(pid); // acquires scheduler lock independently
+        scheduler::wake_pid(pid);
     }
 }
 
@@ -81,7 +87,7 @@ pub fn sys_futex(uaddr: usize, op: u32, val: u32,
         return -14; // EFAULT
     }
 
-    match op & 0x7F { // strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256)
+    match op & 0x7F {
         FUTEX_WAIT => {
             match futex_wait(uaddr, val) {
                 Ok(_)       => 0,

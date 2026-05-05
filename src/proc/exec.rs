@@ -25,8 +25,8 @@ use crate::proc::{scheduler, thread};
 use crate::proc::fork::SignalHandlers;
 use crate::security::CapSet;
 use crate::mm::kstack::alloc_kstack;
+use crate::uaccess::copy_from_user;
 
-// x86-64-only imports — wrapped in cfg so the file compiles on RISC-V too.
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::syscall::SyscallFrame;
 #[cfg(target_arch = "x86_64")]
@@ -46,23 +46,19 @@ const AT_BASE:   u64 =  7;
 const AT_ENTRY:  u64 =  9;
 const AT_RANDOM: u64 = 25;
 
-// ── free_old_address_space ───────────────────────────────────────────────
-//
-// Walk the x86-64 4-level page table for the lower (user) half and free
-// every mapped physical page plus every intermediate page-table page.
-// Only touches VA < USER_HALF_END to avoid freeing shared kernel PTEs.
-//
-// This is intentionally x86-64 specific; on RISC-V the equivalent walk
-// is Sv39/Sv48 and lives in arch/riscv64.  The function is a no-op stub
-// on non-x86 targets.
-
 const USER_HALF_END: usize = 0x0000_8000_0000_0000;
 const ADDR_MASK:     u64   = 0x000F_FFFF_FFFF_F000;
 const PRESENT:       u64   = 1;
 
+/// Maximum length of a user-supplied string (path, argv, envp element).
+const MAX_CSTR_LEN: usize = 4096;
+/// Maximum number of pointer-array entries for argv / envp.
+const MAX_CSTR_ARRAY: usize = 1024;
+
+// ── free_old_address_space ────────────────────────────────────────────────
+
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
-    // PML4: 512 entries, only lower 256 are user space.
     let pml4 = cr3 as *const u64;
     for pml4i in 0..256usize {
         let pml4e = *pml4.add(pml4i);
@@ -73,8 +69,6 @@ unsafe fn free_old_address_space(cr3: usize) {
         for pdpti in 0..512usize {
             let pdpte = *pdpt.add(pdpti);
             if pdpte & PRESENT == 0 { continue; }
-            // Skip 1 GB pages (bit 7 = PS); shouldn't exist in user space
-            // but guard anyway.
             if pdpte & (1 << 7) != 0 { continue; }
             let pd_pa = (pdpte & ADDR_MASK) as usize;
             let pd = pd_pa as *const u64;
@@ -82,7 +76,6 @@ unsafe fn free_old_address_space(cr3: usize) {
             for pdi in 0..512usize {
                 let pde = *pd.add(pdi);
                 if pde & PRESENT == 0 { continue; }
-                // Skip 2 MB pages.
                 if pde & (1 << 7) != 0 { continue; }
                 let pt_pa = (pde & ADDR_MASK) as usize;
                 let pt = pt_pa as *const u64;
@@ -91,25 +84,22 @@ unsafe fn free_old_address_space(cr3: usize) {
                     let pte = *pt.add(pti);
                     if pte & PRESENT == 0 { continue; }
                     let page_pa = (pte & ADDR_MASK) as usize;
-                    // Only free pages in the lower half.
                     let va = ((pml4i << 39) | (pdpti << 30) | (pdi << 21) | (pti << 12)) as usize;
                     if va < USER_HALF_END {
                         pmm::free_page(page_pa);
                     }
                 }
-                pmm::free_page(pt_pa);  // free the PT itself
+                pmm::free_page(pt_pa);
             }
-            pmm::free_page(pd_pa);  // free the PD itself
+            pmm::free_page(pd_pa);
         }
-        pmm::free_page(pdpt_pa); // free the PDPT itself
+        pmm::free_page(pdpt_pa);
     }
-    pmm::free_page(cr3); // free the PML4 itself
+    pmm::free_page(cr3);
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn free_old_address_space(_cr3: usize) {
-    // TODO: RISC-V Sv39/Sv48 walk goes here.
-}
+unsafe fn free_old_address_space(_cr3: usize) {}
 
 // ── spawn_user_process ───────────────────────────────────────────────────
 
@@ -148,7 +138,6 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
             }
         } else { (program_entry, 0) };
 
-    // Alloc stack into new_cr3 BEFORE switching CR3.
     let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
     for i in 0..STACK_PAGES {
         let va = stack_bottom + i * PAGE_SIZE;
@@ -163,7 +152,6 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         );
     }
 
-    // Switch to new address space before writing the initial stack.
     <Arch as Paging>::load_cr3(new_cr3);
 
     let argv_strings: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
@@ -240,7 +228,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
 {
     let pid = scheduler::current_pid();
 
-    // ── 1-2. Read + parse ELF ──────────────────────────────────────────────────
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|e| e)?;
     let file_size = vfs::fstat(fd).unwrap_or(0);
     let mut data_buf = alloc::vec![0u8; file_size.max(1)];
@@ -252,7 +239,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     let hdr   = elf::parse_elf_header(data)?;
     let phdrs = elf::parse_phdrs(data, &hdr);
 
-    // ── 3-4. New address space + ELF load ───────────────────────────────────
     let new_cr3 = <Arch as Paging>::new_user_address_space().ok_or(-12i32)?;
 
     let program_entry = elf::load_elf_into(new_cr3, data, &hdr, &phdrs)
@@ -262,7 +248,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         .find(|ph| ph.p_type == elf::PT_PHDR)
         .map_or(0, |ph| ph.p_vaddr as usize);
 
-    // ── 5. Interpreter ─────────────────────────────────────────────────────────
     let (entry_va, interp_base_val) =
         if let Some(interp_path) = elf::find_interp(data, &phdrs) {
             match load_interpreter(new_cr3, interp_path) {
@@ -271,7 +256,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
             }
         } else { (program_entry, 0) };
 
-    // ── 6. Alloc stack pages into new_cr3 (before CR3 switch) ─────────────
     let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
     for i in 0..STACK_PAGES {
         let va = stack_bottom + i * PAGE_SIZE;
@@ -284,7 +268,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         );
     }
 
-    // ── 7. Tear down old address space, switch to new one ──────────────────
     let old_cr3 = scheduler::with_procs(|procs| {
         procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
     });
@@ -295,13 +278,11 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     }
     <Arch as Paging>::load_cr3(new_cr3);
 
-    // ── 8. Build initial stack (CR3 is now new_cr3 — writes land correctly) ─
     let initial_rsp = build_initial_stack(
         STACK_TOP, argv, envp,
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     )?;
 
-    // ── 9. Update PCB ──────────────────────────────────────────────────────
     let vfork_parent = scheduler::with_procs(|procs| {
         if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
             p.user_satp       = new_cr3;
@@ -317,16 +298,13 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         } else { 0 }
     });
 
-    // ── 10. x86-64 TSS RSP0 update ─────────────────────────────────────────
     let kst = scheduler::with_procs(|procs| {
         procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.kstack_top)
     });
     if kst != 0 { update_rsp0(kst); }
 
-    // ── 11. Wake vfork parent ────────────────────────────────────────────
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
-    // ── 12. Patch syscall frame for SYSRETQ ───────────────────────────────
     frame.rcx = entry_va;
     frame.rip = entry_va;
     frame.rsp = initial_rsp;
@@ -390,7 +368,7 @@ fn build_initial_stack(
     let rsp_raw        = string_va_base - ptrtable_bytes;
     let initial_rsp    = rsp_raw & !0xF;
 
-    // CR3 is active — writes to user VAs are valid.
+    // CR3 is active — writes to user VAs land in the new address space.
     unsafe {
         core::ptr::copy_nonoverlapping(
             string_buf.as_ptr(),
@@ -428,28 +406,33 @@ fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
 
 // ── string helpers ────────────────────────────────────────────────────────
 
+/// Read a NUL-terminated string from user VA `va` into a kernel String.
+/// Uses copy_from_user to avoid raw user pointer dereference.
+/// Returns None if the VA is out of range, copy fails, or no NUL within
+/// MAX_CSTR_LEN bytes.
 pub fn read_cstr_safe(va: usize) -> Option<String> {
     if va < 0x1000 || va > 0x0000_7FFF_FFFF_F000 { return None; }
-    let mut s = String::new();
-    let mut p = va as *const u8;
-    for _ in 0..4096 {
-        let c = unsafe { p.read_volatile() };
-        if c == 0 { return Some(s); }
-        s.push(c as char);
-        p = unsafe { p.add(1) };
-    }
-    None
+    let mut buf = [0u8; MAX_CSTR_LEN];
+    // copy_from_user may copy fewer bytes if the region is partially mapped;
+    // we tolerate any partial success and scan for NUL in what we got.
+    copy_from_user(&mut buf, va).ok()?;
+    let nul = buf.iter().position(|&b| b == 0)?;
+    String::from_utf8(buf[..nul].to_vec()).ok()
 }
 
+/// Read a NUL-pointer-terminated argv/envp array from user VA `array_va`.
+/// Each slot is a usize pointer; the array ends at a NULL entry.
+/// Uses copy_from_user for both the pointer slots and the strings.
 pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
     let mut out = Vec::new();
     if array_va < 0x1000 { return out; }
-    let mut pp = array_va as *const usize;
-    for _ in 0..1024 {
-        let ptr = unsafe { pp.read_volatile() };
+    for i in 0..MAX_CSTR_ARRAY {
+        let slot_va = array_va + i * core::mem::size_of::<usize>();
+        let mut ptr_bytes = [0u8; 8];
+        if copy_from_user(&mut ptr_bytes, slot_va).is_err() { break; }
+        let ptr = usize::from_ne_bytes(ptr_bytes);
         if ptr == 0 { break; }
         if let Some(s) = read_cstr_safe(ptr) { out.push(s); }
-        pp = unsafe { pp.add(1) };
     }
     out
 }
