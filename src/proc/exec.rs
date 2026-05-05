@@ -6,37 +6,36 @@
 //!   2.  parse_elf_header + parse_phdrs
 //!   3.  alloc fresh address space (new_cr3) — old space untouched until step 8
 //!   4.  load_elf_into(new_cr3, data, phdrs) → program_entry
-//!   5.  If PT_INTERP present: load_interpreter → interp_entry;
-//!       entry_va = interp_entry, AT_BASE = INTERP_BASE
-//!   6.  Alloc user stack (STACK_PAGES × 4096) in new_cr3
-//!   7.  build_initial_stack → initial_rsp
-//!   8.  mmap::clear_vmas(old pid_key) — unmaps + frees old anonymous pages
-//!   9.  Arch::load_cr3(new_cr3)
-//!  10.  PCB: user_satp=new_cr3, pc=entry_va, sp=initial_rsp,
-//!            signal_handlers reset, vfork_parent cleared
-//!  11.  wake_pid(vfork_parent) if CLONE_VFORK parent is waiting
-//!  12.  Patch SyscallFrame for SYSRETQ / SRET delivery
+//!   5.  If PT_INTERP present: load_interpreter → interp_entry
+//!   6.  Alloc user stack pages into new_cr3
+//!   7.  clear_vmas(old) + free_old_address_space(old_cr3) + load_cr3(new_cr3)
+//!   8.  build_initial_stack (writes into new_cr3, now active) → initial_rsp
+//!   9.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent
+//!  10.  wake_pid(vfork_parent) if set
+//!  11.  Patch SyscallFrame for SYSRETQ delivery
 
 extern crate alloc;
 use alloc::vec::Vec;
 use alloc::string::String;
 
-use crate::arch::{Arch, api::{Paging, PageFlags, ContextSwitch}};
+use crate::arch::{Arch, api::{Paging, PageFlags}};
 use crate::fs::{elf, vfs};
 use crate::mm::{mmap, pmm};
-use crate::arch::x86_64::syscall::SyscallFrame;
 use crate::proc::{scheduler, thread};
-use crate::proc::process::{Pcb, State};
-use crate::proc::context::Context;
 use crate::proc::fork::SignalHandlers;
 use crate::security::CapSet;
 use crate::mm::kstack::alloc_kstack;
+
+// x86-64-only imports — wrapped in cfg so the file compiles on RISC-V too.
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::syscall::SyscallFrame;
+#[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::gdt::update_rsp0;
 
-const PAGE_SIZE:    usize = 4096;
-const STACK_PAGES:  usize = 8;
-const STACK_TOP:    usize = 0x0000_7FFF_FF00_0000;
-const INTERP_BASE:  usize = 0x0060_0000;
+const PAGE_SIZE:   usize = 4096;
+const STACK_PAGES: usize = 8;
+const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
+const INTERP_BASE: usize = 0x0060_0000;
 
 const AT_NULL:   u64 =  0;
 const AT_PHDR:   u64 =  3;
@@ -47,12 +46,76 @@ const AT_BASE:   u64 =  7;
 const AT_ENTRY:  u64 =  9;
 const AT_RANDOM: u64 = 25;
 
+// ── free_old_address_space ───────────────────────────────────────────────
+//
+// Walk the x86-64 4-level page table for the lower (user) half and free
+// every mapped physical page plus every intermediate page-table page.
+// Only touches VA < USER_HALF_END to avoid freeing shared kernel PTEs.
+//
+// This is intentionally x86-64 specific; on RISC-V the equivalent walk
+// is Sv39/Sv48 and lives in arch/riscv64.  The function is a no-op stub
+// on non-x86 targets.
+
+const USER_HALF_END: usize = 0x0000_8000_0000_0000;
+const ADDR_MASK:     u64   = 0x000F_FFFF_FFFF_F000;
+const PRESENT:       u64   = 1;
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn free_old_address_space(cr3: usize) {
+    // PML4: 512 entries, only lower 256 are user space.
+    let pml4 = cr3 as *const u64;
+    for pml4i in 0..256usize {
+        let pml4e = *pml4.add(pml4i);
+        if pml4e & PRESENT == 0 { continue; }
+        let pdpt_pa = (pml4e & ADDR_MASK) as usize;
+        let pdpt = pdpt_pa as *const u64;
+
+        for pdpti in 0..512usize {
+            let pdpte = *pdpt.add(pdpti);
+            if pdpte & PRESENT == 0 { continue; }
+            // Skip 1 GB pages (bit 7 = PS); shouldn't exist in user space
+            // but guard anyway.
+            if pdpte & (1 << 7) != 0 { continue; }
+            let pd_pa = (pdpte & ADDR_MASK) as usize;
+            let pd = pd_pa as *const u64;
+
+            for pdi in 0..512usize {
+                let pde = *pd.add(pdi);
+                if pde & PRESENT == 0 { continue; }
+                // Skip 2 MB pages.
+                if pde & (1 << 7) != 0 { continue; }
+                let pt_pa = (pde & ADDR_MASK) as usize;
+                let pt = pt_pa as *const u64;
+
+                for pti in 0..512usize {
+                    let pte = *pt.add(pti);
+                    if pte & PRESENT == 0 { continue; }
+                    let page_pa = (pte & ADDR_MASK) as usize;
+                    // Only free pages in the lower half.
+                    let va = ((pml4i << 39) | (pdpti << 30) | (pdi << 21) | (pti << 12)) as usize;
+                    if va < USER_HALF_END {
+                        pmm::free_page(page_pa);
+                    }
+                }
+                pmm::free_page(pt_pa);  // free the PT itself
+            }
+            pmm::free_page(pd_pa);  // free the PD itself
+        }
+        pmm::free_page(pdpt_pa); // free the PDPT itself
+    }
+    pmm::free_page(cr3); // free the PML4 itself
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn free_old_address_space(_cr3: usize) {
+    // TODO: RISC-V Sv39/Sv48 walk goes here.
+}
+
 // ── spawn_user_process ───────────────────────────────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
-        Ok(fd) => fd,
-        Err(_) => return false,
+        Ok(fd) => fd, Err(_) => return false,
     };
     let file_size = vfs::fstat(fd).unwrap_or(0);
     if file_size == 0 { vfs::close(fd); return false; }
@@ -62,20 +125,16 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     if n <= 0 { return false; }
     let data = &data_buf[..n as usize];
 
-    let hdr = match elf::parse_elf_header(data) {
-        Ok(h) => h, Err(_) => return false,
-    };
+    let hdr   = match elf::parse_elf_header(data) { Ok(h) => h, Err(_) => return false };
     let phdrs = elf::parse_phdrs(data, &hdr);
 
-    // Allocate a fresh user address space (kernel half pre-populated).
     let new_cr3 = match <Arch as Paging>::new_user_address_space() {
-        Some(c) => c,
-        None    => return false,
+        Some(c) => c, None => return false,
     };
 
     let program_entry = match elf::load_elf_into(new_cr3, data, &hdr, &phdrs) {
         Ok(e) => e,
-        Err(_) => { pmm::free_page(new_cr3); return false; }
+        Err(_) => { unsafe { free_old_address_space(new_cr3); } return false; }
     };
 
     let phdr_va = phdrs.iter()
@@ -85,19 +144,17 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let (entry_va, interp_base_val) =
         if let Some(interp_path) = elf::find_interp(data, &phdrs) {
             match load_interpreter(new_cr3, interp_path) {
-                Ok(e) => (e, INTERP_BASE),
-                Err(_) => (program_entry, 0),
+                Ok(e) => (e, INTERP_BASE), Err(_) => (program_entry, 0),
             }
-        } else {
-            (program_entry, 0)
-        };
+        } else { (program_entry, 0) };
 
+    // Alloc stack into new_cr3 BEFORE switching CR3.
     let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
     for i in 0..STACK_PAGES {
         let va = stack_bottom + i * PAGE_SIZE;
         let pa = match pmm::alloc_page() {
             Some(p) => p,
-            None    => { pmm::free_page(new_cr3); return false; }
+            None    => { unsafe { free_old_address_space(new_cr3); } return false; }
         };
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
         <Arch as Paging>::map_page(
@@ -106,35 +163,39 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         );
     }
 
+    // Switch to new address space before writing the initial stack.
+    <Arch as Paging>::load_cr3(new_cr3);
+
     let argv_strings: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
     let envp_strings: Vec<String> = envp.iter().map(|s| String::from(*s)).collect();
 
     let initial_rsp = match build_initial_stack(
-        new_cr3, STACK_TOP, &argv_strings, &envp_strings,
+        STACK_TOP, &argv_strings, &envp_strings,
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     ) {
         Ok(rsp) => rsp,
-        Err(_)  => { pmm::free_page(new_cr3); return false; }
+        Err(_)  => { unsafe { free_old_address_space(new_cr3); } return false; }
     };
 
     let kstack_top = alloc_kstack();
     let pid  = scheduler::next_pid();
     let ppid = scheduler::current_pid();
 
-    let mut ctx = Context::zero();
+    let mut ctx = crate::proc::context::Context::zero();
     ctx.rsp = kstack_top;
-    ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize;
+    #[cfg(target_arch = "x86_64")]
+    { ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize; }
 
-    let pcb = Pcb {
+    let pcb = crate::proc::process::Pcb {
         pid, ppid,
-        state:          State::Ready,
-        exit_code:      0,
-        caps:           CapSet::empty(),
-        pc:             entry_va,
-        sp:             initial_rsp,
-        user_satp:      new_cr3,
-        kernel_satp:    0,
-        trapframe_pa:   0,
+        state:               crate::proc::process::State::Ready,
+        exit_code:           0,
+        caps:                CapSet::empty(),
+        pc:                  entry_va,
+        sp:                  initial_rsp,
+        user_satp:           new_cr3,
+        kernel_satp:         0,
+        trapframe_pa:        0,
         kstack_top,
         ctx,
         owned_pages:         alloc::vec![],
@@ -144,6 +205,9 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         exit_signal:         17,
         vfork_parent:        0,
         signal_handlers:     SignalHandlers::default(),
+        vmas:                alloc::vec![],
+        next_va:             0x0001_0000_0000,
+        brk:                 0,
     };
 
     scheduler::enqueue(pcb);
@@ -156,6 +220,7 @@ pub fn sys_execve_from_path(path: &str) -> bool {
 
 // ── sys_execve [NR 59] ───────────────────────────────────────────────────
 
+#[cfg(target_arch = "x86_64")]
 pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
                   frame: &mut SyscallFrame) -> isize
 {
@@ -169,11 +234,13 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
 
 // ── do_execve ─────────────────────────────────────────────────────────────
 
+#[cfg(target_arch = "x86_64")]
 pub fn do_execve(path: &str, argv: &[String], envp: &[String],
                  frame: &mut SyscallFrame) -> Result<(), i32>
 {
     let pid = scheduler::current_pid();
 
+    // ── 1-2. Read + parse ELF ──────────────────────────────────────────────────
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|e| e)?;
     let file_size = vfs::fstat(fd).unwrap_or(0);
     let mut data_buf = alloc::vec![0u8; file_size.max(1)];
@@ -185,15 +252,17 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     let hdr   = elf::parse_elf_header(data)?;
     let phdrs = elf::parse_phdrs(data, &hdr);
 
+    // ── 3-4. New address space + ELF load ───────────────────────────────────
     let new_cr3 = <Arch as Paging>::new_user_address_space().ok_or(-12i32)?;
 
     let program_entry = elf::load_elf_into(new_cr3, data, &hdr, &phdrs)
-        .map_err(|e| { pmm::free_page(new_cr3); e })?;
+        .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
     let phdr_va = phdrs.iter()
         .find(|ph| ph.p_type == elf::PT_PHDR)
         .map_or(0, |ph| ph.p_vaddr as usize);
 
+    // ── 5. Interpreter ─────────────────────────────────────────────────────────
     let (entry_va, interp_base_val) =
         if let Some(interp_path) = elf::find_interp(data, &phdrs) {
             match load_interpreter(new_cr3, interp_path) {
@@ -202,10 +271,12 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
             }
         } else { (program_entry, 0) };
 
+    // ── 6. Alloc stack pages into new_cr3 (before CR3 switch) ─────────────
     let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
     for i in 0..STACK_PAGES {
         let va = stack_bottom + i * PAGE_SIZE;
-        let pa = pmm::alloc_page().ok_or(-12i32)?;
+        let pa = pmm::alloc_page().ok_or(-12i32)
+            .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
         <Arch as Paging>::map_page(
             new_cr3, va, pa,
@@ -213,41 +284,49 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         );
     }
 
+    // ── 7. Tear down old address space, switch to new one ──────────────────
+    let old_cr3 = scheduler::with_procs(|procs| {
+        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
+    });
+    let pid_key = thread::vma_pid(pid);
+    mmap::clear_vmas(pid_key);
+    if old_cr3 != 0 && old_cr3 != new_cr3 {
+        unsafe { free_old_address_space(old_cr3); }
+    }
+    <Arch as Paging>::load_cr3(new_cr3);
+
+    // ── 8. Build initial stack (CR3 is now new_cr3 — writes land correctly) ─
     let initial_rsp = build_initial_stack(
-        new_cr3, STACK_TOP, argv, envp,
+        STACK_TOP, argv, envp,
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     )?;
 
-    let pid_key = thread::vma_pid(pid);
-    mmap::clear_vmas(pid_key);
-
-    <Arch as Paging>::load_cr3(new_cr3);
-
-    let vfork_parent = {
-        let procs = scheduler::procs_lock();
-        let vfp = if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+    // ── 9. Update PCB ──────────────────────────────────────────────────────
+    let vfork_parent = scheduler::with_procs(|procs| {
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
             p.user_satp       = new_cr3;
             p.pc              = entry_va;
             p.sp              = initial_rsp;
             p.signal_handlers = SignalHandlers::default();
-            let vfp = p.vfork_parent;
+            let vfp            = p.vfork_parent;
             p.vfork_parent    = 0;
+            p.vmas            = alloc::vec![];
+            p.next_va         = 0x0001_0000_0000;
+            p.brk             = 0;
             vfp
-        } else { 0 };
-        scheduler::procs_unlock();
-        vfp
-    };
+        } else { 0 }
+    });
 
-    {
-        let procs = scheduler::procs_lock();
-        let kst = procs.iter().find(|p| p.pid == pid)
-            .map_or(0, |p| p.kstack_top);
-        scheduler::procs_unlock();
-        if kst != 0 { update_rsp0(kst); }
-    }
+    // ── 10. x86-64 TSS RSP0 update ─────────────────────────────────────────
+    let kst = scheduler::with_procs(|procs| {
+        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.kstack_top)
+    });
+    if kst != 0 { update_rsp0(kst); }
 
+    // ── 11. Wake vfork parent ────────────────────────────────────────────
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
+    // ── 12. Patch syscall frame for SYSRETQ ───────────────────────────────
     frame.rcx = entry_va;
     frame.rip = entry_va;
     frame.rsp = initial_rsp;
@@ -258,9 +337,10 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
 }
 
 // ── build_initial_stack ───────────────────────────────────────────────────
+// CR3 must already be loaded to new_cr3 before calling this.
+// Writes directly to user VAs (valid because CR3 is active).
 
 fn build_initial_stack(
-    _cr3:        usize,
     stack_top:   usize,
     argv:        &[String],
     envp:        &[String],
@@ -271,9 +351,9 @@ fn build_initial_stack(
     interp_base: usize,
 ) -> Result<usize, i32>
 {
-    let mut string_buf: Vec<u8>      = Vec::new();
-    let mut argv_offsets: Vec<usize> = Vec::new();
-    let mut envp_offsets: Vec<usize> = Vec::new();
+    let mut string_buf:    Vec<u8>   = Vec::new();
+    let mut argv_offsets:  Vec<usize> = Vec::new();
+    let mut envp_offsets:  Vec<usize> = Vec::new();
 
     for s in argv {
         argv_offsets.push(string_buf.len());
@@ -310,6 +390,7 @@ fn build_initial_stack(
     let rsp_raw        = string_va_base - ptrtable_bytes;
     let initial_rsp    = rsp_raw & !0xF;
 
+    // CR3 is active — writes to user VAs are valid.
     unsafe {
         core::ptr::copy_nonoverlapping(
             string_buf.as_ptr(),
@@ -320,11 +401,11 @@ fn build_initial_stack(
 
     let mut wp = initial_rsp as *mut u64;
     unsafe {
-        wp.write(argc as u64); wp = wp.add(1);
+        wp.write(argc as u64);          wp = wp.add(1);
         for off in &argv_offsets { wp.write((string_va_base + off) as u64); wp = wp.add(1); }
-        wp.write(0); wp = wp.add(1);
+        wp.write(0);                    wp = wp.add(1);
         for off in &envp_offsets { wp.write((string_va_base + off) as u64); wp = wp.add(1); }
-        wp.write(0); wp = wp.add(1);
+        wp.write(0);                    wp = wp.add(1);
         for (atype, aval) in auxv { wp.write(*atype); wp = wp.add(1); wp.write(*aval); wp = wp.add(1); }
     }
     Ok(initial_rsp)
@@ -360,7 +441,7 @@ pub fn read_cstr_safe(va: usize) -> Option<String> {
     None
 }
 
-fn collect_cstr_array(array_va: usize) -> Vec<String> {
+pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
     let mut out = Vec::new();
     if array_va < 0x1000 { return out; }
     let mut pp = array_va as *const usize;
