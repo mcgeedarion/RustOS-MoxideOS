@@ -7,7 +7,7 @@
 //! Arch-neutral: uses arch::Arch (Paging trait) throughout.
 
 use crate::arch::{Arch, api::{Paging, PageFlags}};
-use crate::mm::mmap::{VmaKind, PROT_WRITE, PROT_EXEC};
+use crate::mm::mmap::{VmaKind, PROT_WRITE, PROT_EXEC, find_vma};
 use crate::mm::pmm::alloc_page;
 use crate::proc::scheduler;
 
@@ -18,25 +18,16 @@ const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 /// Returns `true` if the fault was handled; `false` if SIGSEGV should be sent.
 pub fn handle_demand_fault(faulting_va: usize) -> bool {
     let page_va = faulting_va & PAGE_MASK;
+    let pid     = scheduler::current_pid();
 
-    // Look up the faulting process's VMA list and CR3 in one lock window.
-    let (vma, user_cr3) = {
-        let pid = scheduler::current_pid();
-        let result = scheduler::with_procs(|procs| {
-            procs.iter().find(|p| p.pid == pid).and_then(|p| {
-                let vma = p.vmas.iter()
-                    .find(|v| v.start <= faulting_va && faulting_va < v.end)
-                    .cloned();
-                vma.map(|v| (v, p.user_satp))
-            })
-        });
-        match result {
-            Some(pair) => pair,
-            None       => return false,
-        }
+    // O(log n) VMA lookup via binary search (find_vma, mmap.rs).
+    let vma = match find_vma(pid, faulting_va) {
+        Some(v) => v,
+        None    => return false,
     };
 
-    // Only map into the process's own address space, never kernel_cr3.
+    // Separate lock acquisition for the CR3: with_proc is O(log n) via pid_idx.
+    let user_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if user_cr3 == 0 { return false; }
 
     let pa = match alloc_page() {
@@ -46,22 +37,21 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
 
     match &vma.kind {
         VmaKind::Anonymous => {
-            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+            // alloc_page() guarantees zero-filled pages; no explicit zeroing needed.
         }
         VmaKind::FileBacked(fd, base_offset) => {
-            let page_idx = (page_va - vma.start) / PAGE_SIZE;
-            let file_pos = base_offset + page_idx as u64 * PAGE_SIZE as u64;
+            // Zero first so any short-read region is clean, then fill from file.
+            // Unlike Anonymous, we cannot rely on alloc_page's zero here because
+            // pread may partially fill the page.
             unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
             // TODO: on pread failure, free `pa` and return false so the arch
             // trap handler delivers SIGBUS (currently the process silently
             // receives a zero page instead of the expected SIGBUS).
-            let _ = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_pos as i64);
+            let _ = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE,
+                (*base_offset + (page_va - vma.start) as u64) as i64);
         }
         VmaKind::Fixed => {
-            // VmaKind::Fixed indicates a MAP_FIXED mapping that was placed
-            // over an already-mapped region. A not-present fault here means
-            // the region was unmapped under the process — treat as access
-            // violation. Free the freshly allocated page and signal SIGSEGV.
+            // MAP_FIXED over an already-unmapped region — access violation.
             crate::mm::pmm::free_page(pa);
             return false;
         }
@@ -73,7 +63,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
     true
 }
 
-/// POSIX PROT_* → canonical HAL PageFlags.
 #[inline]
 fn prot_to_flags(prot: u32) -> PageFlags {
     let mut f = PageFlags::PRESENT | PageFlags::USER;
