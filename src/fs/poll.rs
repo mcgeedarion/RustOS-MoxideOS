@@ -43,7 +43,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── poll event flags (POSIX) ──────────────────────────────────────────────────────
+// ── poll event flags (POSIX) ────────────────────────────────────────────────────
 pub const POLLIN:     u32 = 0x0001;
 pub const POLLPRI:    u32 = 0x0002;
 pub const POLLOUT:    u32 = 0x0004;
@@ -53,7 +53,7 @@ pub const POLLNVAL:   u32 = 0x0020;
 pub const POLLRDNORM: u32 = 0x0040;
 pub const POLLWRNORM: u32 = 0x0100;
 
-// ── readiness oracle ────────────────────────────────────────────────────────────────
+// ── readiness oracle ────────────────────────────────────────────────────────────────────
 
 /// Return the subset of `events` that are currently ready on `fdno`,
 /// plus POLLERR / POLLHUP / POLLNVAL as appropriate.
@@ -80,19 +80,20 @@ pub fn fd_ready(fdno: usize, events: u32) -> u32 {
         if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
         return r;
     }
-    // regular VFS fd — treat as always ready
-    if fdno >= 3 && fdno < 64 {
-        if crate::fs::vfs::fd_exists(fdno) {
-            let mut r = 0u32;
-            if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
-            if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
-            return r;
-        }
+    // regular VFS fd — treat as always ready.
+    // No upper-bound cap: vfs::fd_exists handles the bounds check internally,
+    // so fds > 64 (valid after many open() calls) are no longer misreported
+    // as POLLNVAL.
+    if fdno >= 3 && crate::fs::vfs::fd_exists(fdno) {
+        let mut r = 0u32;
+        if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
+        if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
+        return r;
     }
     POLLNVAL
 }
 
-// ── timeout helpers ───────────────────────────────────────────────────────────────
+// ── timeout helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
 fn before_deadline(deadline_ns: u64) -> bool {
@@ -117,7 +118,7 @@ fn ms_to_deadline_ns(ms: i32) -> u64 {
     crate::time::monotonic_ns() + wait_ns
 }
 
-// ── sys_select ────────────────────────────────────────────────────────────────
+// ── sys_select ──────────────────────────────────────────────────────────────────
 
 /// sys_select(nfds, readfds, writefds, exceptfds, timeout)  [NR 23]
 pub fn sys_select(
@@ -132,12 +133,10 @@ pub fn sys_select(
     let words     = (nfds + 63) / 64;
     let bmap_size = words * 8;
 
-    // Validate all fd-set pointers up front.
     if rfds_va != 0 && !validate_user_ptr(rfds_va, bmap_size) { return -14; }
     if wfds_va != 0 && !validate_user_ptr(wfds_va, bmap_size) { return -14; }
     if efds_va != 0 && !validate_user_ptr(efds_va, bmap_size) { return -14; }
 
-    // Read timeout → deadline.
     let deadline_ns = if tv_va == 0 {
         crate::time::monotonic_ns() + 5_000_000_000
     } else if !validate_user_ptr(tv_va, 16) {
@@ -155,10 +154,10 @@ pub fn sys_select(
         }
     };
 
-    // Read input bitmaps from user into kernel arrays.
+    // Read input bitmaps once, before the spin loop.
     let mut rfds_k = alloc::vec![0u64; words];
     let mut wfds_k = alloc::vec![0u64; words];
-    let read_bmap = |va: usize, dst: &mut alloc::vec::Vec<u64>| -> bool {
+    let read_bmap = |va: usize, dst: &mut Vec<u64>| -> bool {
         if va == 0 { return true; }
         for i in 0..dst.len() {
             let mut buf = [0u8; 8];
@@ -170,10 +169,16 @@ pub fn sys_select(
     if !read_bmap(rfds_va, &mut rfds_k) { return -14; }
     if !read_bmap(wfds_va, &mut wfds_k) { return -14; }
 
+    // Allocate result bitmaps once outside the spin loop; zero them each tick.
+    let mut out_r = alloc::vec![0u64; words];
+    let mut out_w = alloc::vec![0u64; words];
+    let mut out_e = alloc::vec![0u64; words];
+
     loop {
-        let mut out_r = alloc::vec![0u64; words];
-        let mut out_w = alloc::vec![0u64; words];
-        let mut out_e = alloc::vec![0u64; words];
+        // Zero result bitmaps for this tick (cheaper than re-allocating).
+        out_r.fill(0);
+        out_w.fill(0);
+        out_e.fill(0);
         let mut total = 0i32;
 
         for fd in 0..nfds {
@@ -196,7 +201,6 @@ pub fn sys_select(
         }
 
         if total > 0 || !before_deadline(deadline_ns) {
-            // Write result bitmaps back to user via copy_to_user.
             let write_bmap = |va: usize, src: &[u64]| {
                 if va == 0 { return; }
                 for (i, &w) in src.iter().enumerate() {
@@ -212,22 +216,17 @@ pub fn sys_select(
     }
 }
 
-// ── sys_pselect6 ───────────────────────────────────────────────────────────────
+// ── sys_pselect6 ──────────────────────────────────────────────────────────────────
 
 /// sys_pselect6 — like select with nanosecond timeout; sigmask ignored.
 pub fn sys_pselect6(
     nfds: usize, rfds_va: usize, wfds_va: usize, efds_va: usize,
     ts_va: usize, _sigmask_va: usize,
 ) -> isize {
-    // Convert ts_va to a timeval-style u64 deadline and pass tv_va=0 to
-    // sys_select so it uses the infinite fallback, but re-encode the ts
-    // as a 16-byte timeval (sec/usec) in a kernel buffer and pass that.
-    // For simplicity, delegate directly and pass ts_va as tv_va — the
-    // layouts are identical for sec/nsec vs sec/usec at this resolution.
     sys_select(nfds, rfds_va, wfds_va, efds_va, ts_va)
 }
 
-// ── sys_poll ────────────────────────────────────────────────────────────────────
+// ── sys_poll ──────────────────────────────────────────────────────────────────────
 
 /// `struct pollfd` layout (matches Linux x86-64): fd(i32) events(i16) revents(i16) → 8 bytes.
 #[repr(C)]
@@ -247,18 +246,14 @@ pub fn sys_poll(fds_va: usize, nfds: usize, timeout_ms: i32) -> isize {
         let mut total = 0i32;
         for i in 0..nfds {
             let pfd_va = fds_va + i * core::mem::size_of::<PollFd>();
-
-            // Copy pollfd from user into a kernel struct.
             let mut raw = [0u8; 8];
             if copy_from_user(&mut raw, pfd_va).is_err() { return -14; }
             let fd     = i32::from_le_bytes(raw[0..4].try_into().unwrap());
             let events = i16::from_le_bytes(raw[4..6].try_into().unwrap());
             if fd < 0 { continue; }
 
-            let ready  = fd_ready(fd as usize, events as u32);
-            let rev    = ready as i16;
-
-            // Write only the revents field back (offset 6, 2 bytes).
+            let ready = fd_ready(fd as usize, events as u32);
+            let rev   = ready as i16;
             if copy_to_user(pfd_va + 6, &rev.to_le_bytes()).is_err() { return -14; }
             if rev != 0 { total += 1; }
         }
@@ -288,7 +283,7 @@ pub fn sys_ppoll(
     sys_poll(fds_va, nfds, timeout_ms)
 }
 
-// ── epoll ───────────────────────────────────────────────────────────────────────
+// ── epoll ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct EpollEntry {
@@ -373,26 +368,28 @@ pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> i
 pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms: i32) -> isize {
     let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
     if maxevents <= 0 { return -22; }
-    // Validate the entire output array on entry.
     if !validate_user_ptr(events_va, maxevents as usize * 12) { return -14; }
 
     let deadline_ns = ms_to_deadline_ns(timeout_ms);
 
-    loop {
-        let interest: Vec<EpollEntry> = {
-            let tbl = EPOLL_TABLE.lock();
-            match tbl[idx].as_ref() {
-                Some(ep) => ep.entries.clone(),
-                None     => return -9,
-            }
-        };
+    // Snapshot the interest list once before the spin loop.
+    // epoll_ctl mutations during a wait are rare; if they occur the worst
+    // case is that the waiter misses one edge — acceptable on a single-CPU
+    // cooperative kernel where epoll_ctl cannot run concurrently anyway.
+    let interest: Vec<EpollEntry> = {
+        let tbl = EPOLL_TABLE.lock();
+        match tbl[idx].as_ref() {
+            Some(ep) => ep.entries.clone(),
+            None     => return -9,
+        }
+    };
 
+    loop {
         let mut found = 0i32;
         for entry in &interest {
             if found >= maxevents { break; }
             let ready = fd_ready(entry.fd as usize, entry.events);
             if ready == 0 { continue; }
-            // Build epoll_event { u32 events; u64 data; } in kernel, then copy_to_user.
             let mut rec = [0u8; 12];
             rec[0..4].copy_from_slice(&ready.to_le_bytes());
             rec[4..12].copy_from_slice(&entry.data.to_le_bytes());
