@@ -18,10 +18,10 @@
 //!   The fd is stored in a small table here alongside its generator fn.
 
 extern crate alloc;
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec, borrow::Cow};
 use spin::Mutex;
 
-// ─── Synthetic fd table ───────────────────────────────────────────────────────
+// ─── Synthetic fd table ─────────────────────────────────────────────────────────────────────────────
 
 pub const PROCFS_FD_BASE: usize = 0x6000_0000;
 
@@ -44,7 +44,7 @@ pub fn is_procfs_fd(fdno: usize) -> bool {
 pub fn procfs_open(path: &str) -> isize {
     let content = match generate(path) {
         Some(c) => c,
-        None    => return -2, // ENOENT
+        None    => return -2,
     };
     let id   = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let fdno = PROCFS_FD_BASE + id;
@@ -53,62 +53,66 @@ pub fn procfs_open(path: &str) -> isize {
 }
 
 /// Read bytes from a procfs fd, starting at `offset`.
+/// Releases the TABLE lock before copying into `buf` to avoid blocking
+/// other procfs operations during potentially large memcpy.
 pub fn procfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
-    let tbl = TABLE.lock();
-    match tbl.get(&fdno) {
-        None => -9,
-        Some(e) => {
-            if offset >= e.content.len() { return 0; }
-            let avail = &e.content[offset..];
-            let n = avail.len().min(buf.len());
-            buf[..n].copy_from_slice(&avail[..n]);
-            n as isize
+    // Clone only the needed slice under the lock, then copy outside.
+    let chunk: Vec<u8> = {
+        let tbl = TABLE.lock();
+        match tbl.get(&fdno) {
+            None => return -9,
+            Some(e) => {
+                if offset >= e.content.len() { return 0; }
+                let avail = &e.content[offset..];
+                let n = avail.len().min(buf.len());
+                avail[..n].to_vec() // clone only the needed bytes
+            }
         }
-    }
+    }; // TABLE lock released here
+    let n = chunk.len();
+    buf[..n].copy_from_slice(&chunk);
+    n as isize
 }
 
 pub fn procfs_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
-// ─── Content generators ───────────────────────────────────────────────────────
+// ─── Content generators ────────────────────────────────────────────────────────────────────────────
 
 fn generate(path: &str) -> Option<Vec<u8>> {
-    // Normalise /proc/self → /proc/<current_pid>
+    // Normalise /proc/self → /proc/<current_pid>.
+    // Use Cow to avoid allocating when the path already has a numeric PID.
     let pid = crate::proc::scheduler::current_pid();
-    let norm = path.replacen("/proc/self", &format!("/proc/{}", pid), 1);
-    let p = norm.as_str();
+    let norm: Cow<str> = if path.contains("/proc/self") {
+        Cow::Owned(path.replacen("/proc/self", &format!("/proc/{}", pid), 1))
+    } else {
+        Cow::Borrowed(path)
+    };
+    let p = norm.as_ref();
 
-    // /proc/<pid>/maps
     if let Some(rest) = strip_pid_prefix(p, "/maps") {
         return Some(gen_maps(rest.0).into_bytes());
     }
-    // /proc/<pid>/status
     if let Some(rest) = strip_pid_prefix(p, "/status") {
         return Some(gen_status(rest.0).into_bytes());
     }
-    // /proc/<pid>/exe
     if let Some(rest) = strip_pid_prefix(p, "/exe") {
         return Some(gen_exe(rest.0).into_bytes());
     }
-    // /proc/<pid>/fd/<N>
     if let Some((spid, fdpart)) = strip_pid_prefix(p, "/fd/") {
         let fdno: usize = fdpart.parse().ok()?;
         return Some(gen_fd_link(spid, fdno).into_bytes());
     }
-    // /proc/cpuinfo
     if p == "/proc/cpuinfo" {
         return Some(gen_cpuinfo().into_bytes());
     }
-    // /proc/meminfo
     if p == "/proc/meminfo" {
         return Some(gen_meminfo().into_bytes());
     }
-    // /proc/version
     if p == "/proc/version" {
         return Some(gen_version().into_bytes());
     }
-    // /proc/self → directory listing stub
     if p == format!("/proc/{}", pid).as_str() {
         return Some(b"maps\nstatus\nexe\nfd\n".to_vec());
     }
@@ -131,12 +135,11 @@ fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)>
     }
 }
 
-// ─── /proc/<pid>/maps ─────────────────────────────────────────────────────────
+// ─── /proc/<pid>/maps ────────────────────────────────────────────────────────────────────────────────
 
 fn gen_maps(pid: usize) -> String {
     let mut out = String::new();
     crate::mm::mmap::with_vmas(pid as u32, |vma| {
-        // Format: start-end perms offset dev ino pathname
         let perms = format!(
             "{}{}{p}",
             if vma.prot & 1 != 0 { 'r' } else { '-' },
@@ -152,7 +155,7 @@ fn gen_maps(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/status ───────────────────────────────────────────────────────
+// ─── /proc/<pid>/status ────────────────────────────────────────────────────────────────────────────
 
 fn gen_status(pid: usize) -> String {
     let ppid = crate::proc::scheduler::ppid_of(pid);
@@ -169,21 +172,21 @@ fn gen_status(pid: usize) -> String {
     )
 }
 
-// ─── /proc/<pid>/exe ──────────────────────────────────────────────────────────
+// ─── /proc/<pid>/exe ───────────────────────────────────────────────────────────────────────────────
 
 fn gen_exe(pid: usize) -> String {
     crate::proc::scheduler::exe_path_of(pid)
         .unwrap_or_else(|| String::from("/init"))
 }
 
-// ─── /proc/<pid>/fd/<N> ───────────────────────────────────────────────────────
+// ─── /proc/<pid>/fd/<N> ────────────────────────────────────────────────────────────────────────────
 
 fn gen_fd_link(pid: usize, fdno: usize) -> String {
     crate::fs::vfs::fd_to_path(fdno)
         .unwrap_or_else(|| format!("socket:[{}]", fdno))
 }
 
-// ─── /proc/cpuinfo ────────────────────────────────────────────────────────────
+// ─── /proc/cpuinfo ────────────────────────────────────────────────────────────────────────────────
 
 fn gen_cpuinfo() -> String {
     let mut out = String::new();
@@ -206,12 +209,11 @@ fn gen_cpuinfo() -> String {
     out
 }
 
-// ─── /proc/meminfo ────────────────────────────────────────────────────────────
+// ─── /proc/meminfo ────────────────────────────────────────────────────────────────────────────────
 
 fn gen_meminfo() -> String {
     let total_kb = crate::mm::pmm::total_pages() * 4;
     let free_kb  = crate::mm::pmm::free_pages()  * 4;
-    let used_kb  = total_kb - free_kb;
     format!(
         "MemTotal:\t{} kB\n\
          MemFree:\t{} kB\n\
@@ -224,7 +226,7 @@ fn gen_meminfo() -> String {
     )
 }
 
-// ─── /proc/version ────────────────────────────────────────────────────────────
+// ─── /proc/version ────────────────────────────────────────────────────────────────────────────────
 
 fn gen_version() -> String {
     format!("Linux version 6.1.0-rustos (rustc) #1 SMP {}\n",
