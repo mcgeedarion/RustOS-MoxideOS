@@ -655,22 +655,22 @@ fn sys_renameat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize) -
 }
 
 fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
-    let _path = match at_path(dirfd, path_va) { Some(p) => p, None => return -14 };
-    sys_readlink_impl(path_va, buf_va, bufsiz)
-}
-
-// ── NR 290  eventfd2 ────────────────────────────────────────────────────────────
-
-fn sys_eventfd2_impl(_initval: u32, _flags: u32) -> isize {
-    static EVENT_COUNTER: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-    let id   = EVENT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let name = alloc::format!("__eventfd_{}", id);
-    let counter: u64 = 0;
-    crate::fs::vfs::create_file(&name, &counter.to_le_bytes());
-    match crate::fs::vfs::open(&name, crate::fs::vfs::O_RDWR) {
-        Ok(fd) => fd as isize,
-        Err(e) => e as isize,
+    if bufsiz == 0 { return -14; }
+    let path = match at_path(dirfd, path_va) { Some(p) => p, None => return -14 };
+    let data: Option<alloc::vec::Vec<u8>> = if path == "/proc/self/exe" {
+        Some(b"/init".to_vec())
+    } else {
+        crate::fs::vfs::lookup(&path).and_then(|d| {
+            if d.starts_with(b"\x00symlink\x00") { Some(d[9..].to_vec()) } else { None }
+        })
+    };
+    match data {
+        Some(target) => {
+            let n = target.len().min(bufsiz);
+            if copy_to_user(buf_va, &target[..n]).is_err() { return -14; }
+            n as isize
+        }
+        None => -22,
     }
 }
 
@@ -686,17 +686,6 @@ fn sys_inotify_init1_impl(_flags: i32) -> isize {
         Ok(fd) => fd as isize,
         Err(_) => -24,
     }
-}
-
-// ── NR 294  dup3 ─────────────────────────────────────────────────────────────
-
-fn sys_dup3_impl(oldfd: usize, newfd: usize, flags: u32) -> isize {
-    if oldfd == newfd { return -22; }
-    let r = crate::fs::vfs::dup_as(oldfd, newfd);
-    if r >= 0 && flags & 0o2000000 != 0 {
-        crate::fs::fcntl::set_cloexec(newfd, true);
-    }
-    r
 }
 
 // ── NR 318  getrandom ──────────────────────────────────────────────────────────
