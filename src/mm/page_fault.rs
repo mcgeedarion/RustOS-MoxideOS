@@ -52,10 +52,16 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             let page_idx = (page_va - vma.start) / PAGE_SIZE;
             let file_pos = base_offset + page_idx as u64 * PAGE_SIZE as u64;
             unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+            // TODO: on pread failure, free `pa` and return false so the arch
+            // trap handler delivers SIGBUS (currently the process silently
+            // receives a zero page instead of the expected SIGBUS).
             let _ = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_pos as i64);
         }
         VmaKind::Fixed => {
-            // Fixed kernel regions are pre-mapped; fault = access violation.
+            // VmaKind::Fixed indicates a MAP_FIXED mapping that was placed
+            // over an already-mapped region. A not-present fault here means
+            // the region was unmapped under the process — treat as access
+            // violation. Free the freshly allocated page and signal SIGSEGV.
             crate::mm::pmm::free_page(pa);
             return false;
         }
