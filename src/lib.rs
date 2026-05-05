@@ -14,6 +14,7 @@ pub mod elf;
 pub mod fs;
 pub mod gdbstub;
 pub mod input;
+pub mod kernel_main;
 pub mod loader;
 pub mod mm;
 pub mod net;
