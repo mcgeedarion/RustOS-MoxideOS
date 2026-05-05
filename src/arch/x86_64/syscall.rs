@@ -1,6 +1,7 @@
 //! x86-64 SYSCALL/SYSRET entry and per-task first-run hooks.
 
 use crate::proc::scheduler;
+use crate::uaccess::{copy_to_user, validate_user_ptr};
 
 /// Registers pushed onto the kernel stack by the SYSCALL entry stub.
 #[repr(C)]
@@ -23,31 +24,30 @@ pub extern "C" fn child_first_run_hook() {
     let pid = scheduler::current_pid();
     if pid == 0 { return; }
 
-    let (tid_va, tid_val, fs_base) = {
-        let procs = scheduler::procs_lock();
-        let pcb = match procs.iter_mut().find(|p| p.pid == pid) {
-            Some(p) => p,
-            None => { scheduler::procs_unlock(); return; }
-        };
-        let r = (pcb.child_tid_va, pcb.child_tid_val, pcb.ctx.fs_base);
-        if pcb.child_tid_va != 0 { pcb.child_tid_va = 0; }
-        r
-    };
-    scheduler::procs_unlock();
+    let (tid_va, tid_val, fs_base) = scheduler::with_procs(|procs| {
+        match procs.iter_mut().find(|p| p.pid == pid) {
+            Some(p) => {
+                let r = (p.child_tid_va, p.child_tid_val, p.ctx.fs_base);
+                p.child_tid_va = 0; // consume: only write once
+                r
+            }
+            None => (0, 0, 0),
+        }
+    });
 
-    if tid_va > 0x1000 && tid_va < 0x0000_7FFF_FFFF_F000 {
-        unsafe { (tid_va as *mut u32).write_volatile(tid_val); }
+    // CLONE_CHILD_SETTID: write the child's own pid into the tid word.
+    if tid_va != 0 {
+        let _ = copy_to_user(tid_va, &tid_val.to_ne_bytes());
     }
 
+    // CLONE_SETTLS: restore FS.base for TLS.
     if fs_base != 0 {
         unsafe {
             core::arch::asm!(
-                "mov ecx, 0xC0000100",
-                "mov eax, {lo:e}",
-                "mov edx, {hi:e}",
                 "wrmsr",
-                lo = in(reg) fs_base as u32,
-                hi = in(reg) (fs_base >> 32) as u32,
+                in("ecx") 0xC000_0100u32,
+                in("eax") fs_base as u32,
+                in("edx") (fs_base >> 32) as u32,
                 options(nostack)
             );
         }
@@ -55,8 +55,6 @@ pub extern "C" fn child_first_run_hook() {
 }
 
 /// syscall_setup: configure SYSCALL/SYSRET MSRs.
-/// MSR_STAR[47:32] = kernel CS selector (0x08)
-/// MSR_STAR[63:48] = SYSRET CS base (0x18; +3 = user CS 0x1B, +8+3 = user SS 0x23)
 pub fn syscall_setup() {
     use crate::arch::x86_64::cpu::{wrmsr, rdmsr, MSR_EFER, MSR_STAR, MSR_LSTAR, MSR_FMASK};
     unsafe {
@@ -71,17 +69,15 @@ pub fn syscall_setup() {
 /// sys_set_tid_address(tidptr_va)  [NR 218]
 pub fn sys_set_tid_address(tidptr_va: usize) -> isize {
     let pid = scheduler::current_pid();
-    let procs = scheduler::procs_lock();
-    if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-        p.clear_child_tid_va = tidptr_va;
-    }
-    scheduler::procs_unlock();
+    scheduler::with_procs(|procs| {
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.clear_child_tid_va = tidptr_va;
+        }
+    });
     pid as isize
 }
 
 /// sys_arch_prctl(code, addr)  [NR 158]
-/// Handles ARCH_SET_FS (0x1002) and ARCH_GET_FS (0x1003).
-/// ARCH_SET_FS is the very first syscall musl makes to set up TLS.
 pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
     const ARCH_SET_GS: i32 = 0x1001;
     const ARCH_SET_FS: i32 = 0x1002;
@@ -90,7 +86,6 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
 
     match code {
         ARCH_SET_FS => {
-            // Write IA32_FS_BASE MSR (0xC000_0100).
             unsafe {
                 core::arch::asm!(
                     "wrmsr",
@@ -100,26 +95,24 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
                     options(nostack)
                 );
             }
-            // Also update saved fs_base in PCB so context switch preserves it.
             let pid = scheduler::current_pid();
-            let procs = scheduler::procs_lock();
-            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                p.ctx.fs_base = addr;
-            }
-            scheduler::procs_unlock();
+            scheduler::with_procs(|procs| {
+                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                    p.ctx.fs_base = addr;
+                }
+            });
             0
         }
         ARCH_GET_FS => {
-            if addr < 0x1000 { return -14; } // EFAULT
+            if !validate_user_ptr(addr, 8) { return -14; }
             let pid = scheduler::current_pid();
-            let procs = scheduler::procs_lock();
-            let fs = procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.ctx.fs_base);
-            scheduler::procs_unlock();
-            unsafe { (addr as *mut usize).write_volatile(fs); }
+            let fs = scheduler::with_procs(|procs| {
+                procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.ctx.fs_base)
+            });
+            let _ = copy_to_user(addr, &fs.to_ne_bytes());
             0
         }
         ARCH_SET_GS => {
-            // Set IA32_GS_BASE. Rare but accepted.
             unsafe {
                 core::arch::asm!(
                     "wrmsr",
@@ -131,8 +124,8 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
             }
             0
         }
-        ARCH_GET_GS => -22, // EINVAL — not tracked
-        _           => -22, // EINVAL
+        ARCH_GET_GS => -22,
+        _           => -22,
     }
 }
 
@@ -158,11 +151,11 @@ pub unsafe extern "C" fn syscall_asm_entry() {
         "mov [rsp + 10*8], r10",
         "mov [rsp + 11*8], r8",
         "mov [rsp + 12*8], r9",
-        "mov [rsp + 13*8], rcx",  // user RIP
-        "mov [rsp + 14*8], r11",  // user RFLAGS
+        "mov [rsp + 13*8], rcx",
+        "mov [rsp + 14*8], r11",
         "mov rax, [gs:8]",
-        "mov [rsp + 15*8], rax",  // user RSP
-        "mov [rsp + 16*8], rcx",  // rip copy
+        "mov [rsp + 15*8], rax",
+        "mov [rsp + 16*8], rcx",
         "mov rdi, rsp",
         "call syscall_rust_entry",
         "mov r11, [rsp + 14*8]",
@@ -175,12 +168,11 @@ pub unsafe extern "C" fn syscall_asm_entry() {
     );
 }
 
-/// Rust-side syscall dispatcher — called from syscall_asm_entry.
+/// Rust-side syscall dispatcher.
 #[no_mangle]
 pub extern "C" fn syscall_rust_entry(frame: &mut SyscallFrame) {
     let nr = frame.rax;
 
-    // NR 59: execve — needs mutable frame pointer for patching.
     if nr == 59 {
         let ret = crate::proc::exec::sys_execve(
             frame.rdi, frame.rsi, frame.rdx, frame);
@@ -189,7 +181,6 @@ pub extern "C" fn syscall_rust_entry(frame: &mut SyscallFrame) {
         return;
     }
 
-    // NR 15: rt_sigreturn — restores full register state from signal stack.
     if nr == 15 {
         crate::proc::signal::sys_rt_sigreturn(frame);
         return;
@@ -204,9 +195,7 @@ pub extern "C" fn syscall_rust_entry(frame: &mut SyscallFrame) {
     crate::proc::signal::check_pending_signal(frame);
 }
 
-/// Naked trampoline used as the initial RIP for newly created tasks.
-/// On first schedule the context switch jumps here; we call
-/// child_first_run_hook (CLONE_CHILD_SETTID / FS.base) then SYSRETQ.
+/// Naked trampoline: initial RIP for newly created tasks.
 #[naked]
 #[no_mangle]
 pub unsafe extern "C" fn sysret_trampoline() {

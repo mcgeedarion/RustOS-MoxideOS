@@ -21,14 +21,19 @@ pub const USER_SPACE_END: usize = 0x0000_8000_0000_0000;
 #[inline]
 fn user_range_valid(va: usize, len: usize) -> bool {
     if va == 0 || len == 0 { return false; }
-    // Check for wrapping addition.
     let end = match va.checked_add(len) {
         Some(e) => e,
         None    => return false,
     };
-    // Both base and (exclusive) end must be ≤ USER_SPACE_END.
-    // `end` is exclusive so `end == USER_SPACE_END` is still valid.
     end <= USER_SPACE_END
+}
+
+/// Public alias for user_range_valid.
+/// Called by sync::futex, proc::signal, and syscall stubs that need a
+/// quick "is this pointer in user space?" check before a raw dereference.
+#[inline]
+pub fn validate_user_ptr(va: usize, len: usize) -> bool {
+    user_range_valid(va, len)
 }
 
 /// Copy `src_va..src_va+dst.len()` from userspace into `dst`.
@@ -55,13 +60,11 @@ pub fn copy_to_user(dst_va: usize, src: &[u8]) -> bool {
 pub fn read_path(ptr: *const u8) -> Option<alloc::string::String> {
     if ptr.is_null() { return None; }
     let base = ptr as usize;
-    // Validate the first byte is in user space before we touch it.
     if !user_range_valid(base, 1) { return None; }
 
     let mut len = 0usize;
     loop {
         if len > 4096 { return None; }
-        // Validate each extended byte before dereferencing.
         if !user_range_valid(base, len + 1) { return None; }
         if unsafe { *ptr.add(len) } == 0 { break; }
         len += 1;

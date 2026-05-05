@@ -6,7 +6,7 @@
 //!
 //! A CLONE_VM child:
 //!   - Gets a fresh pid but shares user_satp (CR3) with its parent.
-//!   - Shares the parent's VMA list (both point to same logical address space).
+//!   - Shares the parent's VMA list.
 //!   - Gets a private kernel stack and Context.
 //!   - Starts at sysret_trampoline with rax=0 (child return value).
 //!
@@ -21,6 +21,7 @@ use crate::proc::thread;
 use crate::arch::x86_64::syscall::sysret_trampoline;
 use crate::mm::kstack::alloc_kstack;
 use crate::uaccess::{copy_to_user, USER_SPACE_END};
+use crate::security::CapSet;
 
 // ── CLONE_* flag bits (x86-64 Linux ABI) ────────────────────────────────
 
@@ -57,11 +58,10 @@ pub struct CloneArgs {
     pub cgroup:       u64,
 }
 
-// ── sys_clone3 ─────────────────────────────────────────────────────────────
+// ── sys_clone3 ────────────────────────────────────────────────────────────
 
 /// clone3(args_va, args_size) -> child_pid / -errno  [NR 435]
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
-    // Validate pointer and size per Linux clone3 ABI.
     let clone_args_sz = core::mem::size_of::<CloneArgs>();
     if args_va == 0
         || args_va >= USER_SPACE_END
@@ -70,7 +70,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         return -14; // EFAULT
     }
     if args_size < clone_args_sz {
-        return -22; // EINVAL: caller's struct is too small
+        return -22; // EINVAL
     }
 
     let ca: &CloneArgs = unsafe { &*(args_va as *const CloneArgs) };
@@ -99,7 +99,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     });
 
     let user_rsp = if ca.stack != 0 { (ca.stack + ca.stack_size) as usize } else { 0 };
-
     push_syscall_frame(kstack_top, parent_rip, parent_rflags, user_rsp);
 
     let child_ctx = Context {
@@ -109,7 +108,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         ..Context::zero()
     };
 
-    // CLONE_PARENT_SETTID: write child_pid into parent userspace (via uaccess).
+    // CLONE_PARENT_SETTID: write child_pid into parent userspace.
     if flags & CLONE_PARENT_SETTID != 0 {
         let _ = copy_to_user(ca.parent_tid as usize, &(child_pid as u32).to_ne_bytes());
     }
@@ -142,17 +141,11 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         child.owned_pages  = Vec::new();
         child.exit_signal  = ca.exit_signal as u32;
         child.vfork_parent = if flags & CLONE_VFORK != 0 { parent_pid } else { 0 };
+        // CLONE_CHILD_SETTID: child_first_run_hook will write child_pid to this VA.
         child.child_tid_va  = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
         child.child_tid_val = child_pid as u32;
+        // CLONE_CHILD_CLEARTID: do_exit will zero this VA and FUTEX_WAKE.
         child.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
-        // CLONE_VM threads share the parent's VMA list; copy it for non-VM clones.
-        if !is_vm_clone {
-            // vmas already cloned from parent by the cloned() call above
-        } else {
-            // Thread: vmas are logically shared but we keep a copy in each PCB
-            // for simplicity (writes go through mmap which updates all threads
-            // sharing the same user_satp). Future work: use Arc<Mutex<Vec<Vma>>>.
-        }
         child
     });
 
@@ -163,7 +156,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pid as isize
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
@@ -179,15 +172,20 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
 }
 
 fn make_blank_pcb() -> Pcb {
-    use crate::proc::process::Pcb;
     Pcb {
-        pid: 0, ppid: 0, state: State::Ready, exit_code: 0,
-        caps: crate::security::CapSet,
-        pc: 0, sp: 0, user_satp: 0, kernel_satp: 0, trapframe_pa: 0,
-        vmas: Vec::new(),
+        pid:   0,
+        ppid:  0,
+        state: State::Ready,
+        exit_code: 0,
+        caps:  CapSet::empty(),
+        pc: 0, sp: 0,
+        user_satp: 0, kernel_satp: 0, trapframe_pa: 0,
+        vmas:    Vec::new(),
         next_va: Pcb::INITIAL_NEXT_VA,
         brk:     Pcb::INITIAL_BRK,
-        kstack_top: 0, ctx: Context::zero(), owned_pages: Vec::new(),
+        kstack_top: 0,
+        ctx: Context::zero(),
+        owned_pages: Vec::new(),
         child_tid_va: 0, child_tid_val: 0, clear_child_tid_va: 0,
         exit_signal: 17, vfork_parent: 0,
         signal_handlers: crate::proc::fork::SignalHandlers::default(),
