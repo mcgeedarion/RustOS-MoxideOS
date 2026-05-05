@@ -5,26 +5,53 @@
 //! sys_exit_group [NR 231] calls do_exit for every thread in the group.
 //!
 //! Exit sequence:
-//!   1. Arch::clear_child_tid  — zero futex word, wake pthread_join
-//!   2. unregister_thread      — remove from THREAD_GROUP (CLONE_VM threads)
-//!   3. free_kstack             — return kernel stack pages to PMM
-//!   4. State → Zombie         — allow parent waitpid to collect
-//!   5. wake vfork_parent       — unblock CLONE_VFORK parent
-//!   6. notify_exit             — wake parent blocked in waitpid
-//!   7. schedule()              — yield; this task never runs again
+//!   1. clear_child_tid  — zero futex word + FUTEX_WAKE (unblocks pthread_join)
+//!   2. unregister_thread
+//!   3. free_kstack + State → Zombie
+//!   4. wake vfork_parent
+//!   5. notify_exit (wakes parent waitpid)
+//!   6. schedule()   — never returns
 
 extern crate alloc;
 
 use crate::proc::{scheduler, thread, wait};
-use crate::arch::Arch;
+use crate::proc::futex::futex_wake_addr;
+use crate::uaccess::copy_to_user;
 use crate::arch::api::Cpu;
+use crate::arch::Arch;
 use crate::mm::kstack::free_kstack;
 use crate::proc::process::State;
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── clear_child_tid ───────────────────────────────────────────────────
+//
+// Implements the CLONE_CHILD_CLEARTID / set_tid_address contract:
+//   - Zero the tid word in user memory at clear_child_tid_va.
+//   - Call futex_wake(va, 1) so any pthread_join waiter unblocks.
+//
+// Called at the very start of do_exit, before the PCB is zombified,
+// so the user address space is still live.
 
-/// Zombify `pid`: free its kernel stack and set its exit code in one lock window.
-/// Returns the vfork_parent pid (0 if none).
+fn clear_child_tid(pid: usize) {
+    // Read (and consume) the VA under the scheduler lock.
+    let va = scheduler::with_procs(|procs| {
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            let va = p.clear_child_tid_va;
+            p.clear_child_tid_va = 0; // consume: only fire once
+            va
+        } else { 0 }
+    });
+
+    if va == 0 { return; }
+
+    // Zero the tid word.  copy_to_user validates the address.
+    let _ = copy_to_user(va, &0u32.to_ne_bytes());
+
+    // Wake any pthread_join waiting on this futex address.
+    futex_wake_addr(va, 1);
+}
+
+// ── zombify ────────────────────────────────────────────────────────────
+
 fn zombify(pid: usize, code: i32) -> usize {
     let kstack_top = scheduler::with_procs(|procs| {
         procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.kstack_top)
@@ -40,39 +67,32 @@ fn zombify(pid: usize, code: i32) -> usize {
     })
 }
 
-// ── do_exit ───────────────────────────────────────────────────────────────
+// ── do_exit ─────────────────────────────────────────────────────────────
 
-/// Core exit logic for one task.
-/// Safe to call from any context; performs all cleanup then yields forever.
 pub fn do_exit(pid: usize, code: i32) {
-    Arch::clear_child_tid(pid); // 1  — zero futex word in user memory
+    clear_child_tid(pid);           // 1 — zero tid word + FUTEX_WAKE
     thread::unregister_thread(pid); // 2
-    let vfork_parent = zombify(pid, code); // 3 + 4
-    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); } // 5
-    wait::notify_exit(pid); // 6
-    scheduler::schedule();  // 7  — never returns
+    let vfork_parent = zombify(pid, code); // 3
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); } // 4
+    wait::notify_exit(pid);  // 5
+    scheduler::schedule();   // 6 — never returns
 
-    // Unreachable on every arch, but the type system can't prove it;
-    // spin on arch-specific halt so we don't fall off the end of a ! fn.
     loop { <Arch as Cpu>::halt(); }
 }
 
-// ── sys_exit ───────────────────────────────────────────────────────────────
+// ── sys_exit [NR 60] ──────────────────────────────────────────────────
 
-/// sys_exit(status) [NR 60] — exit the calling thread.
 pub fn sys_exit(status: i32) -> isize {
     do_exit(scheduler::current_pid(), status);
-    0 // unreachable
+    0
 }
 
-// ── sys_exit_group ──────────────────────────────────────────────────────────
+// ── sys_exit_group [NR 231] ────────────────────────────────────────────
 
-/// sys_exit_group(status) [NR 231] — exit all threads in the process group.
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
-    // Collect sibling pids (exclude self) in one lock window.
     let siblings: alloc::vec::Vec<usize> = scheduler::with_procs(|procs| {
         procs.iter()
             .filter(|p| p.pid != pid && thread::tgid_of(p.pid) == tgid)
@@ -81,7 +101,7 @@ pub fn sys_exit_group(status: i32) -> isize {
     });
 
     for sibling in siblings {
-        Arch::clear_child_tid(sibling);
+        clear_child_tid(sibling);
         thread::unregister_thread(sibling);
         let _ = zombify(sibling, status);
         wait::notify_exit(sibling);

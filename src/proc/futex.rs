@@ -1,60 +1,97 @@
 //! Futex subsystem — fast userspace mutex primitives.
 //!
 //! futex_wake_addr(addr, count) wakes up to `count` tasks sleeping on `addr`.
-//! Called by exit_clear_child_tid and by sys_futex (NR 202).
+//! Called by exit clear_child_tid and by sys_futex (NR 202).
+//!
+//! ## Lock ordering (MUST NOT be violated)
+//!
+//!   WAITERS < scheduler::SCHED
+//!
+//! i.e. if you need both, acquire WAITERS first and release it before
+//! touching the scheduler lock (with_procs / wake_pid / schedule).
+//! futex_wait enforces this by releasing WAITERS before calling with_procs.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
+use crate::proc::{scheduler, process::State};
 
 /// Maps futex userspace address → list of blocked pids.
 static WAITERS: Mutex<BTreeMap<usize, Vec<usize>>> = Mutex::new(BTreeMap::new());
 
-/// Block the current task on `addr` until woken.
-pub fn futex_wait(addr: usize) {
-    let pid = crate::proc::scheduler::current_pid();
-    WAITERS.lock().entry(addr).or_default().push(pid);
+/// Block the current task on `addr`.
+///
+/// Atomically checks that `*(addr as *const u32) == expected` before
+/// blocking; returns `Err(-11)` (EAGAIN) if the value has already changed.
+/// This closes the TOCTOU window between the caller's read and the
+/// waiter registration.
+pub fn futex_wait(addr: usize, expected: u32) -> Result<(), isize> {
+    let pid = scheduler::current_pid();
+
+    // Step 1: check value AND register under WAITERS lock (atomic w.r.t. wakers).
     {
-        let procs = crate::proc::scheduler::procs_lock();
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.state = crate::proc::process::State::Blocked;
+        let mut map = WAITERS.lock();
+        // Re-read the futex word while holding WAITERS so a concurrent
+        // futex_wake_addr cannot slip between our read and our enqueue.
+        let current = unsafe { (addr as *const u32).read_volatile() };
+        if current != expected {
+            return Err(-11); // EAGAIN: value changed before we could sleep
         }
-        crate::proc::scheduler::procs_unlock();
-    }
-    crate::proc::scheduler::schedule();
+        map.entry(addr).or_default().push(pid);
+    } // WAITERS lock released here — safe to acquire scheduler lock below
+
+    // Step 2: mark self Blocked (scheduler lock; WAITERS not held — no inversion).
+    scheduler::with_procs(|procs| {
+        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+            p.state = State::Blocked;
+        }
+    });
+
+    // Step 3: yield. We will be rescheduled by futex_wake_addr → wake_pid.
+    scheduler::schedule();
+    Ok(())
 }
 
 /// Wake up to `count` tasks waiting on `addr`.
+/// Safe to call from any context; does not hold the scheduler lock.
 pub fn futex_wake_addr(addr: usize, count: usize) {
+    // Drain waiters from the map while holding only WAITERS lock.
     let to_wake: Vec<usize> = {
         let mut map = WAITERS.lock();
         let list = match map.get_mut(&addr) { Some(l) => l, None => return };
         let n = count.min(list.len());
         list.drain(..n).collect()
-    };
+    }; // WAITERS lock released before wake_pid acquires scheduler lock
+
     for pid in to_wake {
-        crate::proc::scheduler::wake_pid(pid);
+        scheduler::wake_pid(pid); // acquires scheduler lock independently
     }
 }
 
-/// sys_futex(uaddr, op, val, ...) [NR 202] — FUTEX_WAIT / FUTEX_WAKE.
+/// sys_futex(uaddr, op, val, timeout, uaddr2, val3) [NR 202]
+/// Handles FUTEX_WAIT (0) and FUTEX_WAKE (1).
+/// Private variants (op | 128) are handled by the op & 0x7F mask.
 pub fn sys_futex(uaddr: usize, op: u32, val: u32,
                  _timeout: usize, _uaddr2: usize, _val3: u32) -> isize {
     const FUTEX_WAIT: u32 = 0;
     const FUTEX_WAKE: u32 = 1;
-    match op & 0xF {
+
+    if uaddr < 0x1000 || uaddr >= crate::uaccess::USER_SPACE_END {
+        return -14; // EFAULT
+    }
+
+    match op & 0x7F { // strip FUTEX_PRIVATE_FLAG (128) and FUTEX_CLOCK_REALTIME (256)
         FUTEX_WAIT => {
-            if uaddr < 0x1000 { return -14; }
-            let current = unsafe { (uaddr as *const u32).read_volatile() };
-            if current != val { return -11; } // EAGAIN
-            futex_wait(uaddr);
-            0
+            match futex_wait(uaddr, val) {
+                Ok(_)       => 0,
+                Err(eagain) => eagain,
+            }
         }
         FUTEX_WAKE => {
             futex_wake_addr(uaddr, val as usize);
             0
         }
-        _ => -38,
+        _ => -38, // ENOSYS
     }
 }
