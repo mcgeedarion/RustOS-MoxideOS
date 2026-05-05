@@ -17,11 +17,11 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use spin::Mutex;
 
-use crate::proc::scheduler;
 use crate::arch::x86_64::syscall::SyscallFrame;
-use crate::uaccess::{copy_to_user, copy_from_user, validate_user_ptr, USER_SPACE_END};
+use crate::proc::scheduler;
+use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr, USER_SPACE_END};
 
-// ── Signal metadata ────────────────────────────────────────────────────
+// ── Signal metadata ───────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct SigInfo {
@@ -39,13 +39,13 @@ const CLD_EXITED:  i32 = 1;
 const CLD_KILLED:  i32 = 2;
 const SEGV_MAPERR: i32 = 1;
 
-// ── Signal storage ────────────────────────────────────────────────────
+// ── Signal storage ─────────────────────────────────────────────────────────
 
 static PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
     Mutex::new(BTreeMap::new());
 static SIGMASK: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
-// ── Alternate stack ────────────────────────────────────────────────────
+// ── Alternate stack ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 struct AltStack { ss_sp: usize, ss_flags: i32, ss_size: usize }
@@ -55,13 +55,13 @@ const SS_AUTODISARM: i32 = 0x80000000u32 as i32;
 
 static ALTSTACK: Mutex<BTreeMap<usize, AltStack>> = Mutex::new(BTreeMap::new());
 
-// ── SA_* flags ────────────────────────────────────────────────────────────
+// ── SA_* flags ────────────────────────────────────────────────────────────────
 
 const SA_ONSTACK:  u32 = 0x08000000;
 const SA_RESTORER: u32 = 0x04000000;
 const SA_NODEFER:  u32 = 0x40000000;
 
-// ── Handler table ─────────────────────────────────────────────────────────
+// ── Handler table ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 pub struct SignalHandlers {
@@ -70,7 +70,7 @@ pub struct SignalHandlers {
     pub restorer: usize,
 }
 
-// ── Public API ────────────────────────────────────────────────────────────
+// ── Public API ───────────────────────────────────────────────────────────────
 
 pub fn send_signal(pid: usize, sig: u32) {
     send_signal_info(pid, SigInfo { sig, code: SI_KERNEL, ..Default::default() });
@@ -110,7 +110,7 @@ pub fn set_sigmask(pid: usize, mask: u64) {
     SIGMASK.lock().insert(pid, mask);
 }
 
-// ── sys_sigaltstack [NR 131] ──────────────────────────────────────────────
+// ── sys_sigaltstack [NR 131] ──────────────────────────────────────────────────
 
 pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -148,36 +148,36 @@ pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
     0
 }
 
-// ── sys_rt_sigaction [NR 13] ───────────────────────────────────────────────
+// ── sys_rt_sigaction [NR 13] ───────────────────────────────────────────────────
 
 pub fn sys_rt_sigaction(
     sig: u32, new_act_va: usize, old_act_va: usize, _sigsetsize: usize,
 ) -> isize {
     if sig == 0 || sig > 64 { return -22; }
     let pid = scheduler::current_pid();
+    let idx = sig as usize;
 
-    let (old_handler, old_flags, old_restorer) = scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            let idx = sig as usize;
-            let old = (p.signal_handlers.handlers[idx],
-                       p.signal_handlers.flags[idx],
-                       p.signal_handlers.restorer);
-            if new_act_va != 0 && new_act_va < USER_SPACE_END {
-                let mut h_bytes = [0u8; 8];
-                let mut f_bytes = [0u8; 8];
-                let mut r_bytes = [0u8; 8];
-                if copy_from_user(&mut h_bytes, new_act_va).is_ok()      &&
-                   copy_from_user(&mut f_bytes, new_act_va + 8).is_ok()  &&
-                   copy_from_user(&mut r_bytes, new_act_va + 16).is_ok()
-                {
-                    p.signal_handlers.handlers[idx] = usize::from_ne_bytes(h_bytes);
-                    p.signal_handlers.flags[idx]    = u64::from_ne_bytes(f_bytes) as u32;
-                    p.signal_handlers.restorer      = usize::from_ne_bytes(r_bytes);
-                }
+    let (old_handler, old_flags, old_restorer) = scheduler::with_proc_mut(pid, |p| {
+        let old = (
+            p.signal_handlers.handlers[idx],
+            p.signal_handlers.flags[idx],
+            p.signal_handlers.restorer,
+        );
+        if new_act_va != 0 && new_act_va < USER_SPACE_END {
+            let mut h_bytes = [0u8; 8];
+            let mut f_bytes = [0u8; 8];
+            let mut r_bytes = [0u8; 8];
+            if copy_from_user(&mut h_bytes, new_act_va).is_ok()
+                && copy_from_user(&mut f_bytes, new_act_va + 8).is_ok()
+                && copy_from_user(&mut r_bytes, new_act_va + 16).is_ok()
+            {
+                p.signal_handlers.handlers[idx] = usize::from_ne_bytes(h_bytes);
+                p.signal_handlers.flags[idx]    = u64::from_ne_bytes(f_bytes) as u32;
+                p.signal_handlers.restorer      = usize::from_ne_bytes(r_bytes);
             }
-            old
-        } else { (0, 0, 0) }
-    });
+        }
+        old
+    }).unwrap_or((0, 0, 0));
 
     if old_act_va != 0 && old_act_va < USER_SPACE_END {
         let _ = copy_to_user(old_act_va,      &old_handler.to_ne_bytes());
@@ -188,7 +188,7 @@ pub fn sys_rt_sigaction(
     0
 }
 
-// ── sys_rt_sigprocmask [NR 14] ─────────────────────────────────────────────
+// ── sys_rt_sigprocmask [NR 14] ────────────────────────────────────────────────
 
 pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _sz: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -213,7 +213,7 @@ pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _sz: usize)
     0
 }
 
-// ── Signal frame layout ───────────────────────────────────────────────────
+// ── Signal frame layout ───────────────────────────────────────────────────────────
 
 const UCONTEXT_SIZE:     usize = 256;
 const SIGINFO_SIZE:      usize = 80;
@@ -245,7 +245,7 @@ const REG_CSGSFS:  usize = 18;
 const REG_OLDMASK: usize = 21;
 const REG_CR2:     usize = 22;
 
-// ── check_pending_signal ──────────────────────────────────────────────────
+// ── check_pending_signal ────────────────────────────────────────────────────────
 
 pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let pid = scheduler::current_pid();
@@ -263,13 +263,12 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     };
     if info.sig == 0 { return; }
 
-    let (handler_va, sa_flags, restorer) = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map(|p| (
-            p.signal_handlers.handlers[info.sig as usize],
-            p.signal_handlers.flags[info.sig as usize],
-            p.signal_handlers.restorer,
-        )).unwrap_or((0, 0, 0))
-    });
+    // O(log n) handler lookup via with_proc.
+    let (handler_va, sa_flags, restorer) = scheduler::with_proc(pid, |p| (
+        p.signal_handlers.handlers[info.sig as usize],
+        p.signal_handlers.flags[info.sig as usize],
+        p.signal_handlers.restorer,
+    )).unwrap_or((0, 0, 0));
 
     if handler_va == 0 {
         match info.sig {
@@ -301,9 +300,7 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
 
     let sp = (sp.wrapping_sub(128).wrapping_sub(SIGNAL_FRAME_SIZE)) & !0xF;
 
-    // Validate that the entire signal frame fits in user space before touching it.
     if !validate_user_ptr(sp, SIGNAL_FRAME_SIZE) {
-        // Can't deliver: re-queue the signal and bail.
         PENDING.lock().entry(pid).or_default().push_front(info);
         return;
     }
@@ -312,13 +309,8 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let si_va  = sp + UCONTEXT_SIZE;
     let ret_va = sp + UCONTEXT_SIZE + SIGINFO_SIZE;
 
-    // Build the entire signal frame in a kernel staging buffer, then
-    // copy it to user space in one call. This avoids direct writes to
-    // arbitrary user VAs if sp has been tampered with.
     let mut kframe = [0u8; SIGNAL_FRAME_SIZE];
 
-    // ── ucontext_t ──────────────────────────────────────────────────────────
-    // uc_stack (offset 16): saved rsp
     kframe[16..24].copy_from_slice(&frame.rsp.to_ne_bytes());
 
     macro_rules! wgreg {
@@ -348,10 +340,8 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     wgreg!(REG_CSGSFS,  0x002B_0033u64);
     wgreg!(REG_OLDMASK, mask);
     wgreg!(REG_CR2,     info.addr as u64);
-    // uc_sigmask (offset 240)
     kframe[240..248].copy_from_slice(&mask.to_ne_bytes());
 
-    // ── siginfo_t (at UCONTEXT_SIZE offset) ─────────────────────────────────
     let si = &mut kframe[UCONTEXT_SIZE..UCONTEXT_SIZE + SIGINFO_SIZE];
     si[0..4].copy_from_slice(&(info.sig as i32).to_ne_bytes());
     si[8..12].copy_from_slice(&info.code.to_ne_bytes());
@@ -361,19 +351,14 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
         _ => {}
     }
 
-    // ── return address ───────────────────────────────────────────────────────
     let ret_addr = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
         restorer
     } else {
-        // Build inline trampoline and return its VA.
-        // build_inline_trampoline now uses copy_to_user internally.
         build_inline_trampoline(sp)
     };
     kframe[UCONTEXT_SIZE + SIGINFO_SIZE..].copy_from_slice(&ret_addr.to_ne_bytes());
 
-    // Single copy_to_user for the entire frame.
     if copy_to_user(sp, &kframe).is_err() {
-        // Re-queue and bail if the copy failed.
         PENDING.lock().entry(pid).or_default().push_front(info);
         return;
     }
@@ -385,14 +370,13 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     frame.rsp = ret_va;
 }
 
-// ── sys_rt_sigreturn [NR 15] ──────────────────────────────────────────────
+// ── sys_rt_sigreturn [NR 15] ────────────────────────────────────────────────────
 
 pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
     let pid = scheduler::current_pid();
     let uc_va = frame.rsp.wrapping_sub(UCONTEXT_SIZE + SIGINFO_SIZE);
     if !validate_user_ptr(uc_va, UCONTEXT_SIZE + 8) { return -14; }
 
-    // Copy the entire ucontext into a kernel buffer before reading any field.
     let mut kframe = [0u8; UCONTEXT_SIZE + 8];
     if copy_from_user(&mut kframe, uc_va).is_err() { return -14; }
 
@@ -429,10 +413,8 @@ pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
 // ── Inline trampoline (fallback when SA_RESTORER not set) ─────────────────
 
 fn build_inline_trampoline(sp: usize) -> usize {
-    // `mov $15,%rax ; syscall` — rt_sigreturn NR
     const CODE: [u8; 9] = [0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
     let va = sp.wrapping_sub(16);
-    // Use copy_to_user so the write goes through the validated uaccess path.
     let _ = copy_to_user(va, &CODE);
     va
 }

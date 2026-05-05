@@ -14,16 +14,16 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::proc::process::{Pcb, State};
-use crate::proc::context::Context;
-use crate::proc::scheduler;
-use crate::proc::thread;
 use crate::arch::x86_64::syscall::sysret_trampoline;
 use crate::mm::kstack::alloc_kstack;
-use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
+use crate::proc::context::Context;
+use crate::proc::process::{Pcb, State};
+use crate::proc::scheduler;
+use crate::proc::thread;
 use crate::security::CapSet;
+use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
 
-// ── CLONE_* flag bits (x86-64 Linux ABI) ────────────────────────────
+// ── CLONE_* flag bits (x86-64 Linux ABI) ─────────────────────────────────
 
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
@@ -58,7 +58,7 @@ pub struct CloneArgs {
     pub cgroup:       u64,
 }
 
-// ── sys_clone3 ──────────────────────────────────────────────────────────
+// ── sys_clone3 ────────────────────────────────────────────────────────────
 
 /// clone3(args_va, args_size) -> child_pid / -errno  [NR 435]
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
@@ -67,25 +67,18 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         || args_va >= USER_SPACE_END
         || args_va.saturating_add(clone_args_sz) > USER_SPACE_END
     {
-        return -14; // EFAULT
+        return -14;
     }
-    if args_size < clone_args_sz {
-        return -22; // EINVAL
-    }
+    if args_size < clone_args_sz { return -22; }
 
-    // Copy the user struct into a kernel buffer before reading any field.
-    // This closes the TOCTOU window and avoids a raw user pointer deref.
     let mut kbuf = [0u8; core::mem::size_of::<CloneArgs>()];
-    if copy_from_user(&mut kbuf, args_va).is_err() {
-        return -14; // EFAULT
-    }
+    if copy_from_user(&mut kbuf, args_va).is_err() { return -14; }
     // SAFETY: CloneArgs is #[repr(C)], all-u64 fields, no padding, no
     // invalid bit patterns. kbuf was filled by copy_from_user.
     let ca: CloneArgs = unsafe { core::mem::transmute(kbuf) };
 
     let flags       = ca.flags;
     let is_vm_clone = flags & CLONE_VM != 0;
-
     let parent_pid  = scheduler::current_pid();
     let parent_tgid = thread::tgid_of(parent_pid);
 
@@ -96,19 +89,22 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let child_pid  = scheduler::next_pid();
     let child_tgid = if is_vm_clone { parent_tgid } else { child_pid };
 
-    let child_cr3 = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == parent_pid)
-             .map(|p| p.user_satp).unwrap_or(0)
-    });
+    // Single lock acquisition: fetch cr3, pc, and ppid (CLONE_PARENT branch)
+    // all at once instead of the previous 3 separate with_procs calls.
+    let (child_cr3, parent_rip, parent_ppid) = scheduler::with_proc(parent_pid, |p| {
+        (p.user_satp, p.pc, p.ppid)
+    }).unwrap_or((0, 0, 1));
 
-    let (parent_rip, parent_rflags) = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == parent_pid)
-             .map(|p| (p.pc, 0x202usize))
-             .unwrap_or((0, 0x202))
-    });
+    let child_ppid = if flags & CLONE_PARENT != 0 {
+        parent_ppid
+    } else if flags & CLONE_THREAD != 0 {
+        parent_tgid
+    } else {
+        parent_pid
+    };
 
     let user_rsp = if ca.stack != 0 { (ca.stack + ca.stack_size) as usize } else { 0 };
-    push_syscall_frame(kstack_top, parent_rip, parent_rflags, user_rsp);
+    push_syscall_frame(kstack_top, parent_rip, 0x202, user_rsp);
 
     let child_ctx = Context {
         rip:     sysret_trampoline as usize,
@@ -125,34 +121,23 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
     }
 
-    let child_ppid = if flags & CLONE_PARENT != 0 {
-        scheduler::with_procs(|procs| {
-            procs.iter().find(|p| p.pid == parent_pid).map(|p| p.ppid).unwrap_or(1)
-        })
-    } else if flags & CLONE_THREAD != 0 {
-        parent_tgid
-    } else {
-        parent_pid
-    };
-
-    let child_pcb: Pcb = scheduler::with_procs(|procs| {
-        let mut child = procs.iter().find(|p| p.pid == parent_pid)
-                            .cloned().unwrap_or_else(make_blank_pcb);
-        child.pid        = child_pid;
-        child.tgid       = child_tgid;
-        child.ppid       = child_ppid;
-        child.state      = State::Ready;
-        child.exit_code  = 0;
-        child.user_satp  = child_cr3;
-        child.kstack_top = kstack_top;
-        child.ctx        = child_ctx;
-        child.exit_signal  = ca.exit_signal as u32;
-        child.vfork_parent = if flags & CLONE_VFORK != 0 { parent_pid } else { 0 };
-        child.child_tid_va       = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
-        child.child_tid_val      = child_pid as u32;
-        child.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
-        child
-    });
+    // Clone parent PCB as the base for the child, then override child fields.
+    // with_proc snapshot avoids holding the lock during kstack alloc above.
+    let mut child_pcb: Pcb = scheduler::with_proc(parent_pid, |p| p.clone())
+        .unwrap_or_else(make_blank_pcb);
+    child_pcb.pid        = child_pid;
+    child_pcb.tgid       = child_tgid;
+    child_pcb.ppid       = child_ppid;
+    child_pcb.state      = State::Ready;
+    child_pcb.exit_code  = 0;
+    child_pcb.user_satp  = child_cr3;
+    child_pcb.kstack_top = kstack_top;
+    child_pcb.ctx        = child_ctx;
+    child_pcb.exit_signal        = ca.exit_signal as u32;
+    child_pcb.vfork_parent       = if flags & CLONE_VFORK != 0 { parent_pid } else { 0 };
+    child_pcb.child_tid_va       = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
+    child_pcb.child_tid_val      = child_pid as u32;
+    child_pcb.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
 
     if is_vm_clone { thread::register_thread(child_pid, child_tgid); }
     scheduler::enqueue(child_pcb);
@@ -161,7 +146,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pid as isize
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
@@ -178,10 +163,10 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
 
 fn make_blank_pcb() -> Pcb {
     Pcb {
-        pid:   0, ppid: 0, tgid: 0,
+        pid: 0, ppid: 0, tgid: 0,
         state: State::Ready,
         exit_code: 0,
-        caps:  CapSet::empty(),
+        caps: CapSet::empty(),
         pc: 0, sp: 0,
         user_satp: 0,
         vmas:    Vec::new(),
