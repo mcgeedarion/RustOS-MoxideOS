@@ -37,32 +37,34 @@ pub struct DynExecInfo {
     pub main_entry:   usize,
 }
 
-/// Try to find PT_INTERP in a mapped ELF binary.
-pub fn find_interp(elf_va: usize) -> Option<String> {
-    let ident = unsafe { core::slice::from_raw_parts(elf_va as *const u8, 64) };
-    if &ident[0..4] != b"\x7FELF" { return None; }
-    if ident[4] != 2 { return None; } // 64-bit only
+/// Try to find PT_INTERP in a mapped ELF image.
+///
+/// `elf_data` is a kernel-side byte slice of the ELF file that was
+/// already read from the VFS — no raw user pointer access is needed.
+pub fn find_interp(elf_data: &[u8]) -> Option<String> {
+    if elf_data.len() < 64 { return None; }
+    if &elf_data[0..4] != b"\x7FELF" { return None; }
+    if elf_data[4] != 2 { return None; } // 64-bit only
 
-    let e_phoff     = usize::from_le_bytes(unsafe { *(((elf_va + 32) as *const [u8;8])) });
-    let e_phentsize = u16::from_le_bytes(unsafe  { *(((elf_va + 54) as *const [u8;2])) }) as usize;
-    let e_phnum     = u16::from_le_bytes(unsafe  { *(((elf_va + 56) as *const [u8;2])) }) as usize;
+    let e_phoff     = usize::from_le_bytes(elf_data[32..40].try_into().ok()?);
+    let e_phentsize = u16::from_le_bytes(elf_data[54..56].try_into().ok()?) as usize;
+    let e_phnum     = u16::from_le_bytes(elf_data[56..58].try_into().ok()?) as usize;
+    if e_phentsize == 0 { return None; }
 
     const PT_INTERP: u32 = 3;
     for i in 0..e_phnum {
-        let phdr_va = elf_va + e_phoff + i * e_phentsize;
-        let p_type  = u32::from_le_bytes(unsafe { *((phdr_va as *const [u8;4])) });
-        if p_type == PT_INTERP {
-            let p_offset = usize::from_le_bytes(unsafe { *(((phdr_va + 8)  as *const [u8;8])) });
-            let p_filesz = usize::from_le_bytes(unsafe { *(((phdr_va + 32) as *const [u8;8])) });
-            if p_filesz == 0 { return None; }
-            let interp_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    (elf_va + p_offset) as *const u8,
-                    p_filesz.saturating_sub(1),
-                )
-            };
-            return core::str::from_utf8(interp_bytes).ok().map(String::from);
-        }
+        let base = e_phoff.checked_add(i.checked_mul(e_phentsize)?)?;
+        let end  = base.checked_add(e_phentsize)?;
+        if end > elf_data.len() { break; }
+        let p_type = u32::from_le_bytes(elf_data[base..base+4].try_into().ok()?);
+        if p_type != PT_INTERP { continue; }
+
+        let p_offset = usize::from_le_bytes(elf_data[base+8..base+16].try_into().ok()?);
+        let p_filesz = usize::from_le_bytes(elf_data[base+32..base+40].try_into().ok()?);
+        if p_filesz == 0 { return None; }
+        let str_end = p_offset.checked_add(p_filesz.saturating_sub(1))?;
+        if str_end > elf_data.len() { return None; }
+        return core::str::from_utf8(&elf_data[p_offset..str_end]).ok().map(String::from);
     }
     None
 }
@@ -104,40 +106,31 @@ pub fn build_auxv(
         (9,  info.main_entry  as u64),
         (11, 0), (12, 0), (13, 0), (14, 0),
         (23, 0),
-        // AT_RANDOM: pointer to 16 random bytes — written just below auxv.
-        // We compute the VA first, then append the bytes after the pairs.
-        (25, 0), // placeholder; patched below
+        (25, 0), // AT_RANDOM placeholder; patched below
         (0,  0), // AT_NULL
     ];
 
-    // Layout (stack grows down):
-    //   [16 random bytes]  <- random_va
-    //   [auxv pairs]       <- sp
-    let auxv_sz    = auxv.len() * 16;
-    let total_sz   = auxv_sz + 16;
-    let sp         = stack_top - total_sz;
-    let random_va  = sp + auxv_sz;   // random bytes sit above (higher addr) the auxv
+    let auxv_sz  = auxv.len() * 16;
+    let total_sz = auxv_sz + 16;
+    let sp       = stack_top - total_sz;
+    let random_va = sp + auxv_sz;
 
-    // Serialise into a kernel-side buffer.
     let mut kbuf: Vec<u8> = alloc::vec![0u8; total_sz];
     for (i, (t, v)) in auxv.iter().enumerate() {
         let off = i * 16;
-        // Patch AT_RANDOM value with the actual VA.
         let val = if *t == 25 { random_va as u64 } else { *v };
         kbuf[off..off+8].copy_from_slice(&t.to_le_bytes());
         kbuf[off+8..off+16].copy_from_slice(&val.to_le_bytes());
     }
-    // Append the 16 random bytes at the end of the buffer.
     kbuf[auxv_sz..auxv_sz+16].copy_from_slice(&random_bytes);
 
-    // Single validated write to user space.
     if copy_to_user(sp, &kbuf).is_err() {
-        return 0; // EFAULT — execve caller should propagate -EFAULT
+        return 0;
     }
     sp
 }
 
-// ── ELF mapping helpers ────────────────────────────────────────────────────────
+// ── ELF mapping helpers ───────────────────────────────────────────────────────
 
 fn map_elf_phdrs(elf: &[u8]) -> Result<usize, isize> {
     if elf.len() < 64 { return Err(-8); }
@@ -172,8 +165,8 @@ fn map_elf_phdrs(elf: &[u8]) -> Result<usize, isize> {
         let p_memsz  = usize::from_le_bytes(elf[base+40..base+48].try_into().unwrap());
         let p_flags  = u32::from_le_bytes(elf[base+4 ..base+8 ].try_into().unwrap());
 
-        let load_va  = (p_vaddr + bias) & !(PAGE - 1);
-        let pages    = (p_memsz + PAGE - 1) / PAGE;
+        let load_va = (p_vaddr + bias) & !(PAGE - 1);
+        let pages   = (p_memsz + PAGE - 1) / PAGE;
         let writable = p_flags & 2 != 0;
         let exec     = p_flags & 1 != 0;
 
@@ -184,23 +177,35 @@ fn map_elf_phdrs(elf: &[u8]) -> Result<usize, isize> {
             f
         };
 
-        for pg in 0..pages {
-            if let Some(pa) = crate::mm::pmm::alloc_page() {
-                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
-                <Arch as Paging>::map_page(cr3, load_va + pg * PAGE, pa, pte_flags);
-            }
-        }
+        // Allocate and map physical pages, then copy ELF file data
+        // directly into the physical pages (not through the user VA).
+        // This avoids a copy_nonoverlapping to a raw user VA and is
+        // safe regardless of the active CR3.
+        let file_end = (p_offset + p_filesz).min(elf.len());
+        let src = if p_filesz > 0 { &elf[p_offset..file_end] } else { &[] };
+        let mut src_off = 0usize;
 
-        if p_filesz > 0 {
-            let end = (p_offset + p_filesz).min(elf.len());
-            let src = &elf[p_offset..end];
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    (p_vaddr + bias) as *mut u8,
-                    src.len(),
-                );
+        for pg in 0..pages {
+            let pa = match crate::mm::pmm::alloc_page() {
+                Some(p) => p,
+                None    => return Err(-12),
+            };
+            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+
+            // Copy the slice of file data that falls within this page.
+            if src_off < src.len() {
+                let copy_len = (src.len() - src_off).min(PAGE);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        src[src_off..].as_ptr(),
+                        pa as *mut u8,
+                        copy_len,
+                    );
+                }
+                src_off += copy_len;
             }
+
+            <Arch as Paging>::map_page(cr3, load_va + pg * PAGE, pa, pte_flags);
         }
 
         crate::mm::mmap::insert_vma(pid, crate::mm::mmap::Vma {

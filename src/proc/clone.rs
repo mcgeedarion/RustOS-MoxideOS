@@ -20,10 +20,10 @@ use crate::proc::scheduler;
 use crate::proc::thread;
 use crate::arch::x86_64::syscall::sysret_trampoline;
 use crate::mm::kstack::alloc_kstack;
-use crate::uaccess::{copy_to_user, USER_SPACE_END};
+use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
 use crate::security::CapSet;
 
-// ── CLONE_* flag bits (x86-64 Linux ABI) ──────────────────────────────────
+// ── CLONE_* flag bits (x86-64 Linux ABI) ────────────────────────────
 
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
@@ -58,14 +58,14 @@ pub struct CloneArgs {
     pub cgroup:       u64,
 }
 
-// ── sys_clone3 ────────────────────────────────────────────────────────────
+// ── sys_clone3 ──────────────────────────────────────────────────────────
 
 /// clone3(args_va, args_size) -> child_pid / -errno  [NR 435]
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let clone_args_sz = core::mem::size_of::<CloneArgs>();
     if args_va == 0
         || args_va >= USER_SPACE_END
-        || args_va + clone_args_sz > USER_SPACE_END
+        || args_va.saturating_add(clone_args_sz) > USER_SPACE_END
     {
         return -14; // EFAULT
     }
@@ -73,7 +73,16 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         return -22; // EINVAL
     }
 
-    let ca: &CloneArgs = unsafe { &*(args_va as *const CloneArgs) };
+    // Copy the user struct into a kernel buffer before reading any field.
+    // This closes the TOCTOU window and avoids a raw user pointer deref.
+    let mut kbuf = [0u8; core::mem::size_of::<CloneArgs>()];
+    if copy_from_user(&mut kbuf, args_va).is_err() {
+        return -14; // EFAULT
+    }
+    // SAFETY: CloneArgs is #[repr(C)], all-u64 fields, no padding, no
+    // invalid bit patterns. kbuf was filled by copy_from_user.
+    let ca: CloneArgs = unsafe { core::mem::transmute(kbuf) };
+
     let flags       = ca.flags;
     let is_vm_clone = flags & CLONE_VM != 0;
 
@@ -84,7 +93,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         Some(k) => k,
         None    => return -12,
     };
-    let child_pid = scheduler::next_pid();
+    let child_pid  = scheduler::next_pid();
     let child_tgid = if is_vm_clone { parent_tgid } else { child_pid };
 
     let child_cr3 = scheduler::with_procs(|procs| {
@@ -152,7 +161,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pid as isize
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ────────────────────────────────────────────────────────────────
 
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
