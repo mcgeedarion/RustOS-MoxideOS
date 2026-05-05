@@ -1,6 +1,8 @@
 //! nanosleep + clock_gettime syscalls.
 
 use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::proc::scheduler;
+use crate::proc::process::State;
 
 /// sys_nanosleep(req_va, rem_va)  [NR 35]
 pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
@@ -12,12 +14,27 @@ pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
     let nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 { return -22; } // EINVAL
 
-    // Approximate busy-wait: ~1 ns per iteration at 1 GHz.
-    // Scaled down for emulation. No schedule() call — known limitation;
-    // a real sleep would block the process on a timer event.
-    let iters  = (sec as u64) * 1_000_000_000 + nsec as u64;
-    let scaled = iters / 100;
-    for _ in 0..scaled { core::hint::spin_loop(); }
+    // Yield rather than busy-spin: mark ourselves Blocked and call
+    // schedule() so other processes can run. Sleep duration is not
+    // precise (we wake on the next schedule() call back to us) because
+    // there is no hardware timer callback yet.
+    // TODO: register a timer event that calls scheduler::wake_pid(pid)
+    //       after (sec * 1e9 + nsec) nanoseconds for precise semantics.
+    if sec > 0 || nsec > 0 {
+        let pid = scheduler::current_pid();
+        scheduler::with_procs(|procs| {
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = State::Blocked;
+            }
+        });
+        scheduler::schedule();
+        // Restore Ready so the process continues normally after wakeup.
+        scheduler::with_procs(|procs| {
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                if p.state == State::Blocked { p.state = State::Ready; }
+            }
+        });
+    }
     0
 }
 
