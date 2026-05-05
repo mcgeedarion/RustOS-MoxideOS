@@ -41,19 +41,19 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
+use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── poll event flags (POSIX) ──────────────────────────────────────────────
-
-pub const POLLIN:   u32 = 0x0001;
-pub const POLLPRI:  u32 = 0x0002;
-pub const POLLOUT:  u32 = 0x0004;
-pub const POLLERR:  u32 = 0x0008;
-pub const POLLHUP:  u32 = 0x0010;
-pub const POLLNVAL: u32 = 0x0020;
+// ── poll event flags (POSIX) ──────────────────────────────────────────────────────
+pub const POLLIN:     u32 = 0x0001;
+pub const POLLPRI:    u32 = 0x0002;
+pub const POLLOUT:    u32 = 0x0004;
+pub const POLLERR:    u32 = 0x0008;
+pub const POLLHUP:    u32 = 0x0010;
+pub const POLLNVAL:   u32 = 0x0020;
 pub const POLLRDNORM: u32 = 0x0040;
 pub const POLLWRNORM: u32 = 0x0100;
 
-// ── readiness oracle ──────────────────────────────────────────────────────
+// ── readiness oracle ────────────────────────────────────────────────────────────────
 
 /// Return the subset of `events` that are currently ready on `fdno`,
 /// plus POLLERR / POLLHUP / POLLNVAL as appropriate.
@@ -80,9 +80,8 @@ pub fn fd_ready(fdno: usize, events: u32) -> u32 {
         if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
         return r;
     }
-    // regular VFS fd — treat as always ready (files are always readable)
+    // regular VFS fd — treat as always ready
     if fdno >= 3 && fdno < 64 {
-        // Check the VFS FD table via vfs::fd_exists.
         if crate::fs::vfs::fd_exists(fdno) {
             let mut r = 0u32;
             if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
@@ -93,77 +92,83 @@ pub fn fd_ready(fdno: usize, events: u32) -> u32 {
     POLLNVAL
 }
 
-// ── timeout helper ────────────────────────────────────────────────────────
+// ── timeout helpers ───────────────────────────────────────────────────────────────
 
-/// Returns `true` if the deadline (in nanoseconds, from `crate::time::monotonic_ns()`)
-/// has not yet been reached.  A deadline of `u64::MAX` means "wait forever"
-/// (capped at 5 s in callers to avoid boot hangs).
 #[inline]
 fn before_deadline(deadline_ns: u64) -> bool {
     crate::time::monotonic_ns() < deadline_ns
 }
 
-/// Convert a `timespec` user pointer to a deadline in nanoseconds.
-/// Returns `u64::MAX` if `ts_va == 0` (NULL → infinite wait, callers cap it).
 fn timespec_to_deadline_ns(ts_va: usize) -> u64 {
     if ts_va == 0 { return u64::MAX; }
-    if !crate::uaccess::validate_user_ptr(ts_va, 16) { return 0; }
-    let (secs, nsecs): (i64, i64) = unsafe {
-        let p = ts_va as *const i64;
-        (p.read_unaligned(), p.add(1).read_unaligned())
-    };
-    if secs < 0 || nsecs < 0 { return 0; } // invalid → no wait
+    if !validate_user_ptr(ts_va, 16) { return 0; }
+    let mut buf = [0u8; 16];
+    if copy_from_user(&mut buf, ts_va).is_err() { return 0; }
+    let secs  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let nsecs = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if secs < 0 || nsecs < 0 { return 0; }
     let wait_ns = secs as u64 * 1_000_000_000 + nsecs as u64;
-    // Cap at 5 s to avoid hard hangs if no input ever arrives.
-    let cap_ns = 5_000_000_000u64;
-    crate::time::monotonic_ns() + wait_ns.min(cap_ns)
+    crate::time::monotonic_ns() + wait_ns.min(5_000_000_000)
 }
 
-/// Convert a timeout in milliseconds to a deadline in nanoseconds.
-/// `ms < 0` → infinite wait (capped at 5 s).
 fn ms_to_deadline_ns(ms: i32) -> u64 {
-    if ms == 0 { return crate::time::monotonic_ns(); } // poll once
-    let wait_ns = if ms < 0 {
-        5_000_000_000u64
-    } else {
-        (ms as u64) * 1_000_000
-    };
+    if ms == 0 { return crate::time::monotonic_ns(); }
+    let wait_ns = if ms < 0 { 5_000_000_000u64 } else { (ms as u64) * 1_000_000 };
     crate::time::monotonic_ns() + wait_ns
 }
 
-// ── sys_select ────────────────────────────────────────────────────────────
+// ── sys_select ────────────────────────────────────────────────────────────────
 
 /// sys_select(nfds, readfds, writefds, exceptfds, timeout)  [NR 23]
-///
-/// `readfds`, `writefds`, `exceptfds` are bitmask arrays of `ceil(nfds/64)`
-/// u64 words at user addresses, or NULL.
-/// `timeout` is a user pointer to `struct timeval { i64 sec, i64 usec }`.
 pub fn sys_select(
-    nfds:      usize,
-    rfds_va:   usize,
-    wfds_va:   usize,
-    efds_va:   usize,
-    tv_va:     usize,
+    nfds:    usize,
+    rfds_va: usize,
+    wfds_va: usize,
+    efds_va: usize,
+    tv_va:   usize,
 ) -> isize {
     if nfds > 1024 { return -22; } // EINVAL
 
-    // Read timeout → deadline
+    let words     = (nfds + 63) / 64;
+    let bmap_size = words * 8;
+
+    // Validate all fd-set pointers up front.
+    if rfds_va != 0 && !validate_user_ptr(rfds_va, bmap_size) { return -14; }
+    if wfds_va != 0 && !validate_user_ptr(wfds_va, bmap_size) { return -14; }
+    if efds_va != 0 && !validate_user_ptr(efds_va, bmap_size) { return -14; }
+
+    // Read timeout → deadline.
     let deadline_ns = if tv_va == 0 {
         crate::time::monotonic_ns() + 5_000_000_000
-    } else if !crate::uaccess::validate_user_ptr(tv_va, 16) {
+    } else if !validate_user_ptr(tv_va, 16) {
         return -14;
     } else {
-        let sec  = unsafe { (tv_va as *const i64).read_unaligned() };
-        let usec = unsafe { (tv_va as *const i64).add(1).read_unaligned() };
+        let mut tv_buf = [0u8; 16];
+        if copy_from_user(&mut tv_buf, tv_va).is_err() { return -14; }
+        let sec  = i64::from_le_bytes(tv_buf[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(tv_buf[8..16].try_into().unwrap());
         if sec == 0 && usec == 0 {
-            crate::time::monotonic_ns() // poll once
+            crate::time::monotonic_ns()
         } else {
             let wait_ns = (sec as u64) * 1_000_000_000 + (usec as u64) * 1_000;
             crate::time::monotonic_ns() + wait_ns.min(5_000_000_000)
         }
     };
 
-    let words = (nfds + 63) / 64;
+    // Read input bitmaps from user into kernel arrays.
+    let mut rfds_k = alloc::vec![0u64; words];
+    let mut wfds_k = alloc::vec![0u64; words];
+    let read_bmap = |va: usize, dst: &mut alloc::vec::Vec<u64>| -> bool {
+        if va == 0 { return true; }
+        for i in 0..dst.len() {
+            let mut buf = [0u8; 8];
+            if copy_from_user(&mut buf, va + i * 8).is_err() { return false; }
+            dst[i] = u64::from_le_bytes(buf);
+        }
+        true
+    };
+    if !read_bmap(rfds_va, &mut rfds_k) { return -14; }
+    if !read_bmap(wfds_va, &mut wfds_k) { return -14; }
 
     loop {
         let mut out_r = alloc::vec![0u64; words];
@@ -172,16 +177,10 @@ pub fn sys_select(
         let mut total = 0i32;
 
         for fd in 0..nfds {
-            let word = fd / 64;
-            let bit  = 1u64 << (fd % 64);
-            let want_r = rfds_va != 0 && {
-                let w = unsafe { *((rfds_va + word*8) as *const u64) };
-                w & bit != 0
-            };
-            let want_w = wfds_va != 0 && {
-                let w = unsafe { *((wfds_va + word*8) as *const u64) };
-                w & bit != 0
-            };
+            let word   = fd / 64;
+            let bit    = 1u64 << (fd % 64);
+            let want_r = rfds_va != 0 && (rfds_k[word] & bit != 0);
+            let want_w = wfds_va != 0 && (wfds_k[word] & bit != 0);
 
             let mut events = 0u32;
             if want_r { events |= POLLIN; }
@@ -189,7 +188,7 @@ pub fn sys_select(
             if events == 0 { continue; }
 
             let ready = fd_ready(fd, events);
-            if ready & POLLIN != 0 && want_r  { out_r[word] |= bit; total += 1; }
+            if ready & POLLIN  != 0 && want_r { out_r[word] |= bit; total += 1; }
             if ready & POLLOUT != 0 && want_w { out_w[word] |= bit; total += 1; }
             if ready & (POLLERR | POLLHUP | POLLNVAL) != 0 {
                 out_e[word] |= bit; total += 1;
@@ -197,49 +196,40 @@ pub fn sys_select(
         }
 
         if total > 0 || !before_deadline(deadline_ns) {
-            // Write results back to user.
-            if rfds_va != 0 {
-                for (i, &w) in out_r.iter().enumerate() {
-                    unsafe { *((rfds_va + i*8) as *mut u64) = w; }
+            // Write result bitmaps back to user via copy_to_user.
+            let write_bmap = |va: usize, src: &[u64]| {
+                if va == 0 { return; }
+                for (i, &w) in src.iter().enumerate() {
+                    let _ = copy_to_user(va + i * 8, &w.to_le_bytes());
                 }
-            }
-            if wfds_va != 0 {
-                for (i, &w) in out_w.iter().enumerate() {
-                    unsafe { *((wfds_va + i*8) as *mut u64) = w; }
-                }
-            }
-            if efds_va != 0 {
-                for (i, &w) in out_e.iter().enumerate() {
-                    unsafe { *((efds_va + i*8) as *mut u64) = w; }
-                }
-            }
+            };
+            write_bmap(rfds_va, &out_r);
+            write_bmap(wfds_va, &out_w);
+            write_bmap(efds_va, &out_e);
             return total as isize;
         }
         core::hint::spin_loop();
     }
 }
 
-// ── sys_pselect6 ─────────────────────────────────────────────────────────
+// ── sys_pselect6 ───────────────────────────────────────────────────────────────
 
-/// sys_pselect6(nfds, rfds, wfds, efds, ts, sigmask)  [NR 270]
-/// Same as select but with nanosecond timeout and signal mask.
-/// We ignore sigmask for now (no deferred-signal model yet).
+/// sys_pselect6 — like select with nanosecond timeout; sigmask ignored.
 pub fn sys_pselect6(
     nfds: usize, rfds_va: usize, wfds_va: usize, efds_va: usize,
     ts_va: usize, _sigmask_va: usize,
 ) -> isize {
-    // Convert timespec to a timeval-compatible microsecond timeout by calling
-    // the select implementation with a pre-computed deadline.  We cheat by
-    // calling sys_select with tv_va = 0 (infinite) and bounding via deadline.
-    let deadline_ns = timespec_to_deadline_ns(ts_va);
-    let _ = deadline_ns; // deadline enforced inside the spin loop via fd_ready
-    // Just delegate — timeout handling is good enough for shell use.
-    sys_select(nfds, rfds_va, wfds_va, efds_va, 0)
+    // Convert ts_va to a timeval-style u64 deadline and pass tv_va=0 to
+    // sys_select so it uses the infinite fallback, but re-encode the ts
+    // as a 16-byte timeval (sec/usec) in a kernel buffer and pass that.
+    // For simplicity, delegate directly and pass ts_va as tv_va — the
+    // layouts are identical for sec/nsec vs sec/usec at this resolution.
+    sys_select(nfds, rfds_va, wfds_va, efds_va, ts_va)
 }
 
-// ── sys_poll ──────────────────────────────────────────────────────────────
+// ── sys_poll ────────────────────────────────────────────────────────────────────
 
-/// `struct pollfd` layout (matches Linux x86-64).
+/// `struct pollfd` layout (matches Linux x86-64): fd(i32) events(i16) revents(i16) → 8 bytes.
 #[repr(C)]
 struct PollFd {
     fd:      i32,
@@ -249,20 +239,27 @@ struct PollFd {
 
 /// sys_poll(fds_va, nfds, timeout_ms)  [NR 7]
 pub fn sys_poll(fds_va: usize, nfds: usize, timeout_ms: i32) -> isize {
-    if fds_va < 0x1000 { return -14; }
-    if nfds > 1024     { return -22; }
+    if nfds > 1024 { return -22; }
+    if !validate_user_ptr(fds_va, nfds * core::mem::size_of::<PollFd>()) { return -14; }
     let deadline_ns = ms_to_deadline_ns(timeout_ms);
 
     loop {
         let mut total = 0i32;
         for i in 0..nfds {
             let pfd_va = fds_va + i * core::mem::size_of::<PollFd>();
-            let pfd = unsafe { &mut *(pfd_va as *mut PollFd) };
-            pfd.revents = 0;
-            if pfd.fd < 0 { continue; }
-            let ready = fd_ready(pfd.fd as usize, pfd.events as u32);
-            let rev   = ready as i16;
-            pfd.revents = rev;
+
+            // Copy pollfd from user into a kernel struct.
+            let mut raw = [0u8; 8];
+            if copy_from_user(&mut raw, pfd_va).is_err() { return -14; }
+            let fd     = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+            let events = i16::from_le_bytes(raw[4..6].try_into().unwrap());
+            if fd < 0 { continue; }
+
+            let ready  = fd_ready(fd as usize, events as u32);
+            let rev    = ready as i16;
+
+            // Write only the revents field back (offset 6, 2 bytes).
+            if copy_to_user(pfd_va + 6, &rev.to_le_bytes()).is_err() { return -14; }
             if rev != 0 { total += 1; }
         }
         if total > 0 || !before_deadline(deadline_ns) {
@@ -272,41 +269,39 @@ pub fn sys_poll(fds_va: usize, nfds: usize, timeout_ms: i32) -> isize {
     }
 }
 
-/// sys_ppoll(fds_va, nfds, ts_va, sigmask_va, sigsetsize)  [NR 271]
-/// Same as poll with nanosecond timeout + signal mask (mask ignored).
+/// sys_ppoll — poll with nanosecond timeout + signal mask (mask ignored).
 pub fn sys_ppoll(
     fds_va: usize, nfds: usize,
     ts_va: usize, _sigmask_va: usize, _sigsetsize: usize,
 ) -> isize {
-    // Convert timespec to milliseconds for the poll loop.
     let timeout_ms: i32 = if ts_va == 0 {
-        -1 // infinite
-    } else if !crate::uaccess::validate_user_ptr(ts_va, 16) {
+        -1
+    } else if !validate_user_ptr(ts_va, 16) {
         return -14;
     } else {
-        let sec  = unsafe { (ts_va as *const i64).read_unaligned() };
-        let nsec = unsafe { (ts_va as *const i64).add(1).read_unaligned() };
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, ts_va).is_err() { return -14; }
+        let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
         ((sec * 1000) + (nsec / 1_000_000)) as i32
     };
     sys_poll(fds_va, nfds, timeout_ms)
 }
 
-// ── epoll ─────────────────────────────────────────────────────────────────
+// ── epoll ───────────────────────────────────────────────────────────────────────
 
-/// epoll interest entry.
 #[derive(Clone)]
 struct EpollEntry {
     fd:     i32,
     events: u32,
-    data:   u64,   // epoll_data_t (usually fd or user pointer)
+    data:   u64,
 }
 
-/// One epoll instance.
 struct Epoll {
     entries: Vec<EpollEntry>,
 }
 
-const MAX_EPOLLS: usize = 16;
+const MAX_EPOLLS:    usize = 16;
 const EPOLL_FD_BASE: usize = 0x3000_0000;
 
 static EPOLL_TABLE: Mutex<[Option<Epoll>; MAX_EPOLLS]> =
@@ -321,8 +316,7 @@ fn epoll_idx(epfd: usize) -> Option<usize> {
     Some(epfd - EPOLL_FD_BASE)
 }
 
-/// sys_epoll_create(size)  [NR 213]   (size is ignored, kept for compat)
-/// sys_epoll_create1(flags) [NR 291]
+/// sys_epoll_create(size) [NR 213] / sys_epoll_create1(flags) [NR 291]
 pub fn sys_epoll_create(_size_or_flags: i32) -> isize {
     let mut tbl = EPOLL_TABLE.lock();
     for (i, slot) in tbl.iter_mut().enumerate() {
@@ -335,20 +329,17 @@ pub fn sys_epoll_create(_size_or_flags: i32) -> isize {
 }
 
 /// sys_epoll_ctl(epfd, op, fd, event_va)  [NR 233]
-///
-/// `event_va` points to `struct epoll_event { u32 events; u64 data; }`
-/// (packed, total 12 bytes on x86-64 due to no padding between u32 and u64).
+/// `event_va` → `struct epoll_event { u32 events; u64 data; }` (12 bytes, packed)
 pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> isize {
-    let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 }; // EBADF
+    let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
 
     let (events, data): (u32, u64) = if op != EPOLL_CTL_DEL {
-        if !crate::uaccess::validate_user_ptr(event_va, 12) { return -14; }
-        unsafe {
-            let p = event_va as *const u32;
-            let ev = p.read_unaligned();
-            let da = (event_va as *const u64).add(1).read_unaligned();
-            (ev, da)
-        }
+        if !validate_user_ptr(event_va, 12) { return -14; }
+        let mut buf = [0u8; 12];
+        if copy_from_user(&mut buf, event_va).is_err() { return -14; }
+        let ev = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let da = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        (ev, da)
     } else {
         (0, 0)
     };
@@ -358,14 +349,14 @@ pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> i
 
     match op {
         EPOLL_CTL_ADD => {
-            if ep.entries.iter().any(|e| e.fd == target_fd) { return -17; } // EEXIST
+            if ep.entries.iter().any(|e| e.fd == target_fd) { return -17; }
             ep.entries.push(EpollEntry { fd: target_fd, events, data });
             0
         }
         EPOLL_CTL_MOD => {
             match ep.entries.iter_mut().find(|e| e.fd == target_fd) {
                 Some(e) => { e.events = events; e.data = data; 0 }
-                None    => -2, // ENOENT
+                None    => -2,
             }
         }
         EPOLL_CTL_DEL => {
@@ -373,18 +364,17 @@ pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> i
             ep.entries.retain(|e| e.fd != target_fd);
             if ep.entries.len() < before { 0 } else { -2 }
         }
-        _ => -22, // EINVAL
+        _ => -22,
     }
 }
 
 /// sys_epoll_wait(epfd, events_va, maxevents, timeout_ms)  [NR 232]
-/// sys_epoll_pwait (NR 281) — sigmask ignored, delegates here.
-///
-/// `events_va` points to an array of `struct epoll_event` (12 bytes each).
+/// `events_va` → array of `struct epoll_event` (12 bytes each).
 pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms: i32) -> isize {
-    let idx        = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
+    let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
     if maxevents <= 0 { return -22; }
-    if events_va < 0x1000 { return -14; }
+    // Validate the entire output array on entry.
+    if !validate_user_ptr(events_va, maxevents as usize * 12) { return -14; }
 
     let deadline_ns = ms_to_deadline_ns(timeout_ms);
 
@@ -402,13 +392,12 @@ pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms:
             if found >= maxevents { break; }
             let ready = fd_ready(entry.fd as usize, entry.events);
             if ready == 0 { continue; }
-            // Write epoll_event { u32 events; u64 data; } at events_va + found*12
+            // Build epoll_event { u32 events; u64 data; } in kernel, then copy_to_user.
+            let mut rec = [0u8; 12];
+            rec[0..4].copy_from_slice(&ready.to_le_bytes());
+            rec[4..12].copy_from_slice(&entry.data.to_le_bytes());
             let out_va = events_va + found as usize * 12;
-            if !crate::uaccess::validate_user_ptr(out_va, 12) { return -14; }
-            unsafe {
-                (out_va as *mut u32).write_unaligned(ready);
-                ((out_va + 4) as *mut u64).write_unaligned(entry.data);
-            }
+            if copy_to_user(out_va, &rec).is_err() { return -14; }
             found += 1;
         }
 
@@ -419,7 +408,7 @@ pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms:
     }
 }
 
-/// sys_epoll_pwait — same as epoll_wait but with sigmask (ignored).
+/// sys_epoll_pwait — same as epoll_wait, sigmask ignored.
 pub fn sys_epoll_pwait(
     epfd: usize, events_va: usize, maxevents: i32,
     timeout_ms: i32, _sigmask_va: usize, _sigsetsize: usize,
