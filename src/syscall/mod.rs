@@ -109,7 +109,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         14  => crate::proc::signal::sys_rt_sigprocmask(a as u32, b, c, d),
         24  => sys_sched_yield_impl(),
         35  => crate::proc::nanosleep::sys_nanosleep(a, b),
-        39  => crate::proc::scheduler::current_pid() as isize,   // getpid
+        39  => crate::proc::scheduler::current_pid() as isize,       // getpid
         56  => sys_clone_impl(a, b, c, d, e),
         57  => crate::proc::fork_syscall::sys_fork(),
         58  => sys_vfork_impl(),
@@ -119,8 +119,8 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         63  => sys_uname_impl(a),
         98  => sys_getrusage_impl(a as i32, b),
         99  => sys_sysinfo_impl(a),
-        // NR 110 = getppid
-        110 => crate::proc::scheduler::ppid_of(crate::proc::scheduler::current_pid()) as isize,
+        // NR 110 = getppid — single lock window via current_ppid()
+        110 => crate::proc::scheduler::current_ppid() as isize,
         // NR 111 = getpmsg (STREAMS, not implemented — ENOSYS)
         113 => if (b as isize) < 0 { -22 } else { 0 }, // setpgid(pid, pgid): stub; EINVAL if pgid < 0
         114 => crate::proc::scheduler::current_pid() as isize,   // getpgrp

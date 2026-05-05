@@ -22,8 +22,9 @@ pub fn unregister_thread(_pid: usize) {
 }
 
 /// Look up the TGID for a pid. Falls back to pid itself (main thread).
+/// Delegates to scheduler::tgid_of — no extra lock acquire.
 pub fn tgid_of(pid: usize) -> usize {
-    scheduler::with_proc(pid, |p| p.tgid).unwrap_or(pid)
+    scheduler::tgid_of(pid)
 }
 
 /// VMA namespace key: threads in the same group share the parent's tgid.
