@@ -9,7 +9,7 @@ use crate::arch::{Arch, api::{Cpu, Paging}};
 use crate::proc::context::switch_to;
 use crate::proc::process::{Pcb, State};
 
-// ── State ──────────────────────────────────────────────────────────────────
+// ── State ───────────────────────────────────────────────────────────────────────────────
 
 struct SchedState {
     procs:    Vec<Pcb>,
@@ -26,11 +26,18 @@ static SCHED: Mutex<SchedState> = Mutex::new(SchedState {
     next_pid: 1,
 });
 
-// ── Simple queries ─────────────────────────────────────────────────────────
+// ── Simple queries ───────────────────────────────────────────────────────────────────
 
 pub fn current_pid() -> usize {
     let s = SCHED.lock();
     if s.procs.is_empty() { 0 } else { s.procs[s.current].pid }
+}
+
+/// Fast path for getppid (NR 110): reads procs[current].ppid directly
+/// without a BTreeMap lookup, saving one O(log n) indirection per syscall.
+pub fn current_ppid() -> usize {
+    let s = SCHED.lock();
+    if s.procs.is_empty() { 0 } else { s.procs[s.current].ppid }
 }
 
 pub fn next_pid() -> usize {
@@ -47,7 +54,23 @@ pub fn ppid_of(pid: usize) -> usize {
         .map_or(0, |p| p.ppid)
 }
 
-// ── Queue management ───────────────────────────────────────────────────────
+/// Return the thread-group ID (tgid) for `pid`.
+/// Previously lived in thread.rs and called with_proc, causing a
+/// redundant lock acquire. Now a direct BTreeMap-indexed read.
+pub fn tgid_of(pid: usize) -> usize {
+    let s = SCHED.lock();
+    s.pid_idx.get(&pid)
+        .and_then(|&i| s.procs.get(i))
+        .map_or(pid, |p| p.tgid)
+}
+
+/// Number of processes currently in the Ready state. Used for diagnostics.
+pub fn ready_count() -> usize {
+    let s = SCHED.lock();
+    s.procs.iter().filter(|p| p.state == State::Ready).count()
+}
+
+// ── Queue management ───────────────────────────────────────────────────────────────────
 
 pub fn enqueue(pcb: Pcb) {
     let mut s = SCHED.lock();
@@ -58,8 +81,16 @@ pub fn enqueue(pcb: Pcb) {
 }
 
 /// Run `f` with exclusive access to the process list.
+/// Prefer with_proc / with_proc_mut for single-process operations to
+/// keep pid_idx in sync. Use this only when iterating all processes.
 pub fn with_procs<R>(f: impl FnOnce(&mut Vec<Pcb>) -> R) -> R {
     f(&mut SCHED.lock().procs)
+}
+
+/// Immutable variant: iterate all processes without risk of breaking
+/// pid_idx by accidentally mutating the list.
+pub fn with_procs_ro<R>(f: impl FnOnce(&[Pcb]) -> R) -> R {
+    f(&SCHED.lock().procs)
 }
 
 /// Run `f` with a shared reference to the PCB for `pid`. Returns `None` if
@@ -78,7 +109,7 @@ pub fn with_proc_mut<R>(pid: usize, f: impl FnOnce(&mut Pcb) -> R) -> Option<R> 
     Some(f(&mut s.procs[idx]))
 }
 
-// ── State transitions ──────────────────────────────────────────────────────
+// ── State transitions ───────────────────────────────────────────────────────────────────
 
 pub fn suspend_current_until_child_exec(_child_pid: usize) {
     {
@@ -103,16 +134,12 @@ pub fn wake_pid(pid: usize) {
 
 pub fn fix_current_after_remove(removed_idx: usize) {
     let mut s = SCHED.lock();
-    // Rebuild the pid→idx map after a swap_remove.
-    // Caller must have already called procs.swap_remove(removed_idx).
     let len = s.procs.len();
     if len == 0 {
         s.current = 0;
         s.pid_idx.clear();
         return;
     }
-    // The element now at removed_idx (if it exists) was previously at
-    // the last position — update its index entry.
     if removed_idx < len {
         let moved_pid = s.procs[removed_idx].pid;
         s.pid_idx.insert(moved_pid, removed_idx);
@@ -136,7 +163,6 @@ pub fn remove_pid(pid: usize) -> Option<Pcb> {
     if len == 0 {
         s.current = 0;
     } else {
-        // Fix up the pid that got moved by swap_remove.
         if idx < len {
             let moved_pid = s.procs[idx].pid;
             s.pid_idx.insert(moved_pid, idx);
@@ -151,13 +177,13 @@ pub fn remove_pid(pid: usize) -> Option<Pcb> {
     Some(removed)
 }
 
-// ── Scheduler ──────────────────────────────────────────────────────────────
+// ── Scheduler ────────────────────────────────────────────────────────────────────────────
 
 /// Round-robin: find the next Ready task, switch context to it.
 /// Does nothing if there is only one runnable task or no tasks.
 pub fn schedule() {
     // Phase 1: under the lock, decide who to switch to and capture raw
-    // pointers to the two Context objects.  Raw ptrs are valid for the
+    // pointers to the two Context objects. Raw ptrs are valid for the
     // lifetime of SCHED (static), so using them after dropping the guard
     // is sound as long as we hold no other reference into SCHED.procs.
     let (old_ctx, new_ctx, new_cr3) = {
@@ -177,6 +203,7 @@ pub fn schedule() {
             nxt = (nxt + 1) % len;
         }
 
+        // No ready task, or the only ready task is already current.
         if !found || nxt == cur { return; }
 
         if s.procs[cur].state == State::Running {
