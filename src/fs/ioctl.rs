@@ -16,9 +16,9 @@
 //! All others return -ENOTTY (-25).
 
 use crate::shell::tty;
+use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── ioctl request codes ───────────────────────────────────────────────────
-
+// ── ioctl request codes ─────────────────────────────────────────────────────────
 const TCGETS:     usize = 0x5401;
 const TCSETS:     usize = 0x5402;
 const TCSETSW:    usize = 0x5403;
@@ -31,59 +31,73 @@ const FIONREAD:   usize = 0x541B;
 const FIOCLEX:    usize = 0x5451;
 const FIONCLEX:   usize = 0x5450;
 
-// ── winsize struct (4 × u16) ──────────────────────────────────────────────
-
+// ── winsize struct (4 × u16 = 8 bytes) ──────────────────────────────────────────────
 #[repr(C)]
 struct Winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
 
 /// sys_ioctl(fd, request, arg) [NR 16]
 pub fn sys_ioctl(fd: usize, request: usize, arg: usize) -> isize {
-    // Only operate on TTY-like fds (0, 1, 2, or /dev/tty fd).
     let is_tty = fd <= 2
         || crate::fs::devfs::get_dev_fd(fd)
             .map_or(false, |k| k == crate::fs::devfs::DevKind::Tty);
 
     match request {
         TCGETS => {
-            if arg < 0x1000 { return -14; } // EFAULT
+            let sz = core::mem::size_of::<tty::Termios>();
+            if !validate_user_ptr(arg, sz) { return -14; }
             let t = tty::get_termios();
-            unsafe { core::ptr::write_volatile(arg as *mut tty::Termios, t); }
+            let bytes = unsafe {
+                core::slice::from_raw_parts(&t as *const tty::Termios as *const u8, sz)
+            };
+            if copy_to_user(arg, bytes).is_err() { return -14; }
             0
         }
         TCSETS | TCSETSW | TCSETSF => {
-            if arg < 0x1000 { return -14; }
-            let t = unsafe { core::ptr::read_volatile(arg as *const tty::Termios) };
+            let sz = core::mem::size_of::<tty::Termios>();
+            if !validate_user_ptr(arg, sz) { return -14; }
+            let mut buf = alloc::vec![0u8; sz];
+            if copy_from_user(&mut buf, arg).is_err() { return -14; }
+            // SAFETY: buf has exactly sizeof(Termios) bytes, all bit
+            // patterns are valid for the Termios POD struct.
+            let t = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const tty::Termios) };
             tty::set_termios(t);
             0
         }
         TIOCGWINSZ => {
-            if arg < 0x1000 { return -14; }
+            if !validate_user_ptr(arg, 8) { return -14; }
             let ws = Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
-            unsafe { core::ptr::write_volatile(arg as *mut Winsize, ws); }
+            let bytes = unsafe {
+                core::slice::from_raw_parts(&ws as *const Winsize as *const u8, 8)
+            };
+            if copy_to_user(arg, bytes).is_err() { return -14; }
             0
         }
-        TIOCSWINSZ => 0,  // accepted, ignored
+        TIOCSWINSZ => 0,
         TIOCGPGRP => {
-            if arg < 0x1000 { return -14; }
+            if !validate_user_ptr(arg, 4) { return -14; }
             let pid = tty::foreground_pid() as u32;
-            unsafe { core::ptr::write_volatile(arg as *mut u32, pid); }
+            if copy_to_user(arg, &pid.to_le_bytes()).is_err() { return -14; }
             0
         }
         TIOCSPGRP => {
-            if arg < 0x1000 { return -14; }
-            let pid = unsafe { core::ptr::read_volatile(arg as *const u32) } as usize;
+            if !validate_user_ptr(arg, 4) { return -14; }
+            let mut buf = [0u8; 4];
+            if copy_from_user(&mut buf, arg).is_err() { return -14; }
+            let pid = u32::from_le_bytes(buf) as usize;
             tty::set_foreground_pid(pid);
             0
         }
         FIONREAD => {
-            if arg < 0x1000 { return -14; }
-            unsafe { core::ptr::write_volatile(arg as *mut u32, 0); }
+            if !validate_user_ptr(arg, 4) { return -14; }
+            if copy_to_user(arg, &0u32.to_le_bytes()).is_err() { return -14; }
             0
         }
-        FIOCLEX  => 0,  // FD_CLOEXEC set — no-op until exec clears fds
-        FIONCLEX => 0,  // FD_CLOEXEC clear
+        FIOCLEX  => { crate::fs::fcntl::set_cloexec(fd, true);  0 }
+        FIONCLEX => { crate::fs::fcntl::set_cloexec(fd, false); 0 }
         _ => {
             if is_tty { -25 } else { -25 } // ENOTTY
         }
     }
 }
+
+extern crate alloc;
