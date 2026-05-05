@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use crate::arch::{Arch, api::{PageFlags, Paging}};
 use crate::proc::scheduler;
 
-// ── VMA descriptor ──────────────────────────────────────────────────────────────────
+// ── VMA descriptor ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum VmaKind {
@@ -34,7 +34,7 @@ pub struct Vma {
     pub file_offset: u64,
 }
 
-// ── PROT_* / MAP_* constants ──────────────────────────────────────────────────────
+// ── PROT_* / MAP_* constants ──────────────────────────────────────────────────────────────────
 
 pub const PROT_READ:  u32 = 1;
 pub const PROT_WRITE: u32 = 2;
@@ -44,12 +44,9 @@ const MAP_FIXED: u32 = 0x10;
 const MAP_ANON:  u32 = 0x20;
 const PAGE:      usize = 4096;
 
-// ── VMA helpers ──────────────────────────────────────────────────────────────────
+// ── VMA helpers ────────────────────────────────────────────────────────────────────────────
 
 /// Insert a VMA in sorted order by start address.
-/// Uses binary_search to find the insertion point in O(log n),
-/// then Vec::insert which is O(n) for the shift — acceptable since
-/// mmap is infrequent compared to find_vma (called on every page fault).
 pub fn insert_vma(pid: usize, vma: Vma) {
     scheduler::with_proc_mut(pid, |p| {
         let idx = p.vmas
@@ -71,9 +68,6 @@ pub fn remove_vma(pid: usize, addr: usize, len: usize) {
 pub fn find_vma(pid: usize, addr: usize) -> Option<Vma> {
     scheduler::with_proc(pid, |p| {
         let vmas = &p.vmas;
-        // Binary search for the last VMA whose start <= addr.
-        // partition_point gives the index of the first entry with start > addr,
-        // so the candidate is one before that.
         let idx = vmas.partition_point(|v| v.start <= addr);
         if idx == 0 { return None; }
         let v = &vmas[idx - 1];
@@ -82,36 +76,20 @@ pub fn find_vma(pid: usize, addr: usize) -> Option<Vma> {
 }
 
 pub fn clone_vmas(src_pid: usize, dst_pid: usize) {
-    // Snapshot src vmas, then write to dst — two separate lock acquisitions
-    // to avoid borrow conflicts on the same Vec. Sort order is preserved.
     let src_vmas: Vec<Vma> = scheduler::with_proc(src_pid, |p| p.vmas.clone())
         .unwrap_or_default();
     scheduler::with_proc_mut(dst_pid, |p| p.vmas = src_vmas);
 }
 
-/// Clear VMA metadata only (no page unmapping). Used internally after
-/// free_address_space has already unmapped the pages.
 fn clear_vmas_internal(pid: usize) {
     scheduler::with_proc_mut(pid, |p| p.vmas.clear());
 }
 
-// ── free_address_space ────────────────────────────────────────────────────────────────────
-//
-// Tear down a process's entire user address space:
-//   1. For each VMA: walk page-by-page, virt_to_phys → unmap_page → free_page.
-//   2. Call Paging::free_page_table(cr3) to release the PML4 and all
-//      intermediate page table pages back to the PMM.
-//   3. Clear pcb.vmas so the zombie PCB holds no dangling references.
-//
-// Must be called BEFORE the process switches away from its CR3 (i.e. while
-// still running, or from the exit path of the last thread in the group).
-// Must NOT be called if other threads still share this CR3 (CLONE_VM).
+// ── free_address_space ────────────────────────────────────────────────────────────────────────────
 
 pub fn free_address_space(pid: usize, user_cr3: usize) {
     if user_cr3 == 0 { return; }
 
-    // Snapshot the VMA list without holding the scheduler lock during
-    // the (potentially long) page-by-page teardown loop.
     let vmas: Vec<Vma> = scheduler::with_proc(pid, |p| p.vmas.clone())
         .unwrap_or_default();
 
@@ -126,11 +104,10 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
 
     <Arch as Paging>::free_page_table(user_cr3);
     clear_vmas_internal(pid);
-
     scheduler::with_proc_mut(pid, |p| p.user_satp = 0);
 }
 
-// ── sys_mmap ──────────────────────────────────────────────────────────────────────────
+// ── sys_mmap ──────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_mmap(
     addr: usize, length: usize, prot: u32, flags: u32,
@@ -140,7 +117,6 @@ pub fn sys_mmap(
     let len = page_align_up(length);
     let pid = scheduler::current_pid();
 
-    // Single lock acquisition: resolve va and cr3.
     let (va, user_cr3) = scheduler::with_proc_mut(pid, |p| {
         let va = if flags & MAP_FIXED != 0 {
             if addr == 0 { return (0, 0); }
@@ -159,9 +135,9 @@ pub fn sys_mmap(
     let pte_flags = prot_to_flags(prot);
     let mut mapped = 0usize;
     for page_va in (va..va + len).step_by(PAGE) {
+        // alloc_page() guarantees the returned page is zero-filled.
         match crate::mm::pmm::alloc_page() {
             Some(pa) => {
-                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
                 <Arch as Paging>::map_page(user_cr3, page_va, pa, pte_flags);
                 mapped += 1;
             }
@@ -192,7 +168,7 @@ pub fn sys_mmap(
     va as isize
 }
 
-// ── sys_munmap ──────────────────────────────────────────────────────────────────────────
+// ── sys_munmap ──────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_munmap(addr: usize, length: usize) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
@@ -206,7 +182,7 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
     0
 }
 
-// ── sys_mprotect ──────────────────────────────────────────────────────────────────────────
+// ── sys_mprotect ────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
@@ -223,8 +199,6 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     }
     scheduler::with_proc_mut(pid, |p| {
         for v in p.vmas.iter_mut() {
-            // Early break: list is sorted by start, so once we pass the
-            // end of the requested range no further VMAs can overlap.
             if v.start >= addr + len { break; }
             if v.start < addr + len && v.end > addr {
                 v.prot = prot;
@@ -234,7 +208,7 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     0
 }
 
-// ── sys_brk ────────────────────────────────────────────────────────────────────────────
+// ── sys_brk ───────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_brk(addr: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -243,8 +217,8 @@ pub fn sys_brk(addr: usize) -> isize {
     if addr == 0 || addr <= old_brk { return old_brk as isize; }
     let new_brk = page_align_up(addr);
     for va in (old_brk..new_brk).step_by(PAGE) {
+        // alloc_page() guarantees the returned page is zero-filled.
         if let Some(pa) = crate::mm::pmm::alloc_page() {
-            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
             <Arch as Paging>::map_page(
                 user_cr3, va, pa,
                 PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX,
@@ -255,7 +229,7 @@ pub fn sys_brk(addr: usize) -> isize {
     new_brk as isize
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
@@ -266,4 +240,18 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     if prot & PROT_WRITE != 0 { f |= PageFlags::WRITE; }
     if prot & PROT_EXEC  == 0 { f |= PageFlags::NX; }
     f
+}
+
+// ── procfs helpers (called from procfs.rs) ────────────────────────────────────────────────
+
+pub fn with_vmas<F: FnMut(&Vma)>(pid: u32, mut f: F) {
+    scheduler::with_proc(pid as usize, |p| {
+        for v in &p.vmas { f(v); }
+    });
+}
+
+pub fn vma_total_kb(pid: u32) -> usize {
+    scheduler::with_proc(pid as usize, |p| {
+        p.vmas.iter().map(|v| (v.end - v.start) / 1024).sum()
+    }).unwrap_or(0)
 }

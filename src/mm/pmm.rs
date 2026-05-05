@@ -24,7 +24,7 @@ use spin::Mutex;
 extern crate alloc;
 use alloc::vec::Vec;
 
-// ── Bootstrap pool ────────────────────────────────────────────────────────
+// ── Bootstrap pool ────────────────────────────────────────────────────────────────────────
 
 const POOL_PAGES: usize = 16_384; // 64 MiB static pool
 const PAGE_SIZE:  usize = 4096;
@@ -34,12 +34,14 @@ struct Pool([u8; POOL_PAGES * PAGE_SIZE]);
 static POOL: Pool = Pool([0u8; POOL_PAGES * PAGE_SIZE]);
 static BUMP: AtomicUsize = AtomicUsize::new(0);
 
-// ── Free list ───────────────────────────────────────────────────────────────
+// ── Free list ──────────────────────────────────────────────────────────────────────────────
 
 static FREE_LIST:   Mutex<Vec<usize>> = Mutex::new(Vec::new());
-static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(POOL_PAGES);
+static TOTAL_PAGES: AtomicUsize      = AtomicUsize::new(POOL_PAGES);
+/// Lock-free counter mirroring FREE_LIST.len(); avoids locking just for diagnostics.
+static FREE_COUNT:  AtomicUsize      = AtomicUsize::new(0);
 
-// ── Kernel image extent ────────────────────────────────────────────────────
+// ── Kernel image extent ─────────────────────────────────────────────────────────────────────
 
 const KERNEL_START_PA: usize = 0x400000;
 extern "C" { static _end: u8; }
@@ -60,12 +62,13 @@ fn is_valid_pa(pa: usize) -> bool {
     pa != 0 && pa & (PAGE_SIZE - 1) == 0 && !is_kernel_page(pa)
 }
 
-// ── Core allocator ─────────────────────────────────────────────────────────
+// ── Core allocator ─────────────────────────────────────────────────────────────────────────
 
 /// Allocate one 4096-byte page. Returns the physical (identity-mapped) address.
+/// The returned page is always zero-filled.
 pub fn alloc_page() -> Option<usize> {
-    // Try free list first (tier 2 + returned tier 1 pages).
     let pa = if let Some(pa) = FREE_LIST.lock().pop() {
+        FREE_COUNT.fetch_sub(1, Ordering::Relaxed);
         pa
     } else {
         let idx = BUMP.fetch_add(1, Ordering::Relaxed);
@@ -75,7 +78,8 @@ pub fn alloc_page() -> Option<usize> {
         }
         POOL.0.as_ptr() as usize + idx * PAGE_SIZE
     };
-    // Zero the page after allocation so callers always get clean memory.
+    // Zero the page so callers always receive clean memory.
+    // This is the single authoritative zero; callers must NOT zero again.
     unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
     Some(pa)
 }
@@ -86,9 +90,7 @@ pub fn alloc_page() -> Option<usize> {
 /// Panics if `pa` is already on the free list (double-free detection).
 /// Also panics if `pa` is 0, not page-aligned, or inside the kernel image.
 pub fn free_page(pa: usize) {
-    // Always-on bounds checks: these are cheap and catch obvious bugs in
-    // both debug and release builds.
-    if pa == 0 { return; } // silently ignore null
+    if pa == 0 { return; }
     assert!(
         pa & (PAGE_SIZE - 1) == 0,
         "free_page: PA {:#x} is not page-aligned",
@@ -102,9 +104,6 @@ pub fn free_page(pa: usize) {
 
     let mut list = FREE_LIST.lock();
 
-    // Debug-only duplicate detection. Iterating the whole free list is O(n)
-    // but only active in debug builds where correctness matters more than
-    // throughput. In release builds the assert compiles away entirely.
     #[cfg(debug_assertions)]
     assert!(
         !list.contains(&pa),
@@ -113,12 +112,11 @@ pub fn free_page(pa: usize) {
     );
 
     list.push(pa);
+    // Increment after the push so FREE_COUNT never exceeds FREE_LIST.len().
+    FREE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Reserve `n` contiguous pages from the bump pool in one atomic step.
-///
-/// Panics if the free list is already non-empty (pmm_add_region was called
-/// first, breaking the heap-contiguity invariant required by heap_init).
 pub fn reserve_bump_range(n: usize) -> Option<usize> {
     assert!(
         FREE_LIST.lock().is_empty(),
@@ -132,12 +130,9 @@ pub fn reserve_bump_range(n: usize) -> Option<usize> {
     Some(POOL.0.as_ptr() as usize + idx * PAGE_SIZE)
 }
 
-// ── Memory map ingestion ───────────────────────────────────────────────────
+// ── Memory map ingestion ──────────────────────────────────────────────────────────────────────
 
 /// Register a usable physical memory region with the PMM.
-///
-/// Skips pages overlapping the bootstrap pool, the kernel image, or
-/// that fail the is_valid_pa check (PA 0, non-aligned, etc.).
 pub fn pmm_add_region(base: u64, size: u64) {
     let pool_start = POOL.0.as_ptr() as u64;
     let pool_end   = pool_start + (POOL_PAGES * PAGE_SIZE) as u64;
@@ -148,7 +143,6 @@ pub fn pmm_add_region(base: u64, size: u64) {
     let end   = (base + size) & !(PAGE_SIZE as u64 - 1);
     if start >= end { return; }
 
-    // Build batch outside the lock to minimise lock hold time.
     let mut batch: Vec<usize> = Vec::new();
     let mut pa = start;
     while pa + PAGE_SIZE as u64 <= end {
@@ -156,7 +150,6 @@ pub fn pmm_add_region(base: u64, size: u64) {
         let in_pool  = pa < pool_end  && pa_end > pool_start;
         let in_kern  = pa < kern_end  && pa_end > kern_start;
         let pa_usize = pa as usize;
-        // Apply the same validity checks as free_page so the list starts clean.
         if !in_pool && !in_kern && is_valid_pa(pa_usize) {
             batch.push(pa_usize);
         }
@@ -165,11 +158,13 @@ pub fn pmm_add_region(base: u64, size: u64) {
 
     let added = batch.len();
     FREE_LIST.lock().extend(batch);
+    FREE_COUNT.fetch_add(added, Ordering::Relaxed);
     TOTAL_PAGES.fetch_add(added, Ordering::Relaxed);
 }
 
-// ── Diagnostics ──────────────────────────────────────────────────────────────
+// ── Diagnostics ────────────────────────────────────────────────────────────────────────────────
 
 pub fn total_pages()     -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
-pub fn free_pages()      -> usize { FREE_LIST.lock().len() }
+/// Lock-free: reads FREE_COUNT atomic instead of locking FREE_LIST.
+pub fn free_pages()      -> usize { FREE_COUNT.load(Ordering::Relaxed) }
 pub fn pages_allocated() -> usize { BUMP.load(Ordering::Relaxed) }
