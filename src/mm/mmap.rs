@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use crate::arch::{Arch, api::{PageFlags, Paging}};
 use crate::proc::scheduler;
 
-// ── VMA descriptor ─────────────────────────────────────────────────────────────────────────────
+// ── VMA descriptor ──────────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum VmaKind {
@@ -34,7 +34,7 @@ pub struct Vma {
     pub file_offset: u64,
 }
 
-// ── PROT_* / MAP_* constants ──────────────────────────────────────────────────────────────────
+// ── PROT_* / MAP_* constants ─────────────────────────────────────────────────────────────────
 
 pub const PROT_READ:  u32 = 1;
 pub const PROT_WRITE: u32 = 2;
@@ -44,7 +44,7 @@ const MAP_FIXED: u32 = 0x10;
 const MAP_ANON:  u32 = 0x20;
 const PAGE:      usize = 4096;
 
-// ── VMA helpers ────────────────────────────────────────────────────────────────────────────
+// ── VMA helpers ───────────────────────────────────────────────────────────────────────────────
 
 /// Insert a VMA in sorted order by start address.
 pub fn insert_vma(pid: usize, vma: Vma) {
@@ -85,7 +85,7 @@ fn clear_vmas_internal(pid: usize) {
     scheduler::with_proc_mut(pid, |p| p.vmas.clear());
 }
 
-// ── free_address_space ────────────────────────────────────────────────────────────────────────────
+// ── free_address_space ──────────────────────────────────────────────────────────────────────────
 
 pub fn free_address_space(pid: usize, user_cr3: usize) {
     if user_cr3 == 0 { return; }
@@ -107,7 +107,7 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
     scheduler::with_proc_mut(pid, |p| p.user_satp = 0);
 }
 
-// ── sys_mmap ──────────────────────────────────────────────────────────────────────────────
+// ── sys_mmap ─────────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_mmap(
     addr: usize, length: usize, prot: u32, flags: u32,
@@ -131,6 +131,12 @@ pub fn sys_mmap(
 
     if va == 0 { return -22; }
     if user_cr3 == 0 { return -12; }
+
+    // MAP_FIXED replaces any existing mapping in [va, va+len) — remove
+    // stale VMAs first so find_vma never returns the old entry after remap.
+    if flags & MAP_FIXED != 0 {
+        remove_vma(pid, va, len);
+    }
 
     let pte_flags = prot_to_flags(prot);
     let mut mapped = 0usize;
@@ -168,7 +174,7 @@ pub fn sys_mmap(
     va as isize
 }
 
-// ── sys_munmap ──────────────────────────────────────────────────────────────────────────────
+// ── sys_munmap ───────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_munmap(addr: usize, length: usize) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
@@ -182,7 +188,7 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
     0
 }
 
-// ── sys_mprotect ────────────────────────────────────────────────────────────────────────────
+// ── sys_mprotect ──────────────────────────────────────────────────────────────────────────
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
@@ -208,7 +214,7 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     0
 }
 
-// ── sys_brk ───────────────────────────────────────────────────────────────────────────────
+// ── sys_brk ──────────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_brk(addr: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -216,6 +222,7 @@ pub fn sys_brk(addr: usize) -> isize {
         .unwrap_or((0, 0));
     if addr == 0 || addr <= old_brk { return old_brk as isize; }
     let new_brk = page_align_up(addr);
+
     for va in (old_brk..new_brk).step_by(PAGE) {
         // alloc_page() guarantees the returned page is zero-filled.
         if let Some(pa) = crate::mm::pmm::alloc_page() {
@@ -225,11 +232,27 @@ pub fn sys_brk(addr: usize) -> isize {
             );
         }
     }
+
     scheduler::with_proc_mut(pid, |p| p.brk = new_brk);
+
+    // Register the newly grown heap region as an Anonymous VMA so that:
+    //   1. find_vma() can locate heap pages on demand faults.
+    //   2. free_address_space() can find and free the physical pages on exit.
+    // The VMA covers [old_brk, new_brk). Since VMAs are sorted by start
+    // and brk only grows, this always inserts at the end of the list.
+    insert_vma(pid, Vma {
+        start:       old_brk,
+        end:         new_brk,
+        prot:        PROT_READ | PROT_WRITE,
+        flags:       MAP_ANON,
+        kind:        VmaKind::Anonymous,
+        file_offset: 0,
+    });
+
     new_brk as isize
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────────────────
+// ── helpers ─────────────────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
@@ -242,7 +265,7 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     f
 }
 
-// ── procfs helpers (called from procfs.rs) ────────────────────────────────────────────────
+// ── procfs helpers (called from procfs.rs) ──────────────────────────────────────────────
 
 pub fn with_vmas<F: FnMut(&Vma)>(pid: u32, mut f: F) {
     scheduler::with_proc(pid as usize, |p| {
