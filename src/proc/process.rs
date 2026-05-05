@@ -17,6 +17,9 @@ pub struct Pcb {
     // Identity
     pub pid:       usize,
     pub ppid:      usize,
+    /// Thread-group id. Equals `pid` for the main thread / fork child.
+    /// Shared across all clone(CLONE_THREAD) threads in the same process.
+    pub tgid:      usize,
     pub state:     State,
     pub exit_code: i32,
     pub caps:      CapSet,
@@ -25,12 +28,10 @@ pub struct Pcb {
     pub pc: usize,
     pub sp: usize,
 
-    // Address space (CR3 / SATP physical addresses)
-    pub user_satp:    usize,
-    pub kernel_satp:  usize,
-    pub trapframe_pa: usize,
+    // Address space (CR3 physical address)
+    pub user_satp: usize,
 
-    // Virtual memory management (per-process — no global hash table needed)
+    // Virtual memory management
     /// Virtual Memory Areas: sorted by start address.
     pub vmas:    Vec<Vma>,
     /// Next free virtual address for anonymous mmap allocations.
@@ -39,9 +40,8 @@ pub struct Pcb {
     pub brk:     usize,
 
     // Kernel stack
-    pub kstack_top:  usize,
-    pub ctx:         Context,
-    pub owned_pages: Vec<usize>,
+    pub kstack_top: usize,
+    pub ctx:        Context,
 
     // clone3 / POSIX thread ABI fields
     /// CLONE_CHILD_SETTID: write pid here on first run. Zeroed after write.

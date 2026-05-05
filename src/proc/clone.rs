@@ -23,7 +23,7 @@ use crate::mm::kstack::alloc_kstack;
 use crate::uaccess::{copy_to_user, USER_SPACE_END};
 use crate::security::CapSet;
 
-// ── CLONE_* flag bits (x86-64 Linux ABI) ────────────────────────────────
+// ── CLONE_* flag bits (x86-64 Linux ABI) ──────────────────────────────────
 
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
@@ -85,11 +85,11 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         None    => return -12,
     };
     let child_pid = scheduler::next_pid();
+    let child_tgid = if is_vm_clone { parent_tgid } else { child_pid };
 
-    let (child_cr3, child_tgid) = scheduler::with_procs(|procs| {
-        let par_cr3 = procs.iter().find(|p| p.pid == parent_pid)
-                          .map(|p| p.user_satp).unwrap_or(0);
-        if is_vm_clone { (par_cr3, parent_tgid) } else { (par_cr3, child_pid) }
+    let child_cr3 = scheduler::with_procs(|procs| {
+        procs.iter().find(|p| p.pid == parent_pid)
+             .map(|p| p.user_satp).unwrap_or(0)
     });
 
     let (parent_rip, parent_rflags) = scheduler::with_procs(|procs| {
@@ -108,11 +108,9 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         ..Context::zero()
     };
 
-    // CLONE_PARENT_SETTID: write child_pid into parent userspace.
     if flags & CLONE_PARENT_SETTID != 0 {
         let _ = copy_to_user(ca.parent_tid as usize, &(child_pid as u32).to_ne_bytes());
     }
-    // CLONE_PIDFD: allocate pidfd, write fd# into parent VA.
     if flags & CLONE_PIDFD != 0 {
         let fd = crate::fs::pidfd::alloc(child_pid);
         let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
@@ -131,20 +129,18 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let child_pcb: Pcb = scheduler::with_procs(|procs| {
         let mut child = procs.iter().find(|p| p.pid == parent_pid)
                             .cloned().unwrap_or_else(make_blank_pcb);
-        child.pid          = child_pid;
-        child.ppid         = child_ppid;
-        child.state        = State::Ready;
-        child.exit_code    = 0;
-        child.user_satp    = child_cr3;
-        child.kstack_top   = kstack_top;
-        child.ctx          = child_ctx;
-        child.owned_pages  = Vec::new();
+        child.pid        = child_pid;
+        child.tgid       = child_tgid;
+        child.ppid       = child_ppid;
+        child.state      = State::Ready;
+        child.exit_code  = 0;
+        child.user_satp  = child_cr3;
+        child.kstack_top = kstack_top;
+        child.ctx        = child_ctx;
         child.exit_signal  = ca.exit_signal as u32;
         child.vfork_parent = if flags & CLONE_VFORK != 0 { parent_pid } else { 0 };
-        // CLONE_CHILD_SETTID: child_first_run_hook will write child_pid to this VA.
-        child.child_tid_va  = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
-        child.child_tid_val = child_pid as u32;
-        // CLONE_CHILD_CLEARTID: do_exit will zero this VA and FUTEX_WAKE.
+        child.child_tid_va       = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
+        child.child_tid_val      = child_pid as u32;
         child.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
         child
     });
@@ -167,25 +163,23 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
         p.add(13).write(rip);      // rcx → user RIP
         p.add(14).write(rflags);   // r11 → user RFLAGS
         p.add(15).write(user_rsp); // rsp → user stack
-        p.add(16).write(rip);      // context-switch RIP mirror
+        p.add(16).write(rip);
     }
 }
 
 fn make_blank_pcb() -> Pcb {
     Pcb {
-        pid:   0,
-        ppid:  0,
+        pid:   0, ppid: 0, tgid: 0,
         state: State::Ready,
         exit_code: 0,
         caps:  CapSet::empty(),
         pc: 0, sp: 0,
-        user_satp: 0, kernel_satp: 0, trapframe_pa: 0,
+        user_satp: 0,
         vmas:    Vec::new(),
         next_va: Pcb::INITIAL_NEXT_VA,
         brk:     Pcb::INITIAL_BRK,
         kstack_top: 0,
         ctx: Context::zero(),
-        owned_pages: Vec::new(),
         child_tid_va: 0, child_tid_val: 0, clear_child_tid_va: 0,
         exit_signal: 17, vfork_parent: 0,
         signal_handlers: crate::proc::fork::SignalHandlers::default(),
