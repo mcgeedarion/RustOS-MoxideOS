@@ -154,7 +154,6 @@ impl Ext2Fs {
     fn group_desc(&self, g: usize) -> GroupDesc {
         let off = if self.block_size == 1024 { 2048 } else { self.block_size };
         let entry_off = off + g * 32;
-        // Bounds-check before the cast to prevent OOB on a corrupt/truncated image.
         if entry_off + 32 > self.data.len() {
             return GroupDesc {
                 block_bitmap: 0, inode_bitmap: 0, inode_table: 0,
@@ -183,8 +182,38 @@ impl Ext2Fs {
         Some(&self.data[off..off + self.block_size])
     }
 
+    /// Iterate over the direct + single-indirect data blocks of `ino`,
+    /// calling `f` with each block slice. Stops early when `f` returns false.
+    /// Zero-copy: slices point into self.data, no allocation.
+    fn scan_inode_data_blocks<F>(&self, ino: &Inode, mut f: F)
+    where F: FnMut(&[u8]) -> bool
+    {
+        // Direct blocks (0..11)
+        for i in 0..12usize {
+            if let Some(blk) = self.block_data(ino.block[i]) {
+                if !f(blk) { return; }
+            }
+        }
+        // Single-indirect block (block[12])
+        if let Some(iblk) = self.block_data(ino.block[12]) {
+            let ptrs = self.block_size / 4;
+            for i in 0..ptrs {
+                let blkno = u32::from_le_bytes([
+                    iblk[i*4], iblk[i*4+1], iblk[i*4+2], iblk[i*4+3]
+                ]);
+                if let Some(blk) = self.block_data(blkno) {
+                    if !f(blk) { return; }
+                }
+            }
+        }
+        // Double/triple indirect not needed for directory lookups —
+        // directories in ext2 are practically never larger than
+        // 12 + ptrs blocks (12 + 1024 = 1036 blocks = ~4 MiB at 4K blocks).
+    }
+
+    /// Read all data bytes for a regular file into an owned Vec.
+    /// Used for file reads only; directory lookup uses scan_inode_data_blocks.
     fn read_inode_data(&self, ino: &Inode) -> Vec<u8> {
-        // Cap at MAX_FILE_SIZE to prevent OOM from a crafted size_lo = u32::MAX.
         let size = (ino.size_lo as usize).min(MAX_FILE_SIZE);
         let mut out = alloc::vec![0u8; size];
         let mut written = 0usize;
@@ -197,8 +226,7 @@ impl Ext2Fs {
             }
         }
         if written < size {
-            let ind = ino.block[12];
-            if let Some(iblk) = self.block_data(ind) {
+            if let Some(iblk) = self.block_data(ino.block[12]) {
                 let ptrs = self.block_size / 4;
                 for i in 0..ptrs {
                     if written >= size { break; }
@@ -226,26 +254,35 @@ impl Ext2Fs {
         Some(ino)
     }
 
+    /// Find `name` in directory inode `dir_ino`.
+    /// Zero-copy: scans block slices from self.data directly via
+    /// scan_inode_data_blocks; no Vec<u8> allocation.
     fn lookup_dir(&self, dir_ino: u32, name: &str) -> Option<u32> {
         let inode = self.inode(dir_ino)?;
-        let data  = self.read_inode_data(&inode);
-        let mut off = 0usize;
-        while off + 8 <= data.len() {
-            let de = unsafe { *(data.as_ptr().add(off) as *const DirEntry2) };
-            let rec = de.rec_len as usize;
-            if rec == 0 { break; }
-            if de.inode != 0 {
-                let name_end = off + 8 + de.name_len as usize;
-                // Guard against corrupt rec_len/name_len pushing past end of data.
-                if name_end > data.len() { break; }
-                let name_bytes = &data[off + 8..name_end];
-                if name_bytes == name.as_bytes() { return Some(de.inode); }
+        let name_bytes = name.as_bytes();
+        let mut result = None;
+        self.scan_inode_data_blocks(&inode, |blk| {
+            let mut off = 0usize;
+            while off + 8 <= blk.len() {
+                let de = unsafe { *(blk.as_ptr().add(off) as *const DirEntry2) };
+                let rec = de.rec_len as usize;
+                if rec == 0 { return false; } // malformed; stop
+                if de.inode != 0 {
+                    let name_end = off + 8 + de.name_len as usize;
+                    if name_end <= blk.len() && &blk[off + 8..name_end] == name_bytes {
+                        result = Some(de.inode);
+                        return false; // found; stop scanning
+                    }
+                }
+                off += rec;
             }
-            off += rec;
-        }
-        None
+            true // continue to next block
+        });
+        result
     }
 
+    /// Collect all entries in directory inode `dir_ino`.
+    /// Uses read_inode_data (allocates once) since readdir needs all entries.
     fn list_dir_ino(&self, dir_ino: u32) -> Vec<(u32, String, bool)> {
         let mut out = Vec::new();
         let inode = match self.inode(dir_ino) { Some(i) => i, None => return out };
@@ -257,7 +294,6 @@ impl Ext2Fs {
             if rec == 0 { break; }
             if de.inode != 0 {
                 let name_end = off + 8 + de.name_len as usize;
-                // Same guard as lookup_dir.
                 if name_end > data.len() { break; }
                 let name_bytes = &data[off + 8..name_end];
                 if let Ok(s) = core::str::from_utf8(name_bytes) {
