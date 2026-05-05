@@ -1,0 +1,114 @@
+name: QEMU RISC-V Smoke Build & CL Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  KERNEL: target/riscv64gc-unknown-none-elf/debug/rustos
+
+jobs:
+  riscv-smoke:
+    name: RISC-V Build + QEMU Boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── Rust nightly + RISC-V bare-metal target ─────────────────────────
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: riscv64gc-unknown-none-elf
+          components: rust-src, llvm-tools-preview
+
+      # ── Cargo cache ──────────────────────────────────────────────────────
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: riscv64-debug
+
+      # ── System deps (QEMU RISC-V) ────────────────────────────────────────
+      - name: Install QEMU (RISC-V)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-riscv64
+
+      # ── Build kernel (debug) ─────────────────────────────────────────────
+      - name: Build rustos (RISC-V debug)
+        run: |
+          cargo build \
+            --target riscv64gc-unknown-none-elf \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem \
+            2>&1 | tee build.log
+          echo "--- Build log tail ---"
+          tail -20 build.log
+          # Fail explicitly if ELF wasn't produced
+          test -f "$KERNEL" || { echo "ELF not found at $KERNEL"; exit 1; }
+          file "$KERNEL"
+
+      # ── QEMU boot smoke test ─────────────────────────────────────────────
+      # Boots for up to 8 seconds; looks for a sentinel string on serial.
+      # Your kernel must print this exact string early in kernel_main:
+      #   println!("rustos: kernel_main reached");
+      - name: QEMU boot smoke test
+        run: |
+          timeout 8 qemu-system-riscv64 \
+            -machine virt \
+            -cpu rv64 \
+            -m 256M \
+            -bios default \
+            -kernel "$KERNEL" \
+            -serial stdio \
+            -display none \
+            -no-reboot \
+            -d guest_errors,cpu_reset \
+            2>&1 | tee qemu-boot.log || true
+
+          echo "--- QEMU output ---"
+          cat qemu-boot.log
+
+          if grep -q 'kernel_main reached' qemu-boot.log; then
+            echo "✅ BOOT SMOKE TEST PASSED"
+          else
+            echo "❌ BOOT SMOKE TEST FAILED — sentinel 'kernel_main reached' not in output"
+            exit 1
+          fi
+
+      # ── CL (command-line) test pass ──────────────────────────────────────
+      # Each test name in tests/ is matched as a sentinel in QEMU output.
+      # The kernel must print "TEST PASS: <name>" for each test that runs.
+      - name: CL test pass
+        run: |
+          TESTS_PASSED=0
+          TESTS_FAILED=0
+
+          for expected in "alloc_smoke" "trap_smoke" "uart_smoke"; do
+            if grep -q "TEST PASS: ${expected}" qemu-boot.log; then
+              echo "  ✅ ${expected}"
+              TESTS_PASSED=$((TESTS_PASSED + 1))
+            else
+              echo "  ❌ ${expected} — not found in QEMU output"
+              TESTS_FAILED=$((TESTS_FAILED + 1))
+            fi
+          done
+
+          echo ""
+          echo "Results: $TESTS_PASSED passed, $TESTS_FAILED failed"
+          [ $TESTS_FAILED -eq 0 ] || exit 1
+
+      # ── Upload artifacts on failure ───────────────────────────────────────
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            build.log
+            qemu-boot.log
