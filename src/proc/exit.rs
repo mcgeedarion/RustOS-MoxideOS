@@ -7,11 +7,12 @@
 //! Exit sequence:
 //!   1. clear_child_tid  — zero futex word + FUTEX_WAKE (unblocks pthread_join)
 //!   2. unregister_thread
-//!   3. free_address_space (last thread in group only)
-//!   4. free_kstack + State → Zombie
-//!   5. wake vfork_parent
-//!   6. notify_exit (wakes parent waitpid)
-//!   7. schedule()   — never returns
+//!   3. altstack_clear_pid + proc_name_clear  (prevent per-pid map leaks)
+//!   4. free_address_space (last thread in group only)
+//!   5. free_kstack + State → Zombie
+//!   6. wake vfork_parent
+//!   7. notify_exit (wakes parent waitpid)
+//!   8. schedule()   — never returns
 
 extern crate alloc;
 
@@ -79,7 +80,13 @@ pub fn do_exit(pid: usize, code: i32) {
     clear_child_tid(pid);           // 1
     thread::unregister_thread(pid); // 2
 
-    // 3: free the address space only when the last live thread exits.
+    // 3: Release per-pid entries in syscall-level tables. These are
+    //    BTreeMaps in stubs.rs that are never cleaned up otherwise,
+    //    leaking one entry per process per exit indefinitely.
+    crate::syscall::altstack_clear_pid(pid);
+    crate::syscall::proc_name_clear(pid);
+
+    // 4: free the address space only when the last live thread exits.
     // Sibling CLONE_VM threads share user_satp; tearing it down while
     // they are still running would cause instant faults on their next
     // user instruction. We read user_satp before zombify() zeroes it.
@@ -90,10 +97,10 @@ pub fn do_exit(pid: usize, code: i32) {
         free_address_space(pid, user_satp); // unmaps pages + frees PML4
     }
 
-    let vfork_parent = zombify(pid, code); // 4
-    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); } // 5
-    wait::notify_exit(pid);  // 6
-    scheduler::schedule();   // 7 — never returns
+    let vfork_parent = zombify(pid, code); // 5
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); } // 6
+    wait::notify_exit(pid);  // 7
+    scheduler::schedule();   // 8 — never returns
 
     loop { <Arch as Cpu>::halt(); }
 }
@@ -126,6 +133,8 @@ pub fn sys_exit_group(status: i32) -> isize {
     for sibling in siblings {
         clear_child_tid(sibling);
         thread::unregister_thread(sibling);
+        crate::syscall::altstack_clear_pid(sibling);
+        crate::syscall::proc_name_clear(sibling);
         let _ = zombify(sibling, status);
         wait::notify_exit(sibling);
     }
