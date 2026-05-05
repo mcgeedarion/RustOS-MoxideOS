@@ -7,10 +7,10 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::arch::{Arch, api::{Paging, PageFlags}};
+use crate::arch::{Arch, api::{PageFlags, Paging}};
 use crate::proc::scheduler;
 
-// ── VMA descriptor ───────────────────────────────────────────────────────
+// ── VMA descriptor ────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum VmaKind {
@@ -29,7 +29,7 @@ pub struct Vma {
     pub file_offset: u64,
 }
 
-// ── PROT_* / MAP_* constants ─────────────────────────────────────────────
+// ── PROT_* / MAP_* constants ──────────────────────────────────────────────
 
 pub const PROT_READ:  u32 = 1;
 pub const PROT_WRITE: u32 = 2;
@@ -42,53 +42,36 @@ const PAGE:      usize = 4096;
 // ── VMA helpers ───────────────────────────────────────────────────────────
 
 pub fn insert_vma(pid: usize, vma: Vma) {
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.vmas.push(vma);
-        }
-    });
+    scheduler::with_proc_mut(pid, |p| p.vmas.push(vma));
 }
 
 pub fn remove_vma(pid: usize, addr: usize, len: usize) {
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.vmas.retain(|v| !(v.start < addr + len && v.end > addr));
-        }
+    scheduler::with_proc_mut(pid, |p| {
+        p.vmas.retain(|v| !(v.start < addr + len && v.end > addr));
     });
 }
 
 pub fn find_vma(pid: usize, addr: usize) -> Option<Vma> {
-    scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).and_then(|p| {
-            p.vmas.iter().find(|v| v.start <= addr && addr < v.end).cloned()
-        })
-    })
+    scheduler::with_proc(pid, |p| {
+        p.vmas.iter().find(|v| v.start <= addr && addr < v.end).cloned()
+    }).flatten()
 }
 
 pub fn clone_vmas(src_pid: usize, dst_pid: usize) {
-    let src_vmas: Vec<Vma> = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == src_pid)
-             .map(|p| p.vmas.clone())
-             .unwrap_or_default()
-    });
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == dst_pid) {
-            p.vmas = src_vmas;
-        }
-    });
+    // Snapshot src vmas, then write to dst — two separate lock acquisitions
+    // to avoid borrow conflicts on the same Vec.
+    let src_vmas: Vec<Vma> = scheduler::with_proc(src_pid, |p| p.vmas.clone())
+        .unwrap_or_default();
+    scheduler::with_proc_mut(dst_pid, |p| p.vmas = src_vmas);
 }
 
 /// Clear VMA metadata only (no page unmapping). Used internally after
 /// free_address_space has already unmapped the pages.
 fn clear_vmas_internal(pid: usize) {
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.vmas.clear();
-        }
-    });
+    scheduler::with_proc_mut(pid, |p| p.vmas.clear());
 }
 
-// ── free_address_space ──────────────────────────────────────────────────────
+// ── free_address_space ────────────────────────────────────────────────────
 //
 // Tear down a process's entire user address space:
 //   1. For each VMA: walk page-by-page, virt_to_phys → unmap_page → free_page.
@@ -105,13 +88,9 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
 
     // Snapshot the VMA list without holding the scheduler lock during
     // the (potentially long) page-by-page teardown loop.
-    let vmas: Vec<Vma> = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid)
-             .map(|p| p.vmas.clone())
-             .unwrap_or_default()
-    });
+    let vmas: Vec<Vma> = scheduler::with_proc(pid, |p| p.vmas.clone())
+        .unwrap_or_default();
 
-    // Unmap and free every physical page in every VMA.
     for vma in &vmas {
         for va in (vma.start..vma.end).step_by(PAGE) {
             if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, va) {
@@ -121,48 +100,35 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
         }
     }
 
-    // Release all page table structures (PML4 + PDPTs + PDs + PTs).
     <Arch as Paging>::free_page_table(user_cr3);
-
-    // Clear the now-stale VMA list from the PCB.
     clear_vmas_internal(pid);
 
-    // Zero the CR3 in the PCB so no stale reference remains.
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.user_satp = 0;
-        }
-    });
+    scheduler::with_proc_mut(pid, |p| p.user_satp = 0);
 }
 
 // ── sys_mmap ──────────────────────────────────────────────────────────────
 
 pub fn sys_mmap(
     addr: usize, length: usize, prot: u32, flags: u32,
-    fd:   usize, offset: usize,
+    fd: usize, offset: usize,
 ) -> isize {
     if length == 0 { return -22; }
     let len = page_align_up(length);
+    let pid = scheduler::current_pid();
 
-    let (va, user_cr3) = scheduler::with_procs(|procs| {
-        let pid = procs.iter().enumerate()
-            .find(|(_, p)| p.state == crate::proc::process::State::Running)
-            .map(|(_, p)| p.pid)
-            .unwrap_or(0);
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            let va = if flags & MAP_FIXED != 0 {
-                if addr == 0 { return (0, 0); }
-                addr
-            } else {
-                let v = p.next_va;
-                p.next_va = page_align_up(v + len + PAGE);
-                v
-            };
-            (va, p.user_satp)
+    // Single lock acquisition: resolve va and cr3.
+    let (va, user_cr3) = scheduler::with_proc_mut(pid, |p| {
+        let va = if flags & MAP_FIXED != 0 {
+            if addr == 0 { return (0, 0); }
+            addr
         } else {
-            (0, 0)
-        }
-    });
+            let v = p.next_va;
+            p.next_va = page_align_up(v + len + PAGE);
+            v
+        };
+        (va, p.user_satp)
+    }).unwrap_or((0, 0));
+
     if va == 0 { return -22; }
     if user_cr3 == 0 { return -12; }
 
@@ -187,10 +153,12 @@ pub fn sys_mmap(
         }
     }
 
-    let pid = scheduler::current_pid();
+    // Insert VMA — reuse the pid already resolved above.
     insert_vma(pid, Vma {
-        start: va, end: va + len,
-        prot, flags,
+        start: va,
+        end:   va + len,
+        prot,
+        flags,
         kind: if flags & MAP_ANON != 0 {
             VmaKind::Anonymous
         } else {
@@ -201,20 +169,15 @@ pub fn sys_mmap(
     va as isize
 }
 
-// ── sys_munmap ─────────────────────────────────────────────────────────────
+// ── sys_munmap ────────────────────────────────────────────────────────────
 
 pub fn sys_munmap(addr: usize, length: usize) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
     let len = page_align_up(length);
-    let user_cr3 = scheduler::with_procs(|procs| {
-        let pid = scheduler_running_pid(procs);
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-    });
     for page_va in (addr..addr + len).step_by(PAGE) {
         if let Some(pa) = <Arch as Paging>::unmap_page(page_va) {
             crate::mm::pmm::free_page(pa);
         }
-        let _ = user_cr3;
     }
     remove_vma(scheduler::current_pid(), addr, len);
     0
@@ -224,12 +187,10 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
-    let len       = page_align_up(length);
+    let len      = page_align_up(length);
+    let pid      = scheduler::current_pid();
     let new_flags = prot_to_flags(prot);
-    let pid       = scheduler::current_pid();
-    let user_cr3  = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-    });
+    let user_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if user_cr3 == 0 { return -12; }
     for page_va in (addr..addr + len).step_by(PAGE) {
         if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, page_va) {
@@ -237,25 +198,22 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
             <Arch as Paging>::flush_va(page_va);
         }
     }
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            for v in p.vmas.iter_mut() {
-                if v.start < addr + len && v.end > addr { v.prot = prot; }
+    scheduler::with_proc_mut(pid, |p| {
+        for v in p.vmas.iter_mut() {
+            if v.start < addr + len && v.end > addr {
+                v.prot = prot;
             }
         }
     });
     0
 }
 
-// ── sys_brk ─────────────────────────────────────────────────────────────────
+// ── sys_brk ───────────────────────────────────────────────────────────────
 
 pub fn sys_brk(addr: usize) -> isize {
     let pid = scheduler::current_pid();
-    let (old_brk, user_cr3) = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid)
-             .map(|p| (p.brk, p.user_satp))
-             .unwrap_or((0, 0))
-    });
+    let (old_brk, user_cr3) = scheduler::with_proc(pid, |p| (p.brk, p.user_satp))
+        .unwrap_or((0, 0));
     if addr == 0 || addr <= old_brk { return old_brk as isize; }
     let new_brk = page_align_up(addr);
     for va in (old_brk..new_brk).step_by(PAGE) {
@@ -267,13 +225,11 @@ pub fn sys_brk(addr: usize) -> isize {
             );
         }
     }
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) { p.brk = new_brk; }
-    });
+    scheduler::with_proc_mut(pid, |p| p.brk = new_brk);
     new_brk as isize
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────
 
 #[inline]
 fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
@@ -284,12 +240,4 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     if prot & PROT_WRITE != 0 { f |= PageFlags::WRITE; }
     if prot & PROT_EXEC  == 0 { f |= PageFlags::NX; }
     f
-}
-
-#[inline]
-fn scheduler_running_pid(procs: &[crate::proc::process::Pcb]) -> usize {
-    procs.iter()
-        .find(|p| p.state == crate::proc::process::State::Running)
-        .map(|p| p.pid)
-        .unwrap_or(0)
 }
