@@ -2,8 +2,14 @@
 # run_qemu.sh — Build rustos (debug) and launch it in QEMU.
 #
 # Usage:
-#   ./run_qemu.sh            # ramfs only (no disk)
-#   ./run_qemu.sh disk.img   # attach a virtio-blk disk image
+#   ./run_qemu.sh                  # normal run
+#   ./run_qemu.sh --gdb            # halt at entry, wait for GDB on :1234
+#   ./run_qemu.sh disk.img         # attach a virtio-blk disk image
+#   ./run_qemu.sh --gdb disk.img   # both
+#
+# GDB workflow:
+#   Terminal 1:  ./run_qemu.sh --gdb [disk.img]
+#   Terminal 2:  gdb   (auto-connects via .gdbinit)
 #
 # Requirements:
 #   rustup target add x86_64-unknown-none
@@ -12,7 +18,16 @@
 set -euo pipefail
 
 KERNEL=target/x86_64-unknown-none/debug/rustos
-DISK="${1:-}"
+GDB_MODE=0
+DISK=""
+
+# Parse arguments: --gdb flag + optional disk image (order-independent).
+for arg in "$@"; do
+  case "$arg" in
+    --gdb)     GDB_MODE=1 ;;
+    *)         DISK="$arg" ;;
+  esac
+done
 
 # ─── Build (debug) ────────────────────────────────────────────────────────────────────────────
 
@@ -25,19 +40,16 @@ cargo build \
 # ─── QEMU args ──────────────────────────────────────────────────────────────────────────
 
 QEMU_ARGS=(
-  -machine q35               # modern PCIe chipset: APIC, IOMMU-capable
-  -cpu qemu64,+xsave,+avx   # XSAVE + AVX so xsave_init() sees them
-  -m 256M                    # 256 MiB RAM
-  -kernel "$KERNEL"          # Multiboot2 / direct ELF64 load
-  -serial stdio              # COM1 -> your terminal
-  -display none              # headless
-  -no-reboot                 # stop on triple-fault instead of rebooting
-  -d guest_errors,cpu_reset  # log triple-faults to stderr
+  -machine q35
+  -cpu qemu64,+xsave,+avx
+  -m 256M
+  -kernel "$KERNEL"
+  -serial stdio
+  -display none
+  -no-reboot
+  -d guest_errors,cpu_reset
 )
 
-# Attach disk if provided.
-# virtio-blk-pci is the correct device type for the q35 PCIe bus.
-# (virtio-blk-device is virtio-mmio and does not attach on q35.)
 if [[ -n "$DISK" ]]; then
   echo "[*] Attaching disk: $DISK"
   QEMU_ARGS+=(
@@ -46,6 +58,21 @@ if [[ -n "$DISK" ]]; then
   )
 else
   echo "[*] No disk image — ramfs only"
+fi
+
+if [[ $GDB_MODE -eq 1 ]]; then
+  QEMU_ARGS+=(
+    -s        # open gdbserver on TCP :1234
+    -S        # halt CPU at startup, wait for GDB `continue`
+  )
+  echo
+  echo "  ┌─────────────────────────────────────────────┐"
+  echo "  │ GDB mode: kernel halted at entry point.       │"
+  echo "  │ In another terminal, run:                     │"
+  echo "  │   gdb                                         │"
+  echo "  │ (.gdbinit auto-connects and loads symbols)    │"
+  echo "  └─────────────────────────────────────────────┘"
+  echo
 fi
 
 echo "[*] Starting QEMU..."

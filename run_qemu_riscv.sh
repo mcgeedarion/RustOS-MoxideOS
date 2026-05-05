@@ -2,18 +2,34 @@
 # run_qemu_riscv.sh — Build rustos (RISC-V) and launch it in QEMU.
 #
 # Usage:
-#   ./run_qemu_riscv.sh            # ramfs only (no disk)
-#   ./run_qemu_riscv.sh disk.img   # attach a virtio-blk disk image
+#   ./run_qemu_riscv.sh                  # normal run
+#   ./run_qemu_riscv.sh --gdb            # halt at entry, wait for GDB on :1235
+#   ./run_qemu_riscv.sh disk.img         # attach a virtio-blk disk image
+#   ./run_qemu_riscv.sh --gdb disk.img   # both
+#
+# GDB workflow (RISC-V uses port 1235 to avoid clash with x86 on :1234):
+#   Terminal 1:  ./run_qemu_riscv.sh --gdb [disk.img]
+#   Terminal 2:  gdb-multiarch -ex 'set arch riscv:rv64' \
+#                              -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \
+#                              -ex 'target remote :1235'
 #
 # Requirements:
 #   rustup target add riscv64gc-unknown-none-elf
 #   qemu-system-riscv64
-#   OpenSBI firmware (qemu-system-riscv64 ships it as bios=default)
+#   OpenSBI firmware (bundled with QEMU as bios=default)
 
 set -euo pipefail
 
 KERNEL=target/riscv64gc-unknown-none-elf/debug/rustos
-DISK="${1:-}"
+GDB_MODE=0
+DISK=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --gdb)     GDB_MODE=1 ;;
+    *)         DISK="$arg" ;;
+  esac
+done
 
 # ─── Build (debug) ────────────────────────────────────────────────────────────────────────────
 
@@ -26,20 +42,17 @@ cargo build \
 # ─── QEMU args ──────────────────────────────────────────────────────────────────────────
 
 QEMU_ARGS=(
-  -machine virt              # RISC-V virt: virtio-mmio, PLIC, CLINT
-  -cpu rv64                  # generic rv64 with standard extensions
-  -m 256M                    # 256 MiB RAM
-  -bios default              # OpenSBI (bundled with QEMU); hands off to -kernel
-  -kernel "$KERNEL"          # ELF64 payload loaded at 0x80200000 by OpenSBI
-  -serial stdio              # UART0 -> your terminal
-  -display none              # headless
-  -no-reboot                 # stop on reset instead of rebooting
-  -d guest_errors,cpu_reset  # log faults to stderr
+  -machine virt
+  -cpu rv64
+  -m 256M
+  -bios default
+  -kernel "$KERNEL"
+  -serial stdio
+  -display none
+  -no-reboot
+  -d guest_errors,cpu_reset
 )
 
-# Attach disk if provided.
-# On the RISC-V virt machine, virtio devices are MMIO-mapped, so the
-# correct device type is virtio-blk-device (not virtio-blk-pci).
 if [[ -n "$DISK" ]]; then
   echo "[*] Attaching disk: $DISK"
   QEMU_ARGS+=(
@@ -48,6 +61,24 @@ if [[ -n "$DISK" ]]; then
   )
 else
   echo "[*] No disk image — ramfs only"
+fi
+
+if [[ $GDB_MODE -eq 1 ]]; then
+  # Use port 1235 to avoid clashing with x86 gdbserver on :1234.
+  QEMU_ARGS+=(
+    -gdb tcp::1235
+    -S
+  )
+  echo
+  echo "  ┌─────────────────────────────────────────────┐"
+  echo "  │ GDB mode: kernel halted at entry point.       │"
+  echo "  │ In another terminal, run:                     │"
+  echo "  │   gdb-multiarch \\                             │"
+  echo "  │     -ex 'set arch riscv:rv64' \\               │"
+  echo "  │     -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \\"
+  echo "  │     -ex 'target remote :1235'                 │"
+  echo "  └─────────────────────────────────────────────┘"
+  echo
 fi
 
 echo "[*] Starting QEMU (RISC-V)..."
