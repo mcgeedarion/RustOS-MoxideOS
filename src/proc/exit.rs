@@ -16,63 +16,59 @@
 
 extern crate alloc;
 
-use crate::proc::{scheduler, thread, wait};
-use crate::proc::futex::futex_wake_addr;
-use crate::uaccess::copy_to_user;
 use crate::arch::api::Cpu;
 use crate::arch::Arch;
 use crate::mm::kstack::free_kstack;
 use crate::mm::mmap::free_address_space;
+use crate::proc::futex::futex_wake_addr;
 use crate::proc::process::State;
+use crate::proc::{scheduler, thread, wait};
+use crate::uaccess::copy_to_user;
 
-// ── clear_child_tid ─────────────────────────────────────────────────────────
+// ── clear_child_tid ────────────────────────────────────────────────────────
 
 fn clear_child_tid(pid: usize) {
-    let va = scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            let va = p.clear_child_tid_va;
-            p.clear_child_tid_va = 0;
-            va
-        } else { 0 }
-    });
+    let va = scheduler::with_proc_mut(pid, |p| {
+        let va = p.clear_child_tid_va;
+        p.clear_child_tid_va = 0;
+        va
+    }).unwrap_or(0);
     if va == 0 { return; }
     let _ = copy_to_user(va, &0u32.to_ne_bytes());
     futex_wake_addr(va, 1);
 }
 
-// ── is_last_live_thread ────────────────────────────────────────────────────
+// ── is_last_live_thread ─────────────────────────────────────────────────
 //
 // Returns true if `pid` is the last non-Zombie thread in its thread group.
-// When true, the caller is responsible for freeing the address space.
+// Requires a full scan — no pid-keyed shortcut possible here.
 
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     scheduler::with_procs(|procs| {
         !procs.iter().any(|p| {
-            p.pid != pid
-                && p.tgid == tgid
-                && p.state != State::Zombie
+            p.pid != pid && p.tgid == tgid && p.state != State::Zombie
         })
     })
 }
 
-// ── zombify ────────────────────────────────────────────────────────────────
+// ── zombify ──────────────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
-    let kstack_top = scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.kstack_top)
-    });
-    if kstack_top != 0 { free_kstack(kstack_top); }
+    // Fetch kstack_top, mark Zombie, record exit_code, return vfork_parent
+    // — all in one lock window instead of two.
+    let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p| {
+        let ks = p.kstack_top;
+        p.kstack_top = 0;
+        p.state      = State::Zombie;
+        p.exit_code  = code;
+        (ks, p.vfork_parent)
+    }).unwrap_or((0, 0));
 
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.state     = State::Zombie;
-            p.exit_code = code;
-            p.vfork_parent
-        } else { 0 }
-    })
+    if kstack_top != 0 { free_kstack(kstack_top); }
+    vfork_parent
 }
 
-// ── do_exit ────────────────────────────────────────────────────────────────
+// ── do_exit ─────────────────────────────────────────────────────────────────
 
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
@@ -80,21 +76,14 @@ pub fn do_exit(pid: usize, code: i32) {
     clear_child_tid(pid);           // 1
     thread::unregister_thread(pid); // 2
 
-    // 3: Release per-pid entries in syscall-level tables. These are
-    //    BTreeMaps in stubs.rs that are never cleaned up otherwise,
-    //    leaking one entry per process per exit indefinitely.
+    // 3: Release per-pid entries in syscall-level tables.
     crate::syscall::altstack_clear_pid(pid);
     crate::syscall::proc_name_clear(pid);
 
-    // 4: free the address space only when the last live thread exits.
-    // Sibling CLONE_VM threads share user_satp; tearing it down while
-    // they are still running would cause instant faults on their next
-    // user instruction. We read user_satp before zombify() zeroes it.
+    // 4: free address space only when the last live thread exits.
     if is_last_live_thread(pid, tgid) {
-        let user_satp = scheduler::with_procs(|procs| {
-            procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.user_satp)
-        });
-        free_address_space(pid, user_satp); // unmaps pages + frees PML4
+        let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
+        free_address_space(pid, user_satp);
     }
 
     let vfork_parent = zombify(pid, code); // 5
@@ -112,15 +101,12 @@ pub fn sys_exit(status: i32) -> isize {
     0
 }
 
-// ── sys_exit_group [NR 231] ─────────────────────────────────────────────
+// ── sys_exit_group [NR 231] ────────────────────────────────────────────────
 
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
-    // Collect sibling pids in one lock window.
-    // Read p.tgid directly — do NOT call thread::tgid_of() here, as that
-    // would call with_procs re-entrantly and deadlock.
     let siblings: alloc::vec::Vec<usize> = scheduler::with_procs(|procs| {
         procs.iter()
             .filter(|p| p.pid != pid && p.tgid == tgid)
@@ -128,8 +114,6 @@ pub fn sys_exit_group(status: i32) -> isize {
             .collect()
     });
 
-    // Terminate siblings (clear_child_tid + zombify; no addr space free
-    // yet since the caller's address space is still live).
     for sibling in siblings {
         clear_child_tid(sibling);
         thread::unregister_thread(sibling);
@@ -139,8 +123,6 @@ pub fn sys_exit_group(status: i32) -> isize {
         wait::notify_exit(sibling);
     }
 
-    // do_exit on self: is_last_live_thread will now be true (all siblings
-    // are Zombies), so free_address_space fires exactly once.
     do_exit(pid, status);
     0
 }

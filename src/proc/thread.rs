@@ -11,27 +11,19 @@ use crate::proc::scheduler;
 /// Register a new thread: sets Pcb.tgid for the given pid.
 /// Called by sys_clone3 after enqueueing the child PCB.
 pub fn register_thread(pid: usize, tgid: usize) {
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.tgid = tgid;
-        }
-    });
+    scheduler::with_proc_mut(pid, |p| p.tgid = tgid);
 }
 
 /// Remove a thread from its group (called by do_exit before zombify).
 /// The PCB stays in the run list as a Zombie until waitpid reaps it.
-pub fn unregister_thread(pid: usize) {
+pub fn unregister_thread(_pid: usize) {
     // Nothing to do — tgid stays on the PCB; it is correct until reap.
-    // This function is kept as a hook for future thread-group accounting
-    // (e.g. decrementing a group thread count for SIGKILL propagation).
-    let _ = pid;
+    // Kept as a hook for future thread-group accounting.
 }
 
 /// Look up the TGID for a pid. Falls back to pid itself (main thread).
 pub fn tgid_of(pid: usize) -> usize {
-    scheduler::with_procs(|procs| {
-        procs.iter().find(|p| p.pid == pid).map_or(pid, |p| p.tgid)
-    })
+    scheduler::with_proc(pid, |p| p.tgid).unwrap_or(pid)
 }
 
 /// VMA namespace key: threads in the same group share the parent's tgid.
