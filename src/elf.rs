@@ -17,11 +17,15 @@ pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
 
 /// ELF magic bytes at e_ident[0..4].
-const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+const ELF_MAGIC:    &[u8; 4] = b"\x7fELF";
 /// ELFCLASS64
-const ELFCLASS64: u8 = 2;
+const ELFCLASS64:   u8  = 2;
 /// ELFDATA2LSB (little-endian)
-const ELFDATA2LSB: u8 = 1;
+const ELFDATA2LSB:  u8  = 1;
+/// EV_CURRENT
+const EV_CURRENT:   u32 = 1;
+/// EM_X86_64
+const EM_X86_64:    u16 = 0x3E;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -57,14 +61,21 @@ pub struct Elf64Phdr {
 
 /// Parse and validate an ELF64 header from `data`.
 ///
-/// Returns `None` if the data is too small, the magic is wrong,
-/// the class is not 64-bit, or the encoding is not little-endian.
+/// Returns `None` if:
+/// - `data` is too small to hold an ELF64 header
+/// - magic bytes are wrong
+/// - class is not ELFCLASS64
+/// - encoding is not ELFDATA2LSB (little-endian)
+/// - `e_version` is not EV_CURRENT (1)
+/// - `e_machine` is not EM_X86_64 (0x3E)
 pub fn parse_header(data: &[u8]) -> Option<&Elf64Hdr> {
     if data.len() < core::mem::size_of::<Elf64Hdr>() { return None; }
     let hdr = unsafe { &*(data.as_ptr() as *const Elf64Hdr) };
-    if &hdr.e_ident[0..4] != ELF_MAGIC     { return None; }
-    if hdr.e_ident[4]     != ELFCLASS64    { return None; } // must be 64-bit
-    if hdr.e_ident[5]     != ELFDATA2LSB   { return None; } // must be LE
+    if &hdr.e_ident[0..4] != ELF_MAGIC   { return None; } // bad magic
+    if hdr.e_ident[4]     != ELFCLASS64  { return None; } // must be 64-bit
+    if hdr.e_ident[5]     != ELFDATA2LSB { return None; } // must be LE
+    if hdr.e_version      != EV_CURRENT  { return None; } // must be version 1
+    if hdr.e_machine      != EM_X86_64   { return None; } // must be x86-64
     Some(hdr)
 }
 
@@ -73,6 +84,10 @@ pub fn parse_header(data: &[u8]) -> Option<&Elf64Hdr> {
 /// Validates each entry's offset + size against `data.len()` and
 /// validates that `e_phentsize >= sizeof(Elf64Phdr)` to prevent
 /// out-of-bounds reads on malformed binaries.
+///
+/// Returns `None` if any program header entry is out of bounds,
+/// forcing the caller to reject the binary rather than loading
+/// a partial segment list.
 pub fn parse_phdrs(data: &[u8]) -> Option<Vec<Elf64Phdr>> {
     let hdr = parse_header(data)?;
     let phent = hdr.e_phentsize as usize;
@@ -80,9 +95,12 @@ pub fn parse_phdrs(data: &[u8]) -> Option<Vec<Elf64Phdr>> {
 
     let mut phdrs = Vec::with_capacity(hdr.e_phnum as usize);
     for i in 0..hdr.e_phnum as usize {
-        let off = (hdr.e_phoff as usize).checked_add(i.checked_mul(phent)?)? ;
+        let off = (hdr.e_phoff as usize).checked_add(i.checked_mul(phent)?)?;
         if off.checked_add(core::mem::size_of::<Elf64Phdr>())? > data.len() {
-            break;
+            // Truncated binary: reject entirely rather than returning a
+            // partial phdr list that could cause the loader to silently
+            // miss segments.
+            return None;
         }
         // SAFETY: bounds checked above; data is at least Elf64Phdr-aligned
         // because it comes from a page-aligned kernel buffer.
