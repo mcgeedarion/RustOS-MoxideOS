@@ -43,7 +43,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── poll event flags (POSIX) ────────────────────────────────────────────────────
+// ── poll event flags (POSIX) ────────────────────────────────────────────────────────────────────
 pub const POLLIN:     u32 = 0x0001;
 pub const POLLPRI:    u32 = 0x0002;
 pub const POLLOUT:    u32 = 0x0004;
@@ -53,37 +53,29 @@ pub const POLLNVAL:   u32 = 0x0020;
 pub const POLLRDNORM: u32 = 0x0040;
 pub const POLLWRNORM: u32 = 0x0100;
 
-// ── readiness oracle ────────────────────────────────────────────────────────────────────
+// ── readiness oracle ───────────────────────────────────────────────────────────────────────────────
 
 /// Return the subset of `events` that are currently ready on `fdno`,
 /// plus POLLERR / POLLHUP / POLLNVAL as appropriate.
 pub fn fd_ready(fdno: usize, events: u32) -> u32 {
-    // stdin
     if fdno == 0 {
         let readable = crate::shell::tty::bytes_available() > 0;
         let mut r = if readable { POLLIN | POLLRDNORM } else { 0 };
         if events & POLLOUT != 0 { r |= POLLOUT | POLLWRNORM; }
         return r & (events | POLLERR | POLLHUP);
     }
-    // stdout / stderr — always writable, always readable (returns 0 bytes)
     if fdno == 1 || fdno == 2 {
         return (POLLOUT | POLLWRNORM | POLLIN) & (events | POLLERR | POLLHUP);
     }
-    // pipe fds
     if crate::fs::pipe::is_pipe_fd(fdno) {
         return crate::fs::pipe::pipe_poll(fdno, events);
     }
-    // devfs / regular file — always ready
     if crate::fs::devfs::get_dev_fd(fdno).is_some() {
         let mut r = 0u32;
         if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
         if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
         return r;
     }
-    // regular VFS fd — treat as always ready.
-    // No upper-bound cap: vfs::fd_exists handles the bounds check internally,
-    // so fds > 64 (valid after many open() calls) are no longer misreported
-    // as POLLNVAL.
     if fdno >= 3 && crate::fs::vfs::fd_exists(fdno) {
         let mut r = 0u32;
         if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
@@ -93,7 +85,7 @@ pub fn fd_ready(fdno: usize, events: u32) -> u32 {
     POLLNVAL
 }
 
-// ── timeout helpers ───────────────────────────────────────────────────────────────────
+// ── timeout helpers ───────────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn before_deadline(deadline_ns: u64) -> bool {
@@ -118,7 +110,7 @@ fn ms_to_deadline_ns(ms: i32) -> u64 {
     crate::time::monotonic_ns() + wait_ns
 }
 
-// ── sys_select ──────────────────────────────────────────────────────────────────
+// ── sys_select ────────────────────────────────────────────────────────────────────────────
 
 /// sys_select(nfds, readfds, writefds, exceptfds, timeout)  [NR 23]
 pub fn sys_select(
@@ -128,7 +120,7 @@ pub fn sys_select(
     efds_va: usize,
     tv_va:   usize,
 ) -> isize {
-    if nfds > 1024 { return -22; } // EINVAL
+    if nfds > 1024 { return -22; }
 
     let words     = (nfds + 63) / 64;
     let bmap_size = words * 8;
@@ -154,7 +146,6 @@ pub fn sys_select(
         }
     };
 
-    // Read input bitmaps once, before the spin loop.
     let mut rfds_k = alloc::vec![0u64; words];
     let mut wfds_k = alloc::vec![0u64; words];
     let read_bmap = |va: usize, dst: &mut Vec<u64>| -> bool {
@@ -169,13 +160,11 @@ pub fn sys_select(
     if !read_bmap(rfds_va, &mut rfds_k) { return -14; }
     if !read_bmap(wfds_va, &mut wfds_k) { return -14; }
 
-    // Allocate result bitmaps once outside the spin loop; zero them each tick.
     let mut out_r = alloc::vec![0u64; words];
     let mut out_w = alloc::vec![0u64; words];
     let mut out_e = alloc::vec![0u64; words];
 
     loop {
-        // Zero result bitmaps for this tick (cheaper than re-allocating).
         out_r.fill(0);
         out_w.fill(0);
         out_e.fill(0);
@@ -216,9 +205,8 @@ pub fn sys_select(
     }
 }
 
-// ── sys_pselect6 ──────────────────────────────────────────────────────────────────
+// ── sys_pselect6 ────────────────────────────────────────────────────────────────────────────
 
-/// sys_pselect6 — like select with nanosecond timeout; sigmask ignored.
 pub fn sys_pselect6(
     nfds: usize, rfds_va: usize, wfds_va: usize, efds_va: usize,
     ts_va: usize, _sigmask_va: usize,
@@ -226,7 +214,7 @@ pub fn sys_pselect6(
     sys_select(nfds, rfds_va, wfds_va, efds_va, ts_va)
 }
 
-// ── sys_poll ──────────────────────────────────────────────────────────────────────
+// ── sys_poll ──────────────────────────────────────────────────────────────────────────────
 
 /// `struct pollfd` layout (matches Linux x86-64): fd(i32) events(i16) revents(i16) → 8 bytes.
 #[repr(C)]
@@ -236,25 +224,48 @@ struct PollFd {
     revents: i16,
 }
 
+/// Parsed, owned copy of one pollfd entry (fd + events only).
+struct PollFdCopy {
+    fd:     i32,
+    events: i16,
+}
+
 /// sys_poll(fds_va, nfds, timeout_ms)  [NR 7]
 pub fn sys_poll(fds_va: usize, nfds: usize, timeout_ms: i32) -> isize {
+    if nfds == 0 {
+        // Nothing to wait on; respect timeout then return 0.
+        let deadline = ms_to_deadline_ns(timeout_ms);
+        while before_deadline(deadline) { core::hint::spin_loop(); }
+        return 0;
+    }
     if nfds > 1024 { return -22; }
-    if !validate_user_ptr(fds_va, nfds * core::mem::size_of::<PollFd>()) { return -14; }
+    let struct_size = core::mem::size_of::<PollFd>(); // 8
+    if !validate_user_ptr(fds_va, nfds * struct_size) { return -14; }
+
+    // Copy the fd+events fields once before the spin loop.
+    // revents are written back on exit, not read here.
+    let mut pfds: Vec<PollFdCopy> = Vec::with_capacity(nfds);
+    for i in 0..nfds {
+        let pfd_va = fds_va + i * struct_size;
+        let mut raw = [0u8; 8];
+        if copy_from_user(&mut raw, pfd_va).is_err() { return -14; }
+        pfds.push(PollFdCopy {
+            fd:     i32::from_le_bytes(raw[0..4].try_into().unwrap()),
+            events: i16::from_le_bytes(raw[4..6].try_into().unwrap()),
+        });
+    }
+
     let deadline_ns = ms_to_deadline_ns(timeout_ms);
 
     loop {
         let mut total = 0i32;
-        for i in 0..nfds {
-            let pfd_va = fds_va + i * core::mem::size_of::<PollFd>();
-            let mut raw = [0u8; 8];
-            if copy_from_user(&mut raw, pfd_va).is_err() { return -14; }
-            let fd     = i32::from_le_bytes(raw[0..4].try_into().unwrap());
-            let events = i16::from_le_bytes(raw[4..6].try_into().unwrap());
-            if fd < 0 { continue; }
-
-            let ready = fd_ready(fd as usize, events as u32);
+        for (i, pfc) in pfds.iter().enumerate() {
+            if pfc.fd < 0 { continue; }
+            let ready = fd_ready(pfc.fd as usize, pfc.events as u32);
             let rev   = ready as i16;
-            if copy_to_user(pfd_va + 6, &rev.to_le_bytes()).is_err() { return -14; }
+            // Write only the revents field (offset 6 in the pollfd struct).
+            let revents_va = fds_va + i * struct_size + 6;
+            if copy_to_user(revents_va, &rev.to_le_bytes()).is_err() { return -14; }
             if rev != 0 { total += 1; }
         }
         if total > 0 || !before_deadline(deadline_ns) {
@@ -283,7 +294,7 @@ pub fn sys_ppoll(
     sys_poll(fds_va, nfds, timeout_ms)
 }
 
-// ── epoll ─────────────────────────────────────────────────────────────────────────
+// ── epoll ───────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct EpollEntry {
@@ -324,7 +335,6 @@ pub fn sys_epoll_create(_size_or_flags: i32) -> isize {
 }
 
 /// sys_epoll_ctl(epfd, op, fd, event_va)  [NR 233]
-/// `event_va` → `struct epoll_event { u32 events; u64 data; }` (12 bytes, packed)
 pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> isize {
     let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
 
@@ -364,7 +374,6 @@ pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> i
 }
 
 /// sys_epoll_wait(epfd, events_va, maxevents, timeout_ms)  [NR 232]
-/// `events_va` → array of `struct epoll_event` (12 bytes each).
 pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms: i32) -> isize {
     let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
     if maxevents <= 0 { return -22; }
@@ -372,10 +381,6 @@ pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms:
 
     let deadline_ns = ms_to_deadline_ns(timeout_ms);
 
-    // Snapshot the interest list once before the spin loop.
-    // epoll_ctl mutations during a wait are rare; if they occur the worst
-    // case is that the waiter misses one edge — acceptable on a single-CPU
-    // cooperative kernel where epoll_ctl cannot run concurrently anyway.
     let interest: Vec<EpollEntry> = {
         let tbl = EPOLL_TABLE.lock();
         match tbl[idx].as_ref() {
