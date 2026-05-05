@@ -10,10 +10,6 @@
 //!     shared futexes on a single-CPU cooperative kernel are handled
 //!     identically in practice.
 //!
-//! The same design is used by the original src/proc/futex.rs stub.  This
-//! module replaces that stub with the full WAIT/WAKE/REQUEUE/WAKE_OP
-//! implementation.
-//!
 //! ## Race-freedom
 //!
 //! The table lock is held while we read *uaddr and insert the waiter.
@@ -26,7 +22,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ── Types ────────────────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct FutexWaiter {
@@ -39,20 +35,18 @@ struct FutexWaiter {
 static FUTEX_TABLE: Mutex<BTreeMap<usize, Vec<FutexWaiter>>> =
     Mutex::new(BTreeMap::new());
 
-// ── FUTEX_WAIT ───────────────────────────────────────────────────────────────
+// ── FUTEX_WAIT ─────────────────────────────────────────────────────────────────
 
 pub fn futex_wait(uaddr: usize, val: u32, bitset: u32, deadline_ns: u64) -> isize {
     if !crate::uaccess::validate_user_ptr(uaddr, 4) { return -14; }
 
     let pid = crate::proc::scheduler::current_pid();
 
-    // ── Check value and enqueue atomically under the table lock ───────────
+    // Enqueue under the table lock, checking the value atomically.
     {
         let mut tbl = FUTEX_TABLE.lock();
         let current = unsafe { (uaddr as *const u32).read_volatile() };
-        if current != val {
-            return -11; // EAGAIN
-        }
+        if current != val { return -11; } // EAGAIN
         tbl.entry(uaddr).or_insert_with(Vec::new).push(FutexWaiter {
             pid,
             bitset,
@@ -61,39 +55,34 @@ pub fn futex_wait(uaddr: usize, val: u32, bitset: u32, deadline_ns: u64) -> isiz
         });
     }
 
-    // ── Wait loop ────────────────────────────────────────────────────────
+    // Wait loop: yield until woken or deadline.
+    // We avoid acquiring the table lock on every tick; we only re-enter
+    // to confirm the woken flag after being rescheduled (futex_wake sets
+    // the flag and calls wake_pid, so we will not miss the notification).
     loop {
-        let woken = {
-            let tbl = FUTEX_TABLE.lock();
-            match tbl.get(&uaddr) {
-                None        => true, // queue fully drained by wake
-                Some(queue) => !queue.iter().any(|w| w.pid == pid && !w.woken),
-            }
+        crate::proc::scheduler::schedule();
+
+        // Check woken flag and handle timeout under a single lock window.
+        let now = crate::time::monotonic_ns();
+        let mut tbl = FUTEX_TABLE.lock();
+
+        let woken = match tbl.get(&uaddr) {
+            None        => true,
+            Some(queue) => queue.iter().any(|w| w.pid == pid && w.woken),
         };
 
-        if woken {
-            let mut tbl = FUTEX_TABLE.lock();
+        if woken || now >= deadline_ns {
+            // Remove our entry and clean up the queue.
             if let Some(queue) = tbl.get_mut(&uaddr) {
                 queue.retain(|w| w.pid != pid);
                 if queue.is_empty() { tbl.remove(&uaddr); }
             }
-            return 0;
+            return if woken { 0 } else { -110 }; // 0 or ETIMEDOUT
         }
-
-        if crate::time::monotonic_ns() >= deadline_ns {
-            let mut tbl = FUTEX_TABLE.lock();
-            if let Some(queue) = tbl.get_mut(&uaddr) {
-                queue.retain(|w| w.pid != pid);
-                if queue.is_empty() { tbl.remove(&uaddr); }
-            }
-            return -110; // ETIMEDOUT
-        }
-
-        crate::proc::scheduler::schedule();
     }
 }
 
-// ── FUTEX_WAKE ───────────────────────────────────────────────────────────────
+// ── FUTEX_WAKE ─────────────────────────────────────────────────────────────────
 
 pub fn futex_wake(uaddr: usize, n: u32, bitset: u32) -> isize {
     if uaddr < 0x1000 { return 0; }
@@ -117,7 +106,7 @@ pub fn futex_wake(uaddr: usize, n: u32, bitset: u32) -> isize {
     woken as isize
 }
 
-// ── FUTEX_REQUEUE / FUTEX_CMP_REQUEUE ────────────────────────────────────────
+// ── FUTEX_REQUEUE / FUTEX_CMP_REQUEUE ────────────────────────────────────────────
 
 pub fn futex_requeue(
     uaddr:     usize,
@@ -138,35 +127,42 @@ pub fn futex_requeue(
 
     let mut woken    = 0u32;
     let mut requeued = 0u32;
-    let mut to_move: Vec<FutexWaiter> = Vec::new();
 
     if let Some(queue) = tbl.get_mut(&uaddr) {
-        let mut i = 0;
-        while i < queue.len() {
+        // Single O(n) pass: partition into wake / requeue / keep buckets.
+        // Avoids the O(n²) Vec::remove(i) shift of the previous loop.
+        let mut to_wake:    Vec<FutexWaiter> = Vec::new();
+        let mut to_requeue: Vec<FutexWaiter> = Vec::new();
+        let mut to_keep:    Vec<FutexWaiter> = Vec::new();
+
+        for w in queue.drain(..) {
             if woken < wake_n {
-                let w = queue.remove(i);
-                crate::proc::scheduler::wake_pid(w.pid);
+                to_wake.push(w);
                 woken += 1;
             } else if requeued < requeue_n {
-                let mut w = queue.remove(i);
-                w.woken = false;
-                to_move.push(w);
+                to_requeue.push(w);
                 requeued += 1;
             } else {
-                break;
+                to_keep.push(w);
             }
         }
-        if queue.is_empty() { tbl.remove(&uaddr); }
-    }
 
-    if !to_move.is_empty() {
-        tbl.entry(uaddr2).or_insert_with(Vec::new).extend(to_move);
+        *queue = to_keep;
+        if queue.is_empty() { tbl.remove(&uaddr); }
+
+        for w in &to_wake {
+            crate::proc::scheduler::wake_pid(w.pid);
+        }
+
+        if !to_requeue.is_empty() {
+            tbl.entry(uaddr2).or_insert_with(Vec::new).extend(to_requeue);
+        }
     }
 
     woken as isize
 }
 
-// ── FUTEX_WAKE_OP ─────────────────────────────────────────────────────────────
+// ── FUTEX_WAKE_OP ──────────────────────────────────────────────────────────────────
 //
 // val3 encoding:
 //   bits 31-28: op    (0=set, 1=add, 2=or, 3=andn, 4=xor)
@@ -213,4 +209,17 @@ pub fn futex_wake_op(
     let woken2 = if cmp_ok { futex_wake(uaddr2, wake2_n, 0xFFFF_FFFF) } else { 0 };
 
     woken1 + woken2
+}
+
+// ── futex_clear_pid ───────────────────────────────────────────────────────────────
+
+/// Remove all waiter entries for `pid` from every queue in the table.
+/// Call this from do_exit to prevent leaks when a process exits while
+/// blocked on a futex (e.g. SIGKILL mid-wait).
+pub fn futex_clear_pid(pid: usize) {
+    let mut tbl = FUTEX_TABLE.lock();
+    tbl.retain(|_addr, queue| {
+        queue.retain(|w| w.pid != pid);
+        !queue.is_empty()
+    });
 }
