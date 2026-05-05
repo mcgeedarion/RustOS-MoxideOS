@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_qemu.sh — Build rustos and launch it in QEMU.
+# run_qemu.sh — Build rustos (debug) and launch it in QEMU.
 #
 # Usage:
 #   ./run_qemu.sh            # ramfs only (no disk)
@@ -7,7 +7,6 @@
 #
 # Requirements:
 #   rustup target add x86_64-unknown-none
-#   cargo install bootimage   (optional, only needed for BIOS iso)
 #   qemu-system-x86_64
 
 set -euo pipefail
@@ -15,18 +14,18 @@ set -euo pipefail
 KERNEL=target/x86_64-unknown-none/debug/rustos
 DISK="${1:-}"
 
-# ─── Build ───────────────────────────────────────────────────────────────────────
+# ─── Build (debug) ────────────────────────────────────────────────────────────────────────────
 
-echo "[*] Building rustos..."
+echo "[*] Building rustos (debug)..."
 cargo build \
   --target x86_64-unknown-none \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem
 
-# ─── QEMU args ──────────────────────────────────────────────────────────────────
+# ─── QEMU args ──────────────────────────────────────────────────────────────────────────
 
 QEMU_ARGS=(
-  -machine q35               # modern chipset: PCIe, APIC, IOMMU-capable
+  -machine q35               # modern PCIe chipset: APIC, IOMMU-capable
   -cpu qemu64,+xsave,+avx   # XSAVE + AVX so xsave_init() sees them
   -m 256M                    # 256 MiB RAM
   -kernel "$KERNEL"          # Multiboot2 / direct ELF64 load
@@ -37,11 +36,13 @@ QEMU_ARGS=(
 )
 
 # Attach disk if provided.
+# virtio-blk-pci is the correct device type for the q35 PCIe bus.
+# (virtio-blk-device is virtio-mmio and does not attach on q35.)
 if [[ -n "$DISK" ]]; then
   echo "[*] Attaching disk: $DISK"
   QEMU_ARGS+=(
     -drive "id=vblk0,file=${DISK},format=raw,if=none"
-    -device "virtio-blk-device,drive=vblk0,id=virtblk0"
+    -device "virtio-blk-pci,drive=vblk0,id=virtblk0"
   )
 else
   echo "[*] No disk image — ramfs only"

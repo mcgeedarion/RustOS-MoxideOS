@@ -2,6 +2,11 @@ OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
 /* UEFI primary entry; _start is the Multiboot2/QEMU fallback. */
 ENTRY(uefi_start)
+
+/* Expose kernel load address as a linker symbol so Rust code can reference
+ * it directly instead of hardcoding 0x400000 in pmm.rs. */
+PROVIDE(_kernel_start = 0x400000);
+
 SECTIONS {
   /* Load at 4 MiB physical. Kernel VA = PA (identity mapped by UEFI/QEMU). */
   . = 0x400000;
@@ -22,10 +27,11 @@ SECTIONS {
   .bss    ALIGN(4096) : {
     *(.bss .bss.*)
     *(COMMON)
-    /* Boot stack lives at the very end of .bss */
+    /* Boot stack: 32 KiB. Signal frame building and nested fault handlers
+     * each consume several hundred bytes; 16 KiB was insufficient headroom. */
     . = ALIGN(16);
     __BOOT_STACK = .;
-    . += 16384;
+    . += 32768;
     __boot_stack_top = .;
   }
   . = ALIGN(4096);
