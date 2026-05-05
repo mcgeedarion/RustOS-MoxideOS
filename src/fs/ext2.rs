@@ -8,6 +8,9 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 
+// Cap individual file reads to 256 MiB to prevent OOM from crafted images.
+const MAX_FILE_SIZE: usize = 256 * 1024 * 1024;
+
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Superblock {
@@ -150,7 +153,16 @@ pub fn mount() -> bool {
 impl Ext2Fs {
     fn group_desc(&self, g: usize) -> GroupDesc {
         let off = if self.block_size == 1024 { 2048 } else { self.block_size };
-        unsafe { *((self.data.as_ptr().add(off + g * 32)) as *const GroupDesc) }
+        let entry_off = off + g * 32;
+        // Bounds-check before the cast to prevent OOB on a corrupt/truncated image.
+        if entry_off + 32 > self.data.len() {
+            return GroupDesc {
+                block_bitmap: 0, inode_bitmap: 0, inode_table: 0,
+                free_blocks: 0, free_inodes: 0, used_dirs: 0,
+                _pad: 0, _reserved: [0; 3],
+            };
+        }
+        unsafe { *((self.data.as_ptr().add(entry_off)) as *const GroupDesc) }
     }
 
     fn inode(&self, ino: u32) -> Option<Inode> {
@@ -172,7 +184,8 @@ impl Ext2Fs {
     }
 
     fn read_inode_data(&self, ino: &Inode) -> Vec<u8> {
-        let size = ino.size_lo as usize;
+        // Cap at MAX_FILE_SIZE to prevent OOM from a crafted size_lo = u32::MAX.
+        let size = (ino.size_lo as usize).min(MAX_FILE_SIZE);
         let mut out = alloc::vec![0u8; size];
         let mut written = 0usize;
         for i in 0..12usize {
@@ -222,7 +235,10 @@ impl Ext2Fs {
             let rec = de.rec_len as usize;
             if rec == 0 { break; }
             if de.inode != 0 {
-                let name_bytes = &data[off + 8..off + 8 + de.name_len as usize];
+                let name_end = off + 8 + de.name_len as usize;
+                // Guard against corrupt rec_len/name_len pushing past end of data.
+                if name_end > data.len() { break; }
+                let name_bytes = &data[off + 8..name_end];
                 if name_bytes == name.as_bytes() { return Some(de.inode); }
             }
             off += rec;
@@ -230,7 +246,6 @@ impl Ext2Fs {
         None
     }
 
-    /// Return all directory entries as (inode, name, is_dir) tuples.
     fn list_dir_ino(&self, dir_ino: u32) -> Vec<(u32, String, bool)> {
         let mut out = Vec::new();
         let inode = match self.inode(dir_ino) { Some(i) => i, None => return out };
@@ -241,7 +256,10 @@ impl Ext2Fs {
             let rec = de.rec_len as usize;
             if rec == 0 { break; }
             if de.inode != 0 {
-                let name_bytes = &data[off + 8..off + 8 + de.name_len as usize];
+                let name_end = off + 8 + de.name_len as usize;
+                // Same guard as lookup_dir.
+                if name_end > data.len() { break; }
+                let name_bytes = &data[off + 8..name_end];
                 if let Ok(s) = core::str::from_utf8(name_bytes) {
                     let child_ino = de.inode;
                     let is_dir = de.file_type == 2
@@ -282,8 +300,6 @@ pub fn is_dir(path: &str) -> bool {
     inode.mode & 0xF000 == 0x4000
 }
 
-/// List a directory inode's entries for getdents.
-/// Returns (inode, name, is_dir) tuples.
 pub fn readdir(dir_ino: u32) -> Option<Vec<(u32, String, bool)>> {
     let fs = FS.lock();
     let fs = fs.as_ref()?;
