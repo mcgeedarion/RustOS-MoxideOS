@@ -9,5 +9,6 @@ pub mod multiboot2;
 pub mod paging;
 pub mod serial;
 pub mod syscall;
+pub mod uentry;
 pub mod uefi_entry;
 pub mod xsave;

@@ -9,37 +9,28 @@
 //!   "TEST PASS: uart_smoke"          — UART is functional
 //!   "TEST PASS: alloc_smoke"         — global allocator is functional
 //!   "TEST PASS: trap_smoke"          — trap handler is wired up
+//!   "TEST PASS: initramfs_load"      — /init ELF parsed and mapped
 
 use crate::arch::api::{ArchInit, Serial};
 use crate::arch::ArchImpl;
 
 // CRT stub exported from src/crt/crt0.c.
-// Walks __init_array_start..__init_array_end and calls each constructor.
-// This is a no-op when no C/C++ globals with constructors are linked.
 extern "C" {
     fn run_init_array();
 }
 
 /// Kernel entry point.  Called from `_start` with interrupts disabled.
-///
-/// # Arguments
-/// * `hart_id`  — RISC-V hart ID (0 on single-core QEMU virt)
-/// * `fdt_ptr`  — physical address of the Flattened Device Tree blob
 #[no_mangle]
 pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     // ── 0. C/C++ global constructors ─────────────────────────────────────
-    // Must run before any C++ objects with non-trivial constructors are used.
-    // Safe to call unconditionally — no-op when .init_array is empty.
     unsafe { run_init_array(); }
 
     // ── 1. Serial / UART init ────────────────────────────────────────────
     ArchImpl::serial_init();
-
-    // Boot sentinel — CI boot smoke test checks for this exact string.
     println!("rustos: kernel_main reached");
     println!("TEST PASS: uart_smoke");
 
-    // ── 2. Architecture early init (stvec, mmu stubs) ───────────────────
+    // ── 2. Architecture early init ──────────────────────────────────────
     ArchImpl::early_init();
 
     // ── 3. Physical memory manager ───────────────────────────────────────
@@ -62,71 +53,130 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     // ── 6. Architecture late init (enable interrupts) ────────────────────
     ArchImpl::late_init();
 
-    // ── 7. Initramfs — locate and exec /init ─────────────────────────────
-    //
-    // The CPIO archive base address and byte length come from the boot
-    // protocol.  Multiboot2 passes them as a module tag; UEFI stores them
-    // in a config table entry.  Both paths should set INITRAMFS_BASE /
-    // INITRAMFS_SIZE before jumping to kernel_main.
-    //
-    // For now we read two linker-exported symbols that build_x86.sh / the
-    // UEFI stub will populate.  If neither is present (bare QEMU without
-    // -initrd) the symbols are zero and we skip the exec path gracefully.
+    // ── 7. Initramfs — locate /init, map it, build stack, enter userspace ───
     extern "C" {
-        /// Physical address of the CPIO archive in memory.
-        /// Set to 0 if no initramfs was provided.
         static INITRAMFS_BASE: usize;
-        /// Byte length of the CPIO archive.
-        /// Set to 0 if no initramfs was provided.
         static INITRAMFS_SIZE: usize;
     }
-
-    // Safety: these are linker-defined symbols; reading them is always safe.
     let (ramfs_base, ramfs_size) = unsafe { (INITRAMFS_BASE, INITRAMFS_SIZE) };
 
     if ramfs_base != 0 && ramfs_size != 0 {
-        // Build a slice over the CPIO archive (identity-mapped PA = VA here).
-        // Safety: QEMU / bootloader guarantees this memory is readable.
         let cpio: &[u8] = unsafe {
             core::slice::from_raw_parts(ramfs_base as *const u8, ramfs_size)
         };
 
         match crate::initramfs::find_file(cpio, "/init") {
             Some(elf_bytes) => {
-                println!("rustos: found /init in initramfs ({} bytes)", elf_bytes.len());
-
-                // Allocate a fresh page table for the init process.
-                // TODO: replace with proc::new_address_space() when the
-                //       process table is wired up.
-                #[cfg(target_arch = "x86_64")]
-                let cr3 = unsafe { crate::arch::x86_64::paging::alloc_pml4() };
+                println!("rustos: found /init ({} bytes), loading", elf_bytes.len());
 
                 #[cfg(target_arch = "x86_64")]
-                match crate::loader::elf64::load(elf_bytes, cr3) {
-                    Some(loaded) => {
-                        println!("rustos: /init loaded, entry={:#x} brk={:#x}",
-                                 loaded.entry, loaded.brk);
-                        // TODO: allocate user stack page, call
-                        //   auxv::write_initial_stack(), then sysret to
-                        //   loaded.entry.  Blocked on proc::exec integration.
-                        println!("TEST PASS: initramfs_load");
-                    }
-                    None => {
-                        println!("rustos: ERROR — elf64::load() failed for /init");
-                    }
-                }
+                init_exec_x86_64(elf_bytes, cpio);
+
+                #[cfg(target_arch = "riscv64")]
+                init_exec_riscv64(elf_bytes, cpio);
             }
-            None => {
-                println!("rustos: WARNING — /init not found in initramfs");
-            }
+            None => println!("rustos: WARNING — /init not found in initramfs"),
         }
     } else {
         println!("rustos: no initramfs provided, skipping /init exec");
     }
 
-    // ── 8. Idle loop ─────────────────────────────────────────────────────
+    // ── 8. Idle loop (reached only when no initramfs / exec failed) ───────
     println!("rustos: entering idle loop");
     loop {
         crate::arch::api::Cpu::halt();
     }
+}
+
+// ── x86_64: load /init and sysret into it ─────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn init_exec_x86_64(elf_bytes: &[u8], cpio: &[u8]) -> ! {
+    use crate::arch::x86_64::{paging, uentry};
+    use crate::loader::{elf64, auxv};
+
+    // Allocate a fresh PML4 for the init process.
+    let cr3 = unsafe { paging::alloc_pml4() };
+
+    let loaded = match elf64::load(elf_bytes, cr3) {
+        Some(l) => l,
+        None => panic!("rustos: elf64::load failed for /init"),
+    };
+    println!("rustos: /init entry={:#x} brk={:#x}", loaded.entry, loaded.brk);
+    println!("TEST PASS: initramfs_load");
+
+    // Allocate user stack pages and map them into the process CR3.
+    let stack_top = uentry::alloc_user_stack(cr3)
+        .expect("rustos: failed to allocate user stack");
+
+    // Build the initial stack frame (argc / argv / envp / auxv).
+    // We use the top page of the user stack as our write buffer.
+    const PAGE: usize = 4096;
+    // The stack page VA range: [stack_top - PAGE, stack_top).
+    // We need the kernel-accessible physical address of that page to write into it.
+    // For now, since PA = VA in our identity map, we can write directly.
+    let stack_page_va = stack_top - PAGE;
+    let stack_buf: &mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(stack_page_va as *mut u8, PAGE)
+    };
+
+    let argv: &[&str] = &["/init"];
+    let envp: &[&str] = &["HOME=/", "PATH=/bin"];
+
+    let user_rsp = auxv::write_initial_stack(
+        stack_buf,
+        stack_top,
+        argv,
+        envp,
+        &loaded,
+        elf_bytes,
+    );
+
+    println!("rustos: jumping to /init at {:#x}, RSP={:#x}", loaded.entry, user_rsp);
+
+    // Load CR3 and sysretq into userspace.  Does not return.
+    unsafe { uentry::sysret_to_user(cr3, loaded.entry, user_rsp) }
+}
+
+// ── RISC-V: load /init and sret into it ───────────────────────────────
+
+#[cfg(target_arch = "riscv64")]
+fn init_exec_riscv64(elf_bytes: &[u8], _cpio: &[u8]) -> ! {
+    use crate::arch::riscv64::{paging, uentry};
+    use crate::loader::{elf64, auxv};
+
+    // Allocate a root page table (Sv39 PPN).
+    let satp_ppn = unsafe { paging::alloc_root_page_table() };
+
+    let loaded = match elf64::load(elf_bytes, satp_ppn) {
+        Some(l) => l,
+        None => panic!("rustos: elf64::load failed for /init"),
+    };
+    println!("rustos: /init entry={:#x} brk={:#x}", loaded.entry, loaded.brk);
+    println!("TEST PASS: initramfs_load");
+
+    let stack_top = uentry::alloc_user_stack(satp_ppn)
+        .expect("rustos: failed to allocate user stack");
+
+    const PAGE: usize = 4096;
+    let stack_page_va = stack_top - PAGE;
+    let stack_buf: &mut [u8] = unsafe {
+        core::slice::from_raw_parts_mut(stack_page_va as *mut u8, PAGE)
+    };
+
+    let argv: &[&str] = &["/init"];
+    let envp: &[&str] = &["HOME=/", "PATH=/bin"];
+
+    let user_rsp = auxv::write_initial_stack(
+        stack_buf,
+        stack_top,
+        argv,
+        envp,
+        &loaded,
+        elf_bytes,
+    );
+
+    println!("rustos: jumping to /init at {:#x}, SP={:#x}", loaded.entry, user_rsp);
+
+    unsafe { uentry::sret_to_user(satp_ppn, loaded.entry, user_rsp) }
 }

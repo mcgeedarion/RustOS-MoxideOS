@@ -7,6 +7,15 @@ ENTRY(uefi_start)
  * it directly instead of hardcoding 0x400000 in pmm.rs. */
 PROVIDE(_kernel_start = 0x400000);
 
+/*
+ * Initramfs location symbols.
+ * Defaults to 0 (= no initramfs).  The UEFI stub or Multiboot2 boot code
+ * overwrites these with the physical address and byte length of the CPIO
+ * archive before jumping to kernel_main.
+ */
+PROVIDE(INITRAMFS_BASE = 0);
+PROVIDE(INITRAMFS_SIZE = 0);
+
 SECTIONS {
   /* Load at 4 MiB physical. Kernel VA = PA (identity mapped by UEFI/QEMU). */
   . = 0x400000;
@@ -42,8 +51,7 @@ SECTIONS {
   .bss    ALIGN(4096) : {
     *(.bss .bss.*)
     *(COMMON)
-    /* Boot stack: 32 KiB. Signal frame building and nested fault handlers
-     * each consume several hundred bytes; 16 KiB was insufficient headroom. */
+    /* Boot stack: 32 KiB. */
     . = ALIGN(16);
     __BOOT_STACK = .;
     . += 32768;

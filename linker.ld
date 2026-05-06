@@ -1,5 +1,15 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
+
+/*
+ * Initramfs location symbols.
+ * Defaults to 0 (= no initramfs).  OpenSBI / bootloader overwrites these
+ * with the physical address and byte length of the CPIO archive before
+ * jumping to kernel_main.
+ */
+PROVIDE(INITRAMFS_BASE = 0);
+PROVIDE(INITRAMFS_SIZE = 0);
+
 SECTIONS {
   . = 0x80200000;
   _kernel_start = .;
@@ -7,8 +17,7 @@ SECTIONS {
   .text   : { *(.text .text.*) }
   .rodata : { *(.rodata .rodata.*) }
 
-  /* C/C++ global constructor/destructor arrays. run_init_array() in crt0.c
-   * iterates __init_array_start..__init_array_end at kernel boot. */
+  /* C/C++ global constructor/destructor arrays. */
   .init_array ALIGN(8) : {
     __init_array_start = .;
     *(.init_array .init_array.*)
