@@ -21,6 +21,7 @@ pub mod dt;
 pub mod elf;
 pub mod fs;
 pub mod gdbstub;
+pub mod initramfs;
 pub mod input;
 pub mod kernel_main;
 pub mod loader;

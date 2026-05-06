@@ -43,8 +43,6 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     ArchImpl::early_init();
 
     // ── 3. Physical memory manager ───────────────────────────────────────
-    // pmm::init() scans available RAM from the DTB / linker symbols.
-    // We call the stub here; a full implementation will call pmm::init(fdt_ptr).
     crate::mm::pmm::init();
 
     // ── 4. Global allocator smoke test ──────────────────────────────────
@@ -64,7 +62,69 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     // ── 6. Architecture late init (enable interrupts) ────────────────────
     ArchImpl::late_init();
 
-    // ── 7. Idle loop ─────────────────────────────────────────────────────
+    // ── 7. Initramfs — locate and exec /init ─────────────────────────────
+    //
+    // The CPIO archive base address and byte length come from the boot
+    // protocol.  Multiboot2 passes them as a module tag; UEFI stores them
+    // in a config table entry.  Both paths should set INITRAMFS_BASE /
+    // INITRAMFS_SIZE before jumping to kernel_main.
+    //
+    // For now we read two linker-exported symbols that build_x86.sh / the
+    // UEFI stub will populate.  If neither is present (bare QEMU without
+    // -initrd) the symbols are zero and we skip the exec path gracefully.
+    extern "C" {
+        /// Physical address of the CPIO archive in memory.
+        /// Set to 0 if no initramfs was provided.
+        static INITRAMFS_BASE: usize;
+        /// Byte length of the CPIO archive.
+        /// Set to 0 if no initramfs was provided.
+        static INITRAMFS_SIZE: usize;
+    }
+
+    // Safety: these are linker-defined symbols; reading them is always safe.
+    let (ramfs_base, ramfs_size) = unsafe { (INITRAMFS_BASE, INITRAMFS_SIZE) };
+
+    if ramfs_base != 0 && ramfs_size != 0 {
+        // Build a slice over the CPIO archive (identity-mapped PA = VA here).
+        // Safety: QEMU / bootloader guarantees this memory is readable.
+        let cpio: &[u8] = unsafe {
+            core::slice::from_raw_parts(ramfs_base as *const u8, ramfs_size)
+        };
+
+        match crate::initramfs::find_file(cpio, "/init") {
+            Some(elf_bytes) => {
+                println!("rustos: found /init in initramfs ({} bytes)", elf_bytes.len());
+
+                // Allocate a fresh page table for the init process.
+                // TODO: replace with proc::new_address_space() when the
+                //       process table is wired up.
+                #[cfg(target_arch = "x86_64")]
+                let cr3 = unsafe { crate::arch::x86_64::paging::alloc_pml4() };
+
+                #[cfg(target_arch = "x86_64")]
+                match crate::loader::elf64::load(elf_bytes, cr3) {
+                    Some(loaded) => {
+                        println!("rustos: /init loaded, entry={:#x} brk={:#x}",
+                                 loaded.entry, loaded.brk);
+                        // TODO: allocate user stack page, call
+                        //   auxv::write_initial_stack(), then sysret to
+                        //   loaded.entry.  Blocked on proc::exec integration.
+                        println!("TEST PASS: initramfs_load");
+                    }
+                    None => {
+                        println!("rustos: ERROR — elf64::load() failed for /init");
+                    }
+                }
+            }
+            None => {
+                println!("rustos: WARNING — /init not found in initramfs");
+            }
+        }
+    } else {
+        println!("rustos: no initramfs provided, skipping /init exec");
+    }
+
+    // ── 8. Idle loop ─────────────────────────────────────────────────────
     println!("rustos: entering idle loop");
     loop {
         crate::arch::api::Cpu::halt();
