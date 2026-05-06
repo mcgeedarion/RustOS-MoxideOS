@@ -5,16 +5,18 @@
 //! devfs is consulted before the ramfs/ext2 path in vfs::open.
 //!
 //! ## Nodes implemented
-//!   /dev/null      — reads return 0, writes are discarded
-//!   /dev/zero      — reads return 0x00 bytes, writes discarded
-//!   /dev/full      — reads return 0x00, writes return ENOSPC
-//!   /dev/random    — reads return RDRAND bytes (or LFSR fallback)
-//!   /dev/urandom   — same as /dev/random
-//!   /dev/tty       — proxy to the serial console (stdin/stdout/stderr)
-//!   /dev/stdin     — fd 0 alias
-//!   /dev/stdout    — fd 1 alias
-//!   /dev/stderr    — fd 2 alias
-//!   /dev/fb0       — linear framebuffer (GOP/UEFI); mmap-only, ioctl for geometry
+//!   /dev/null           — reads return 0, writes are discarded
+//!   /dev/zero           — reads return 0x00 bytes, writes discarded
+//!   /dev/full           — reads return 0x00, writes return ENOSPC
+//!   /dev/random         — reads return RDRAND bytes (or LFSR fallback)
+//!   /dev/urandom        — same as /dev/random
+//!   /dev/tty            — proxy to the serial console (stdin/stdout/stderr)
+//!   /dev/stdin          — fd 0 alias
+//!   /dev/stdout         — fd 1 alias
+//!   /dev/stderr         — fd 2 alias
+//!   /dev/fb0            — linear framebuffer (GOP/UEFI); mmap-only
+//!   /dev/dri/card0      — DRM/KMS device; ioctl + mmap
+//!   /dev/dri/renderD128 — DRM render node (same backing as card0)
 //!
 //! ## Integration with vfs.rs
 //!   vfs::open() calls devfs::try_open(path) first.
@@ -26,7 +28,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use spin::Mutex;
 
-// ── Device kind ─────────────────────────────────────────────────────────────────────
+// ── Device kind ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DevKind {
@@ -37,9 +39,10 @@ pub enum DevKind {
     Tty,
     FdAlias(usize), // /dev/stdin→0, /dev/stdout→1, /dev/stderr→2
     Framebuffer,    // /dev/fb0 — GOP linear framebuffer, mmap-only
+    DrmCard,        // /dev/dri/card0, /dev/dri/renderD128
 }
 
-// ── Open device slot ───────────────────────────────────────────────────────────────────
+// ── Open device slot ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct DevFd {
@@ -52,31 +55,38 @@ const DEV_TABLE_SIZE: usize = 64;
 static DEV_TABLE: Mutex<[Option<DevFd>; DEV_TABLE_SIZE]> =
     Mutex::new([const { None }; DEV_TABLE_SIZE]);
 
-// ── Path → DevKind mapping ───────────────────────────────────────────────────────────────
+// ── Path → DevKind mapping ───────────────────────────────────────────────────────────────────
 
 fn path_to_kind(path: &str) -> Option<DevKind> {
     match path {
-        "/dev/null"                    => Some(DevKind::Null),
-        "/dev/zero"                    => Some(DevKind::Zero),
-        "/dev/full"                    => Some(DevKind::Full),
-        "/dev/random" | "/dev/urandom" => Some(DevKind::Random),
-        "/dev/tty"                     => Some(DevKind::Tty),
-        "/dev/stdin"                   => Some(DevKind::FdAlias(0)),
-        "/dev/stdout"                  => Some(DevKind::FdAlias(1)),
-        "/dev/stderr"                  => Some(DevKind::FdAlias(2)),
-        "/dev/fb0"                     => {
-            // Only expose fb0 if GOP was captured.
+        "/dev/null"                      => Some(DevKind::Null),
+        "/dev/zero"                      => Some(DevKind::Zero),
+        "/dev/full"                      => Some(DevKind::Full),
+        "/dev/random" | "/dev/urandom"   => Some(DevKind::Random),
+        "/dev/tty"                       => Some(DevKind::Tty),
+        "/dev/stdin"                     => Some(DevKind::FdAlias(0)),
+        "/dev/stdout"                    => Some(DevKind::FdAlias(1)),
+        "/dev/stderr"                    => Some(DevKind::FdAlias(2)),
+        "/dev/fb0"                       => {
             if crate::drivers::gop::get().is_some() {
                 Some(DevKind::Framebuffer)
             } else {
-                None // ENOENT if no framebuffer available
+                None
             }
         }
-        _                              => None,
+        "/dev/dri/card0" | "/dev/dri/renderD128" => {
+            // DRM node: only expose if GOP framebuffer is available.
+            if crate::drivers::gop::get().is_some() {
+                Some(DevKind::DrmCard)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
-// ── Internal fd allocation ───────────────────────────────────────────────────────────────
+// ── Internal fd allocation ───────────────────────────────────────────────────────────────────
 
 const DEV_FD_BASE: usize = 0x4000_0000;
 
@@ -91,7 +101,7 @@ fn alloc_dev_fd(kind: DevKind, flags: u32) -> Option<usize> {
     None
 }
 
-// ── Public API (called from vfs.rs) ───────────────────────────────────────────────────
+// ── Public API (called from vfs.rs) ──────────────────────────────────────────────────────────
 
 /// Try to open a /dev path. Returns a synthetic fd number or None.
 pub fn try_open(path: &str, flags: u32) -> Option<usize> {
@@ -113,6 +123,11 @@ pub fn is_framebuffer(fdno: usize) -> bool {
     get_dev_fd(fdno) == Some(DevKind::Framebuffer)
 }
 
+/// Returns true if `fdno` is a /dev/dri/card0 (or renderD128) file descriptor.
+pub fn is_drm_card(fdno: usize) -> bool {
+    get_dev_fd(fdno) == Some(DevKind::DrmCard)
+}
+
 /// Close a devfs fd.
 pub fn close(fdno: usize) {
     if fdno < DEV_FD_BASE { return; }
@@ -126,16 +141,10 @@ pub fn close(fdno: usize) {
 pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
     let kind = match get_dev_fd(fdno) { Some(k) => k, None => return -9 };
     match kind {
-        DevKind::Null             => 0,
-        DevKind::Zero | DevKind::Full => {
-            buf.fill(0);
-            buf.len() as isize
-        }
-        DevKind::Random           => {
-            fill_random(buf);
-            buf.len() as isize
-        }
-        DevKind::Tty              => {
+        DevKind::Null                  => 0,
+        DevKind::Zero | DevKind::Full  => { buf.fill(0); buf.len() as isize }
+        DevKind::Random                => { fill_random(buf); buf.len() as isize }
+        DevKind::Tty                   => {
             let mut n = 0usize;
             for b in buf.iter_mut() {
                 match serial_read_byte() {
@@ -145,9 +154,9 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
             }
             n as isize
         }
-        DevKind::FdAlias(real_fd) => crate::fs::vfs::read(real_fd, buf),
-        // fb0 is mmap-only; sequential read is not meaningful.
-        DevKind::Framebuffer      => -22, // EINVAL
+        DevKind::FdAlias(real_fd)      => crate::fs::vfs::read(real_fd, buf),
+        DevKind::Framebuffer           => -22, // EINVAL — use mmap
+        DevKind::DrmCard               => -22, // EINVAL — use ioctl/mmap
     }
 }
 
@@ -156,15 +165,14 @@ pub fn write(fdno: usize, buf: &[u8]) -> isize {
     let kind = match get_dev_fd(fdno) { Some(k) => k, None => return -9 };
     match kind {
         DevKind::Null | DevKind::Zero | DevKind::Random => buf.len() as isize,
-        DevKind::Tty              => {
+        DevKind::Tty => {
             for &b in buf { serial_write_byte(b); }
             buf.len() as isize
         }
-        DevKind::Full             => -28, // ENOSPC
-        DevKind::FdAlias(real_fd) => crate::fs::vfs::write(real_fd, buf),
-        // fb0: writes go directly to the physical framebuffer at offset 0.
-        // Real apps use mmap; this is a convenience fallback.
-        DevKind::Framebuffer      => {
+        DevKind::Full                  => -28, // ENOSPC
+        DevKind::FdAlias(real_fd)      => crate::fs::vfs::write(real_fd, buf),
+        DevKind::Framebuffer           => {
+            // Convenience write path — blits into the physical framebuffer.
             if let Some(info) = crate::drivers::gop::get() {
                 let fb = unsafe {
                     core::slice::from_raw_parts_mut(
@@ -179,10 +187,11 @@ pub fn write(fdno: usize, buf: &[u8]) -> isize {
                 -19 // ENODEV
             }
         }
+        DevKind::DrmCard               => -22, // EINVAL — use ioctl
     }
 }
 
-// ── Random number generation ───────────────────────────────────────────────────────────────
+// ── Random number generation ──────────────────────────────────────────────────────────────────
 
 use core::sync::atomic::{AtomicU64, Ordering};
 static LFSR: AtomicU64 = AtomicU64::new(0xDEAD_BEEF_CAFE_1337);
@@ -233,7 +242,7 @@ fn rdrand() -> Option<u64> {
     { None }
 }
 
-// ── Serial I/O (COM1 = 0x3F8) ───────────────────────────────────────────────────────────────
+// ── Serial I/O ────────────────────────────────────────────────────────────────────────────────
 
 const COM1: u16 = 0x3F8;
 
@@ -251,11 +260,8 @@ fn serial_write_byte(b: u8) {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn serial_write_byte(b: u8) {
-    // RISC-V: write to NS16550 UART at virtio virt base 0x10000000.
-    // Works on both QEMU virt (SBI and UEFI paths).
     unsafe {
         let uart = 0x1000_0000 as *mut u8;
-        // Spin on THR Empty (LSR bit 5) at offset 5.
         loop {
             let lsr = uart.add(5).read_volatile();
             if lsr & 0x20 != 0 { break; }
