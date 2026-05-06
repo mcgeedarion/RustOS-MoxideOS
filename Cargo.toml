@@ -17,6 +17,9 @@ spin = { version = "0.9", features = ["mutex", "spin_mutex"] }
 bitflags = "2"
 linked_list_allocator = { version = "0.10", default-features = false }
 
+[build-dependencies]
+cc = "1"
+
 [features]
 # Wayland compositor subsystem. Not part of the default kernel build.
 # Enable with: cargo build --features wayland

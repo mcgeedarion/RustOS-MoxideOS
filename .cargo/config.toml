@@ -24,3 +24,12 @@ rustflags = [
 rustflags = [
   "-C", "link-arg=-Tlinker.ld",
 ]
+
+# ── C compiler configuration ──────────────────────────────────────────────────
+# Clang is used for cross-compiling src/crt/crt0.c via the cc crate.
+# These env vars are picked up automatically by the cc crate during build.rs.
+[env]
+CC_x86_64-unknown-none          = "clang"
+CFLAGS_x86_64-unknown-none      = "--target=x86_64-unknown-none -ffreestanding -nostdlib"
+CC_riscv64gc-unknown-none-elf   = "clang"
+CFLAGS_riscv64gc-unknown-none-elf = "--target=riscv64-unknown-none-elf -march=rv64gc -mabi=lp64d -ffreestanding -nostdlib"
