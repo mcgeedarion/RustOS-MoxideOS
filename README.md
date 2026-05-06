@@ -1,6 +1,6 @@
 # RustOS
 
-A hobby operating-system kernel written in **Rust**, targeting **x86_64** (primary) and **RISC-V 64** (secondary). Runs on bare metal and under QEMU. No C runtime, no external libc.
+A hobby operating-system kernel written in **Rust**, targeting **RISC-V 64** (primary) and **x86_64** (secondary). Runs on bare metal and under QEMU. No C runtime, no external libc.
 
 ---
 
@@ -8,8 +8,8 @@ A hobby operating-system kernel written in **Rust**, targeting **x86_64** (prima
 
 | Target | Boot | Paging | Syscall | Status |
 |---|---|---|---|---|
-| `x86_64-unknown-none` | UEFI | 4-level (PML4) | `syscall`/`sysret` | Primary |
-| `riscv64gc-unknown-none-elf` | UEFI **or** SBI | sv39 | `ecall` | Secondary |
+| `riscv64gc-unknown-none-elf` | SBI **or** UEFI | sv39 | `ecall` | **Primary** |
+| `x86_64-unknown-none` | UEFI | 4-level (PML4) | `syscall`/`sysret` | Secondary |
 
 RISC-V supports two boot modes selectable at build time:
 - **SBI** (default) — OpenSBI hands off to `_start` in S-mode; no extra firmware required
@@ -20,8 +20,8 @@ RISC-V supports two boot modes selectable at build time:
 ## Feature overview
 
 ### Hardware abstraction
+- RISC-V: SBI + UEFI boot, CSR helpers, PLIC, CLINT, sv39 trap handling
 - x86_64: GDT, IDT, APIC (local + I/O), TSS, `RDMSR`/`WRMSR`, serial UART, PS/2
-- RISC-V: UEFI + SBI boot, CSR helpers, PLIC, CLINT, sv39 trap handling
 - PCIe MMIO enumeration; virtio-blk (read + write), virtio-net
 
 ### Memory management
@@ -66,27 +66,29 @@ RISC-V supports two boot modes selectable at build time:
 ### Prerequisites
 
 ```sh
-rustup target add x86_64-unknown-none
-rustup target add riscv64gc-unknown-none-elf
+# Rust toolchain (targets are pinned in rust-toolchain.toml — rustup installs them automatically)
+rustup toolchain install nightly
 rustup component add rust-src llvm-tools-preview
+
 # QEMU
-apt install qemu-system-x86 qemu-system-misc   # or brew install qemu
+apt install qemu-system-misc             # RISC-V
+apt install qemu-system-x86             # x86_64
+# or: brew install qemu
+
 # UEFI RISC-V firmware (only needed for --uefi mode)
-apt install qemu-efi-riscv64                   # Debian/Ubuntu
+apt install qemu-efi-riscv64            # Debian/Ubuntu
+
+# x86_64 only: nasm (assembles the multiboot2 entry stub)
+apt install nasm
 ```
 
-The correct nightly toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
-
-### x86_64
-
-```sh
-bash build_x86.sh
-```
+The correct nightly toolchain and both targets are pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+Running any `cargo` command will trigger `rustup` to install the toolchain and targets automatically.
 
 ### RISC-V 64 — SBI (default)
 
 ```sh
-bash build_riscv.sh
+cargo build --release   # or: bash build.sh
 ```
 
 ### RISC-V 64 — UEFI
@@ -95,18 +97,20 @@ bash build_riscv.sh
 bash build_riscv.sh --uefi
 ```
 
-This builds against [`riscv64-uefi.json`](riscv64-uefi.json) (PE/COFF via `lld-link`) with
-`--features uefi_boot` and installs the output to `esp/EFI/BOOT/BOOTRISCV64.EFI`.
-
----
-
-## Running under QEMU
+Builds against [`riscv64-uefi.json`](riscv64-uefi.json) (PE/COFF via `lld-link`) and installs
+the output to `esp/EFI/BOOT/BOOTRISCV64.EFI`.
 
 ### x86_64
 
 ```sh
-bash run_qemu.sh
+bash build_x86.sh
 ```
+
+Requires `nasm` on `$PATH` (used by `build.rs` to assemble `src/arch/x86_64/boot.s`).
+
+---
+
+## Running under QEMU
 
 ### RISC-V 64 — SBI
 
@@ -124,6 +128,12 @@ The script auto-detects the EDK2 RISC-V firmware (`RISCV_VIRT_CODE.fd`) from com
 install paths, creates a writable vars store on first run, and launches QEMU with
 pflash firmware + a FAT virtio drive containing the ESP.
 
+### x86_64
+
+```sh
+bash run_qemu.sh
+```
+
 All scripts boot straight to the kernel shell. Serial output goes to stdio.
 
 ---
@@ -133,35 +143,41 @@ All scripts boot straight to the kernel shell. Serial output goes to stdio.
 Terminal 1 — start QEMU with GDB stub:
 
 ```sh
-bash run_qemu.sh --gdb              # x86_64  (port :1234)
 bash run_qemu_riscv.sh --gdb        # RISC-V SBI  (port :1235)
 bash run_qemu_riscv.sh --uefi --gdb # RISC-V UEFI (port :1235)
+bash run_qemu.sh --gdb              # x86_64      (port :1234)
 ```
 
 Terminal 2 — attach:
 
 ```sh
-# x86_64
-gdb target/x86_64-unknown-none/debug/rustos
-
 # RISC-V
 gdb-multiarch \
   -ex 'set arch riscv:rv64' \
   -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \
   -ex 'target remote :1235'
+
+# x86_64
+gdb target/x86_64-unknown-none/debug/rustos
 ```
 
-[`.gdbinit`](.gdbinit) sets the architecture, loads symbols, connects to `localhost:1234`, and defines helpers (`vmas`, `procs`, `klog`).
+[`.gdbinit`](.gdbinit) sets the architecture, loads symbols, connects to `localhost:1234`, and
+defines helpers (`vmas`, `procs`, `klog`).
 
 ---
 
 ## Testing
 
 ```sh
+# RISC-V (primary)
+cargo test --target riscv64gc-unknown-none-elf
+
+# x86_64
 cargo test --target x86_64-unknown-none
 ```
 
 Integration tests live in [`tests/`](tests/). CI runs on every push via [`.github/workflows/`](.github/workflows/).
+The `build-riscv` job (debug + release) runs first; `build-x86_64` is the secondary job.
 
 ---
 
@@ -170,18 +186,25 @@ Integration tests live in [`tests/`](tests/). CI runs on every push via [`.githu
 ```
 src/
   arch/
+    riscv64/     # SBI + UEFI entry, CSR, PLIC, sv39 paging, syscall, trampoline
     x86_64/      # GDT, IDT, APIC, UEFI entry, paging, syscall
-    riscv64/     # UEFI entry, SBI boot, CSR, PLIC, sv39 paging, syscall
   fs/            # VFS, ext2, devfs, procfs, pipe, poll, …
   mm/            # PMM, VMM, mmap, page_fault, CoW
   proc/          # PCB, scheduler, fork, exec, signal, futex
   drivers/       # virtio-blk, virtio-net, PCIe, PS/2, TTY
-  net/           # smoltcp integration, socket syscalls
-  security/      # capability sets
+  net/           # ARP, DHCP, DNS, Ethernet, ICMP, IPv4, TCP, UDP
+  security/      # capability sets (CapSet)
   shell/         # in-kernel TTY shell
 tests/           # integration test harness
 tools/           # mkfs helper, symbol scripts
+linker.ld          # RISC-V linker script (loads at 0x80200000)
+x86_64.ld          # x86_64 linker script
 riscv64-uefi.json  # custom Rust target spec (PE/COFF, RISC-V UEFI)
+build.sh           # default build (RISC-V SBI release)
+build_riscv.sh     # RISC-V builder with --uefi / --debug / --initrd flags
+build_x86.sh       # x86_64 builder
+run_qemu_riscv.sh  # RISC-V QEMU launcher
+run_qemu.sh        # x86_64 QEMU launcher
 ```
 
 ---
