@@ -4,19 +4,21 @@
 //! 64-bit long mode with flat 1:1-mapped memory and interrupts disabled.
 //!
 //! ## What we do here
-//!   1. Obtain the UEFI memory map and call ExitBootServices.
-//!   2. Find the RSDP from the EFI configuration table (ACPI 2.0 GUID).
-//!   3. Hand off to kernel_main() with the RSDP physical address in a
-//!      global so acpi_init() can pick it up without needing arguments.
+//!   1. Print a banner via UEFI SimpleTextOutput.
+//!   2. Capture the GOP framebuffer (-> drivers::gop::GOP_INFO).
+//!   3. Locate the ACPI 2.0 RSDP from the EFI configuration table.
+//!   4. Obtain the EFI memory map key and call ExitBootServices.
+//!   5. Switch to the kernel boot stack and tail-call kernel_main().
 //!
 //! ## Memory layout after ExitBootServices
 //!   - All physical RAM is identity-mapped by the UEFI page tables.
 //!   - The kernel image is loaded at 0x400000 (physical) per x86_64.ld.
 //!   - The static PMM pool inside the kernel image is immediately usable.
+//!   - The GOP framebuffer physical address is in drivers::gop::GOP_INFO.
 
 use core::arch::asm;
 
-// ─── EFI types (bare-minimum subset) ───────────────────────────────────────────────
+// ─── EFI types (bare-minimum subset) ──────────────────────────────────
 
 type EfiStatus = usize;
 type EfiHandle = *mut core::ffi::c_void;
@@ -52,33 +54,26 @@ struct EfiSystemTable {
 struct EfiSimpleTextOutput {
     reset:           *mut core::ffi::c_void,
     output_string:   unsafe extern "efiapi" fn(*mut EfiSimpleTextOutput, *const u16) -> EfiStatus,
-    // other fields omitted
 }
 
 #[repr(C)]
 struct EfiBootServices {
-    hdr: EfiTableHeader,
-    // task priority (2 fn ptrs)
-    _tpl_raise:  *mut core::ffi::c_void,
-    _tpl_restore: *mut core::ffi::c_void,
-    // memory (5 fn ptrs)
-    _alloc_pages: *mut core::ffi::c_void,
-    _free_pages:  *mut core::ffi::c_void,
+    hdr:            EfiTableHeader,
+    _tpl_raise:     *mut core::ffi::c_void,
+    _tpl_restore:   *mut core::ffi::c_void,
+    _alloc_pages:   *mut core::ffi::c_void,
+    _free_pages:    *mut core::ffi::c_void,
     get_memory_map: unsafe extern "efiapi" fn(
-        map_size:       *mut usize,
-        map:            *mut EfiMemDescriptor,
-        map_key:        *mut usize,
-        desc_size:      *mut usize,
-        desc_version:   *mut u32,
+        map_size:     *mut usize,
+        map:          *mut EfiMemDescriptor,
+        map_key:      *mut usize,
+        desc_size:    *mut usize,
+        desc_version: *mut u32,
     ) -> EfiStatus,
-    _alloc_pool:  *mut core::ffi::c_void,
-    _free_pool:   *mut core::ffi::c_void,
-    // events (5)
-    _ev: [*mut core::ffi::c_void; 5],
-    // timers (none skipped), protocol (many skipped)…
-    // We only need ExitBootServices which is at a fixed offset.
-    // Rather than enumerate every field we use a raw function pointer
-    // resolved below by offset.
+    _alloc_pool:    *mut core::ffi::c_void,
+    _free_pool:     *mut core::ffi::c_void,
+    _ev:            [*mut core::ffi::c_void; 5],
+    // ExitBootServices and LocateProtocol resolved by fixed offset below.
 }
 
 #[repr(C)]
@@ -103,28 +98,22 @@ const ACPI2_GUID: [u64; 2] = [
     0x8188_3cc7_8000_22bc,
 ];
 
-// EFI_SUCCESS
 const EFI_SUCCESS: EfiStatus = 0;
 
-/// Offset of ExitBootServices within EFI_BOOT_SERVICES (bytes from struct base).
-/// From the UEFI 2.10 spec table: ExitBootServices is function #47 (0-indexed),
-/// each entry is one pointer = 8 bytes, header is 24 bytes.
-/// Offset = 24 + 47 * 8 = 400 = 0x190.
+/// Offset of ExitBootServices in EFI_BOOT_SERVICES (UEFI 2.10 spec).
+/// header(24) + 47 fn ptrs * 8 = 0x190.
 const EXIT_BOOT_SERVICES_OFFSET: usize = 0x190;
 type ExitBootServicesFn = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 
-// ─── Globals set before kernel_main runs ──────────────────────────────────────────
+// ─── Globals set before kernel_main runs ─────────────────────────────────────
 
-/// Physical address of the RSDP, set by uefi_start before kernel_main.
-/// 0 means "not found" — acpi_init() will fall back to BIOS scan.
+/// Physical address of the RSDP (ACPI 2.0). 0 = not found.
 pub static mut RSDP_PHYS: u64 = 0;
 
-// ─── Scratch buffer for the EFI memory map ────────────────────────────────────────
-// We can't heap-allocate before ExitBootServices so we use a static buffer.
-// 4096 bytes fits ~50 EFI_MEMORY_DESCRIPTOR entries, enough for QEMU.
+// ─── Scratch buffer for the EFI memory map ─────────────────────────────────
 static mut MAP_BUF: [u8; 4096] = [0u8; 4096];
 
-// ─── Entry point ─────────────────────────────────────────────────────────────────
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub unsafe extern "efiapi" fn uefi_start(
@@ -134,12 +123,14 @@ pub unsafe extern "efiapi" fn uefi_start(
     let st = &*system_table;
     let bs = &*st.boot_services;
 
-    // — 1. Print banner via UEFI console —
-    efi_print(st.con_out, "RustOS booting...\r\n");
+    // 1. Banner.
+    efi_print(st.con_out, "RustOS (x86_64) booting via UEFI...\r\n");
 
-    // — 2. Locate RSDP from configuration table —
-    let num = st.num_table_entries;
-    let cfg = core::slice::from_raw_parts(st.configuration_table, num);
+    // 2. Capture GOP framebuffer before ExitBootServices.
+    crate::drivers::gop::capture_from_boot_services(st.boot_services as *mut core::ffi::c_void);
+
+    // 3. Locate RSDP in EFI configuration table.
+    let cfg = core::slice::from_raw_parts(st.configuration_table, st.num_table_entries);
     for entry in cfg {
         if entry.guid == ACPI2_GUID {
             RSDP_PHYS = entry.table as u64;
@@ -147,34 +138,24 @@ pub unsafe extern "efiapi" fn uefi_start(
         }
     }
 
-    // — 3. Get memory map + map key for ExitBootServices —
-    let mut map_size:    usize = MAP_BUF.len();
-    let mut map_key:     usize = 0;
-    let mut desc_size:   usize = 0;
-    let mut desc_ver:    u32   = 0;
+    // 4. Get memory map + map key for ExitBootServices.
+    let mut map_size:  usize = MAP_BUF.len();
+    let mut map_key:   usize = 0;
+    let mut desc_size: usize = 0;
+    let mut desc_ver:  u32   = 0;
     let map_ptr = MAP_BUF.as_mut_ptr() as *mut EfiMemDescriptor;
-
-    let status = (bs.get_memory_map)(
+    let _ = (bs.get_memory_map)(
         &mut map_size, map_ptr, &mut map_key, &mut desc_size, &mut desc_ver,
     );
-    if status != EFI_SUCCESS {
-        // Buffer too small — just proceed; we don't actually need the map
-        // because the PMM uses a static pool.
-    }
 
-    // — 4. ExitBootServices —
-    // Resolve function pointer by offset into the boot services table.
+    // 5. ExitBootServices.
     let bs_base = st.boot_services as usize;
     let exit_fn = *((bs_base + EXIT_BOOT_SERVICES_OFFSET) as *const ExitBootServicesFn);
     let _ = exit_fn(image_handle, map_key);
-    // If ExitBootServices fails (stale key), retry once with a fresh map.
-    // In practice QEMU never fails here.
 
-    // — 5. Set up a proper kernel stack and call kernel_main —
-    // The linker provides __boot_stack_top (defined in main.rs).
+    // 6. Switch to kernel boot stack and call kernel_main.
     extern "C" { fn kernel_main() -> !; }
-    // Switch to the kernel boot stack before calling Rust.
-    core::arch::asm!(
+    asm!(
         "lea rsp, [rip + __boot_stack_top]",
         "xor rbp, rbp",
         "call {km}",
@@ -185,10 +166,8 @@ pub unsafe extern "efiapi" fn uefi_start(
     );
 }
 
-// ─── EFI text output helper ────────────────────────────────────────────────────────
+// ─── EFI text output helper ──────────────────────────────────────────────────
 
-/// Print an ASCII string via the UEFI simple text output protocol.
-/// Converts to UCS-2 on the stack (max 127 chars).
 unsafe fn efi_print(con_out: *mut EfiSimpleTextOutput, s: &str) {
     let mut buf = [0u16; 128];
     let n = s.len().min(127);

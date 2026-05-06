@@ -5,15 +5,16 @@
 //! devfs is consulted before the ramfs/ext2 path in vfs::open.
 //!
 //! ## Nodes implemented
-//!   /dev/null   — reads return 0, writes are discarded
-//!   /dev/zero   — reads return 0x00 bytes, writes discarded
-//!   /dev/full   — reads return 0x00, writes return ENOSPC
-//!   /dev/random — reads return RDRAND bytes (or LFSR fallback)
-//!   /dev/urandom— same as /dev/random
-//!   /dev/tty    — proxy to the serial console (stdin/stdout/stderr)
-//!   /dev/stdin  — fd 0 alias
-//!   /dev/stdout — fd 1 alias
-//!   /dev/stderr — fd 2 alias
+//!   /dev/null      — reads return 0, writes are discarded
+//!   /dev/zero      — reads return 0x00 bytes, writes discarded
+//!   /dev/full      — reads return 0x00, writes return ENOSPC
+//!   /dev/random    — reads return RDRAND bytes (or LFSR fallback)
+//!   /dev/urandom   — same as /dev/random
+//!   /dev/tty       — proxy to the serial console (stdin/stdout/stderr)
+//!   /dev/stdin     — fd 0 alias
+//!   /dev/stdout    — fd 1 alias
+//!   /dev/stderr    — fd 2 alias
+//!   /dev/fb0       — linear framebuffer (GOP/UEFI); mmap-only, ioctl for geometry
 //!
 //! ## Integration with vfs.rs
 //!   vfs::open() calls devfs::try_open(path) first.
@@ -35,6 +36,7 @@ pub enum DevKind {
     Random,
     Tty,
     FdAlias(usize), // /dev/stdin→0, /dev/stdout→1, /dev/stderr→2
+    Framebuffer,    // /dev/fb0 — GOP linear framebuffer, mmap-only
 }
 
 // ── Open device slot ───────────────────────────────────────────────────────────────────
@@ -62,6 +64,14 @@ fn path_to_kind(path: &str) -> Option<DevKind> {
         "/dev/stdin"                   => Some(DevKind::FdAlias(0)),
         "/dev/stdout"                  => Some(DevKind::FdAlias(1)),
         "/dev/stderr"                  => Some(DevKind::FdAlias(2)),
+        "/dev/fb0"                     => {
+            // Only expose fb0 if GOP was captured.
+            if crate::drivers::gop::get().is_some() {
+                Some(DevKind::Framebuffer)
+            } else {
+                None // ENOENT if no framebuffer available
+            }
+        }
         _                              => None,
     }
 }
@@ -98,6 +108,11 @@ pub fn get_dev_fd(fdno: usize) -> Option<DevKind> {
     DEV_TABLE.lock()[idx].as_ref().map(|d| d.kind)
 }
 
+/// Returns true if `fdno` is a /dev/fb0 file descriptor.
+pub fn is_framebuffer(fdno: usize) -> bool {
+    get_dev_fd(fdno) == Some(DevKind::Framebuffer)
+}
+
 /// Close a devfs fd.
 pub fn close(fdno: usize) {
     if fdno < DEV_FD_BASE { return; }
@@ -131,6 +146,8 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
             n as isize
         }
         DevKind::FdAlias(real_fd) => crate::fs::vfs::read(real_fd, buf),
+        // fb0 is mmap-only; sequential read is not meaningful.
+        DevKind::Framebuffer      => -22, // EINVAL
     }
 }
 
@@ -138,14 +155,30 @@ pub fn read(fdno: usize, buf: &mut [u8]) -> isize {
 pub fn write(fdno: usize, buf: &[u8]) -> isize {
     let kind = match get_dev_fd(fdno) { Some(k) => k, None => return -9 };
     match kind {
-        DevKind::Null | DevKind::Zero | DevKind::Random | DevKind::Tty => {
-            if kind == DevKind::Tty {
-                for &b in buf { serial_write_byte(b); }
-            }
+        DevKind::Null | DevKind::Zero | DevKind::Random => buf.len() as isize,
+        DevKind::Tty              => {
+            for &b in buf { serial_write_byte(b); }
             buf.len() as isize
         }
         DevKind::Full             => -28, // ENOSPC
         DevKind::FdAlias(real_fd) => crate::fs::vfs::write(real_fd, buf),
+        // fb0: writes go directly to the physical framebuffer at offset 0.
+        // Real apps use mmap; this is a convenience fallback.
+        DevKind::Framebuffer      => {
+            if let Some(info) = crate::drivers::gop::get() {
+                let fb = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        info.fb_phys as *mut u8,
+                        crate::drivers::gop::fb_byte_size(&info),
+                    )
+                };
+                let n = buf.len().min(fb.len());
+                fb[..n].copy_from_slice(&buf[..n]);
+                n as isize
+            } else {
+                -19 // ENODEV
+            }
+        }
     }
 }
 
@@ -154,16 +187,12 @@ pub fn write(fdno: usize, buf: &[u8]) -> isize {
 use core::sync::atomic::{AtomicU64, Ordering};
 static LFSR: AtomicU64 = AtomicU64::new(0xDEAD_BEEF_CAFE_1337);
 
-/// Fill `buf` with random bytes.
-/// Generates one u64 per 8-byte chunk (8× fewer RDRAND calls than per-byte);
-/// leftover tail bytes are filled from the last word.
 fn fill_random(buf: &mut [u8]) {
     let mut chunks = buf.chunks_exact_mut(8);
     for chunk in chunks.by_ref() {
         let word = next_random_u64();
         chunk.copy_from_slice(&word.to_le_bytes());
     }
-    // Fill remainder (0–7 bytes) from one more word.
     let rem = chunks.into_remainder();
     if !rem.is_empty() {
         let word = next_random_u64().to_le_bytes();
@@ -182,27 +211,33 @@ fn next_random_u64() -> u64 {
 }
 
 fn rdrand() -> Option<u64> {
-    let mut val: u64 = 0;
-    let mut ok: u8;
-    for _ in 0..10 {
-        unsafe {
-            core::arch::asm!(
-                "rdrand {v}",
-                "setc {ok}",
-                v  = out(reg) val,
-                ok = out(reg_byte) ok,
-                options(nostack)
-            );
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut val: u64 = 0;
+        let mut ok: u8;
+        for _ in 0..10 {
+            unsafe {
+                core::arch::asm!(
+                    "rdrand {v}",
+                    "setc {ok}",
+                    v  = out(reg) val,
+                    ok = out(reg_byte) ok,
+                    options(nostack)
+                );
+            }
+            if ok != 0 { return Some(val); }
         }
-        if ok != 0 { return Some(val); }
+        None
     }
-    None
+    #[cfg(not(target_arch = "x86_64"))]
+    { None }
 }
 
 // ── Serial I/O (COM1 = 0x3F8) ───────────────────────────────────────────────────────────────
 
 const COM1: u16 = 0x3F8;
 
+#[cfg(target_arch = "x86_64")]
 fn serial_write_byte(b: u8) {
     unsafe {
         loop {
@@ -214,6 +249,22 @@ fn serial_write_byte(b: u8) {
     }
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+fn serial_write_byte(b: u8) {
+    // RISC-V: write to NS16550 UART at virtio virt base 0x10000000.
+    // Works on both QEMU virt (SBI and UEFI paths).
+    unsafe {
+        let uart = 0x1000_0000 as *mut u8;
+        // Spin on THR Empty (LSR bit 5) at offset 5.
+        loop {
+            let lsr = uart.add(5).read_volatile();
+            if lsr & 0x20 != 0 { break; }
+        }
+        uart.write_volatile(b);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn serial_read_byte() -> Option<u8> {
     unsafe {
         let lsr: u8;
@@ -222,5 +273,15 @@ fn serial_read_byte() -> Option<u8> {
         let data: u8;
         core::arch::asm!("in al, dx", out("al") data, in("dx") COM1, options(nostack));
         Some(data)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn serial_read_byte() -> Option<u8> {
+    unsafe {
+        let uart = 0x1000_0000 as *mut u8;
+        let lsr = uart.add(5).read_volatile();
+        if lsr & 0x01 == 0 { return None; }
+        Some(uart.read_volatile())
     }
 }
