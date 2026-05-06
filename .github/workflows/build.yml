@@ -8,84 +8,28 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Suppress cargo's progress bars in CI logs.
   CARGO_INCREMENTAL: 0
 
 jobs:
-  build-x86_64:
-    name: x86_64 (debug + release)
+  # ── Primary: RISC-V (default target) ────────────────────────────────────────
+  build-riscv:
+    name: "RISC-V riscv64gc (debug + release)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml is picked up automatically by rustup.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      # build.rs compiles src/crt/crt0.c via the cc crate using clang.
-      # clang is required for --target=x86_64-unknown-none cross-compilation.
-      - name: Install clang
-        if: success()
-        continue-on-error: false
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends clang
-
-      - name: Cache cargo registry + build
-        if: success()
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-x86_64-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: ${{ runner.os }}-x86_64-
-
-      - name: Build (debug)
-        if: success()
-        continue-on-error: false
-        run: |
-          cargo build \
-            --target x86_64-unknown-none \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-      - name: Build (release)
-        if: success()
-        continue-on-error: false
-        run: |
-          cargo build --release \
-            --target x86_64-unknown-none \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-  build-riscv:
-    name: RISC-V riscv64gc (debug)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rust-src
           targets: riscv64gc-unknown-none-elf
 
-      # build.rs compiles src/crt/crt0.c via the cc crate using clang.
-      # clang is required for --target=riscv64-unknown-none-elf cross-compilation.
       - name: Install clang
-        if: success()
-        continue-on-error: false
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends clang
 
       - name: Cache cargo registry + build
-        if: success()
         uses: actions/cache@v4
         with:
           path: |
@@ -96,10 +40,57 @@ jobs:
           restore-keys: ${{ runner.os }}-riscv-
 
       - name: Build (debug)
-        if: success()
-        continue-on-error: false
         run: |
           cargo build \
             --target riscv64gc-unknown-none-elf \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem
+
+      - name: Build (release)
+        run: |
+          cargo build --release \
+            --target riscv64gc-unknown-none-elf \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem
+
+  # ── Secondary: x86_64 ────────────────────────────────────────────────────────
+  build-x86_64:
+    name: "x86_64 (debug + release)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Install clang + nasm
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends clang nasm
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86_64-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-x86_64-
+
+      - name: Build (debug)
+        run: |
+          cargo build \
+            --target x86_64-unknown-none \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem
+
+      - name: Build (release)
+        run: |
+          cargo build --release \
+            --target x86_64-unknown-none \
             -Z build-std=core,alloc,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem

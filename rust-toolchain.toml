@@ -1,3 +1,5 @@
 [toolchain]
 channel = "nightly"
 components = ["rust-src", "llvm-tools-preview"]
+# Primary target first; x86_64 kept for cross-build support.
+targets = ["riscv64gc-unknown-none-elf", "x86_64-unknown-none"]

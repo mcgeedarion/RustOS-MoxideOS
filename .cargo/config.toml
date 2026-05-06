@@ -1,35 +1,38 @@
 [build]
-target = "x86_64-unknown-none"
+# Primary target: RISC-V SBI (OpenSBI / QEMU virt).
+# To build for x86_64 pass --target x86_64-unknown-none explicitly,
+# or use ./build_x86.sh.
+target = "riscv64gc-unknown-none-elf"
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 
-# ── x86_64 target ────────────────────────────────────────────────────────────
+# ── RISC-V target ────────────────────────────────────────────────────────────────
+# link-arg=-Tlinker.ld: apply the RISC-V linker script so the kernel loads
+# at 0x80200000 (OpenSBI handoff address) automatically.
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+  "-C", "link-arg=-Tlinker.ld",
+]
+
+# ── x86_64 target ────────────────────────────────────────────────────────────────
 # code-model=kernel: use 32-bit signed RIP-relative addressing throughout
-#   (no need for large-model GOT indirection in an identity-mapped kernel).
+# (no need for large-model GOT indirection in an identity-mapped kernel).
 # link-arg=-Tx86_64.ld: apply the kernel linker script on every build so
-#   load address, section layout, boot stack size, and _kernel_start are
-#   always in effect without passing the flag manually.
+# load address, section layout, boot stack size, and _kernel_start are
+# always in effect without passing the flag manually.
 [target.x86_64-unknown-none]
 rustflags = [
   "-C", "code-model=kernel",
   "-C", "link-arg=-Tx86_64.ld",
 ]
 
-# ── RISC-V target ─────────────────────────────────────────────────────────────
-# link-arg=-Tlinker.ld: apply the RISC-V linker script so the kernel loads
-#   at 0x80200000 (OpenSBI handoff address) automatically.
-[target.riscv64gc-unknown-none-elf]
-rustflags = [
-  "-C", "link-arg=-Tlinker.ld",
-]
-
-# ── C compiler configuration ──────────────────────────────────────────────────
+# ── C compiler configuration ──────────────────────────────────────────────────────
 # Clang is used for cross-compiling src/crt/crt0.c via the cc crate.
 # These env vars are picked up automatically by the cc crate during build.rs.
 [env]
-CC_x86_64-unknown-none          = "clang"
-CFLAGS_x86_64-unknown-none      = "--target=x86_64-unknown-none -ffreestanding -nostdlib"
-CC_riscv64gc-unknown-none-elf   = "clang"
+CC_riscv64gc-unknown-none-elf     = "clang"
 CFLAGS_riscv64gc-unknown-none-elf = "--target=riscv64-unknown-none-elf -march=rv64gc -mabi=lp64d -ffreestanding -nostdlib"
+CC_x86_64-unknown-none            = "clang"
+CFLAGS_x86_64-unknown-none        = "--target=x86_64-unknown-none -ffreestanding -nostdlib"
