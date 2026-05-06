@@ -29,15 +29,15 @@ jobs:
       # ── Cargo cache ─────────────────────────────────────────────────
       - uses: Swatinem/rust-cache@v2
 
-      # ── System deps (QEMU + GRUB ISO tools + musl + clang) ─────────────
-      # clang is required by build.rs to cross-compile src/crt/crt0.c
-      # via the cc crate for the x86_64-unknown-none target.
+      # ── System deps (QEMU + GRUB ISO tools + musl + clang + nasm) ──────
+      # clang: cross-compiles src/crt/crt0.c via the cc crate.
+      # nasm:  assembles src/arch/x86_64/boot.s (multiboot2 header + _start).
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 grub-pc-bin grub-common xorriso mtools \
-            musl-tools clang
+            musl-tools clang nasm
 
       # ── Build kernel (default features = no Wayland) ──────────────────
       - name: Build kernel (release)
