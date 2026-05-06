@@ -1,106 +1,139 @@
 #!/usr/bin/env bash
-# build_riscv.sh — Build rustos for RISC-V (riscv64gc-unknown-none-elf).
+# build_riscv.sh — Build rustos for RISC-V.
 #
-# Mirrors build_x86.sh for the RISC-V target.  Produces a release ELF kernel
-# at target/riscv64gc-unknown-none-elf/release/rustos that can be passed
-# directly to QEMU with -kernel (no objcopy stripping needed — QEMU loads
-# the ELF natively via OpenSBI).
+# Supports two boot modes:
+#   SBI  (default) — OpenSBI/QEMU -kernel, target riscv64gc-unknown-none-elf
+#   UEFI (--uefi)  — EDK2 RiscVVirt, target riscv64-uefi.json, output .efi
 #
 # Usage:
-#   ./build_riscv.sh                 # release build (default)
-#   ./build_riscv.sh --debug         # debug build
-#   ./build_riscv.sh --initrd        # also build + pack initramfs.cpio
+#   ./build_riscv.sh                 # SBI release build (default)
+#   ./build_riscv.sh --debug         # SBI debug build
+#   ./build_riscv.sh --uefi          # UEFI release build
+#   ./build_riscv.sh --uefi --debug  # UEFI debug build
+#   ./build_riscv.sh --initrd        # also build + pack initramfs.cpio (SBI only)
 #
 # Prerequisites:
 #   rustup target add riscv64gc-unknown-none-elf
 #   rustup component add rust-src
-#   clang (for CRT cross-compilation via cc crate)
-#   # Optional, for --initrd:
-#   riscv64-linux-musl-gcc  (or musl-cross from https://musl.cc/)
+#   clang / rust-lld
+#   # For --uefi:
+#   lld (rust-lld is sufficient; invoked automatically via riscv64-uefi.json)
 #
-# Output files:
-#   target/riscv64gc-unknown-none-elf/release/rustos   (release ELF)
-#   target/riscv64gc-unknown-none-elf/debug/rustos      (debug ELF, --debug)
-#   initramfs.cpio                                      (--initrd only)
+# Output files (SBI):
+#   target/riscv64gc-unknown-none-elf/{release,debug}/rustos   (ELF)
+#
+# Output files (UEFI):
+#   target/riscv64-uefi/{release,debug}/rustos.efi             (PE/COFF EFI app)
+#   esp/EFI/BOOT/BOOTRISCV64.EFI                               (ESP layout)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET="riscv64gc-unknown-none-elf"
 PROFILE="release"
+BOOT="sbi"
 BUILD_INITRD=0
 
 for arg in "$@"; do
   case "$arg" in
     --debug)  PROFILE="debug" ;;
+    --uefi)   BOOT="uefi" ;;
     --initrd) BUILD_INITRD=1 ;;
     *) echo "Unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
 
-# ── Kernel build ────────────────────────────────────────────────────────────
+# ── SBI build (existing path) ────────────────────────────────────────────────
 
-echo "[build_riscv] Building rustos (RISC-V, $PROFILE)..."
+if [[ "$BOOT" == "sbi" ]]; then
+  echo "[build_riscv] Building rustos (RISC-V SBI, $PROFILE)..."
+
+  CARGO_ARGS=(
+    build
+    --target riscv64gc-unknown-none-elf
+    -Z build-std=core,alloc,compiler_builtins
+    -Z build-std-features=compiler-builtins-mem
+  )
+  [[ "$PROFILE" == "release" ]] && CARGO_ARGS+=(--release)
+
+  cargo "${CARGO_ARGS[@]}" 2>&1
+
+  KERNEL_ELF="$SCRIPT_DIR/target/riscv64gc-unknown-none-elf/$PROFILE/rustos"
+  echo
+  echo "[build_riscv] Built: $KERNEL_ELF"
+
+  if command -v llvm-size &>/dev/null; then
+    echo; echo "[build_riscv] Size breakdown:"; llvm-size "$KERNEL_ELF"
+  elif command -v size &>/dev/null; then
+    echo; echo "[build_riscv] Size breakdown:"; size "$KERNEL_ELF"
+  fi
+
+  if [[ $BUILD_INITRD -eq 1 ]]; then
+    echo
+    echo "[build_riscv] Building RISC-V userspace and initramfs..."
+    bash "$SCRIPT_DIR/tools/build_userspace.sh" riscv64
+    echo "[build_riscv] Initramfs: $SCRIPT_DIR/initramfs.cpio"
+  fi
+
+  echo
+  echo "[build_riscv] Done."
+  echo
+  echo "  Kernel ELF : $KERNEL_ELF"
+  [[ $BUILD_INITRD -eq 1 ]] && echo "  Initramfs  : $SCRIPT_DIR/initramfs.cpio"
+  echo
+  echo "  Run with QEMU (SBI):"
+  echo "    ./run_qemu_riscv.sh"
+  exit 0
+fi
+
+# ── UEFI build ───────────────────────────────────────────────────────────────
+
+echo "[build_riscv] Building rustos (RISC-V UEFI, $PROFILE)..."
+
+TARGET_JSON="$SCRIPT_DIR/riscv64-uefi.json"
 
 CARGO_ARGS=(
   build
-  --target "$TARGET"
+  --target "$TARGET_JSON"
+  --features uefi_boot
   -Z build-std=core,alloc,compiler_builtins
   -Z build-std-features=compiler-builtins-mem
 )
-
-if [[ "$PROFILE" == "release" ]]; then
-  CARGO_ARGS+=(--release)
-fi
+[[ "$PROFILE" == "release" ]] && CARGO_ARGS+=(--release)
 
 cargo "${CARGO_ARGS[@]}" 2>&1
 
-KERNEL_ELF="$SCRIPT_DIR/target/$TARGET/$PROFILE/rustos"
+# Cargo names the output after the crate, with a .efi extension when os=uefi.
+KERNEL_EFI="$SCRIPT_DIR/target/riscv64-uefi/$PROFILE/rustos.efi"
+
+if [[ ! -f "$KERNEL_EFI" ]]; then
+  # Some toolchain versions drop the .efi suffix — try without.
+  KERNEL_EFI_NOEXT="$SCRIPT_DIR/target/riscv64-uefi/$PROFILE/rustos"
+  if [[ -f "$KERNEL_EFI_NOEXT" ]]; then
+    KERNEL_EFI="$KERNEL_EFI_NOEXT"
+  else
+    echo "[build_riscv] ERROR: could not find EFI binary under target/riscv64-uefi/$PROFILE/" >&2
+    exit 1
+  fi
+fi
 
 echo
-echo "[build_riscv] Built: $KERNEL_ELF"
+echo "[build_riscv] Built: $KERNEL_EFI"
 
-# Print size breakdown (rust-size / llvm-size if available).
-if command -v llvm-size &>/dev/null; then
-  echo
-  echo "[build_riscv] Size breakdown:"
-  llvm-size "$KERNEL_ELF"
-elif command -v size &>/dev/null; then
-  echo
-  echo "[build_riscv] Size breakdown:"
-  size "$KERNEL_ELF"
-fi
-
-# ── Optional: build userspace + initramfs ───────────────────────────────────
-
-if [[ $BUILD_INITRD -eq 1 ]]; then
-  echo
-  echo "[build_riscv] Building RISC-V userspace and initramfs..."
-  bash "$SCRIPT_DIR/tools/build_userspace.sh" riscv64
-  echo "[build_riscv] Initramfs: $SCRIPT_DIR/initramfs.cpio"
-fi
-
-# ── Summary ─────────────────────────────────────────────────────────────────
+# Install into a FAT ESP directory tree that QEMU can mount directly.
+ESP="$SCRIPT_DIR/esp"
+mkdir -p "$ESP/EFI/BOOT"
+cp "$KERNEL_EFI" "$ESP/EFI/BOOT/BOOTRISCV64.EFI"
+echo "[build_riscv] Installed: $ESP/EFI/BOOT/BOOTRISCV64.EFI"
 
 echo
 echo "[build_riscv] Done."
 echo
-echo "  Kernel ELF : $KERNEL_ELF"
-if [[ $BUILD_INITRD -eq 1 ]]; then
-echo "  Initramfs  : $SCRIPT_DIR/initramfs.cpio"
-fi
+echo "  EFI binary : $KERNEL_EFI"
+echo "  ESP tree   : $ESP/EFI/BOOT/BOOTRISCV64.EFI"
 echo
-echo "  Run with QEMU:"
-if [[ $BUILD_INITRD -eq 1 ]]; then
-echo "    qemu-system-riscv64 -machine virt -cpu rv64 -m 256M -bios default \\"
-echo "      -kernel $KERNEL_ELF \\"
-echo "      -initrd $SCRIPT_DIR/initramfs.cpio \\"
-echo "      -serial stdio -display none -no-reboot"
-else
-echo "    qemu-system-riscv64 -machine virt -cpu rv64 -m 256M -bios default \\"
-echo "      -kernel $KERNEL_ELF \\"
-echo "      -serial stdio -display none -no-reboot"
-fi
+echo "  Run with QEMU (UEFI):"
+echo "    ./run_qemu_riscv.sh --uefi"
 echo
-echo "  Or use the existing wrapper:"
-echo "    ./run_qemu_riscv.sh"
+echo "  Note: requires EDK2 RISC-V firmware (edk2-riscv-code.fd)."
+echo "  Install with:  sudo apt install qemu-efi-riscv64   # Debian/Ubuntu"
+echo "               or brew install qemu                  # macOS"
