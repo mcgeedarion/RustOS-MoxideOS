@@ -161,11 +161,23 @@ pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_vo
         return;
     }
 
-    let gop = &*(gop_iface as *const GopProtocol);
-    if gop.mode.is_null() { return; }
-    let mode = &*gop.mode;
-    if mode.info.is_null() { return; }
-    let info = &*mode.info;
+    let gop_ptr = gop_iface as *const GopProtocol;
+    if gop_ptr.is_null() || (gop_ptr as usize) % core::mem::align_of::<GopProtocol>() != 0 {
+        return;
+    }
+    let gop = &*gop_ptr;
+
+    let mode_ptr = gop.mode as *const GopMode;
+    if mode_ptr.is_null() || (mode_ptr as usize) % core::mem::align_of::<GopMode>() != 0 {
+        return;
+    }
+    let mode = &*mode_ptr;
+
+    let info_ptr = mode.info as *const GopModeInfo;
+    if info_ptr.is_null() || (info_ptr as usize) % core::mem::align_of::<GopModeInfo>() != 0 {
+        return;
+    }
+    let info = &*info_ptr;
 
     if mode.fb_base == 0 { return; } // BltOnly — no linear FB
 
