@@ -28,11 +28,14 @@ jobs:
       # build.rs compiles src/crt/crt0.c via the cc crate using clang.
       # clang is required for --target=x86_64-unknown-none cross-compilation.
       - name: Install clang
+        if: success()
+        continue-on-error: false
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends clang
 
       - name: Cache cargo registry + build
+        if: success()
         uses: actions/cache@v4
         with:
           path: |
@@ -43,6 +46,8 @@ jobs:
           restore-keys: ${{ runner.os }}-x86_64-
 
       - name: Build (debug)
+        if: success()
+        continue-on-error: false
         run: |
           cargo build \
             --target x86_64-unknown-none \
@@ -50,6 +55,8 @@ jobs:
             -Z build-std-features=compiler-builtins-mem
 
       - name: Build (release)
+        if: success()
+        continue-on-error: false
         run: |
           cargo build --release \
             --target x86_64-unknown-none \
@@ -71,11 +78,14 @@ jobs:
       # build.rs compiles src/crt/crt0.c via the cc crate using clang.
       # clang is required for --target=riscv64-unknown-none-elf cross-compilation.
       - name: Install clang
+        if: success()
+        continue-on-error: false
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends clang
 
       - name: Cache cargo registry + build
+        if: success()
         uses: actions/cache@v4
         with:
           path: |
@@ -86,6 +96,8 @@ jobs:
           restore-keys: ${{ runner.os }}-riscv-
 
       - name: Build (debug)
+        if: success()
+        continue-on-error: false
         run: |
           cargo build \
             --target riscv64gc-unknown-none-elf \
