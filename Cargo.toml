@@ -21,17 +21,20 @@ linked_list_allocator = { version = "0.10", default-features = false, features =
 cc = "1"
 
 [features]
+# RISC-V UEFI boot path (EDK2 RiscVVirt) — enabled by default.
+# When enabled:
+#   - src/arch/riscv64/uefi_entry.rs replaces src/arch/riscv64/boot.rs
+#   - build target is riscv64-uefi.json (PE/COFF via lld-link)
+#   - Use: cargo build --release   or   ./build.sh
+# To use SBI boot instead, disable this feature:
+#   - ./build_riscv.sh --sbi
+default = ["uefi_boot"]
+uefi_boot = []
+
 # Wayland compositor subsystem. Not part of the default kernel build.
 # Enable with: cargo build --features wayland
 # All code under src/wayland/ is cfg-gated on this feature.
 wayland = []
-
-# RISC-V UEFI boot path (EDK2 RiscVVirt).
-# When enabled:
-#   - src/arch/riscv64/uefi_entry.rs replaces src/arch/riscv64/boot.rs
-#   - build target becomes riscv64-uefi.json (PE/COFF via lld-link)
-#   - Use: ./build_riscv.sh --uefi   or   ./run_qemu_riscv.sh --uefi
-uefi_boot = []
 
 [lib]
 name = "rustos"

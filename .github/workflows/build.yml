@@ -11,9 +11,9 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Primary: RISC-V (default target) ────────────────────────────────────────
-  build-riscv:
-    name: "RISC-V riscv64gc (debug + release)"
+  # ── Primary: RISC-V UEFI (default target + default feature) ───────────────────
+  build-riscv-uefi:
+    name: "RISC-V UEFI (debug + release)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +22,49 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src, llvm-tools-preview
+
+      - name: Install clang + lld
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends clang lld
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-riscv-uefi-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-riscv-uefi-
+
+      - name: Build (debug)
+        run: |
+          cargo build \
+            --target riscv64-uefi.json \
+            --features uefi_boot \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem
+
+      - name: Build (release)
+        run: |
+          cargo build --release \
+            --target riscv64-uefi.json \
+            --features uefi_boot \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem
+
+  # ── Secondary: RISC-V SBI ───────────────────────────────────────────────────────
+  build-riscv-sbi:
+    name: "RISC-V SBI (debug)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
           targets: riscv64gc-unknown-none-elf
 
       - name: Install clang
@@ -36,24 +79,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-riscv-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: ${{ runner.os }}-riscv-
+          key: ${{ runner.os }}-riscv-sbi-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-riscv-sbi-
 
       - name: Build (debug)
         run: |
           cargo build \
             --target riscv64gc-unknown-none-elf \
+            --no-default-features \
             -Z build-std=core,alloc,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem
 
-      - name: Build (release)
-        run: |
-          cargo build --release \
-            --target riscv64gc-unknown-none-elf \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-  # ── Secondary: x86_64 ────────────────────────────────────────────────────────
+  # ── Tertiary: x86_64 ────────────────────────────────────────────────────────────
   build-x86_64:
     name: "x86_64 (debug + release)"
     runs-on: ubuntu-latest
@@ -85,6 +122,7 @@ jobs:
         run: |
           cargo build \
             --target x86_64-unknown-none \
+            --no-default-features \
             -Z build-std=core,alloc,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem
 
@@ -92,5 +130,6 @@ jobs:
         run: |
           cargo build --release \
             --target x86_64-unknown-none \
+            --no-default-features \
             -Z build-std=core,alloc,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem
