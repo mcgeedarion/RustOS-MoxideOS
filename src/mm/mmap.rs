@@ -10,33 +10,42 @@
 //! find_vma (called on every page fault) to use binary search in O(log n)
 //! instead of a linear scan.
 //!
-//! ## Framebuffer / MMIO mappings
+//! ## Physical mappings (VmaKind::PhysMap)
 //!
-//! VmaKind::PhysFixed(pa_base) covers device memory that must NOT be
-//! backed by the PMM.  The pages are mapped va→pa directly.  On munmap
-//! the PTEs are cleared but the physical pages are never freed via pmm.
+//! The GOP framebuffer (and any other MMIO region that userspace needs to
+//! mmap directly) uses `VmaKind::PhysMap(phys_base)`.  These VMAs differ
+//! from anonymous VMAs in two important ways:
 //!
-//! Userspace triggers this path by calling:
-//!   mmap(0, size, PROT_READ|PROT_WRITE, MAP_SHARED, drm_fd, offset)
-//! where `offset` is the value returned by DRM_IOCTL_MODE_MAP_DUMB
-//! (== fb_phys from GOP).  sys_mmap detects that offset falls in the
-//! known GOP framebuffer range and switches to the PhysFixed path.
+//!   1. Pages are mapped with the supplied physical address directly —
+//!      no PMM allocation happens.
+//!   2. munmap of a PhysMap VMA does NOT return pages to the PMM because
+//!      the kernel never owned them.
+//!
+//! ## How a Wayland compositor / libdrm gets the framebuffer
+//!
+//!   DRM_IOCTL_MODE_MAP_DUMB  → returns `offset` = GOP fb_phys
+//!   mmap(0, size, PROT_RW, MAP_SHARED, drm_fd, offset)
+//!       → sys_mmap detects offset == GOP fb_phys → PhysMap path
+//!       → pages mapped 1:1 to fb_phys .. fb_phys+size
+//!   userspace pointer lands directly on the GOP linear framebuffer
 
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::arch::{Arch, api::{PageFlags, Paging}};
 use crate::proc::scheduler;
 
-// ── VMA descriptor ──────────────────────────────────────────────────────────────────────────────────
+// ── VMA descriptor ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum VmaKind {
     Anonymous,
+    /// fd-backed file mapping: (fd, file_offset)
     FileBacked(usize, u64),
+    /// Fixed kernel-internal mapping (no backing store).
     Fixed,
-    /// Direct MMIO / framebuffer mapping.  `pa_base` is the physical address
-    /// of the first byte of the region.  Pages are never PMM-managed.
-    PhysFixed(u64),
+    /// Direct physical mapping — pages are NOT PMM-owned.
+    /// Contains the physical address of the first mapped byte.
+    PhysMap(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -49,18 +58,19 @@ pub struct Vma {
     pub file_offset: u64,
 }
 
-// ── PROT_* / MAP_* constants ─────────────────────────────────────────────────────────────────
+// ── PROT_* / MAP_* constants ─────────────────────────────────────────────────
 
 pub const PROT_READ:  u32 = 1;
 pub const PROT_WRITE: u32 = 2;
 pub const PROT_EXEC:  u32 = 4;
 
-const MAP_FIXED:      u32 = 0x10;
-const MAP_ANON:       u32 = 0x20;
-const MAP_SHARED:     u32 = 0x01;
-const PAGE:           usize = 4096;
+const MAP_SHARED:  u32 = 0x01;
+const MAP_PRIVATE: u32 = 0x02;
+const MAP_FIXED:   u32 = 0x10;
+const MAP_ANON:    u32 = 0x20;
+const PAGE:        usize = 4096;
 
-// ── VMA helpers ───────────────────────────────────────────────────────────────────────────────
+// ── VMA helpers ──────────────────────────────────────────────────────────────
 
 /// Insert a VMA in sorted order by start address.
 pub fn insert_vma(pid: usize, vma: Vma) {
@@ -101,7 +111,7 @@ fn clear_vmas_internal(pid: usize) {
     scheduler::with_proc_mut(pid, |p| p.vmas.clear());
 }
 
-// ── free_address_space ──────────────────────────────────────────────────────────────────────────
+// ── free_address_space ───────────────────────────────────────────────────────
 
 pub fn free_address_space(pid: usize, user_cr3: usize) {
     if user_cr3 == 0 { return; }
@@ -110,11 +120,13 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
         .unwrap_or_default();
 
     for vma in &vmas {
+        // PhysMap VMAs are MMIO / framebuffer — the kernel does not own
+        // those physical pages, so never feed them back to the PMM.
+        let is_phys = matches!(vma.kind, VmaKind::PhysMap(_));
         for va in (vma.start..vma.end).step_by(PAGE) {
             if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, va) {
                 <Arch as Paging>::unmap_page(va);
-                // PhysFixed VMAs back device memory — never free via PMM.
-                if !matches!(vma.kind, VmaKind::PhysFixed(_)) {
+                if !is_phys {
                     crate::mm::pmm::free_page(pa);
                 }
             }
@@ -126,7 +138,14 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
     scheduler::with_proc_mut(pid, |p| p.user_satp = 0);
 }
 
-// ── sys_mmap ─────────────────────────────────────────────────────────────────────────────────
+// ── sys_mmap ─────────────────────────────────────────────────────────────────
+//
+// Three mapping kinds are handled:
+//
+//   1. MAP_ANON (or fd == usize::MAX) — allocate PMM pages, zero-fill.
+//   2. PhysMap  — `offset` falls within the GOP framebuffer physical range.
+//                 Map pages 1:1 to the physical range; no PMM involvement.
+//   3. FileBacked — fd-backed; VMA registered, pages faulted lazily.
 
 pub fn sys_mmap(
     addr: usize, length: usize, prot: u32, flags: u32,
@@ -136,21 +155,21 @@ pub fn sys_mmap(
     let len = page_align_up(length);
     let pid = scheduler::current_pid();
 
-    // ── Detect framebuffer / MMIO physical-fixed mapping ─────────────────────
-    //
-    // DRM_IOCTL_MODE_MAP_DUMB returns fb_phys as the offset.  Userspace then
-    // calls mmap(0, size, PROT_RW, MAP_SHARED, drm_fd, fb_phys).  We detect
-    // this by checking whether `offset` matches the GOP framebuffer base.
-    //
-    // The same path handles any MAP_SHARED mmap against a /dev/fb0 fd where
-    // the offset is 0 (the whole framebuffer).
-    let phys_base: Option<u64> = detect_phys_offset(fd, offset, length);
-
-    if let Some(pa_base) = phys_base {
-        return mmap_phys(pid, addr, len, prot, flags, pa_base);
+    // ── Detect GOP framebuffer physical mapping ───────────────────────────
+    // libdrm calls mmap(0, size, PROT_RW, MAP_SHARED, drm_fd, phys_offset)
+    // where phys_offset == GOP fb_phys (returned by DRM_IOCTL_MODE_MAP_DUMB).
+    // Detect by checking whether `offset` falls inside the GOP FB region.
+    if flags & MAP_ANON == 0 {
+        if let Some(info) = crate::drivers::gop::get() {
+            let fb_phys = info.fb_phys as usize;
+            let fb_size = crate::drivers::gop::fb_byte_size(&info);
+            if offset >= fb_phys && offset < fb_phys + fb_size {
+                return mmap_phys(addr, len, prot, flags, pid, offset as u64);
+            }
+        }
     }
 
-    // ── Normal anonymous / file-backed mapping ────────────────────────────────
+    // ── Normal (anonymous or file-backed) path ────────────────────────────
     let (va, user_cr3) = scheduler::with_proc_mut(pid, |p| {
         let va = if flags & MAP_FIXED != 0 {
             if addr == 0 { return (0, 0); }
@@ -163,57 +182,71 @@ pub fn sys_mmap(
         (va, p.user_satp)
     }).unwrap_or((0, 0));
 
-    if va == 0 { return -22; }
+    if va == 0       { return -22; }
     if user_cr3 == 0 { return -12; }
 
     if flags & MAP_FIXED != 0 {
         remove_vma(pid, va, len);
     }
 
+    let is_anon  = flags & MAP_ANON != 0 || fd == usize::MAX;
     let pte_flags = prot_to_flags(prot);
-    let mut mapped = 0usize;
-    for page_va in (va..va + len).step_by(PAGE) {
-        match crate::mm::pmm::alloc_page() {
-            Some(pa) => {
-                <Arch as Paging>::map_page(user_cr3, page_va, pa, pte_flags);
-                mapped += 1;
-            }
-            None => {
-                for rollback_va in (va..va + mapped * PAGE).step_by(PAGE) {
-                    if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, rollback_va) {
-                        <Arch as Paging>::unmap_page(rollback_va);
-                        crate::mm::pmm::free_page(pa);
-                    }
+
+    if is_anon {
+        let mut mapped = 0usize;
+        for page_va in (va..va + len).step_by(PAGE) {
+            match crate::mm::pmm::alloc_page() {
+                Some(pa) => {
+                    <Arch as Paging>::map_page(user_cr3, page_va, pa, pte_flags);
+                    mapped += 1;
                 }
-                return -12;
+                None => {
+                    for rollback_va in (va..va + mapped * PAGE).step_by(PAGE) {
+                        if let Some(pa) =
+                            <Arch as Paging>::virt_to_phys(user_cr3, rollback_va)
+                        {
+                            <Arch as Paging>::unmap_page(rollback_va);
+                            crate::mm::pmm::free_page(pa);
+                        }
+                    }
+                    return -12; // ENOMEM
+                }
             }
         }
+        insert_vma(pid, Vma {
+            start: va, end: va + len,
+            prot, flags,
+            kind: VmaKind::Anonymous,
+            file_offset: 0,
+        });
+    } else {
+        // File-backed — register VMA; pages faulted lazily by page_fault.rs.
+        insert_vma(pid, Vma {
+            start: va, end: va + len,
+            prot, flags,
+            kind: VmaKind::FileBacked(fd, offset as u64),
+            file_offset: offset as u64,
+        });
     }
 
-    insert_vma(pid, Vma {
-        start: va,
-        end:   va + len,
-        prot,
-        flags,
-        kind: if flags & MAP_ANON != 0 {
-            VmaKind::Anonymous
-        } else {
-            VmaKind::FileBacked(fd, offset as u64)
-        },
-        file_offset: offset as u64,
-    });
     va as isize
 }
 
-// ── Physical-fixed mmap (framebuffer / MMIO) ──────────────────────────────────────────────────
-
-/// Map `len` bytes of device-physical memory starting at `pa_base` into
-/// the calling process's address space.  No PMM pages are allocated;
-/// each VA is pointed directly at the corresponding PA.
-fn mmap_phys(pid: usize, hint: usize, len: usize, prot: u32, flags: u32, pa_base: u64) -> isize {
+/// Map `len` bytes of physical memory at `offset` (= phys address) into the
+/// current process address space without touching the PMM.
+/// PROT_EXEC is silently stripped — framebuffer pages are never executable.
+fn mmap_phys(
+    addr:   usize,
+    len:    usize,
+    prot:   u32,
+    flags:  u32,
+    pid:    usize,
+    offset: u64,
+) -> isize {
     let (va, user_cr3) = scheduler::with_proc_mut(pid, |p| {
-        let va = if flags & MAP_FIXED != 0 && hint != 0 {
-            hint
+        let va = if flags & MAP_FIXED != 0 {
+            if addr == 0 { return (0usize, 0usize); }
+            addr
         } else {
             let v = p.next_va;
             p.next_va = page_align_up(v + len + PAGE);
@@ -222,89 +255,65 @@ fn mmap_phys(pid: usize, hint: usize, len: usize, prot: u32, flags: u32, pa_base
         (va, p.user_satp)
     }).unwrap_or((0, 0));
 
-    if va == 0 || user_cr3 == 0 { return -12; }
+    if va == 0       { return -22; }
+    if user_cr3 == 0 { return -12; }
 
     if flags & MAP_FIXED != 0 {
         remove_vma(pid, va, len);
     }
 
-    // PTE flags: Present + User + Write (if PROT_WRITE); no NX on framebuffer.
-    // Write-combining (PAT) would be ideal but requires MSR programming;
-    // plain WB is correct and safe for a single-GPU framebuffer.
-    let pte_flags = prot_to_flags(prot);
-
+    let pte_flags = prot_to_flags(prot & !PROT_EXEC);
+    let phys_start = offset as usize;
     for (i, page_va) in (va..va + len).step_by(PAGE).enumerate() {
-        let pa = pa_base as usize + i * PAGE;
-        <Arch as Paging>::map_page(user_cr3, page_va, pa, pte_flags);
+        <Arch as Paging>::map_page(user_cr3, page_va, phys_start + i * PAGE, pte_flags);
     }
 
     insert_vma(pid, Vma {
-        start:       va,
-        end:         va + len,
-        prot,
+        start: va, end: va + len,
+        prot: prot & !PROT_EXEC,
         flags,
-        kind:        VmaKind::PhysFixed(pa_base),
-        file_offset: pa_base,  // echo the pa so procfs /maps can show it
+        kind: VmaKind::PhysMap(offset),
+        file_offset: offset,
     });
 
     va as isize
 }
 
-/// Determine whether an mmap call should use the physical-fixed path.
-///
-/// Returns `Some(pa_base)` when:
-///   1. `fd` is a /dev/fb0 fd and `offset` == 0  (fbdev mmap)
-///   2. `fd` is a /dev/dri/card0 fd and `offset` matches the GOP fb_phys
-///      (DRM dumb-buffer mmap after MAP_DUMB returned fb_phys as offset)
-///   3. `offset` directly equals gop fb_phys (libdrm passes it raw)
-fn detect_phys_offset(fd: usize, offset: usize, _len: usize) -> Option<u64> {
-    let info = crate::drivers::gop::get()?;
-    let fb_phys = info.fb_phys;
-
-    // Case 1: /dev/fb0, offset 0.
-    if crate::fs::devfs::is_framebuffer(fd) && offset == 0 {
-        return Some(fb_phys);
-    }
-
-    // Case 2 & 3: DRM fd or raw offset matching fb_phys.
-    if crate::fs::devfs::is_drm_card(fd) || offset as u64 == fb_phys {
-        if offset as u64 == fb_phys || offset == 0 {
-            return Some(fb_phys);
-        }
-    }
-
-    // Case 3 (raw): libdrm may mmap with the exact physical address as offset.
-    if offset as u64 == fb_phys {
-        return Some(fb_phys);
-    }
-
-    None
-}
-
-// ── sys_munmap ───────────────────────────────────────────────────────────────────────────────
+// ── sys_munmap ───────────────────────────────────────────────────────────────
 
 pub fn sys_munmap(addr: usize, length: usize) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
     let len = page_align_up(length);
     let pid = scheduler::current_pid();
 
-    // Check if this is a PhysFixed VMA — if so, unmap but do NOT free pages.
-    let is_phys = find_vma(pid, addr)
-        .map_or(false, |v| matches!(v.kind, VmaKind::PhysFixed(_)));
+    // Collect physical VMA ranges in [addr, addr+len) before unmapping
+    // so we know which pages to skip PMM-freeing.
+    let phys_ranges: Vec<(usize, usize)> = scheduler::with_proc(pid, |p| {
+        p.vmas.iter()
+            .filter(|v| {
+                matches!(v.kind, VmaKind::PhysMap(_))
+                    && v.start < addr + len
+                    && v.end   > addr
+            })
+            .map(|v| (v.start.max(addr), v.end.min(addr + len)))
+            .collect()
+    }).unwrap_or_default();
 
     for page_va in (addr..addr + len).step_by(PAGE) {
+        let is_phys = phys_ranges.iter().any(|&(s, e)| page_va >= s && page_va < e);
         if is_phys {
-            // Just clear the PTE, no PMM involvement.
+            // Unmap but do NOT free the physical page — it belongs to GOP.
             <Arch as Paging>::unmap_page(page_va);
         } else if let Some(pa) = <Arch as Paging>::unmap_page(page_va) {
             crate::mm::pmm::free_page(pa);
         }
     }
+
     remove_vma(pid, addr, len);
     0
 }
 
-// ── sys_mprotect ──────────────────────────────────────────────────────────────────────────
+// ── sys_mprotect ─────────────────────────────────────────────────────────────
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
@@ -330,7 +339,7 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     0
 }
 
-// ── sys_brk ──────────────────────────────────────────────────────────────────────────────────
+// ── sys_brk ──────────────────────────────────────────────────────────────────
 
 pub fn sys_brk(addr: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -362,7 +371,7 @@ pub fn sys_brk(addr: usize) -> isize {
     new_brk as isize
 }
 
-// ── helpers ─────────────────────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
 fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
@@ -375,7 +384,7 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     f
 }
 
-// ── procfs helpers (called from procfs.rs) ──────────────────────────────────────────────
+// ── procfs helpers (called from procfs.rs) ────────────────────────────────────
 
 pub fn with_vmas<F: FnMut(&Vma)>(pid: u32, mut f: F) {
     scheduler::with_proc(pid as usize, |p| {
