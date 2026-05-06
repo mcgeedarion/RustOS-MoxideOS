@@ -9,7 +9,11 @@ A hobby operating-system kernel written in **Rust**, targeting **x86_64** (prima
 | Target | Boot | Paging | Syscall | Status |
 |---|---|---|---|---|
 | `x86_64-unknown-none` | UEFI | 4-level (PML4) | `syscall`/`sysret` | Primary |
-| `riscv64gc-unknown-none-elf` | SBI | sv39 | `ecall` | Secondary |
+| `riscv64gc-unknown-none-elf` | UEFI **or** SBI | sv39 | `ecall` | Secondary |
+
+RISC-V supports two boot modes selectable at build time:
+- **SBI** (default) — OpenSBI hands off to `_start` in S-mode; no extra firmware required
+- **UEFI** — EDK2 RiscVVirt calls `uefi_start` as a standard EFI application; output is a PE/COFF `.efi` binary installed on a FAT ESP
 
 ---
 
@@ -17,7 +21,7 @@ A hobby operating-system kernel written in **Rust**, targeting **x86_64** (prima
 
 ### Hardware abstraction
 - x86_64: GDT, IDT, APIC (local + I/O), TSS, `RDMSR`/`WRMSR`, serial UART, PS/2
-- RISC-V: SBI boot, CSR helpers, PLIC, CLINT, sv39 trap handling
+- RISC-V: UEFI + SBI boot, CSR helpers, PLIC, CLINT, sv39 trap handling
 - PCIe MMIO enumeration; virtio-blk (read + write), virtio-net
 
 ### Memory management
@@ -67,6 +71,8 @@ rustup target add riscv64gc-unknown-none-elf
 rustup component add rust-src llvm-tools-preview
 # QEMU
 apt install qemu-system-x86 qemu-system-misc   # or brew install qemu
+# UEFI RISC-V firmware (only needed for --uefi mode)
+apt install qemu-efi-riscv64                   # Debian/Ubuntu
 ```
 
 The correct nightly toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
@@ -77,11 +83,20 @@ The correct nightly toolchain is pinned in [`rust-toolchain.toml`](rust-toolchai
 bash build_x86.sh
 ```
 
-### RISC-V 64
+### RISC-V 64 — SBI (default)
 
 ```sh
-bash build.sh
+bash build_riscv.sh
 ```
+
+### RISC-V 64 — UEFI
+
+```sh
+bash build_riscv.sh --uefi
+```
+
+This builds against [`riscv64-uefi.json`](riscv64-uefi.json) (PE/COFF via `lld-link`) with
+`--features uefi_boot` and installs the output to `esp/EFI/BOOT/BOOTRISCV64.EFI`.
 
 ---
 
@@ -93,13 +108,23 @@ bash build.sh
 bash run_qemu.sh
 ```
 
-### RISC-V 64
+### RISC-V 64 — SBI
 
 ```sh
 bash run_qemu_riscv.sh
 ```
 
-Both scripts boot straight to the kernel shell. Serial output goes to stdio.
+### RISC-V 64 — UEFI
+
+```sh
+bash run_qemu_riscv.sh --uefi
+```
+
+The script auto-detects the EDK2 RISC-V firmware (`RISCV_VIRT_CODE.fd`) from common
+install paths, creates a writable vars store on first run, and launches QEMU with
+pflash firmware + a FAT virtio drive containing the ESP.
+
+All scripts boot straight to the kernel shell. Serial output goes to stdio.
 
 ---
 
@@ -108,15 +133,22 @@ Both scripts boot straight to the kernel shell. Serial output goes to stdio.
 Terminal 1 — start QEMU with GDB stub:
 
 ```sh
-bash run_qemu.sh -s -S          # x86_64
-bash run_qemu_riscv.sh -s -S    # RISC-V
+bash run_qemu.sh --gdb              # x86_64  (port :1234)
+bash run_qemu_riscv.sh --gdb        # RISC-V SBI  (port :1235)
+bash run_qemu_riscv.sh --uefi --gdb # RISC-V UEFI (port :1235)
 ```
 
 Terminal 2 — attach:
 
 ```sh
+# x86_64
 gdb target/x86_64-unknown-none/debug/rustos
-# .gdbinit loads automatically and connects to :1234
+
+# RISC-V
+gdb-multiarch \
+  -ex 'set arch riscv:rv64' \
+  -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \
+  -ex 'target remote :1235'
 ```
 
 [`.gdbinit`](.gdbinit) sets the architecture, loads symbols, connects to `localhost:1234`, and defines helpers (`vmas`, `procs`, `klog`).
@@ -137,7 +169,9 @@ Integration tests live in [`tests/`](tests/). CI runs on every push via [`.githu
 
 ```
 src/
-  arch/          # x86_64 + riscv64 HAL (Paging, Cpu traits)
+  arch/
+    x86_64/      # GDT, IDT, APIC, UEFI entry, paging, syscall
+    riscv64/     # UEFI entry, SBI boot, CSR, PLIC, sv39 paging, syscall
   fs/            # VFS, ext2, devfs, procfs, pipe, poll, …
   mm/            # PMM, VMM, mmap, page_fault, CoW
   proc/          # PCB, scheduler, fork, exec, signal, futex
@@ -147,6 +181,7 @@ src/
   shell/         # in-kernel TTY shell
 tests/           # integration test harness
 tools/           # mkfs helper, symbol scripts
+riscv64-uefi.json  # custom Rust target spec (PE/COFF, RISC-V UEFI)
 ```
 
 ---
