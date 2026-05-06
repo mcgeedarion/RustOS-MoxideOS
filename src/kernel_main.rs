@@ -13,6 +13,13 @@
 use crate::arch::api::{ArchInit, Serial};
 use crate::arch::ArchImpl;
 
+// CRT stub exported from src/crt/crt0.c.
+// Walks __init_array_start..__init_array_end and calls each constructor.
+// This is a no-op when no C/C++ globals with constructors are linked.
+extern "C" {
+    fn run_init_array();
+}
+
 /// Kernel entry point.  Called from `_start` with interrupts disabled.
 ///
 /// # Arguments
@@ -20,6 +27,11 @@ use crate::arch::ArchImpl;
 /// * `fdt_ptr`  — physical address of the Flattened Device Tree blob
 #[no_mangle]
 pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
+    // ── 0. C/C++ global constructors ─────────────────────────────────────
+    // Must run before any C++ objects with non-trivial constructors are used.
+    // Safe to call unconditionally — no-op when .init_array is empty.
+    unsafe { run_init_array(); }
+
     // ── 1. Serial / UART init ────────────────────────────────────────────
     ArchImpl::serial_init();
 
