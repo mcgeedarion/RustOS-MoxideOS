@@ -7,6 +7,7 @@ pub mod exec;
 pub mod exit;
 pub mod fork;
 pub mod fork_syscall;
+pub mod futex;
 pub mod nanosleep;
 pub mod process;
 pub mod scheduler;

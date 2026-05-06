@@ -56,7 +56,6 @@ pub fn procfs_open(path: &str) -> isize {
 /// Releases the TABLE lock before copying into `buf` to avoid blocking
 /// other procfs operations during potentially large memcpy.
 pub fn procfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
-    // Clone only the needed slice under the lock, then copy outside.
     let chunk: Vec<u8> = {
         let tbl = TABLE.lock();
         match tbl.get(&fdno) {
@@ -65,10 +64,10 @@ pub fn procfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
                 if offset >= e.content.len() { return 0; }
                 let avail = &e.content[offset..];
                 let n = avail.len().min(buf.len());
-                avail[..n].to_vec() // clone only the needed bytes
+                avail[..n].to_vec()
             }
         }
-    }; // TABLE lock released here
+    };
     let n = chunk.len();
     buf[..n].copy_from_slice(&chunk);
     n as isize
@@ -81,8 +80,6 @@ pub fn procfs_close(fdno: usize) {
 // ─── Content generators ────────────────────────────────────────────────────────────────────────────
 
 fn generate(path: &str) -> Option<Vec<u8>> {
-    // Normalise /proc/self → /proc/<current_pid>.
-    // Use Cow to avoid allocating when the path already has a numeric PID.
     let pid = crate::proc::scheduler::current_pid();
     let norm: Cow<str> = if path.contains("/proc/self") {
         Cow::Owned(path.replacen("/proc/self", &format!("/proc/{}", pid), 1))
@@ -140,13 +137,11 @@ fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)>
 fn gen_maps(pid: usize) -> String {
     let mut out = String::new();
     crate::mm::mmap::with_vmas(pid as u32, |vma| {
-        let perms = format!(
-            "{}{}{p}",
-            if vma.prot & 1 != 0 { 'r' } else { '-' },
-            if vma.prot & 2 != 0 { 'w' } else { '-' },
-            if vma.prot & 4 != 0 { 'x' } else { '-' },
-            p = if vma.flags & 1 != 0 { 's' } else { 'p' },
-        );
+        let r = if vma.prot & 1 != 0 { 'r' } else { '-' };
+        let w = if vma.prot & 2 != 0 { 'w' } else { '-' };
+        let x = if vma.prot & 4 != 0 { 'x' } else { '-' };
+        let s = if vma.flags & 1 != 0 { 's' } else { 'p' };
+        let perms = format!("{}{}{}{}", r, w, x, s);
         out.push_str(&format!(
             "{:016x}-{:016x} {} {:08x} 00:00 0\n",
             vma.start, vma.end, perms, vma.file_offset,

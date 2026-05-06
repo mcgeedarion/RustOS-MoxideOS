@@ -1,11 +1,11 @@
-//! P0/P1/P2 syscall gap implementations.
-//!
-//! Included from mod.rs via `include!("p0_gaps.rs")` so the functions
-//! share the same namespace as the rest of the syscall dispatcher.
-//!
-//! This file contains ONLY the permission/attribute stubs that have no
-//! implementation elsewhere.  All stat, time, and openat2 functions were
-//! promoted to mod.rs directly and must NOT be redefined here.
+// P0/P1/P2 syscall gap implementations.
+//
+// Included from mod.rs via `include!("p0_gaps.rs")` so the functions
+// share the same namespace as the rest of the syscall dispatcher.
+//
+// This file contains ONLY the permission/attribute stubs that have no
+// implementation elsewhere.  All stat, time, and openat2 functions were
+// promoted to mod.rs directly and must NOT be redefined here.
 
 // ── P2 permission / attribute stubs ────────────────────────────────────────
 

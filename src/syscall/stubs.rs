@@ -1,9 +1,8 @@
-//! Implementations for syscalls that are either trivial, return constant
-//! data, or are safely no-ops for a single-user root kernel.
-//!
-//! Included from syscall/mod.rs via `include!("stubs.rs")`.
+// Implementations for syscalls that are either trivial, return constant
+// data, or are safely no-ops for a single-user root kernel.
+//
+// Included from syscall/mod.rs via `include!("stubs.rs")`.
 
-extern crate alloc;
 use alloc::string::String;
 use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user};
@@ -37,11 +36,8 @@ fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     if iovcnt > 1024 { return -22; }
     if !crate::uaccess::validate_user_ptr(iov_va, iovcnt * 16) { return -14; }
 
-    // Single heap allocation sized to the largest iov_len in the array,
-    // capped at 64 KiB per scatter element to bound worst-case alloc.
     const IOV_MAX_LEN: usize = 64 * 1024;
 
-    // Scan the iovec array once to find the max len, then allocate once.
     let mut max_len: usize = 0;
     for i in 0..iovcnt {
         let mut iov_buf = [0u8; 16];
@@ -51,7 +47,6 @@ fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     }
     let max_len = max_len.min(IOV_MAX_LEN);
 
-    // Use a stack array for small iovecs, heap Vec for large ones.
     let mut stack_buf = [0u8; IOV_STACK_BUF];
     let mut heap_buf: alloc::vec::Vec<u8> = if max_len > IOV_STACK_BUF {
         alloc::vec![0u8; max_len]
@@ -437,7 +432,6 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
 // ── NR 131  sigaltstack ───────────────────────────────────────────────────────────
 
 use spin::Mutex as SpinMutex;
-extern crate alloc;
 use alloc::collections::BTreeMap;
 
 static ALTSTACK: SpinMutex<BTreeMap<usize, [u8; 24]>> = SpinMutex::new(BTreeMap::new());

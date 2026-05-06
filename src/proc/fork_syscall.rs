@@ -2,7 +2,6 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::arch::x86_64::syscall::sysret_trampoline;
 use crate::mm::kstack::alloc_kstack;
 use crate::proc::context::Context;
 use crate::proc::cow_fault::clone_for_fork;
@@ -10,6 +9,14 @@ use crate::proc::fork::SignalHandlers;
 use crate::proc::process::{Pcb, State};
 use crate::proc::scheduler;
 use crate::security::CapSet;
+
+// arch-specific sysret trampoline — only meaningful on x86_64
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::syscall::sysret_trampoline;
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
+fn sysret_trampoline() {}
 
 /// sys_fork() -> child_pid (parent) / 0 (child)  [NR 57]
 pub fn sys_fork() -> isize {

@@ -14,7 +14,6 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use crate::arch::x86_64::syscall::sysret_trampoline;
 use crate::mm::kstack::alloc_kstack;
 use crate::proc::context::Context;
 use crate::proc::process::{Pcb, State};
@@ -22,6 +21,14 @@ use crate::proc::scheduler;
 use crate::proc::thread;
 use crate::security::CapSet;
 use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
+
+// arch-specific sysret trampoline — only meaningful on x86_64
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::syscall::sysret_trampoline;
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)]
+fn sysret_trampoline() {}
 
 // ── CLONE_* flag bits (x86-64 Linux ABI) ─────────────────────────────────
 
@@ -89,8 +96,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let child_pid  = scheduler::next_pid();
     let child_tgid = if is_vm_clone { parent_tgid } else { child_pid };
 
-    // Single lock acquisition: fetch cr3, pc, and ppid (CLONE_PARENT branch)
-    // all at once instead of the previous 3 separate with_procs calls.
     let (child_cr3, parent_rip, parent_ppid) = scheduler::with_proc(parent_pid, |p| {
         (p.user_satp, p.pc, p.ppid)
     }).unwrap_or((0, 0, 1));
@@ -121,8 +126,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
     }
 
-    // Clone parent PCB as the base for the child, then override child fields.
-    // with_proc snapshot avoids holding the lock during kstack alloc above.
     let mut child_pcb: Pcb = scheduler::with_proc(parent_pid, |p| p.clone())
         .unwrap_or_else(make_blank_pcb);
     child_pcb.pid        = child_pid;

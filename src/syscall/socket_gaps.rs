@@ -1,4 +1,4 @@
-//! openat2 RESOLVE_* enforcement + VMA-aware sys_mincore.
+// openat2 RESOLVE_* enforcement + VMA-aware sys_mincore.
 
 const RESOLVE_NO_XDEV:       u64 = 0x01;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -11,7 +11,6 @@ const OPENAT2_STRUCT_SIZE:   usize = 24;
 
 fn sys_openat2_impl(dirfd: i32, path_va: usize, how_va: usize, size: usize) -> isize {
     if size < OPENAT2_STRUCT_SIZE { return -22; }
-    // Copy open_how from user into a kernel buffer — no raw dereference.
     let mut how_buf = [0u8; 24];
     if crate::uaccess::copy_from_user(&mut how_buf, how_va).is_err() { return -14; }
     let flags   = u64::from_le_bytes(how_buf[0..8].try_into().unwrap());
@@ -19,7 +18,7 @@ fn sys_openat2_impl(dirfd: i32, path_va: usize, how_va: usize, size: usize) -> i
     let resolve = u64::from_le_bytes(how_buf[16..24].try_into().unwrap());
 
     if resolve & !RESOLVE_ALL_KNOWN != 0 { return -22; }
-    if resolve & RESOLVE_CACHED != 0     { return -11; } // EAGAIN
+    if resolve & RESOLVE_CACHED != 0     { return -11; }
 
     let path = read_cstr_safe(path_va);
     if path.is_empty() { return -2; }
