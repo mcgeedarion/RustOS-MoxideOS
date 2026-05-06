@@ -25,6 +25,13 @@ jobs:
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
 
+      # build.rs compiles src/crt/crt0.c via the cc crate using clang.
+      # clang is required for --target=x86_64-unknown-none cross-compilation.
+      - name: Install clang
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends clang
+
       - name: Cache cargo registry + build
         uses: actions/cache@v4
         with:
@@ -60,6 +67,13 @@ jobs:
         with:
           components: rust-src
           targets: riscv64gc-unknown-none-elf
+
+      # build.rs compiles src/crt/crt0.c via the cc crate using clang.
+      # clang is required for --target=riscv64-unknown-none-elf cross-compilation.
+      - name: Install clang
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends clang
 
       - name: Cache cargo registry + build
         uses: actions/cache@v4

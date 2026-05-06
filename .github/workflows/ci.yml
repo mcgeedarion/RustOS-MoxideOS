@@ -16,28 +16,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────
+      # ── Checkout ──────────────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # ── Rust toolchain (nightly + bare-metal target) ────────────────────
+      # ── Rust toolchain (nightly + bare-metal target) ──────────────────
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
         with:
           targets: x86_64-unknown-none
           components: rust-src, llvm-tools-preview
 
-      # ── Cargo cache ─────────────────────────────────────────────────────
+      # ── Cargo cache ─────────────────────────────────────────────────
       - uses: Swatinem/rust-cache@v2
 
-      # ── System deps (QEMU + GRUB ISO tools + musl) ──────────────────────
+      # ── System deps (QEMU + GRUB ISO tools + musl + clang) ─────────────
+      # clang is required by build.rs to cross-compile src/crt/crt0.c
+      # via the cc crate for the x86_64-unknown-none target.
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 grub-pc-bin grub-common xorriso mtools \
-            musl-tools
+            musl-tools clang
 
-      # ── Build kernel (default features = no Wayland) ─────────────────────
+      # ── Build kernel (default features = no Wayland) ──────────────────
       - name: Build kernel (release)
         run: |
           cargo build \
@@ -46,7 +48,7 @@ jobs:
             2>&1 | tee build.log
           if grep -q '^error' build.log; then exit 1; fi
 
-      # ── Build with wayland feature (compile-only, no QEMU) ───────────────
+      # ── Build with wayland feature (compile-only, no QEMU) ────────────
       - name: Build kernel with wayland feature
         run: |
           cargo build \
@@ -56,42 +58,30 @@ jobs:
             2>&1 | tee build-wayland.log
           if grep -q '^error' build-wayland.log; then exit 1; fi
 
-      # ── Build pthread test binary (static musl) ──────────────────────────
+      # ── Build pthread test binary (static musl) ─────────────────────
       - name: Build pthread test binary
         run: |
           musl-gcc -static -O0 -o tests/pthread_test \
             tests/pthread_test.c -lpthread
           file tests/pthread_test
 
-      # ── Pack initrd with test binary ─────────────────────────────────────
-      # Creates a minimal cpio newc initrd:
-      #   /init  → a tiny shell script that runs the test binary and
-      #            writes the result to the serial console, then halts.
-      # The kernel must already have a working VFS + exec path; if init
-      # fails to exec, the serial output will be missing the sentinel and
-      # CI will fail with a clear log.
+      # ── Pack initrd with test binary ───────────────────────────────
       - name: Pack initrd
         run: |
           mkdir -p initrd_root/bin
           cp tests/pthread_test initrd_root/bin/pthread_test
 
-          # Minimal /init: exec the test, then trigger QEMU shutdown via
-          # the debug exit port (0xf4) so the VM exits cleanly.
           cat > initrd_root/init << 'INIT_EOF'
           #!/bin/sh
           /bin/pthread_test
-          # Signal QEMU to exit: write 0x00 to isa-debug-exit port 0xf4
-          # Exit code = (val << 1) | 1; writing 0 → qemu exits with code 1
-          # which is fine — CI checks the log, not the exit code.
           busybox poweroff -f 2>/dev/null || echo "halt"
           INIT_EOF
           chmod +x initrd_root/init
 
-          # Build the cpio archive
           (cd initrd_root && find . | cpio --quiet -H newc -o) > initrd.img
           ls -lh initrd.img
 
-      # ── Assemble bootable ISO ────────────────────────────────────────────
+      # ── Assemble bootable ISO ──────────────────────────────────────
       - name: Assemble ISO
         run: |
           mkdir -p iso/boot/grub
@@ -106,7 +96,7 @@ jobs:
           EOF
           grub-mkrescue -o rustos.iso iso/ 2>&1
 
-      # ── QEMU smoke test (boot sentinel) ─────────────────────────────────
+      # ── QEMU smoke test (boot sentinel) ───────────────────────────
       - name: QEMU boot smoke test
         timeout-minutes: 2
         run: |
@@ -125,10 +115,7 @@ jobs:
             exit 1
           fi
 
-      # ── QEMU pthread test (userspace sentinel) ───────────────────────────
-      # Boots with the initrd; the kernel must exec /init which runs
-      # pthread_test and prints "PTHREAD_TEST PASS" to serial (stdout).
-      # Timeout is 30s to allow for slower CI runners.
+      # ── QEMU pthread test (userspace sentinel) ─────────────────────
       - name: QEMU pthread test
         timeout-minutes: 2
         run: |
@@ -150,7 +137,7 @@ jobs:
             exit 1
           fi
 
-      # ── Upload artefacts on failure ──────────────────────────────────────
+      # ── Upload artefacts on failure ───────────────────────────────
       - name: Upload logs and test binary
         if: failure()
         uses: actions/upload-artifact@v4
