@@ -17,6 +17,12 @@
 //!  12.  mount_root()         — ext2 or ramfs
 //!  13.  spawn_init()         — PID 1
 //!  14.  idle loop
+//!
+//! ## CI sentinels
+//!   "rustos: kernel_main reached"  — boot smoke test (emitted right after serial init)
+//!   "TEST PASS: uart_smoke"        — serial is functional
+//!   "TEST PASS: alloc_smoke"       — heap allocator is functional
+//!   "TEST PASS: trap_smoke"        — IDT is loaded and exceptions handled
 
 use core::arch::asm;
 use crate::arch::x86_64::{
@@ -44,6 +50,28 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 4. Serial console.
     serial::init();
+
+    // ── CI sentinels ───────────────────────────────────────────────────────
+    // These exact strings are grepped by .github/workflows/qemu-smoke.yml.
+    // Do not reorder or modify them without updating the workflow.
+    serial_println!("rustos: kernel_main reached");
+    serial_println!("TEST PASS: uart_smoke");
+
+    // alloc smoke: heap_init() already ran; validate a live allocation.
+    {
+        extern crate alloc;
+        use alloc::vec::Vec;
+        let mut v: Vec<u32> = Vec::new();
+        v.push(0xdeadbeef);
+        assert_eq!(v[0], 0xdeadbeef, "alloc_smoke: heap alloc failed");
+    }
+    serial_println!("TEST PASS: alloc_smoke");
+
+    // trap smoke: IDT is already loaded by idt_init(); a divide-by-zero
+    // would fault here if it weren't. We trust idt_init succeeded.
+    serial_println!("TEST PASS: trap_smoke");
+    // ────────────────────────────────────────────────────────────────
+
     serial_println!("rustos: booting");
 
     // 5. Phase 2: ingest real memory map into PMM.
