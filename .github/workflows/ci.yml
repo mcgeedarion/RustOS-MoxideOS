@@ -85,7 +85,7 @@ jobs:
       - name: Assemble ISO
         run: |
           mkdir -p iso/boot/grub
-          cp target/x86_64-unknown-none/release/librustos.a iso/boot/kernel.elf
+          cp target/x86_64-unknown-none/release/rustos iso/boot/kernel.elf
           cat > iso/boot/grub/grub.cfg <<'EOF'
           set timeout=0
           set default=0
