@@ -1,15 +1,25 @@
 pub mod devfs;
 pub mod elf;
 pub mod ext2;
+pub mod fanotify;
 pub mod fat32;
 pub mod fcntl;
+pub mod getdents;
 pub mod initramfs;
+pub mod inotify;
 pub mod io_syscalls;
+pub mod ioctl;
 pub mod mount;
 pub mod pidfd;
+pub mod pipe;
+pub mod poll;
 pub mod procfs;
 pub mod ramfs;
+pub mod signalfd;
 pub mod stat_syscalls;
 pub mod sysfs;
+pub mod timerfd;
 pub mod vfs;
 pub mod vfs_ops;
+
+pub mod eventfd;

@@ -1,23 +1,29 @@
 //! Core file I/O syscalls: read, write, open, close, pread64, writev, dup2.
 //!
 //! ## Dispatch order for sys_open
-//!   1. /dev/…      → devfs::try_open
-//!   2. /proc/…     → procfs::procfs_open   (synthetic fd in 0x6000_0000 range)
-//!   3. /sys/…      → sysfs::sysfs_open     (synthetic fd in 0x7000_0000 range)
-//!   4. everything  → vfs::open (ext2 / ramfs / etc.)
+//!   1. /dev/…       → devfs::try_open
+//!   2. /proc/…      → procfs::procfs_open   (0x6000_0000 range)
+//!   3. /sys/…       → sysfs::sysfs_open     (0x7000_0000 range)
+//!   4. everything   → vfs::open (ext2 / ramfs / …)
 //!
 //! ## Dispatch order for sys_read
-//!   stdin(0)       → tty
-//!   devfs fd       → devfs::read
-//!   procfs fd      → procfs::procfs_read   (offset tracked externally via seek table)
-//!   sysfs fd       → sysfs::sysfs_read
-//!   default        → vfs::read
+//!   stdin(0)        → tty
+//!   devfs fd        → devfs::read
+//!   procfs fd       → procfs::procfs_read
+//!   sysfs fd        → sysfs::sysfs_read
+//!   inotify fd      → inotify::inotify_read
+//!   fanotify fd     → fanotify::fanotify_read
+//!   default         → vfs::read
+//!
+//! ## Dispatch order for sys_write
+//!   stdout/stderr   → tty
+//!   devfs fd        → devfs::write
+//!   fanotify fd     → fanotify::fanotify_write  (permission responses)
+//!   default         → vfs::write
 //!
 //! ## Dispatch order for sys_close
-//!   devfs fd       → devfs::close
-//!   procfs fd      → procfs::procfs_close
-//!   sysfs fd       → sysfs::sysfs_close
-//!   default        → vfs::close
+//!   devfs / procfs / sysfs / inotify / fanotify → respective close fn
+//!   default → vfs::close
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -26,8 +32,6 @@ use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
 // ─── Seek-offset table for procfs / sysfs synthetic fds ─────────────────────
-// procfs_read / sysfs_read are stateless (offset passed in), so we maintain
-// a per-fd offset here exactly as ext2 does for regular files.
 
 use spin::Mutex;
 static SYNTH_OFFSET: Mutex<alloc::collections::BTreeMap<usize, usize>> =
@@ -66,6 +70,10 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
         let off = synth_offset_get(fd);
         n = crate::fs::sysfs::sysfs_read(fd, &mut kbuf, off);
         if n > 0 { synth_offset_advance(fd, n as usize); }
+    } else if crate::fs::inotify::is_inotify_fd(fd) {
+        n = crate::fs::inotify::inotify_read(fd, &mut kbuf);
+    } else if crate::fs::fanotify::is_fanotify_fd(fd) {
+        n = crate::fs::fanotify::fanotify_read(fd, &mut kbuf);
     } else {
         n = vfs::read(fd, &mut kbuf);
     }
@@ -87,6 +95,9 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::devfs::get_dev_fd(fd).is_some() {
         return crate::fs::devfs::write(fd, &kbuf);
+    }
+    if crate::fs::fanotify::is_fanotify_fd(fd) {
+        return crate::fs::fanotify::fanotify_write(fd, &kbuf);
     }
     vfs::write(fd, &kbuf)
 }
@@ -145,6 +156,16 @@ pub fn sys_close(fd: usize) -> isize {
         crate::fs::fcntl::close_fd_meta(fd);
         return 0;
     }
+    if crate::fs::inotify::is_inotify_fd(fd) {
+        crate::fs::inotify::inotify_close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
+        return 0;
+    }
+    if crate::fs::fanotify::is_fanotify_fd(fd) {
+        crate::fs::fanotify::fanotify_close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
+        return 0;
+    }
     crate::fs::fcntl::close_fd_meta(fd);
     vfs::close(fd)
 }
@@ -156,7 +177,6 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
     if count == 0 { return 0; }
     if !validate_user_ptr(buf_va, count) { return -14; }
 
-    // pread on procfs/sysfs fds: pass offset directly, don't touch SYNTH_OFFSET.
     if crate::fs::procfs::is_procfs_fd(fd) {
         let mut kbuf = alloc::vec![0u8; count];
         let n = crate::fs::procfs::procfs_read(fd, &mut kbuf, offset as usize);
@@ -206,8 +226,6 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
 // ─── sys_dup2 ────────────────────────────────────────────────────────────────
 
 /// sys_dup2(oldfd, newfd)  [NR 33]
-/// Delegates to fcntl::sys_dup2 so that the cloexec flag is propagated
-/// correctly — the old direct vfs::dup_as call bypassed that entirely.
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
     crate::fs::fcntl::sys_dup2(oldfd, newfd)
 }
