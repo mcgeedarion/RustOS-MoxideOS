@@ -1,10 +1,52 @@
 //! Core file I/O syscalls: read, write, open, close, pread64, writev, dup2.
+//!
+//! ## Dispatch order for sys_open
+//!   1. /dev/…      → devfs::try_open
+//!   2. /proc/…     → procfs::procfs_open   (synthetic fd in 0x6000_0000 range)
+//!   3. /sys/…      → sysfs::sysfs_open     (synthetic fd in 0x7000_0000 range)
+//!   4. everything  → vfs::open (ext2 / ramfs / etc.)
+//!
+//! ## Dispatch order for sys_read
+//!   stdin(0)       → tty
+//!   devfs fd       → devfs::read
+//!   procfs fd      → procfs::procfs_read   (offset tracked externally via seek table)
+//!   sysfs fd       → sysfs::sysfs_read
+//!   default        → vfs::read
+//!
+//! ## Dispatch order for sys_close
+//!   devfs fd       → devfs::close
+//!   procfs fd      → procfs::procfs_close
+//!   sysfs fd       → sysfs::sysfs_close
+//!   default        → vfs::close
 
 extern crate alloc;
 use alloc::vec::Vec;
 use crate::fs::vfs;
 use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
+
+// ─── Seek-offset table for procfs / sysfs synthetic fds ─────────────────────
+// procfs_read / sysfs_read are stateless (offset passed in), so we maintain
+// a per-fd offset here exactly as ext2 does for regular files.
+
+use spin::Mutex;
+static SYNTH_OFFSET: Mutex<alloc::collections::BTreeMap<usize, usize>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+
+fn synth_offset_get(fd: usize) -> usize {
+    *SYNTH_OFFSET.lock().get(&fd).unwrap_or(&0)
+}
+fn synth_offset_advance(fd: usize, n: usize) {
+    *SYNTH_OFFSET.lock().entry(fd).or_insert(0) += n;
+}
+fn synth_offset_reset(fd: usize, v: usize) {
+    SYNTH_OFFSET.lock().insert(fd, v);
+}
+fn synth_offset_remove(fd: usize) {
+    SYNTH_OFFSET.lock().remove(&fd);
+}
+
+// ─── sys_read ────────────────────────────────────────────────────────────────
 
 /// sys_read(fd, buf_va, count)  [NR 0]
 pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
@@ -16,6 +58,14 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
         n = crate::shell::tty::read_line(&mut kbuf);
     } else if crate::fs::devfs::get_dev_fd(fd).is_some() {
         n = crate::fs::devfs::read(fd, &mut kbuf);
+    } else if crate::fs::procfs::is_procfs_fd(fd) {
+        let off = synth_offset_get(fd);
+        n = crate::fs::procfs::procfs_read(fd, &mut kbuf, off);
+        if n > 0 { synth_offset_advance(fd, n as usize); }
+    } else if crate::fs::sysfs::is_sysfs_fd(fd) {
+        let off = synth_offset_get(fd);
+        n = crate::fs::sysfs::sysfs_read(fd, &mut kbuf, off);
+        if n > 0 { synth_offset_advance(fd, n as usize); }
     } else {
         n = vfs::read(fd, &mut kbuf);
     }
@@ -23,6 +73,8 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
     n
 }
+
+// ─── sys_write ───────────────────────────────────────────────────────────────
 
 /// sys_write(fd, buf_va, count)  [NR 1]
 pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
@@ -39,24 +91,57 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     vfs::write(fd, &kbuf)
 }
 
+// ─── sys_open ────────────────────────────────────────────────────────────────
+
 /// sys_open(path_va, flags, mode)  [NR 2]
 pub fn sys_open(path_va: usize, flags: u32, _mode: u32) -> isize {
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+
+    // 1. /dev/
     if path.starts_with("/dev/") {
         if let Some(fd) = crate::fs::devfs::try_open(&path, flags) {
             return fd as isize;
         }
     }
+
+    // 2. /proc/
+    if path.starts_with("/proc/") || path == "/proc" {
+        let fd = crate::fs::procfs::procfs_open(&path);
+        if fd >= 0 { synth_offset_reset(fd as usize, 0); }
+        return fd;
+    }
+
+    // 3. /sys/
+    if path.starts_with("/sys/") || path == "/sys" {
+        let fd = crate::fs::sysfs::sysfs_open(&path);
+        if fd >= 0 { synth_offset_reset(fd as usize, 0); }
+        return fd;
+    }
+
+    // 4. real VFS (ext2, ramfs, …)
     match vfs::open(&path, flags) {
         Ok(fd)  => fd as isize,
         Err(e)  => e as isize,
     }
 }
 
+// ─── sys_close ───────────────────────────────────────────────────────────────
+
 /// sys_close(fd)  [NR 3]
 pub fn sys_close(fd: usize) -> isize {
+    synth_offset_remove(fd);
     if crate::fs::devfs::get_dev_fd(fd).is_some() {
         crate::fs::devfs::close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
+        return 0;
+    }
+    if crate::fs::procfs::is_procfs_fd(fd) {
+        crate::fs::procfs::procfs_close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
+        return 0;
+    }
+    if crate::fs::sysfs::is_sysfs_fd(fd) {
+        crate::fs::sysfs::sysfs_close(fd);
         crate::fs::fcntl::close_fd_meta(fd);
         return 0;
     }
@@ -64,10 +149,29 @@ pub fn sys_close(fd: usize) -> isize {
     vfs::close(fd)
 }
 
+// ─── sys_pread64 ─────────────────────────────────────────────────────────────
+
 /// sys_pread64(fd, buf_va, count, offset)  [NR 17]
 pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
     if !validate_user_ptr(buf_va, count) { return -14; }
+
+    // pread on procfs/sysfs fds: pass offset directly, don't touch SYNTH_OFFSET.
+    if crate::fs::procfs::is_procfs_fd(fd) {
+        let mut kbuf = alloc::vec![0u8; count];
+        let n = crate::fs::procfs::procfs_read(fd, &mut kbuf, offset as usize);
+        if n <= 0 { return n; }
+        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
+        return n;
+    }
+    if crate::fs::sysfs::is_sysfs_fd(fd) {
+        let mut kbuf = alloc::vec![0u8; count];
+        let n = crate::fs::sysfs::sysfs_read(fd, &mut kbuf, offset as usize);
+        if n <= 0 { return n; }
+        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
+        return n;
+    }
+
     let saved = vfs::seek(fd, 0, vfs::SEEK_CUR) as i64;
     vfs::seek(fd, offset, vfs::SEEK_SET);
     let mut kbuf = alloc::vec![0u8; count];
@@ -77,6 +181,8 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
     if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
     n
 }
+
+// ─── sys_writev ──────────────────────────────────────────────────────────────
 
 /// sys_writev(fd, iov_va, iovcnt)  [NR 20]
 pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
@@ -96,6 +202,8 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     }
     total
 }
+
+// ─── sys_dup2 ────────────────────────────────────────────────────────────────
 
 /// sys_dup2(oldfd, newfd)  [NR 33]
 /// Delegates to fcntl::sys_dup2 so that the cloexec flag is propagated
