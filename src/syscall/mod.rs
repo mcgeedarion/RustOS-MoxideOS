@@ -1,11 +1,13 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
-//! ## Wired in this commit
+//! ## Recently wired
+//!   NR 318  getrandom(buf, count, flags)     => stubs::sys_getrandom_impl
 //!   NR 334  close_range(first, last, flags)  => fs::close_range::sys_close_range
 //!
-//! ## Already implemented (noted here for audit)
+//! ## Already implemented (audit notes)
 //!   NR 9    mmap — MAP_FIXED_NOREPLACE (0x100000) handled in mm::mmap::sys_mmap
-//!   /proc/self/exe readlink — procfs::procfs_readlink dispatched from stat_syscalls
+//!   NR 89   readlink  — routes /proc/* through procfs::procfs_readlink
+//!   NR 267  readlinkat — same routing as NR 89
 //!
 //! ## Signal NRs
 //!   NR 127  rt_sigpending   NR 128  rt_sigtimedwait   NR 130  rt_sigsuspend
@@ -114,8 +116,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         294 => crate::fs::fcntl::sys_dup3(a, b, c as i32),
         319 => sys_memfd_create_impl(a, b as u32),
         // NR 334  close_range(first, last, flags)
-        // glibc 2.34+ calls close_range(3, ~0U, 0) unconditionally at startup
-        // to sanitise inherited fds.  Without this the process hits ENOSYS.
+        // glibc 2.34+ calls close_range(3, ~0U, 0) unconditionally at startup.
         334 => match (arg_u32(a), arg_u32(b), arg_u32(c)) {
                    (Some(first), Some(last), Some(flags)) =>
                        crate::fs::close_range::sys_close_range(first, last, flags),
@@ -246,6 +247,15 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         102 | 104 | 107 | 108 => 0,
         105 | 106             => 0,
         109 | 117 | 118 | 119 | 120 => 0,
+        // ── random ────────────────────────────────────────────────────────────
+        // NR 318  getrandom(buf, count, flags)
+        // OpenSSL, libsodium, glibc arc4random all call this at init time.
+        // GRND_RANDOM (0x02) and GRND_NONBLOCK (0x01) flags are accepted but
+        // ignored — we always return immediately with RDRAND/LFSR entropy.
+        318 => match arg_u32(c) {
+                   Some(flags) => sys_getrandom_impl(a, b, flags),
+                   None        => -22,
+               },
         // ── pidfd ─────────────────────────────────────────────────────────────
         424 => crate::fs::pidfd::sys_pidfd_send_signal(a, b as u32, c, d as u32),
         434 => crate::fs::pidfd::sys_pidfd_open(a, b as u32),
@@ -270,6 +280,7 @@ pub fn altstack_clear_pid(pid: usize) {
     crate::proc::signal::altstack_clear_pid(pid);
 }
 
-pub fn proc_name_clear(_pid: usize) {
-    // proc name table lives in stubs.rs for now; no-op until /proc is wired.
+pub fn proc_name_clear(pid: usize) {
+    // Delegate to stubs.rs PROC_NAME table.
+    crate::syscall::proc_name_clear(pid);
 }
