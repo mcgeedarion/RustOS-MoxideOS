@@ -11,6 +11,7 @@ pub mod inotify;
 pub mod io_syscalls;
 pub mod ioctl;
 pub mod mount;
+pub mod overlayfs;
 pub mod pidfd;
 pub mod pipe;
 pub mod poll;
