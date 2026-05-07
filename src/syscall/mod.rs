@@ -1,8 +1,24 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
-//! ## Wired NRs (75 + 30 new = 105 total)
+//! ## Wired NRs (75 + 30 new + 7 inotify/fanotify = 112 total)
 //!
 //! See stubs.rs and p0_gaps.rs for implementations of the gap-fill entries.
+//!
+//! ## inotify / fanotify NR layout
+//!   NR 253  inotify_init       => inotify::sys_inotify_init1(0)
+//!   NR 254  inotify_add_watch  => inotify::sys_inotify_add_watch(fd, path, mask)
+//!   NR 255  inotify_rm_watch   => inotify::sys_inotify_rm_watch(fd, wd)
+//!   NR 292  inotify_init1      => inotify::sys_inotify_init1(flags)   [replaces old stub]
+//!   NR 293  pipe2              => pipe::sys_pipe2  (unchanged)
+//!   NR 294  inotify_init1 dup  => inotify::sys_inotify_init1(flags)   [was dup3; dup3=292 on old kernels]
+//!           NOTE: Linux x86-64: NR 294 is dup3, NOT a second inotify_init1.
+//!                 dup3 was previously wired here correctly; inotify_init1 is NR 294 only
+//!                 on i386 (compat). On x86-64, NR 294 stays as dup3.
+//!                 inotify_init1 on x86-64 is NR 292.
+//!   NR 300  fanotify_init      => fanotify::sys_fanotify_init(flags, event_f_flags)
+//!   NR 301  fanotify_mark      => fanotify::sys_fanotify_mark(fd, flags, mask, dirfd, path)
+//!   NR 302  prlimit64          => sys_prlimit64_impl  (Linux x86-64 NR 302 is prlimit64, NOT fanotify)
+//!           NOTE: fanotify syscalls end at NR 301. NR 302 = prlimit64 on x86-64.
 
 #![allow(unused_variables, unused_imports)]
 extern crate alloc;
@@ -89,11 +105,24 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         264 => sys_renameat_impl(a as i32, b, c as i32, d),
         267 => sys_readlinkat_impl(a as i32, b, c, d),
         290 => crate::fs::eventfd::sys_eventfd2(a as u32, b as u32),
-        292 => sys_inotify_init1_impl(a as i32),
         293 => crate::fs::pipe::sys_pipe2(a, b as u32),
         294 => crate::fs::fcntl::sys_dup3(a, b, c as i32),
         319 => sys_memfd_create_impl(a, b as u32),
-        // ── I/O multiplexing ───────────────────────────────────────────────────────────────
+        // ── inotify ─────────────────────────────────────────────────────────────────────
+        // NR 253  inotify_init  (legacy, no flags)
+        253 => crate::fs::inotify::sys_inotify_init1(0),
+        // NR 254  inotify_add_watch(fd, path_va, mask)
+        254 => crate::fs::inotify::sys_inotify_add_watch(a, b, c as u32),
+        // NR 255  inotify_rm_watch(fd, wd)
+        255 => crate::fs::inotify::sys_inotify_rm_watch(a, b as i32),
+        // NR 292  inotify_init1(flags)  — x86-64 canonical NR
+        292 => crate::fs::inotify::sys_inotify_init1(a as u32),
+        // ── fanotify ────────────────────────────────────────────────────────────────────
+        // NR 300  fanotify_init(flags, event_f_flags)
+        300 => crate::fs::fanotify::sys_fanotify_init(a as u32, b as u32),
+        // NR 301  fanotify_mark(fanotify_fd, flags, mask, dirfd, path_va)
+        301 => crate::fs::fanotify::sys_fanotify_mark(a, b as u32, c as u64, d as i32, e),
+        // ── I/O multiplexing ─────────────────────────────────────────────────────────────
         7   => crate::fs::poll::sys_poll(a, b, c as i32),
         23  => crate::fs::poll::sys_select(a, b, c, d, e),
         213 => crate::fs::poll::sys_epoll_create(a as i32),   // epoll_create(size)
