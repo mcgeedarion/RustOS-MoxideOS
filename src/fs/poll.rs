@@ -193,6 +193,9 @@ fn write_fdset(va: usize, src: &[u64]) {
 // We read the sigset through one extra pointer dereference, then atomically
 // swap the current thread's signal mask before entering the poll loop,
 // restoring it on exit.
+//
+// set_sigmask(pid, mask) takes TWO arguments (pid + mask), so we resolve
+// the current pid here rather than in each call site.
 
 /// pselect6 6th-argument struct: { *sigset_t, size_t } (16 bytes on x86-64)
 #[repr(C)]
@@ -217,15 +220,18 @@ fn pselect_swap_sigmask(ss_va: usize) -> Option<u64> {
     let mut mask_buf = [0u8; 8];
     if copy_from_user(&mut mask_buf, ss_ptr as usize).is_err() { return None; }
     let new_mask = u64::from_le_bytes(mask_buf);
-    // Swap in the new mask and return the old one.
-    let old = crate::proc::signal::set_sigmask(new_mask);
+    // Resolve the current pid once here so both get and set use the same pid.
+    let pid = crate::proc::scheduler::current_pid();
+    let old  = crate::proc::signal::get_sigmask(pid);
+    crate::proc::signal::set_sigmask(pid, new_mask);
     Some(old)
 }
 
 /// Restore a previously saved signal mask (called after pselect6 poll loop).
 fn pselect_restore_sigmask(old: Option<u64>) {
     if let Some(m) = old {
-        crate::proc::signal::set_sigmask(m);
+        let pid = crate::proc::scheduler::current_pid();
+        crate::proc::signal::set_sigmask(pid, m);
     }
 }
 
