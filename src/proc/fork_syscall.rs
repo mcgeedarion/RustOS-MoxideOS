@@ -10,7 +10,6 @@ use crate::proc::process::{Pcb, State};
 use crate::proc::scheduler;
 use crate::security::CapSet;
 
-// arch-specific sysret trampoline — only meaningful on x86_64
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::syscall::sysret_trampoline;
 
@@ -23,7 +22,7 @@ pub fn sys_fork() -> isize {
     let parent_pid = scheduler::current_pid();
 
     let (parent_cr3, parent_pc, parent_sp, parent_caps, parent_sig, parent_vmas,
-         parent_next_va, parent_brk) =
+         parent_next_va, parent_brk, parent_exe) =
         scheduler::with_proc(parent_pid, |p| (
             p.user_satp,
             p.pc,
@@ -33,6 +32,7 @@ pub fn sys_fork() -> isize {
             p.vmas.clone(),
             p.next_va,
             p.brk,
+            p.exe_path.clone(),
         )).unwrap_or((
             0, 0, 0,
             CapSet::empty(),
@@ -40,6 +40,7 @@ pub fn sys_fork() -> isize {
             Vec::new(),
             Pcb::INITIAL_NEXT_VA,
             Pcb::INITIAL_BRK,
+            None,
         ));
 
     if parent_cr3 == 0 { return -1; }
@@ -49,7 +50,14 @@ pub fn sys_fork() -> isize {
 
     let kstack_top = match alloc_kstack() {
         Some(k) => k,
-        None    => return -12,
+        None => {
+            // Free the child page table that clone_for_fork already allocated
+            // to prevent a permanent physical memory leak on OOM.
+            if child_cr3 != 0 {
+                unsafe { crate::proc::exec::free_child_address_space(child_cr3); }
+            }
+            return -12;
+        }
     };
 
     push_syscall_frame(kstack_top, parent_pc, 0x202, parent_sp);
@@ -80,6 +88,7 @@ pub fn sys_fork() -> isize {
         exit_signal:        17,
         vfork_parent:       0,
         signal_handlers:    parent_sig,
+        exe_path:           parent_exe,
     };
 
     scheduler::enqueue(child_pcb);

@@ -59,6 +59,17 @@ const MAX_CSTR_ARRAY: usize = 1024;
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
+
+/// Public wrapper used by fork_syscall to free a child CR3 on OOM.
+/// Safety: `cr3` must be a valid page-table root that was fully initialised
+/// by `clone_for_fork` and is not currently loaded in any CPU.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn free_child_address_space(cr3: usize) {
+    unsafe { free_old_address_space(cr3); }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn free_child_address_space(_cr3: usize) {}
     let pml4 = cr3 as *const u64;
     for pml4i in 0..256usize {
         let pml4e = *pml4.add(pml4i);
@@ -108,7 +119,8 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         Ok(fd) => fd, Err(_) => return false,
     };
     let file_size = vfs::fstat(fd).unwrap_or(0);
-    if file_size == 0 { vfs::close(fd); return false; }
+    const MAX_ELF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    if file_size == 0 || file_size > MAX_ELF_SIZE { vfs::close(fd); return false; }
     let mut data_buf = alloc::vec![0u8; file_size];
     let n = vfs::pread(fd, data_buf.as_mut_ptr(), data_buf.len(), 0);
     vfs::close(fd);
@@ -217,8 +229,8 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
                   frame: &mut SyscallFrame) -> isize
 {
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    let argv = collect_cstr_array(argv_va);
-    let envp = collect_cstr_array(envp_va);
+    let argv = match collect_cstr_array(argv_va) { Ok(v) => v, Err(e) => return e as isize };
+    let envp = match collect_cstr_array(envp_va) { Ok(v) => v, Err(e) => return e as isize };
     match do_execve(&path, &argv, &envp, frame) {
         Ok(_) => 0, Err(e) => e as isize,
     }
@@ -234,7 +246,13 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
 
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|e| e)?;
     let file_size = vfs::fstat(fd).unwrap_or(0);
-    let mut data_buf = alloc::vec![0u8; file_size.max(1)];
+    // Reject oversized files before heap allocation to prevent single-syscall OOM.
+    const MAX_ELF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    if file_size == 0 || file_size > MAX_ELF_SIZE {
+        vfs::close(fd);
+        return Err(-8); // ENOEXEC
+    }
+    let mut data_buf = alloc::vec![0u8; file_size];
     let n = vfs::pread(fd, data_buf.as_mut_ptr(), data_buf.len(), 0);
     vfs::close(fd);
     if n <= 0 { return Err(-8); }
@@ -279,6 +297,9 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         unsafe { free_old_address_space(old_cr3); }
     }
     <Arch as Paging>::load_cr3(new_cr3);
+    // Flush stale TLB entries from the old address space before writing
+    // argv/envp/auxv directly to user VAs in build_initial_stack.
+    <Arch as Paging>::flush_all();
 
     let initial_rsp = build_initial_stack(
         STACK_TOP, argv, envp,
@@ -345,8 +366,13 @@ fn build_initial_stack(
         string_buf.extend_from_slice(s.as_bytes());
         string_buf.push(0);
     }
+    // Write 16 random bytes for AT_RANDOM — must be unique per exec, never zero.
+    // glibc uses these to seed stack canaries and __pointer_chaining_key.
     let random_offset = string_buf.len();
-    string_buf.extend_from_slice(&[0u8; 16]);
+    let rand_a = crate::rand::next_u64().to_le_bytes();
+    let rand_b = crate::rand::next_u64().to_le_bytes();
+    string_buf.extend_from_slice(&rand_a);
+    string_buf.extend_from_slice(&rand_b);
 
     let str_total      = (string_buf.len() + 15) & !15;
     let string_va_base = stack_top - str_total;
@@ -418,10 +444,15 @@ pub fn read_cstr_safe(va: usize) -> Option<String> {
 }
 
 /// Read a NUL-pointer-terminated argv/envp array from user VA `array_va`.
-pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
+/// Returns `Err(-7)` (E2BIG) if the array exceeds MAX_CSTR_ARRAY entries,
+/// allowing callers to propagate EFAULT / E2BIG to userspace.
+pub fn collect_cstr_array(array_va: usize) -> Result<Vec<String>, i32> {
     let mut out = Vec::new();
-    if array_va < 0x1000 { return out; }
-    for i in 0..MAX_CSTR_ARRAY {
+    if array_va < 0x1000 { return Ok(out); }
+    for i in 0..=MAX_CSTR_ARRAY {
+        if i == MAX_CSTR_ARRAY {
+            return Err(-7); // E2BIG — array exceeded limit
+        }
         let slot_va = array_va + i * core::mem::size_of::<usize>();
         let mut ptr_bytes = [0u8; 8];
         if copy_from_user(&mut ptr_bytes, slot_va).is_err() { break; }
@@ -429,7 +460,7 @@ pub fn collect_cstr_array(array_va: usize) -> Vec<String> {
         if ptr == 0 { break; }
         if let Some(s) = read_cstr_safe(ptr) { out.push(s); }
     }
-    out
+    Ok(out)
 }
 
 // ── clear_vmas helper (called from do_execve) ──────────────────────────────────────────

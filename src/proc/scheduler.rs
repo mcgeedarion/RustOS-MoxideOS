@@ -41,7 +41,8 @@ pub fn current_ppid() -> usize {
 pub fn next_pid() -> usize {
     let mut s = SCHED.lock();
     let n = s.next_pid;
-    s.next_pid += 1;
+    s.next_pid = s.next_pid.checked_add(1)
+        .expect("PID space exhausted (usize overflow)");
     n
 }
 
@@ -205,6 +206,17 @@ pub fn schedule() {
         (old_ctx, new_ctx, new_cr3)
     };
 
+    // SAFETY / SMP HAZARD:
+    // We extract raw pointers to procs[cur].ctx and procs[nxt].ctx while
+    // holding the lock, then drop the lock before switch_to() writes to
+    // old_ctx.  This is intentional: holding the lock across a context switch
+    // would deadlock the next process when it tries to acquire SCHED.
+    //
+    // On this single-CPU build the lock drop is safe because no other CPU can
+    // concurrently call remove_pid(cur) between the lock release and the
+    // completion of switch_to().  Before adding SMP support, replace this with
+    // a per-CPU "current context" slot that is not guarded by SCHED, so that
+    // switch_to() never races with remove_pid().
     let cur_cr3 = <Arch as Paging>::kernel_cr3();
     if new_cr3 != 0 && new_cr3 != cur_cr3 {
         <Arch as Paging>::load_cr3(new_cr3);

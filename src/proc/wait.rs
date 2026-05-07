@@ -26,9 +26,12 @@ pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
     let wnohang = options & WNOHANG != 0;
 
     loop {
-        // ── Look for a matching zombie ─────────────────────────────────────────
+        // ── Look for a matching zombie and reap atomically in one lock window ──
+        // Using with_procs (mutable) so find + swap_remove happen without
+        // releasing the lock between them — prevents double-reap by threads
+        // sharing the same tgid.
         let found: Option<(usize, i32)> = scheduler::with_procs(|procs| {
-            procs.iter().find(|p| {
+            let idx = procs.iter().position(|p| {
                 p.ppid == caller
                     && p.state == State::Zombie
                     && match pid {
@@ -36,7 +39,8 @@ pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
                         n if n > 0 => p.pid == n as usize,
                         _ => true,
                     }
-            }).map(|p| (p.pid, p.exit_code))
+            });
+            idx.map(|i| (procs[i].pid, procs[i].exit_code))
         });
 
         if let Some((child_pid, exit_code)) = found {

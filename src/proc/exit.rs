@@ -118,7 +118,19 @@ pub fn sys_exit_group(status: i32) -> isize {
         // Wake the sibling's vfork parent if it is waiting.
         let vfork_parent = zombify(sibling, status);
         if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
-        wait::notify_exit(sibling);
+        // Do NOT call notify_exit per-sibling — that would send one SIGCHLD
+        // per thread to the parent, causing spurious wakeups and extra waitpid
+        // calls. We send a single SIGCHLD below after all siblings are done.
+    }
+
+    // One SIGCHLD to the parent after all sibling threads are zombified.
+    // notify_exit on the calling thread (do_exit below) will send the real one.
+    {
+        let (ppid, exit_signal) = scheduler::with_proc(
+            scheduler::current_pid(), |p| (p.ppid, p.exit_signal)
+        ).unwrap_or((0, 17));
+        if ppid != 0 { scheduler::wake_pid(ppid); }
+        let _ = exit_signal; // SIGCHLD sent by do_exit's notify_exit
     }
 
     do_exit(pid, status);
