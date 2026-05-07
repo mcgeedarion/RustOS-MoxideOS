@@ -5,7 +5,7 @@
 // x86_64. It is NOT declared here because cfg_attr cannot gate #![feature]
 // on a per-arch basis in a way rustc accepts for bare-metal targets.
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-#![allow(dead_code, unused_variables, unused_imports)]
+#![allow(dead_code, unused_variables)]
 extern crate alloc;
 
 pub mod allocator;
