@@ -1,10 +1,17 @@
-pub mod arp;
-pub mod dhcp;
-pub mod dns;
-pub mod ethernet;
-pub mod icmp;
-pub mod ipv4;
-pub mod tcp;
-pub mod udp;
+//! Network subsystem.
+//!
+//! Layer hierarchy:
+//!   eth   — Ethernet II framing, ARP
+//!   ip    — IPv4 (fragmentation, routing table)
+//!   icmp  — ICMP echo request/reply + unreachable
+//!   udp   — UDP datagrams
+//!   tcp   — TCP (RFC 793/7323): 3-way handshake, data transfer, FIN/RST teardown
+//!   socket — BSD socket layer (AF_INET SOCK_STREAM / SOCK_DGRAM)
 
-pub use ethernet::MacAddr;
+pub mod eth;
+pub mod arp;
+pub mod ip;
+pub mod icmp;
+pub mod udp;
+pub mod tcp;
+pub mod socket;
