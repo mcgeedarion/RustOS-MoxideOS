@@ -1,5 +1,6 @@
 pub mod devfs;
 pub mod elf;
+pub mod eventfd;
 pub mod ext2;
 pub mod fanotify;
 pub mod fat32;
@@ -15,11 +16,8 @@ pub mod pipe;
 pub mod poll;
 pub mod procfs;
 pub mod ramfs;
-pub mod signalfd;
 pub mod stat_syscalls;
 pub mod sysfs;
-pub mod timerfd;
 pub mod vfs;
 pub mod vfs_ops;
-
-pub mod eventfd;
+pub mod close_range;

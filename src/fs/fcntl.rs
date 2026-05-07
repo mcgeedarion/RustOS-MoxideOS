@@ -55,24 +55,19 @@ pub const O_NONBLOCK: i32 = 2048;
 pub const O_APPEND:   i32 = 1024;
 pub const O_CLOEXEC:  i32 = 524288;
 
-// F_UNLCK value written into the l_type field of struct flock.
 const F_UNLCK: u16 = 2;
 
-/// Per-fd metadata.
-/// owner_pid doubles as the F_SETOWN target AND the fd ownership record
-/// previously held in the now-removed FD_OWNER map.
 #[derive(Clone, Default)]
 struct FdMeta {
     pub cloexec:   bool,
     pub nonblock:  bool,
     pub fl_flags:  i32,
-    pub owner_pid: i32,  // F_SETOWN / fd ownership (0 = unowned)
+    pub owner_pid: i32,
 }
 
-// Single map covers all per-fd metadata. Replaces the old FD_META + FD_OWNER pair.
 static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
 
-// ── cloexec / nonblock / fl_flags ──────────────────────────────────────────────────
+// ── cloexec / nonblock / fl_flags ────────────────────────────────────────────
 pub fn set_cloexec(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().cloexec = val;
 }
@@ -85,13 +80,12 @@ pub fn get_fl(fd: usize) -> i32 {
 pub fn set_fl(fd: usize, flags: i32) {
     FD_META.lock().entry(fd).or_default().fl_flags = flags;
 }
-/// Remove all metadata for `fd`. Call on close.
+/// Remove all metadata for `fd`. Called on close and by close_range.
 pub fn close_fd_meta(fd: usize) {
     FD_META.lock().remove(&fd);
 }
 
-// ── fd ownership (used by pidfd_getfd) ───────────────────────────────────────────
-// owner_pid is stored in FdMeta; no separate FD_OWNER map.
+// ── fd ownership ─────────────────────────────────────────────────────────────
 pub fn set_fd_owner(fd: usize, pid: usize) {
     FD_META.lock().entry(fd).or_default().owner_pid = pid as i32;
 }
@@ -104,13 +98,10 @@ pub fn clear_fd_owner(fd: usize) {
     }
 }
 
-// ── close_on_exec ─────────────────────────────────────────────────────────────────
+// ── close_on_exec ────────────────────────────────────────────────────────────
 
 /// Close all fds with FD_CLOEXEC set (called from execve).
-/// Collects and removes cloexec entries in a single locked section to avoid
-/// repeated lock acquisitions from calling close_fd_meta per fd.
 pub fn close_on_exec() {
-    // Drain cloexec entries under one lock window.
     let cloexec_fds: Vec<usize> = {
         let mut meta = FD_META.lock();
         let fds: Vec<usize> = meta.iter()
@@ -120,9 +111,19 @@ pub fn close_on_exec() {
         for fd in &fds { meta.remove(fd); }
         fds
     };
-    // Process the closed set outside the lock.
     for fd in cloexec_fds {
         close_fd_no_meta(fd);
+    }
+}
+
+/// Set FD_CLOEXEC on every fd in [lo, hi] that has metadata.
+/// Used by close_range with CLOSE_RANGE_CLOEXEC.
+pub fn cloexec_range(lo: usize, hi: usize) {
+    let mut meta = FD_META.lock();
+    for (fd, m) in meta.iter_mut() {
+        if *fd >= lo && *fd <= hi {
+            m.cloexec = true;
+        }
     }
 }
 
@@ -136,13 +137,13 @@ fn close_fd_no_meta(fd: usize) {
     vfs::close(fd);
 }
 
-/// Close an fd and remove its metadata (used by sys_dup2 and sys_close_fd).
+/// Close an fd and remove its metadata.
 fn sys_close_fd(fd: usize) {
     close_fd_meta(fd);
     close_fd_no_meta(fd);
 }
 
-// ── sys_fcntl ───────────────────────────────────────────────────────────────────
+// ── sys_fcntl ────────────────────────────────────────────────────────────────
 
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     match cmd {
@@ -194,15 +195,13 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     }
 }
 
-// ── dup2 / dup3 ───────────────────────────────────────────────────────────────────
+// ── dup2 / dup3 ──────────────────────────────────────────────────────────────
 
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
     if oldfd == newfd { return oldfd as isize; }
-    // Close newfd (including its metadata) before duplicating.
     sys_close_fd(newfd);
     let r = vfs::dup_as(oldfd, newfd);
     if r >= 0 {
-        // Propagate cloexec flag from source to duplicate.
         let cloexec = is_cloexec(oldfd);
         set_cloexec(newfd, cloexec);
     }
@@ -216,7 +215,7 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     r
 }
 
-// ── nonblock ───────────────────────────────────────────────────────────────────────
+// ── nonblock ─────────────────────────────────────────────────────────────────
 
 pub fn set_nonblock(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().nonblock = val;
