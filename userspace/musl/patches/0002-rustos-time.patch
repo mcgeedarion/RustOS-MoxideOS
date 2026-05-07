@@ -1,0 +1,40 @@
+From: RustOS <kernel@rustos>
+Subject: [PATCH 2/2] time: clock_gettime via RustOS vDSO, fallback to syscall
+
+RustOS exposes a vDSO page (mapped by the kernel at execve, address
+communicated via AT_SYSINFO_EHDR in the aux vector) with two fast-path
+functions:
+
+  __vdso_clock_gettime(clockid_t, struct timespec *) -> int
+  __vdso_gettimeofday(struct timeval *, void *)      -> int
+
+This patch makes musl's clock_gettime resolver prefer the vDSO symbol
+over the raw syscall, matching the Linux fast path.
+
+--- a/src/time/clock_gettime.c
++++ b/src/time/clock_gettime.c
+@@ -1,10 +1,26 @@
++#ifdef __rustos__
++#include <sys/auxv.h>
++typedef int (*vdso_clock_fn)(clockid_t, struct timespec *);
++static vdso_clock_fn __vdso_clock_gettime_ptr;
++
++static void __init_vdso_clock(void) __attribute__((constructor));
++static void __init_vdso_clock(void) {
++	/* AT_SYSINFO_EHDR points to the vDSO ELF; we resolve the symbol
++	 * by walking the ELF hash table — or use the fixed vDSO ABI:
++	 * the first 8 bytes of the vDSO data page are a pointer to
++	 * __vdso_clock_gettime (set by the kernel at vDSO map time). */
++	unsigned long vdso = getauxval(AT_SYSINFO_EHDR);
++	if (vdso) __vdso_clock_gettime_ptr = *(vdso_clock_fn *)(vdso + 0x1000);
++}
++#endif
++
+ int clock_gettime(clockid_t clk, struct timespec *ts)
+ {
++#ifdef __rustos__
++	if (__vdso_clock_gettime_ptr)
++		return __vdso_clock_gettime_ptr(clk, ts);
++#endif
+ 	return syscall(SYS_clock_gettime, clk, ts);
+ }
