@@ -1,4 +1,6 @@
-//! Kernel security / capability subsystem.
+//! Kernel security / capability + seccomp subsystem.
+
+pub mod seccomp;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

@@ -6,7 +6,9 @@ use alloc::vec::Vec;
 use crate::mm::mmap::Vma;
 use crate::proc::context::Context;
 use crate::proc::fork::SignalHandlers;
+use crate::proc::namespace::NsSet;
 use crate::security::CapSet;
+use crate::security::seccomp::FilterChain;
 
 /// Process lifecycle state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -61,6 +63,18 @@ pub struct Pcb {
     /// Set by exec, inherited across fork/clone, used by /proc/<pid>/exe.
     /// None for kernel threads or before the first successful execve.
     pub exe_path: Option<String>,
+
+    // ── Namespace set ────────────────────────────────────────────────────────
+    /// Linux namespace memberships (mount, pid, net, uts, ipc, user, time).
+    /// Inherited from parent on fork; individual types may be unshared via
+    /// unshare(2) / clone(CLONE_NEW*).
+    pub ns: NsSet,
+
+    // ── seccomp filter chain ─────────────────────────────────────────────────
+    /// cBPF filter programs installed by seccomp(2).
+    /// Empty chain = no filtering.  strict = SECCOMP_SET_MODE_STRICT.
+    /// Inherited (copied) into fork/clone children.
+    pub seccomp: FilterChain,
 }
 
 impl Pcb {

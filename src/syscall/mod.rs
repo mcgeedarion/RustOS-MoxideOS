@@ -1,24 +1,17 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
-//! ## Wired NRs (75 + 30 new + 7 inotify/fanotify = 112 total)
+//! ## Wired NRs (112 + 3 = 115 total)
 //!
 //! See stubs.rs and p0_gaps.rs for implementations of the gap-fill entries.
 //!
-//! ## inotify / fanotify NR layout
-//!   NR 253  inotify_init       => inotify::sys_inotify_init1(0)
-//!   NR 254  inotify_add_watch  => inotify::sys_inotify_add_watch(fd, path, mask)
-//!   NR 255  inotify_rm_watch   => inotify::sys_inotify_rm_watch(fd, wd)
-//!   NR 292  inotify_init1      => inotify::sys_inotify_init1(flags)   [replaces old stub]
-//!   NR 293  pipe2              => pipe::sys_pipe2  (unchanged)
-//!   NR 294  inotify_init1 dup  => inotify::sys_inotify_init1(flags)   [was dup3; dup3=292 on old kernels]
-//!           NOTE: Linux x86-64: NR 294 is dup3, NOT a second inotify_init1.
-//!                 dup3 was previously wired here correctly; inotify_init1 is NR 294 only
-//!                 on i386 (compat). On x86-64, NR 294 stays as dup3.
-//!                 inotify_init1 on x86-64 is NR 292.
-//!   NR 300  fanotify_init      => fanotify::sys_fanotify_init(flags, event_f_flags)
-//!   NR 301  fanotify_mark      => fanotify::sys_fanotify_mark(fd, flags, mask, dirfd, path)
-//!   NR 302  prlimit64          => sys_prlimit64_impl  (Linux x86-64 NR 302 is prlimit64, NOT fanotify)
-//!           NOTE: fanotify syscalls end at NR 301. NR 302 = prlimit64 on x86-64.
+//! ## seccomp / namespace NR layout
+//!   NR 272  unshare(flags)           => namespace::sys_unshare
+//!   NR 308  setns(fd, nstype)        => namespace::sys_setns
+//!   NR 317  seccomp(op, flags, args) => seccomp::sys_seccomp
+//!
+//! ## inotify / fanotify NR layout  (previously wired)
+//!   NR 253/254/255/292 inotify_*
+//!   NR 300/301         fanotify_*
 
 #![allow(unused_variables, unused_imports)]
 extern crate alloc;
@@ -33,18 +26,12 @@ include!("stubs.rs");
 const EPOLL_CLOEXEC: u32 = 0x0008_0000;
 
 /// Safely narrow a 64-bit syscall argument to u32.
-/// Returns None (EINVAL) if the high bits are non-zero — prevents silent
-/// truncation where a caller passes e.g. signal=0x1_00000009 and we'd
-/// silently interpret it as signal 9.
 #[inline(always)]
 fn arg_u32(v: usize) -> Option<u32> {
     if v > u32::MAX as usize { None } else { Some(v as u32) }
 }
 
 /// Safely narrow a 64-bit syscall argument to i32.
-/// The argument is expected to arrive as a sign-extended i32 value
-/// (the kernel sign-extends register arguments for i32 params on Linux ABI).
-/// We accept values whose upper 32 bits are either all-zeros or all-ones.
 #[inline(always)]
 fn arg_i32(v: usize) -> Option<i32> {
     let v = v as isize;
@@ -55,10 +42,7 @@ fn arg_i32(v: usize) -> Option<i32> {
     }
 }
 
-/// sys_epoll_create1 wrapper: creates an epoll instance and sets FD_CLOEXEC
-/// on the returned fd when EPOLL_CLOEXEC is present in flags.
-/// Programs using glibc >= 2.9 always pass EPOLL_CLOEXEC; without this the
-/// epoll fd leaks across execve.
+/// sys_epoll_create1 wrapper.
 fn sys_epoll_create1(flags: u32) -> isize {
     let fd = crate::fs::poll::sys_epoll_create(0);
     if fd >= 0 && flags & EPOLL_CLOEXEC != 0 {
@@ -69,6 +53,28 @@ fn sys_epoll_create1(flags: u32) -> isize {
 
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
+
+    // ── seccomp pre-check ────────────────────────────────────────────────────
+    // Evaluate the current process's BPF filter chain before dispatching.
+    // The check itself (NR 317) and the exit family are always allowed through
+    // to avoid a self-deadlock where a filter tries to block seccomp(2).
+    if nr != 317 && nr != 60 && nr != 231 {
+        match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f]) {
+            crate::security::seccomp::SeccompVerdict::Allow  => {}
+            crate::security::seccomp::SeccompVerdict::Errno(e) => return -(e as isize),
+            crate::security::seccomp::SeccompVerdict::Trap  => {
+                // Deliver SIGSYS to the current process.
+                let pid = crate::proc::scheduler::current_pid();
+                crate::proc::signal::send_signal(pid, 31 /* SIGSYS */);
+                return -1;
+            }
+            crate::security::seccomp::SeccompVerdict::Kill  => {
+                crate::proc::exit::sys_exit(-1);
+                return -1; // unreachable
+            }
+        }
+    }
+
     match nr {
         // ── filesystem I/O ───────────────────────────────────────────────────────────────
         0   => crate::fs::io_syscalls::sys_read(a, b, c),
@@ -85,7 +91,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         40  => sys_sendfile_impl(a, b, c, d),
         72  => crate::fs::fcntl::sys_fcntl(a, b as i32, c),
         74  => sys_fsync_impl(a),
-        75  => sys_fsync_impl(a),  // fdatasync ≈ fsync
+        75  => sys_fsync_impl(a),
         76  => sys_truncate_impl(a, b as i64),
         77  => sys_ftruncate_impl(a, b as i64),
         78  => crate::fs::getdents::sys_getdents(a, b, c),
@@ -109,23 +115,24 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         294 => crate::fs::fcntl::sys_dup3(a, b, c as i32),
         319 => sys_memfd_create_impl(a, b as u32),
         // ── inotify ─────────────────────────────────────────────────────────────────────
-        // NR 253  inotify_init  (legacy, no flags)
         253 => crate::fs::inotify::sys_inotify_init1(0),
-        // NR 254  inotify_add_watch(fd, path_va, mask)
         254 => crate::fs::inotify::sys_inotify_add_watch(a, b, c as u32),
-        // NR 255  inotify_rm_watch(fd, wd)
         255 => crate::fs::inotify::sys_inotify_rm_watch(a, b as i32),
-        // NR 292  inotify_init1(flags)  — x86-64 canonical NR
         292 => crate::fs::inotify::sys_inotify_init1(a as u32),
         // ── fanotify ────────────────────────────────────────────────────────────────────
-        // NR 300  fanotify_init(flags, event_f_flags)
         300 => crate::fs::fanotify::sys_fanotify_init(a as u32, b as u32),
-        // NR 301  fanotify_mark(fanotify_fd, flags, mask, dirfd, path_va)
         301 => crate::fs::fanotify::sys_fanotify_mark(a, b as u32, c as u64, d as i32, e),
+        // ── seccomp + namespaces ─────────────────────────────────────────────────────────
+        // NR 272  unshare(flags)
+        272 => crate::proc::namespace::sys_unshare(a),
+        // NR 308  setns(fd, nstype)
+        308 => crate::proc::namespace::sys_setns(a, b as u32),
+        // NR 317  seccomp(operation, flags, args_va)
+        317 => crate::security::seccomp::sys_seccomp(a as u32, b as u32, c),
         // ── I/O multiplexing ─────────────────────────────────────────────────────────────
         7   => crate::fs::poll::sys_poll(a, b, c as i32),
         23  => crate::fs::poll::sys_select(a, b, c, d, e),
-        213 => crate::fs::poll::sys_epoll_create(a as i32),   // epoll_create(size)
+        213 => crate::fs::poll::sys_epoll_create(a as i32),
         232 => crate::fs::poll::sys_epoll_wait(a, b, c as i32, d as i32),
         233 => crate::fs::poll::sys_epoll_ctl(a, b as i32, c as i32, d),
         270 => crate::fs::poll::sys_pselect6(a, b, c, d, e, f),
@@ -157,92 +164,77 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         149 => sys_mlock_impl(a, b),
         150 => sys_munlock_impl(a, b),
         // ── process / signals ───────────────────────────────────────────────────────────────
-        // NR 13 — rt_sigaction(signum, act, old, sigsetsize)
-        // signum must fit in u32 and be a valid signal (1..64).
         13  => match arg_u32(a) {
                    Some(sig) if sig >= 1 && sig <= 64 =>
                        crate::proc::signal::sys_rt_sigaction(sig, b, c, d),
-                   _ => -22, // EINVAL
+                   _ => -22,
                },
-        // NR 14 — rt_sigprocmask(how, set, old, sigsetsize)
-        // `how` is SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2.
         14  => match arg_u32(a) {
                    Some(how) if how <= 2 =>
                        crate::proc::signal::sys_rt_sigprocmask(how, b, c, d),
-                   _ => -22, // EINVAL
+                   _ => -22,
                },
         24  => sys_sched_yield_impl(),
         35  => crate::proc::nanosleep::sys_nanosleep(a, b),
-        39  => crate::proc::scheduler::current_pid() as isize,  // getpid
+        39  => crate::proc::scheduler::current_pid() as isize,
         56  => sys_clone_impl(a, b, c, d, e),
         57  => crate::proc::fork_syscall::sys_fork(),
         58  => sys_vfork_impl(),
         60  => crate::proc::exit::sys_exit(a as i32),
         61  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
-        // NR 62 — kill(pid, sig): sig 0 is valid (existence check); reject >64.
         62  => match arg_u32(b) {
                    Some(sig) if sig <= 64 => sys_kill_impl(a as isize, sig),
-                   _ => -22, // EINVAL
+                   _ => -22,
                },
         63  => sys_uname_impl(a),
         98  => sys_getrusage_impl(a as i32, b),
         99  => sys_sysinfo_impl(a),
-        110 => crate::proc::scheduler::current_ppid() as isize, // getppid
-        // NR 113 — setpgid(pid, pgid): both are plain process IDs; reject if
-        // high bits are set (they'd silently truncate to a different PID).
+        110 => crate::proc::scheduler::current_ppid() as isize,
         113 => match (arg_u32(a), arg_u32(b)) {
-                   (Some(pid), Some(pgid)) => {
-                       let _ = (pid, pgid); // stub — validates args then succeeds
-                       0
-                   }
-                   _ => -22, // EINVAL
+                   (Some(pid), Some(pgid)) => { let _ = (pid, pgid); 0 }
+                   _ => -22,
                },
-        114 => crate::proc::scheduler::current_pid() as isize,  // getpgrp
-        121 => crate::proc::scheduler::current_pid() as isize,  // getpgid(pid) stub
+        114 => crate::proc::scheduler::current_pid() as isize,
+        121 => crate::proc::scheduler::current_pid() as isize,
         131 => sys_sigaltstack_impl(a, b),
         158 => crate::arch::x86_64::syscall::sys_arch_prctl(a as i32, b),
         185 => sys_prctl_impl(a as i32, b, c, d, e),
         186 => crate::proc::thread::sys_gettid(),
         201 => sys_time_impl(a),
-        // NR 202 — futex: op and val are u32 on the ABI.
         202 => match (arg_u32(b), arg_u32(c), arg_u32(f)) {
                    (Some(op), Some(val), Some(val3)) =>
                        sys_futex_impl(a, op, val, d, e, val3),
-                   _ => -22, // EINVAL
+                   _ => -22,
                },
         203 => sys_sched_setaffinity_impl(a, b, c),
         204 => sys_sched_getaffinity_impl(a, b, c),
         218 => crate::arch::x86_64::syscall::sys_set_tid_address(a),
-        // NR 228 — clock_gettime(clockid, timespec*)
         228 => match arg_u32(a) {
                    Some(clk) => crate::proc::nanosleep::sys_clock_gettime(clk, b),
-                   None => -22, // EINVAL
+                   None => -22,
                },
-        // NR 230 — clock_getres(clockid, timespec*)
         230 => match arg_u32(a) {
                    Some(clk) => sys_clock_getres_impl(clk, b),
-                   None => -22, // EINVAL
+                   None => -22,
                },
         231 => crate::proc::exit::sys_exit_group(a as i32),
-        // NR 234 — tgkill(tgid, tid, sig): sig must be valid.
         234 => match arg_u32(c) {
                    Some(sig) if sig <= 64 => sys_tgkill_impl(a, b, sig),
-                   _ => -22, // EINVAL
+                   _ => -22,
                },
-        // NR 247 — waitid(idtype, id, infop, options)
         247 => match (arg_i32(a), arg_i32(b), arg_u32(d)) {
                    (Some(idtype), Some(id), Some(opts)) =>
                        sys_waitid_impl(idtype, id, c, opts),
-                   _ => -22, // EINVAL
+                   _ => -22,
                },
         // ── uid / gid ─────────────────────────────────────────────────────────────────────────
         96  => sys_gettimeofday_impl(a, b),
         97  => sys_getrlimit_impl(a as u32, b),
         160 => sys_setrlimit_impl(a as u32, b),
         302 => sys_prlimit64_impl(a, b as u32, c, d),
-        102 | 104 | 107 | 108 => 0, // get{u,g,eu,eg}id = 0 (root)
-        105 | 106             => 0, // set{u,g}id no-op
-        109 | 117 | 118 | 119 | 120 => 0, // res{u,g}id variants
+        102 | 104 | 107 | 108 => 0,
+        105 | 106             => 0,
+        109 | 117 | 118 | 119 | 120 => 0,
         // ── pidfd ────────────────────────────────────────────────────────────────────────────
         424 => crate::fs::pidfd::sys_pidfd_send_signal(a, b as u32, c, d as u32),
         434 => crate::fs::pidfd::sys_pidfd_open(a, b as u32),

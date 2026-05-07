@@ -9,6 +9,7 @@ pub mod fork;
 pub mod fork_syscall;
 pub mod futex;
 pub mod nanosleep;
+pub mod namespace;
 pub mod process;
 pub mod scheduler;
 pub mod signal;
