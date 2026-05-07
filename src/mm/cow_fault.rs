@@ -6,10 +6,10 @@ use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
 
-// ── clone_for_fork ─────────────────────────────────────────────────────────────────────
+// ── clone_for_fork ──────────────────────────────────────────────────────────
 
-/// Create a CoW copy of the parent’s address space for a fork() child.
-/// Returns the child’s CR3 physical address, or 0 on OOM.
+/// Create a CoW copy of the parent's address space for a fork() child.
+/// Returns the child's CR3 physical address, or 0 on OOM.
 pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) -> usize {
     let child_cr3 = match <Arch as Paging>::clone_address_space(parent_cr3) {
         Some(c) => c,
@@ -23,19 +23,26 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
     child_cr3
 }
 
-// ── handle_cow_fault ───────────────────────────────────────────────────────────────
+// ── handle_cow_fault ────────────────────────────────────────────────────────
 
 /// Handle a write fault that may be a CoW page.
 /// Returns true if resolved; false if genuine access violation.
 ///
-/// # Safety invariant on free_page(old_pa)
-/// `free_page(old_pa)` is called after the new private copy has been mapped.
-/// This is safe only because `clone_address_space` (arch layer) decrements a
-/// per-page refcount and marks pages CoW precisely when the refcount drops to
-/// 1 — meaning that by the time a process faults with COW_BIT set, the arch
-/// layer guarantees `old_pa` is referenced by exactly this one PTE.
-/// If the arch layer ever changes to shared-page semantics (refcount > 1 CoW),
-/// this free_page call must be gated on refcount == 0.
+/// ## SMP TLB shootdown protocol
+///
+/// After mapping the new private copy and replacing the PTE, we must
+/// invalidate the old mapping on ALL CPUs before freeing `old_pa`.  The
+/// sequence is:
+///
+///   1. map_page()     — replace the PTE in this process's page tables
+///   2. flush_va()     — invalidate local TLB entry
+///   3. tlb_shootdown()— send TLB-shootdown IPIs to all other CPUs and
+///                       WAIT for their acknowledgment (blocking)
+///   4. free_page()    — only now is it safe to recycle old_pa
+///
+/// Skipping step 3 on a multi-processor system would allow another CPU
+/// that held this process's address space loaded to dereference the freed
+/// page via its stale TLB entry, causing a use-after-free.
 pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     // P=1, W=1, U=1  (x86-64 page-fault error code bits 0-2)
     if error_code & 0x7 != 0x7 { return false; }
@@ -61,7 +68,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         None    => return false,
     };
 
-    // alloc_page() returns a zero-filled page; copy only the live content.
+    // alloc_page() returns a zero-filled page; copy the live content.
     unsafe {
         core::ptr::copy_nonoverlapping(
             old_pa as *const u8,
@@ -70,28 +77,32 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         );
     }
 
+    let page_va = faulting_va & !0xFFF;
     let flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER;
-    <Arch as Paging>::map_page(cr3, faulting_va & !0xFFF, new_pa, flags);
-    <Arch as Paging>::flush_va(faulting_va & !0xFFF);
-    // See safety invariant in doc comment above.
-    // Debug assertion: the VA should now be unreachable via the old PA
-    // (the arch layer must have replaced the PTE before we arrive here).
-    #[cfg(debug_assertions)]
-    {
-        let current_pa = unsafe { crate::mm::cow_fault::pte_read_pub(cr3, faulting_va & !0xFFF) };
-        debug_assert!(
-            current_pa.map_or(true, |pte| pte & 0x000F_FFFF_FFFF_F000 != old_pa as u64),
-            "cow_fault: PTE still points to old_pa {:#x} after map_page — \
-             arch layer did not replace it before free_page",
-            old_pa
-        );
-    }
+
+    // Step 1: replace the PTE with the new private copy.
+    <Arch as Paging>::map_page(cr3, page_va, new_pa, flags);
+
+    // Step 2: flush local TLB entry.
+    <Arch as Paging>::flush_va(page_va);
+
+    // Step 3: TLB shootdown — wait for all other CPUs to drop the old
+    // mapping before we hand old_pa back to the PMM.
+    // tlb_shootdown() is a no-op when only one CPU is online, so this
+    // is safe in both UP and SMP configurations.
+    crate::smp::ipi::tlb_shootdown(
+        page_va as u64,
+        (page_va + PAGE_SIZE) as u64,
+        0, // asid 0 = all address spaces (conservative)
+    );
+
+    // Step 4: now safe to recycle the old page.
     pmm::free_page(old_pa);
 
     true
 }
 
-// ── low-level PTE read (x86-64 4-level paging) ───────────────────────────────────
+// ── low-level PTE read (x86-64 4-level paging) ────────────────────────────
 
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT:   u64 = 1;
@@ -99,7 +110,6 @@ const PRESENT:   u64 = 1;
 const PAGE_SIZE_BIT: u64 = 1 << 7;
 
 /// Public alias for the debug assertion in handle_cow_fault.
-/// Only used in debug builds.
 #[cfg(debug_assertions)]
 pub unsafe fn pte_read_pub(cr3: usize, va: usize) -> Option<u64> {
     unsafe { pte_read(cr3, va) }
@@ -107,9 +117,8 @@ pub unsafe fn pte_read_pub(cr3: usize, va: usize) -> Option<u64> {
 
 /// Walk the 4-level page table and return the leaf PTE value for `va`.
 ///
-/// Returns `None` if any level is not present OR if a large page (1 GiB PDPTE
-/// or 2 MiB PDE) is encountered — large pages are not CoW-eligible in the
-/// current design and the caller will fall through to the false (SIGSEGV) path.
+/// Returns `None` if any level is not present OR if a large page is
+/// encountered — large pages are not CoW-eligible.
 unsafe fn pte_read(cr3: usize, va: usize) -> Option<u64> {
     let pml4i = (va >> 39) & 0x1FF;
     let pdpti = (va >> 30) & 0x1FF;
@@ -121,12 +130,10 @@ unsafe fn pte_read(cr3: usize, va: usize) -> Option<u64> {
 
     let pdpte = *(((pml4e & ADDR_MASK) as usize + pdpti * 8) as *const u64);
     if pdpte & PRESENT == 0 { return None; }
-    // 1 GiB page: leaf at PDPT level — not CoW-eligible.
     if pdpte & PAGE_SIZE_BIT != 0 { return None; }
 
     let pde = *(((pdpte & ADDR_MASK) as usize + pdi * 8) as *const u64);
     if pde & PRESENT == 0 { return None; }
-    // 2 MiB page: leaf at PD level — not CoW-eligible.
     if pde & PAGE_SIZE_BIT != 0 { return None; }
 
     Some(*((  (pde & ADDR_MASK) as usize + pti * 8) as *const u64))

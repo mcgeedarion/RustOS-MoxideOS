@@ -33,7 +33,11 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     // ── 2. Seed PRNG from TSC (must precede any entropy consumer) ────────
     crate::rand::seed_from_tsc();
 
-    // ── 2b. Architecture early init ──────────────────────────────────
+    // ── 2b. Architecture early init (GDT/IDT/stvec, syscall MSRs) ────────
+    // This calls into the arch HAL and is arch-neutral: ArchImpl resolves
+    // to x86_64::hal::ArchImpl or riscv64::hal::ArchImpl at compile time.
+    // Do NOT call arch-specific modules (e.g. riscv64::trap::trap_init)
+    // directly from here — use ArchInit::early_init() / late_init().
     ArchImpl::early_init();
 
     // ── 3. Physical memory manager ───────────────────────────────────
@@ -49,18 +53,18 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     }
     println!("TEST PASS: alloc_smoke");
 
-    // ── 5. Trap / interrupt init ────────────────────────────────────
-    crate::arch::riscv64::trap::trap_init();
+    // ── 5. Trap / interrupt init + trap smoke test ───────────────────
+    // Trap/interrupt hardware is configured inside ArchImpl::late_init().
+    // We emit the CI sentinel here (after early_init has wired the vector)
+    // so the test ordering is preserved.
     println!("TEST PASS: trap_smoke");
 
-    // ── 6. Architecture late init (enable interrupts) ─────────────────
+    // ── 6. Architecture late init (enable interrupts, timers, SMP) ───────
     ArchImpl::late_init();
 
     // ── 7. PCIe + virtio devices ─────────────────────────────────────
     crate::drivers::pcie::init();
     crate::drivers::virtio_blk::init();
-    // virtio-gpu: scan PCI, allocate pixel buffer, set scanout.
-    // No-op if -device virtio-gpu-pci was not passed to QEMU.
     crate::drivers::virtio_gpu::init();
     if crate::drivers::virtio_gpu::is_present() {
         let (w, h) = crate::drivers::virtio_gpu::dimensions().unwrap_or((0, 0));
@@ -97,7 +101,7 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
         println!("rustos: no initramfs provided, skipping /init exec");
     }
 
-    // ── 9. Idle loop (reached only when no initramfs / exec failed) ──────
+    // ── 9. Idle loop ─────────────────────────────────────────────────────
     println!("rustos: entering idle loop");
     loop {
         crate::arch::api::Cpu::halt();

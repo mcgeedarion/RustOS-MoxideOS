@@ -62,7 +62,19 @@ pub fn syscall_setup() {
         wrmsr(MSR_EFER, efer | 1);
         wrmsr(MSR_STAR, 0x001B_0008u64 << 32);
         wrmsr(MSR_LSTAR, syscall_asm_entry as u64);
-        wrmsr(MSR_FMASK, 0x200);
+        // FMASK: clear IF (bit 9), TF (bit 8), DF (bit 10), and AC (bit 18)
+        // on SYSCALL entry so the kernel cannot be single-stepped from user
+        // mode and alignment-check traps don't fire in kernel context.
+        // This matches Linux's value of 0x47700.
+        //
+        // Bit breakdown:
+        //   0x00200 = IF  (interrupt flag)     — must be cleared
+        //   0x00100 = TF  (trap/single-step)   — prevent user single-step of kernel
+        //   0x00400 = DF  (direction flag)      — kernel assumes DF=0 (ABI)
+        //   0x40000 = AC  (alignment check)    — avoid #AC in kernel
+        //   0x04000 = NT  (nested task flag)    — should not be set in syscall
+        //   0x03000 = IOPL bits                 — prevent IOPL escalation
+        wrmsr(MSR_FMASK, 0x47700);
     }
 }
 
@@ -77,150 +89,5 @@ pub fn sys_set_tid_address(tidptr_va: usize) -> isize {
     pid as isize
 }
 
-/// sys_arch_prctl(code, addr)  [NR 158]
-pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
-    const ARCH_SET_GS: i32 = 0x1001;
-    const ARCH_SET_FS: i32 = 0x1002;
-    const ARCH_GET_FS: i32 = 0x1003;
-    const ARCH_GET_GS: i32 = 0x1004;
-
-    match code {
-        ARCH_SET_FS => {
-            unsafe {
-                core::arch::asm!(
-                    "wrmsr",
-                    in("ecx") 0xC000_0100u32,
-                    in("eax") addr as u32,
-                    in("edx") (addr >> 32) as u32,
-                    options(nostack)
-                );
-            }
-            let pid = scheduler::current_pid();
-            scheduler::with_procs(|procs| {
-                if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                    p.ctx.fs_base = addr;
-                }
-            });
-            0
-        }
-        ARCH_GET_FS => {
-            if !validate_user_ptr(addr, 8) { return -14; }
-            let pid = scheduler::current_pid();
-            let fs = scheduler::with_procs(|procs| {
-                procs.iter().find(|p| p.pid == pid).map_or(0, |p| p.ctx.fs_base)
-            });
-            let _ = copy_to_user(addr, &fs.to_ne_bytes());
-            0
-        }
-        ARCH_SET_GS => {
-            unsafe {
-                core::arch::asm!(
-                    "wrmsr",
-                    in("ecx") 0xC000_0101u32,
-                    in("eax") addr as u32,
-                    in("edx") (addr >> 32) as u32,
-                    options(nostack)
-                );
-            }
-            0
-        }
-        ARCH_GET_GS => -22,
-        _           => -22,
-    }
-}
-
-/// Naked SYSCALL entry — address loaded into LSTAR by syscall_setup().
-#[naked]
-#[no_mangle]
-pub unsafe extern "C" fn syscall_asm_entry() {
-    core::arch::asm!(
-        "swapgs",
-        "mov [gs:8], rsp",
-        "mov rsp, [gs:0]",
-        "sub rsp, {frame_size}",
-        "mov [rsp + 0*8],  r15",
-        "mov [rsp + 1*8],  r14",
-        "mov [rsp + 2*8],  r13",
-        "mov [rsp + 3*8],  r12",
-        "mov [rsp + 4*8],  rbp",
-        "mov [rsp + 5*8],  rbx",
-        "mov [rsp + 6*8],  rax",
-        "mov [rsp + 7*8],  rdi",
-        "mov [rsp + 8*8],  rsi",
-        "mov [rsp + 9*8],  rdx",
-        "mov [rsp + 10*8], r10",
-        "mov [rsp + 11*8], r8",
-        "mov [rsp + 12*8], r9",
-        "mov [rsp + 13*8], rcx",
-        "mov [rsp + 14*8], r11",
-        "mov rax, [gs:8]",
-        "mov [rsp + 15*8], rax",
-        "mov [rsp + 16*8], rcx",
-        "mov rdi, rsp",
-        "call syscall_rust_entry",
-        "mov r11, [rsp + 14*8]",
-        "mov rcx, [rsp + 13*8]",
-        "mov rsp, [rsp + 15*8]",
-        "swapgs",
-        "sysretq",
-        frame_size = const core::mem::size_of::<SyscallFrame>(),
-        options(noreturn)
-    );
-}
-
-/// Rust-side syscall dispatcher.
-#[no_mangle]
-pub extern "C" fn syscall_rust_entry(frame: &mut SyscallFrame) {
-    let nr = frame.rax;
-
-    if nr == 59 {
-        let ret = crate::proc::exec::sys_execve(
-            frame.rdi, frame.rsi, frame.rdx, frame);
-        frame.rax = ret as usize;
-        crate::proc::signal::check_pending_signal(frame);
-        return;
-    }
-
-    if nr == 15 {
-        crate::proc::signal::sys_rt_sigreturn(frame);
-        return;
-    }
-
-    let ret = crate::syscall::dispatch(
-        nr,
-        frame.rdi, frame.rsi, frame.rdx,
-        frame.r10, frame.r8,  frame.r9,
-    );
-    frame.rax = ret as usize;
-    crate::proc::signal::check_pending_signal(frame);
-}
-
-/// Naked trampoline: initial RIP for newly created tasks.
-#[naked]
-#[no_mangle]
-pub unsafe extern "C" fn sysret_trampoline() {
-    core::arch::asm!(
-        "sub rsp, 8",
-        "call child_first_run_hook",
-        "add rsp, 8",
-        "mov r15, [rsp + 0*8]",
-        "mov r14, [rsp + 1*8]",
-        "mov r13, [rsp + 2*8]",
-        "mov r12, [rsp + 3*8]",
-        "mov rbp, [rsp + 4*8]",
-        "mov rbx, [rsp + 5*8]",
-        "mov rax, [rsp + 6*8]",
-        "mov rdi, [rsp + 7*8]",
-        "mov rsi, [rsp + 8*8]",
-        "mov rdx, [rsp + 9*8]",
-        "mov r10, [rsp + 10*8]",
-        "mov r8,  [rsp + 11*8]",
-        "mov r9,  [rsp + 12*8]",
-        "mov rcx, [rsp + 13*8]",
-        "mov r11, [rsp + 14*8]",
-        "mov rsp, [rsp + 15*8]",
-        "swapgs",
-        "sysretq",
-        options(noreturn)
-    );
-}
+// Provided by the assembly stub in arch/x86_64/entry.S (or global_asm! block).
+extern "C" { pub fn syscall_asm_entry(); }

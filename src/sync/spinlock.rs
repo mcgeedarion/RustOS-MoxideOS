@@ -1,14 +1,34 @@
 //! Ticket spinlock — fair, starvation-free, SMP-correct.
 //!
-//! Each `lock()` call atomically grabs a ticket number from `next_ticket`.
-//! The holder is the CPU whose ticket matches `now_serving`.  On unlock,
-//! `now_serving` is incremented, waking the next waiter.
+//! Two variants are provided:
 //!
-//! Backoff: x86_64 uses `pause` (reduces memory-order speculation).
-//!          RISC-V uses `wfi` if in S-mode idle, otherwise spin.
+//!   `SpinLock<T>`         — plain spinlock; use when the lock is NEVER
+//!                           acquired from interrupt context on the same CPU.
+//!
+//!   `IrqSpinLock<T>`      — IRQ-saving spinlock; use when the lock may be
+//!                           acquired from both normal (process/task) context
+//!                           AND from interrupt handlers on the same CPU.
+//!                           `lock_irqsave()` disables local interrupts before
+//!                           spinning, and the guard re-enables them on drop.
+//!                           This prevents the classic IRQ-context deadlock:
+//!                             CPU holds lock → IRQ fires → IRQ tries to
+//!                             acquire same lock → deadlock.
+//!
+//! ## Choosing the right variant
+//!
+//!   Use `IrqSpinLock` for:
+//!     - PMM free list (touched by page-fault handler)
+//!     - Process list / scheduler run-queue (touched by timer IRQ)
+//!     - Any lock that driver ISRs acquire
+//!
+//!   Use `SpinLock` for:
+//!     - Locks held only in process context (never from an ISR)
+//!     - Kernel-internal data structures accessed only via syscalls
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::cell::UnsafeCell;
+
+// ─── SpinLock ────────────────────────────────────────────────────────────────
 
 pub struct SpinLock<T> {
     next_ticket:  AtomicU32,
@@ -29,11 +49,11 @@ impl<T> SpinLock<T> {
     }
 
     /// Acquire the lock, returning a guard that releases it on drop.
+    /// **Do not use this from interrupt handlers** — use `IrqSpinLock` instead.
     #[inline]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.now_serving.load(Ordering::Acquire) != ticket {
-            // Backoff hint.
             #[cfg(target_arch = "x86_64")]
             unsafe { core::arch::asm!("pause", options(nostack, preserves_flags)); }
             #[cfg(target_arch = "riscv64")]
@@ -49,7 +69,6 @@ impl<T> SpinLock<T> {
         let serving = self.now_serving.load(Ordering::Acquire);
         let next    = self.next_ticket.load(Ordering::Relaxed);
         if serving == next {
-            // Attempt to grab the ticket.
             if self.next_ticket
                 .compare_exchange(next, next + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
@@ -60,7 +79,6 @@ impl<T> SpinLock<T> {
         None
     }
 
-    /// Returns `true` if the lock is currently held by anyone.
     #[inline]
     pub fn is_locked(&self) -> bool {
         self.now_serving.load(Ordering::Relaxed)
@@ -85,5 +103,131 @@ impl<'a, T> Drop for SpinLockGuard<'a, T> {
     #[inline]
     fn drop(&mut self) {
         self.lock.now_serving.fetch_add(1, Ordering::Release);
+    }
+}
+
+// ─── IrqSpinLock ─────────────────────────────────────────────────────────────
+//
+// Wraps SpinLock with interrupt save/restore semantics.
+// Acquiring the lock disables local interrupts BEFORE spinning; releasing
+// restores the interrupt state that was in effect at acquire time.
+
+pub struct IrqSpinLock<T> {
+    inner: SpinLock<T>,
+}
+
+unsafe impl<T: Send> Send for IrqSpinLock<T> {}
+unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
+
+impl<T> IrqSpinLock<T> {
+    pub const fn new(val: T) -> Self {
+        IrqSpinLock { inner: SpinLock::new(val) }
+    }
+
+    /// Acquire the lock with interrupts disabled.
+    ///
+    /// Interrupts are disabled **before** the spinloop begins so that a
+    /// timer or device IRQ cannot fire between "I'm waiting" and "I hold
+    /// the lock", which would allow a re-entrant lock attempt from the
+    /// same CPU.
+    ///
+    /// The saved interrupt state is embedded in the returned guard and
+    /// restored automatically when the guard is dropped.
+    #[inline]
+    pub fn lock_irqsave(&self) -> IrqSpinLockGuard<'_, T> {
+        // Snapshot the interrupt state and disable interrupts.
+        let irq_was_enabled = irq_flags_and_disable();
+        // Now spin with interrupts off — no IRQ can fire on this CPU.
+        let guard = self.inner.lock();
+        // Forget the plain guard (we'll release via IrqSpinLockGuard).
+        core::mem::forget(guard);
+        IrqSpinLockGuard { lock: self, irq_was_enabled }
+    }
+
+    /// Try to acquire the lock with interrupts disabled.
+    /// Returns `None` if the lock is contended.
+    #[inline]
+    pub fn try_lock_irqsave(&self) -> Option<IrqSpinLockGuard<'_, T>> {
+        let irq_was_enabled = irq_flags_and_disable();
+        match self.inner.try_lock() {
+            Some(guard) => {
+                core::mem::forget(guard);
+                Some(IrqSpinLockGuard { lock: self, irq_was_enabled })
+            }
+            None => {
+                // Restore interrupts — we didn't get the lock.
+                if irq_was_enabled { irq_enable(); }
+                None
+            }
+        }
+    }
+}
+
+pub struct IrqSpinLockGuard<'a, T> {
+    lock:            &'a IrqSpinLock<T>,
+    irq_was_enabled: bool,
+}
+
+impl<'a, T> core::ops::Deref for IrqSpinLockGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.lock.inner.data.get() } }
+}
+
+impl<'a, T> core::ops::DerefMut for IrqSpinLockGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.lock.inner.data.get() } }
+}
+
+impl<'a, T> Drop for IrqSpinLockGuard<'a, T> {
+    #[inline]
+    fn drop(&mut self) {
+        // Release the ticket lock.
+        self.lock.inner.now_serving.fetch_add(1, Ordering::Release);
+        // Restore interrupts to the state before lock_irqsave().
+        if self.irq_was_enabled { irq_enable(); }
+    }
+}
+
+// ─── Arch-abstracted IRQ helpers ─────────────────────────────────────────────
+
+/// Disable interrupts on the current CPU and return whether they were
+/// enabled before (so the caller can restore them later).
+#[inline]
+fn irq_flags_and_disable() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let flags: usize;
+        core::arch::asm!(
+            "pushfq",
+            "pop {f}",
+            "cli",
+            f = out(reg) flags,
+            options(nostack, preserves_flags)
+        );
+        flags & (1 << 9) != 0 // IF bit
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let sstatus: usize;
+        core::arch::asm!(
+            "csrrci {ss}, sstatus, 2",  // atomically read sstatus and clear SIE
+            ss = out(reg) sstatus,
+            options(nostack)
+        );
+        sstatus & (1 << 1) != 0 // SIE bit was set
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+    { false }
+}
+
+#[inline]
+fn irq_enable() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)); }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "csrsi sstatus, 2",  // set SIE bit
+            options(nostack)
+        );
     }
 }

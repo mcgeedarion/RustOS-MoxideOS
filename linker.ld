@@ -14,6 +14,12 @@ SECTIONS {
   . = 0x80200000;
   _kernel_start = .;
 
+  /* .text.boot must come first so that _start (the OpenSBI entry point)
+   * is the very first instruction the hart executes.  Place _start in
+   * this section with #[link_section = ".text.boot"] in the Rust source.
+   */
+  .text.boot : { *(.text.boot) }
+
   .text   : { *(.text .text.*) }
   .rodata : { *(.rodata .rodata.*) }
 

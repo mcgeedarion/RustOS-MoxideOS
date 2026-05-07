@@ -21,5 +21,7 @@
   "target-c-int-width": "32",
   "panic-strategy": "abort",
   "disable-redzone": true,
-  "frame-pointer": "always"
+  "frame-pointer": "always",
+  "relocation-model": "static",
+  "code-model": "medium"
 }
