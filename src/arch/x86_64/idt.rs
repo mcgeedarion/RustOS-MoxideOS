@@ -149,7 +149,10 @@ pub extern "C" fn page_fault_handler(faulting_va: usize, error_code: u64) {
         crate::proc::scheduler::schedule();
         return;
     }
-    loop { unsafe { core::arch::asm!("hlt", options(nostack)); } }
+    // Use the arch-neutral HAL halt so this path compiles correctly on
+    // RISC-V as well as x86_64.  A raw `hlt` here would cause an
+    // illegal-instruction fault on any non-x86 target.
+    loop { crate::arch::api::Cpu::halt(); }
 }
 
 // ── ASM stubs ──────────────────────────────────────────────────────────────
