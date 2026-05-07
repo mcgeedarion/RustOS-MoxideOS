@@ -1,10 +1,24 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
-//! ## Batch (this commit)
-//!   NR 334  close_range(first, last, flags)    => fs::close_range::sys_close_range
-//!   NR   9  MAP_FIXED_NOREPLACE (0x100000)     => mm::mmap::sys_mmap (now returns -EEXIST)
-//!   NR  89  readlink("/proc/self/exe", …)      => stat_syscalls (routes to procfs_readlink)
-//!   NR 267  readlinkat — same routing fix
+//! ## Wired in this commit
+//!   NR 334  close_range(first, last, flags)  => fs::close_range::sys_close_range
+//!
+//! ## Already implemented (noted here for audit)
+//!   NR 9    mmap — MAP_FIXED_NOREPLACE (0x100000) handled in mm::mmap::sys_mmap
+//!   /proc/self/exe readlink — procfs::procfs_readlink dispatched from stat_syscalls
+//!
+//! ## Signal NRs
+//!   NR 127  rt_sigpending   NR 128  rt_sigtimedwait   NR 130  rt_sigsuspend
+//!
+//! ## NPTL threading NRs
+//!   NR 200  tkill   NR 202  futex   NR 234  tgkill
+//!   NR 273  set_robust_list   NR 274  get_robust_list
+//!
+//! ## seccomp / namespace NRs
+//!   NR 272  unshare  NR 308  setns  NR 317  seccomp
+//!
+//! ## inotify / fanotify NRs
+//!   NR 253/254/255/292  NR 300/301
 
 #![allow(unused_variables, unused_imports)]
 extern crate alloc;
@@ -43,7 +57,7 @@ fn sys_epoll_create1(flags: u32) -> isize {
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
 
-    // ── seccomp pre-check ─────────────────────────────────────────────────
+    // ── seccomp pre-check ─────────────────────────────────────────────────────
     if nr != 317 && nr != 60 && nr != 231 {
         match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f]) {
             crate::security::seccomp::SeccompVerdict::Allow  => {}
@@ -61,7 +75,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
     }
 
     match nr {
-        // ── filesystem I/O ────────────────────────────────────────────────
+        // ── filesystem I/O ────────────────────────────────────────────────────
         0   => crate::fs::io_syscalls::sys_read(a, b, c),
         1   => crate::fs::io_syscalls::sys_write(a, b, c),
         2   => crate::fs::io_syscalls::sys_open(a, b as u32, c as u32),
@@ -86,7 +100,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         85  => sys_creat_impl(a, b as u32),
         86  => sys_link_impl(a, b),
         88  => sys_symlink_impl(a, b),
-        89  => crate::fs::stat_syscalls::sys_readlink(a, b, c),
+        89  => sys_readlink_impl(a, b, c),
         162 => sys_sync_impl(),
         217 => crate::fs::getdents::sys_getdents64(a, b, c),
         257 => sys_openat_impl(a as i32, b, c as i32, d as u32),
@@ -94,25 +108,32 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         262 => sys_newfstatat_impl(a as i32, b, c, d as u32),
         263 => sys_unlinkat_impl(a as i32, b, c as u32),
         264 => sys_renameat_impl(a as i32, b, c as i32, d),
-        267 => crate::fs::stat_syscalls::sys_readlinkat(a as i32, b, c, d),
+        267 => sys_readlinkat_impl(a as i32, b, c, d),
         290 => crate::fs::eventfd::sys_eventfd2(a as u32, b as u32),
         293 => crate::fs::pipe::sys_pipe2(a, b as u32),
         294 => crate::fs::fcntl::sys_dup3(a, b, c as i32),
         319 => sys_memfd_create_impl(a, b as u32),
-        334 => crate::fs::close_range::sys_close_range(a as u32, b as u32, c as u32),
-        // ── inotify ───────────────────────────────────────────────────────
+        // NR 334  close_range(first, last, flags)
+        // glibc 2.34+ calls close_range(3, ~0U, 0) unconditionally at startup
+        // to sanitise inherited fds.  Without this the process hits ENOSYS.
+        334 => match (arg_u32(a), arg_u32(b), arg_u32(c)) {
+                   (Some(first), Some(last), Some(flags)) =>
+                       crate::fs::close_range::sys_close_range(first, last, flags),
+                   _ => -22,
+               },
+        // ── inotify ───────────────────────────────────────────────────────────
         253 => crate::fs::inotify::sys_inotify_init1(0),
         254 => crate::fs::inotify::sys_inotify_add_watch(a, b, c as u32),
         255 => crate::fs::inotify::sys_inotify_rm_watch(a, b as i32),
         292 => crate::fs::inotify::sys_inotify_init1(a as u32),
-        // ── fanotify ──────────────────────────────────────────────────────
+        // ── fanotify ──────────────────────────────────────────────────────────
         300 => crate::fs::fanotify::sys_fanotify_init(a as u32, b as u32),
         301 => crate::fs::fanotify::sys_fanotify_mark(a, b as u32, c as u64, d as i32, e),
-        // ── seccomp + namespaces ──────────────────────────────────────────
+        // ── seccomp + namespaces ──────────────────────────────────────────────
         272 => crate::proc::namespace::sys_unshare(a),
         308 => crate::proc::namespace::sys_setns(a, b as u32),
         317 => crate::security::seccomp::sys_seccomp(a as u32, b as u32, c),
-        // ── I/O multiplexing ──────────────────────────────────────────────
+        // ── I/O multiplexing ──────────────────────────────────────────────────
         7   => crate::fs::poll::sys_poll(a, b, c as i32),
         23  => crate::fs::poll::sys_select(a, b, c, d, e),
         213 => crate::fs::poll::sys_epoll_create(a as i32),
@@ -122,7 +143,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         271 => crate::fs::poll::sys_ppoll(a, b, c, d, e),
         281 => crate::fs::poll::sys_epoll_pwait(a, b, c as i32, d as i32, e, f),
         291 => sys_epoll_create1(a as u32),
-        // ── stat / path ops ───────────────────────────────────────────────
+        // ── stat / path ops ───────────────────────────────────────────────────
         4   => crate::fs::stat_syscalls::sys_stat(a, b),
         5   => crate::fs::stat_syscalls::sys_fstat(a, b),
         6   => crate::fs::stat_syscalls::sys_lstat(a, b),
@@ -137,7 +158,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         137 => sys_statfs_impl(a, b),
         138 => sys_fstatfs_impl(a, b),
         269 => crate::fs::stat_syscalls::sys_faccessat(a as i32, b, c as u32),
-        // ── memory ────────────────────────────────────────────────────────
+        // ── memory ────────────────────────────────────────────────────────────
         9   => crate::mm::mmap::sys_mmap(a, b, c as u32, d as u32, e, f),
         10  => crate::mm::mmap::sys_mprotect(a, b, c as u32),
         11  => crate::mm::mmap::sys_munmap(a, b),
@@ -146,7 +167,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         28  => sys_madvise_impl(a, b, c as i32),
         149 => sys_mlock_impl(a, b),
         150 => sys_munlock_impl(a, b),
-        // ── process / signals ─────────────────────────────────────────────
+        // ── process / signals ─────────────────────────────────────────────────
         13  => match arg_u32(a) {
                    Some(sig) if sig >= 1 && sig <= 64 =>
                        crate::proc::signal::sys_rt_sigaction(sig, b, c, d),
@@ -186,7 +207,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         158 => crate::arch::x86_64::syscall::sys_arch_prctl(a as i32, b),
         185 => sys_prctl_impl(a as i32, b, c, d, e),
         186 => crate::proc::thread::sys_gettid(),
-        // ── NPTL threading ────────────────────────────────────────────────
+        // ── NPTL threading ────────────────────────────────────────────────────
         200 => match arg_u32(b) {
                    Some(sig) if sig <= 64 => crate::proc::thread::sys_tkill(a, sig),
                    _ => -22,
@@ -199,7 +220,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                },
         273 => crate::proc::futex::sys_set_robust_list(a, b),
         274 => crate::proc::futex::sys_get_robust_list(a, b, c),
-        // ── time ──────────────────────────────────────────────────────────
+        // ── time ──────────────────────────────────────────────────────────────
         201 => sys_time_impl(a),
         203 => sys_sched_setaffinity_impl(a, b, c),
         204 => sys_sched_getaffinity_impl(a, b, c),
@@ -217,7 +238,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        sys_waitid_impl(idtype, id, c, opts),
                    _ => -22,
                },
-        // ── uid / gid ─────────────────────────────────────────────────────
+        // ── uid / gid ─────────────────────────────────────────────────────────
         96  => sys_gettimeofday_impl(a, b),
         97  => sys_getrlimit_impl(a as u32, b),
         160 => sys_setrlimit_impl(a as u32, b),
@@ -225,12 +246,12 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         102 | 104 | 107 | 108 => 0,
         105 | 106             => 0,
         109 | 117 | 118 | 119 | 120 => 0,
-        // ── pidfd ─────────────────────────────────────────────────────────
+        // ── pidfd ─────────────────────────────────────────────────────────────
         424 => crate::fs::pidfd::sys_pidfd_send_signal(a, b as u32, c, d as u32),
         434 => crate::fs::pidfd::sys_pidfd_open(a, b as u32),
         435 => crate::proc::clone::sys_clone3(a, b),
         438 => crate::fs::pidfd::sys_pidfd_getfd(a, b, c as u32),
-        // ── permission / attribute stubs ──────────────────────────────────
+        // ── permission / attribute stubs ──────────────────────────────────────
         90  => sys_chmod_impl(a, b as u32),
         91  => sys_fchmod_impl(a, b as u32),
         92  => sys_chown_impl(a, b as u32, c as u32),
@@ -243,10 +264,12 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
     }
 }
 
-// ── Syscall-side side-table cleanup (called from do_exit) ─────────────────────
+// ── Syscall-side side-table cleanup (called from do_exit) ─────────────────────────────
 
 pub fn altstack_clear_pid(pid: usize) {
     crate::proc::signal::altstack_clear_pid(pid);
 }
 
-pub fn proc_name_clear(_pid: usize) {}
+pub fn proc_name_clear(_pid: usize) {
+    // proc name table lives in stubs.rs for now; no-op until /proc is wired.
+}
