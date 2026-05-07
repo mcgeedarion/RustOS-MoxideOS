@@ -9,12 +9,12 @@ A hobby operating-system kernel written in **Rust**, targeting **RISC-V 64** (pr
 | Target | Boot | Paging | Syscall | Status |
 |---|---|---|---|---|
 | `riscv64-uefi.json` | **UEFI** (default) | sv39 | `ecall` | **Primary** |
-| `riscv64gc-unknown-none-elf` | SBI (`--sbi`) | sv39 | `ecall` | Secondary |
+| `riscv64gc-unknown-none-elf` | SBI (`--boot sbi`) | sv39 | `ecall` | Secondary |
 | `x86_64-unknown-none` | UEFI | 4-level (PML4) | `syscall`/`sysret` | Tertiary |
 
 RISC-V boot modes:
 - **UEFI** (default) — EDK2 RiscVVirt calls `uefi_start`; output is a PE/COFF `.efi` binary on a FAT ESP; requires `qemu-efi-riscv64`
-- **SBI** (`--sbi`) — OpenSBI hands off to `_start` in S-mode; no extra firmware; pass `--no-default-features` to disable `uefi_boot`
+- **SBI** (`--boot sbi`) — OpenSBI hands off to `_start` in S-mode; no extra firmware; pass `--no-default-features` to disable `uefi_boot`
 
 ---
 
@@ -64,10 +64,12 @@ RISC-V boot modes:
 
 ## Building
 
+All builds go through `cargo xtask`. No shell scripts required.
+
 ### Prerequisites
 
 ```sh
-# Rust toolchain (targets are pinned in rust-toolchain.toml — rustup installs them automatically)
+# Rust nightly toolchain (targets pinned in rust-toolchain.toml)
 rustup toolchain install nightly
 rustup component add rust-src llvm-tools-preview
 
@@ -89,34 +91,42 @@ apt install lld
 ### RISC-V 64 — UEFI (default)
 
 ```sh
-cargo build --release   # or: bash build.sh
+cargo xtask build
+# or explicitly:
+cargo xtask build --arch riscv64 --boot uefi
 ```
 
-Produces `esp/EFI/BOOT/BOOTRISCV64.EFI`. Run with:
-
-```sh
-bash run_qemu_riscv.sh
-```
+Produces `esp/EFI/BOOT/BOOTRISCV64.EFI`.
 
 ### RISC-V 64 — SBI
 
 ```sh
-bash build_riscv.sh --sbi
-```
-
-Run with:
-
-```sh
-bash run_qemu_riscv.sh --sbi
+cargo xtask build --arch riscv64 --boot sbi
+# Debug + initramfs:
+cargo xtask build --arch riscv64 --boot sbi --debug --initrd
 ```
 
 ### x86_64
 
 ```sh
-bash build_x86.sh
+cargo xtask build --arch x86_64
+# Debug:
+cargo xtask build --arch x86_64 --debug
 ```
 
 Requires `nasm` on `$PATH` (used by `build.rs` to assemble `src/arch/x86_64/boot.s`).
+Produces `kernel.bin` (flat binary via `objcopy`).
+
+### All options
+
+```
+cargo xtask build [--arch <riscv64|x86_64>] [--boot <uefi|sbi>] [--debug] [--initrd]
+
+  --arch    riscv64 (default) or x86_64
+  --boot    uefi (default) or sbi  — only meaningful for riscv64
+  --debug   debug build instead of release
+  --initrd  also build + pack initramfs.cpio (SBI mode only)
+```
 
 ---
 
@@ -210,14 +220,12 @@ src/
   net/           # ARP, DHCP, DNS, Ethernet, ICMP, IPv4, TCP, UDP
   security/      # capability sets (CapSet)
   shell/         # in-kernel TTY shell
+xtask/           # cargo xtask build automation (replaces build shell scripts)
 tests/           # integration test harness
 tools/           # mkfs helper, symbol scripts
 linker.ld          # RISC-V SBI linker script (loads at 0x80200000)
 x86_64.ld          # x86_64 linker script
 riscv64-uefi.json  # custom Rust target spec (PE/COFF, RISC-V UEFI) — default target
-build.sh           # default build (RISC-V UEFI release)
-build_riscv.sh     # RISC-V builder: UEFI (default) or --sbi, --debug, --initrd
-build_x86.sh       # x86_64 builder
 run_qemu_riscv.sh  # RISC-V QEMU launcher: UEFI (default) or --sbi
 run_qemu.sh        # x86_64 QEMU launcher
 ```

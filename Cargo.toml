@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "xtask"]
+resolver = "2"
+
 [package]
 name = "rustos"
 version = "0.1.0"
@@ -25,9 +29,9 @@ cc = "1"
 # When enabled:
 #   - src/arch/riscv64/uefi_entry.rs replaces src/arch/riscv64/boot.rs
 #   - build target is riscv64-uefi.json (PE/COFF via lld-link)
-#   - Use: cargo build --release   or   ./build.sh
-# To use SBI boot instead, disable this feature:
-#   - ./build_riscv.sh --sbi
+#   - Use: cargo xtask build
+# To use SBI boot instead:
+#   - cargo xtask build --arch riscv64 --boot sbi
 default = ["uefi_boot"]
 uefi_boot = []
 
