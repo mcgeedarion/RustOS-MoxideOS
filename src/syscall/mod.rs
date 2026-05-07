@@ -1,13 +1,15 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
-//! ## NPTL-required NRs (this commit)
-//!   NR 200  tkill(tid, sig)              => thread::sys_tkill
-//!   NR 202  futex(...)                   => futex::sys_futex  (WAIT/WAKE/REQUEUE/BITSET)
-//!   NR 234  tgkill(tgid, tid, sig)       => thread::sys_tgkill
-//!   NR 273  set_robust_list(head, len)   => futex::sys_set_robust_list
-//!   NR 274  get_robust_list(tid, hp, lp) => futex::sys_get_robust_list
+//! ## Signal NRs (this commit)
+//!   NR 127  rt_sigpending(set, size)              => signal::sys_rt_sigpending
+//!   NR 128  rt_sigtimedwait(set, info, ts, size)  => signal::sys_rt_sigtimedwait
+//!   NR 130  rt_sigsuspend(mask, size)             => signal::sys_rt_sigsuspend
 //!
-//! ## seccomp / namespace NRs (prev commit)
+//! ## NPTL threading NRs (prev commit)
+//!   NR 200  tkill   NR 202  futex   NR 234  tgkill
+//!   NR 273  set_robust_list   NR 274  get_robust_list
+//!
+//! ## seccomp / namespace NRs
 //!   NR 272  unshare  NR 308  setns  NR 317  seccomp
 //!
 //! ## inotify / fanotify NRs
@@ -185,29 +187,25 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                },
         114 => crate::proc::scheduler::current_pid() as isize,
         121 => crate::proc::scheduler::current_pid() as isize,
+        127 => crate::proc::signal::sys_rt_sigpending(a, b),
+        128 => crate::proc::signal::sys_rt_sigtimedwait(a, b, c, d),
+        130 => crate::proc::signal::sys_rt_sigsuspend(a, b),
         131 => sys_sigaltstack_impl(a, b),
         158 => crate::arch::x86_64::syscall::sys_arch_prctl(a as i32, b),
         185 => sys_prctl_impl(a as i32, b, c, d, e),
         186 => crate::proc::thread::sys_gettid(),
         // ── NPTL threading ────────────────────────────────────────────────────
-        // NR 200  tkill(tid, sig)
         200 => match arg_u32(b) {
                    Some(sig) if sig <= 64 => crate::proc::thread::sys_tkill(a, sig),
                    _ => -22,
                },
-        // NR 202  futex(uaddr, op, val, timeout_or_val2, uaddr2, val3)
-        // Full decode: op (b), val (c as u32), timeout_or_val2 (d), uaddr2 (e), val3 (f as u32)
         202 => crate::proc::futex::sys_futex(a, b as u32, c as u32, d, e, f as u32),
-        // NR 218  set_tid_address(tidptr) — stores clear_child_tid_va, returns tid
         218 => crate::arch::x86_64::syscall::sys_set_tid_address(a),
-        // NR 234  tgkill(tgid, tid, sig)
         234 => match arg_u32(c) {
                    Some(sig) if sig <= 64 => crate::proc::thread::sys_tgkill(a, b, sig),
                    _ => -22,
                },
-        // NR 273  set_robust_list(head, len)
         273 => crate::proc::futex::sys_set_robust_list(a, b),
-        // NR 274  get_robust_list(tid, headp, lenp)
         274 => crate::proc::futex::sys_get_robust_list(a, b, c),
         // ── time ──────────────────────────────────────────────────────────────
         201 => sys_time_impl(a),
@@ -251,4 +249,15 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         103 => sys_syslog_impl(a as i32, b, c as i32),
         _   => -38,  // ENOSYS
     }
+}
+
+// ── Syscall-side side-table cleanup (called from do_exit) ─────────────────────────────
+// These are thin forwards so do_exit doesn't need to import signal internals.
+
+pub fn altstack_clear_pid(pid: usize) {
+    crate::proc::signal::altstack_clear_pid(pid);
+}
+
+pub fn proc_name_clear(_pid: usize) {
+    // proc name table lives in stubs.rs for now; no-op until /proc is wired.
 }

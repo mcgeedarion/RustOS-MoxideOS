@@ -12,16 +12,65 @@
 //!      c. Points rdi=signum, rsi=siginfo*, rdx=ucontext*, rip=handler.
 //!   4. SA_RESTORER (musl: __restore_rt) does `mov $15,%rax; syscall`.
 //!   5. sys_rt_sigreturn restores all registers from ucontext_t.
+//!
+//! ## New in this revision
+//!   NR 127  rt_sigpending(set, sigsetsize)
+//!   NR 128  rt_sigtimedwait(set, info, timeout, sigsetsize)
+//!   NR 130  rt_sigsuspend(mask, sigsetsize)
+//!
+//! ### rt_sigpending
+//!   Writes the set of currently pending-and-unmasked signals to *set.
+//!   Actually follows Linux: writes ALL pending signals regardless of mask
+//!   (the caller can AND with the current mask itself).  POSIX requires
+//!   "signals that are both blocked AND pending"; Linux returns all pending.
+//!   We match Linux: return pending & ~0 (everything queued).
+//!
+//! ### rt_sigsuspend
+//!   Atomically replaces the signal mask with `mask`, then blocks until a
+//!   signal that is NOT in `mask` is delivered (or any signal arrives if
+//!   the handler is SIG_DFL and the signal isn't ignored).  On return the
+//!   original mask is restored and -EINTR is returned.
+//!
+//!   Implementation:
+//!     1. Save old mask, install new mask.
+//!     2. Mark task Blocked.
+//!     3. schedule() — will return once check_pending_signal (which runs
+//!        on every wake) delivers an unmasked signal.
+//!     4. Restore old mask.
+//!     5. Return -EINTR (-4).
+//!
+//!   The subtle invariant: check_pending_signal fires AFTER we return from
+//!   schedule(), so delivery happens at the next syscall exit checkpoint.
+//!   That is correct — POSIX allows delivery to happen on sigreturn.
+//!
+//! ### rt_sigtimedwait
+//!   Waits for any signal in `set` to become pending (i.e. a signal that
+//!   the caller is deliberately waiting for).  Returns the signal number
+//!   (positive) or -EAGAIN on timeout / -EINTR if interrupted by a
+//!   different signal.
+//!
+//!   Unlike rt_sigsuspend the caller specifies a SET of signals to WAIT
+//!   FOR, not a mask of signals to block.  The implementation:
+//!     1. Check if any pending signal matches `set` — return immediately if so.
+//!     2. Block the calling task (State::Blocked).
+//!     3. schedule() until woken by send_signal.
+//!     4. On each wake, re-check PENDING for a matching signal.
+//!     5. On timeout, return -EAGAIN.
+//!
+//!   Timeout: if `timeout_va == 0` wait forever; otherwise read the
+//!   timespec and use nanosleep-style deadline comparison.  Timer
+//!   resolution is limited by the current scheduler tick until a
+//!   preemptive timer is wired.
 
 extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use spin::Mutex;
 
 use crate::arch::x86_64::syscall::SyscallFrame;
-use crate::proc::scheduler;
+use crate::proc::{scheduler, process::State};
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr, USER_SPACE_END};
 
-// ── Signal metadata ────────────────────────────────────────────────────────────────────
+// ── Signal metadata ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct SigInfo {
@@ -78,8 +127,10 @@ pub struct SignalHandlers {
 
 // ── Public API ─────────────────────────────────────────────────────────────────────────
 
-pub fn send_signal(pid: usize, sig: u32) {
-    send_signal_info(pid, SigInfo { sig, code: SI_KERNEL, ..Default::default() });
+pub fn send_signal(pid: usize, sig: i32) -> isize {
+    if sig <= 0 || sig > 64 { return -22; } // EINVAL
+    send_signal_info(pid, SigInfo { sig: sig as u32, code: SI_KERNEL, ..Default::default() });
+    0
 }
 
 pub fn send_signal_info(pid: usize, info: SigInfo) {
@@ -114,6 +165,220 @@ pub fn get_sigmask(pid: usize) -> u64 {
 
 pub fn set_sigmask(pid: usize, mask: u64) {
     SIGMASK.lock().insert(pid, mask);
+}
+
+// ── sys_rt_sigpending [NR 127] ────────────────────────────────────────────────────────
+//
+// Writes a sigset_t (8 bytes on x86-64) to *set that contains all signals
+// currently pending for the calling thread.  Matches Linux semantics:
+// returns the full pending set (not intersected with the current mask).
+// sigsetsize must be 8; return -EINVAL otherwise.
+
+pub fn sys_rt_sigpending(set_va: usize, sigsetsize: usize) -> isize {
+    if sigsetsize != 8 { return -22; } // EINVAL
+    if set_va == 0 || set_va >= USER_SPACE_END { return -14; } // EFAULT
+
+    let pid = scheduler::current_pid();
+    let mut pending_set: u64 = 0;
+    {
+        let map = PENDING.lock();
+        if let Some(queue) = map.get(&pid) {
+            for info in queue.iter() {
+                if info.sig >= 1 && info.sig <= 64 {
+                    pending_set |= 1u64 << info.sig;
+                }
+            }
+        }
+    }
+    if copy_to_user(set_va, &pending_set.to_ne_bytes()).is_err() { return -14; }
+    0
+}
+
+// ── sys_rt_sigsuspend [NR 130] ────────────────────────────────────────────────────────
+//
+// Atomically installs `mask` as the current signal mask, then suspends the
+// calling task until a signal that is not blocked by `mask` arrives.
+//
+// On return:
+//   - The old signal mask is always restored.
+//   - Returns -EINTR (always — POSIX requires this).
+//   - The arriving signal's handler has been invoked via check_pending_signal
+//     at the next syscall-exit checkpoint (after schedule() returns).
+//
+// ABI: mask_va points to a sigset_t (8 bytes); sigsetsize must be 8.
+
+pub fn sys_rt_sigsuspend(mask_va: usize, sigsetsize: usize) -> isize {
+    if sigsetsize != 8 { return -22; } // EINVAL
+    if mask_va == 0 || mask_va >= USER_SPACE_END { return -14; } // EFAULT
+
+    let pid = scheduler::current_pid();
+
+    // Read the temporary mask.
+    let mut mask_bytes = [0u8; 8];
+    if copy_from_user(&mut mask_bytes, mask_va).is_err() { return -14; }
+    let new_mask = u64::from_ne_bytes(mask_bytes);
+
+    // SIGKILL (9) and SIGSTOP (19) cannot be blocked.
+    let new_mask = new_mask & !((1u64 << 9) | (1u64 << 19));
+
+    // Save old mask and install the temporary one atomically.
+    let old_mask = get_sigmask(pid);
+    set_sigmask(pid, new_mask);
+
+    // Block until a signal that is NOT in new_mask is queued.
+    // We spin in the scheduler: block ourselves, yield, and on each wake
+    // check whether an unmasked signal is now pending.
+    loop {
+        // Check now — a signal may have arrived before we blocked.
+        {
+            let map = PENDING.lock();
+            if let Some(queue) = map.get(&pid) {
+                for info in queue.iter() {
+                    if info.sig >= 1 && info.sig <= 64 {
+                        // An unmasked (deliverable) signal is pending.
+                        if (new_mask >> info.sig) & 1 == 0 {
+                            drop(map);
+                            // Restore original mask before returning.
+                            // check_pending_signal will deliver the signal
+                            // on the next syscall-exit pass.
+                            set_sigmask(pid, old_mask);
+                            return -4; // EINTR
+                        }
+                    }
+                }
+            }
+        }
+
+        // No deliverable signal yet — sleep.
+        scheduler::with_procs(|procs| {
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = State::Blocked;
+            }
+        });
+        scheduler::schedule();
+        // Woken by send_signal_info — loop and re-check.
+    }
+}
+
+// ── sys_rt_sigtimedwait [NR 128] ─────────────────────────────────────────────────────
+//
+// Suspends the calling task until one of the signals in `uset` becomes
+// pending, or the timeout expires.
+//
+// ABI:
+//   uset_va    — const sigset_t * (signals to WAIT FOR, not to block)
+//   uinfo_va   — siginfo_t *      (out; may be NULL)
+//   timeout_va — const timespec * (NULL = wait forever)
+//   sigsetsize — must be 8
+//
+// Returns:
+//   signal number (positive) on success
+//   -EAGAIN  on timeout (-11)
+//   -EINTR   if interrupted by a signal not in `uset` (-4)
+//   -EINVAL  bad sigsetsize or empty uset
+//   -EFAULT  bad pointer
+//
+// Key difference from rt_sigsuspend: the caller is waiting FOR these
+// signals (they're typically blocked via rt_sigprocmask so they queue
+// rather than invoke the default action), and the kernel dequeues the
+// first match and returns its number.
+//
+// Timeout: we read a timespec and compute a deadline using now_ns().
+// The scheduler is cooperative for now, so we poll on each reschedule.
+
+pub fn sys_rt_sigtimedwait(
+    uset_va:    usize,
+    uinfo_va:   usize,
+    timeout_va: usize,
+    sigsetsize: usize,
+) -> isize {
+    if sigsetsize != 8 { return -22; } // EINVAL
+    if uset_va == 0 || uset_va >= USER_SPACE_END { return -14; } // EFAULT
+
+    // Read the wait set.
+    let mut set_bytes = [0u8; 8];
+    if copy_from_user(&mut set_bytes, uset_va).is_err() { return -14; }
+    let wait_set = u64::from_ne_bytes(set_bytes);
+    if wait_set == 0 { return -22; } // EINVAL — empty wait set
+
+    // Read optional timeout.
+    let deadline_ns: Option<u64> = if timeout_va != 0 && timeout_va < USER_SPACE_END {
+        let mut ts = [0u8; 16];
+        if copy_from_user(&mut ts, timeout_va).is_err() { return -14; }
+        let secs  = i64::from_ne_bytes(ts[0..8].try_into().unwrap());
+        let nsecs = i64::from_ne_bytes(ts[8..16].try_into().unwrap());
+        if secs < 0 || nsecs < 0 || nsecs >= 1_000_000_000 { return -22; }
+        let rel_ns = (secs as u64).saturating_mul(1_000_000_000)
+                         .saturating_add(nsecs as u64);
+        Some(crate::proc::nanosleep::now_ns().saturating_add(rel_ns))
+    } else {
+        None // wait forever
+    };
+
+    let pid = scheduler::current_pid();
+
+    loop {
+        // ── Check for a matching pending signal ───────────────────────────────
+        let found: Option<SigInfo> = {
+            let mut map = PENDING.lock();
+            if let Some(queue) = map.get_mut(&pid) {
+                let pos = queue.iter().position(|s| {
+                    s.sig >= 1 && s.sig <= 64 && (wait_set >> s.sig) & 1 != 0
+                });
+                pos.and_then(|i| queue.remove(i))
+            } else {
+                None
+            }
+        };
+
+        if let Some(info) = found {
+            // Optionally write siginfo_t back to the caller.
+            if uinfo_va != 0 && uinfo_va < USER_SPACE_END {
+                let mut si = [0u8; 80];
+                si[0..4].copy_from_slice(&(info.sig as i32).to_ne_bytes());
+                si[4..8].copy_from_slice(&info.code.to_ne_bytes());
+                match info.sig {
+                    17 => si[24..28].copy_from_slice(&info.status.to_ne_bytes()),
+                    11 | 7 | 8 => si[16..24].copy_from_slice(&info.addr.to_ne_bytes()),
+                    _ => {}
+                }
+                let _ = copy_to_user(uinfo_va, &si);
+            }
+            return info.sig as isize; // success: return signal number
+        }
+
+        // ── Check timeout ─────────────────────────────────────────────────────────
+        if let Some(dl) = deadline_ns {
+            if crate::proc::nanosleep::now_ns() >= dl {
+                return -11; // EAGAIN — timeout
+            }
+        }
+
+        // ── Check if a non-waited signal is pending (return -EINTR) ───────────
+        {
+            let mask = get_sigmask(pid);
+            let map = PENDING.lock();
+            if let Some(queue) = map.get(&pid) {
+                for info in queue.iter() {
+                    // An unmasked, non-waited signal is pending — abort.
+                    if info.sig >= 1 && info.sig <= 64
+                        && (wait_set  >> info.sig) & 1 == 0
+                        && (mask      >> info.sig) & 1 == 0
+                    {
+                        return -4; // EINTR
+                    }
+                }
+            }
+        }
+
+        // ── Sleep until woken by send_signal_info ──────────────────────────
+        scheduler::with_procs(|procs| {
+            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
+                p.state = State::Blocked;
+            }
+        });
+        scheduler::schedule();
+    }
 }
 
 // ── sys_sigaltstack [NR 131] ──────────────────────────────────────────────────────────────
@@ -264,14 +529,11 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
         let queue = match q.get_mut(&pid) { Some(q) => q, None => return };
 
         // Fast path: front signal is unmasked (the common case).
-        // pop_front is O(1) on VecDeque.
         if let Some(front) = queue.front() {
             if front.sig > 0 && (mask >> front.sig) & 1 == 0 {
                 queue.pop_front().unwrap_or_default()
             } else {
                 // Slow path: scan for first unmasked signal.
-                // VecDeque::remove(i) is O(n) but only reached when signals
-                // are masked, which is uncommon.
                 let pos = queue.iter().position(|s| s.sig > 0 && (mask >> s.sig) & 1 == 0);
                 match pos {
                     Some(i) => queue.remove(i).unwrap_or_default(),
@@ -374,8 +636,6 @@ pub fn check_pending_signal(frame: &mut SyscallFrame) {
     let ret_addr = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
         restorer
     } else {
-        // build_inline_trampoline returns None if copy_to_user fails;
-        // re-enqueue the signal and bail out safely.
         match build_inline_trampoline(sp) {
             Some(va) => va,
             None => {
@@ -440,11 +700,19 @@ pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
 
 // ── Inline trampoline (fallback when SA_RESTORER not set) ──────────────────────────────
 
-/// Write the rt_sigreturn trampoline below `sp` and return its VA.
-/// Returns None if copy_to_user fails (e.g. stack page not mapped).
 fn build_inline_trampoline(sp: usize) -> Option<usize> {
     // mov rax, 15 (NR_rt_sigreturn); syscall
     const CODE: [u8; 9] = [0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
     let va = sp.wrapping_sub(16);
     copy_to_user(va, &CODE).ok().map(|_| va)
+}
+
+// ── altstack_clear_pid / proc_name_clear ──────────────────────────────────────────────
+//
+// Called by do_exit to clean up per-pid side tables.
+
+pub fn altstack_clear_pid(pid: usize) {
+    ALTSTACK.lock().remove(&pid);
+    SIGMASK.lock().remove(&pid);
+    PENDING.lock().remove(&pid);
 }
