@@ -2,10 +2,11 @@
 # run_qemu.sh — Build rustos (debug) and launch it in QEMU.
 #
 # Usage:
-#   ./run_qemu.sh                  # normal run
+#   ./run_qemu.sh                  # normal run (serial only)
+#   ./run_qemu.sh --gpu            # add virtio-gpu-pci, open SDL/GTK window
 #   ./run_qemu.sh --gdb            # halt at entry, wait for GDB on :1234
 #   ./run_qemu.sh disk.img         # attach a virtio-blk disk image
-#   ./run_qemu.sh --gdb disk.img   # both
+#   ./run_qemu.sh --gpu --gdb disk.img
 #
 # GDB workflow:
 #   Terminal 1:  ./run_qemu.sh --gdb [disk.img]
@@ -13,23 +14,24 @@
 #
 # Requirements:
 #   rustup target add x86_64-unknown-none
-#   qemu-system-x86_64
+#   qemu-system-x86_64  (with SDL2 or GTK for --gpu)
 
 set -euo pipefail
 
 KERNEL=target/x86_64-unknown-none/debug/rustos
 GDB_MODE=0
+GPU_MODE=0
 DISK=""
 
-# Parse arguments: --gdb flag + optional disk image (order-independent).
 for arg in "$@"; do
   case "$arg" in
-    --gdb)     GDB_MODE=1 ;;
-    *)         DISK="$arg" ;;
+    --gdb) GDB_MODE=1 ;;
+    --gpu) GPU_MODE=1 ;;
+    *)     DISK="$arg" ;;
   esac
 done
 
-# ─── Build (debug) ────────────────────────────────────────────────────────────────────────────
+# ─── Build (debug) ───────────────────────────────────────────────────────────
 
 echo "[*] Building rustos (debug)..."
 cargo build \
@@ -37,7 +39,7 @@ cargo build \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem
 
-# ─── QEMU args ──────────────────────────────────────────────────────────────────────────
+# ─── QEMU args ────────────────────────────────────────────────────────────
 
 QEMU_ARGS=(
   -machine q35
@@ -45,10 +47,22 @@ QEMU_ARGS=(
   -m 256M
   -kernel "$KERNEL"
   -serial stdio
-  -display none
   -no-reboot
   -d guest_errors,cpu_reset
 )
+
+if [[ $GPU_MODE -eq 1 ]]; then
+  echo "[*] GPU mode: adding virtio-gpu-pci + SDL display"
+  # virtio-gpu-pci exposes a PCI device (vendor=0x1AF4 device=0x1050).
+  # The kernel driver (src/drivers/virtio_gpu.rs) will discover it via PCI
+  # scan and use it as /dev/fb0.
+  QEMU_ARGS+=(
+    -device virtio-gpu-pci
+    -display sdl,gl=off     # use SDL2; swap to gtk or egl-headless as needed
+  )
+else
+  QEMU_ARGS+=(-display none)
+fi
 
 if [[ -n "$DISK" ]]; then
   echo "[*] Attaching disk: $DISK"

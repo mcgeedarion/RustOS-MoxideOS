@@ -25,7 +25,7 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     // ── 0. C/C++ global constructors ─────────────────────────────────────
     unsafe { run_init_array(); }
 
-    // ── 1. Serial / UART init ────────────────────────────────────────────
+    // ── 1. Serial / UART init ────────────────────────────────────────
     ArchImpl::serial_init();
     println!("rustos: kernel_main reached");
     println!("TEST PASS: uart_smoke");
@@ -33,13 +33,13 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     // ── 2. Seed PRNG from TSC (must precede any entropy consumer) ────────
     crate::rand::seed_from_tsc();
 
-    // ── 2b. Architecture early init ──────────────────────────────────────
+    // ── 2b. Architecture early init ──────────────────────────────────
     ArchImpl::early_init();
 
-    // ── 3. Physical memory manager ───────────────────────────────────────
+    // ── 3. Physical memory manager ───────────────────────────────────
     crate::mm::pmm::init();
 
-    // ── 4. Global allocator smoke test ──────────────────────────────────
+    // ── 4. Global allocator smoke test ──────────────────────────────
     {
         extern crate alloc;
         use alloc::vec::Vec;
@@ -49,14 +49,27 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     }
     println!("TEST PASS: alloc_smoke");
 
-    // ── 5. Trap / interrupt init ─────────────────────────────────────────
+    // ── 5. Trap / interrupt init ────────────────────────────────────
     crate::arch::riscv64::trap::trap_init();
     println!("TEST PASS: trap_smoke");
 
-    // ── 6. Architecture late init (enable interrupts) ────────────────────
+    // ── 6. Architecture late init (enable interrupts) ─────────────────
     ArchImpl::late_init();
 
-    // ── 7. Initramfs — locate /init, map it, build stack, enter userspace ───
+    // ── 7. PCIe + virtio devices ─────────────────────────────────────
+    crate::drivers::pcie::init();
+    crate::drivers::virtio_blk::init();
+    // virtio-gpu: scan PCI, allocate pixel buffer, set scanout.
+    // No-op if -device virtio-gpu-pci was not passed to QEMU.
+    crate::drivers::virtio_gpu::init();
+    if crate::drivers::virtio_gpu::is_present() {
+        let (w, h) = crate::drivers::virtio_gpu::dimensions().unwrap_or((0, 0));
+        println!("rustos: virtio-gpu ready  {}x{}", w, h);
+    } else {
+        println!("rustos: virtio-gpu not found, framebuffer via GOP");
+    }
+
+    // ── 8. Initramfs — locate /init, map it, build stack, enter userspace ──
     extern "C" {
         static INITRAMFS_BASE: usize;
         static INITRAMFS_SIZE: usize;
@@ -84,21 +97,20 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
         println!("rustos: no initramfs provided, skipping /init exec");
     }
 
-    // ── 8. Idle loop (reached only when no initramfs / exec failed) ───────
+    // ── 9. Idle loop (reached only when no initramfs / exec failed) ──────
     println!("rustos: entering idle loop");
     loop {
         crate::arch::api::Cpu::halt();
     }
 }
 
-// ── x86_64: load /init and sysret into it ─────────────────────────────
+// ── x86_64: load /init and sysret into it ───────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 fn init_exec_x86_64(elf_bytes: &[u8], cpio: &[u8]) -> ! {
     use crate::arch::x86_64::{paging, uentry};
     use crate::loader::{elf64, auxv};
 
-    // Allocate a fresh PML4 for the init process.
     let cr3 = unsafe { paging::alloc_pml4() };
 
     let loaded = match elf64::load(elf_bytes, cr3) {
@@ -108,16 +120,10 @@ fn init_exec_x86_64(elf_bytes: &[u8], cpio: &[u8]) -> ! {
     println!("rustos: /init entry={:#x} brk={:#x}", loaded.entry, loaded.brk);
     println!("TEST PASS: initramfs_load");
 
-    // Allocate user stack pages and map them into the process CR3.
     let stack_top = uentry::alloc_user_stack(cr3)
         .expect("rustos: failed to allocate user stack");
 
-    // Build the initial stack frame (argc / argv / envp / auxv).
-    // We use the top page of the user stack as our write buffer.
     const PAGE: usize = 4096;
-    // The stack page VA range: [stack_top - PAGE, stack_top).
-    // We need the kernel-accessible physical address of that page to write into it.
-    // For now, since PA = VA in our identity map, we can write directly.
     let stack_page_va = stack_top - PAGE;
     let stack_buf: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut(stack_page_va as *mut u8, PAGE)
@@ -127,28 +133,20 @@ fn init_exec_x86_64(elf_bytes: &[u8], cpio: &[u8]) -> ! {
     let envp: &[&str] = &["HOME=/", "PATH=/bin"];
 
     let user_rsp = auxv::write_initial_stack(
-        stack_buf,
-        stack_top,
-        argv,
-        envp,
-        &loaded,
-        elf_bytes,
+        stack_buf, stack_top, argv, envp, &loaded, elf_bytes,
     );
 
     println!("rustos: jumping to /init at {:#x}, RSP={:#x}", loaded.entry, user_rsp);
-
-    // Load CR3 and sysretq into userspace.  Does not return.
     unsafe { uentry::sysret_to_user(cr3, loaded.entry, user_rsp) }
 }
 
-// ── RISC-V: load /init and sret into it ───────────────────────────────
+// ── RISC-V: load /init and sret into it ──────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 fn init_exec_riscv64(elf_bytes: &[u8], _cpio: &[u8]) -> ! {
     use crate::arch::riscv64::{paging, uentry};
     use crate::loader::{elf64, auxv};
 
-    // Allocate a root page table (Sv39 PPN).
     let satp_ppn = unsafe { paging::alloc_root_page_table() };
 
     let loaded = match elf64::load(elf_bytes, satp_ppn) {
@@ -171,15 +169,9 @@ fn init_exec_riscv64(elf_bytes: &[u8], _cpio: &[u8]) -> ! {
     let envp: &[&str] = &["HOME=/", "PATH=/bin"];
 
     let user_rsp = auxv::write_initial_stack(
-        stack_buf,
-        stack_top,
-        argv,
-        envp,
-        &loaded,
-        elf_bytes,
+        stack_buf, stack_top, argv, envp, &loaded, elf_bytes,
     );
 
     println!("rustos: jumping to /init at {:#x}, SP={:#x}", loaded.entry, user_rsp);
-
     unsafe { uentry::sret_to_user(satp_ppn, loaded.entry, user_rsp) }
 }
