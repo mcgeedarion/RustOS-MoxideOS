@@ -280,7 +280,7 @@ fn sys_creat_impl(path_va: usize, _mode: u32) -> isize {
     }
 }
 
-// ── NR 86/88/89  link / symlink / readlink ───────────────────────────────────────
+// ── NR 86/88  link / symlink ──────────────────────────────────────────────────
 
 fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
     let old = match read_cstr_safe(old_va) { Some(s) => s, None => return -14 };
@@ -300,23 +300,31 @@ fn sys_symlink_impl(target_va: usize, link_va: usize) -> isize {
     0
 }
 
+// ── NR 89  readlink ──────────────────────────────────────────────────────────
+//
+// Routes /proc/* paths through procfs_readlink (which handles /proc/self/exe,
+// /proc/self/fd/N, /proc/<pid>/exe, etc.) and falls back to the VFS symlink
+// store for regular filesystem symlinks.
+
 fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
-    if bufsiz == 0 { return -14; }
+    if bufsiz == 0 { return -22; }
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    let data: Option<alloc::vec::Vec<u8>> = if path == "/proc/self/exe" {
-        Some(b"/init".to_vec())
-    } else {
-        crate::fs::vfs::lookup(&path).and_then(|d| {
-            if d.starts_with(b"\x00symlink\x00") { Some(d[9..].to_vec()) } else { None }
-        })
-    };
-    match data {
-        Some(target) => {
+    if path.starts_with("/proc/") || path == "/proc/self" {
+        let mut kbuf = alloc::vec![0u8; bufsiz];
+        let n = crate::fs::procfs::procfs_readlink(&path, &mut kbuf);
+        if n < 0 { return n; }
+        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
+        return n;
+    }
+    // Regular VFS symlink.
+    match crate::fs::vfs::lookup(&path) {
+        Some(d) if d.starts_with(b"\x00symlink\x00") => {
+            let target = &d[9..];
             let n = target.len().min(bufsiz);
             if copy_to_user(buf_va, &target[..n]).is_err() { return -14; }
             n as isize
         }
-        None => -22,
+        _ => -22,
     }
 }
 
@@ -544,56 +552,6 @@ fn sys_time_impl(t_va: usize) -> isize {
     secs as isize
 }
 
-// ── NR 202  futex ─────────────────────────────────────────────────────────────
-
-const FUTEX_WAIT:         u32 = 0;
-const FUTEX_WAKE:         u32 = 1;
-const FUTEX_REQUEUE:      u32 = 3;
-const FUTEX_CMP_REQUEUE:  u32 = 4;
-const FUTEX_WAKE_OP:      u32 = 5;
-const FUTEX_WAIT_BITSET:  u32 = 9;
-const FUTEX_WAKE_BITSET:  u32 = 10;
-const FUTEX_PRIVATE_FLAG: u32 = 128;
-const FUTEX_CMD_MASK:     u32 = !(FUTEX_PRIVATE_FLAG | 256);
-const BITSET_ANY:         u32 = 0xFFFF_FFFF;
-
-fn sys_futex_impl(
-    uaddr: usize, op: u32, val: u32,
-    timeout_va: usize, uaddr2: usize, val3: u32,
-) -> isize {
-    if uaddr < 0x1000 { return -14; }
-    let op_base = op & FUTEX_CMD_MASK;
-    match op_base {
-        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            let bitset = if op_base == FUTEX_WAIT_BITSET { val3 } else { BITSET_ANY };
-            if bitset == 0 { return -22; }
-            let deadline_ns = if timeout_va == 0 {
-                u64::MAX
-            } else if !crate::uaccess::validate_user_ptr(timeout_va, 16) {
-                return -14;
-            } else {
-                let mut buf = [0u8; 16];
-                if copy_from_user(&mut buf, timeout_va).is_err() { return -14; }
-                let tv_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-                let tv_nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-                if tv_sec < 0 || tv_nsec < 0 || tv_nsec >= 1_000_000_000 { return -22; }
-                crate::time::monotonic_ns()
-                    .saturating_add((tv_sec as u64) * 1_000_000_000 + tv_nsec as u64)
-            };
-            crate::sync::futex::futex_wait(uaddr, val, bitset, deadline_ns)
-        }
-        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-            let bitset = if op_base == FUTEX_WAKE_BITSET { val3 } else { BITSET_ANY };
-            if bitset == 0 { return -22; }
-            crate::sync::futex::futex_wake(uaddr, val, bitset)
-        }
-        FUTEX_REQUEUE     => crate::sync::futex::futex_requeue(uaddr, val, uaddr2, timeout_va as u32, None),
-        FUTEX_CMP_REQUEUE => crate::sync::futex::futex_requeue(uaddr, val, uaddr2, timeout_va as u32, Some(val3)),
-        FUTEX_WAKE_OP     => crate::sync::futex::futex_wake_op(uaddr, val, uaddr2, timeout_va as u32, val3),
-        _ => -38,
-    }
-}
-
 // ── NR 203/204  sched_setaffinity / sched_getaffinity ───────────────────────────
 
 fn sys_sched_getaffinity_impl(_pid: usize, cpusetsize: usize, mask_va: usize) -> isize {
@@ -615,12 +573,6 @@ fn sys_clock_getres_impl(_clkid: u32, res_va: usize) -> isize {
         if copy_to_user(res_va, &buf).is_err() { return -14; }
     }
     0
-}
-
-// ── NR 234  tgkill ─────────────────────────────────────────────────────────────
-
-fn sys_tgkill_impl(_tgid: usize, tid: usize, sig: u32) -> isize {
-    sys_kill_impl(tid as isize, sig)
 }
 
 // ── NR 247  waitid ─────────────────────────────────────────────────────────────
@@ -679,41 +631,41 @@ fn sys_renameat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize) -
     crate::fs::stat_syscalls::sys_rename_str(&old, &new)
 }
 
+// ── NR 267  readlinkat ───────────────────────────────────────────────────────
+//
+// Same routing as sys_readlink_impl: /proc/* goes through procfs_readlink;
+// everything else uses the VFS symlink store.
+
 fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
-    if bufsiz == 0 { return -14; }
+    if bufsiz == 0 { return -22; }
     let path = match at_path(dirfd, path_va) { Some(p) => p, None => return -14 };
-    let data: Option<alloc::vec::Vec<u8>> = if path == "/proc/self/exe" {
-        Some(b"/init".to_vec())
-    } else {
-        crate::fs::vfs::lookup(&path).and_then(|d| {
-            if d.starts_with(b"\x00symlink\x00") { Some(d[9..].to_vec()) } else { None }
-        })
-    };
-    match data {
-        Some(target) => {
+    if path.starts_with("/proc/") || path == "/proc/self" {
+        let mut kbuf = alloc::vec![0u8; bufsiz];
+        let n = crate::fs::procfs::procfs_readlink(&path, &mut kbuf);
+        if n < 0 { return n; }
+        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
+        return n;
+    }
+    match crate::fs::vfs::lookup(&path) {
+        Some(d) if d.starts_with(b"\x00symlink\x00") => {
+            let target = &d[9..];
             let n = target.len().min(bufsiz);
             if copy_to_user(buf_va, &target[..n]).is_err() { return -14; }
             n as isize
         }
-        None => -22,
+        _ => -22,
     }
 }
 
-// ── NR 292  inotify_init1 ──────────────────────────────────────────────────────────
+// ── NR 280  utimensat ─────────────────────────────────────────────────────────
 
-fn sys_inotify_init1_impl(_flags: i32) -> isize {
-    static IN_COUNTER: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-    let id   = IN_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let name = alloc::format!("__inotify_{}", id);
-    crate::fs::vfs::create_file(&name, &[]);
-    match crate::fs::vfs::open(&name, crate::fs::vfs::O_RDONLY) {
-        Ok(fd) => fd as isize,
-        Err(_) => -24,
-    }
-}
+fn sys_utimensat_impl(_dirfd: i32, _path_va: usize, _times_va: usize, _flags: i32) -> isize { 0 }
 
-// ── NR 318  getrandom ────────────────────────────────────────────────────────────
+// ── NR 318  getrandom ────────────────────────────────────────────────────────
+//
+// Fills the user buffer with entropy from RDRAND (or LFSR fallback).
+// Capped at 4096 bytes per call to bound single-syscall latency.
+// Wired as NR 318 in mod.rs dispatch.
 
 const GETRANDOM_MAX: usize = 4096;
 
@@ -748,3 +700,15 @@ fn sys_memfd_create_impl(name_va: usize, _flags: u32) -> isize {
         Err(e) => e as isize,
     }
 }
+
+// ── Misc stubs ────────────────────────────────────────────────────────────────
+
+fn sys_chmod_impl(_path_va: usize, _mode: u32) -> isize { 0 }
+fn sys_fchmod_impl(_fd: usize, _mode: u32) -> isize { 0 }
+fn sys_chown_impl(_path_va: usize, _uid: u32, _gid: u32) -> isize { 0 }
+fn sys_fchown_impl(_fd: usize, _uid: u32, _gid: u32) -> isize { 0 }
+fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
+fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
+fn sys_ptrace_impl(_req: i32, _pid: i32, _addr: usize, _data: usize) -> isize { -1 }
+fn sys_mount_impl(_src: usize, _tgt: usize, _fs: usize, _flags: u64, _data: usize) -> isize { 0 }
+fn sys_syslog_impl(_t: i32, _buf: usize, _len: i32) -> isize { 0 }
