@@ -75,6 +75,13 @@ pub struct Pcb {
     /// Empty chain = no filtering.  strict = SECCOMP_SET_MODE_STRICT.
     /// Inherited (copied) into fork/clone children.
     pub seccomp: FilterChain,
+
+    // ── NPTL / robust futex ─────────────────────────────────────────────────
+    /// User-VA of the robust_list_head registered by set_robust_list(2).
+    /// 0 = not registered.
+    pub robust_list_head: usize,
+    /// Byte length of the robust list head struct (16 or 24).
+    pub robust_list_len:  usize,
 }
 
 impl Pcb {
