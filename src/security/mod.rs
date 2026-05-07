@@ -1,12 +1,12 @@
-//! Kernel security / capability subsystem (stub).
+//! Kernel security / capability subsystem.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Linux-compatible capability bitmask (two 32-bit halves → one u64).
 ///
 /// All 64 capability bits can be individually set, cleared, or tested.
-/// The kernel starts every process with a full set (trusted root environment);
-/// real capability enforcement is a future work item.
+/// New processes inherit a full set from their parent; capability enforcement
+/// is applied per-process via `check_capability`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct CapSet(pub u64);
 
@@ -30,11 +30,25 @@ impl CapSet {
     }
 }
 
-/// Global "privileged" flag used by simple capability checks.
-static PRIVILEGED: AtomicU64 = AtomicU64::new(!0u64);
+/// Global fallback used only before the scheduler has a current process
+/// (e.g. during early kernel init).  Never modified after boot.
+static BOOT_CAPS: AtomicU64 = AtomicU64::new(!0u64);
 
-/// Returns `true` if the current task holds the given Linux capability number.
+/// Returns `true` if the **current process** holds Linux capability `cap`.
+///
+/// Consults the per-process `CapSet` stored in the PCB.  Falls back to the
+/// global boot caps during early init (before the scheduler has a runnable
+/// process).
 pub fn check_capability(cap: u32) -> bool {
     if cap >= 64 { return false; }
-    PRIVILEGED.load(Ordering::Relaxed) & (1 << cap) != 0
+    // Ask the scheduler for the current process's capability set.
+    // `with_proc` returns None if the scheduler has no current process.
+    let pid = crate::proc::scheduler::current_pid();
+    if pid != 0 {
+        if let Some(has) = crate::proc::scheduler::with_proc(pid, |p| p.caps.has(cap)) {
+            return has;
+        }
+    }
+    // Fall back to boot-time global caps (always full during kernel init).
+    BOOT_CAPS.load(Ordering::Relaxed) & (1 << cap) != 0
 }

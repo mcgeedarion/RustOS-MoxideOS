@@ -74,6 +74,18 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     <Arch as Paging>::map_page(cr3, faulting_va & !0xFFF, new_pa, flags);
     <Arch as Paging>::flush_va(faulting_va & !0xFFF);
     // See safety invariant in doc comment above.
+    // Debug assertion: the VA should now be unreachable via the old PA
+    // (the arch layer must have replaced the PTE before we arrive here).
+    #[cfg(debug_assertions)]
+    {
+        let current_pa = unsafe { crate::mm::cow_fault::pte_read_pub(cr3, faulting_va & !0xFFF) };
+        debug_assert!(
+            current_pa.map_or(true, |pte| pte & 0x000F_FFFF_FFFF_F000 != old_pa as u64),
+            "cow_fault: PTE still points to old_pa {:#x} after map_page — \
+             arch layer did not replace it before free_page",
+            old_pa
+        );
+    }
     pmm::free_page(old_pa);
 
     true
@@ -85,6 +97,13 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT:   u64 = 1;
 /// Bit 7 in a PDPTE or PDE: page size (1 GiB / 2 MiB large page).
 const PAGE_SIZE_BIT: u64 = 1 << 7;
+
+/// Public alias for the debug assertion in handle_cow_fault.
+/// Only used in debug builds.
+#[cfg(debug_assertions)]
+pub unsafe fn pte_read_pub(cr3: usize, va: usize) -> Option<u64> {
+    unsafe { pte_read(cr3, va) }
+}
 
 /// Walk the 4-level page table and return the leaf PTE value for `va`.
 ///

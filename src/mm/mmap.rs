@@ -164,7 +164,11 @@ pub fn sys_mmap(
             let fb_phys = info.fb_phys as usize;
             let fb_size = crate::drivers::gop::fb_byte_size(&info);
             if offset >= fb_phys && offset < fb_phys + fb_size {
-                return mmap_phys(addr, len, prot, flags, pid, offset as u64);
+                // Clamp `len` so it cannot extend past the end of the FB,
+                // preventing userspace from mapping physical memory beyond it.
+                let max_len = fb_size - (offset - fb_phys);
+                let safe_len = len.min(max_len);
+                return mmap_phys(addr, safe_len, prot, flags, pid, offset as u64);
             }
         }
     }
@@ -348,12 +352,26 @@ pub fn sys_brk(addr: usize) -> isize {
     if addr == 0 || addr <= old_brk { return old_brk as isize; }
     let new_brk = page_align_up(addr);
 
+    let pte_flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX;
+    let mut mapped_end = old_brk;
+
     for va in (old_brk..new_brk).step_by(PAGE) {
-        if let Some(pa) = crate::mm::pmm::alloc_page() {
-            <Arch as Paging>::map_page(
-                user_cr3, va, pa,
-                PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX,
-            );
+        match crate::mm::pmm::alloc_page() {
+            Some(pa) => {
+                <Arch as Paging>::map_page(user_cr3, va, pa, pte_flags);
+                mapped_end = va + PAGE;
+            }
+            None => {
+                // OOM: unmap the pages we already committed and return the
+                // old brk so the caller knows the expansion failed.
+                for rollback_va in (old_brk..mapped_end).step_by(PAGE) {
+                    if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, rollback_va) {
+                        <Arch as Paging>::unmap_page(rollback_va);
+                        crate::mm::pmm::free_page(pa);
+                    }
+                }
+                return old_brk as isize;
+            }
         }
     }
 

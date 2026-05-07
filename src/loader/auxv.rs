@@ -127,8 +127,25 @@ pub fn write_initial_stack(
         stack_top_va - page + off
     };
 
-    // Write random bytes (16) for AT_RANDOM.
-    let random_va = write_str("AAAAAAAAAAAAAAAA"); // placeholder random
+    // Write 16 cryptographically-seeded random bytes for AT_RANDOM.
+    // glibc uses these as its stack-canary seed and pointer-encryption key —
+    // they must be unique per process per boot, never a fixed constant.
+    let random_bytes: [u8; 16] = {
+        let a = crate::rand::next_u64().to_le_bytes();
+        let b = crate::rand::next_u64().to_le_bytes();
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&a);
+        buf[8..].copy_from_slice(&b);
+        buf
+    };
+    // Write the bytes as a raw blob (not a NUL-terminated string) so that
+    // bytes with value 0 are preserved verbatim.
+    let random_va = {
+        let off = string_off;
+        stack_buf[off..off + 16].copy_from_slice(&random_bytes);
+        string_off += 16;
+        stack_top_va - page + off
+    };
 
     // Write execfn (argv[0]).
     let execfn_va = if argv.is_empty() {

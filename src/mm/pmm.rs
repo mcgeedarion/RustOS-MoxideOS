@@ -18,9 +18,12 @@
 //!
 //! ## Safety invariant
 //!   Every PA on the free list appears exactly once.
-//!   In debug builds, free_page() asserts this before pushing.
+//!   For bootstrap-pool pages, a static bitset (`POOL_FREE_BITS`) enforces
+//!   this in all build modes (debug and release) in O(1).
+//!   For dynamic pages (added via pmm_add_region), the free list Vec is
+//!   scanned in debug builds only (O(n)); a future bitmap can cover them too.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use spin::Mutex;
 extern crate alloc;
 use alloc::vec::Vec;
@@ -35,10 +38,56 @@ struct Pool([u8; POOL_PAGES * PAGE_SIZE]);
 static POOL: Pool = Pool([0u8; POOL_PAGES * PAGE_SIZE]);
 static BUMP: AtomicUsize = AtomicUsize::new(0);
 
+// ── Pool double-free bitmap ───────────────────────────────────────────────────────────────────────
+//
+// One bit per pool page: 1 = currently on the free list, 0 = allocated.
+// Allows O(1) double-free detection in all build modes without scanning the
+// free list Vec.  POOL_PAGES / 64 = 256 u64 words.
+
+const BITMAP_WORDS: usize = POOL_PAGES / 64; // 256 words
+static POOL_FREE_BITS: [AtomicU64; BITMAP_WORDS] = {
+    // const initialiser — all zeros means "all allocated" at boot.
+    const ZERO: AtomicU64 = AtomicU64::new(0);
+    [ZERO; BITMAP_WORDS]
+};
+
+/// Mark pool page `idx` as free (returns false if already free → double-free).
+#[inline]
+fn pool_bit_set_free(idx: usize) -> bool {
+    let word = idx / 64;
+    let bit  = 1u64 << (idx % 64);
+    // fetch_or returns the old value; if bit was already 1 → double-free.
+    POOL_FREE_BITS[word].fetch_or(bit, Ordering::Relaxed) & bit == 0
+}
+
+/// Mark pool page `idx` as allocated (clears free bit).
+#[inline]
+fn pool_bit_clear_free(idx: usize) {
+    let word = idx / 64;
+    let bit  = 1u64 << (idx % 64);
+    POOL_FREE_BITS[word].fetch_and(!bit, Ordering::Relaxed);
+}
+
+/// Return the index of `pa` in the pool, or None if `pa` is not a pool page.
+#[inline]
+fn pool_index(pa: usize) -> Option<usize> {
+    let pool_base = POOL.0.as_ptr() as usize;
+    let pool_end  = pool_base + POOL_PAGES * PAGE_SIZE;
+    if pa >= pool_base && pa < pool_end {
+        Some((pa - pool_base) / PAGE_SIZE)
+    } else {
+        None
+    }
+}
+
 // ── Free list ─────────────────────────────────────────────────────────────────────────────────────
 
 static FREE_LIST:   Mutex<Vec<usize>> = Mutex::new(Vec::new());
-static TOTAL_PAGES: AtomicUsize      = AtomicUsize::new(POOL_PAGES);
+/// Total pages managed by the PMM.  Starts at 0; incremented only when pages
+/// are actually registered (bump pool pages on alloc, dynamic pages on add).
+/// This keeps total_pages() and free_pages() consistent: both reflect only
+/// pages the PMM has explicitly taken ownership of.
+static TOTAL_PAGES: AtomicUsize      = AtomicUsize::new(0);
 /// Lock-free counter mirroring FREE_LIST.len(); avoids locking just for diagnostics.
 static FREE_COUNT:  AtomicUsize      = AtomicUsize::new(0);
 
@@ -95,6 +144,8 @@ pub fn init() {
 pub fn alloc_page() -> Option<usize> {
     let pa = if let Some(pa) = FREE_LIST.lock().pop() {
         FREE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        // Clear the pool free-bit (no-op for dynamic pages).
+        if let Some(idx) = pool_index(pa) { pool_bit_clear_free(idx); }
         pa
     } else {
         let idx = BUMP.fetch_add(1, Ordering::Relaxed);
@@ -102,6 +153,8 @@ pub fn alloc_page() -> Option<usize> {
             BUMP.fetch_sub(1, Ordering::Relaxed);
             return None;
         }
+        // First time this bump page enters the system — count it as managed.
+        TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
         POOL.0.as_ptr() as usize + idx * PAGE_SIZE
     };
     // Zero the page so callers always receive clean memory.
@@ -112,9 +165,10 @@ pub fn alloc_page() -> Option<usize> {
 
 /// Return a page to the free list for reuse.
 ///
-/// # Panics (debug builds only)
-/// Panics if `pa` is already on the free list (double-free detection).
-/// Also panics if `pa` is 0, not page-aligned, or inside the kernel image.
+/// # Panics
+/// - Always: if `pa` is 0, not page-aligned, or inside the kernel image.
+/// - Always (O(1)): if `pa` is a pool page that is already free (double-free).
+/// - Debug only (O(n)): if `pa` is a dynamic page already on the free list.
 pub fn free_page(pa: usize) {
     if pa == 0 { return; }
     assert!(
@@ -128,14 +182,26 @@ pub fn free_page(pa: usize) {
         pa, kernel_start_pa(), kernel_end_pa()
     );
 
+    // O(1) double-free check for pool pages (all build modes).
+    if let Some(idx) = pool_index(pa) {
+        assert!(
+            pool_bit_set_free(idx),
+            "free_page: double-free of pool PA {:#x} (pool index {})",
+            pa, idx
+        );
+    }
+
     let mut list = FREE_LIST.lock();
 
+    // O(n) double-free check for dynamic pages (debug builds only).
     #[cfg(debug_assertions)]
-    assert!(
-        !list.contains(&pa),
-        "free_page: double-free of PA {:#x}",
-        pa
-    );
+    if pool_index(pa).is_none() {
+        assert!(
+            !list.contains(&pa),
+            "free_page: double-free of dynamic PA {:#x}",
+            pa
+        );
+    }
 
     list.push(pa);
     // Increment after the push so FREE_COUNT never exceeds FREE_LIST.len().

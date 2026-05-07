@@ -103,10 +103,18 @@ pub fn load(image: &[u8], cr3: usize) -> Option<LoadedElf> {
         _ => return None,
     };
 
-    // For PIE (ET_DYN), choose a fixed load bias.
-    // Linux uses a random bias; we use a deterministic one for now.
-    const PIE_BASE: usize = 0x0000_5555_5555_0000;
-    let bias = if is_dyn { PIE_BASE } else { 0 };
+    // For PIE (ET_DYN), choose a randomised load bias within the lower half
+    // of user space.  We align to 2 MiB so huge-page mappings remain valid.
+    // Bias range: [0x0000_1000_0000_0000, 0x0000_7000_0000_0000) in 2 MiB steps.
+    const ASLR_BASE:  usize = 0x0000_1000_0000_0000;
+    const ASLR_RANGE: usize = 0x0000_6000_0000_0000;
+    const ALIGN_2MB:  usize = 2 * 1024 * 1024;
+    let bias = if is_dyn {
+        let rand_off = (crate::rand::next_u64() as usize) % (ASLR_RANGE / ALIGN_2MB);
+        ASLR_BASE + rand_off * ALIGN_2MB
+    } else {
+        0
+    };
 
     let phoff    = ehdr.e_phoff as usize;
     let phnum    = ehdr.e_phnum as usize;

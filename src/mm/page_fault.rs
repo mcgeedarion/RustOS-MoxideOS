@@ -19,7 +19,7 @@ use crate::arch::{Arch, api::{Paging, PageFlags}};
 use crate::mm::mmap::{VmaKind, PROT_WRITE, PROT_EXEC, find_vma};
 use crate::mm::pmm::{alloc_page, free_page};
 use crate::proc::scheduler;
-use crate::proc::signal::{send_signal_info, send_sigsegv, SigInfo};
+use crate::proc::signal::{send_signal, send_signal_info, send_sigsegv, SigInfo};
 
 const PAGE_SIZE: usize = 4096;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
@@ -54,7 +54,9 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
     let pa = match alloc_page() {
         Some(p) => p,
         None    => {
-            // OOM: no signal — let the arch handler deliver SIGKILL or panic.
+            // OOM: the process cannot continue — deliver SIGKILL so it is
+            // reaped rather than spinning forever retrying the faulting insn.
+            send_signal(pid, 9 /* SIGKILL */);
             return false;
         }
     };
@@ -97,6 +99,17 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             free_page(pa);
             send_sigsegv(pid, faulting_va);
             return false;
+        }
+        VmaKind::PhysMap(phys_base) => {
+            // Physical (MMIO/framebuffer) mapping: re-map the exact physical
+            // page — do NOT use the PMM-allocated `pa`.  Return `pa` to the
+            // PMM immediately; the physical page is not kernel-owned.
+            free_page(pa);
+            let phys_pa = (*phys_base as usize) + (page_va - vma.start);
+            let flags = prot_to_flags(vma.prot);
+            <Arch as Paging>::map_page(user_cr3, page_va, phys_pa, flags);
+            <Arch as Paging>::flush_va(page_va);
+            return true;
         }
     }
 

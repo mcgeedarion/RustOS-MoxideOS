@@ -30,7 +30,10 @@ pub extern "C" fn kernel_main(_hart_id: usize, _fdt_ptr: usize) -> ! {
     println!("rustos: kernel_main reached");
     println!("TEST PASS: uart_smoke");
 
-    // ── 2. Architecture early init ──────────────────────────────────────
+    // ── 2. Seed PRNG from TSC (must precede any entropy consumer) ────────
+    crate::rand::seed_from_tsc();
+
+    // ── 2b. Architecture early init ──────────────────────────────────────
     ArchImpl::early_init();
 
     // ── 3. Physical memory manager ───────────────────────────────────────

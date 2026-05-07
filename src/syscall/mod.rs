@@ -16,6 +16,29 @@ include!("stubs.rs");
 // EPOLL_CLOEXEC flag value (matches Linux).
 const EPOLL_CLOEXEC: u32 = 0x0008_0000;
 
+/// Safely narrow a 64-bit syscall argument to u32.
+/// Returns None (EINVAL) if the high bits are non-zero — prevents silent
+/// truncation where a caller passes e.g. signal=0x1_00000009 and we'd
+/// silently interpret it as signal 9.
+#[inline(always)]
+fn arg_u32(v: usize) -> Option<u32> {
+    if v > u32::MAX as usize { None } else { Some(v as u32) }
+}
+
+/// Safely narrow a 64-bit syscall argument to i32.
+/// The argument is expected to arrive as a sign-extended i32 value
+/// (the kernel sign-extends register arguments for i32 params on Linux ABI).
+/// We accept values whose upper 32 bits are either all-zeros or all-ones.
+#[inline(always)]
+fn arg_i32(v: usize) -> Option<i32> {
+    let v = v as isize;
+    if v >= i32::MIN as isize && v <= i32::MAX as isize {
+        Some(v as i32)
+    } else {
+        None
+    }
+}
+
 /// sys_epoll_create1 wrapper: creates an epoll instance and sets FD_CLOEXEC
 /// on the returned fd when EPOLL_CLOEXEC is present in flags.
 /// Programs using glibc >= 2.9 always pass EPOLL_CLOEXEC; without this the
@@ -79,7 +102,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         270 => crate::fs::poll::sys_pselect6(a, b, c, d, e, f),
         271 => crate::fs::poll::sys_ppoll(a, b, c, d, e),
         281 => crate::fs::poll::sys_epoll_pwait(a, b, c as i32, d as i32, e, f),
-        291 => sys_epoll_create1(a as u32),                    // epoll_create1(flags) — CLOEXEC aware
+        291 => sys_epoll_create1(a as u32),
         // ── stat / path ops ───────────────────────────────────────────────────────────────
         4   => crate::fs::stat_syscalls::sys_stat(a, b),
         5   => crate::fs::stat_syscalls::sys_fstat(a, b),
@@ -105,40 +128,84 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         149 => sys_mlock_impl(a, b),
         150 => sys_munlock_impl(a, b),
         // ── process / signals ───────────────────────────────────────────────────────────────
-        13  => crate::proc::signal::sys_rt_sigaction(a as u32, b, c, d),
-        14  => crate::proc::signal::sys_rt_sigprocmask(a as u32, b, c, d),
+        // NR 13 — rt_sigaction(signum, act, old, sigsetsize)
+        // signum must fit in u32 and be a valid signal (1..64).
+        13  => match arg_u32(a) {
+                   Some(sig) if sig >= 1 && sig <= 64 =>
+                       crate::proc::signal::sys_rt_sigaction(sig, b, c, d),
+                   _ => -22, // EINVAL
+               },
+        // NR 14 — rt_sigprocmask(how, set, old, sigsetsize)
+        // `how` is SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2.
+        14  => match arg_u32(a) {
+                   Some(how) if how <= 2 =>
+                       crate::proc::signal::sys_rt_sigprocmask(how, b, c, d),
+                   _ => -22, // EINVAL
+               },
         24  => sys_sched_yield_impl(),
         35  => crate::proc::nanosleep::sys_nanosleep(a, b),
-        39  => crate::proc::scheduler::current_pid() as isize,       // getpid
+        39  => crate::proc::scheduler::current_pid() as isize,  // getpid
         56  => sys_clone_impl(a, b, c, d, e),
         57  => crate::proc::fork_syscall::sys_fork(),
         58  => sys_vfork_impl(),
         60  => crate::proc::exit::sys_exit(a as i32),
         61  => crate::proc::wait::sys_waitpid(a as isize, b, c as u32),
-        62  => sys_kill_impl(a as isize, b as u32),
+        // NR 62 — kill(pid, sig): sig 0 is valid (existence check); reject >64.
+        62  => match arg_u32(b) {
+                   Some(sig) if sig <= 64 => sys_kill_impl(a as isize, sig),
+                   _ => -22, // EINVAL
+               },
         63  => sys_uname_impl(a),
         98  => sys_getrusage_impl(a as i32, b),
         99  => sys_sysinfo_impl(a),
-        // NR 110 = getppid — single lock window via current_ppid()
-        110 => crate::proc::scheduler::current_ppid() as isize,
-        // NR 111 = getpmsg (STREAMS, not implemented — ENOSYS)
-        113 => if (b as isize) < 0 { -22 } else { 0 }, // setpgid(pid, pgid): stub; EINVAL if pgid < 0
-        114 => crate::proc::scheduler::current_pid() as isize,   // getpgrp
-        121 => crate::proc::scheduler::current_pid() as isize,   // getpgid(pid) stub — returns own pgid
+        110 => crate::proc::scheduler::current_ppid() as isize, // getppid
+        // NR 113 — setpgid(pid, pgid): both are plain process IDs; reject if
+        // high bits are set (they'd silently truncate to a different PID).
+        113 => match (arg_u32(a), arg_u32(b)) {
+                   (Some(pid), Some(pgid)) => {
+                       let _ = (pid, pgid); // stub — validates args then succeeds
+                       0
+                   }
+                   _ => -22, // EINVAL
+               },
+        114 => crate::proc::scheduler::current_pid() as isize,  // getpgrp
+        121 => crate::proc::scheduler::current_pid() as isize,  // getpgid(pid) stub
         131 => sys_sigaltstack_impl(a, b),
         158 => crate::arch::x86_64::syscall::sys_arch_prctl(a as i32, b),
         185 => sys_prctl_impl(a as i32, b, c, d, e),
         186 => crate::proc::thread::sys_gettid(),
         201 => sys_time_impl(a),
-        202 => sys_futex_impl(a, b as u32, c as u32, d, e, f as u32),
+        // NR 202 — futex: op and val are u32 on the ABI.
+        202 => match (arg_u32(b), arg_u32(c), arg_u32(f)) {
+                   (Some(op), Some(val), Some(val3)) =>
+                       sys_futex_impl(a, op, val, d, e, val3),
+                   _ => -22, // EINVAL
+               },
         203 => sys_sched_setaffinity_impl(a, b, c),
         204 => sys_sched_getaffinity_impl(a, b, c),
         218 => crate::arch::x86_64::syscall::sys_set_tid_address(a),
-        228 => crate::proc::nanosleep::sys_clock_gettime(a as u32, b),
-        230 => sys_clock_getres_impl(a as u32, b),
+        // NR 228 — clock_gettime(clockid, timespec*)
+        228 => match arg_u32(a) {
+                   Some(clk) => crate::proc::nanosleep::sys_clock_gettime(clk, b),
+                   None => -22, // EINVAL
+               },
+        // NR 230 — clock_getres(clockid, timespec*)
+        230 => match arg_u32(a) {
+                   Some(clk) => sys_clock_getres_impl(clk, b),
+                   None => -22, // EINVAL
+               },
         231 => crate::proc::exit::sys_exit_group(a as i32),
-        234 => sys_tgkill_impl(a, b, c as u32),
-        247 => sys_waitid_impl(a as i32, b as i32, c, d as u32),
+        // NR 234 — tgkill(tgid, tid, sig): sig must be valid.
+        234 => match arg_u32(c) {
+                   Some(sig) if sig <= 64 => sys_tgkill_impl(a, b, sig),
+                   _ => -22, // EINVAL
+               },
+        // NR 247 — waitid(idtype, id, infop, options)
+        247 => match (arg_i32(a), arg_i32(b), arg_u32(d)) {
+                   (Some(idtype), Some(id), Some(opts)) =>
+                       sys_waitid_impl(idtype, id, c, opts),
+                   _ => -22, // EINVAL
+               },
         // ── uid / gid ─────────────────────────────────────────────────────────────────────────
         96  => sys_gettimeofday_impl(a, b),
         97  => sys_getrlimit_impl(a as u32, b),
