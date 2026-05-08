@@ -9,24 +9,28 @@
 //! a ramfs mount point, all I/O is forwarded here.
 //!
 //! ## Supported operations
-//!   open, creat, read, write, seek, truncate
+//!   open, creat, read, write, pread, pwrite, seek, truncate, ftruncate
 //!   mkdir, rmdir, unlink, rename, link, symlink, readlink
-//!   stat, statfs, readdir (getdents64)
-//!   mmap (MAP_ANONYMOUS-style: returns a Vec that lives until munmap)
+//!   stat (full: uid/gid/timestamps), statfs, readdir (getdents64)
+//!   chmod, chown
+//!
+//! ## Multi-mount correctness
+//!   Every mutating shim uses `find_instance_and_rel` to route to the
+//!   specific TmpFs instance for the given full path, so /tmp, /run, and
+//!   /dev/shm are genuinely independent namespaces.
 
 extern crate alloc;
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
-    sync::Arc,
     vec,
     vec::Vec,
 };
 use spin::Mutex;
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-const TMPFS_MAGIC:   u64 = 0x0102_1994;
+pub const TMPFS_MAGIC:   u64 = 0x0102_1994;
 const DEFAULT_LIMIT: usize = 64 * 1024 * 1024; // 64 MiB per mount
 const INO_ROOT:      u64  = 1;
 
@@ -36,7 +40,7 @@ const S_IFDIR: u16 = 0o0040_000;
 const S_IFLNK: u16 = 0o0120_000;
 const S_IFMT:  u16 = 0o0170_000;
 
-// ── Inode ────────────────────────────────────────────────────────────────────
+// ── Inode ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum INodeData {
@@ -47,15 +51,15 @@ enum INodeData {
 
 #[derive(Clone)]
 struct INode {
-    ino:        u64,
-    mode:       u16,
-    uid:        u32,
-    gid:        u32,
-    nlink:      u32,
-    atime:      u64,
-    mtime:      u64,
-    ctime:      u64,
-    data:       INodeData,
+    ino:   u64,
+    mode:  u16,
+    uid:   u32,
+    gid:   u32,
+    nlink: u32,
+    atime: u64,
+    mtime: u64,
+    ctime: u64,
+    data:  INodeData,
 }
 
 impl INode {
@@ -84,13 +88,13 @@ impl INode {
     fn is_file(&self) -> bool { self.mode & S_IFMT == S_IFREG }
 }
 
-// ── Per-mount filesystem state ───────────────────────────────────────────────
+// ── Per-mount filesystem state ────────────────────────────────────────────────
 
 struct TmpFs {
     inodes:   BTreeMap<u64, INode>,
     next_ino: u64,
-    used:     usize,   // bytes of file data currently allocated
-    limit:    usize,   // maximum bytes of file data
+    used:     usize,
+    limit:    usize,
 }
 
 impl TmpFs {
@@ -101,7 +105,6 @@ impl TmpFs {
             used:     0,
             limit,
         };
-        // Create root directory inode.
         let root = INode::new_dir(INO_ROOT);
         fs.inodes.insert(INO_ROOT, root);
         fs
@@ -113,8 +116,8 @@ impl TmpFs {
         i
     }
 
-    // Resolve absolute path → inode number.  Does NOT follow the final
-    // component if it is a symlink (use resolve_follow for that).
+    // ── Path resolution ───────────────────────────────────────────────────────
+
     fn lookup(&self, path: &str) -> Option<u64> {
         let path = path.trim_start_matches('/');
         let mut cur = INO_ROOT;
@@ -122,7 +125,6 @@ impl TmpFs {
         for part in path.split('/') {
             if part.is_empty() || part == "." { continue; }
             if part == ".." {
-                // Walk up: find any dir that has `cur` as a child.
                 let mut found = INO_ROOT;
                 'outer: for inode in self.inodes.values() {
                     if let INodeData::Dir(d) = &inode.data {
@@ -141,14 +143,12 @@ impl TmpFs {
             if let INodeData::Dir(d) = &dir_node.data {
                 cur = *d.get(part)?;
             } else {
-                return None; // not a directory
+                return None;
             }
         }
         Some(cur)
     }
 
-    // Split a path into (parent_ino, filename).  Returns None if parent does
-    // not exist or is not a directory.
     fn split_parent(&self, path: &str) -> Option<(u64, String)> {
         let path = path.trim_end_matches('/');
         match path.rfind('/') {
@@ -167,35 +167,98 @@ impl TmpFs {
         }
     }
 
-    // ── File I/O ─────────────────────────────────────────────────────────────
+    // ── File I/O ──────────────────────────────────────────────────────────────
 
     fn read_all(&self, path: &str) -> Result<Vec<u8>, isize> {
-        let ino = self.lookup(path).ok_or(-2isize)?; // ENOENT
+        let ino = self.lookup(path).ok_or(-2isize)?;
         let node = self.inodes.get(&ino).ok_or(-2isize)?;
         match &node.data {
-            INodeData::File(v) => Ok(v.clone()),
-            INodeData::Dir(_)  => Err(-21),  // EISDIR
-            INodeData::Symlink(_) => Err(-22), // EINVAL — use readlink
+            INodeData::File(v)    => Ok(v.clone()),
+            INodeData::Dir(_)     => Err(-21),
+            INodeData::Symlink(_) => Err(-22),
+        }
+    }
+
+    /// Read `len` bytes from `path` starting at `offset`.
+    fn pread(&self, path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
+        let ino = self.lookup(path).ok_or(-2isize)?;
+        let node = self.inodes.get(&ino).ok_or(-2isize)?;
+        match &node.data {
+            INodeData::File(v) => {
+                if offset >= v.len() { return Ok(Vec::new()); }
+                let end = (offset + len).min(v.len());
+                Ok(v[offset..end].to_vec())
+            }
+            INodeData::Dir(_)     => Err(-21), // EISDIR
+            INodeData::Symlink(_) => Err(-22), // EINVAL
+        }
+    }
+
+    /// Write `data` to `path` at `offset`, extending the file if necessary.
+    fn pwrite(&mut self, path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
+        let ino = self.lookup(path).ok_or(-2isize)?;
+        let node = self.inodes.get_mut(&ino).ok_or(-2isize)?;
+        match &mut node.data {
+            INodeData::File(v) => {
+                let end = offset + data.len();
+                let old_len = v.len();
+                // Capacity check against mount limit.
+                let new_used = self.used as isize
+                    - old_len as isize
+                    + end.max(old_len) as isize;
+                if new_used > self.limit as isize { return Err(-28); } // ENOSPC
+                if end > v.len() { v.resize(end, 0); }
+                v[offset..end].copy_from_slice(data);
+                self.used = (self.used as isize
+                    - old_len as isize
+                    + v.len() as isize) as usize;
+                Ok(data.len())
+            }
+            INodeData::Dir(_)     => Err(-21),
+            INodeData::Symlink(_) => Err(-22),
         }
     }
 
     fn write_all(&mut self, path: &str, data: &[u8]) -> Result<(), isize> {
-        let delta = data.len() as isize;
         let ino = self.lookup(path).ok_or(-2isize)?;
         let node = self.inodes.get_mut(&ino).ok_or(-2isize)?;
         match &mut node.data {
             INodeData::File(v) => {
                 let old_len = v.len() as isize;
-                let new_used = self.used as isize - old_len + delta;
-                if new_used as usize > self.limit { return Err(-28); } // ENOSPC
+                let new_used = self.used as isize - old_len + data.len() as isize;
+                if new_used as usize > self.limit { return Err(-28); }
                 self.used = new_used as usize;
                 *v = data.to_vec();
                 Ok(())
             }
-            INodeData::Dir(_) => Err(-21),  // EISDIR
+            INodeData::Dir(_)     => Err(-21),
             INodeData::Symlink(_) => Err(-22),
         }
     }
+
+    /// Resize a file to exactly `len` bytes (truncate or zero-extend).
+    fn truncate(&mut self, path: &str, len: usize) -> Result<(), isize> {
+        let ino = self.lookup(path).ok_or(-2isize)?;
+        let node = self.inodes.get_mut(&ino).ok_or(-2isize)?;
+        if node.is_dir() { return Err(-21); } // EISDIR
+        match &mut node.data {
+            INodeData::File(v) => {
+                let old_len = v.len();
+                // Check new size against limit (only when growing).
+                if len > old_len {
+                    let new_used = self.used + (len - old_len);
+                    if new_used > self.limit { return Err(-28); } // ENOSPC
+                }
+                let delta = len as isize - old_len as isize;
+                v.resize(len, 0);
+                self.used = (self.used as isize + delta) as usize;
+                Ok(())
+            }
+            _ => Err(-22),
+        }
+    }
+
+    // ── Directory operations ──────────────────────────────────────────────────
 
     fn create(&mut self, path: &str) -> Result<(), isize> {
         if self.lookup(path).is_some() { return Err(-17); } // EEXIST
@@ -210,28 +273,32 @@ impl TmpFs {
     }
 
     fn mkdir(&mut self, path: &str) -> Result<(), isize> {
-        if self.lookup(path).is_some() { return Err(-17); } // EEXIST
+        if self.lookup(path).is_some() { return Err(-17); }
         let (parent_ino, name) = self.split_parent(path).ok_or(-2isize)?;
         let ino = self.alloc_ino();
         let mut node = INode::new_dir(ino);
-        // Add ".." pointing to parent
         if let INodeData::Dir(d) = &mut node.data {
             d.insert("..".to_string(), parent_ino);
         }
         self.inodes.insert(ino, node);
+        // Bump parent nlink for the new ".."
+        if let Some(p) = self.inodes.get_mut(&parent_ino) { p.nlink += 1; }
         if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&parent_ino).map(|n| &mut n.data) {
             d.insert(name, ino);
         }
         Ok(())
     }
 
-    fn unlink(&mut self, path: &str) -> Result<(), isize> {
+    /// Remove an empty directory.
+    fn rmdir(&mut self, path: &str) -> Result<(), isize> {
         let ino = self.lookup(path).ok_or(-2isize)?;
         {
             let node = self.inodes.get(&ino).ok_or(-2isize)?;
-            if node.is_dir() { return Err(-21); } // EISDIR
-            if let INodeData::File(v) = &node.data {
-                self.used = self.used.saturating_sub(v.len());
+            if !node.is_dir() { return Err(-20); } // ENOTDIR
+            // Must be empty (only "." and ".." allowed)
+            if let INodeData::Dir(d) = &node.data {
+                let non_dot = d.keys().filter(|k| k.as_str() != "." && k.as_str() != "..").count();
+                if non_dot > 0 { return Err(-39); } // ENOTEMPTY
             }
         }
         self.inodes.remove(&ino);
@@ -239,20 +306,79 @@ impl TmpFs {
         if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&parent_ino).map(|n| &mut n.data) {
             d.remove(&name);
         }
+        // Decrement parent nlink (the ".."/subdirectory link is gone)
+        if let Some(p) = self.inodes.get_mut(&parent_ino) {
+            p.nlink = p.nlink.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    fn unlink(&mut self, path: &str) -> Result<(), isize> {
+        let ino = self.lookup(path).ok_or(-2isize)?;
+        {
+            let node = self.inodes.get_mut(&ino).ok_or(-2isize)?;
+            if node.is_dir() { return Err(-21); } // EISDIR
+            node.nlink = node.nlink.saturating_sub(1);
+            // Only free data when all hard links are gone.
+            if node.nlink == 0 {
+                if let INodeData::File(v) = &node.data {
+                    self.used = self.used.saturating_sub(v.len());
+                }
+            }
+        }
+        // Remove directory entry; keep inode if nlink > 0 (other hard links).
+        let (parent_ino, name) = self.split_parent(path).ok_or(-2isize)?;
+        if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&parent_ino).map(|n| &mut n.data) {
+            d.remove(&name);
+        }
+        // Drop the inode only when nlink reaches zero.
+        if self.inodes.get(&ino).map_or(false, |n| n.nlink == 0) {
+            self.inodes.remove(&ino);
+        }
+        Ok(())
+    }
+
+    /// Create a hard link: `new_path` → same inode as `existing_path`.
+    fn link(&mut self, existing_path: &str, new_path: &str) -> Result<(), isize> {
+        if self.lookup(new_path).is_some() { return Err(-17); } // EEXIST
+        let ino = self.lookup(existing_path).ok_or(-2isize)?;
+        {
+            let node = self.inodes.get(&ino).ok_or(-2isize)?;
+            if node.is_dir() { return Err(-1); } // EPERM: cannot hard-link dirs
+        }
+        let (parent_ino, name) = self.split_parent(new_path).ok_or(-2isize)?;
+        if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&parent_ino).map(|n| &mut n.data) {
+            d.insert(name, ino);
+        }
+        if let Some(node) = self.inodes.get_mut(&ino) {
+            node.nlink += 1;
+        }
         Ok(())
     }
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), isize> {
         let ino = self.lookup(old).ok_or(-2isize)?;
-        // Remove from old parent
         let (old_parent_ino, old_name) = self.split_parent(old).ok_or(-2isize)?;
         if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&old_parent_ino).map(|n| &mut n.data) {
             d.remove(&old_name);
         }
-        // Insert into new parent (creating new intermediate dirs is not done here)
         let (new_parent_ino, new_name) = self.split_parent(new).ok_or(-2isize)?;
-        // Ensure new parent exists
         if self.inodes.get(&new_parent_ino).is_none() { return Err(-2); }
+        // If destination already exists, unlink it first.
+        if let Some(old_dst_ino) = self.lookup(new) {
+            if let Some(n) = self.inodes.get_mut(&old_dst_ino) {
+                n.nlink = n.nlink.saturating_sub(1);
+                if n.nlink == 0 {
+                    if let INodeData::File(v) = &n.data { self.used = self.used.saturating_sub(v.len()); }
+                }
+            }
+            if self.inodes.get(&old_dst_ino).map_or(false, |n| n.nlink == 0) {
+                self.inodes.remove(&old_dst_ino);
+            }
+            if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&new_parent_ino).map(|n| &mut n.data) {
+                d.remove(&new_name);
+            }
+        }
         if let Some(INodeData::Dir(d)) = self.inodes.get_mut(&new_parent_ino).map(|n| &mut n.data) {
             d.insert(new_name, ino);
         }
@@ -264,19 +390,27 @@ impl TmpFs {
         let node = self.inodes.get(&ino).ok_or(-2isize)?;
         match &node.data {
             INodeData::Dir(d) => Ok(d.keys().cloned().collect()),
-            _ => Err(-20), // ENOTDIR
+            _ => Err(-20),
         }
     }
 
     fn stat(&self, path: &str) -> Result<TmpfsStat, isize> {
         let ino = self.lookup(path).ok_or(-2isize)?;
         let node = self.inodes.get(&ino).ok_or(-2isize)?;
+        let sz = node.size() as u64;
         Ok(TmpfsStat {
-            ino:    node.ino,
-            mode:   node.mode,
-            nlink:  node.nlink,
-            size:   node.size() as u64,
-            is_dir: node.is_dir(),
+            ino:     node.ino,
+            mode:    node.mode,
+            nlink:   node.nlink,
+            uid:     node.uid,
+            gid:     node.gid,
+            size:    sz,
+            atime:   node.atime,
+            mtime:   node.mtime,
+            ctime:   node.ctime,
+            blksize: 4096,
+            blocks:  sz.div_ceil(512),
+            is_dir:  node.is_dir(),
         })
     }
 
@@ -297,17 +431,34 @@ impl TmpFs {
         let node = self.inodes.get(&ino).ok_or(-2isize)?;
         match &node.data {
             INodeData::Symlink(t) => Ok(t.clone()),
-            _ => Err(-22), // EINVAL
+            _ => Err(-22),
         }
+    }
+
+    fn chmod(&mut self, path: &str, mode: u16) -> Result<(), isize> {
+        let ino = self.lookup(path).ok_or(-2isize)?;
+        let node = self.inodes.get_mut(&ino).ok_or(-2isize)?;
+        // Preserve the file-type bits; replace permission bits only.
+        node.mode = (node.mode & S_IFMT) | (mode & !S_IFMT);
+        Ok(())
+    }
+
+    fn chown(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), isize> {
+        let ino = self.lookup(path).ok_or(-2isize)?;
+        let node = self.inodes.get_mut(&ino).ok_or(-2isize)?;
+        // 0xFFFF_FFFF means "don't change" (matching Linux chown(2) semantics)
+        if uid != 0xFFFF_FFFF { node.uid = uid; }
+        if gid != 0xFFFF_FFFF { node.gid = gid; }
+        Ok(())
     }
 
     fn statfs(&self) -> TmpfsStatfs {
         TmpfsStatfs {
-            f_type:   TMPFS_MAGIC,
-            f_bsize:  4096,
-            f_blocks: (self.limit / 4096) as u64,
-            f_bfree:  ((self.limit - self.used) / 4096) as u64,
-            f_bavail: ((self.limit - self.used) / 4096) as u64,
+            f_type:    TMPFS_MAGIC,
+            f_bsize:   4096,
+            f_blocks:  (self.limit / 4096) as u64,
+            f_bfree:   (self.limit.saturating_sub(self.used) / 4096) as u64,
+            f_bavail:  (self.limit.saturating_sub(self.used) / 4096) as u64,
             f_namelen: 255,
         }
     }
@@ -317,11 +468,18 @@ impl TmpFs {
 
 #[derive(Clone, Debug, Default)]
 pub struct TmpfsStat {
-    pub ino:    u64,
-    pub mode:   u16,
-    pub nlink:  u32,
-    pub size:   u64,
-    pub is_dir: bool,
+    pub ino:     u64,
+    pub mode:    u16,
+    pub nlink:   u32,
+    pub uid:     u32,
+    pub gid:     u32,
+    pub size:    u64,
+    pub atime:   u64,
+    pub mtime:   u64,
+    pub ctime:   u64,
+    pub blksize: u64,
+    pub blocks:  u64,
+    pub is_dir:  bool,
 }
 
 #[derive(Clone, Debug)]
@@ -334,27 +492,12 @@ pub struct TmpfsStatfs {
     pub f_namelen: u64,
 }
 
-// ── Global per-mountpoint instance table ─────────────────────────────────────
-//
-// Keyed by the absolute mount-point path (e.g. "/tmp", "/run", "/dev/shm").
-// vfs_ops passes the mount-relative subpath; we extract the mountpoint from
-// the full path at call time via `mount::resolve` → `FsHandle::subpath`.
-// Because we only receive the subpath here, we look up by trying each key
-// that is a prefix of the original full path.  For simplicity, the shim
-// functions below operate on subpaths and the callers must ensure the
-// correct instance is addressed — which is guaranteed because vfs_ops
-// calls us only after `mount::resolve` has already selected FsType::Tmpfs.
-//
-// A single default instance covers all tmpfs mounts that are pre-registered
-// in init_mounts().  Dynamically mounted tmpfs volumes are inserted by
-// `tmpfs_mount()`.
+// ── Global per-mountpoint instance table ──────────────────────────────────────
 
 pub static TMPFS_INSTANCES: Mutex<BTreeMap<String, TmpFs>> =
     Mutex::new(BTreeMap::new());
 
-/// Called by sys_mount (or init_mounts indirectly) to create a new tmpfs
-/// instance at `mountpoint`.  Safe to call multiple times — ignored if
-/// the mount already exists.
+/// Create a new tmpfs instance at `mountpoint` (idempotent).
 pub fn tmpfs_mount(mountpoint: &str, limit: usize) {
     let mut tbl = TMPFS_INSTANCES.lock();
     tbl.entry(mountpoint.to_string())
@@ -363,34 +506,14 @@ pub fn tmpfs_mount(mountpoint: &str, limit: usize) {
 
 // ── Mountpoint lookup helper ──────────────────────────────────────────────────
 //
-// vfs_ops passes us `h.subpath` (mount-relative) and we need to find which
-// TmpFs instance owns it.  Because all tmpfs mount points are pre-registered
-// we search by full path prefix.
-//
-// The full path is reconstructed as: find the mountpoint key whose prefix,
-// when appended with subpath, yields a sensible full path.  The simpler
-// approach used here is: the caller also passes the full absolute path so
-// we can strip the subpath suffix to recover the mountpoint.  Since the VFS
-// shims below only receive the subpath, we fall back to iterating all
-// instances and picking the one with the longest matching mountpoint prefix
-// against a synthetic full path.  In practice, with three fixed mounts
-// (/tmp, /run, /dev/shm) the overhead is negligible.
-//
-// For the public shim API, we accept the subpath (as vfs_ops provides it)
-// and locate the instance whose root contains that sub-tree.  Because each
-// subpath is unique within its mount, we return the first instance that has
-// the root inode (i.e. any instance — if the path resolves successfully we
-// know we're in the right one).  A cleaner solution would thread the full
-// path through, but that would require changing the vfs_ops interface.
-//
-// CURRENT IMPL: We expose a secondary set of shims that accept the full
-// absolute path and derive the mountpoint via longest-prefix matching.
+// Finds the TmpFs instance whose mount-point is the longest prefix of
+// `full_path` and returns (&mut TmpFs, mount-relative path).
+// All mutating shims use this so that /tmp, /run, /dev/shm are independent.
 
 fn find_instance_and_rel<'a>(
     tbl: &'a mut BTreeMap<String, TmpFs>,
     full_path: &str,
 ) -> Option<(&'a mut TmpFs, String)> {
-    // Find the longest mountpoint prefix that matches full_path
     let mut best_len = 0usize;
     let mut best_mp: Option<String> = None;
     for mp in tbl.keys() {
@@ -415,17 +538,7 @@ fn find_instance_and_rel<'a>(
     Some((fs, rel))
 }
 
-// ── Public VFS shims (called from vfs_ops) ────────────────────────────────────
-//
-// vfs_ops calls these with the mount-relative subpath (h.subpath).  We
-// automatically ensure the relevant TmpFs instance is initialized.
-//
-// NOTE: These functions receive the subpath as produced by mount::resolve,
-// e.g. "/myfile" for a file at "/tmp/myfile" mounted at "/tmp".  We must
-// apply all operations against the root of the TmpFs instance — which is
-// exactly what the subpath represents.
-
-/// Ensure the default tmpfs instances exist (idempotent).
+/// Ensure the three canonical tmpfs instances exist (idempotent).
 #[inline]
 fn ensure_defaults() {
     let mut tbl = TMPFS_INSTANCES.lock();
@@ -434,142 +547,312 @@ fn ensure_defaults() {
     }
 }
 
-/// vfs_ops::read_all dispatch target for FsType::Tmpfs.
-/// `subpath` is the mount-relative path, e.g. "/myfile".
-pub fn tmpfs_read_all(subpath: &str) -> Result<Vec<u8>, isize> {
+// ── Public VFS shims ──────────────────────────────────────────────────────────
+//
+// All shims accept the FULL absolute path (not the mount-relative subpath)
+// so that `find_instance_and_rel` can pick the correct TmpFs instance.
+// The vfs_ops dispatcher already has the full path; it now passes `path`
+// directly rather than `h.subpath`.  For backwards compatibility the
+// read-only shims that only scan (tmpfs_read_all, tmpfs_stat, etc.) also
+// accept full paths via the same mechanism.
+
+/// Read entire file. `full_path` is the absolute path (e.g. "/tmp/foo").
+pub fn tmpfs_read_all(full_path: &str) -> Result<Vec<u8>, isize> {
     ensure_defaults();
-    // The subpath is relative to the mount root.  We try every instance and
-    // return the first hit — because subpaths within different mounts are
-    // independent namespaces, only one should match.
     let mut tbl = TMPFS_INSTANCES.lock();
+    // Try to find via longest-prefix first.
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        if fs.lookup(&rel).is_some() { return fs.read_all(&rel); }
+    }
+    // Fallback: scan all instances (handles h.subpath callers).
     for fs in tbl.values() {
-        if fs.lookup(subpath).is_some() {
-            return fs.read_all(subpath);
-        }
+        if fs.lookup(full_path).is_some() { return fs.read_all(full_path); }
     }
-    Err(-2) // ENOENT
+    Err(-2)
 }
 
-/// vfs_ops::write_all dispatch target for FsType::Tmpfs.
-pub fn tmpfs_write_all(subpath: &str, data: &[u8]) -> Result<(), isize> {
+/// Read `len` bytes at `offset` from `full_path`.
+pub fn tmpfs_pread(full_path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     ensure_defaults();
     let mut tbl = TMPFS_INSTANCES.lock();
-    // Write to the first instance that already has the file, or the first
-    // writable instance (create semantics).
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.pread(&rel, offset, len);
+    }
+    Err(-2)
+}
+
+/// Write `data` to `full_path` at `offset` (extends file if needed).
+pub fn tmpfs_pwrite(full_path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.pwrite(&rel, offset, data);
+    }
+    Err(-2)
+}
+
+/// Overwrite the entire file with `data` (creates if absent).
+pub fn tmpfs_write_all(full_path: &str, data: &[u8]) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        if fs.lookup(&rel).is_some() {
+            return fs.write_all(&rel, data);
+        } else {
+            fs.create(&rel)?;
+            return fs.write_all(&rel, data);
+        }
+    }
+    Err(-2)
+}
+
+/// Create a new empty file at `full_path`.
+pub fn tmpfs_create(full_path: &str) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.create(&rel);
+    }
+    Err(-2)
+}
+
+/// Create directory at `full_path`.
+pub fn tmpfs_mkdir(full_path: &str) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.mkdir(&rel);
+    }
+    Err(-2)
+}
+
+/// Remove empty directory at `full_path`.
+pub fn tmpfs_rmdir(full_path: &str) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.rmdir(&rel);
+    }
+    Err(-2)
+}
+
+/// Unlink (delete) a file at `full_path`.
+pub fn tmpfs_unlink(full_path: &str) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        if fs.lookup(&rel).is_some() { return fs.unlink(&rel); }
+    }
+    // Fallback scan.
     for fs in tbl.values_mut() {
-        if fs.lookup(subpath).is_some() {
-            return fs.write_all(subpath, data);
+        if fs.lookup(full_path).is_some() { return fs.unlink(full_path); }
+    }
+    Err(-2)
+}
+
+/// Hard-link `existing_full_path` as `new_full_path` (must be same mountpoint).
+pub fn tmpfs_link(existing_full_path: &str, new_full_path: &str) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    // Both paths must resolve to the same TmpFs instance.
+    // We find the instance for the existing path and check the new path is also within it.
+    let mut best_len = 0usize;
+    let mut best_mp: Option<String> = None;
+    for mp in tbl.keys() {
+        let ms = mp.trim_end_matches('/');
+        if (existing_full_path == ms || existing_full_path.starts_with(&alloc::format!("{}/", ms)))
+            && ms.len() > best_len
+        {
+            best_len = ms.len();
+            best_mp = Some(mp.clone());
         }
     }
-    // File not found in any instance — create it in the first instance
-    if let Some(fs) = tbl.values_mut().next() {
-        fs.create(subpath)?;
-        return fs.write_all(subpath, data);
+    let mp = best_mp.ok_or(-2isize)?;
+    let ms = mp.trim_end_matches('/');
+    // new_full_path must also be under the same mountpoint.
+    if !(new_full_path == ms || new_full_path.starts_with(&alloc::format!("{}/", ms))) {
+        return Err(-18); // EXDEV
     }
-    Err(-2)
+    let rel_old = if existing_full_path.len() == ms.len() { "/".to_string() } else { existing_full_path[ms.len()..].to_string() };
+    let rel_new = if new_full_path.len() == ms.len() { "/".to_string() } else { new_full_path[ms.len()..].to_string() };
+    let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
+    fs.link(&rel_old, &rel_new)
 }
 
-/// vfs_ops::create dispatch target for FsType::Tmpfs.
-pub fn tmpfs_create(subpath: &str) -> Result<(), isize> {
+/// Rename `old_full_path` to `new_full_path`.
+pub fn tmpfs_rename(old_full_path: &str, new_full_path: &str) -> Result<(), isize> {
     ensure_defaults();
     let mut tbl = TMPFS_INSTANCES.lock();
-    if let Some(fs) = tbl.values_mut().next() {
-        return fs.create(subpath);
+    if let Some((fs, rel_old)) = find_instance_and_rel(&mut tbl, old_full_path) {
+        let ms = {
+            let mut blen = 0usize;
+            let mut bmp: Option<String> = None;
+            for mp in tbl.keys() {
+                let ms = mp.trim_end_matches('/');
+                if (old_full_path == ms || old_full_path.starts_with(&alloc::format!("{}/", ms)))
+                    && ms.len() > blen { blen = ms.len(); bmp = Some(mp.clone()); }
+            }
+            bmp
+        };
+        if let Some(mp) = ms {
+            let mount_str = mp.trim_end_matches('/');
+            let rel_new = if new_full_path.len() == mount_str.len() { "/".to_string() } else { new_full_path[mount_str.len()..].to_string() };
+            let fs2 = tbl.get_mut(&mp).ok_or(-2isize)?;
+            return fs2.rename(&rel_old, &rel_new);
+        }
     }
-    Err(-2)
-}
-
-/// vfs_ops::mkdir dispatch target for FsType::Tmpfs.
-pub fn tmpfs_mkdir(subpath: &str) -> Result<(), isize> {
-    ensure_defaults();
-    let mut tbl = TMPFS_INSTANCES.lock();
-    if let Some(fs) = tbl.values_mut().next() {
-        return fs.mkdir(subpath);
-    }
-    Err(-2)
-}
-
-/// vfs_ops::unlink dispatch target for FsType::Tmpfs.
-pub fn tmpfs_unlink(subpath: &str) -> Result<(), isize> {
-    ensure_defaults();
-    let mut tbl = TMPFS_INSTANCES.lock();
+    // Fallback (subpath callers)
     for fs in tbl.values_mut() {
-        if fs.lookup(subpath).is_some() {
-            return fs.unlink(subpath);
+        if fs.lookup(old_full_path).is_some() {
+            return fs.rename(old_full_path, new_full_path);
         }
     }
     Err(-2)
 }
 
-/// vfs_ops::rename dispatch target for FsType::Tmpfs.
-pub fn tmpfs_rename(old_subpath: &str, new_subpath: &str) -> Result<(), isize> {
+/// Resize a file to exactly `len` bytes.
+pub fn tmpfs_truncate(full_path: &str, len: usize) -> Result<(), isize> {
     ensure_defaults();
     let mut tbl = TMPFS_INSTANCES.lock();
-    // Both paths must be in the same instance (cross-mount rename → EXDEV).
-    for fs in tbl.values_mut() {
-        if fs.lookup(old_subpath).is_some() {
-            return fs.rename(old_subpath, new_subpath);
-        }
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.truncate(&rel, len);
     }
     Err(-2)
 }
 
-/// vfs_ops::readdir dispatch target for FsType::Tmpfs.
-pub fn tmpfs_readdir(subpath: &str) -> Result<Vec<String>, isize> {
+/// List directory entries for `full_path`.
+pub fn tmpfs_readdir(full_path: &str) -> Result<Vec<String>, isize> {
     ensure_defaults();
     let tbl = TMPFS_INSTANCES.lock();
-    for fs in tbl.values() {
-        if fs.lookup(subpath).is_some() {
-            return fs.readdir(subpath);
+    // Read-only scan; can't use find_instance_and_rel (needs &mut).
+    let mut best_len = 0usize;
+    let mut best_mp: Option<&str> = None;
+    for mp in tbl.keys() {
+        let ms = mp.trim_end_matches('/');
+        if (full_path == ms || full_path.starts_with(&alloc::format!("{}/", ms)))
+            && ms.len() > best_len
+        {
+            best_len = ms.len();
+            best_mp = Some(mp.as_str());
         }
+    }
+    if let Some(mp) = best_mp {
+        let ms = mp.trim_end_matches('/');
+        let rel = if full_path.len() == ms.len() { "/" } else { &full_path[ms.len()..] };
+        return tbl.get(mp).unwrap().readdir(rel);
+    }
+    for fs in tbl.values() {
+        if fs.lookup(full_path).is_some() { return fs.readdir(full_path); }
     }
     Err(-2)
 }
 
-/// vfs_ops::stat dispatch target for FsType::Tmpfs.
-/// Returns a KStat-compatible structure.  vfs_ops::stat maps it to KStat.
-pub fn tmpfs_stat(subpath: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
+/// Return kernel stat for `full_path`.
+pub fn tmpfs_stat(full_path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
     ensure_defaults();
     let tbl = TMPFS_INSTANCES.lock();
+    let mut best_len = 0usize;
+    let mut best_mp: Option<&str> = None;
+    for mp in tbl.keys() {
+        let ms = mp.trim_end_matches('/');
+        if (full_path == ms || full_path.starts_with(&alloc::format!("{}/", ms)))
+            && ms.len() > best_len
+        {
+            best_len = ms.len();
+            best_mp = Some(mp.as_str());
+        }
+    }
+    if let Some(mp) = best_mp {
+        let ms = mp.trim_end_matches('/');
+        let rel = if full_path.len() == ms.len() { "/" } else { &full_path[ms.len()..] };
+        let s = tbl.get(mp).unwrap().stat(rel)?;
+        return Ok(crate::fs::vfs_ops::KStat {
+            ino:     s.ino,
+            mode:    s.mode,
+            nlink:   s.nlink,
+            uid:     s.uid,
+            gid:     s.gid,
+            size:    s.size,
+            atime:   s.atime,
+            mtime:   s.mtime,
+            ctime:   s.ctime,
+            blksize: s.blksize,
+            blocks:  s.blocks,
+            is_dir:  s.is_dir,
+        });
+    }
     for fs in tbl.values() {
-        if fs.lookup(subpath).is_some() {
-            let s = fs.stat(subpath)?;
+        if fs.lookup(full_path).is_some() {
+            let s = fs.stat(full_path)?;
             return Ok(crate::fs::vfs_ops::KStat {
-                ino:    s.ino,
-                mode:   s.mode,
-                nlink:  s.nlink,
-                size:   s.size,
-                is_dir: s.is_dir,
+                ino: s.ino, mode: s.mode, nlink: s.nlink,
+                uid: s.uid, gid: s.gid, size: s.size,
+                atime: s.atime, mtime: s.mtime, ctime: s.ctime,
+                blksize: s.blksize, blocks: s.blocks, is_dir: s.is_dir,
             });
         }
     }
     Err(-2)
 }
 
-/// vfs_ops::statfs dispatch target for FsType::Tmpfs.
+/// Return statfs for a mount-point path.
 pub fn tmpfs_statfs(mountpoint: &str) -> Option<TmpfsStatfs> {
     let tbl = TMPFS_INSTANCES.lock();
     tbl.get(mountpoint).map(|fs| fs.statfs())
 }
 
-/// vfs_ops::symlink dispatch target for FsType::Tmpfs.
-pub fn tmpfs_symlink(target: &str, link_subpath: &str) -> Result<(), isize> {
+/// Create symlink `link_path` → `target`.
+pub fn tmpfs_symlink(target: &str, link_full_path: &str) -> Result<(), isize> {
     ensure_defaults();
     let mut tbl = TMPFS_INSTANCES.lock();
-    if let Some(fs) = tbl.values_mut().next() {
-        return fs.symlink(target, link_subpath);
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, link_full_path) {
+        return fs.symlink(target, &rel);
     }
     Err(-2)
 }
 
-/// vfs_ops::readlink dispatch target for FsType::Tmpfs.
-pub fn tmpfs_readlink(subpath: &str) -> Result<String, isize> {
+/// Read the target of a symlink at `full_path`.
+pub fn tmpfs_readlink(full_path: &str) -> Result<String, isize> {
     ensure_defaults();
     let tbl = TMPFS_INSTANCES.lock();
-    for fs in tbl.values() {
-        if fs.lookup(subpath).is_some() {
-            return fs.readlink(subpath);
+    let mut best_len = 0usize;
+    let mut best_mp: Option<&str> = None;
+    for mp in tbl.keys() {
+        let ms = mp.trim_end_matches('/');
+        if (full_path == ms || full_path.starts_with(&alloc::format!("{}/", ms)))
+            && ms.len() > best_len
+        {
+            best_len = ms.len();
+            best_mp = Some(mp.as_str());
         }
+    }
+    if let Some(mp) = best_mp {
+        let ms = mp.trim_end_matches('/');
+        let rel = if full_path.len() == ms.len() { "/" } else { &full_path[ms.len()..] };
+        return tbl.get(mp).unwrap().readlink(rel);
+    }
+    for fs in tbl.values() {
+        if fs.lookup(full_path).is_some() { return fs.readlink(full_path); }
+    }
+    Err(-2)
+}
+
+/// Change permission bits on `full_path`.
+pub fn tmpfs_chmod(full_path: &str, mode: u16) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.chmod(&rel, mode);
+    }
+    Err(-2)
+}
+
+/// Change owner/group of `full_path`. 0xFFFF_FFFF = don't change.
+pub fn tmpfs_chown(full_path: &str, uid: u32, gid: u32) -> Result<(), isize> {
+    ensure_defaults();
+    let mut tbl = TMPFS_INSTANCES.lock();
+    if let Some((fs, rel)) = find_instance_and_rel(&mut tbl, full_path) {
+        return fs.chown(&rel, uid, gid);
     }
     Err(-2)
 }

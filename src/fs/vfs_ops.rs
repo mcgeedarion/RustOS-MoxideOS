@@ -26,24 +26,32 @@ use crate::fs::mount::{self, FsType, OverlayOpts};
 use crate::fs::overlayfs::OverlayMount;
 
 // ── Stat result (kernel-internal, mirrors struct stat fields we care about) ──
+//
+// Added uid, gid, atime, mtime, ctime, blksize, blocks so that fstat() on
+// tmpfs FDs (e.g. from shm_open) returns correct data to userspace.
 
 #[derive(Clone, Debug, Default)]
 pub struct KStat {
-    pub ino:    u64,
-    pub mode:   u16,
-    pub nlink:  u32,
-    pub size:   u64,
-    pub is_dir: bool,
+    pub ino:     u64,
+    pub mode:    u16,
+    pub nlink:   u32,
+    pub uid:     u32,
+    pub gid:     u32,
+    pub size:    u64,
+    pub atime:   u64,
+    pub mtime:   u64,
+    pub ctime:   u64,
+    pub blksize: u64,
+    pub blocks:  u64,
+    pub is_dir:  bool,
 }
 
-// ── read_all / write_all — convenience wrappers used by overlayfs ────────────
+// ── read_all / write_all ─────────────────────────────────────────────────────
 
-/// Read the entire contents of `path` into a Vec<u8>.
 pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Ext2 => {
-            // Forward to ext2 via the kernel fd table
             use crate::fs::fcntl::{fd_open, fd_read, fd_close};
             let fd = fd_open(path, 0).map_err(|e| e)?;
             let mut data = Vec::new();
@@ -64,9 +72,7 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
             let fs = fs_map.get(&mp).ok_or(-2isize)?;
             fs.read(&mut f, &mut data).map(|_| data)
         }
-        FsType::Tmpfs => {
-            crate::fs::ramfs::tmpfs_read_all(&h.subpath)
-        }
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_read_all(path),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             let mut buf = Vec::new();
@@ -79,14 +85,12 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
     }
 }
 
-/// Write `data` to `path`, truncating the file first.
 pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     let h = mount::resolve(path)?;
-    if h.is_readonly() { return Err(-30); } // EROFS
+    if h.is_readonly() { return Err(-30); }
     match h.fstype {
         FsType::Ext2 => {
             use crate::fs::fcntl::{fd_open, fd_write, fd_close};
-            // O_WRONLY | O_TRUNC | O_CREAT = 0x241
             let fd = fd_open(path, 0x241).map_err(|e| e)?;
             let n  = fd_write(fd, data);
             fd_close(fd);
@@ -101,14 +105,83 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
             fs.truncate(&mut f, 0)?;
             fs.write(&mut f, data).map(|_| ())
         }
-        FsType::Tmpfs => {
-            crate::fs::ramfs::tmpfs_write_all(&h.subpath, data)
-        }
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_write_all(path, data),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::write(&om, &h.subpath, data)
         }
-        FsType::Devfs | FsType::Procfs | FsType::Sysfs => Err(-30), // EROFS
+        FsType::Devfs | FsType::Procfs | FsType::Sysfs => Err(-30),
+    }
+}
+
+// ── pread / pwrite — offset-based I/O ────────────────────────────────────────
+//
+// Used by the fd layer (io_syscalls) for pread64/pwrite64 and for regular
+// read/write when the FD has a non-zero file offset.
+
+/// Read `len` bytes from `path` at byte `offset`.
+pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
+    let h = mount::resolve(path)?;
+    match h.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_pread(path, offset, len),
+        FsType::Ext2 => {
+            // For ext2 we fall back to read_all + slice.
+            // A proper pread path through ext2 can be added later.
+            let data = read_all(path)?;
+            if offset >= data.len() { return Ok(Vec::new()); }
+            let end = (offset + len).min(data.len());
+            Ok(data[offset..end].to_vec())
+        }
+        FsType::Fat32 => {
+            let data = read_all(path)?;
+            if offset >= data.len() { return Ok(Vec::new()); }
+            let end = (offset + len).min(data.len());
+            Ok(data[offset..end].to_vec())
+        }
+        _ => Err(-38), // ENOSYS for virtual filesystems
+    }
+}
+
+/// Write `data` to `path` at byte `offset`, extending if necessary.
+pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
+    let h = mount::resolve(path)?;
+    if h.is_readonly() { return Err(-30); }
+    match h.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_pwrite(path, offset, data),
+        FsType::Ext2 | FsType::Fat32 => {
+            // Emulate via read-modify-write until native pwrite is wired.
+            let mut full = read_all(path).unwrap_or_default();
+            let end = offset + data.len();
+            if end > full.len() { full.resize(end, 0); }
+            full[offset..end].copy_from_slice(data);
+            write_all(path, &full)?;
+            Ok(data.len())
+        }
+        _ => Err(-38),
+    }
+}
+
+// ── truncate / ftruncate ──────────────────────────────────────────────────────
+//
+// Resize a file to exactly `len` bytes.  Growing zero-extends.
+// Used by shm_open()+ftruncate() before mmap(MAP_SHARED).
+
+pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
+    let h = mount::resolve(path)?;
+    if h.is_readonly() { return Err(-30); }
+    match h.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_truncate(path, len),
+        FsType::Ext2 => {
+            crate::fs::ext2::sys_truncate(path, len as u64).map(|_| ())
+        }
+        FsType::Fat32 => {
+            let mp = mount_point_for(&h.subpath, path);
+            let mut f = crate::fs::fat32::fat_open(&mp, &h.subpath)?;
+            let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
+            let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
+            fs.truncate(&mut f, len as u64)
+        }
+        _ => Err(-38),
     }
 }
 
@@ -120,7 +193,6 @@ pub fn create(path: &str) -> Result<(), isize> {
     match h.fstype {
         FsType::Ext2 => {
             use crate::fs::fcntl::{fd_open, fd_close};
-            // O_CREAT | O_WRONLY | O_TRUNC
             let fd = fd_open(path, 0x241).map_err(|e| e)?;
             fd_close(fd); Ok(())
         }
@@ -128,12 +200,27 @@ pub fn create(path: &str) -> Result<(), isize> {
             let mp = mount_point_for(&h.subpath, path);
             crate::fs::fat32::fat_creat(&mp, &h.subpath).map(|_| ())
         }
-        FsType::Tmpfs => crate::fs::ramfs::tmpfs_create(&h.subpath),
+        FsType::Tmpfs    => crate::fs::ramfs::tmpfs_create(path),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::create(&om, &h.subpath).map(|_| ())
         }
-        _ => Err(-1), // EPERM
+        _ => Err(-1),
+    }
+}
+
+// ── link ──────────────────────────────────────────────────────────────────────
+
+/// Create a hard link. Both paths must be on the same filesystem.
+pub fn link(existing: &str, new: &str) -> Result<(), isize> {
+    let h_e = mount::resolve(existing)?;
+    let h_n = mount::resolve(new)?;
+    if h_e.fstype != h_n.fstype { return Err(-18); } // EXDEV
+    if h_e.is_readonly() { return Err(-30); }
+    match h_e.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_link(existing, new),
+        FsType::Ext2  => crate::fs::ext2::sys_link(existing, new).map(|_| ()),
+        _             => Err(-38), // ENOSYS
     }
 }
 
@@ -143,19 +230,37 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     match h.fstype {
-        FsType::Ext2 => {
-            crate::fs::ext2::sys_mkdir(path, 0o755).map(|_| ())
-        }
+        FsType::Ext2 => crate::fs::ext2::sys_mkdir(path, 0o755).map(|_| ()),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
             let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
             fs.mkdir(&h.subpath)
         }
-        FsType::Tmpfs => crate::fs::ramfs::tmpfs_mkdir(&h.subpath),
+        FsType::Tmpfs    => crate::fs::ramfs::tmpfs_mkdir(path),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::mkdir(&om, &h.subpath)
+        }
+        _ => Err(-1),
+    }
+}
+
+// ── rmdir ─────────────────────────────────────────────────────────────────────
+
+/// Remove an empty directory.
+pub fn rmdir(path: &str) -> Result<(), isize> {
+    let h = mount::resolve(path)?;
+    if h.is_readonly() { return Err(-30); }
+    match h.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_rmdir(path),
+        FsType::Ext2  => crate::fs::ext2::sys_rmdir(path).map(|_| ()),
+        FsType::Fat32 => {
+            // FAT32 rmdir: walk + check empty + deallocate cluster chain.
+            let mp = mount_point_for(&h.subpath, path);
+            let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
+            let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
+            fs.rmdir(&h.subpath)
         }
         _ => Err(-1),
     }
@@ -167,16 +272,14 @@ pub fn unlink(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     match h.fstype {
-        FsType::Ext2 => {
-            crate::fs::ext2::sys_unlink(path).map(|_| ())
-        }
+        FsType::Ext2 => crate::fs::ext2::sys_unlink(path).map(|_| ()),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
             let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
             fs.unlink(&h.subpath)
         }
-        FsType::Tmpfs => crate::fs::ramfs::tmpfs_unlink(&h.subpath),
+        FsType::Tmpfs    => crate::fs::ramfs::tmpfs_unlink(path),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::unlink(&om, &h.subpath)
@@ -190,9 +293,7 @@ pub fn unlink(path: &str) -> Result<(), isize> {
 pub fn readdir(path: &str) -> Result<Vec<String>, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
-        FsType::Ext2 => {
-            crate::fs::ext2::sys_getdents(path)
-        }
+        FsType::Ext2 => crate::fs::ext2::sys_getdents(path),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mounts = crate::fs::fat32::FAT_MOUNTS.lock();
@@ -201,7 +302,7 @@ pub fn readdir(path: &str) -> Result<Vec<String>, isize> {
             let entries = fs.read_dir(entry.cluster)?;
             Ok(entries.into_iter().map(|e| e.name).collect())
         }
-        FsType::Tmpfs => crate::fs::ramfs::tmpfs_readdir(&h.subpath),
+        FsType::Tmpfs    => crate::fs::ramfs::tmpfs_readdir(path),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::readdir(&om, &h.subpath)
@@ -217,9 +318,7 @@ pub fn readdir(path: &str) -> Result<Vec<String>, isize> {
 pub fn stat(path: &str) -> Result<KStat, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
-        FsType::Ext2 => {
-            crate::fs::stat_syscalls::kstat_ext2(path)
-        }
+        FsType::Ext2 => crate::fs::stat_syscalls::kstat_ext2(path),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mounts = crate::fs::fat32::FAT_MOUNTS.lock();
@@ -231,9 +330,10 @@ pub fn stat(path: &str) -> Result<KStat, isize> {
                 nlink:  1,
                 size:   e.size as u64,
                 is_dir: e.is_dir(),
+                ..KStat::default()
             })
         }
-        FsType::Tmpfs => crate::fs::ramfs::tmpfs_stat(&h.subpath),
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_stat(path),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             let concrete = crate::fs::overlayfs::lookup(&om, &h.subpath)?;
@@ -251,21 +351,16 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_old = mount::resolve(old)?;
     let h_new = mount::resolve(new)?;
     if h_old.is_readonly() { return Err(-30); }
-    // Cross-mount rename is not supported
-    if h_old.fstype != h_new.fstype { return Err(-18); } // EXDEV
+    if h_old.fstype != h_new.fstype { return Err(-18); }
     match h_old.fstype {
-        FsType::Ext2 => {
-            crate::fs::ext2::sys_rename(old, new).map(|_| ())
-        }
+        FsType::Ext2 => crate::fs::ext2::sys_rename(old, new).map(|_| ()),
         FsType::Fat32 => {
             let mp = mount_point_for(&h_old.subpath, old);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
             let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
             fs.rename(&h_old.subpath, &h_new.subpath)
         }
-        FsType::Tmpfs => {
-            crate::fs::ramfs::tmpfs_rename(&h_old.subpath, &h_new.subpath)
-        }
+        FsType::Tmpfs    => crate::fs::ramfs::tmpfs_rename(old, new),
         FsType::Overlayfs => {
             let om = overlay_mount(&h_old)?;
             crate::fs::overlayfs::rename(&om, &h_old.subpath, &h_new.subpath)
@@ -274,36 +369,32 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     }
 }
 
-// ── sys_mount / sys_umount2 — syscall entry points ───────────────────────────
+// ── sys_mount / sys_umount2 ───────────────────────────────────────────────────
 
-/// Kernel entry point for the mount(2) syscall.  Validates arguments and
-/// triggers any backend-specific initialisation (e.g. fat_mount for FAT32).
 pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: u64, data: &str) -> isize {
-    // Register in the mount table first
     let rc = mount::sys_mount(source, target, fstype, flags, data);
     if rc != 0 { return rc; }
-    // For FAT32, probe the block device and cache the BPB
     if fstype == "vfat" || fstype == "fat32" || fstype == "fat" {
-        // Derive a device number from the source path (simplified: use hash)
         let dev = source.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
         if let Err(e) = crate::fs::fat32::fat_mount(dev, target) {
-            // Roll back the mount table entry
             mount::sys_umount2(target, 0);
             return e;
         }
     }
+    // For tmpfs, create the per-mount instance with optional size= data option.
+    if fstype == "tmpfs" {
+        let limit = parse_size_option(data).unwrap_or(64 * 1024 * 1024);
+        crate::fs::ramfs::tmpfs_mount(target, limit);
+    }
     0
 }
 
-/// Kernel entry point for umount2(2).
 pub fn sys_umount2(target: &str, flags: u32) -> isize {
     mount::sys_umount2(target, flags)
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Reconstruct the mount-point string from a resolved subpath + original path.
-/// Example: path="/boot/efi/EFI/boot", subpath="/EFI/boot" → "/boot/efi"
 fn mount_point_for(subpath: &str, full_path: &str) -> String {
     let sub  = subpath.trim_start_matches('/');
     let full = full_path.trim_end_matches('/');
@@ -315,9 +406,34 @@ fn mount_point_for(subpath: &str, full_path: &str) -> String {
     }
 }
 
-/// Build an OverlayMount from an FsHandle's embedded OverlayOpts.
 fn overlay_mount(h: &crate::fs::mount::FsHandle) -> Result<OverlayMount, isize> {
     h.overlay.as_ref()
      .map(|o| OverlayMount::from_opts(o))
-     .ok_or(-22) // EINVAL — overlayfs mount missing options
+     .ok_or(-22)
+}
+
+/// Parse a `size=<n>[k|m|g]` option from the mount data string.
+/// Returns `None` if the option is absent or malformed.
+fn parse_size_option(data: &str) -> Option<usize> {
+    for part in data.split(',') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("size=") {
+            let (num_str, mult) = if val.ends_with('k') || val.ends_with('K') {
+                (&val[..val.len()-1], 1024usize)
+            } else if val.ends_with('m') || val.ends_with('M') {
+                (&val[..val.len()-1], 1024 * 1024)
+            } else if val.ends_with('g') || val.ends_with('G') {
+                (&val[..val.len()-1], 1024 * 1024 * 1024)
+            } else if val.ends_with('%') {
+                // Percentage of a hypothetical 512 MiB total RAM.
+                let pct: usize = val[..val.len()-1].parse().ok()?;
+                return Some((512 * 1024 * 1024 / 100) * pct);
+            } else {
+                (val, 1)
+            };
+            let n: usize = num_str.parse().ok()?;
+            return Some(n * mult);
+        }
+    }
+    None
 }
