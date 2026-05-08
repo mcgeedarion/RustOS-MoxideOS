@@ -25,10 +25,7 @@ use alloc::{
 use crate::fs::mount::{self, FsType, OverlayOpts};
 use crate::fs::overlayfs::OverlayMount;
 
-// ── Stat result (kernel-internal, mirrors struct stat fields we care about) ──
-//
-// Added uid, gid, atime, mtime, ctime, blksize, blocks so that fstat() on
-// tmpfs FDs (e.g. from shm_open) returns correct data to userspace.
+// ── Stat result (kernel-internal) ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct KStat {
@@ -115,18 +112,12 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
 }
 
 // ── pread / pwrite — offset-based I/O ────────────────────────────────────────
-//
-// Used by the fd layer (io_syscalls) for pread64/pwrite64 and for regular
-// read/write when the FD has a non-zero file offset.
 
-/// Read `len` bytes from `path` at byte `offset`.
 pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Tmpfs => crate::fs::ramfs::tmpfs_pread(path, offset, len),
         FsType::Ext2 => {
-            // For ext2 we fall back to read_all + slice.
-            // A proper pread path through ext2 can be added later.
             let data = read_all(path)?;
             if offset >= data.len() { return Ok(Vec::new()); }
             let end = (offset + len).min(data.len());
@@ -138,18 +129,16 @@ pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
             let end = (offset + len).min(data.len());
             Ok(data[offset..end].to_vec())
         }
-        _ => Err(-38), // ENOSYS for virtual filesystems
+        _ => Err(-38),
     }
 }
 
-/// Write `data` to `path` at byte `offset`, extending if necessary.
 pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     match h.fstype {
         FsType::Tmpfs => crate::fs::ramfs::tmpfs_pwrite(path, offset, data),
         FsType::Ext2 | FsType::Fat32 => {
-            // Emulate via read-modify-write until native pwrite is wired.
             let mut full = read_all(path).unwrap_or_default();
             let end = offset + data.len();
             if end > full.len() { full.resize(end, 0); }
@@ -161,10 +150,7 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     }
 }
 
-// ── truncate / ftruncate ──────────────────────────────────────────────────────
-//
-// Resize a file to exactly `len` bytes.  Growing zero-extends.
-// Used by shm_open()+ftruncate() before mmap(MAP_SHARED).
+// ── truncate ────────────────────────────────────────────────────────────────────
 
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -211,16 +197,15 @@ pub fn create(path: &str) -> Result<(), isize> {
 
 // ── link ──────────────────────────────────────────────────────────────────────
 
-/// Create a hard link. Both paths must be on the same filesystem.
 pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let h_e = mount::resolve(existing)?;
     let h_n = mount::resolve(new)?;
-    if h_e.fstype != h_n.fstype { return Err(-18); } // EXDEV
+    if h_e.fstype != h_n.fstype { return Err(-18); }
     if h_e.is_readonly() { return Err(-30); }
     match h_e.fstype {
         FsType::Tmpfs => crate::fs::ramfs::tmpfs_link(existing, new),
         FsType::Ext2  => crate::fs::ext2::sys_link(existing, new).map(|_| ()),
-        _             => Err(-38), // ENOSYS
+        _             => Err(-38),
     }
 }
 
@@ -248,7 +233,6 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
 
 // ── rmdir ─────────────────────────────────────────────────────────────────────
 
-/// Remove an empty directory.
 pub fn rmdir(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
@@ -256,7 +240,6 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
         FsType::Tmpfs => crate::fs::ramfs::tmpfs_rmdir(path),
         FsType::Ext2  => crate::fs::ext2::sys_rmdir(path).map(|_| ()),
         FsType::Fat32 => {
-            // FAT32 rmdir: walk + check empty + deallocate cluster chain.
             let mp = mount_point_for(&h.subpath, path);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
             let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
@@ -345,6 +328,31 @@ pub fn stat(path: &str) -> Result<KStat, isize> {
     }
 }
 
+// ── chmod / chown ──────────────────────────────────────────────────────────────
+
+/// Change permission bits. Native on tmpfs; no-op stub on other backends.
+pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
+    let h = mount::resolve(path)?;
+    if h.is_readonly() { return Err(-30); }
+    match h.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_chmod(path, mode),
+        // ext2 chmod can be wired in later; for now succeed silently.
+        FsType::Ext2 | FsType::Fat32 => Ok(()),
+        _ => Ok(()), // virtual FSes: no-op
+    }
+}
+
+/// Change owner/group. Native on tmpfs; no-op on other backends.
+pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
+    let h = mount::resolve(path)?;
+    if h.is_readonly() { return Err(-30); }
+    match h.fstype {
+        FsType::Tmpfs => crate::fs::ramfs::tmpfs_chown(path, uid, gid),
+        FsType::Ext2 | FsType::Fat32 => Ok(()),
+        _ => Ok(()),
+    }
+}
+
 // ── rename ────────────────────────────────────────────────────────────────────
 
 pub fn rename(old: &str, new: &str) -> Result<(), isize> {
@@ -381,7 +389,6 @@ pub fn sys_mount(source: &str, target: &str, fstype: &str, flags: u64, data: &st
             return e;
         }
     }
-    // For tmpfs, create the per-mount instance with optional size= data option.
     if fstype == "tmpfs" {
         let limit = parse_size_option(data).unwrap_or(64 * 1024 * 1024);
         crate::fs::ramfs::tmpfs_mount(target, limit);
@@ -412,8 +419,6 @@ fn overlay_mount(h: &crate::fs::mount::FsHandle) -> Result<OverlayMount, isize> 
      .ok_or(-22)
 }
 
-/// Parse a `size=<n>[k|m|g]` option from the mount data string.
-/// Returns `None` if the option is absent or malformed.
 fn parse_size_option(data: &str) -> Option<usize> {
     for part in data.split(',') {
         let part = part.trim();
@@ -425,7 +430,6 @@ fn parse_size_option(data: &str) -> Option<usize> {
             } else if val.ends_with('g') || val.ends_with('G') {
                 (&val[..val.len()-1], 1024 * 1024 * 1024)
             } else if val.ends_with('%') {
-                // Percentage of a hypothetical 512 MiB total RAM.
                 let pct: usize = val[..val.len()-1].parse().ok()?;
                 return Some((512 * 1024 * 1024 / 100) * pct);
             } else {
