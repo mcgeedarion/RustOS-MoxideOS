@@ -43,11 +43,35 @@ RISC-V boot modes:
 
 ### Filesystem
 - VFS layer with fd table, `fcntl`, `dup2`, `O_CLOEXEC`
-- ext2 (read + write), initramfs (read-only tarball)
+- **ext2** (read + write), initramfs (read-only tarball)
+- **FAT32 / VFAT** (`src/fs/fat32.rs`) — BPB parsing, cluster-chain walking, LFN reconstruction, full read/write/truncate/mkdir/unlink/rename; mounted read-only at `/boot/efi` by default
+- **tmpfs** (`src/fs/ramfs.rs`) — memory-backed filesystem; auto-mounted at `/tmp`, `/run`, and `/dev/shm`; per-instance size cap; supports `tmpfs_mount(mp, limit)` for dynamic mounts via `sys_mount`
+- **overlayfs** (`src/fs/overlayfs.rs`) — union mount with `lowerdir=`, `upperdir=`, `workdir=` options; copy-up on write; used for container-style layered roots
 - devfs (`/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty`, `/dev/fb0`, block devices)
 - procfs: `/proc/self/{exe,maps,status,fd/N}`, `/proc/{cpuinfo,meminfo,version}`
 - `pipe`, `eventfd`, `poll`/`epoll`, `ioctl`, `getdents64`, `fstat`/`newfstatat`
 - `pread64` (user-space) and `vfs::pread` (kernel-internal, used by demand-pager & ELF loader)
+
+### Syscall surface (musl / glibc compatibility)
+
+The dispatch table (`src/syscall/mod.rs`) covers the full x86-64 Linux ABI required by musl and glibc. Notable additions:
+
+| NR | Syscall | Notes |
+|---|---|---|
+| 36 | `getitimer` | Returns zeroed `itimerval`; no-op disarm |
+| 38 | `setitimer` | Accepts and discards; old value written back |
+| 98 | `getrusage` | Returns zeroed 144-byte `rusage`; `RUSAGE_SELF` / `RUSAGE_CHILDREN` |
+| 100 | `times` | Returns monotonic ticks in `tms_utime`; other fields zero |
+| 185 | `prctl` | `PR_SET_NAME`, `PR_GET_NAME`, `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE`, `PR_SET_PDEATHSIG` |
+| 318 | `getrandom` | RDRAND-backed with LFSR fallback; capped at 4096 bytes/call |
+| 332 | `statx` | Full `STATX_BASIC_STATS` transcoder from `struct stat` |
+| 326 | `copy_file_range` | Kernel-side splice up to 1 MiB/call; offset pointers updated |
+| 425 | `io_uring_setup` | Returns `ENOSYS`; placeholder for future io_uring support |
+| 426 | `io_uring_enter` | Returns `ENOSYS` |
+| 427 | `io_uring_register` | Returns `ENOSYS` |
+| 437 | `openat2` | Full `open_how` struct; `RESOLVE_*` flags parsed; delegates to VFS |
+
+Also wired: `statx` (NR 332), `copy_file_range` (NR 326), `close_range` (NR 334), `preadv2`/`pwritev2` (NR 327/328), full POSIX timer set (NR 222–226), IPC (NR 29–31, 64–71, 240–245), seccomp (NR 317), namespaces (NR 272, 308).
 
 ### Networking
 - smoltcp-backed stack: Ethernet, ARP, IPv4, TCP, UDP, ICMP, DHCP, DNS
@@ -339,7 +363,10 @@ src/
   arch/
     riscv64/     # UEFI + SBI entry, CSR, PLIC, sv39 paging, syscall, trampoline
     x86_64/      # GDT, IDT, APIC, UEFI entry, paging, syscall
-  fs/            # VFS, ext2, devfs, procfs, pipe, poll, ...
+  fs/            # VFS, ext2, fat32, ramfs (tmpfs), overlayfs, devfs, procfs, pipe, poll, ...
+    fat32.rs     #   FAT32/VFAT: BPB, cluster chains, LFN, r/w/truncate/mkdir/unlink/rename
+    ramfs.rs     #   tmpfs: memory-backed FS; auto-mounted at /tmp, /run, /dev/shm
+    overlayfs.rs #   overlayfs: lowerdir/upperdir/workdir union mount, copy-up on write
   mm/            # PMM, VMM, mmap, page_fault, CoW
   proc/          # PCB, scheduler, fork, exec, signal, futex
   drivers/       # virtio-blk, virtio-net, virtio-gpu, PCIe, PS/2, TTY
@@ -350,6 +377,11 @@ src/
   net/           # ARP, DHCP, DNS, Ethernet, ICMP, IPv4, TCP, UDP
   security/      # capability sets (CapSet)
   shell/         # in-kernel TTY shell
+  syscall/
+    mod.rs       #   x86-64 syscall dispatch table (NR 0-437)
+    stubs.rs     #   trivial / constant-return implementations
+    posix_full.rs#   full POSIX implementations (timers, statx, copy_file_range, ...)
+    p0_gaps.rs   #   permission/attribute stubs
   wayland/       # in-kernel Wayland compositor
     server.rs    #   wl_display / wl_registry / wl_compositor / xdg_wm_base
     compositor.rs#   surface tree, damage tracking, DRM page-flip integration
@@ -362,6 +394,28 @@ riscv64-uefi.json  # custom Rust target spec (PE/COFF, RISC-V UEFI) -- default t
 run_qemu_riscv.sh  # RISC-V QEMU launcher: UEFI (default) or --sbi
 run_qemu.sh        # x86_64 QEMU launcher
 ```
+
+---
+
+## Changelog
+
+### v0.2.0
+- **FAT32/VFAT** filesystem driver (`src/fs/fat32.rs`): BPB parsing, cluster-chain traversal, LFN support, full read/write/truncate/mkdir/unlink/rename; auto-mounted read-only at `/boot/efi`
+- **tmpfs** (`src/fs/ramfs.rs`): memory-backed FS with per-instance size cap; auto-mounted at `/tmp`, `/run`, `/dev/shm`; dynamic `tmpfs_mount()` API for `sys_mount`
+- **overlayfs** (`src/fs/overlayfs.rs`): union mount driver with `lowerdir=`/`upperdir=`/`workdir=` mount options and copy-up-on-write semantics
+- **Syscall additions** for musl/glibc compatibility: `getitimer`/`setitimer` (NR 36/38); `times` (NR 100); `openat2` (NR 437) with `open_how` / `RESOLVE_*` flag parsing; `io_uring_setup`/`enter`/`register` (NR 425-427) stubs returning `ENOSYS`
+- **DRM/KMS subsystem** (`src/drivers/drm.rs`, `src/drivers/virtio_gpu.rs`): full Linux-compatible KMS object model, GEM dumb-buffer allocator, page-flip with vblank event delivery, virtio-gpu accelerated path
+- **Wayland compositor** (`src/wayland/`): in-kernel compositor at `/run/wayland-0`, `wl_shm` buffer -> DRM framebuffer copy-on-commit
+
+### v0.1.0
+- Initial kernel: RISC-V UEFI + SBI boot, x86_64 UEFI boot
+- PMM/VMM, CoW fork, demand paging
+- ext2 read/write, initramfs, devfs, procfs
+- POSIX signals, futex, POSIX timers
+- smoltcp networking stack, BSD socket API
+- ELF loader with dynamic linker support
+- System V IPC (shm, sem, msg), POSIX mqueue
+- seccomp, namespaces (unshare/setns)
 
 ---
 
