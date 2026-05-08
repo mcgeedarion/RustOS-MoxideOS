@@ -6,15 +6,17 @@
 //! handles by detecting PT_INTERP and loading the interpreter instead.
 //!
 //! ## Functions
-//!   parse_elf_header(data)          -> Result<Elf64Hdr, errno>
-//!   parse_phdrs(data, hdr)          -> Vec<Elf64Phdr>
-//!   load_elf_into(cr3, data, phdrs) -> Result<entry_va, errno>
-//!   find_interp(data, phdrs)        -> Option<&str>
+//!   parse_elf_header(data)               -> Result<Elf64Hdr, errno>
+//!   parse_phdrs(data, hdr)               -> Vec<Elf64Phdr>
+//!   load_elf_into(cr3, data, phdrs)      -> Result<entry_va, errno>
+//!   end_of_bss(phdrs, bias)              -> usize
+//!   find_interp(data, phdrs)             -> Option<&str>
 
 extern crate alloc;
 use alloc::vec::Vec;
 
-// ── ELF64 types ────────────────────────────────────────────────────────────────
+// ── ELF64 types ──────────────────────────────────────────────────────────────────
+
 pub type Elf64Addr  = u64;
 pub type Elf64Off   = u64;
 pub type Elf64Half  = u16;
@@ -74,7 +76,7 @@ pub struct Elf64Phdr {
     pub p_align:  Elf64Xword,
 }
 
-// ── parse_elf_header ─────────────────────────────────────────────────────────────
+// ── parse_elf_header ───────────────────────────────────────────────────────────────────
 
 /// Validate and return a copy of the ELF64 header from `data`.
 /// Returns -ENOEXEC (-8) on any format error.
@@ -90,7 +92,7 @@ pub fn parse_elf_header(data: &[u8]) -> Result<Elf64Hdr, i32> {
     Ok(hdr)
 }
 
-// ── parse_phdrs ───────────────────────────────────────────────────────────────────
+// ── parse_phdrs ─────────────────────────────────────────────────────────────────────
 
 /// Return a Vec of all program headers from `data`.
 /// Capped at MAX_PHDRS to bound heap allocation from crafted headers.
@@ -107,7 +109,29 @@ pub fn parse_phdrs(data: &[u8], hdr: &Elf64Hdr) -> Vec<Elf64Phdr> {
     out
 }
 
-// ── load_elf_into ─────────────────────────────────────────────────────────────────
+// ── end_of_bss ────────────────────────────────────────────────────────────────────────
+
+/// Return the first byte *past* the highest PT_LOAD segment (biased by
+/// `bias`, as used for ET_DYN PIE executables loaded at INTERP_BASE).
+///
+/// This is the "end of BSS" as far as the OS is concerned — the address
+/// that `set_brk_base` must receive to place the heap above all ELF data.
+///
+/// If there are no PT_LOAD segments (pathological) the function returns 0
+/// so that `set_brk_base` falls back to its minimum safe address.
+pub fn end_of_bss(phdrs: &[Elf64Phdr], bias: usize) -> usize {
+    phdrs.iter()
+        .filter(|ph| ph.p_type == PT_LOAD && ph.p_memsz > 0)
+        .map(|ph| {
+            (ph.p_vaddr as usize)
+                .wrapping_add(bias)
+                .wrapping_add(ph.p_memsz as usize)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+// ── load_elf_into ─────────────────────────────────────────────────────────────────────
 
 /// Load all PT_LOAD segments from `data` into the page tables rooted at `cr3`.
 pub fn load_elf_into(cr3: usize, data: &[u8], hdr: &Elf64Hdr, phdrs: &[Elf64Phdr])
@@ -124,7 +148,7 @@ pub fn load_elf_into(cr3: usize, data: &[u8], hdr: &Elf64Hdr, phdrs: &[Elf64Phdr
         if ph.p_type != PT_LOAD { continue; }
         if ph.p_memsz == 0      { continue; }
 
-        // ── va_start / va_end with overflow + kernel-VA guard ───────────────────
+        // ── va_start / va_end with overflow + kernel-VA guard ─────────────────────
         let seg_va = (ph.p_vaddr as usize)
             .checked_add(bias)
             .ok_or(-8i32)?; // overflow → ENOEXEC
@@ -184,7 +208,7 @@ fn seg_pte_flags(p_flags: u32) -> u64 {
     f
 }
 
-// ── find_interp ──────────────────────────────────────────────────────────────────
+// ── find_interp ────────────────────────────────────────────────────────────────────────
 
 /// Return the interpreter path from a PT_INTERP segment, if present.
 pub fn find_interp<'a>(data: &'a [u8], phdrs: &[Elf64Phdr]) -> Option<&'a str> {

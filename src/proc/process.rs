@@ -39,7 +39,13 @@ pub struct Pcb {
     pub vmas:    Vec<Vma>,
     /// Next free virtual address for anonymous mmap allocations.
     pub next_va: usize,
-    /// Current program break (top of heap).
+    /// Base of the heap: first page-aligned address above the ELF image.
+    /// Set once by mm::mmap::set_brk_base() at exec time (after all PT_LOAD
+    /// segments are committed).  Never changes for the lifetime of the process
+    /// image — a new execve resets it to 0 then re-derives it.
+    /// 0 for kernel threads or any process that has not yet exec'd an ELF.
+    pub brk_base: usize,
+    /// Current program break (top of heap).  Always >= brk_base.
     pub brk:     usize,
 
     // Kernel stack
@@ -64,19 +70,19 @@ pub struct Pcb {
     /// None for kernel threads or before the first successful execve.
     pub exe_path: Option<String>,
 
-    // ── Namespace set ────────────────────────────────────────────────────────
+    // ── Namespace set ─────────────────────────────────────────────────────────
     /// Linux namespace memberships (mount, pid, net, uts, ipc, user, time).
     /// Inherited from parent on fork; individual types may be unshared via
     /// unshare(2) / clone(CLONE_NEW*).
     pub ns: NsSet,
 
-    // ── seccomp filter chain ─────────────────────────────────────────────────
+    // ── seccomp filter chain ──────────────────────────────────────────────────────
     /// cBPF filter programs installed by seccomp(2).
     /// Empty chain = no filtering.  strict = SECCOMP_SET_MODE_STRICT.
     /// Inherited (copied) into fork/clone children.
     pub seccomp: FilterChain,
 
-    // ── NPTL / robust futex ─────────────────────────────────────────────────
+    // ── NPTL / robust futex ───────────────────────────────────────────────────────
     /// User-VA of the robust_list_head registered by set_robust_list(2).
     /// 0 = not registered.
     pub robust_list_head: usize,
@@ -87,6 +93,7 @@ pub struct Pcb {
 impl Pcb {
     /// Initial `next_va` for new processes: 128 MiB into user space.
     pub const INITIAL_NEXT_VA: usize = 0x0800_0000;
-    /// Initial `brk` for new processes: 32 MiB into user space.
+    /// Fallback `brk` for processes that have not yet exec'd an ELF.
+    /// The real heap base is set by mm::mmap::set_brk_base() after exec.
     pub const INITIAL_BRK:     usize = 0x0200_0000;
 }

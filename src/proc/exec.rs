@@ -6,13 +6,14 @@
 //!   2.  parse_elf_header + parse_phdrs
 //!   3.  alloc fresh address space (new_cr3) — old space untouched until step 8
 //!   4.  load_elf_into(new_cr3, data, phdrs) → program_entry
-//!   5.  If PT_INTERP present: load_interpreter → interp_entry
-//!   6.  Alloc user stack pages into new_cr3
-//!   7.  clear_vmas(old) + free_old_address_space(old_cr3) + load_cr3(new_cr3)
-//!   8.  build_initial_stack (writes into new_cr3, now active) → initial_rsp
-//!   9.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
-//!  10.  wake_pid(vfork_parent) if set
-//!  11.  Patch SyscallFrame for SYSRETQ delivery
+//!   5.  elf::end_of_bss(phdrs, bias) → call set_brk_base  <── NEW
+//!   6.  If PT_INTERP present: load_interpreter → interp_entry
+//!   7.  Alloc user stack pages into new_cr3
+//!   8.  clear_vmas(old) + free_old_address_space(old_cr3) + load_cr3(new_cr3)
+//!   9.  build_initial_stack (writes into new_cr3, now active) → initial_rsp
+//!  10.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
+//!  11.  wake_pid(vfork_parent) if set
+//!  12.  Patch SyscallFrame for SYSRETQ delivery
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -37,6 +38,10 @@ const STACK_PAGES: usize = 8;
 const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
 const INTERP_BASE: usize = 0x0060_0000;
 
+/// `bias` applied to ET_DYN images by load_elf_into.  We need the same
+/// value here to correctly compute end_of_bss for PIE executables.
+const ELF_DYN_BIAS: usize = 0x0040_0000;
+
 const AT_NULL:   u64 =  0;
 const AT_PHDR:   u64 =  3;
 const AT_PHENT:  u64 =  4;
@@ -55,7 +60,7 @@ const MAX_CSTR_LEN: usize = 4096;
 /// Maximum number of pointer-array entries for argv / envp.
 const MAX_CSTR_ARRAY: usize = 1024;
 
-// ── free_old_address_space ────────────────────────────────────────────
+// ── free_old_address_space ────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
@@ -112,7 +117,7 @@ pub unsafe fn free_child_address_space(_cr3: usize) {}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn free_old_address_space(_cr3: usize) {}
 
-// ── spawn_user_process ─────────────────────────────────────────────────────────
+// ── spawn_user_process ───────────────────────────────────────────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
@@ -138,6 +143,12 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         Ok(e) => e,
         Err(_) => { unsafe { free_old_address_space(new_cr3); } return false; }
     };
+
+    // ── Derive heap base from the highest PT_LOAD segment ─────────────────────
+    // Must happen right after load_elf_into so brk_base/brk are set
+    // before any PT_INTERP or stack setup that might call sys_brk.
+    let elf_bias = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
+    let bss_end  = elf::end_of_bss(&phdrs, elf_bias);
 
     let phdr_va = phdrs.iter()
         .find(|ph| ph.p_type == elf::PT_PHDR)
@@ -189,6 +200,11 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     #[cfg(target_arch = "x86_64")]
     { ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize; }
 
+    // Compute brk_base *before* enqueueing so the PCB is correct from the
+    // first time the scheduler looks at it.  set_brk_base is called below
+    // on `pid` after enqueue so the PCB entry exists.
+    let heap_base = mmap::set_brk_base_compute(bss_end);
+
     let pcb = crate::proc::process::Pcb {
         pid,
         ppid,
@@ -203,14 +219,14 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         ctx,
         vmas:        alloc::vec![],
         next_va:     crate::proc::process::Pcb::INITIAL_NEXT_VA,
-        brk:         crate::proc::process::Pcb::INITIAL_BRK,
+        brk_base:    heap_base,
+        brk:         heap_base,
         child_tid_va:        0,
         child_tid_val:       0,
         clear_child_tid_va:  0,
         exit_signal:         17,
         vfork_parent:        0,
         signal_handlers:     SignalHandlers::default(),
-        // Record the executable path for /proc/<pid>/exe.
         exe_path:            Some(String::from(path)),
     };
 
@@ -222,7 +238,7 @@ pub fn sys_execve_from_path(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ──────────────────────────────────────────────────────
+// ── sys_execve [NR 59] ─────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
@@ -236,7 +252,7 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
     }
 }
 
-// ── do_execve ──────────────────────────────────────────────────────────────────────
+// ── do_execve ───────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(path: &str, argv: &[String], envp: &[String],
@@ -246,7 +262,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
 
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|e| e)?;
     let file_size = vfs::fstat(fd).unwrap_or(0);
-    // Reject oversized files before heap allocation to prevent single-syscall OOM.
     const MAX_ELF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
     if file_size == 0 || file_size > MAX_ELF_SIZE {
         vfs::close(fd);
@@ -265,6 +280,14 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
 
     let program_entry = elf::load_elf_into(new_cr3, data, &hdr, &phdrs)
         .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
+
+    // ── Derive heap base from the highest PT_LOAD segment ─────────────────────
+    // Done here (after load_elf_into, before the point-of-no-return)
+    // so that a failed execve never modifies the caller's brk_base.
+    // set_brk_base() is called in the with_proc_mut block below.
+    let elf_bias  = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
+    let bss_end   = elf::end_of_bss(&phdrs, elf_bias);
+    let heap_base = mmap::set_brk_base_compute(bss_end);
 
     let phdr_va = phdrs.iter()
         .find(|ph| ph.p_type == elf::PT_PHDR)
@@ -297,8 +320,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         unsafe { free_old_address_space(old_cr3); }
     }
     <Arch as Paging>::load_cr3(new_cr3);
-    // Flush stale TLB entries from the old address space before writing
-    // argv/envp/auxv directly to user VAs in build_initial_stack.
     <Arch as Paging>::flush_all();
 
     let initial_rsp = build_initial_stack(
@@ -307,8 +328,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     )?;
 
     // Single with_proc_mut: update all PCB fields after point-of-no-return.
-    // exe_path is set here because this is the only place where both
-    // "ELF loaded successfully" and "path string" are simultaneously known.
     let vfork_parent = scheduler::with_proc_mut(pid, |p| {
         p.user_satp       = new_cr3;
         p.pc              = entry_va;
@@ -316,7 +335,9 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         p.signal_handlers = SignalHandlers::default();
         p.vmas            = alloc::vec![];
         p.next_va         = crate::proc::process::Pcb::INITIAL_NEXT_VA;
-        p.brk             = crate::proc::process::Pcb::INITIAL_BRK;
+        // Set the heap base/break for the new image.
+        p.brk_base        = heap_base;
+        p.brk             = heap_base;
         p.exe_path        = Some(String::from(path));
         let vfp            = p.vfork_parent;
         p.vfork_parent    = 0;
@@ -337,7 +358,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     Ok(())
 }
 
-// ── build_initial_stack ────────────────────────────────────────────────────────────────────
+// ── build_initial_stack ───────────────────────────────────────────────────────────────────────
 // CR3 must already be loaded to new_cr3 before calling this.
 // Writes directly to user VAs (valid because CR3 is active).
 
@@ -366,8 +387,6 @@ fn build_initial_stack(
         string_buf.extend_from_slice(s.as_bytes());
         string_buf.push(0);
     }
-    // Write 16 random bytes for AT_RANDOM — must be unique per exec, never zero.
-    // glibc uses these to seed stack canaries and __pointer_chaining_key.
     let random_offset = string_buf.len();
     let rand_a = crate::rand::next_u64().to_le_bytes();
     let rand_b = crate::rand::next_u64().to_le_bytes();
@@ -416,7 +435,7 @@ fn build_initial_stack(
     Ok(initial_rsp)
 }
 
-// ── load_interpreter ───────────────────────────────────────────────────────────────────────
+// ── load_interpreter ─────────────────────────────────────────────────────────────────────────
 
 fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     let fd  = vfs::open(interp_path, vfs::O_RDONLY).map_err(|e| e)?;
@@ -431,10 +450,9 @@ fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── string helpers ────────────────────────────────────────────────────────────────────────
+// ── string helpers ───────────────────────────────────────────────────────────────────────────
 
 /// Read a NUL-terminated string from user VA `va` into a kernel String.
-/// Uses copy_from_user to avoid raw user pointer dereference.
 pub fn read_cstr_safe(va: usize) -> Option<String> {
     if va < 0x1000 || va > 0x0000_7FFF_FFFF_F000 { return None; }
     let mut buf = [0u8; MAX_CSTR_LEN];
@@ -444,15 +462,11 @@ pub fn read_cstr_safe(va: usize) -> Option<String> {
 }
 
 /// Read a NUL-pointer-terminated argv/envp array from user VA `array_va`.
-/// Returns `Err(-7)` (E2BIG) if the array exceeds MAX_CSTR_ARRAY entries,
-/// allowing callers to propagate EFAULT / E2BIG to userspace.
 pub fn collect_cstr_array(array_va: usize) -> Result<Vec<String>, i32> {
     let mut out = Vec::new();
     if array_va < 0x1000 { return Ok(out); }
     for i in 0..=MAX_CSTR_ARRAY {
-        if i == MAX_CSTR_ARRAY {
-            return Err(-7); // E2BIG — array exceeded limit
-        }
+        if i == MAX_CSTR_ARRAY { return Err(-7); }
         let slot_va = array_va + i * core::mem::size_of::<usize>();
         let mut ptr_bytes = [0u8; 8];
         if copy_from_user(&mut ptr_bytes, slot_va).is_err() { break; }
@@ -463,7 +477,7 @@ pub fn collect_cstr_array(array_va: usize) -> Result<Vec<String>, i32> {
     Ok(out)
 }
 
-// ── clear_vmas helper (called from do_execve) ──────────────────────────────────────────
+// ── clear_vmas helper ───────────────────────────────────────────────────────────────────
 
 pub fn clear_vmas(pid_key: u32) {
     crate::mm::mmap::clear_vmas_pub(pid_key as usize);
