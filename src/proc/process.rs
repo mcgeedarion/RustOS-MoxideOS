@@ -31,7 +31,7 @@ pub struct Pcb {
     pub pc: usize,
     pub sp: usize,
 
-    // Address space (CR3 physical address)
+    // Address space (CR3 / satp physical address)
     pub user_satp: usize,
 
     // Virtual memory management
@@ -51,6 +51,12 @@ pub struct Pcb {
     // Kernel stack
     pub kstack_top: usize,
     pub ctx:        Context,
+
+    // ── TLS ───────────────────────────────────────────────────────────────────
+    /// User-space TLS base address (FS.base on x86-64, tp on RISC-V).
+    /// Set by clone3(CLONE_SETTLS) and preserved across context switches.
+    /// 0 for threads that have not registered a TLS block.
+    pub tls_base: usize,
 
     // clone3 / POSIX thread ABI fields
     /// CLONE_CHILD_SETTID: write pid here on first run. Zeroed after write.
@@ -76,13 +82,13 @@ pub struct Pcb {
     /// unshare(2) / clone(CLONE_NEW*).
     pub ns: NsSet,
 
-    // ── seccomp filter chain ──────────────────────────────────────────────────────
+    // ── seccomp filter chain ──────────────────────────────────────────────────
     /// cBPF filter programs installed by seccomp(2).
     /// Empty chain = no filtering.  strict = SECCOMP_SET_MODE_STRICT.
     /// Inherited (copied) into fork/clone children.
     pub seccomp: FilterChain,
 
-    // ── NPTL / robust futex ───────────────────────────────────────────────────────
+    // ── NPTL / robust futex ───────────────────────────────────────────────────
     /// User-VA of the robust_list_head registered by set_robust_list(2).
     /// 0 = not registered.
     pub robust_list_head: usize,

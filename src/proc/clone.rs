@@ -9,6 +9,8 @@
 //!   - Shares the parent's VMA list.
 //!   - Gets a private kernel stack and Context.
 //!   - Starts at sysret_trampoline with rax=0 (child return value).
+//!   - Gets its TLS base saved in Pcb.tls_base so it survives across
+//!     context switches (written back to FS.base / tp on every resume).
 //!
 //! Non-CLONE_VM (fork / vfork) is handled by fork.rs.
 
@@ -20,6 +22,8 @@ use crate::proc::process::{Pcb, State};
 use crate::proc::scheduler;
 use crate::proc::thread;
 use crate::security::CapSet;
+use crate::proc::namespace::NsSet;
+use crate::security::seccomp::FilterChain;
 use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
 
 // arch-specific sysret trampoline — only meaningful on x86_64
@@ -108,13 +112,18 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         parent_pid
     };
 
+    // TLS base for this new thread.
+    let child_tls = if flags & CLONE_SETTLS != 0 { ca.tls as usize } else { 0 };
+
     let user_rsp = if ca.stack != 0 { (ca.stack + ca.stack_size) as usize } else { 0 };
     push_syscall_frame(kstack_top, parent_rip, 0x202, user_rsp);
 
     let child_ctx = Context {
         rip:     sysret_trampoline as usize,
         rsp:     kstack_top - 17 * 8,
-        fs_base: if flags & CLONE_SETTLS != 0 { ca.tls as usize } else { 0 },
+        // fs_base is set here for the first resume; subsequent context switches
+        // reload it from Pcb.tls_base via the scheduler's switch_to path.
+        fs_base: child_tls,
         ..Context::zero()
     };
 
@@ -141,6 +150,12 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.child_tid_va       = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
     child_pcb.child_tid_val      = child_pid as u32;
     child_pcb.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
+    // Persist TLS base so the scheduler can reload FS.base / tp on every
+    // context switch back to this thread.
+    child_pcb.tls_base = child_tls;
+    // New thread starts with an empty robust list.
+    child_pcb.robust_list_head = 0;
+    child_pcb.robust_list_len  = 0;
 
     if is_vm_clone { thread::register_thread(child_pid, child_tgid); }
     scheduler::enqueue(child_pcb);
@@ -164,21 +179,36 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
     }
 }
 
+/// Construct a blank PCB with all fields explicitly initialised.
+/// Used as a fallback when the parent PCB cannot be found in the scheduler.
 fn make_blank_pcb() -> Pcb {
     Pcb {
-        pid: 0, ppid: 0, tgid: 0,
-        state: State::Ready,
-        exit_code: 0,
-        caps: CapSet::empty(),
-        pc: 0, sp: 0,
-        user_satp: 0,
-        vmas:    Vec::new(),
-        next_va: Pcb::INITIAL_NEXT_VA,
-        brk:     Pcb::INITIAL_BRK,
+        pid:        0,
+        ppid:       0,
+        tgid:       0,
+        state:      State::Ready,
+        exit_code:  0,
+        caps:       CapSet::empty(),
+        pc:         0,
+        sp:         0,
+        user_satp:  0,
+        vmas:       Vec::new(),
+        next_va:    Pcb::INITIAL_NEXT_VA,
+        brk_base:   0,
+        brk:        Pcb::INITIAL_BRK,
         kstack_top: 0,
-        ctx: Context::zero(),
-        child_tid_va: 0, child_tid_val: 0, clear_child_tid_va: 0,
-        exit_signal: 17, vfork_parent: 0,
-        signal_handlers: crate::proc::fork::SignalHandlers::default(),
+        ctx:        Context::zero(),
+        tls_base:   0,
+        child_tid_va:        0,
+        child_tid_val:       0,
+        clear_child_tid_va:  0,
+        exit_signal:         17,
+        vfork_parent:        0,
+        signal_handlers:     crate::proc::fork::SignalHandlers::default(),
+        exe_path:            None,
+        ns:                  NsSet::default(),
+        seccomp:             FilterChain::default(),
+        robust_list_head:    0,
+        robust_list_len:     0,
     }
 }
