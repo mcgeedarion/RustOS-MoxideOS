@@ -18,6 +18,7 @@
 //!   | Pipe (closed)  | returns POLLHUP              |                             |
 //!   | Socket         | recv-buf non-empty           | send-buf not full           |
 //!   | eventfd        | counter > 0                  | always (counter < MAX)      |
+//!   | timerfd        | expirations > 0              | N/A                         |
 //!   | devfs / file   | always (data available)      | always                      |
 //!   | unknown fd     | POLLNVAL                     |                             |
 //!
@@ -59,7 +60,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── poll event flags (POSIX) ─────────────────────────────────────────────────────────────────
+// ── poll event flags (POSIX) ─────────────────────────────────────────────────────────────────────────────
 pub const POLLIN:     u32 = 0x0001;
 pub const POLLPRI:    u32 = 0x0002;
 pub const POLLOUT:    u32 = 0x0004;
@@ -69,7 +70,7 @@ pub const POLLNVAL:   u32 = 0x0020;
 pub const POLLRDNORM: u32 = 0x0040;
 pub const POLLWRNORM: u32 = 0x0100;
 
-// ── readiness oracle ─────────────────────────────────────────────────────────────────────────
+// ── readiness oracle ─────────────────────────────────────────────────────────────────────────────────
 
 /// Return the subset of `events` that are currently ready on `fdno`,
 /// plus POLLERR / POLLHUP / POLLNVAL as appropriate.
@@ -89,13 +90,17 @@ pub fn fd_ready(fdno: usize, events: u32) -> u32 {
     if crate::fs::pipe::is_pipe_fd(fdno) {
         return crate::fs::pipe::pipe_poll(fdno, events);
     }
-    // sockets  (eventfd lives in the socket table on our impl)
+    // sockets
     if let Some(ready) = crate::net::socket::socket_poll(fdno, events) {
         return ready;
     }
-    // eventfd  (standalone)
+    // eventfd (standalone)
     if crate::fs::eventfd::is_eventfd(fdno) {
         return crate::fs::eventfd::eventfd_poll(fdno, events);
+    }
+    // timerfd — POLLIN when expirations > 0
+    if crate::fs::timerfd::is_timerfd(fdno) {
+        return crate::fs::timerfd::timerfd_poll(fdno, events);
     }
     // devfs files
     if crate::fs::devfs::get_dev_fd(fdno).is_some() {
@@ -114,7 +119,7 @@ pub fn fd_ready(fdno: usize, events: u32) -> u32 {
     POLLNVAL
 }
 
-// ── time helpers ──────────────────────────────────────────────────────────────────────────
+// ── time helpers ──────────────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn now_ns() -> u64 { crate::time::monotonic_ns() }
@@ -162,7 +167,7 @@ fn ms_to_deadline_ns(ms: i32) -> u64 {
     now_ns() + wait_ns
 }
 
-// ── fd_set bitmap helpers ─────────────────────────────────────────────────────────────────
+// ── fd_set bitmap helpers ────────────────────────────────────────────────────────────────────
 
 fn read_fdset(va: usize, words: usize) -> Result<Vec<u64>, isize> {
     if va == 0 { return Ok(alloc::vec![0u64; words]); }
@@ -183,7 +188,7 @@ fn write_fdset(va: usize, src: &[u64]) {
     }
 }
 
-// ── signal mask helpers ───────────────────────────────────────────────────────────────────
+// ── signal mask helpers ───────────────────────────────────────────────────────────────────────────
 //
 // pselect6's 6th argument is not a raw sigset_t*.
 // It is a pointer to:  struct { const sigset_t *ss; size_t ss_len; }
@@ -208,19 +213,16 @@ struct Pselect6SigArg {
 /// Returns `None` if `ss_va` is NULL (no mask change requested).
 fn pselect_swap_sigmask(ss_va: usize) -> Option<u64> {
     if ss_va == 0 { return None; }
-    // Decode the two-word arg struct.
     if !validate_user_ptr(ss_va, 16) { return None; }
     let mut arg_buf = [0u8; 16];
     if copy_from_user(&mut arg_buf, ss_va).is_err() { return None; }
     let ss_ptr = u64::from_le_bytes(arg_buf[0..8].try_into().unwrap());
     let ss_len = u64::from_le_bytes(arg_buf[8..16].try_into().unwrap());
-    // Validate: we only support 64-bit signal sets (8 bytes).
     if ss_ptr == 0 || ss_len != 8 { return None; }
     if !validate_user_ptr(ss_ptr as usize, 8) { return None; }
     let mut mask_buf = [0u8; 8];
     if copy_from_user(&mut mask_buf, ss_ptr as usize).is_err() { return None; }
     let new_mask = u64::from_le_bytes(mask_buf);
-    // Resolve the current pid once here so both get and set use the same pid.
     let pid = crate::proc::scheduler::current_pid();
     let old  = crate::proc::signal::get_sigmask(pid);
     crate::proc::signal::set_sigmask(pid, new_mask);
@@ -235,7 +237,7 @@ fn pselect_restore_sigmask(old: Option<u64>) {
     }
 }
 
-// ── sys_select ────────────────────────────────────────────────────────────────────────────
+// ── sys_select ─────────────────────────────────────────────────────────────────────────────────
 //
 // select(2)  NR 23
 //
@@ -255,26 +257,22 @@ pub fn sys_select(
     efds_va: usize,
     tv_va:   usize,
 ) -> isize {
-    // ── argument validation ──
-    if nfds > 1024 { return -22; }   // EINVAL — select limit is FD_SETSIZE=1024
+    if nfds > 1024 { return -22; }
 
     let words     = (nfds + 63) / 64;
     let bmap_size = words * 8;
 
-    // Validate fd_set pointers (excluding NULL which means "don't care").
     for va in [rfds_va, wfds_va, efds_va] {
-        if va != 0 && !validate_user_ptr(va, bmap_size) { return -14; } // EFAULT
+        if va != 0 && !validate_user_ptr(va, bmap_size) { return -14; }
     }
 
-    // ── timeout parsing ──
-    // tv_va == NULL → block indefinitely (capped at 5 s, see module doc).
     let (deadline_ns, zero_poll) = if tv_va == 0 {
         (now_ns() + 5_000_000_000, false)
     } else {
         match read_timeval(tv_va) {
             Err(e) => return e,
             Ok((sec, usec)) => {
-                if sec < 0 || usec < 0 { return -22; } // EINVAL
+                if sec < 0 || usec < 0 { return -22; }
                 let wait_ns = (sec as u64) * 1_000_000_000 + (usec as u64) * 1_000;
                 let zero    = wait_ns == 0;
                 let dl      = if zero { now_ns() } else { now_ns() + wait_ns.min(5_000_000_000) };
@@ -283,16 +281,13 @@ pub fn sys_select(
         }
     };
 
-    // ── read input fd_sets ──
     let rfds_k = match read_fdset(rfds_va, words) { Ok(v) => v, Err(e) => return e };
     let wfds_k = match read_fdset(wfds_va, words) { Ok(v) => v, Err(e) => return e };
-    // exceptfds input is ignored (we synthesise it from fd_ready error bits).
 
     let mut out_r = alloc::vec![0u64; words];
     let mut out_w = alloc::vec![0u64; words];
     let mut out_e = alloc::vec![0u64; words];
 
-    // ── poll loop ──
     loop {
         out_r.fill(0);
         out_w.fill(0);
@@ -305,7 +300,6 @@ pub fn sys_select(
 
             let want_r = rfds_va != 0 && (rfds_k[word] & bit != 0);
             let want_w = wfds_va != 0 && (wfds_k[word] & bit != 0);
-            // exceptfds: watch same fds as read or write, regardless of input
             let want_e = efds_va != 0 && ((rfds_va != 0 && rfds_k[word] & bit != 0)
                                          || (wfds_va != 0 && wfds_k[word] & bit != 0));
 
@@ -332,11 +326,9 @@ pub fn sys_select(
         }
 
         if total > 0 || zero_poll || !before_deadline(deadline_ns) {
-            // ── write output fd_sets ──
             write_fdset(rfds_va, &out_r);
             write_fdset(wfds_va, &out_w);
             write_fdset(efds_va, &out_e);
-            // ── write back remaining time (POSIX-required for select) ──
             write_timeval_remaining(tv_va, deadline_ns);
             return total as isize;
         }
@@ -344,34 +336,15 @@ pub fn sys_select(
     }
 }
 
-// ── sys_pselect6 ──────────────────────────────────────────────────────────────────────────
-//
-// pselect6(2)  NR 270
-//
-// int pselect6(int nfds,
-//              fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
-//              const struct timespec *timeout,
-//              const struct { const sigset_t *ss; size_t ss_len; } *sigmask);
-//
-// Key differences from select(2):
-//   1. timeout is struct timespec (nanosecond precision) not struct timeval
-//   2. sigmask arg is a two-word struct {ss*, ss_len}, not a raw sigset_t*
-//   3. The signal mask is swapped atomically with the wait (to avoid races)
-//   4. The timeout pointer is NOT written back on return (Linux-compatible)
-//
-// errno values (match Linux):
-//   EINVAL  (-22)  nfds > 1024, negative timeout, invalid ss_len
-//   EFAULT  (-14)  bad pointer
-
+// ── sys_pselect6 ──────────────────────────────────────────────────────────────────────────────
 pub fn sys_pselect6(
     nfds:       usize,
     rfds_va:    usize,
     wfds_va:    usize,
     efds_va:    usize,
-    ts_va:      usize,   // struct timespec *  (NULL = block forever)
-    sigarg_va:  usize,   // struct { sigset_t *ss; size_t ss_len; } * (NULL = no change)
+    ts_va:      usize,
+    sigarg_va:  usize,
 ) -> isize {
-    // ── argument validation ──
     if nfds > 1024 { return -22; }
 
     let words     = (nfds + 63) / 64;
@@ -381,7 +354,6 @@ pub fn sys_pselect6(
         if va != 0 && !validate_user_ptr(va, bmap_size) { return -14; }
     }
 
-    // ── timeout parsing (timespec, nanosecond precision) ──
     let (deadline_ns, zero_poll) = if ts_va == 0 {
         (now_ns() + 5_000_000_000, false)
     } else {
@@ -397,20 +369,15 @@ pub fn sys_pselect6(
         }
     };
 
-    // ── read input fd_sets ──
     let rfds_k = match read_fdset(rfds_va, words) { Ok(v) => v, Err(e) => return e };
     let wfds_k = match read_fdset(wfds_va, words) { Ok(v) => v, Err(e) => return e };
 
-    // ── atomically swap signal mask ──
-    // This must happen AFTER validation and BEFORE the poll loop,
-    // matching pselect6's atomic-mask-swap semantics.
     let old_mask = pselect_swap_sigmask(sigarg_va);
 
     let mut out_r = alloc::vec![0u64; words];
     let mut out_w = alloc::vec![0u64; words];
     let mut out_e = alloc::vec![0u64; words];
 
-    // ── poll loop (identical logic to sys_select, no timeval writeback) ──
     let ret = loop {
         out_r.fill(0);
         out_w.fill(0);
@@ -452,19 +419,16 @@ pub fn sys_pselect6(
             write_fdset(rfds_va, &out_r);
             write_fdset(wfds_va, &out_w);
             write_fdset(efds_va, &out_e);
-            // pselect6 does NOT write back the timespec (unlike select's timeval).
             break total as isize;
         }
         core::hint::spin_loop();
     };
 
-    // ── restore original signal mask ──
     pselect_restore_sigmask(old_mask);
-
     ret
 }
 
-// ── sys_poll ──────────────────────────────────────────────────────────────────────────────
+// ── sys_poll ────────────────────────────────────────────────────────────────────────────────────
 
 /// `struct pollfd` layout (matches Linux x86-64): fd(i32) events(i16) revents(i16) → 8 bytes.
 #[repr(C)]
@@ -543,7 +507,7 @@ pub fn sys_ppoll(
     sys_poll(fds_va, nfds, timeout_ms)
 }
 
-// ── epoll ────────────────────────────────────────────────────────────────────────────────
+// ── epoll ───────────────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct EpollEntry {
