@@ -1,6 +1,8 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
 //! ## Recently wired
+//!   NR 41-55 socket syscalls (all 15)
+//!   NR 288   accept4 (was wrongly aliased to timerfd_gettime64)
 //!   NR 318  getrandom(buf, count, flags)     => stubs::sys_getrandom_impl
 //!   NR 334  close_range(first, last, flags)  => fs::close_range::sys_close_range
 //!   NR 332  statx                            => posix_full::sys_statx_impl
@@ -13,7 +15,13 @@
 //!   NR 283  timerfd_create                   => fs::timerfd::sys_timerfd_create
 //!   NR 286  timerfd_settime                  => fs::timerfd::sys_timerfd_settime
 //!   NR 287  timerfd_gettime                  => fs::timerfd::sys_timerfd_gettime
-//!   NR 288  timerfd_gettime64 (alias 287)    => fs::timerfd::sys_timerfd_gettime
+//!
+//! ## Socket NRs (NR 41-55)
+//!   41  socket       42  connect     43  accept      44  sendto
+//!   45  recvfrom     46  sendmsg     47  recvmsg     48  shutdown
+//!   49  bind         50  listen      51  getsockname 52  getpeername
+//!   53  socketpair   54  setsockopt  55  getsockopt
+//!   288 accept4
 //!
 //! ## IPC (wired)
 //!   NR 29   shmget   NR 30  shmat    NR 31  shmctl
@@ -226,6 +234,52 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        crate::fs::close_range::sys_close_range(first, last, flags),
                    _ => -22,
                },
+        // ── socket syscalls (NR 41-55, 288) ─────────────────────────────────────────────
+        // NR 41  socket(domain, type, protocol)
+        41  => crate::net::socket::sys_socket(a as i32, b as i32, c as i32),
+        // NR 42  connect(sockfd, addr, addrlen)
+        42  => crate::net::socket::sys_connect(a, b, c as u32),
+        // NR 43  accept(sockfd, addr, addrlen)
+        43  => crate::net::socket::sys_accept(a, b, c),
+        // NR 44  sendto(sockfd, buf, len, flags, dest_addr, addrlen)
+        44  => crate::net::socket::sys_sendto(a, b, c, d as i32, e, f as u32),
+        // NR 45  recvfrom(sockfd, buf, len, flags, src_addr, addrlen)
+        45  => crate::net::socket::sys_recvfrom(a, b, c, d as i32, e, f),
+        // NR 46  sendmsg(sockfd, msg, flags)
+        46  => crate::net::socket::sys_sendmsg(a, b, c as i32),
+        // NR 47  recvmsg(sockfd, msg, flags)
+        47  => crate::net::socket::sys_recvmsg(a, b, c as i32),
+        // NR 48  shutdown(sockfd, how)
+        48  => crate::net::socket::sys_shutdown(a, b as i32),
+        // NR 49  bind(sockfd, addr, addrlen)
+        49  => crate::net::socket::sys_bind(a, b, c as u32),
+        // NR 50  listen(sockfd, backlog)
+        50  => crate::net::socket::sys_listen(a, b as i32),
+        // NR 51  getsockname(sockfd, addr, addrlen)
+        51  => crate::net::socket::sys_getsockname(a, b, c),
+        // NR 52  getpeername(sockfd, addr, addrlen)
+        52  => crate::net::socket::sys_getpeername(a, b, c),
+        // NR 53  socketpair(domain, type, protocol, sv)
+        53  => crate::net::socket::sys_socketpair(a as i32, b as i32, c as i32, d),
+        // NR 54  setsockopt(sockfd, level, optname, optval, optlen)
+        54  => crate::net::socket::sys_setsockopt(a, b as i32, c as i32, d, e as u32),
+        // NR 55  getsockopt(sockfd, level, optname, optval, optlen)
+        55  => crate::net::socket::sys_getsockopt(a, b as i32, c as i32, d, e),
+        // NR 288 accept4(sockfd, addr, addrlen, flags)
+        // flags: SOCK_NONBLOCK=0x800, SOCK_CLOEXEC=0x80000
+        288 => {
+            let fd = crate::net::socket::sys_accept(a, b, c);
+            if fd >= 0 {
+                if d & 0x800 != 0 {
+                    let mut t = crate::net::socket::UDP_SOCKETS.lock();
+                    if let Some(Some(s)) = t.get_mut(fd as usize) { s.nonblocking = true; }
+                }
+                if d & 0x80000 != 0 {
+                    crate::fs::fcntl::set_cloexec(fd as usize, true);
+                }
+            }
+            fd
+        }
         // ── timerfd ───────────────────────────────────────────────────────────────────────────
         // NR 283  timerfd_create(clockid, flags)
         283 => crate::fs::timerfd::sys_timerfd_create(a as u32, b as u32),
@@ -233,8 +287,6 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         286 => crate::fs::timerfd::sys_timerfd_settime(a, b as i32, c, d),
         // NR 287  timerfd_gettime(fd, curr_value_va)
         287 => crate::fs::timerfd::sys_timerfd_gettime(a, b),
-        // NR 288  timerfd_gettime64 — same ABI on x86-64
-        288 => crate::fs::timerfd::sys_timerfd_gettime(a, b),
         // ── inotify ──────────────────────────────────────────────────────────────────────────
         253 => crate::fs::inotify::sys_inotify_init1(0),
         254 => crate::fs::inotify::sys_inotify_add_watch(a, b, c as u32),
@@ -345,7 +397,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
             let cmd = c as i32;
             let arg = match cmd {
                 sem::SETVAL => Some(sem::SemctlArg::Val(d as i32)),
-                sem::SETALL => Some(sem::SemctlArg::Val(d as i32))
+                sem::SETALL => Some(sem::SemctlArg::Val(d as i32)),
                 _ => None,
             };
             match sem::semctl(a as i32, b as i32, cmd, arg) {

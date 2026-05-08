@@ -128,12 +128,13 @@ pub fn cloexec_range(lo: usize, hi: usize) {
 }
 
 /// Close an fd without touching FD_META (caller has already removed the entry).
-fn close_fd_no_meta(fd: usize) {
-    if crate::fs::pidfd::is_pidfd(fd)         { crate::fs::pidfd::free(fd);                    return; }
-    if crate::fs::timerfd::is_timerfd(fd)     { crate::fs::timerfd::sys_close_tfd(fd);         return; }
-    if crate::fs::signalfd::is_signalfd(fd)   { crate::fs::signalfd::sys_close_sfd(fd);        return; }
-    if crate::fs::eventfd::is_eventfd(fd)     { crate::fs::eventfd::sys_close_efd(fd);         return; }
-    if crate::fs::pipe::is_pipe(fd)           { crate::fs::pipe::sys_close_pipe(fd);           return; }
+pub fn close_fd_no_meta(fd: usize) {
+    if crate::fs::pidfd::is_pidfd(fd)           { crate::fs::pidfd::free(fd);                    return; }
+    if crate::fs::timerfd::is_timerfd(fd)       { crate::fs::timerfd::sys_close_tfd(fd);         return; }
+    if crate::fs::signalfd::is_signalfd(fd)     { crate::fs::signalfd::sys_close_sfd(fd);        return; }
+    if crate::fs::eventfd::is_eventfd(fd)       { crate::fs::eventfd::sys_close_efd(fd);         return; }
+    if crate::fs::pipe::is_pipe(fd)             { crate::fs::pipe::sys_close_pipe(fd);           return; }
+    if crate::net::socket::is_socket_fd(fd)     { crate::net::socket::sys_close_socket(fd);      return; }
     vfs::close(fd);
 }
 
