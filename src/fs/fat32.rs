@@ -602,8 +602,9 @@ pub struct FatStatfs {
 }
 
 // ── Global per-mount table ───────────────────────────────────────────────────
+// pub so that vfs_ops can lock it directly for read/write dispatch.
 
-static FAT_MOUNTS: Mutex<BTreeMap<String, Fat32Fs>> = Mutex::new(BTreeMap::new());
+pub static FAT_MOUNTS: Mutex<BTreeMap<String, Fat32Fs>> = Mutex::new(BTreeMap::new());
 
 /// Mount a FAT32 volume from block device `dev` at `mountpoint`.
 pub fn fat_mount(dev: u32, mountpoint: &str) -> Result<(), isize> {
@@ -640,7 +641,7 @@ pub fn fat_creat(mountpoint: &str, path: &str) -> Result<FatFile, isize> {
 fn split_path(path: &str) -> (&str, &str) {
     let path = path.trim_end_matches('/');
     match path.rfind('/') {
-        Some(i) => { let p = &path[..i]; (&path[..i.max(1)], &path[i+1..]) }
+        Some(i) => (&path[..i.max(1)], &path[i+1..]),
         None    => ("/", path),
     }
 }
@@ -669,7 +670,7 @@ fn write_short_entry(e: &mut [u8], name: &str, cluster: u32, size: u32, attr: u8
 
 fn write_dot_entries(buf: &mut [u8], self_cluster: u32, parent_cluster: u32) {
     // "." entry
-    write_short_entry(&mut buf[0..32],   ".",  self_cluster,   0, ATTR_DIRECTORY);
+    write_short_entry(&mut buf[0..32],  ".",  self_cluster,   0, ATTR_DIRECTORY);
     // ".." entry
-    write_short_entry(&mut buf[32..64],  "..", parent_cluster, 0, ATTR_DIRECTORY);
+    write_short_entry(&mut buf[32..64], "..", parent_cluster, 0, ATTR_DIRECTORY);
 }

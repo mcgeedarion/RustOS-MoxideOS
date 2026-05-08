@@ -5,6 +5,10 @@
 //! On UEFI systems the firmware hands us a pointer to the RSDP.  From there we
 //! locate the MADT so we can discover LAPIC/IOAPIC information (x86_64) or any
 //! other tables we may want later.
+//!
+//! Power management tables (FADT, DSDT) are parsed by the `power` sub-module.
+
+pub mod power;
 
 use core::mem::size_of;
 use core::slice;
@@ -31,15 +35,15 @@ pub struct RsdpV2 {
 
 #[repr(C, packed)]
 pub struct SdtHeader {
-    sig: [u8; 4],
-    len: u32,
-    rev: u8,
-    csum: u8,
-    oem_id: [u8; 6],
-    oem_table_id: [u8; 8],
-    oem_rev: u32,
-    creator_id: u32,
-    creator_rev: u32,
+    pub sig: [u8; 4],
+    pub len: u32,
+    pub rev: u8,
+    pub csum: u8,
+    pub oem_id: [u8; 6],
+    pub oem_table_id: [u8; 8],
+    pub oem_rev: u32,
+    pub creator_id: u32,
+    pub creator_rev: u32,
 }
 
 #[repr(C, packed)]
@@ -157,5 +161,16 @@ pub unsafe fn walk_madt(mut f: impl FnMut(&MadtEntryHdr, *const u8)) {
         }
         f(h, p as *const u8);
         p += h.len as usize;
+    }
+}
+
+/// Return the base address of the PCIe ECAM region from MCFG, if present.
+pub fn pcie_ecam_base() -> Option<u64> {
+    unsafe {
+        let mcfg = find_table(b"MCFG")?;
+        // MCFG body starts at offset 44 (SdtHeader=36 + 8 reserved bytes).
+        let body = (mcfg as usize + 44) as *const u64;
+        let base = body.read_unaligned();
+        if base == 0 { None } else { Some(base) }
     }
 }
