@@ -6,15 +6,16 @@
 //!   framebuffer   — Unified FB abstraction (virtio-gpu > GOP fallback)
 //!   virtio_gpu    — VirtIO GPU device (virtio-gpu-pci, device ID 0x1050)
 //!   ahci          — AHCI SATA controller
+//!   nvme          — NVMe host controller
 //!   pcie          — PCIe ECAM enumeration
 //!   virtio_blk    — VirtIO block device
-//!   virtio_net    — VirtIO network device (stub)
-//!   virtio_input  — VirtIO input device (stub)
-//!   evdev         — evdev input event layer (stub)
-//!   keyboard      — PS/2 / USB keyboard (stub)
-//!   mouse         — PS/2 / USB mouse (stub)
-//!   hid           — USB HID (stub)
-//!   usb           — USB host controller (stub)
+//!   virtio_net    — VirtIO network device
+//!   virtio_input  — VirtIO input device
+//!   evdev         — evdev input event layer
+//!   keyboard      — PS/2 / USB keyboard
+//!   mouse         — PS/2 / USB mouse
+//!   hid           — USB HID
+//!   usb           — USB xHCI host controller
 //!   clint         — RISC-V CLINT timer
 //!   gpio          — GPIO (stub)
 //!   tty           — TTY driver shim (real impl in shell/tty.rs)
@@ -34,6 +35,7 @@ pub mod gpu;
 pub mod hid;
 pub mod keyboard;
 pub mod mouse;
+pub mod nvme;
 pub mod pcie;
 pub mod tty;
 pub mod usb;
