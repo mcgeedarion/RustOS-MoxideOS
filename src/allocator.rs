@@ -1,44 +1,43 @@
 //! Global heap allocator — backed by the PMM.
 //!
-//! We use a simple linked-list allocator from the `linked_list_allocator`
-//! crate sitting on top of a fixed-size heap carved from the PMM pool.
-//!
-//! ## Contiguity guarantee
-//! The heap requires a single physically-contiguous region.  We obtain
-//! it by computing the address directly from the PMM's static `POOL`
-//! array and advancing the bump index in one atomic step, rather than
-//! calling `alloc_page()` in a loop and hoping the pages are adjacent.
-//!
-//! ### Calling order invariant
-//! `heap_init()` MUST be called before `pmm_add_region()` ever runs.
-//! At that point the free list is still empty, so the bump allocator
-//! is the only path — pages 0..HEAP_PAGES come out of `POOL` in
-//! address order with no gaps.  An assertion enforces this.
-//!
-//! The heap is 8 MiB, initialised once during early boot by
-//! `heap_init()`.  After that all `alloc::` calls (Vec, Box, String, …)
-//! are served from here.
+//! We use a simple linked-list / slab allocator on top of the physical
+//! memory manager.  Nothing fancy; correctness over performance.
 
-use linked_list_allocator::LockedHeap;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr;
 
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+use crate::mm::pmm;
 
-const HEAP_PAGES: usize = 2048; // 8 MiB
-const PAGE_SIZE:  usize = 4096;
+/// Minimum alignment we hand out (pointer-sized).
+const MIN_ALIGN: usize = core::mem::size_of::<usize>();
 
-/// Initialise the heap.  Call once, early in kernel_main, **before**
-/// `pmm_add_region()` and before any code that uses `alloc::`.
-pub fn heap_init() {
-    // Grab HEAP_PAGES pages atomically from the bump pool.
-    // `pmm_reserve_bump_range` returns the base PA of a contiguous
-    // run taken directly from POOL, or panics if the pool is exhausted
-    // or if the free list is already non-empty (calling-order violation).
-    let start = crate::mm::pmm::reserve_bump_range(HEAP_PAGES)
-        .expect("heap_init: PMM pool exhausted or called after pmm_add_region");
+/// The global allocator instance registered with `#[global_allocator]`.
+pub struct KernelAllocator;
 
-    let size = HEAP_PAGES * PAGE_SIZE;
-    unsafe {
-        ALLOCATOR.lock().init(start as *mut u8, size);
+unsafe impl GlobalAlloc for KernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size().max(MIN_ALIGN);
+        let align = layout.align().max(MIN_ALIGN);
+        match pmm::alloc_bytes(size, align) {
+            Some(p) => p.as_ptr(),
+            None => ptr::null_mut(),
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let size = layout.size().max(MIN_ALIGN);
+        pmm::free_bytes(core::ptr::NonNull::new_unchecked(ptr), size);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_layout = Layout::from_size_align(new_size, layout.align())
+            .expect("realloc: bad layout");
+        let new_ptr = self.alloc(new_layout);
+        if !new_ptr.is_null() {
+            let copy_size = layout.size().min(new_size);
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_size);
+            self.dealloc(ptr, layout);
+        }
+        new_ptr
     }
 }

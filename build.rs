@@ -1,49 +1,32 @@
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    // ── C runtime (crt0.c) ───────────────────────────────────────────────
-    let mut build = cc::Build::new();
-    build
-        .file("src/crt/crt0.c")
-        .flag("-ffreestanding")
-        .flag("-nostdlib")
-        .flag("-nostartfiles")
-        .flag("-fno-stack-protector")
-        .flag("-fno-builtin")
-        .opt_level(2);
-
-    if target.contains("x86_64") {
-        build.flag("--target=x86_64-unknown-none");
-    } else if target.contains("riscv64") {
-        build.flag("--target=riscv64-unknown-none-elf");
-        build.flag("-march=rv64gc");
-        build.flag("-mabi=lp64d");
+    // Compile the RISC-V user-space entry trampoline.
+    let asm_src = "src/arch/riscv64/uentry.S";
+    println!("cargo:rerun-if-changed={asm_src}");
+    let obj = out.join("uentry_riscv64.o");
+    let status = Command::new("riscv64-unknown-elf-as")
+        .args(["-march=rv64gc", "-mabi=lp64d", "-o"])
+        .arg(&obj)
+        .arg(asm_src)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            let lib = out.join("libuentry_riscv64.a");
+            Command::new("riscv64-unknown-elf-ar")
+                .args(["crs"])
+                .arg(&lib)
+                .arg(&obj)
+                .status()
+                .expect("ar failed");
+            println!("cargo:rustc-link-search=native={}", out.display());
+            println!("cargo:rustc-link-lib=static=uentry_riscv64");
+        }
+        _ => {
+            println!("cargo:warning=riscv64-unknown-elf-as not found; skipping uentry assembly");
+        }
     }
-
-    build.compile("kcrt");
-
-    // ── Multiboot2 entry stub (x86_64 only) ────────────────────────────
-    if target.contains("x86_64") {
-        let boot_obj = PathBuf::from(&out_dir).join("boot.o");
-        let status = Command::new("nasm")
-            .args([
-                "-f", "elf64",
-                "-o", boot_obj.to_str().unwrap(),
-                "src/arch/x86_64/boot.s",
-            ])
-            .status()
-            .expect("nasm not found — install nasm");
-        assert!(status.success(), "nasm failed to assemble boot.s");
-
-        // Tell rustc to link boot.o directly
-        println!("cargo:rustc-link-arg={}", boot_obj.display());
-        println!("cargo:rerun-if-changed=src/arch/x86_64/boot.s");
-    }
-
-    println!("cargo:rerun-if-changed=src/crt/crt0.c");
-    println!("cargo:rerun-if-changed=build.rs");
 }
