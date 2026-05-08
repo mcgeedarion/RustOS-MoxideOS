@@ -5,6 +5,33 @@
 //! The per-process VA bump pointer (Pcb::next_va) and brk (Pcb::brk)
 //! are also PCB fields, eliminating the old process-global statics.
 //!
+//! ## Growable heap (sys_brk)
+//!
+//! The heap occupies the virtual address range [brk_base, brk) where:
+//!
+//!   * `brk_base` — set once at exec load time to the first page-aligned
+//!     address above the ELF .bss section.  Never changes.
+//!   * `brk` — the current program break.  Grows upward on `brk(addr > brk)`
+//!     and shrinks downward on `brk(addr < brk)`.
+//!
+//! A single **guard page** at `brk_base - PAGE` is left permanently unmapped.
+//! An off-by-one under-read therefore causes a clean page fault / SIGSEGV
+//! instead of silently aliasing .bss.
+//!
+//! ### Grow path
+//! Pages are eagerly allocated from the PMM (glibc expects brk pages to be
+//! immediately readable). A full rollback returns `old_brk` unchanged on OOM
+//! so `malloc` can fall through to `mmap(MAP_ANON)`.
+//!
+//! ### Shrink path
+//! Pages in `[new_brk, old_brk)` are unmapped and returned to the PMM.
+//! The heap VMA is updated (or removed if fully collapsed).
+//!
+//! ### VMA coalescing
+//! Each `brk()` call extends the existing heap VMA in-place rather than
+//! inserting a new entry.  The VMA list therefore stays O(1) for the heap
+//! regardless of how many `sbrk(n)` increments the user-space malloc issues.
+//!
 //! ## VMA ordering
 //! VMAs are kept sorted by `start` address at all times.  This allows
 //! find_vma (called on every page fault) to use binary search in O(log n)
@@ -26,10 +53,6 @@
 //! Like MAP_FIXED but returns -EEXIST (-17) instead of silently clobbering
 //! an existing mapping.  ld.so uses this for precise segment placement while
 //! protecting itself against layout surprises.
-//!
-//! Detection: bit 0x100000 set AND bit 0x10 (MAP_FIXED) set.
-//! On clobber detection the function returns early with -EEXIST without
-//! having modified any mappings.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -48,6 +71,9 @@ pub enum VmaKind {
     /// Direct physical mapping — pages are NOT PMM-owned.
     /// Contains the physical address of the first mapped byte.
     PhysMap(u64),
+    /// Program break (heap) region. Treated identically to Anonymous for
+    /// page-fault handling but tracked separately for /proc/<pid>/status.
+    Heap,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +86,12 @@ pub struct Vma {
     pub file_offset: u64,
 }
 
+impl Vma {
+    /// Returns true if this VMA is the heap (brk) region.
+    #[inline]
+    pub fn is_heap(&self) -> bool { matches!(self.kind, VmaKind::Heap) }
+}
+
 // ── PROT_* / MAP_* constants ─────────────────────────────────────────────────
 
 pub const PROT_READ:  u32 = 1;
@@ -69,9 +101,9 @@ pub const PROT_EXEC:  u32 = 4;
 const MAP_SHARED:          u32 = 0x01;
 const MAP_PRIVATE:         u32 = 0x02;
 const MAP_FIXED:           u32 = 0x10;
-const MAP_ANON:            u32 = 0x20;
+pub const MAP_ANON:        u32 = 0x20;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000; // Linux 4.17+
-const PAGE:                usize = 4096;
+pub const PAGE:            usize = 4096;
 
 // ── VMA helpers ──────────────────────────────────────────────────────────────
 
@@ -158,15 +190,12 @@ pub fn sys_mmap(
     let pid = scheduler::current_pid();
 
     // ── MAP_FIXED_NOREPLACE collision check ───────────────────────────────
-    // Must happen before any allocations or pointer assignment.
-    let is_fixed          = flags & MAP_FIXED           != 0;
+    let is_fixed           = flags & MAP_FIXED           != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
     if is_fixed || is_fixed_noreplace {
         if addr == 0 || addr & (PAGE - 1) != 0 { return -22; }
-
         if is_fixed_noreplace {
-            // Check every page in [addr, addr+len) for an existing mapping.
             let collision = scheduler::with_proc(pid, |p| {
                 p.vmas.iter().any(|v| v.start < addr + len && v.end > addr)
             }).unwrap_or(false);
@@ -202,8 +231,6 @@ pub fn sys_mmap(
     if va == 0       { return -22; }
     if user_cr3 == 0 { return -12; }
 
-    // For plain MAP_FIXED, evict any existing mappings in the range.
-    // MAP_FIXED_NOREPLACE already returned -EEXIST above if there was a collision.
     if is_fixed && !is_fixed_noreplace {
         remove_vma(pid, va, len);
     }
@@ -354,53 +381,170 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
 }
 
 // ── sys_brk ──────────────────────────────────────────────────────────────────
+//
+// Fully growable + shrinkable heap with guard page and VMA coalescing.
+//
+// Layout:
+//   ... .bss end ...
+//   [brk_base - PAGE]         <- guard page (never mapped)
+//   [brk_base .. brk)         <- live heap pages (VmaKind::Heap)
+//   [brk ..)                  <- unmapped
+//
+// Invariants:
+//   * brk_base is page-aligned and set once at exec time.
+//   * brk is always page-aligned.
+//   * The heap VMA (if any) is always [brk_base, brk).
+//   * Returning old_brk on OOM is the POSIX-mandated behaviour.
 
 pub fn sys_brk(addr: usize) -> isize {
     let pid = scheduler::current_pid();
-    let (old_brk, user_cr3) = scheduler::with_proc(pid, |p| (p.brk, p.user_satp))
-        .unwrap_or((0, 0));
-    if addr == 0 || addr <= old_brk { return old_brk as isize; }
+
+    let (brk_base, old_brk, user_cr3) =
+        scheduler::with_proc(pid, |p| (p.brk_base, p.brk, p.user_satp))
+            .unwrap_or((0, 0, 0));
+
+    // brk() with addr == 0 (or anything ≤ brk_base) just returns the current break.
+    if addr == 0 || addr <= brk_base { return old_brk as isize; }
+
+    // Clamp new_brk to a page boundary.
     let new_brk = page_align_up(addr);
+    if user_cr3 == 0 { return old_brk as isize; }
 
-    let pte_flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX;
-    let mut mapped_end = old_brk;
+    let heap_pte_flags =
+        PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX;
 
-    for va in (old_brk..new_brk).step_by(PAGE) {
-        match crate::mm::pmm::alloc_page() {
-            Some(pa) => {
-                <Arch as Paging>::map_page(user_cr3, va, pa, pte_flags);
-                mapped_end = va + PAGE;
-            }
-            None => {
-                for rollback_va in (old_brk..mapped_end).step_by(PAGE) {
-                    if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, rollback_va) {
-                        <Arch as Paging>::unmap_page(rollback_va);
-                        crate::mm::pmm::free_page(pa);
+    if new_brk > old_brk {
+        // ── GROW ─────────────────────────────────────────────────────────────
+        let grow_start = old_brk;
+        let grow_end   = new_brk;
+        let mut mapped_end = grow_start;
+
+        for va in (grow_start..grow_end).step_by(PAGE) {
+            match crate::mm::pmm::alloc_page() {
+                Some(pa) => {
+                    // Zero-fill the new page before mapping (glibc relies on this).
+                    unsafe {
+                        core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
                     }
+                    <Arch as Paging>::map_page(user_cr3, va, pa, heap_pte_flags);
+                    <Arch as Paging>::flush_va(va);
+                    mapped_end = va + PAGE;
                 }
-                return old_brk as isize;
+                None => {
+                    // OOM — roll back all pages allocated in this call.
+                    for rollback_va in (grow_start..mapped_end).step_by(PAGE) {
+                        if let Some(pa) =
+                            <Arch as Paging>::virt_to_phys(user_cr3, rollback_va)
+                        {
+                            <Arch as Paging>::unmap_page(rollback_va);
+                            <Arch as Paging>::flush_va(rollback_va);
+                            crate::mm::pmm::free_page(pa);
+                        }
+                    }
+                    // Return old_brk unchanged — POSIX OOM contract.
+                    return old_brk as isize;
+                }
             }
         }
+
+        // Commit the new break.
+        scheduler::with_proc_mut(pid, |p| p.brk = new_brk);
+
+        // Coalesce with the existing heap VMA if possible, otherwise insert new.
+        coalesce_or_insert_heap_vma(pid, brk_base, new_brk);
+
+    } else if new_brk < old_brk {
+        // ── SHRINK ───────────────────────────────────────────────────────────
+        // Clamp: never shrink below brk_base.
+        let real_new_brk = new_brk.max(brk_base);
+        if real_new_brk == old_brk { return old_brk as isize; }
+
+        let free_start = real_new_brk;
+        let free_end   = old_brk;
+
+        for va in (free_start..free_end).step_by(PAGE) {
+            if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, va) {
+                <Arch as Paging>::unmap_page(va);
+                <Arch as Paging>::flush_va(va);
+                crate::mm::pmm::free_page(pa);
+            }
+        }
+
+        scheduler::with_proc_mut(pid, |p| p.brk = real_new_brk);
+
+        // Update the heap VMA: trim its end (or remove entirely).
+        trim_heap_vma(pid, brk_base, real_new_brk);
     }
+    // new_brk == old_brk: no-op, fall through.
 
-    scheduler::with_proc_mut(pid, |p| p.brk = new_brk);
+    // Return the updated brk.
+    scheduler::with_proc(pid, |p| p.brk)
+        .unwrap_or(old_brk) as isize
+}
 
-    insert_vma(pid, Vma {
-        start:       old_brk,
-        end:         new_brk,
-        prot:        PROT_READ | PROT_WRITE,
-        flags:       MAP_ANON,
-        kind:        VmaKind::Anonymous,
-        file_offset: 0,
+// ── set_brk_base ─────────────────────────────────────────────────────────────
+//
+// Called once from the ELF loader after it has finished mapping all segments.
+// `end_of_bss` is the first byte after the last segment — we round it up to
+// a page boundary and skip an extra guard page.
+
+pub fn set_brk_base(pid: usize, end_of_bss: usize) {
+    let base = page_align_up(end_of_bss);
+    // Leave one page unmapped as a guard between .bss and the heap.
+    let heap_start = base + PAGE;
+    scheduler::with_proc_mut(pid, |p| {
+        p.brk_base = heap_start;
+        p.brk      = heap_start;
     });
+}
 
-    new_brk as isize
+// ── VMA coalescing helpers ────────────────────────────────────────────────────
+
+/// After a successful grow, either extend the existing Heap VMA or insert one.
+fn coalesce_or_insert_heap_vma(pid: usize, brk_base: usize, new_brk: usize) {
+    let extended = scheduler::with_proc_mut(pid, |p| {
+        // Find a Heap VMA starting at brk_base.
+        if let Some(v) = p.vmas.iter_mut().find(|v| v.is_heap() && v.start == brk_base) {
+            v.end = new_brk;
+            true
+        } else {
+            false
+        }
+    }).unwrap_or(false);
+
+    if !extended {
+        insert_vma(pid, Vma {
+            start:       brk_base,
+            end:         new_brk,
+            prot:        PROT_READ | PROT_WRITE,
+            flags:       MAP_ANON,
+            kind:        VmaKind::Heap,
+            file_offset: 0,
+        });
+    }
+}
+
+/// After a shrink, trim the Heap VMA end or remove it entirely.
+fn trim_heap_vma(pid: usize, brk_base: usize, new_brk: usize) {
+    scheduler::with_proc_mut(pid, |p| {
+        if new_brk <= brk_base {
+            p.vmas.retain(|v| !v.is_heap());
+        } else if let Some(v) = p.vmas.iter_mut().find(|v| v.is_heap()) {
+            if new_brk > v.start {
+                v.end = new_brk;
+            } else {
+                // VMA fully emptied — will be cleaned up below.
+            }
+        }
+        // Remove any zero-sized heap VMAs.
+        p.vmas.retain(|v| !v.is_heap() || v.end > v.start);
+    });
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 #[inline]
-fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
+pub fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
 
 #[inline]
 fn prot_to_flags(prot: u32) -> PageFlags {
@@ -422,4 +566,19 @@ pub fn vma_total_kb(pid: u32) -> usize {
     scheduler::with_proc(pid as usize, |p| {
         p.vmas.iter().map(|v| (v.end - v.start) / 1024).sum()
     }).unwrap_or(0)
+}
+
+/// Heap size in KiB (VmData equivalent).
+pub fn heap_kb(pid: u32) -> usize {
+    scheduler::with_proc(pid as usize, |p| {
+        p.vmas.iter()
+            .filter(|v| v.is_heap())
+            .map(|v| (v.end - v.start) / 1024)
+            .sum()
+    }).unwrap_or(0)
+}
+
+/// Current program break (for /proc/<pid>/status VmBrk).
+pub fn current_brk(pid: u32) -> usize {
+    scheduler::with_proc(pid as usize, |p| p.brk).unwrap_or(0)
 }

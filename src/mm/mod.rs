@@ -1,3 +1,5 @@
+pub mod cow_fault;
+pub mod heap;
 pub mod kstack;
 pub mod memmap;
 pub mod mmap;
