@@ -682,23 +682,56 @@ fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
     n as isize
 }
 
-// ── NR 319  memfd_create ───────────────────────────────────────────────────────────
+// ── NR 319  memfd_create(name_va, flags) ─────────────────────────────────────
+//
+// Linux semantics:
+//   - Creates an anonymous tmpfs file.  The `name` arg is used only for
+//     debugging (/proc/<pid>/fd/<n> shows "memfd:<name>"); it is NOT a path.
+//   - The returned FD behaves exactly like a regular tmpfs FD: ftruncate,
+//     pread/pwrite, mmap(MAP_SHARED) all work.
+//   - MFD_CLOEXEC       (0x1): set FD_CLOEXEC on the returned FD.
+//   - MFD_ALLOW_SEALING (0x2): accepted; seals not enforced yet.
+//   - MFD_HUGETLB       (0x4): no huge-page support → EINVAL.
 
-fn sys_memfd_create_impl(name_va: usize, _flags: u32) -> isize {
-    static MFD_CTR: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-    let id     = MFD_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let suffix = if name_va != 0 {
-        read_cstr_safe(name_va).unwrap_or_default()
-    } else {
-        String::new()
+const MFD_CLOEXEC:       u32 = 0x0001;
+const MFD_ALLOW_SEALING: u32 = 0x0002;
+const MFD_HUGETLB:       u32 = 0x0004;
+
+fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
+    // Reject hugepage requests and unknown flags.
+    if flags & MFD_HUGETLB != 0 { return -22; }
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 { return -22; }
+
+    // Ensure /dev/shm tmpfs is mounted (idempotent — noop if already up).
+    crate::fs::ramfs::tmpfs_mount("/dev/shm", 64 * 1024 * 1024);
+
+    // Allocate an anonymous (unlinked) inode inside the /dev/shm tmpfs.
+    // The returned synthetic path is "/dev/shm/@anon:<ino>" and never
+    // appears in any directory listing.
+    let anon_path = match crate::fs::ramfs::tmpfs_create_anon("/dev/shm") {
+        Ok(p)  => p,
+        Err(e) => return e,
     };
-    let name = alloc::format!("__memfd_{}_{}", id, suffix);
-    crate::fs::vfs::create_file(&name, &[]);
-    match crate::fs::vfs::open(&name, crate::fs::vfs::O_RDWR) {
-        Ok(fd) => fd as isize,
-        Err(e) => e as isize,
+
+    // Open the anon inode O_RDWR so that ftruncate + mmap(MAP_SHARED) work.
+    let fd = match crate::fs::vfs::open(&anon_path, crate::fs::vfs::O_RDWR) {
+        Ok(fd)  => fd,
+        Err(e)  => return e as isize,
+    };
+
+    // Honour MFD_CLOEXEC.
+    if flags & MFD_CLOEXEC != 0 {
+        crate::fs::fcntl::set_cloexec(fd, true);
     }
+
+    // Tag the FD with "memfd:<name>" for /proc/<pid>/fd/<n> readlink.
+    if name_va != 0 {
+        if let Some(name) = read_cstr_safe(name_va) {
+            crate::fs::vfs::fd_set_debug_name(fd, alloc::format!("memfd:{}", name));
+        }
+    }
+
+    fd as isize
 }
 
 // ── Misc stubs ────────────────────────────────────────────────────────────────
