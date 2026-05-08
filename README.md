@@ -198,10 +198,6 @@ Both launchers append `-device virtio-gpu-pci -display sdl,gl=on` to the QEMU co
 
 #### Known limitations / TODO
 
-- **Single CRTC / single plane** — no multi-head, no overlay or cursor planes yet
-- **No atomic KMS** — `DRM_IOCTL_MODE_ATOMIC` not yet implemented; the legacy `setcrtc`/`page_flip` path is used
-- **No hardware cursor** — cursor is rendered in software into the primary plane
-- **No vblank interrupt** — page flips are immediate; `DRM_EVENT_FLIP_COMPLETE` is sent synchronously
 - **No GEM object sharing** — `DRM_IOCTL_PRIME_HANDLE_TO_FD` / `PRIME_FD_TO_HANDLE` not yet implemented; cross-process buffer sharing requires `wl_shm` copies
 - **renderD128 capability gate** — render-node vs. master-node access control pending per-file `CapSet` integration
 
