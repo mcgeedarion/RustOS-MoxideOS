@@ -17,6 +17,7 @@ pub mod poll;
 pub mod inotify;
 pub mod fanotify;
 pub mod eventfd;
+pub mod timerfd;
 pub mod pidfd;
 pub mod close_range;
 pub mod ioctl;

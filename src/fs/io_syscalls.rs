@@ -14,6 +14,8 @@
 //!   sysfs fd        → sysfs::sysfs_read
 //!   inotify fd      → inotify::inotify_read
 //!   fanotify fd     → fanotify::fanotify_read
+//!   eventfd fd      → eventfd::eventfd_read
+//!   timerfd fd      → timerfd::timerfd_read
 //!   default         → vfs::read
 //!
 //! ## Dispatch order for sys_write
@@ -23,7 +25,8 @@
 //!   default         → vfs::write
 //!
 //! ## Dispatch order for sys_close
-//!   devfs / procfs / sysfs / inotify / fanotify → respective close fn
+//!   devfs / procfs / sysfs / inotify / fanotify / eventfd / timerfd
+//!                   → respective close fn
 //!   default → vfs::close
 
 extern crate alloc;
@@ -32,7 +35,7 @@ use crate::fs::vfs;
 use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── Seek-offset table for procfs / sysfs synthetic fds ──────────────────────
+// ── Seek-offset table for procfs / sysfs synthetic fds ────────────────
 
 use spin::Mutex;
 static SYNTH_OFFSET: Mutex<alloc::collections::BTreeMap<usize, usize>> =
@@ -51,7 +54,7 @@ fn synth_offset_remove(fd: usize) {
     SYNTH_OFFSET.lock().remove(&fd);
 }
 
-// ── sys_read ────────────────────────────────────────────────────────────────────
+// ── sys_read ───────────────────────────────────────────────────────────────────────
 
 /// sys_read(fd, buf_va, count)  [NR 0]
 pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
@@ -75,6 +78,10 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
         n = crate::fs::inotify::inotify_read(fd, &mut kbuf);
     } else if crate::fs::fanotify::is_fanotify_fd(fd) {
         n = crate::fs::fanotify::fanotify_read(fd, &mut kbuf);
+    } else if crate::fs::eventfd::is_eventfd(fd) {
+        n = crate::fs::eventfd::eventfd_read(fd, &mut kbuf);
+    } else if crate::fs::timerfd::is_timerfd(fd) {
+        n = crate::fs::timerfd::timerfd_read(fd, &mut kbuf);
     } else {
         n = vfs::read(fd, &mut kbuf);
     }
@@ -83,7 +90,7 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     n
 }
 
-// ── sys_write ───────────────────────────────────────────────────────────────────
+// ── sys_write ─────────────────────────────────────────────────────────────────────
 
 /// sys_write(fd, buf_va, count)  [NR 1]
 pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
@@ -103,7 +110,7 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     vfs::write(fd, &kbuf)
 }
 
-// ── sys_open ───────────────────────────────────────────────────────────────────
+// ── sys_open ─────────────────────────────────────────────────────────────────────
 
 /// sys_open(path_va, flags, mode)  [NR 2]
 pub fn sys_open(path_va: usize, flags: u32, _mode: u32) -> isize {
@@ -137,7 +144,7 @@ pub fn sys_open(path_va: usize, flags: u32, _mode: u32) -> isize {
     }
 }
 
-// ── sys_close ───────────────────────────────────────────────────────────────────
+// ── sys_close ─────────────────────────────────────────────────────────────────────
 
 /// sys_close(fd)  [NR 3]
 pub fn sys_close(fd: usize) -> isize {
@@ -167,11 +174,21 @@ pub fn sys_close(fd: usize) -> isize {
         crate::fs::fcntl::close_fd_meta(fd);
         return 0;
     }
+    if crate::fs::eventfd::is_eventfd(fd) {
+        crate::fs::eventfd::eventfd_close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
+        return 0;
+    }
+    if crate::fs::timerfd::is_timerfd(fd) {
+        crate::fs::timerfd::timerfd_close(fd);
+        crate::fs::fcntl::close_fd_meta(fd);
+        return 0;
+    }
     crate::fs::fcntl::close_fd_meta(fd);
     vfs::close(fd)
 }
 
-// ── sys_pread64 ─────────────────────────────────────────────────────────────
+// ── sys_pread64 ────────────────────────────────────────────────────────────────
 
 /// sys_pread64(fd, buf_va, count, offset)  [NR 17]
 ///
@@ -221,12 +238,12 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
     n
 }
 
-// ── sys_pwrite64 ────────────────────────────────────────────────────────────
+// ── sys_pwrite64 ───────────────────────────────────────────────────────────────
 
 /// sys_pwrite64(fd, buf_va, count, offset)  [NR 18]
 ///
 /// Writes `count` bytes from userspace at `buf_va` to the file at `offset`
-/// without changing the FD’s current position.
+/// without changing the FD's current position.
 pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
     if !validate_user_ptr(buf_va, count) { return -14; }
@@ -251,7 +268,7 @@ pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isiz
     n
 }
 
-// ── sys_ftruncate ─────────────────────────────────────────────────────────────
+// ── sys_ftruncate ──────────────────────────────────────────────────────────────
 
 /// sys_ftruncate(fd, length)  [NR 77]
 ///
@@ -273,7 +290,7 @@ pub fn sys_ftruncate(fd: usize, length: i64) -> isize {
     }
 }
 
-// ── sys_writev ──────────────────────────────────────────────────────────────────
+// ── sys_writev ────────────────────────────────────────────────────────────────────
 
 /// sys_writev(fd, iov_va, iovcnt)  [NR 20]
 pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
@@ -294,7 +311,7 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     total
 }
 
-// ── sys_readv ────────────────────────────────────────────────────────────────────
+// ── sys_readv ──────────────────────────────────────────────────────────────────────
 
 /// sys_readv(fd, iov_va, iovcnt)  [NR 19]
 pub fn sys_readv(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
@@ -315,14 +332,14 @@ pub fn sys_readv(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     total
 }
 
-// ── sys_dup2 ─────────────────────────────────────────────────────────────────────
+// ── sys_dup2 ──────────────────────────────────────────────────────────────────────
 
 /// sys_dup2(oldfd, newfd)  [NR 33]
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
     crate::fs::fcntl::sys_dup2(oldfd, newfd)
 }
 
-// ── sys_link ─────────────────────────────────────────────────────────────────────
+// ── sys_link ──────────────────────────────────────────────────────────────────────
 
 /// sys_link(old_va, new_va)  [NR 86]
 pub fn sys_link(old_va: usize, new_va: usize) -> isize {
@@ -334,7 +351,7 @@ pub fn sys_link(old_va: usize, new_va: usize) -> isize {
     }
 }
 
-// ── sys_rmdir ────────────────────────────────────────────────────────────────────
+// ── sys_rmdir ─────────────────────────────────────────────────────────────────────
 
 /// sys_rmdir(path_va)  [NR 84]
 pub fn sys_rmdir(path_va: usize) -> isize {
