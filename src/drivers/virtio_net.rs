@@ -26,6 +26,7 @@
 use crate::drivers::pcie::{
     find_device_by_id, pci_enable_msix, pci_enable_msi_ex,
 };
+use crate::drivers::nic::{register_nic, NicDevice};
 use crate::mm::pmm;
 use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
@@ -459,6 +460,15 @@ fn log_mac(kind: &str, mac: &[u8; 6]) {
 fn finalize(transport: Transport, mac: [u8; 6], rxq: Virtqueue, txq: Virtqueue) {
     crate::net::eth::set_mac(mac);
     *DEV.lock() = Some(VirtioNetDev { transport, mac, rxq, txq });
+
+    // Register with the NIC abstraction layer so nic::send_frame() and
+    // nic::rx_poll_all() can dispatch through us.
+    register_nic(NicDevice {
+        send_frame: |frame| send_frame(frame),
+        rx_poll:    rx_poll,
+        mac,
+    });
+
     crate::arch::x86_64::serial::serial_println!("virtio_net: device ready");
 }
 
