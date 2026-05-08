@@ -29,10 +29,10 @@ pub fn send(dst_mac: [u8; 6], ethertype: u16, payload: &[u8]) {
     frame[12] = (ethertype >> 8) as u8;
     frame[13] = ethertype as u8;
     frame[ETH_HDR_LEN..].copy_from_slice(payload);
-    crate::drivers::virtio_net::send_frame(&frame);
+    crate::drivers::nic::send_frame(&frame);
 }
 
-/// Called from virtio-net driver on every received frame.
+/// Called from any NIC driver on every received frame.
 pub fn receive_frame(frame: &[u8]) {
     if frame.len() < ETH_HDR_LEN { return; }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
