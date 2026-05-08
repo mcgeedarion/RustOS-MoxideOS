@@ -437,6 +437,14 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
     0
 }
 
+// ── NR 101  ptrace ────────────────────────────────────────────────────────────
+//
+// Fully implemented in src/proc/ptrace.rs.  This stub is a thin dispatch shim.
+
+fn sys_ptrace_impl(req: i32, pid: i32, addr: usize, data: usize) -> isize {
+    crate::proc::ptrace::sys_ptrace(req, pid, addr, data)
+}
+
 // ── NR 131  sigaltstack ───────────────────────────────────────────────────────────
 
 use spin::Mutex as SpinMutex;
@@ -742,6 +750,5 @@ fn sys_chown_impl(_path_va: usize, _uid: u32, _gid: u32) -> isize { 0 }
 fn sys_fchown_impl(_fd: usize, _uid: u32, _gid: u32) -> isize { 0 }
 fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
 fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-fn sys_ptrace_impl(_req: i32, _pid: i32, _addr: usize, _data: usize) -> isize { -1 }
 fn sys_mount_impl(_src: usize, _tgt: usize, _fs: usize, _flags: u64, _data: usize) -> isize { 0 }
 fn sys_syslog_impl(_t: i32, _buf: usize, _len: i32) -> isize { 0 }
