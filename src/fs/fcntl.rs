@@ -59,10 +59,11 @@ const F_UNLCK: u16 = 2;
 
 #[derive(Clone, Default)]
 struct FdMeta {
-    pub cloexec:   bool,
-    pub nonblock:  bool,
-    pub fl_flags:  i32,
-    pub owner_pid: i32,
+    pub cloexec:    bool,
+    pub nonblock:   bool,
+    pub fl_flags:   i32,
+    pub owner_pid:  i32,
+    pub debug_name: Option<alloc::string::String>,
 }
 
 static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
@@ -96,6 +97,21 @@ pub fn clear_fd_owner(fd: usize) {
     if let Some(m) = FD_META.lock().get_mut(&fd) {
         m.owner_pid = 0;
     }
+}
+
+// ── fd debug names (for /proc/<pid>/fd/<n> readlink) ─────────────────────────
+
+/// Tag an fd with a human-readable name shown by readlink /proc/<pid>/fd/<n>.
+/// Used by memfd_create to store "memfd:<name>", and by any future special fd
+/// that wants a custom /proc path representation.
+pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
+    FD_META.lock().entry(fd).or_default().debug_name = Some(name);
+}
+
+/// Retrieve the debug name previously set with fd_set_debug_name.
+/// Returns None if no name has been set (callers fall back to fd_to_path).
+pub fn fd_get_debug_name(fd: usize) -> Option<alloc::string::String> {
+    FD_META.lock().get(&fd).and_then(|m| m.debug_name.clone())
 }
 
 // ── close_on_exec ────────────────────────────────────────────────────────────

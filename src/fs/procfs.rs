@@ -1,16 +1,17 @@
-//! /proc pseudo-filesystem.
+//! procfs — synthetic /proc filesystem.
 //!
-//! ## Entries implemented
-//!   /proc/self         → symlink to /proc/<current_pid>
+//! ## Paths handled
 //!   /proc/self/exe     → readlink target = path of current executable
-//!   /proc/self/maps    → VMA list in /proc/maps format
-//!   /proc/self/status  → task_struct subset (Name, Pid, PPid, VmRSS…)
+//!   /proc/<pid>/exe    → same for any pid
 //!   /proc/self/fd/N    → symlink to the open file behind fd N
 //!   /proc/self/fd/     → directory listing of open fds (getdents)
-//!   /proc/cpuinfo      → one entry per ACPI CPU
-//!   /proc/meminfo      → PMM totals
-//!   /proc/version      → kernel version string
-//!   /proc/<pid>/…      → same as /proc/self/… for the given pid
+//!   /proc/self/maps    → VMA map in Linux /proc/maps format
+//!   /proc/<pid>/maps   → same for any pid
+//!   /proc/self/status  → minimal status fields
+//!   /proc/self/stat    → minimal stat line (for getrusage etc.)
+//!   /proc/uptime       → uptime in seconds
+//!   /proc/meminfo      → basic memory figures
+//!   /proc/cpuinfo      → single-CPU stub
 //!
 //! ## readlink support
 //!   readlink("/proc/self/exe")  → exe path string (no NUL)
@@ -19,86 +20,66 @@
 //!   procfs_readlink(path, buf, bufsz) is the entry point; called from
 //!   stat_syscalls::sys_readlink and sys_readlinkat.
 //!
-//! ## for_open_fds
+//! ## Synthetic fd support
 //!   Used by close_range to enumerate synthetic procfs fds without
-//!   exposing the internal TABLE.
+//!   allocating real VFS fds.
 
 extern crate alloc;
-use alloc::{format, string::String, vec::Vec, borrow::Cow};
-use spin::Mutex;
-
-// ─── Synthetic fd table ──────────────────────────────────────────────────────
-
-pub const PROCFS_FD_BASE: usize = 0x6000_0000;
-
-struct ProcEntry {
-    content: Vec<u8>,
-}
-
-static TABLE: Mutex<alloc::collections::BTreeMap<usize, ProcEntry>> =
-    Mutex::new(alloc::collections::BTreeMap::new());
-static COUNTER: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+use alloc::borrow::Cow;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Returns true if `fdno` is a procfs synthetic fd.
 pub fn is_procfs_fd(fdno: usize) -> bool {
-    fdno >= PROCFS_FD_BASE && TABLE.lock().contains_key(&fdno)
+    PROCFS_FDS.lock().contains_key(&fdno)
 }
 
-/// Called by vfs::open() when the path starts with "/proc/".
-/// Returns a synthetic fd, or -ENOENT.
-pub fn procfs_open(path: &str) -> isize {
-    let content = match generate(path) {
-        Some(c) => c,
-        None    => return -2,
-    };
-    let id   = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let fdno = PROCFS_FD_BASE + id;
-    TABLE.lock().insert(fdno, ProcEntry { content });
-    fdno as isize
+use spin::Mutex;
+use alloc::collections::BTreeMap;
+
+#[derive(Clone)]
+struct ProcFd {
+    content: Vec<u8>,
+    offset:  usize,
 }
+
+static PROCFS_FDS: Mutex<BTreeMap<usize, ProcFd>> = Mutex::new(BTreeMap::new());
 
 /// Read bytes from a procfs fd, starting at `offset`.
 pub fn procfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
-    let chunk: Vec<u8> = {
-        let tbl = TABLE.lock();
-        match tbl.get(&fdno) {
-            None => return -9,
-            Some(e) => {
-                if offset >= e.content.len() { return 0; }
-                let avail = &e.content[offset..];
-                let n = avail.len().min(buf.len());
-                avail[..n].to_vec()
-            }
-        }
+    let guard = PROCFS_FDS.lock();
+    let pfd = match guard.get(&fdno) {
+        Some(p) => p,
+        None    => return -9,
     };
-    let n = chunk.len();
-    buf[..n].copy_from_slice(&chunk);
+    let start = offset.min(pfd.content.len());
+    let avail = &pfd.content[start..];
+    let n = avail.len().min(buf.len());
+    buf[..n].copy_from_slice(&avail[..n]);
     n as isize
 }
 
 pub fn procfs_close(fdno: usize) {
-    TABLE.lock().remove(&fdno);
+    PROCFS_FDS.lock().remove(&fdno);
 }
 
 /// Enumerate all open procfs synthetic fds. Used by close_range.
-pub fn for_open_fds<F: FnMut(usize)>(mut f: F) {
-    let fds: Vec<usize> = TABLE.lock().keys().copied().collect();
-    for fd in fds { f(fd); }
+pub fn procfs_fds() -> Vec<usize> {
+    PROCFS_FDS.lock().keys().cloned().collect()
 }
 
 // ─── readlink support ────────────────────────────────────────────────────────
-//
+
 // procfs_readlink is the single entry point for all /proc readlink targets.
-// It does NOT open a synthetic fd — it synthesises the link target directly
+// It writes up to buf.len() bytes of the target path into buf and returns
 // into the caller's buffer.  This matches how Linux handles readlink on
-// symlink-like /proc entries.
+// /proc paths.
 //
-// Supported paths:
-//   /proc/self            → "/proc/<current_pid>"
-//   /proc/self/exe        → absolute exe path
+// Paths handled:
+//   /proc/self            → /proc/<pid>
+//   /proc/<pid>/exe       → executable path
 //   /proc/self/fd/<N>     → path behind fd N
-//   /proc/<pid>/exe       → exe path for pid
 //   /proc/<pid>/fd/<N>    → path behind fd N of pid (cross-pid; pid ignored)
 
 pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
@@ -128,7 +109,10 @@ pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     // /proc/<pid>/fd/<N>
     if let Some((_spid, fdpart)) = strip_pid_prefix(p, "/fd/") {
         if let Ok(fdno) = fdpart.parse::<usize>() {
-            let target = crate::fs::vfs::fd_to_path(fdno)
+            // Prefer a debug name set by the fd creator (e.g. "memfd:<name>").
+            // Fall back to the VFS path, then a synthetic socket string.
+            let target = crate::fs::vfs::fd_get_debug_name(fdno)
+                .or_else(|| crate::fs::vfs::fd_to_path(fdno))
                 .unwrap_or_else(|| format!("socket:[{}]", fdno));
             return copy_link(target.as_bytes(), buf);
         }
@@ -159,158 +143,156 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     if let Some((mpid, "")) = strip_pid_prefix(p, "/maps") {
         return Some(gen_maps(mpid).into_bytes());
     }
-    if let Some((spid, "")) = strip_pid_prefix(p, "/status") {
-        return Some(gen_status(spid).into_bytes());
+    if let Some((_, "")) = strip_pid_prefix(p, "/status") {
+        return Some(gen_status(pid).into_bytes());
     }
-    // /proc/<pid>/exe — readable as a file returns the path as plain text.
-    // readlink uses procfs_readlink() instead.
-    if let Some((epid, "")) = strip_pid_prefix(p, "/exe") {
-        return Some(gen_exe(epid).into_bytes());
+    if let Some((_, "")) = strip_pid_prefix(p, "/stat") {
+        return Some(gen_stat(pid).into_bytes());
+    }
+    if p == "/proc/uptime" {
+        let ns = crate::time::monotonic_ns();
+        let secs = ns / 1_000_000_000;
+        let frac = (ns % 1_000_000_000) / 10_000_000;
+        return Some(format!("{}.{:02} 0.00\n", secs, frac).into_bytes());
+    }
+    if p == "/proc/meminfo" {
+        let total = crate::mm::pmm::total_pages() as u64 * 4;
+        let free  = crate::mm::pmm::free_pages()  as u64 * 4;
+        return Some(format!(
+            "MemTotal:  {:8} kB\nMemFree:   {:8} kB\nMemAvailable: {:8} kB\n",
+            total, free, free
+        ).into_bytes());
+    }
+    if p == "/proc/cpuinfo" {
+        return Some(b"processor\t: 0\nmodel name\t: rustos virtual CPU\n".to_vec());
+    }
+    if p == "/proc/self/cmdline" || p.ends_with("/cmdline") {
+        let exe = crate::proc::scheduler::exe_path_of(pid)
+            .unwrap_or_else(|| String::from("/init"));
+        let mut v = exe.into_bytes();
+        v.push(0);
+        return Some(v);
     }
     // /proc/<pid>/fd/<N> — readable content = symlink target.
     if let Some((_spid, fdpart)) = strip_pid_prefix(p, "/fd/") {
-        let fdno: usize = fdpart.parse().ok()?;
-        return Some(gen_fd_link(fdno).into_bytes());
+        if let Ok(fdno) = fdpart.parse::<usize>() {
+            // Prefer debug name (e.g. "memfd:foo"), fall back to VFS path.
+            if let Some(name) = crate::fs::vfs::fd_get_debug_name(fdno) {
+                return Some(name.into_bytes());
+            }
+            if let Some(path) = crate::fs::vfs::fd_to_path(fdno) {
+                return Some(path.into_bytes());
+            }
+        }
     }
     // /proc/<pid>/fd/ — directory listing of open fd numbers.
     if let Some((_spid, "")) = strip_pid_prefix(p, "/fd") {
-        return Some(gen_fd_dir().into_bytes());
+        return Some(gen_fd_dir(pid));
     }
-    if p == "/proc/cpuinfo"  { return Some(gen_cpuinfo().into_bytes()); }
-    if p == "/proc/meminfo"  { return Some(gen_meminfo().into_bytes()); }
-    if p == "/proc/version"  { return Some(gen_version().into_bytes()); }
-    if p == format!("/proc/{}", pid).as_str() {
-        return Some(b"maps\nstatus\nexe\nfd\n".to_vec());
+    if p == "/proc/filesystems" {
+        return Some(b"nodev\ttmpfs\next4\nvfat\n".to_vec());
+    }
+    if p == "/proc/mounts" || p == "/proc/self/mounts" || p.ends_with("/mounts") {
+        return Some(b"tmpfs /dev/shm tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n".to_vec());
     }
     None
 }
 
-/// Returns (pid, suffix_after_prefix) if path matches "/proc/<pid><suffix>".
-fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)> {
-    let after = path.strip_prefix("/proc/")?;
-    let slash  = after.find('/')?;
-    let pid: usize = after[..slash].parse().ok()?;
-    let rest = &after[slash..];
-    if suffix.is_empty() {
-        return Some((pid, rest));
-    }
-    if rest == suffix {
-        Some((pid, ""))
-    } else if rest.starts_with(suffix) {
-        Some((pid, &rest[suffix.len()..]))
-    } else {
-        None
-    }
-}
-
-// ─── /proc/<pid>/maps ────────────────────────────────────────────────────────
-
-fn gen_maps(pid: usize) -> String {
-    let mut out = String::new();
-    crate::mm::mmap::with_vmas(pid as u32, |vma| {
-        let r = if vma.prot & 1 != 0 { 'r' } else { '-' };
-        let w = if vma.prot & 2 != 0 { 'w' } else { '-' };
-        let x = if vma.prot & 4 != 0 { 'x' } else { '-' };
-        let s = if vma.flags & 1 != 0 { 's' } else { 'p' };
-        let perms = format!("{}{}{}{}", r, w, x, s);
-        out.push_str(&format!(
-            "{:016x}-{:016x} {} {:08x} 00:00 0\n",
-            vma.start, vma.end, perms, vma.file_offset,
-        ));
-    });
-    out
-}
-
-// ─── /proc/<pid>/status ──────────────────────────────────────────────────────
+// ─── /proc stat/status generators ───────────────────────────────────────────
 
 fn gen_status(pid: usize) -> String {
-    let ppid  = crate::proc::scheduler::ppid_of(pid);
-    let vm_kb = crate::mm::mmap::vma_total_kb(pid as u32);
     format!(
-        "Name:\trustos-proc\n\
-         Pid:\t{}\n\
-         PPid:\t{}\n\
-         State:\tR (running)\n\
-         VmRSS:\t{} kB\n\
-         VmSize:\t{} kB\n\
-         Threads:\t1\n",
-        pid, ppid, vm_kb, vm_kb,
+        "Name:\trustos\nState:\tR (running)\nPid:\t{}\nPPid:\t1\nVmRSS:\t4096 kB\n",
+        pid
     )
 }
 
-// ─── /proc/<pid>/exe ─────────────────────────────────────────────────────────
+fn gen_stat(pid: usize) -> String {
+    format!("{} (rustos) R 1 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0\n",
+        pid, pid, pid)
+}
 
-fn gen_exe(pid: usize) -> String {
-    crate::proc::scheduler::exe_path_of(pid)
-        .unwrap_or_else(|| String::from("/init"))
+// ─── /proc/<pid>/maps generator ──────────────────────────────────────────────
+
+fn gen_maps(pid: usize) -> String {
+    let mut out = String::new();
+    let vmas = crate::proc::scheduler::with_proc(pid, |p| p.vmas.clone())
+        .unwrap_or_default();
+    for vma in &vmas {
+        let r = if vma.prot & 1 != 0 { 'r' } else { '-' };
+        let w = if vma.prot & 2 != 0 { 'w' } else { '-' };
+        let x = if vma.prot & 4 != 0 { 'x' } else { '-' };
+        let s = match vma.kind {
+            crate::mm::mmap::VmaKind::Anonymous      => 'p',
+            crate::mm::mmap::VmaKind::FileBacked(..) => 'p',
+            crate::mm::mmap::VmaKind::Fixed          => 'p',
+            crate::mm::mmap::VmaKind::PhysMap(..)    => 'p',
+        };
+        let label = match &vma.kind {
+            crate::mm::mmap::VmaKind::FileBacked(fd, _) =>
+                crate::fs::vfs::fd_to_path(*fd).unwrap_or_default(),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "{:016x}-{:016x} {}{}{}{} {:08x} 00:00 0\t{}\n",
+            vma.start, vma.end, r, w, x, s, vma.file_offset, label
+        ));
+    }
+    out
 }
 
 // ─── /proc/<pid>/fd/<N> ──────────────────────────────────────────────────────
 
-fn gen_fd_link(fdno: usize) -> String {
+fn fd_target(fdno: usize) -> Option<String> {
     crate::fs::vfs::fd_to_path(fdno)
-        .unwrap_or_else(|| format!("socket:[{}]", fdno))
 }
 
-// ─── /proc/<pid>/fd/ (directory listing) ─────────────────────────────────────
-//
-// Returns newline-separated fd numbers for all open fds.  This is the
-// content musl's closefrom() fallback reads when close_range is unavailable.
+// ─── /proc/<pid>/fd/ directory ───────────────────────────────────────────────
 
-fn gen_fd_dir() -> String {
-    let mut out = String::new();
-    crate::fs::vfs::for_open_fds(|fd| {
-        out.push_str(&format!("{}", fd));
-        out.push('\n');
-    });
-    out
-}
-
-// ─── /proc/cpuinfo ───────────────────────────────────────────────────────────
-
-fn gen_cpuinfo() -> String {
-    let mut out = String::new();
-    let mut idx = 0usize;
-    crate::acpi::with_cpus(|cpu| {
-        out.push_str(&format!(
-            "processor\t: {}\n\
-             vendor_id\t: RustOS\n\
-             cpu MHz\t: 1000.000\n\
-             model name\t: RustOS Virtual CPU\n\
-             apicid\t: {}\n\n",
-            idx, cpu.apic_id,
-        ));
-        idx += 1;
-    });
-    if idx == 0 {
-        out.push_str(
-            "processor\t: 0\nvendor_id\t: RustOS\n\
-             cpu MHz\t: 1000.000\nmodel name\t: RustOS Virtual CPU\n\n"
-        );
+fn gen_fd_dir(pid: usize) -> Vec<u8> {
+    let _ = pid;
+    let mut out = Vec::new();
+    for fdno in 0usize..256 {
+        if crate::fs::vfs::fd_to_path(fdno).is_some() {
+            out.extend_from_slice(format!("{} ", fdno).as_bytes());
+        }
     }
     out
 }
 
-// ─── /proc/meminfo ───────────────────────────────────────────────────────────
+// ─── open helper ─────────────────────────────────────────────────────────────
 
-fn gen_meminfo() -> String {
-    let total_kb = crate::mm::pmm::total_pages() * 4;
-    let free_kb  = crate::mm::pmm::free_pages()  * 4;
-    format!(
-        "MemTotal:\t{} kB\n\
-         MemFree:\t{} kB\n\
-         MemAvailable:\t{} kB\n\
-         Buffers:\t0 kB\n\
-         Cached:\t0 kB\n\
-         SwapTotal:\t0 kB\n\
-         SwapFree:\t0 kB\n",
-        total_kb, free_kb, free_kb,
-    )
+pub fn procfs_open(path: &str) -> Option<usize> {
+    let content = generate(path)?;
+    let fdno = alloc::vec![0usize; 1]
+        .into_iter()
+        .fold(256usize, |acc, _| acc);
+    let fdno = next_procfs_fd();
+    PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0 });
+    Some(fdno)
 }
 
-// ─── /proc/version ───────────────────────────────────────────────────────────
+fn next_procfs_fd() -> usize {
+    let guard = PROCFS_FDS.lock();
+    for candidate in 256..512 {
+        if !guard.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    256
+}
 
-fn gen_version() -> String {
-    format!("Linux version 6.1.0-rustos (rustc) #1 SMP {}\n",
-            "Sun Jan  1 00:00:00 UTC 2023")
+// ─── strip_pid_prefix helper ─────────────────────────────────────────────────
+
+/// Parse "/proc/<pid><suffix>" and return (pid, rest_after_suffix).
+/// `suffix` is e.g. "/maps", "/fd/", "/exe".
+fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)> {
+    let after_proc = path.strip_prefix("/proc/")?;
+    // Find the end of the numeric pid segment.
+    let slash = after_proc.find('/').unwrap_or(after_proc.len());
+    let pid_str = &after_proc[..slash];
+    let pid: usize = pid_str.parse().ok()?;
+    let rest = &after_proc[slash..];
+    let tail = rest.strip_prefix(suffix)?;
+    Some((pid, tail))
 }

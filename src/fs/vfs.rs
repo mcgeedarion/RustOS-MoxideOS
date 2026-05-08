@@ -36,6 +36,19 @@ pub fn seek(fd: usize, offset: i64, whence: i32) -> isize {
     crate::fs::fcntl::fd_seek(fd, offset, whence)
 }
 
+// ── fd debug names ───────────────────────────────────────────────────────────
+
+/// Tag an fd with a human-readable name for /proc/<pid>/fd/<n> readlink.
+/// See fcntl::fd_set_debug_name for details.
+pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
+    crate::fs::fcntl::fd_set_debug_name(fd, name);
+}
+
+/// Retrieve the debug name set by fd_set_debug_name, if any.
+pub fn fd_get_debug_name(fd: usize) -> Option<alloc::string::String> {
+    crate::fs::fcntl::fd_get_debug_name(fd)
+}
+
 // ── pread ────────────────────────────────────────────────────────────────
 // Kernel-internal positional read. Saves and restores the file offset so
 // pread has no side-effect on the fd's seek position (POSIX pread64).
