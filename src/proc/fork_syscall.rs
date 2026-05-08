@@ -8,6 +8,7 @@ use crate::proc::cow_fault::clone_for_fork;
 use crate::proc::fork::SignalHandlers;
 use crate::proc::process::{Pcb, State};
 use crate::proc::ptrace::PtraceState;
+use crate::proc::rlimit::RlimitSet;
 use crate::proc::scheduler;
 use crate::security::CapSet;
 
@@ -23,7 +24,7 @@ pub fn sys_fork() -> isize {
     let parent_pid = scheduler::current_pid();
 
     let (parent_cr3, parent_pc, parent_sp, parent_caps, parent_sig, parent_vmas,
-         parent_next_va, parent_brk, parent_exe) =
+         parent_next_va, parent_brk, parent_exe, parent_rlimits) =
         scheduler::with_proc(parent_pid, |p| (
             p.user_satp,
             p.pc,
@@ -34,6 +35,7 @@ pub fn sys_fork() -> isize {
             p.next_va,
             p.brk,
             p.exe_path.clone(),
+            p.rlimits.clone(),
         )).unwrap_or((
             0, 0, 0,
             CapSet::empty(),
@@ -42,6 +44,7 @@ pub fn sys_fork() -> isize {
             Pcb::INITIAL_NEXT_VA,
             Pcb::INITIAL_BRK,
             None,
+            RlimitSet::default(),
         ));
 
     if parent_cr3 == 0 { return -1; }
@@ -52,8 +55,6 @@ pub fn sys_fork() -> isize {
     let kstack_top = match alloc_kstack() {
         Some(k) => k,
         None => {
-            // Free the child page table that clone_for_fork already allocated
-            // to prevent a permanent physical memory leak on OOM.
             if child_cr3 != 0 {
                 unsafe { crate::proc::exec::free_child_address_space(child_cr3); }
             }
@@ -92,6 +93,7 @@ pub fn sys_fork() -> isize {
         exe_path:           parent_exe,
         ptrace_state:       PtraceState::None,
         ptrace_event:       0,
+        rlimits:            parent_rlimits,
     };
 
     scheduler::enqueue(child_pcb);
@@ -104,10 +106,10 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
     let p    = base as *mut usize;
     unsafe {
         for i in 0..17 { p.add(i).write(0); }
-        p.add(6).write(0);         // rax = 0  (child returns 0 from fork)
-        p.add(13).write(rip);      // rcx = user RIP
-        p.add(14).write(rflags);   // r11 = RFLAGS
-        p.add(15).write(user_rsp); // user RSP
+        p.add(6).write(0);
+        p.add(13).write(rip);
+        p.add(14).write(rflags);
+        p.add(15).write(user_rsp);
         p.add(16).write(rip);
     }
 }

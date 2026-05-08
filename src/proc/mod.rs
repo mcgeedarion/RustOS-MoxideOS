@@ -14,6 +14,7 @@ pub mod net_ns;
 pub mod pid_ns;
 pub mod process;
 pub mod ptrace;
+pub mod rlimit;
 pub mod sched_helpers;
 pub mod scheduler;
 pub mod signal;

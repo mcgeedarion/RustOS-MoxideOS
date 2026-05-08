@@ -19,6 +19,8 @@ use alloc::vec::Vec;
 use crate::mm::kstack::alloc_kstack;
 use crate::proc::context::Context;
 use crate::proc::process::{Pcb, State};
+use crate::proc::ptrace::PtraceState;
+use crate::proc::rlimit::RlimitSet;
 use crate::proc::scheduler;
 use crate::proc::thread;
 use crate::security::CapSet;
@@ -26,7 +28,6 @@ use crate::proc::namespace::NsSet;
 use crate::security::seccomp::FilterChain;
 use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
 
-// arch-specific sysret trampoline — only meaningful on x86_64
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::syscall::sysret_trampoline;
 
@@ -34,7 +35,7 @@ use crate::arch::x86_64::syscall::sysret_trampoline;
 #[allow(dead_code)]
 fn sysret_trampoline() {}
 
-// ── CLONE_* flag bits (x86-64 Linux ABI) ─────────────────────────────────
+// ── CLONE_* flag bits ─────────────────────────────────────────────────────
 
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
@@ -53,7 +54,6 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 pub const CLONE_DETACHED:       u64 = 0x0040_0000;
 pub const CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
 
-/// clone3_args userspace structure (Linux ABI, <linux/sched.h>).
 #[repr(C)]
 pub struct CloneArgs {
     pub flags:        u64,
@@ -71,7 +71,6 @@ pub struct CloneArgs {
 
 // ── sys_clone3 ────────────────────────────────────────────────────────────
 
-/// clone3(args_va, args_size) -> child_pid / -errno  [NR 435]
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let clone_args_sz = core::mem::size_of::<CloneArgs>();
     if args_va == 0
@@ -84,8 +83,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
     let mut kbuf = [0u8; core::mem::size_of::<CloneArgs>()];
     if copy_from_user(&mut kbuf, args_va).is_err() { return -14; }
-    // SAFETY: CloneArgs is #[repr(C)], all-u64 fields, no padding, no
-    // invalid bit patterns. kbuf was filled by copy_from_user.
     let ca: CloneArgs = unsafe { core::mem::transmute(kbuf) };
 
     let flags       = ca.flags;
@@ -112,7 +109,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         parent_pid
     };
 
-    // TLS base for this new thread.
     let child_tls = if flags & CLONE_SETTLS != 0 { ca.tls as usize } else { 0 };
 
     let user_rsp = if ca.stack != 0 { (ca.stack + ca.stack_size) as usize } else { 0 };
@@ -121,8 +117,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let child_ctx = Context {
         rip:     sysret_trampoline as usize,
         rsp:     kstack_top - 17 * 8,
-        // fs_base is set here for the first resume; subsequent context switches
-        // reload it from Pcb.tls_base via the scheduler's switch_to path.
         fs_base: child_tls,
         ..Context::zero()
     };
@@ -150,18 +144,30 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.child_tid_va       = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
     child_pcb.child_tid_val      = child_pid as u32;
     child_pcb.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
-    // Persist TLS base so the scheduler can reload FS.base / tp on every
-    // context switch back to this thread.
     child_pcb.tls_base = child_tls;
-    // New thread starts with an empty robust list.
     child_pcb.robust_list_head = 0;
     child_pcb.robust_list_len  = 0;
+    child_pcb.ptrace_state = PtraceState::None;
+    child_pcb.ptrace_event = 0;
+    // rlimits are inherited via the parent clone above; no override needed.
 
     if is_vm_clone { thread::register_thread(child_pid, child_tgid); }
     scheduler::enqueue(child_pcb);
     if flags & CLONE_VFORK != 0 { scheduler::suspend_current_until_child_exec(child_pid); }
 
     child_pid as isize
+}
+
+// ── legacy 5-argument clone (NR 56) ──────────────────────────────────────────
+
+pub fn sys_clone_legacy(flags: usize, child_sp: usize, _ptid: usize,
+                        _ctid: usize, tls: usize) -> isize {
+    let mut args = [0u64; core::mem::size_of::<CloneArgs>() / 8];
+    args[0] = flags as u64;
+    args[6] = child_sp as u64;
+    args[7] = tls as u64;
+    let va = args.as_ptr() as usize;
+    sys_clone3(va, core::mem::size_of::<CloneArgs>())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -172,15 +178,13 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
     unsafe {
         core::ptr::write_bytes(base as *mut u8, 0, FRAME_SZ);
         let p = base as *mut usize;
-        p.add(13).write(rip);      // rcx → user RIP
-        p.add(14).write(rflags);   // r11 → user RFLAGS
-        p.add(15).write(user_rsp); // rsp → user stack
+        p.add(13).write(rip);
+        p.add(14).write(rflags);
+        p.add(15).write(user_rsp);
         p.add(16).write(rip);
     }
 }
 
-/// Construct a blank PCB with all fields explicitly initialised.
-/// Used as a fallback when the parent PCB cannot be found in the scheduler.
 fn make_blank_pcb() -> Pcb {
     Pcb {
         pid:        0,
@@ -210,5 +214,8 @@ fn make_blank_pcb() -> Pcb {
         seccomp:             FilterChain::default(),
         robust_list_head:    0,
         robust_list_len:     0,
+        ptrace_state:        PtraceState::None,
+        ptrace_event:        0,
+        rlimits:             RlimitSet::default(),
     }
 }
