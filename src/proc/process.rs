@@ -7,6 +7,7 @@ use crate::mm::mmap::Vma;
 use crate::proc::context::Context;
 use crate::proc::fork::SignalHandlers;
 use crate::proc::namespace::NsSet;
+use crate::proc::ptrace::PtraceState;
 use crate::security::CapSet;
 use crate::security::seccomp::FilterChain;
 
@@ -94,6 +95,14 @@ pub struct Pcb {
     pub robust_list_head: usize,
     /// Byte length of the robust list head struct (16 or 24).
     pub robust_list_len:  usize,
+
+    // ── ptrace ────────────────────────────────────────────────────────────────
+    /// ptrace attachment state for this process.
+    /// `PtraceState::None` unless this process is being traced.
+    pub ptrace_state: PtraceState,
+    /// Event message delivered by PTRACE_GETEVENTMSG.
+    /// Set to the child PID on fork/clone events, exit status on exit events.
+    pub ptrace_event: u64,
 }
 
 impl Pcb {

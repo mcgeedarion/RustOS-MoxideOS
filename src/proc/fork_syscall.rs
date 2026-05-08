@@ -7,6 +7,7 @@ use crate::proc::context::Context;
 use crate::proc::cow_fault::clone_for_fork;
 use crate::proc::fork::SignalHandlers;
 use crate::proc::process::{Pcb, State};
+use crate::proc::ptrace::PtraceState;
 use crate::proc::scheduler;
 use crate::security::CapSet;
 
@@ -89,6 +90,8 @@ pub fn sys_fork() -> isize {
         vfork_parent:       0,
         signal_handlers:    parent_sig,
         exe_path:           parent_exe,
+        ptrace_state:       PtraceState::None,
+        ptrace_event:       0,
     };
 
     scheduler::enqueue(child_pcb);
