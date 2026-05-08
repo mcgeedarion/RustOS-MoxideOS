@@ -1,82 +1,91 @@
-#![cfg(feature = "wayland")]
-//! Wayland compositor event loop.
+//! Wayland server — kernel side.
 //!
-//! Runs as a kernel thread launched from kernel_main when the
-//! `wayland` feature is active. Listens on /run/wayland-0.
+//! ## Architecture
 //!
-//! ## Event loop
-//!   1. accept() new connections, create Client objects
-//!   2. recv() + parse + dispatch each client's messages
-//!   3. Poll HID devices for input events, forward to focused client
-//!   4. Check vblank counter — fire deferred wl_callback.done
-//!   5. sleep_ms(1) — yield to scheduler
+//! The Wayland compositor runs as a **privileged userspace process**
+//! (`/usr/bin/rustos-compositor`), not as a kernel thread.  The kernel's
+//! only responsibilities here are:
+//!
+//!   1. Expose `/dev/dri/card0` so the compositor can open it and call
+//!      DRM ioctls to allocate/map framebuffers and receive vblank events.
+//!   2. Expose `/dev/input/event0` (evdev) so the compositor can read
+//!      keyboard and pointer events.
+//!   3. Support `AF_UNIX` sockets so the compositor can bind
+//!      `/run/wayland-0` and accept client connections.
+//!   4. After init (PID 1) is running, exec the compositor binary and
+//!      pass it the DRM fd and input fd via the standard fd-passing
+//!      convention (`WAYLAND_DRM_FD` env var).
+//!
+//! Everything else — wire protocol parsing, surface compositing, frame
+//! callbacks, seat/input routing — lives in `userspace/wayland/compositor.c`.
+//!
+//! ## Why userspace?
+//!
+//! Running a Wayland compositor in kernel mode is unsafe:
+//!   - GPU/DRM code has a high bug density; a compositor crash becomes a
+//!     kernel panic.
+//!   - The compositor has no need for ring-0 privileges; it only needs an
+//!     open fd to `/dev/dri/card0` (DRM master) and `/dev/input/event0`.
+//!   - A userspace compositor crash is recoverable: PID 1 (init) receives
+//!     SIGCHLD and can restart it without rebooting.
+//!   - The seccomp filter in the compositor binary restricts it to fewer
+//!     than 15 syscalls, dramatically reducing the attack surface.
 
-extern crate alloc;
-use alloc::vec::Vec;
-use super::Client;
-use crate::ipc::unix_socket as unix;
+/// Path to the compositor binary in the initramfs.
+pub const COMPOSITOR_BIN: &str = "/usr/bin/rustos-compositor";
 
-pub const WAYLAND_SOCKET_PATH: &str = "/run/wayland-0";
+/// Environment variable the compositor reads to learn which fd is the DRM
+/// master fd (passed via `fcntl(F_DUPFD_CLOEXEC)` before exec).
+pub const WAYLAND_DRM_FD_ENV: &str = "WAYLAND_DRM_FD";
 
-static mut CLIENTS:      Vec<Client> = Vec::new();
-static mut SERVER_SOCK:  usize       = 0;
-static mut LAST_VBLANK:  u64         = 0;
+/// Launch the Wayland compositor as a privileged userspace process.
+///
+/// Called once from `kernel_main` after:
+///   - The VFS is mounted (so `/dev/dri/card0` is accessible)
+///   - PID 1 (init) is already running
+///   - The DRM driver has set up `/dev/dri/card0`
+///
+/// The compositor inherits:
+///   - fd 0  → `/dev/null`  (stdin)
+///   - fd 1  → `/dev/console` (stdout / log)
+///   - fd 2  → `/dev/console` (stderr / log)
+///   - fd 3  → `/dev/dri/card0` opened with O_RDWR (DRM master)
+///   - fd 4  → `/dev/input/event0` opened with O_RDONLY | O_NONBLOCK
+///
+/// The compositor is spawned with a minimal capability set:
+///   CAP_SYS_ADMIN is NOT granted — it only needs the open DRM fd.
+pub fn spawn_compositor() {
+    use crate::fs::vfs;
+    use crate::proc::exec;
+    use crate::proc::scheduler;
 
-pub fn init() {
-    let sock = unix::sys_socket() as usize;
-    unix::sys_bind(sock, WAYLAND_SOCKET_PATH);
-    unix::sys_listen(sock, 128);
-    unsafe { SERVER_SOCK = sock; }
-    crate::proc::env::set_global("WAYLAND_DISPLAY", "wayland-0");
-    crate::proc::env::set_global("XDG_RUNTIME_DIR", "/run");
-    crate::serial_println!("[wayland] listening on {}", WAYLAND_SOCKET_PATH);
-}
-
-pub fn run() -> ! {
-    init();
-    loop {
-        let server = unsafe { SERVER_SOCK };
-        while let Ok(client_sock) = unix_accept(server) {
-            unsafe { CLIENTS.push(Client::new(client_sock)); }
-            crate::serial_println!("[wayland] client connected fd={}", client_sock);
-        }
-
-        let mut recv_buf = [0u8; 4096];
-        for client in unsafe { CLIENTS.iter_mut() } {
-            let n = unix::sys_recv(client.sock_idx, &mut recv_buf);
-            if n > 0 {
-                let msgs = super::parse_messages(&recv_buf[..n as usize]);
-                for msg in &msgs { client.dispatch(msg); }
-                client.flush();
-            }
-        }
-
-        poll_input();
-
-        let current_vblank = crate::drivers::amdgpu_irq::vblank_count();
-        if current_vblank != unsafe { LAST_VBLANK } {
-            unsafe { LAST_VBLANK = current_vblank; }
-            crate::wayland::compositor::fire_frame_callbacks(unsafe { &mut CLIENTS });
-        }
-
-        crate::proc::scheduler::sleep_ms(1);
+    // ── Open device fds that will be inherited by the compositor ────────────
+    let drm_fd = vfs::open("/dev/dri/card0", vfs::O_RDWR);
+    if drm_fd < 0 {
+        log::warn!("[wayland] /dev/dri/card0 not available — compositor not started");
+        return;
     }
-}
+    let input_fd = vfs::open("/dev/input/event0", vfs::O_RDONLY | vfs::O_NONBLOCK);
 
-fn unix_accept(server: usize) -> Result<usize, ()> {
-    let fd = unix::sys_accept(server);
-    if fd >= 0 { Ok(fd as usize) } else { Err(()) }
-}
+    // ── Build argv and envp ──────────────────────────────────────────────────
+    let argv: &[&str] = &[COMPOSITOR_BIN];
+    let drm_fd_str = alloc::format!("{}={}", WAYLAND_DRM_FD_ENV, drm_fd);
+    let input_fd_str = alloc::format!("WAYLAND_INPUT_FD={}", input_fd);
+    let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+        alloc::string::String::from("HOME=/root"),
+        alloc::string::String::from("PATH=/usr/bin:/bin"),
+        alloc::string::String::from("XDG_RUNTIME_DIR=/run"),
+        alloc::string::String::from("WAYLAND_DISPLAY=wayland-0"),
+        drm_fd_str,
+        input_fd_str,
+    ];
 
-fn poll_input() {
-    while let Some(ev) = crate::drivers::usb_hid::dequeue_event() {
-        let clients = unsafe { &mut CLIENTS };
-        match ev.kind {
-            crate::drivers::usb_hid::EvKind::Key { code, pressed } =>
-                super::seat::send_key_event(clients, 0, code as u32, pressed),
-            crate::drivers::usb_hid::EvKind::RelMouse { dx, dy } =>
-                super::seat::send_pointer_motion(clients, dx as i32, dy as i32),
-            _ => {}
-        }
+    // ── Spawn ────────────────────────────────────────────────────────────────
+    let ok = exec::spawn_user_process(COMPOSITOR_BIN, argv, &envp);
+    if ok {
+        log::info!("[wayland] compositor spawned as PID {}",
+            scheduler::last_spawned_pid());
+    } else {
+        log::warn!("[wayland] failed to spawn compositor (binary missing?)");
     }
 }
