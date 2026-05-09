@@ -11,7 +11,7 @@
 //!   4. altstack_clear_pid + proc_name_clear + futex_clear_pid
 //!   5. proc_fd_free         — close all open fds (before address space is freed)
 //!   6. free_address_space (last thread in group only)
-//!   7. free_kstack + State → Zombie
+//!   7. free_kstack + State → Zombie + exit_code = encode_exit(code)
 //!   8. wake vfork_parent
 //!   9. notify_exit (wakes parent waitpid)
 //!  10. schedule()   — never returns
@@ -25,6 +25,7 @@ use crate::mm::mmap::free_address_space;
 use crate::proc::futex::{futex_wake_addr, robust_list_on_exit};
 use crate::proc::process::State;
 use crate::proc::{scheduler, thread, wait};
+use crate::proc::wait::encode_exit;
 use crate::uaccess::copy_to_user;
 
 // ── clear_child_tid ───────────────────────────────────────────────────────────
@@ -36,9 +37,7 @@ fn clear_child_tid(pid: usize) {
         va
     }).unwrap_or(0);
     if va == 0 { return; }
-    // Write 0 to the TID word in user space (pthread_join reads this).
     let _ = copy_to_user(va, &0u32.to_ne_bytes());
-    // Wake any thread blocked in pthread_join on this word.
     futex_wake_addr(va, 1);
 }
 
@@ -59,7 +58,7 @@ fn zombify(pid: usize, code: i32) -> usize {
         let ks = p.kstack_top;
         p.kstack_top = 0;
         p.state      = State::Zombie;
-        p.exit_code  = code;
+        p.exit_code  = encode_exit(code);  // store pre-encoded wstatus bits
         (ks, p.vfork_parent)
     }).unwrap_or((0, 0));
 
@@ -72,19 +71,15 @@ fn zombify(pid: usize, code: i32) -> usize {
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
 
-    robust_list_on_exit(pid);       // 1 — wake robust-mutex waiters
-    clear_child_tid(pid);           // 2 — unblock pthread_join
+    robust_list_on_exit(pid);       // 1
+    clear_child_tid(pid);           // 2
     thread::unregister_thread(pid); // 3
 
     crate::syscall::altstack_clear_pid(pid);
     crate::syscall::proc_name_clear(pid);
     crate::sync::futex::futex_clear_pid(pid);
 
-    // 5 — close all open fds before the address space is torn down.
-    // Some backing fds (pipes, sockets) may hold references into the
-    // process address space; closing them first ensures those refs drop
-    // cleanly before the pages are unmapped.
-    crate::fs::process_fd::proc_fd_free(pid);
+    crate::fs::process_fd::proc_fd_free(pid); // 5
 
     if is_last_live_thread(pid, tgid) {
         let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
@@ -129,14 +124,7 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::fs::process_fd::proc_fd_free(sibling);
         let vfork_parent = zombify(sibling, status);
         if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
-    }
-
-    {
-        let (ppid, exit_signal) = scheduler::with_proc(
-            scheduler::current_pid(), |p| (p.ppid, p.exit_signal)
-        ).unwrap_or((0, 17));
-        if ppid != 0 { scheduler::wake_pid(ppid); }
-        let _ = exit_signal;
+        wait::notify_exit(sibling);
     }
 
     do_exit(pid, status);

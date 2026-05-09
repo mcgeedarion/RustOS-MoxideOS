@@ -13,8 +13,31 @@ use crate::security::CapSet;
 use crate::security::seccomp::FilterChain;
 
 /// Process lifecycle state.
+///
+/// Transitions:
+///   Ready ↔ Running       — scheduler tick
+///   Running → Blocked     — voluntary sleep / wait / pipe-block
+///   Blocked → Ready       — wake_pid() / futex_wake / timer
+///   Running → Zombie      — do_exit()
+///   Running → Stopped     — SIGSTOP / ptrace-stop
+///   Stopped → Ready       — SIGCONT delivered
+///   Stopped → StopReported— waitpid(WUNTRACED) harvested the stop event
+///   StopReported → Ready  — SIGCONT delivered after report was consumed
+///   Ready   → Continued   — notify_continue() marks SIGCONT resume
+///   Continued → Ready     — waitpid(WCONTINUED) consumed the event
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum State { Ready, Running, Blocked, Zombie }
+pub enum State {
+    Ready,
+    Running,
+    Blocked,
+    Zombie,
+    /// Process stopped by SIGSTOP / SIGTSTP / ptrace; not yet reported to parent.
+    Stopped,
+    /// Stop was already reported via waitpid(WUNTRACED); waiting for SIGCONT.
+    StopReported,
+    /// Process was resumed by SIGCONT; not yet reported to parent via WCONTINUED.
+    Continued,
+}
 
 /// Per-process kernel control block.
 #[derive(Clone)]
@@ -25,7 +48,13 @@ pub struct Pcb {
     /// Thread-group id. Equals `pid` for the main thread / fork child.
     /// Shared across all clone(CLONE_THREAD) threads in the same process.
     pub tgid:      usize,
+    /// Process group id.  Set to pid on fork; changed by setpgrp/setpgid.
+    /// Used by wait4(-pgid, …) to match children in the same process group.
+    pub pgid:      usize,
     pub state:     State,
+    /// Pre-encoded wait-status bits (see wait.rs for layout).
+    /// Set by encode_exit() on normal exit, encode_signal() on kill,
+    /// encode_stop() on stop, WSTATUS_CONTINUED on continue.
     pub exit_code: i32,
     pub caps:      CapSet,
 
@@ -60,57 +89,36 @@ pub struct Pcb {
     pub exit_signal: u32,
     pub vfork_parent: usize,
     pub signal_handlers: SignalHandlers,
+    pub pending_signals: alloc::collections::VecDeque<u32>,
     pub exe_path: Option<String>,
 
-    // ── Namespace set ────────────────────────────────────────────────────────────────
+    // ── Namespace set ──────────────────────────────────────────────────────
     pub ns: NsSet,
 
-    // ── seccomp filter chain ──────────────────────────────────────────────────────────
+    // ── seccomp filter chain ───────────────────────────────────────────────
     pub seccomp: FilterChain,
 
-    // ── NPTL / robust futex ─────────────────────────────────────────────────────────
+    // ── NPTL / robust futex ───────────────────────────────────────────────
     pub robust_list_head: usize,
     pub robust_list_len:  usize,
 
-    // ── ptrace ───────────────────────────────────────────────────────────────
+    // ── ptrace ────────────────────────────────────────────────────────────
     pub ptrace_state: PtraceState,
     pub ptrace_event: u64,
 
-    // ── resource limits ──────────────────────────────────────────────────────────
-    /// Per-process resource limits.  Inherited on fork; shared across
-    /// CLONE_THREAD threads (both get a clone, Linux semantics are identical).
+    // ── resource limits ───────────────────────────────────────────────────
     pub rlimits: RlimitSet,
 
-    // ── CPU time accounting ────────────────────────────────────────────────────────
+    // ── CPU time accounting ───────────────────────────────────────────────
     /// Accumulated CPU time in nanoseconds.  Incremented once per timer tick
-    /// (TICK_NS = 1 ms) while this process is the running task.
-    /// Used for RLIMIT_CPU enforcement and sys_times / getrusage.
+    /// while this process is Running.  Reported via getrusage / wait4 rusage.
     pub cpu_time_ns: u64,
 
-    // ── RT CPU time accounting (RLIMIT_RTTIME) ───────────────────────────────
-    /// Accumulated *real-time* CPU time in **microseconds** while the process
-    /// is running under `SCHED_FIFO` or `SCHED_RR`.
-    ///
-    /// Linux resets this counter each time an RT task voluntarily blocks
-    /// (deschedules without being preempted), giving it a fresh budget at the
-    /// next wakeup.  We mirror that: the scheduler must call
-    /// `p.rt_cpu_time_us = 0` whenever it transitions the task to `Blocked`.
-    ///
-    /// Compared in microseconds against RLIMIT_RTTIME limits:
-    ///   soft  → SIGXCPU delivered once (then the process has until hard).
-    ///   hard  → SIGKILL delivered immediately.
-    ///
-    /// Only charged / checked when `sched.policy` is Fifo or Rr.
-    /// Never inherited by fork children (reset to 0 in fork_syscall.rs).
+    // ── RT CPU time accounting (RLIMIT_RTTIME) ────────────────────────────
     pub rt_cpu_time_us: u64,
 
-    // ── nanosleep / timer blocking ───────────────────────────────────────────
-    /// Absolute monotonic deadline (ns) for the current sleep.
-    /// 0 = not sleeping.  Written by sys_nanosleep / clock_nanosleep before
-    /// blocking; read by the wakeup callback to compute `rem`.
+    // ── nanosleep / timer blocking ────────────────────────────────────────
     pub sleep_deadline_ns: u64,
-    /// Timer-wheel ID of the pending sleep wakeup timer.
-    /// 0 = no timer armed.  Cancelled on EINTR so the wheel entry is freed.
     pub sleep_timer_id: u64,
 }
 
