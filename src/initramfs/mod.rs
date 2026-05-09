@@ -1,59 +1,157 @@
-//! CPIO newc initramfs parser.
+//! CPIO newc initramfs parser + kernel-facing `load()` entry point.
 //!
-//! Parses the CPIO "newc" (SVR4, magic `070701`) format that QEMU places in
-//! memory when you pass `-initrd <file>`.  The kernel receives the base
-//! physical address and byte length from the boot protocol (multiboot2
-//! module tag or UEFI config table) and passes a `&[u8]` slice here.
+//! ## Boot-protocol initramfs discovery
+//!
+//! On **RISC-V / OpenSBI**: QEMU passes the initrd physical address and size
+//! in FDT node `/chosen`, properties `linux,initrd-start` and `linux,initrd-end`.
+//! `pmm::init_from_fdt()` stores those values via `set_initramfs_range()` before
+//! the heap is initialised, so no allocation is needed.
+//!
+//! On **x86_64 / multiboot2**: the multiboot2 tag type 3 (module) carries the
+//! initrd start/end physical addresses.  The x86_64 boot stub calls
+//! `set_initramfs_range()` after parsing the multiboot2 header.
 //!
 //! ## Public API
 //!
 //! ```rust
-//! // Locate a file by path and get its content bytes:
-//! if let Some(data) = initramfs::find_file(cpio_bytes, "/init") {
-//!     // data is a sub-slice of cpio_bytes — zero-copy
-//! }
-//!
-//! // Iterate every entry:
-//! for entry in initramfs::iter(cpio_bytes) {
-//!     // entry.name : &str
-//!     // entry.data : &[u8]
-//!     // entry.mode : u32  (Unix permission bits)
-//!     // entry.size : usize
-//! }
+//! let ram = initramfs::load();
+//! if let Some(bytes) = ram.file("/init") { /* load ELF */ }
+//! for entry in ram.entries() { /* walk archive */ }
 //! ```
-//!
-//! ## Format reference
-//! Each record:
-//!   - 110-byte ASCII header (all fields zero-padded hex)
-//!   - name (namesize bytes, NUL-terminated)
-//!   - padding to 4-byte boundary
-//!   - file data (filesize bytes)
-//!   - padding to 4-byte boundary
-//! The archive ends with an entry whose name is `TRAILER!!!`.
 
-/// Parsed view of one CPIO entry.  Borrows from the underlying archive slice.
-#[derive(Debug, Clone, Copy)]
-pub struct CpioEntry<'a> {
-    /// File path as stored in the archive (e.g. `"./init"`, `"init"`, `"/init"`).
-    pub name: &'a str,
-    /// Raw file content bytes (empty for directories / device nodes).
-    pub data: &'a [u8],
-    /// Unix mode word (type + permission bits).
-    pub mode: u32,
-    /// File size in bytes (same as `data.len()`).
-    pub size: usize,
+// ─── cpio newc constants ───────────────────────────────────────────────────
+
+const NEWC_MAGIC: &[u8; 6] = b"070701";
+const HEADER_LEN: usize    = 110;
+const TRAILER:    &str     = "TRAILER!!!";
+
+// ─── Global initramfs range (set by boot stub before kernel_main) ──────────
+//
+// We store the physical address and byte length in two static atomics so they
+// can be written once by the early boot code (before the allocator is up) and
+// read later by `load()`.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+static INITRAMFS_PA:  AtomicUsize = AtomicUsize::new(0);
+static INITRAMFS_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Called by the boot stub (FDT walker on RISC-V, multiboot2 tag parser on
+/// x86_64) to record where QEMU placed the initramfs image in physical memory.
+///
+/// Must be called **before** `heap::init()` and **before** `load()`.
+pub fn set_initramfs_range(phys_start: usize, byte_len: usize) {
+    INITRAMFS_PA .store(phys_start, Ordering::Relaxed);
+    INITRAMFS_LEN.store(byte_len,   Ordering::Relaxed);
 }
 
-// ── Internal constants ────────────────────────────────────────────────────
+// ─── InitramfsHandle ──────────────────────────────────────────────────────
 
-const NEWC_MAGIC:  &[u8; 6] = b"070701";
-const HEADER_LEN:  usize    = 110;
-const TRAILER:     &str     = "TRAILER!!!";
+/// Borrowed view of the in-memory CPIO archive.  Returned by `load()`.
+///
+/// The underlying bytes are not copied — this is a zero-copy reference into
+/// the physical memory where QEMU (or the bootloader) placed the initrd image.
+pub struct InitramfsHandle<'a> {
+    cpio: &'a [u8],
+}
 
-// ── Helpers ───────────────────────────────────────────────────────────────
+impl<'a> InitramfsHandle<'a> {
+    /// Return the raw file content bytes for `path`, or `None` if not found.
+    ///
+    /// Accepts paths with or without a leading `/` or `./` prefix:
+    /// `"/init"`, `"init"`, and `"./init"` all resolve to the same entry.
+    pub fn file(&self, path: &str) -> Option<&'a [u8]> {
+        find_file(self.cpio, path)
+    }
 
-/// Parse a zero-padded 8-digit ASCII hex field from the CPIO header.
-/// Returns 0 on any parse error rather than panicking.
+    /// Iterate every non-directory entry in the archive.
+    pub fn entries(&self) -> CpioIter<'a> {
+        iter(self.cpio)
+    }
+}
+
+// ─── load() ───────────────────────────────────────────────────────────────
+
+/// Obtain a zero-copy handle to the initramfs CPIO archive.
+///
+/// Panics (kernel panic via the `!` diverge) if `set_initramfs_range()` was
+/// never called (i.e. the boot stub forgot to record the initrd location).
+///
+/// # Safety
+/// The physical memory at `[pa, pa+len)` must be valid, readable, and must
+/// remain mapped for the lifetime of the returned handle.  On both RISC-V
+/// (Sv39 identity map) and x86_64 (direct-map region) this is guaranteed by
+/// the time `kernel_main` calls this function.
+pub fn load() -> InitramfsHandle<'static> {
+    let pa  = INITRAMFS_PA .load(Ordering::Relaxed);
+    let len = INITRAMFS_LEN.load(Ordering::Relaxed);
+
+    if pa == 0 || len == 0 {
+        // The boot stub must call set_initramfs_range() before kernel_main.
+        // If we reach here the kernel cannot proceed — there is no /init.
+        crate::println!("initramfs: FATAL: initramfs physical address not set.");
+        crate::println!("initramfs: Pass -initrd <file> to QEMU and ensure");
+        crate::println!("initramfs: the boot stub calls set_initramfs_range().");
+        loop {
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("wfi"); }
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("hlt"); }
+            #[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64")))]
+            core::hint::spin_loop();
+        }
+    }
+
+    // SAFETY: the boot stub guarantees [pa, pa+len) is valid mapped memory.
+    let cpio: &'static [u8] = unsafe {
+        core::slice::from_raw_parts(pa as *const u8, len)
+    };
+
+    // Quick sanity check — the first 6 bytes must be the newc magic.
+    if cpio.len() < HEADER_LEN || &cpio[..6] != NEWC_MAGIC {
+        crate::println!("initramfs: WARN: cpio magic not found at {:#x} (len={})", pa, len);
+        crate::println!("initramfs: the archive may be compressed — pass an uncompressed cpio to QEMU.");
+    }
+
+    InitramfsHandle { cpio }
+}
+
+// ─── Parsed entry ─────────────────────────────────────────────────────────
+
+/// One file/directory entry inside the CPIO archive.
+#[derive(Debug, Clone, Copy)]
+pub struct CpioEntry<'a> {
+    /// File path, with leading `./` and `/` stripped.
+    pub name: &'a str,
+    /// Raw file content (empty for directories / special files).
+    pub data: &'a [u8],
+    /// Unix mode word (type + permission bits, e.g. `0o100755`).
+    pub mode: u32,
+    /// File size in bytes — always `data.len()`.
+    pub size: usize,
+    /// Unix UID (owner).
+    pub uid: u32,
+    /// Unix GID (group).
+    pub gid: u32,
+    /// Modification timestamp (seconds since epoch).
+    pub mtime: u32,
+    /// Number of hard links.
+    pub nlink: u32,
+}
+
+impl<'a> CpioEntry<'a> {
+    /// True if this entry represents a regular file (`S_IFREG`).
+    #[inline] pub fn is_file(&self)      -> bool { self.mode & 0o170000 == 0o100000 }
+    /// True if this entry represents a directory (`S_IFDIR`).
+    #[inline] pub fn is_dir(&self)       -> bool { self.mode & 0o170000 == 0o040000 }
+    /// True if this entry represents a symbolic link (`S_IFLNK`).
+    #[inline] pub fn is_symlink(&self)   -> bool { self.mode & 0o170000 == 0o120000 }
+    /// Unix permission bits only (strips the file-type nibble).
+    #[inline] pub fn permissions(&self)  -> u32  { self.mode & 0o007777 }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
 #[inline]
 fn parse_hex8(bytes: &[u8]) -> u32 {
     let mut val: u32 = 0;
@@ -69,15 +167,14 @@ fn parse_hex8(bytes: &[u8]) -> u32 {
     val
 }
 
-/// Round `n` up to the next multiple of `align` (must be power of two).
 #[inline]
 fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
 
-// ── Iterator ─────────────────────────────────────────────────────────────
+// ─── Iterator ─────────────────────────────────────────────────────────────
 
-/// Iterator over CPIO entries in a newc archive.
+/// Iterator over entries in a newc CPIO archive.
 pub struct CpioIter<'a> {
     data:   &'a [u8],
     offset: usize,
@@ -91,39 +188,36 @@ impl<'a> Iterator for CpioIter<'a> {
 
         loop {
             let off = self.offset;
-
-            // Need at least a full header.
             if off + HEADER_LEN > buf.len() { return None; }
-
-            // Verify magic.
             if &buf[off..off + 6] != NEWC_MAGIC { return None; }
 
-            // ── Parse header fields (all 8-digit hex, positions per spec) ──
-            // Offsets within the 110-byte header:
-            //   [0..6]   magic
-            //   [6..14]  ino
-            //   [14..22] mode
-            //   [22..30] uid
-            //   [30..38] gid
-            //   [38..46] nlink
-            //   [46..54] mtime
-            //   [54..62] filesize
-            //   [62..70] devmajor
-            //   [70..78] devminor
-            //   [78..86] rdevmajor
-            //   [86..94] rdevminor
-            //   [94..102] namesize
-            //   [102..110] check
+            // Header field offsets per the newc spec:
+            //   [0  .. 6  ] magic
+            //   [6  .. 14 ] ino
+            //   [14 .. 22 ] mode
+            //   [22 .. 30 ] uid
+            //   [30 .. 38 ] gid
+            //   [38 .. 46 ] nlink
+            //   [46 .. 54 ] mtime
+            //   [54 .. 62 ] filesize
+            //   [62 .. 70 ] devmajor
+            //   [70 .. 78 ] devminor
+            //   [78 .. 86 ] rdevmajor
+            //   [86 .. 94 ] rdevminor
+            //   [94 .. 102] namesize
+            //   [102.. 110] check
             let mode      = parse_hex8(&buf[off + 14..off + 22]);
+            let uid       = parse_hex8(&buf[off + 22..off + 30]);
+            let gid       = parse_hex8(&buf[off + 30..off + 38]);
+            let nlink     = parse_hex8(&buf[off + 38..off + 46]);
+            let mtime     = parse_hex8(&buf[off + 46..off + 54]);
             let filesize  = parse_hex8(&buf[off + 54..off + 62]) as usize;
             let namesize  = parse_hex8(&buf[off + 94..off + 102]) as usize;
 
-            // Name immediately follows header.
             let name_start = off + HEADER_LEN;
             let name_end   = name_start + namesize;
             if name_end > buf.len() { return None; }
 
-            // Name is NUL-terminated; strip the NUL and any leading "./".
             let raw_name = core::str::from_utf8(&buf[name_start..name_end])
                 .unwrap_or("")
                 .trim_end_matches('\0');
@@ -131,128 +225,126 @@ impl<'a> Iterator for CpioIter<'a> {
                 .trim_start_matches("./")
                 .trim_start_matches('/');
 
-            // File data follows name, both padded to 4-byte boundary.
             let data_start = align_up(name_end, 4);
             let data_end   = data_start + filesize;
             if data_end > buf.len() { return None; }
 
-            // Advance offset past this record.
             self.offset = align_up(data_end, 4);
 
-            // End-of-archive sentinel.
             if name == TRAILER { return None; }
 
-            let data = &buf[data_start..data_end];
-
-            return Some(CpioEntry { name, data, mode, size: filesize });
+            return Some(CpioEntry {
+                name,
+                data: &buf[data_start..data_end],
+                mode,
+                size: filesize,
+                uid,
+                gid,
+                mtime,
+                nlink,
+            });
         }
     }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────
+// ─── Public free functions ─────────────────────────────────────────────────
 
-/// Return an iterator over every entry in a newc CPIO archive.
+/// Return an iterator over every entry in a newc CPIO archive slice.
 pub fn iter(cpio: &[u8]) -> CpioIter<'_> {
     CpioIter { data: cpio, offset: 0 }
 }
 
-/// Find a file by path in a newc CPIO archive and return its content bytes.
+/// Find a file by path and return its content bytes.
 ///
-/// Accepts paths with or without leading `/` or `./` (all normalised).
-/// Returns `None` if not found or if the archive is malformed.
+/// Accepts paths with or without leading `/` or `./`.
+/// Returns `None` for directories, symlinks, or missing paths.
 pub fn find_file<'a>(cpio: &'a [u8], path: &str) -> Option<&'a [u8]> {
-    // Normalise query: strip leading slashes and "./".
     let needle = path
         .trim_start_matches("./")
         .trim_start_matches('/');
-
     for entry in iter(cpio) {
-        if entry.name == needle && entry.size > 0 {
+        if entry.name == needle && entry.is_file() {
             return Some(entry.data);
         }
     }
     None
 }
 
-// ── Tests (run with `cargo test` on host) ────────────────────────────────
+// ─── Unit tests (host) ────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a minimal newc CPIO record by hand.
-    fn make_record(name: &str, data: &[u8]) -> alloc::vec::Vec<u8> {
+    fn make_record(name: &str, mode: u32, data: &[u8]) -> alloc::vec::Vec<u8> {
         extern crate alloc;
-        use alloc::vec::Vec;
-
-        let namesize = name.len() + 1; // include NUL
+        use alloc::{format, vec::Vec};
+        let namesize = name.len() + 1;
         let filesize = data.len();
-
-        let header = alloc::format!(
-            "070701"
-            "{:08x}" // ino
-            "{:08x}" // mode
-            "{:08x}" // uid
-            "{:08x}" // gid
-            "{:08x}" // nlink
-            "{:08x}" // mtime
-            "{:08x}" // filesize
-            "{:08x}" // devmajor
-            "{:08x}" // devminor
-            "{:08x}" // rdevmajor
-            "{:08x}" // rdevminor
-            "{:08x}" // namesize
-            "{:08x}", // check
-            1u32, 0o100644u32, 0u32, 0u32, 1u32, 0u32,
-            filesize as u32,
-            0u32, 0u32, 0u32, 0u32,
-            namesize as u32, 0u32,
+        let header = format!(
+            "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+            1u32, mode, 0u32, 0u32, 1u32, 0u32, filesize as u32,
+            0u32, 0u32, 0u32, 0u32, namesize as u32, 0u32,
         );
         let mut rec: Vec<u8> = header.into_bytes();
         rec.extend_from_slice(name.as_bytes());
-        rec.push(0); // NUL
+        rec.push(0);
         while rec.len() % 4 != 0 { rec.push(0); }
         rec.extend_from_slice(data);
         while rec.len() % 4 != 0 { rec.push(0); }
         rec
     }
 
-    fn make_trailer() -> alloc::vec::Vec<u8> {
-        make_record("TRAILER!!!", b"")
+    fn trailer() -> alloc::vec::Vec<u8> { make_record("TRAILER!!!", 0, b"") }
+
+    #[test]
+    fn find_init_slash_prefix() {
+        extern crate alloc;
+        let mut a = make_record("init", 0o100755, b"ELF");
+        a.extend(trailer());
+        assert_eq!(find_file(&a, "/init"), Some(b"ELF".as_ref()));
+        assert_eq!(find_file(&a, "init"),  Some(b"ELF".as_ref()));
+        assert_eq!(find_file(&a, "./init"), Some(b"ELF".as_ref()));
     }
 
     #[test]
-    fn find_init() {
+    fn dirs_not_returned_by_find_file() {
         extern crate alloc;
-        let mut archive = make_record("init", b"ELF_FAKE_DATA");
-        archive.extend(make_trailer());
-        let found = find_file(&archive, "/init").unwrap();
-        assert_eq!(found, b"ELF_FAKE_DATA");
+        let mut a = make_record("etc", 0o040755, b""); // directory
+        a.extend(make_record("etc/passwd", 0o100644, b"root:x:0:0\n"));
+        a.extend(trailer());
+        assert!(find_file(&a, "etc").is_none(), "directory returned as file");
+        assert!(find_file(&a, "etc/passwd").is_some());
     }
 
     #[test]
-    fn find_dotslash_prefix() {
+    fn iter_all_entries_including_dirs() {
         extern crate alloc;
-        let mut archive = make_record("./bin/hello", b"HELLO");
-        archive.extend(make_trailer());
-        assert!(find_file(&archive, "bin/hello").is_some());
-        assert!(find_file(&archive, "/bin/hello").is_some());
+        let mut a = make_record("etc",        0o040755, b"");
+        a.extend(make_record("etc/passwd",  0o100644, b"..."));
+        a.extend(make_record("bin/sh",      0o100755, b"ELF"));
+        a.extend(trailer());
+        assert_eq!(iter(&a).count(), 3);
     }
 
     #[test]
-    fn not_found() {
+    fn entry_type_helpers() {
         extern crate alloc;
-        let mut archive = make_record("other", b"DATA");
-        archive.extend(make_trailer());
-        assert!(find_file(&archive, "/init").is_none());
+        let mut a = make_record("dir",  0o040755, b"");
+        a.extend(make_record("file", 0o100644, b"x"));
+        a.extend(make_record("link", 0o120777, b"target"));
+        a.extend(trailer());
+        let entries: alloc::vec::Vec<_> = iter(&a).collect();
+        assert!(entries[0].is_dir());
+        assert!(entries[1].is_file());
+        assert!(entries[2].is_symlink());
     }
 
     #[test]
-    fn iter_count() {
+    fn not_found_returns_none() {
         extern crate alloc;
-        let mut archive = make_record("a", b"1");
-        archive.extend(make_record("b", b"2"));
-        archive.extend(make_trailer());
-        assert_eq!(iter(&archive).count(), 2);
+        let mut a = make_record("other", 0o100644, b"DATA");
+        a.extend(trailer());
+        assert!(find_file(&a, "/init").is_none());
     }
 }
