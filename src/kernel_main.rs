@@ -4,12 +4,26 @@
 //!   - `kernel_main` (x86_64)   — called from the x86_64 UEFI or multiboot2 stub
 //!   - `kernel_main_riscv64`    — called from the RISC-V SBI stub (boot.rs)
 //!
+//! x86_64 boot sequence:
+//!   1. serial::init()    — UART output
+//!   2. pmm::init()       — physical memory manager
+//!   3. heap::init()      — slab allocator over PMM
+//!   4. gdt::init()       — GDT + TSS
+//!   5. idt::init()       — IDT / exception vectors
+//!   6. apic::init()      — local + IO APIC, timer IRQ
+//!   7. time::init()      — clocksource calibration (TSC/HPET), timerfd, itimers
+//!   8. smp::init()       — enumerate MADT CPUs, bring up APs
+//!   9. tty::init()       — PTY registry + /dev/pts
+//!  10. Load /init from initramfs → userspace
+//!
 //! RISC-V boot sequence:
-//!   1. trap_init()      — install stvec, enable SIE (must be first)
-//!   2. init_from_fdt()  — parse FDT /memory nodes → PMM free list
-//!   3. heap::init()     — slab/linked-list allocator over PMM
-//!   4. clint::init()    — timer setup
-//!   5. Load /init from initramfs → userspace
+//!   1. trap_init()       — install stvec, enable SIE (must be first)
+//!   2. init_from_fdt()   — parse FDT /memory nodes → PMM free list
+//!   3. heap::init()      — slab/linked-list allocator over PMM
+//!   4. time::init()      — calibrate CLINT mtime clocksource, timerfd, itimers
+//!   5. smp::init()       — SBI HSM hart bringup
+//!   6. tty::init()       — PTY registry + /dev/pts
+//!   7. Load /init from initramfs → userspace
 
 #![allow(unused_imports)]
 
@@ -32,6 +46,17 @@ pub fn kernel_main_x86_64() {
     gdt::init();
     idt::init();
     apic::init();
+
+    // Clocksource calibration (TSC / HPET fallback), timerfd table, itimer list.
+    // Must run after the APIC timer is active so TSC calibration has a reference.
+    crate::time::init();
+
+    // Bring up application processors.  Requires the heap, GDT, IDT, and APIC
+    // to all be live before any AP executes code.
+    crate::smp::init();
+
+    // Initialise the PTY registry and /dev/pts pseudo-filesystem.
+    crate::tty::init();
 
     crate::println!("rustos: subsystems initialised");
 
@@ -90,7 +115,6 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     use crate::arch::riscv64::{paging, trap, uentry};
     use crate::loader::{elf64, auxv};
     use crate::mm::{heap, pmm};
-    use crate::drivers::clint;
 
     // 1. Trap vector MUST be first — any fault before this is unrecoverable.
     trap::trap_init();
@@ -108,12 +132,20 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     // 3. Heap over the real PMM.
     heap::init();
 
-    // 4. Timer.
-    clint::init();
+    // 4. Timekeeping: calibrate CLINT mtime, set clocksource, init timerfd/itimer
+    //    tables.  Replaces the bare clint::init() call — time::init() calls it
+    //    internally under the ClintMtime path.
+    crate::time::init();
+
+    // 5. Bring up additional harts via SBI HSM.
+    crate::smp::init();
+
+    // 6. Initialise the PTY registry and /dev/pts pseudo-filesystem.
+    crate::tty::init();
 
     crate::println!("rustos: riscv64 subsystems initialised");
 
-    // 5. Load /init and jump to userspace.
+    // 7. Load /init and jump to userspace.
     let initramfs = initramfs::load();
     let elf_bytes = match initramfs.file("/init") {
         Some(b) => b,
