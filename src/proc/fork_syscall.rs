@@ -21,10 +21,29 @@ fn sysret_trampoline() {}
 /// only the fields that must differ in the child.  This ensures that every
 /// field added to Pcb in the future (rlimits, ns, seccomp, brk_base, …) is
 /// automatically inherited without requiring a manual update here.
+///
+/// ## RLIMIT_NPROC
+/// Before creating the child we check the caller’s RLIMIT_NPROC soft limit
+/// against the current total process count.  If the limit would be exceeded
+/// we return -EAGAIN (-11) — identical to Linux’s behaviour for
+/// `fork(2)`/`clone(2)` when the per-user process limit is hit (musl maps
+/// EAGAIN from fork to `EAGAIN` in errno, which is what programs expect).
 pub fn sys_fork() -> isize {
     let parent_pid = scheduler::current_pid();
 
-    // Snapshot the parent's address-space fields we need before we mutate
+    // ── RLIMIT_NPROC: reject if we would exceed the caller’s soft limit ───
+    {
+        use crate::proc::rlimit::{RLIMIT_NPROC, RLIM_INFINITY};
+        let (soft, _hard) = crate::proc::rlimit::getrlimit_for(parent_pid, RLIMIT_NPROC);
+        if soft != RLIM_INFINITY {
+            let count = scheduler::proc_count() as u64;
+            if count >= soft {
+                return -11; // EAGAIN
+            }
+        }
+    }
+
+    // Snapshot the parent’s address-space fields we need before we mutate
     // anything.  The full PCB clone happens inside the scheduler lock below.
     let parent_cr3 = match scheduler::with_proc(parent_pid, |p| p.user_satp) {
         Some(cr3) if cr3 != 0 => cr3,
@@ -69,7 +88,6 @@ pub fn sys_fork() -> isize {
     child_pcb.kstack_top       = kstack_top;
     child_pcb.ctx              = child_ctx;
     // POSIX: child_tid / clear_child_tid are reset unless CLONE_CHILD_SETTID
-    // is set — for plain fork() they are zeroed.
     child_pcb.child_tid_va       = 0;
     child_pcb.child_tid_val      = child_pid as u32;
     child_pcb.clear_child_tid_va = 0;
@@ -79,6 +97,8 @@ pub fn sys_fork() -> isize {
     child_pcb.ptrace_event       = 0;
     child_pcb.robust_list_head   = 0;
     child_pcb.robust_list_len    = 0;
+    // cpu_time_ns: child starts fresh (does not inherit parent CPU time).
+    child_pcb.cpu_time_ns        = 0;
     // tls_base, brk_base, brk, next_va, vmas, rlimits, ns, seccomp,
     // signal_handlers, caps, exe_path — all inherited from the parent clone.
 

@@ -21,7 +21,7 @@ use core::cmp::Reverse;
 use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
 use crate::sync::spinlock::SpinLock;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Constants ───────────────────────────────────────────────────────────────────
 
 /// Scheduler tick period in nanoseconds (1 ms).
 pub const TICK_NS: u64 = 1_000_000;
@@ -32,7 +32,7 @@ pub const BALANCE_TICKS: u64 = 10;
 /// All CPUs allowed (default affinity mask for a 64-CPU system).
 pub const CPUMASK_ALL: u64 = u64::MAX;
 
-// ── Scheduling policy ─────────────────────────────────────────────────────────
+// ── Scheduling policy ──────────────────────────────────────────────────────
 
 /// Linux-compatible scheduling policy selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ impl SchedPolicy {
 /// Per-task scheduler state embedded in every `Pcb`.
 #[derive(Debug, Clone)]
 pub struct SchedEntity {
-    // ── CFS (SCHED_NORMAL) ────────────────────────────────────────────────────
+    // ── CFS (SCHED_NORMAL) ────────────────────────────────────────────────
     /// Accumulated virtual runtime in nanoseconds.
     pub vruntime: u64,
     /// CFS weight derived from nice value.
@@ -77,11 +77,11 @@ pub struct SchedEntity {
     /// Static nice level (-20..19).
     pub nice: i8,
 
-    // ── Real-time (SCHED_FIFO / SCHED_RR) ───────────────────────────────────
+    // ── Real-time (SCHED_FIFO / SCHED_RR) ──────────────────────────────────
     /// Real-time priority 1-99 (99 = highest).  0 for SCHED_NORMAL.
     pub rt_priority: u8,
 
-    // ── Deadline (SCHED_DEADLINE) ─────────────────────────────────────────────
+    // ── Deadline (SCHED_DEADLINE) ─────────────────────────────────────────
     /// CBS runtime budget per period (nanoseconds).
     pub dl_runtime: u64,
     /// Relative deadline (nanoseconds, measured from period start).
@@ -95,7 +95,7 @@ pub struct SchedEntity {
     /// Time of next period replenishment (nanoseconds since boot).
     pub dl_next_replenish: u64,
 
-    // ── Common ────────────────────────────────────────────────────────────────
+    // ── Common ─────────────────────────────────────────────────────────────────
     /// Active scheduling policy for this task.
     pub policy: SchedPolicy,
     /// CPU affinity bitmask (bit N = allowed on CPU N).
@@ -128,7 +128,6 @@ impl SchedEntity {
     }
 
     /// Configure as a deadline task (CBS parameters, nanoseconds).
-    /// `now_ns` is the current monotonic time used to set the first activation.
     pub fn set_deadline(&mut self, runtime_ns: u64, deadline_ns: u64, period_ns: u64, now_ns: u64) {
         self.dl_runtime  = runtime_ns;
         self.dl_deadline = deadline_ns;
@@ -139,17 +138,14 @@ impl SchedEntity {
         self.policy = SchedPolicy::Deadline;
     }
 
-    /// Returns `true` if this CPU index is in the affinity mask.
     #[inline]
     pub fn cpu_allowed(&self, cpu: u32) -> bool {
         cpu < 64 && (self.cpumask >> cpu) & 1 == 1
     }
 }
 
-// ── Weight table ──────────────────────────────────────────────────────────────
+// ── Weight table ────────────────────────────────────────────────────────────────
 
-/// Convert nice level (-20..19) to a CFS weight.
-/// Uses the same simplified 1.25× per-step ratio as before.
 fn nice_to_weight(nice: i8) -> u64 {
     let n = nice.clamp(-20, 19) as i64;
     let base: u64 = 1024;
@@ -165,7 +161,7 @@ fn nice_to_weight(nice: i8) -> u64 {
     }
 }
 
-// ── CFS run-queue entry ───────────────────────────────────────────────────────
+// ── CFS run-queue entry ────────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct CfsEntry {
@@ -175,7 +171,7 @@ struct CfsEntry {
 }
 impl Ord for CfsEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        other.vruntime.cmp(&self.vruntime) // min-heap
+        other.vruntime.cmp(&self.vruntime)
     }
 }
 impl PartialOrd for CfsEntry {
@@ -183,9 +179,8 @@ impl PartialOrd for CfsEntry {
 }
 unsafe impl Send for CfsEntry {}
 
-// ── Deadline run-queue entry ──────────────────────────────────────────────────
+// ── Deadline run-queue entry ──────────────────────────────────────────────────────
 
-/// Entry in the EDF deadline heap, ordered by absolute deadline (earliest first).
 #[derive(Eq, PartialEq)]
 struct DlEntry {
     abs_deadline: u64,
@@ -194,7 +189,7 @@ struct DlEntry {
 }
 impl Ord for DlEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        other.abs_deadline.cmp(&self.abs_deadline) // min-heap (earliest deadline first)
+        other.abs_deadline.cmp(&self.abs_deadline)
     }
 }
 impl PartialOrd for DlEntry {
@@ -202,26 +197,13 @@ impl PartialOrd for DlEntry {
 }
 unsafe impl Send for DlEntry {}
 
-// ── Per-CPU RunQueue ───────────────────────────────────────────────────────────
+// ── Per-CPU RunQueue ────────────────────────────────────────────────────────────
 
-/// Per-CPU run-queue holding all three scheduling classes.
 pub struct RunQueue {
-    // ── CFS (SCHED_NORMAL) ────────────────────────────────────────────────────
     cfs_heap: BinaryHeap<CfsEntry>,
-    /// Minimum vruntime across all CFS tasks on this queue.
     pub min_vruntime: u64,
-
-    // ── Real-time (SCHED_FIFO / SCHED_RR) ───────────────────────────────────
-    /// FIFO queue ordered by rt_priority (highest first = front of deque).
-    /// All FIFO/RR tasks are pushed to the back at their priority level;
-    /// we do a linear scan to find the highest-priority head.
     rt_queue: VecDeque<*mut crate::proc::task::Task>,
-
-    // ── Deadline (SCHED_DEADLINE) ─────────────────────────────────────────────
-    /// EDF min-heap ordered by absolute deadline.
     dl_heap: BinaryHeap<DlEntry>,
-
-    // ── Aggregate stats ───────────────────────────────────────────────────────
     pub nr_running: u32,
     pub load_weight: u64,
     pub tick_count: u64,
@@ -244,15 +226,11 @@ impl RunQueue {
         }
     }
 
-    // ── Enqueue ───────────────────────────────────────────────────────────────
-
-    /// Enqueue a task into the appropriate class queue.
     pub fn enqueue(&mut self, task: *mut crate::proc::task::Task) {
         let t = unsafe { &mut *task };
         self.nr_running += 1;
         self.load_weight += t.sched.weight;
         t.sched.on_rq = true;
-
         match t.sched.policy {
             SchedPolicy::Deadline => {
                 self.dl_heap.push(DlEntry {
@@ -262,9 +240,6 @@ impl RunQueue {
                 });
             }
             SchedPolicy::Fifo | SchedPolicy::Rr => {
-                // Insert maintaining rt_priority order (higher = closer to front).
-                // For simplicity we push to back and rely on peek_rt / dequeue_rt
-                // to scan for the highest priority entry.
                 self.rt_queue.push_back(task);
             }
             SchedPolicy::Normal => {
@@ -280,8 +255,6 @@ impl RunQueue {
         }
     }
 
-    // ── Dequeue helpers ───────────────────────────────────────────────────────
-
     fn dequeue_cfs(&mut self) -> Option<*mut crate::proc::task::Task> {
         self.cfs_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
@@ -294,7 +267,6 @@ impl RunQueue {
 
     fn dequeue_rt(&mut self) -> Option<*mut crate::proc::task::Task> {
         if self.rt_queue.is_empty() { return None; }
-        // Find index of highest rt_priority task.
         let best_idx = self.rt_queue.iter().enumerate()
             .max_by_key(|(_, &tp)| unsafe { (*tp).sched.rt_priority })
             .map(|(i, _)| i)?;
@@ -316,24 +288,18 @@ impl RunQueue {
         })
     }
 
-    /// Dequeue the next task to run.  Priority: Deadline > RT > CFS.
     pub fn dequeue_next(&mut self) -> Option<*mut crate::proc::task::Task> {
         if !self.dl_heap.is_empty() { return self.dequeue_dl(); }
         if !self.rt_queue.is_empty() { return self.dequeue_rt(); }
         self.dequeue_cfs()
     }
 
-    /// Peek without dequeuing (used by load balancer heuristic).
     pub fn peek_next(&self) -> Option<*mut crate::proc::task::Task> {
         if let Some(e) = self.dl_heap.peek() { return Some(e.task_ptr); }
         if let Some(&tp) = self.rt_queue.front() { return Some(tp); }
         self.cfs_heap.peek().map(|e| e.task_ptr)
     }
 
-    // ── Tick accounting ───────────────────────────────────────────────────────
-
-    /// Advance the current task's vruntime / deadline budget by `delta_ns`.
-    /// Call once per timer tick with the currently running task pointer.
     pub fn update_curr(&mut self, curr: *mut crate::proc::task::Task, delta_ns: u64) {
         let t = unsafe { &mut *curr };
         match t.sched.policy {
@@ -345,10 +311,7 @@ impl RunQueue {
                 }
             }
             SchedPolicy::Deadline => {
-                // CBS budget consumption.
                 t.sched.dl_remaining = t.sched.dl_remaining.saturating_sub(delta_ns);
-                // If budget exhausted, advance absolute deadline by one period
-                // (CBS replenishment) so the task drops to the back of the EDF queue.
                 if t.sched.dl_remaining == 0 {
                     let period = t.sched.dl_period.max(1);
                     t.sched.dl_remaining      = t.sched.dl_runtime;
@@ -358,7 +321,6 @@ impl RunQueue {
                         t.pid, t.sched.dl_abs_deadline);
                 }
             }
-            // FIFO/RR: just consume ticks (RR rotation handled in schedule()).
             _ => {}
         }
     }
@@ -368,17 +330,11 @@ impl Default for RunQueue {
     fn default() -> Self { Self::new() }
 }
 
-// ── Load balancer ─────────────────────────────────────────────────────────────
+// ── Load balancer ───────────────────────────────────────────────────────────────
 
-/// Called from the timer interrupt on each CPU every `BALANCE_TICKS` ticks.
-/// Migrates one CFS task from the busiest CPU to this CPU, respecting
-/// the task's CPU affinity mask.
 pub fn load_balance(this_cpu: u32) {
     let n = crate::smp::num_online_cpus();
     if n <= 1 { return; }
-
-    // Find the busiest CPU (by load_weight, excluding deadline tasks which
-    // must not be migrated without deadline admission re-check).
     let mut busiest_cpu = this_cpu;
     let mut max_load: u64 = 0;
     for cpu in 0..n {
@@ -390,22 +346,13 @@ pub fn load_balance(this_cpu: u32) {
         }
     }
     if busiest_cpu == this_cpu { return; }
-
     let this_load = unsafe { crate::smp::percpu::PERCPU_BLOCKS[this_cpu as usize].runqueue.load_weight };
-    // Only migrate if imbalance > 25%.
     if max_load <= this_load + this_load / 4 { return; }
-
     let busy_blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[busiest_cpu as usize] };
     if busy_blk.runqueue.nr_running <= 1 { return; }
-
-    // Pull one CFS task that allows this CPU.
-    // We do a targeted scan: dequeue-scan-reenqueue if the task is pinned.
-    // To keep O(log n) amortised, we pull once and check affinity.
     if let Some(task) = busy_blk.runqueue.dequeue_next() {
         let t = unsafe { &mut *task };
-        // Deadline tasks: never migrate here (they have their own admission control).
         if t.sched.policy == SchedPolicy::Deadline || !t.sched.cpu_allowed(this_cpu) {
-            // Put it back.
             busy_blk.runqueue.enqueue(task);
             return;
         }
@@ -416,9 +363,8 @@ pub fn load_balance(this_cpu: u32) {
     }
 }
 
-// ── Core scheduler ────────────────────────────────────────────────────────────
+// ── Core scheduler ──────────────────────────────────────────────────────────────
 
-/// Idle loop entered by each AP after bringup.
 pub fn ap_idle() -> ! {
     let cpu_id = crate::smp::percpu::current_cpu_id();
     log::info!("sched: CPU {} idle loop started", cpu_id);
@@ -433,8 +379,6 @@ pub fn ap_idle() -> ! {
     }
 }
 
-/// Pick and context-switch to the next runnable task on this CPU.
-/// Priority: SCHED_DEADLINE (EDF) > SCHED_FIFO/RR > SCHED_NORMAL (CFS).
 pub fn schedule() {
     let blk = unsafe { &mut *crate::smp::percpu::current_block() };
     let rq = &mut blk.runqueue;
@@ -448,7 +392,21 @@ pub fn schedule() {
     }
 }
 
-// ── Context switch (arch-specific, unchanged) ────────────────────────────────
+// ── Public helpers ──────────────────────────────────────────────────────────────
+
+/// Return the total number of live (non-zombie) processes across all CPUs.
+/// Used by RLIMIT_NPROC enforcement in fork and by sys_sysinfo.
+pub fn proc_count() -> usize {
+    let mut n = 0usize;
+    with_procs_ro(|procs| {
+        for p in procs.iter() {
+            if p.state != crate::proc::process::State::Zombie { n += 1; }
+        }
+    });
+    n
+}
+
+// ── Context switch (arch-specific, unchanged) ────────────────────────────
 
 #[naked]
 unsafe extern "C" fn context_switch(
