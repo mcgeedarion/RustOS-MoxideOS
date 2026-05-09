@@ -17,17 +17,10 @@ fn sysret_trampoline() {}
 
 /// sys_fork() -> child_pid (parent) / 0 (child)  [NR 57]
 ///
-/// The child PCB is built by cloning the full parent PCB and then patching
-/// only the fields that must differ in the child.  This ensures that every
-/// field added to Pcb in the future (rlimits, ns, seccomp, brk_base, …) is
-/// automatically inherited without requiring a manual update here.
-///
 /// ## RLIMIT_NPROC
 /// Before creating the child we check the caller’s RLIMIT_NPROC soft limit
 /// against the current total process count.  If the limit would be exceeded
-/// we return -EAGAIN (-11) — identical to Linux’s behaviour for
-/// `fork(2)`/`clone(2)` when the per-user process limit is hit (musl maps
-/// EAGAIN from fork to `EAGAIN` in errno, which is what programs expect).
+/// we return -EAGAIN (-11).
 pub fn sys_fork() -> isize {
     let parent_pid = scheduler::current_pid();
 
@@ -43,8 +36,6 @@ pub fn sys_fork() -> isize {
         }
     }
 
-    // Snapshot the parent’s address-space fields we need before we mutate
-    // anything.  The full PCB clone happens inside the scheduler lock below.
     let parent_cr3 = match scheduler::with_proc(parent_pid, |p| p.user_satp) {
         Some(cr3) if cr3 != 0 => cr3,
         _ => return -1,
@@ -63,13 +54,11 @@ pub fn sys_fork() -> isize {
         }
     };
 
-    // Clone the full parent PCB — every field is inherited by default.
     let mut child_pcb: Pcb = match scheduler::with_proc(parent_pid, |p| p.clone()) {
         Some(pcb) => pcb,
         None => return -1,
     };
 
-    // Push a sysret frame so the child returns 0 from the fork syscall.
     push_syscall_frame(kstack_top, child_pcb.pc, 0x202, child_pcb.sp);
 
     let child_ctx = Context {
@@ -78,29 +67,26 @@ pub fn sys_fork() -> isize {
         ..Context::zero()
     };
 
-    // ── Patch only the fields that differ in the child ────────────────────
     child_pcb.pid              = child_pid;
     child_pcb.ppid             = parent_pid;
-    child_pcb.tgid             = child_pid;   // child is its own thread-group leader
+    child_pcb.tgid             = child_pid;
     child_pcb.state            = State::Ready;
     child_pcb.exit_code        = 0;
-    child_pcb.user_satp        = child_cr3;   // CoW page table copy
+    child_pcb.user_satp        = child_cr3;
     child_pcb.kstack_top       = kstack_top;
     child_pcb.ctx              = child_ctx;
-    // POSIX: child_tid / clear_child_tid are reset unless CLONE_CHILD_SETTID
     child_pcb.child_tid_va       = 0;
     child_pcb.child_tid_val      = child_pid as u32;
     child_pcb.clear_child_tid_va = 0;
-    child_pcb.exit_signal        = 17;        // SIGCHLD
+    child_pcb.exit_signal        = 17;
     child_pcb.vfork_parent       = 0;
     child_pcb.ptrace_state       = PtraceState::None;
     child_pcb.ptrace_event       = 0;
     child_pcb.robust_list_head   = 0;
     child_pcb.robust_list_len    = 0;
-    // cpu_time_ns: child starts fresh (does not inherit parent CPU time).
+    // Child starts with clean CPU time accumulators.
     child_pcb.cpu_time_ns        = 0;
-    // tls_base, brk_base, brk, next_va, vmas, rlimits, ns, seccomp,
-    // signal_handlers, caps, exe_path — all inherited from the parent clone.
+    child_pcb.rt_cpu_time_us     = 0;
 
     scheduler::enqueue(child_pcb);
     child_pid as isize

@@ -50,7 +50,7 @@ pub struct Pcb {
     pub kstack_top: usize,
     pub ctx:        Context,
 
-    // ── TLS ───────────────────────────────────────────────────────────────────
+    // ── TLS ────────────────────────────────────────────────────────────────
     pub tls_base: usize,
 
     // clone3 / POSIX thread ABI fields
@@ -65,10 +65,10 @@ pub struct Pcb {
     // ── Namespace set ────────────────────────────────────────────────────────────────
     pub ns: NsSet,
 
-    // ── seccomp filter chain ─────────────────────────────────────────────────────
+    // ── seccomp filter chain ──────────────────────────────────────────────────────────
     pub seccomp: FilterChain,
 
-    // ── NPTL / robust futex ──────────────────────────────────────────────────────
+    // ── NPTL / robust futex ─────────────────────────────────────────────────────────
     pub robust_list_head: usize,
     pub robust_list_len:  usize,
 
@@ -76,20 +76,33 @@ pub struct Pcb {
     pub ptrace_state: PtraceState,
     pub ptrace_event: u64,
 
-    // ── resource limits ───────────────────────────────────────────────────────
+    // ── resource limits ──────────────────────────────────────────────────────────
     /// Per-process resource limits.  Inherited on fork; shared across
     /// CLONE_THREAD threads (both get a clone, Linux semantics are identical).
     pub rlimits: RlimitSet,
 
-    // ── CPU time accounting (for RLIMIT_CPU) ───────────────────────────────
+    // ── CPU time accounting ────────────────────────────────────────────────────────
     /// Accumulated CPU time in nanoseconds.  Incremented once per timer tick
     /// (TICK_NS = 1 ms) while this process is the running task.
-    /// Compared in seconds against the RLIMIT_CPU soft/hard limits:
-    ///   soft  → SIGXCPU delivered every second until the process exits or
-    ///            raises its limit (POSIX allows an implementation-defined
-    ///            grace period; we use 1-second intervals matching Linux).
-    ///   hard  → SIGKILL sent immediately.
+    /// Used for RLIMIT_CPU enforcement and sys_times / getrusage.
     pub cpu_time_ns: u64,
+
+    // ── RT CPU time accounting (RLIMIT_RTTIME) ───────────────────────────────
+    /// Accumulated *real-time* CPU time in **microseconds** while the process
+    /// is running under `SCHED_FIFO` or `SCHED_RR`.
+    ///
+    /// Linux resets this counter each time an RT task voluntarily blocks
+    /// (deschedules without being preempted), giving it a fresh budget at the
+    /// next wakeup.  We mirror that: the scheduler must call
+    /// `p.rt_cpu_time_us = 0` whenever it transitions the task to `Blocked`.
+    ///
+    /// Compared in microseconds against RLIMIT_RTTIME limits:
+    ///   soft  → SIGXCPU delivered once (then the process has until hard).
+    ///   hard  → SIGKILL delivered immediately.
+    ///
+    /// Only charged / checked when `sched.policy` is Fifo or Rr.
+    /// Never inherited by fork children (reset to 0 in fork_syscall.rs).
+    pub rt_cpu_time_us: u64,
 }
 
 impl Pcb {
