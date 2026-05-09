@@ -15,16 +15,28 @@
 //!  11.  wake_pid(vfork_parent) if set
 //!  12.  Patch SyscallFrame (x86_64) or enqueue new PCB (riscv64)
 //!
-//! ## spawn_user_process_from_bytes
+//! ## Bug fixes in this revision
 //!
-//!   Used by kernel_main to launch pid 1 (/init) directly from the in-memory
-//!   CPIO slice without going through the VFS.
+//! ### copy_from_user argument order was swapped
+//!   Signature: `copy_from_user(&mut dst_buf, src_va: usize)`.
+//!   All call sites in sys_execve and read_cstr_array had the args
+//!   transposed — passing the VA as the slice and the buffer pointer
+//!   as the VA. Path and argv were always garbage/EFAULT.
+//!
+//! ### build_initial_stack NULL sentinel was before pointer arrays
+//!   ELF ABI (low→high): argc | argv[] | NULL | envp[] | NULL | auxv
+//!   Old code pushed NULL then the pointers, placing NULL at the top
+//!   of each array instead of after it. musl/glibc read past the end.
+//!
+//! ### do_execve re-read vfork_parent after zeroing it
+//!   with_proc_mut zeroed p.vfork_parent and returned the old value,
+//!   but the return was ignored; a second with_proc call re-read 0.
+//!   wake_pid(0) never unblocks the vfork parent.
 
 extern crate alloc;
 use alloc::vec::Vec;
 use alloc::string::String;
 
-// NOTE: elf lives at crate root (src/elf.rs), not src/fs/elf.rs.
 use crate::elf;
 use crate::fs::vfs;
 use crate::mm::{mmap, pmm};
@@ -67,7 +79,7 @@ const PRESENT:       u64   = 1;
 const MAX_CSTR_LEN:   usize = 4096;
 const MAX_CSTR_ARRAY: usize = 1024;
 
-// ── stack size helper ─────────────────────────────────────────────────────────────────
+// ── stack size helper ─────────────────────────────────────────────────────────────
 
 fn stack_bytes_for_pid(pid: usize) -> usize {
     let soft = scheduler::with_proc(pid, |p| p.rlimits.stack_soft())
@@ -82,7 +94,7 @@ fn stack_bytes_for_pid(pid: usize) -> usize {
 
 fn stack_bytes_default() -> usize { DEFAULT_STACK_BYTES }
 
-// ── free_old_address_space ─────────────────────────────────────────────────────────────
+// ── free_old_address_space ────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
@@ -128,14 +140,13 @@ pub unsafe fn free_child_address_space(_cr3: usize) {}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn free_old_address_space(_cr3: usize) {}
 
-// ── new_user_address_space ───────────────────────────────────────────────────────────
+// ── new_user_address_space ──────────────────────────────────────────────────────────
 
 fn new_user_address_space() -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
     {
         let pa = crate::mm::pmm::alloc_page()?;
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
-        // Copy kernel half of current PML4 into new PML4.
         let cur_cr3: usize;
         unsafe { core::arch::asm!("mov {}, cr3", out(reg) cur_cr3); }
         let src = cur_cr3 as *const u64;
@@ -166,7 +177,7 @@ fn load_cr3(cr3: usize) {
     }
 }
 
-// ── spawn_user_process (open via VFS) ─────────────────────────────────────────────
+// ── spawn_user_process (open via VFS) ──────────────────────────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
@@ -182,9 +193,6 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     spawn_user_process_from_bytes(&buf[..n as usize], path, argv, envp)
 }
 
-/// Launch a new process from an in-memory ELF image (e.g. from initramfs).
-///
-/// Used by kernel_main to spawn pid 1 (/init) directly from the CPIO slice.
 pub fn spawn_user_process_from_bytes(
     data: &[u8],
     path: &str,
@@ -216,8 +224,6 @@ pub fn spawn_user_process_from_bytes(
     let phdr_va = phdrs.iter()
         .find(|ph| ph.p_type == elf::PT_PHDR)
         .map_or(0, |ph| ph.p_vaddr as usize + elf_bias);
-    let phdr_count = phdrs.len();
-    let phdr_size  = core::mem::size_of::<elf::Elf64Phdr>();
 
     let (entry_va, interp_base_val) =
         if let Some(interp_path) = elf::find_interp(data, &phdrs) {
@@ -253,7 +259,6 @@ pub fn spawn_user_process_from_bytes(
     };
 
     let pid  = scheduler::next_pid();
-    // Allocate stdin/stdout/stderr (fds 0, 1, 2) for the new process.
     crate::fs::process_fd::proc_fd_alloc(pid, 0, 1, 2);
     let ppid = scheduler::current_pid();
     let heap_base = mmap::set_brk_base_compute(bss_end);
@@ -290,12 +295,11 @@ pub fn spawn_user_process_from_bytes(
     true
 }
 
-/// Convenience wrapper: launch a process by path with no argv/envp.
 pub fn spawn_process(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ──────────────────────────────────────────────────────────
+// ── sys_execve [NR 59] ────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(
@@ -304,13 +308,13 @@ pub fn sys_execve(
     envp_va:  usize,
     frame:    &mut SyscallFrame,
 ) -> isize {
-    let mut path = alloc::vec![0u8; MAX_CSTR_LEN];
-    let n = copy_from_user(path_va, &mut path);
-    if n <= 0 { return -14; }
-    let path = match core::str::from_utf8(&path[..n as usize]).ok()
-        .and_then(|s| Some(s.trim_end_matches('\0'))) {
-        Some(s) => s.to_string(),
-        None    => return -14,
+    // FIX: copy_from_user(&mut dst, src_va) — args were transposed.
+    let mut path_buf = alloc::vec![0u8; MAX_CSTR_LEN];
+    if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
+    let nul = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    let path = match core::str::from_utf8(&path_buf[..nul]) {
+        Ok(s) => s.to_string(),
+        Err(_) => return -14,
     };
 
     let argv = read_cstr_array(argv_va);
@@ -326,13 +330,12 @@ pub fn sys_execve(
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
-    let mut path = alloc::vec![0u8; MAX_CSTR_LEN];
-    let n = copy_from_user(path_va, &mut path);
-    if n <= 0 { return -14; }
-    let path = match core::str::from_utf8(&path[..n as usize]).ok()
-        .and_then(|s| Some(s.trim_end_matches('\0'))) {
-        Some(s) => s.to_string(),
-        None    => return -14,
+    let mut path_buf = alloc::vec![0u8; MAX_CSTR_LEN];
+    if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
+    let nul = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    let path = match core::str::from_utf8(&path_buf[..nul]) {
+        Ok(s) => s.to_string(),
+        Err(_) => return -14,
     };
     let argv = read_cstr_array(argv_va);
     let envp = read_cstr_array(envp_va);
@@ -341,7 +344,7 @@ pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isi
     if spawn_user_process(&path, &argv_refs, &envp_refs) { 0 } else { -8 }
 }
 
-// ── do_execve (x86_64 only) ───────────────────────────────────────────────────────────────
+// ── do_execve (x86_64 only) ─────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(
@@ -351,8 +354,6 @@ pub fn do_execve(
     frame: &mut SyscallFrame,
 ) -> Result<(), isize> {
     let pid = scheduler::current_pid();
-    // Close all O_CLOEXEC fds before loading the new image.
-    // POSIX requires this to happen before the new image is mapped.
     crate::fs::process_fd::proc_fd_close_on_exec(pid);
 
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|_| -8isize)?;
@@ -379,8 +380,6 @@ pub fn do_execve(
     let phdr_va = phdrs.iter()
         .find(|ph| ph.p_type == elf::PT_PHDR)
         .map_or(0, |ph| ph.p_vaddr as usize + elf_bias);
-    let phdr_count = phdrs.len();
-    let phdr_size  = core::mem::size_of::<elf::Elf64Phdr>();
 
     let (entry_va, interp_base_val) =
         if let Some(interp_path) = elf::find_interp(data, &phdrs) {
@@ -413,30 +412,32 @@ pub fn do_execve(
 
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    scheduler::with_proc_mut(pid, |p| {
-        p.user_satp      = new_cr3;
-        p.pc             = entry_va;
-        p.sp             = initial_rsp;
+    // FIX: capture vfork_parent from the with_proc_mut return value directly.
+    // The old code zeroed p.vfork_parent inside the closure but then did a
+    // second with_proc read which returned 0, so wake_pid(0) was always called.
+    let vfork_parent = scheduler::with_proc_mut(pid, |p| {
+        p.user_satp       = new_cr3;
+        p.pc              = entry_va;
+        p.sp              = initial_rsp;
         p.signal_handlers = SignalHandlers::default();
-        let vfork_parent = p.vfork_parent;
-        p.vfork_parent   = 0;
-        p.exe_path       = String::from(path);
-        p.brk_base       = heap_base;
-        p.brk_current    = heap_base;
-        vfork_parent
-    });
-    let vfork_parent = scheduler::with_proc(pid, |p| p.vfork_parent).unwrap_or(0);
+        p.exe_path        = String::from(path);
+        p.brk_base        = heap_base;
+        p.brk_current     = heap_base;
+        let vp = p.vfork_parent;
+        p.vfork_parent    = 0;
+        vp
+    }).unwrap_or(0);
+
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
-    // Patch the saved SyscallFrame so sysret returns to the new image.
-    frame.rip = entry_va;
-    frame.rsp = initial_rsp;
+    frame.rip    = entry_va;
+    frame.rsp    = initial_rsp;
     frame.rflags = 0x202;
 
     Ok(())
 }
 
-// ── read_cstr_array ────────────────────────────────────────────────────────────────
+// ── read_cstr_array ──────────────────────────────────────────────────────────────────
 
 fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     if ptr_array_va == 0 { return Vec::new(); }
@@ -445,21 +446,35 @@ fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     loop {
         if i >= MAX_CSTR_ARRAY { break; }
         let ptr_va = ptr_array_va + i * 8;
+        // FIX: copy_from_user(&mut dst, src_va) — was transposed.
         let mut ptr_buf = [0u8; 8];
-        if copy_from_user(ptr_va, &mut ptr_buf) != 8 { break; }
+        if copy_from_user(&mut ptr_buf, ptr_va).is_err() { break; }
         let ptr = usize::from_ne_bytes(ptr_buf);
         if ptr == 0 { break; }
         let mut buf = alloc::vec![0u8; MAX_CSTR_LEN];
-        let n = copy_from_user(ptr, &mut buf);
-        if n <= 0 { break; }
-        let s = core::str::from_utf8(&buf[..n as usize]).unwrap_or("").trim_end_matches('\0');
+        if copy_from_user(&mut buf, ptr).is_err() { break; }
+        let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let s = match core::str::from_utf8(&buf[..nul]) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
         result.push(String::from(s));
         i += 1;
     }
     result
 }
 
-// ── build_initial_stack ───────────────────────────────────────────────────────────────
+// ── build_initial_stack ─────────────────────────────────────────────────────────────────
+//
+// ELF initial stack layout (low address → high address, stack grows down):
+//
+//   [low]                                     [high = stack_top]
+//   argc | argv[0..n-1] | NULL | envp[0..n-1] | NULL | auxv | padding | strings | random
+//
+// Since we push by decrementing sp, we must push in REVERSE order
+// (push last element first). The NULL sentinel must be pushed AFTER all
+// pointers (which means it lands at a lower address, i.e. after them in
+// the array when read forwards).
 
 fn build_initial_stack(
     stack_top: usize,
@@ -480,8 +495,7 @@ fn build_initial_stack(
             let b: &[u8] = $bytes;
             sp -= b.len();
             sp &= !0xf;
-            let dst = sp as *mut u8;
-            unsafe { ptr::copy_nonoverlapping(b.as_ptr(), dst, b.len()); }
+            unsafe { ptr::copy_nonoverlapping(b.as_ptr(), sp as *mut u8, b.len()); }
         }};
     }
     macro_rules! push_usize {
@@ -490,29 +504,32 @@ fn build_initial_stack(
             unsafe { (sp as *mut usize).write($val); }
         }};
     }
+    macro_rules! push_u8 {
+        ($val:expr) => {{
+            sp -= 1;
+            unsafe { *(sp as *mut u8) = $val; }
+        }};
+    }
 
-    // 1. Write string data (env strings, then arg strings)
+    // 1. Write string data high in the stack (env then arg, each NUL-terminated).
+    //    Collect the user-space VAs of each string as we go.
     let mut env_ptrs: Vec<usize> = Vec::new();
     for e in envp.iter().rev() {
-        let b = e.as_bytes();
-        push_bytes!(b);
-        sp -= 1; // null terminator
-        unsafe { *(sp as *mut u8) = 0; }
-        env_ptrs.push(sp);
+        push_u8!(0);                         // NUL terminator
+        push_bytes!(e.as_bytes());           // string bytes
+        env_ptrs.push(sp);                  // VA of start of string
     }
     env_ptrs.reverse();
 
     let mut arg_ptrs: Vec<usize> = Vec::new();
     for a in argv.iter().rev() {
-        let b = a.as_bytes();
-        push_bytes!(b);
-        sp -= 1;
-        unsafe { *(sp as *mut u8) = 0; }
+        push_u8!(0);
+        push_bytes!(a.as_bytes());
         arg_ptrs.push(sp);
     }
     arg_ptrs.reverse();
 
-    // 2. Random bytes for AT_RANDOM (16 bytes)
+    // 2. 16-byte random seed for AT_RANDOM.
     sp -= 16;
     sp &= !0xf;
     let random_va = sp;
@@ -520,10 +537,10 @@ fn build_initial_stack(
                       0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef];
     unsafe { ptr::copy_nonoverlapping(rand_bytes.as_ptr(), sp as *mut u8, 16); }
 
-    // 3. Align to 16 bytes
+    // 3. Align.
     sp &= !0xf;
 
-    // 4. Auxvec (NULL-terminated)
+    // 4. Auxvec (NULL-terminated), pushed in reverse so AT_NULL lands lowest.
     let phdr_count = phdrs.len();
     let phdr_size  = core::mem::size_of::<elf::Elf64Phdr>();
     let auxv: &[(u64,u64)] = &[
@@ -541,18 +558,20 @@ fn build_initial_stack(
         push_usize!(t as usize);
     }
 
-    // 5. envp NULL, then envp pointers (reversed)
-    push_usize!(0);
+    // 5. envp: NULL sentinel first (lowest address), then pointers in reverse.
+    //    FIX: old code pushed NULL then pointers, placing NULL ABOVE pointers.
+    //    Correct: push pointers (reversed, so they land in order), then NULL.
     for &p in env_ptrs.iter().rev() { push_usize!(p); }
+    push_usize!(0); // NULL terminator at lowest address of envp array
 
-    // 6. argv NULL, then argv pointers (reversed)
-    push_usize!(0);
+    // 6. argv: same fix.
     for &p in arg_ptrs.iter().rev() { push_usize!(p); }
+    push_usize!(0); // NULL terminator at lowest address of argv array
 
     // 7. argc
     push_usize!(argv.len());
 
-    // 8. Final 16-byte alignment
+    // 8. 16-byte alignment for ABI compliance.
     sp &= !0xf;
 
     Ok(sp)
@@ -579,7 +598,7 @@ fn load_interpreter(cr3: usize, path: &str) -> Result<usize, isize> {
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── clear_vmas wrapper (called from fork_syscall) ─────────────────────────────────
+// ── clear_vmas wrapper ────────────────────────────────────────────────────────────────
 
 pub fn clear_vmas(pid_key: u32) {
     mmap::clear_vmas_pub(pid_key as usize);
