@@ -25,6 +25,12 @@
 //!
 //! Linux delivers SIGXCPU only once (at the soft limit) and then SIGKILL at
 //! the hard limit — there is no repeated-per-interval warning like RLIMIT_CPU.
+//!
+//! ## Timer wheel
+//!
+//! Every tick calls `time::tick_advance(TICK_NS)` to advance the monotonic
+//! clock, then `time::timer::expire_timers()` to fire any due callbacks
+//! (nanosleep wakeups, ITIMER_REAL, timerfd, etc.).
 
 use crate::proc::scheduler::TICK_NS;
 use crate::proc::scheduler::SchedPolicy;
@@ -38,6 +44,15 @@ const RLIMIT_RTTIME: usize = 15;
 /// Wired by apic.rs once the APIC is initialised.
 #[no_mangle]
 pub extern "C" fn timer_irq_handler() {
+    // ────────────────────────────────────────────────────────────────
+    // 0. Advance monotonic clock + fire due timer-wheel entries.
+    //    Must happen before rlimit checks so that nanosleep wakeup callbacks
+    //    run at the correct time and transition tasks to Ready before
+    //    schedule() picks them up.
+    // ────────────────────────────────────────────────────────────────
+    crate::time::tick_advance(TICK_NS);
+    crate::time::timer::expire_timers();
+
     let pid = crate::proc::scheduler::current_pid();
 
     if pid != 0 {
@@ -47,16 +62,13 @@ pub extern "C" fn timer_irq_handler() {
         let (soft_cpu, hard_cpu) = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_CPU);
         let (soft_rt,  hard_rt)  = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_RTTIME);
 
-        // Tick charge + snapshot: (cpu_secs, prev_cpu_ns, rt_us, policy, rt_soft_already_fired)
         let (cpu_secs, prev_ns, rt_us, policy) =
             crate::proc::scheduler::with_proc_mut(pid, |p| {
                 let prev = p.cpu_time_ns;
                 p.cpu_time_ns = p.cpu_time_ns.saturating_add(TICK_NS);
 
-                // Charge RT accumulator only for RT tasks.
                 let policy = p.sched.policy;
                 if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
-                    // TICK_NS is in ns; RLIMIT_RTTIME unit is microseconds.
                     p.rt_cpu_time_us = p.rt_cpu_time_us
                         .saturating_add(TICK_NS / 1_000);
                 }
@@ -70,7 +82,7 @@ pub extern "C" fn timer_irq_handler() {
             }).unwrap_or((0, 0, 0, SchedPolicy::Normal));
 
         // ────────────────────────────────────────────────────────────────
-        // 2. RLIMIT_CPU enforcement (unchanged semantics).
+        // 2. RLIMIT_CPU enforcement.
         // ────────────────────────────────────────────────────────────────
         if hard_cpu != crate::proc::rlimit::RLIM_INFINITY && cpu_secs >= hard_cpu {
             crate::proc::signal::send_signal(pid, SIGKILL);
@@ -83,18 +95,11 @@ pub extern "C" fn timer_irq_handler() {
 
         // ────────────────────────────────────────────────────────────────
         // 3. RLIMIT_RTTIME enforcement — only for SCHED_FIFO / SCHED_RR.
-        //
-        // Linux semantics:
-        //   • rt_cpu_time_us >= hard  → SIGKILL (takes priority, checked first)
-        //   • rt_cpu_time_us >= soft  → SIGXCPU once; after that only SIGKILL
-        //     at hard.  We detect "first crossing" by checking whether the
-        //     value one tick ago was still below soft.
         // ────────────────────────────────────────────────────────────────
         if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
             if hard_rt != crate::proc::rlimit::RLIM_INFINITY && rt_us >= hard_rt {
                 crate::proc::signal::send_signal(pid, SIGKILL);
             } else if soft_rt != crate::proc::rlimit::RLIM_INFINITY && rt_us >= soft_rt {
-                // Deliver SIGXCPU only on the tick that first crosses soft.
                 let prev_rt_us = rt_us.saturating_sub(TICK_NS / 1_000);
                 if prev_rt_us < soft_rt {
                     crate::proc::signal::send_signal(pid, SIGXCPU);
