@@ -91,70 +91,307 @@ fn sys_sched_yield_impl() -> isize {
 }
 
 // ── NR 25  mremap ──────────────────────────────────────────────────────────────
+//
+// Linux mremap semantics:
+//
+//   mremap(old_addr, old_size, new_size, flags[, new_addr])
+//
+//   flags:
+//     MREMAP_MAYMOVE  (1) — allowed to relocate when in-place grow fails
+//     MREMAP_FIXED    (2) — new_addr must be used (implies MAYMOVE)
+//     MREMAP_DONTUNMAP(4) — keep old mapping after move (not implemented → EINVAL)
+//
+// Strategy
+// ────────
+// 1. Validate alignment and sizes.
+// 2. Shrink:       unmap tail pages + shrink VMA.  Always succeeds.
+// 3. Same size:    no-op.
+// 4. Grow in-place:
+//    a. Check that [old_end, old_end+delta) is free.
+//    b. Allocate PMM pages there, map them, extend VMA.
+//    c. On OOM fall through to move if MAYMOVE, else -ENOMEM.
+// 5. Move (MREMAP_MAYMOVE or MREMAP_FIXED):
+//    a. Pick destination (hint if FIXED, else bump next_va).
+//    b. Re-point each present PTE: map at dst_va, unmap at src_va
+//       (the physical frame is NOT freed — we just reuse it at the new VA).
+//    c. Zero-fill the extension pages with fresh PMM frames.
+//    d. Replace the VMA record.
+//
+// MREMAP_DONTUNMAP is not implemented (rare; added in Linux 5.7).
 
-fn sys_mremap_impl(old_addr: usize, old_size: usize, new_size: usize,
-                   _flags: usize, _new_addr: usize) -> isize {
+const MREMAP_MAYMOVE:   usize = 1;
+const MREMAP_FIXED:     usize = 2;
+const MREMAP_DONTUNMAP: usize = 4;
+
+fn sys_mremap_impl(
+    old_addr: usize,
+    old_size: usize,
+    new_size: usize,
+    flags:    usize,
+    new_addr: usize,
+) -> isize {
     const PAGE: usize = 4096;
-    if old_addr & (PAGE - 1) != 0 { return -22; }
-    let old_pages = (old_size + PAGE - 1) / PAGE;
-    let new_pages = (new_size + PAGE - 1) / PAGE;
-    let pid = crate::proc::scheduler::current_pid();
 
-    if new_pages <= old_pages {
-        let unmap_start = old_addr + new_pages * PAGE;
-        let unmap_len   = (old_pages - new_pages) * PAGE;
-        if unmap_len > 0 { crate::mm::mmap::sys_munmap(unmap_start, unmap_len); }
+    if old_addr & (PAGE - 1) != 0 { return -22; }
+    if new_size == 0               { return -22; }
+    if flags & MREMAP_DONTUNMAP != 0 { return -22; }
+    if flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0 { return -22; }
+
+    let old_len = (old_size + PAGE - 1) & !(PAGE - 1);
+    let new_len = (new_size + PAGE - 1) & !(PAGE - 1);
+    let pid     = crate::proc::scheduler::current_pid();
+    let cr3     = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
+    if cr3 == 0 { return -12; }
+
+    // Source VMA must cover the entire old range.
+    let vma = match crate::mm::mmap::find_vma(pid, old_addr) {
+        Some(v) if v.start <= old_addr && v.end >= old_addr + old_len => v,
+        _ => return -22,
+    };
+    let is_phys = matches!(vma.kind, crate::mm::mmap::VmaKind::PhysMap(_));
+
+    // ── Shrink ──────────────────────────────────────────────────────────
+    if new_len < old_len {
+        let tail_start = old_addr + new_len;
+        let tail_len   = old_len  - new_len;
+        for va in (tail_start..tail_start + tail_len).step_by(PAGE) {
+            if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, va) {
+                <Arch as Paging>::unmap_page(va);
+                <Arch as Paging>::flush_va(va);
+                if !is_phys { crate::mm::pmm::free_page(pa); }
+            }
+        }
+        crate::mm::mmap::remove_vma(pid, old_addr, old_len);
+        crate::mm::mmap::insert_vma(pid, crate::mm::mmap::Vma {
+            start: vma.start, end: old_addr + new_len,
+            prot: vma.prot, flags: vma.flags,
+            kind: vma.kind, file_offset: vma.file_offset,
+        });
         return old_addr as isize;
     }
 
-    let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
-    if cr3 == 0 { return -12; }
+    // ── Same size ────────────────────────────────────────────────────────
+    if new_len == old_len { return old_addr as isize; }
 
-    let extend_start = old_addr + old_pages * PAGE;
-    let extend_len   = (new_pages - old_pages) * PAGE;
-    for va in (extend_start..extend_start + extend_len).step_by(PAGE) {
+    // ── Grow ─────────────────────────────────────────────────────────────
+    let delta   = new_len - old_len;
+    let old_end = old_addr + old_len;
+
+    // If MREMAP_FIXED, skip in-place attempt and go straight to move.
+    if flags & MREMAP_FIXED == 0 {
+        // Check that [old_end, old_end+delta) is completely free.
+        let range_free = crate::proc::scheduler::with_proc(pid, |p| {
+            !p.vmas.iter().any(|v| v.start < old_end + delta && v.end > old_end)
+        }).unwrap_or(false);
+
+        if range_free {
+            let pte_flags = prot_to_flags_mremap(vma.prot);
+            let mut mapped = 0usize;
+            let mut oom = false;
+            for va in (old_end..old_end + delta).step_by(PAGE) {
+                match crate::mm::pmm::alloc_page() {
+                    Some(pa) => {
+                        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+                        <Arch as Paging>::map_page(cr3, va, pa, pte_flags);
+                        <Arch as Paging>::flush_va(va);
+                        mapped += 1;
+                    }
+                    None => { oom = true; break; }
+                }
+            }
+            if !oom {
+                crate::mm::mmap::remove_vma(pid, old_addr, old_len);
+                crate::mm::mmap::insert_vma(pid, crate::mm::mmap::Vma {
+                    start: vma.start, end: old_addr + new_len,
+                    prot: vma.prot, flags: vma.flags,
+                    kind: vma.kind, file_offset: vma.file_offset,
+                });
+                return old_addr as isize;
+            }
+            // OOM rollback of partial in-place extension.
+            for j in 0..mapped {
+                let rva = old_end + j * PAGE;
+                if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, rva) {
+                    <Arch as Paging>::unmap_page(rva);
+                    <Arch as Paging>::flush_va(rva);
+                    crate::mm::pmm::free_page(pa);
+                }
+            }
+            // Fall through to move if MAYMOVE.
+        }
+    }
+
+    // ── Move ─────────────────────────────────────────────────────────────
+    if flags & MREMAP_MAYMOVE != 0 || flags & MREMAP_FIXED != 0 {
+        return mremap_move(pid, cr3, old_addr, old_len, new_len, flags, new_addr, &vma);
+    }
+    -12 // ENOMEM: can't grow and MAYMOVE not permitted
+}
+
+/// Copy the mapping from `old_addr..old_addr+old_len` to a new location and
+/// extend to `new_len` bytes (zero-filling the extension with PMM pages).
+fn mremap_move(
+    pid:      usize,
+    cr3:      usize,
+    old_addr: usize,
+    old_len:  usize,
+    new_len:  usize,
+    flags:    usize,
+    hint:     usize,
+    vma:      &crate::mm::mmap::Vma,
+) -> isize {
+    const PAGE: usize = 4096;
+    let is_phys = matches!(vma.kind, crate::mm::mmap::VmaKind::PhysMap(_));
+
+    // Choose the destination VA.
+    let dst = if flags & MREMAP_FIXED != 0 {
+        if hint == 0 || hint & (PAGE - 1) != 0 { return -22; }
+        // Remove any existing mapping at the destination.
+        crate::mm::mmap::sys_munmap(hint, new_len);
+        hint
+    } else {
+        crate::proc::scheduler::with_proc_mut(pid, |p| {
+            let v = p.next_va;
+            p.next_va = (v + new_len + PAGE * 2 + PAGE - 1) & !(PAGE - 1);
+            v
+        }).unwrap_or(0)
+    };
+    if dst == 0 { return -12; }
+    if dst == old_addr { return old_addr as isize; }
+
+    let pte_flags = prot_to_flags_mremap(vma.prot);
+
+    // Re-point existing PTEs (physical frames are reused, not copied).
+    for i in 0..(old_len / PAGE) {
+        let src_va = old_addr + i * PAGE;
+        let dst_va = dst      + i * PAGE;
+        if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, src_va) {
+            <Arch as Paging>::map_page(cr3, dst_va, pa, pte_flags);
+            <Arch as Paging>::flush_va(dst_va);
+            // Invalidate old PTE without freeing the frame.
+            <Arch as Paging>::unmap_page(src_va);
+            <Arch as Paging>::flush_va(src_va);
+        }
+    }
+
+    // Zero-fill extension pages.
+    for i in (old_len / PAGE)..(new_len / PAGE) {
+        let dst_va = dst + i * PAGE;
         match crate::mm::pmm::alloc_page() {
             Some(pa) => {
                 unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
-                <Arch as Paging>::map_page(
-                    cr3, va, pa,
-                    PageFlags::PRESENT | PageFlags::WRITE
-                    | PageFlags::USER  | PageFlags::NX,
-                );
+                <Arch as Paging>::map_page(cr3, dst_va, pa, pte_flags);
+                <Arch as Paging>::flush_va(dst_va);
             }
-            None => return -12,
+            None => return -12, // ENOMEM (partial mapping left; POSIX-undefined)
         }
     }
-    crate::mm::mmap::remove_vma(pid, old_addr, old_size);
+
+    // Replace VMA record.
+    crate::mm::mmap::remove_vma(pid, old_addr, old_len);
     crate::mm::mmap::insert_vma(pid, crate::mm::mmap::Vma {
-        start: old_addr,
-        end:   old_addr + new_pages * PAGE,
-        prot:  crate::mm::mmap::PROT_READ | crate::mm::mmap::PROT_WRITE,
-        flags: 0x22,
-        kind:  crate::mm::mmap::VmaKind::Anonymous,
-        file_offset: 0,
+        start: dst, end: dst + new_len,
+        prot: vma.prot, flags: vma.flags,
+        kind: vma.kind.clone(), file_offset: vma.file_offset,
     });
-    old_addr as isize
+
+    dst as isize
+}
+
+/// Prot-to-PageFlags translation matching mmap.rs::prot_to_flags.
+/// Duplicated here so stubs.rs has no cross-module import cycle.
+#[inline]
+fn prot_to_flags_mremap(prot: u32) -> PageFlags {
+    let mut f = PageFlags::PRESENT | PageFlags::USER;
+    if prot & crate::mm::mmap::PROT_WRITE != 0 { f |= PageFlags::WRITE; }
+    if prot & crate::mm::mmap::PROT_EXEC  == 0 { f |= PageFlags::NX; }
+    f
 }
 
 // ── NR 28  madvise ─────────────────────────────────────────────────────────────
+//
+// Linux madvise semantics for the advices we implement:
+//
+//   MADV_NORMAL      (0) — no-op: reset to default readahead behaviour
+//   MADV_DONTNEED    (4) — free the physical pages and mark the VMA
+//                          demand-pageable; subsequent reads return zeroes
+//   MADV_FREE       (8)  — lazily free pages (we treat as DONTNEED)
+//   MADV_WILLNEED   (3)  — prefetch (no-op; we have no readahead)
+//   MADV_SEQUENTIAL (2)  — no-op
+//   MADV_RANDOM     (1)  — no-op
+//   MADV_DONTFORK  (10)  — no-op (CoW fork handles this adequately)
+//   MADV_DOFORK    (11)  — no-op
+//   MADV_DONTDUMP  (16)  — no-op
+//   MADV_DODUMP    (17)  — no-op
+//   MADV_MERGEABLE  (12) — no-op (no KSM)
+//   MADV_HUGEPAGE   (14) — no-op (no THP yet)
+//   MADV_NOHUGEPAGE (15) — no-op
+//   Anything else        — return -EINVAL
+//
+// The critical difference from the old stub: MADV_DONTNEED now actually
+// releases physical frames and unmaps the PTEs so subsequent accesses fault
+// back through the demand-paging handler and see zeroes.  The old code
+// merely zero-filled the pages in place, which wasted memory and could
+// cause glibc malloc to misuse "freed" heap memory.
 
 fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
-    const MADV_DONTNEED: i32 = 4;
     const PAGE: usize = 4096;
-    if advice == MADV_DONTNEED {
-        let pid = crate::proc::scheduler::current_pid();
-        let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
-        if cr3 == 0 { return 0; }
-        let aligned = addr & !(PAGE - 1);
-        let end     = (addr + length + PAGE - 1) & !(PAGE - 1);
-        for va in (aligned..end).step_by(PAGE) {
-            if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, va) {
-                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+
+    // Align addr down, end up (Linux rounds inward for addr, outward for end).
+    let aligned_addr = addr & !(PAGE - 1);
+    let end          = (addr + length + PAGE - 1) & !(PAGE - 1);
+    if aligned_addr >= end && length != 0 { return -22; }
+
+    match advice {
+        // No-op advices — accepted silently.
+        0  | // MADV_NORMAL
+        1  | // MADV_RANDOM
+        2  | // MADV_SEQUENTIAL
+        3  | // MADV_WILLNEED
+        10 | // MADV_DONTFORK
+        11 | // MADV_DOFORK
+        12 | // MADV_MERGEABLE
+        13 | // MADV_UNMERGEABLE
+        14 | // MADV_HUGEPAGE
+        15 | // MADV_NOHUGEPAGE
+        16 | // MADV_DONTDUMP
+        17   // MADV_DODUMP
+        => return 0,
+
+        4 | // MADV_DONTNEED
+        8   // MADV_FREE — lazily free; we treat as DONTNEED for simplicity
+        => {
+            let pid = crate::proc::scheduler::current_pid();
+            let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp)
+                .unwrap_or(0);
+            if cr3 == 0 { return 0; }
+
+            // Only free pages that belong to PMM-owned VMAs.  PhysMap
+            // VMAs (MMIO/framebuffer) must never have their pages freed.
+            let is_phys_range = |va: usize| -> bool {
+                matches!(
+                    crate::mm::mmap::find_vma(pid, va),
+                    Some(v) if matches!(v.kind, crate::mm::mmap::VmaKind::PhysMap(_))
+                )
+            };
+
+            for va in (aligned_addr..end).step_by(PAGE) {
+                if is_phys_range(va) { continue; }
+                if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, va) {
+                    // Unmap the PTE — the next access will demand-fault
+                    // through page_fault::handle_demand_fault and return
+                    // a fresh zero page (Anonymous/Heap/Stack) or re-read
+                    // the file page (FileBacked).
+                    <Arch as Paging>::unmap_page(va);
+                    <Arch as Paging>::flush_va(va);
+                    crate::mm::pmm::free_page(pa);
+                }
             }
+            0
         }
+
+        _ => -22, // EINVAL
     }
-    0
 }
 
 // ── NR 40  sendfile ─────────────────────────────────────────────────────────────
@@ -382,14 +619,6 @@ fn sys_prlimit64_impl(pid: usize, resource: u32, new_va: usize, old_va: usize) -
 }
 
 // ── NR 98  getrusage ────────────────────────────────────────────────────────────
-//
-// struct rusage layout (Linux x86-64, 144 bytes):
-//   [0..16]   ru_utime  (timeval: sec i64, usec i64)
-//   [16..32]  ru_stime  (timeval: sec i64, usec i64)  — we report 0
-//   [32..144] remaining fields                        — zeroed
-//
-// We populate ru_utime from the current process's cpu_time_ns counter.
-// RUSAGE_CHILDREN (-1) and RUSAGE_THREAD (1) return all-zeroes for now.
 
 fn sys_getrusage_impl(who: i32, buf_va: usize) -> isize {
     let mut kbuf = [0u8; 144];
@@ -430,7 +659,6 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
     let total    = crate::mm::pmm::total_pages() as u64 * 4096;
     let free     = crate::mm::pmm::free_pages()  as u64 * 4096;
     let uptime_s = (crate::time::monotonic_ns() / 1_000_000_000) as i64;
-    // Live process count instead of hard-coded 1.
     let nprocs   = crate::proc::scheduler::proc_count().min(u16::MAX as usize) as u16;
     let info = SysInfo {
         uptime: uptime_s, loads: [0; 3],
@@ -450,19 +678,10 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
 }
 
 // ── NR 100  times ─────────────────────────────────────────────────────────────
-//
-// struct tms layout (Linux x86-64, 32 bytes):
-//   tms_utime  i64  — user CPU time of this process in clock ticks
-//   tms_stime  i64  — kernel CPU time (we report 0; no kernel-time tracking yet)
-//   tms_cutime i64  — waited-for children user time (0)
-//   tms_cstime i64  — waited-for children kernel time (0)
-//
-// Returns: elapsed real time in clock ticks since boot, or -errno.
-// CLOCKS_PER_SEC = 100 (Linux HZ=100 convention used by musl's times(3)).
 
 fn sys_times_impl(buf_va: usize) -> isize {
     const CLOCKS_PER_SEC: u64 = 100;
-    const NS_PER_TICK:    u64 = 1_000_000_000 / CLOCKS_PER_SEC; // 10_000_000
+    const NS_PER_TICK:    u64 = 1_000_000_000 / CLOCKS_PER_SEC;
 
     let now_ns   = crate::time::monotonic_ns();
     let elapsed  = (now_ns / NS_PER_TICK) as i64;
@@ -475,7 +694,6 @@ fn sys_times_impl(buf_va: usize) -> isize {
 
         let mut kbuf = [0u8; 32];
         kbuf[0..8].copy_from_slice(&utime.to_le_bytes());
-        // stime, cutime, cstime all zero
         if copy_to_user(buf_va, &kbuf).is_err() { return -14; }
     }
     elapsed
