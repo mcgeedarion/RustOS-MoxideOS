@@ -1,21 +1,22 @@
 //! Architecture-independent kernel entry points and init-process launcher.
 //!
 //! Two entry points exist, selected at compile time by target architecture:
-//!   - `kernel_main_x86_64` — called from the x86_64 UEFI or multiboot2 stub
-//!   - `kernel_main_riscv64` — called from the RISC-V SBI / UEFI stub
+//!   - `kernel_main` (x86_64)   — called from the x86_64 UEFI or multiboot2 stub
+//!   - `kernel_main_riscv64`    — called from the RISC-V SBI stub (boot.rs)
 //!
-//! Both paths:
-//!   1. Initialise the physical memory manager (PMM).
-//!   2. Set up the heap allocator.
-//!   3. Initialise the interrupt/exception layer (IDT / PLIC).
-//!   4. Start the APIC / CLINT timer.
-//!   5. Load `/init` from the embedded initramfs and jump to userspace.
+//! RISC-V boot sequence:
+//!   1. trap_init()      — install stvec, enable SIE (must be first)
+//!   2. init_from_fdt()  — parse FDT /memory nodes → PMM free list
+//!   3. heap::init()     — slab/linked-list allocator over PMM
+//!   4. clint::init()    — timer setup
+//!   5. Load /init from initramfs → userspace
 
 #![allow(unused_imports)]
 
 use crate::initramfs;
 
 // ── x86_64 entry ──────────────────────────────────────────────────────────────
+// (unchanged — the real x86_64 path lives in src/arch/x86_64/kernel_main.rs)
 
 #[cfg(target_arch = "x86_64")]
 pub fn kernel_main_x86_64() {
@@ -70,14 +71,9 @@ pub fn kernel_main_x86_64() {
     };
 
     let sp = auxv::build_stack(
-        stack_buf,
-        stack_top,
-        &["/init"],
-        &[],
-        loaded.entry,
-        loaded.phdr_va,
-        loaded.phdr_count,
-        loaded.phdr_size,
+        stack_buf, stack_top,
+        &["/init"], &[],
+        loaded.entry, loaded.phdr_va, loaded.phdr_count, loaded.phdr_size,
     );
 
     crate::println!("rustos: jumping to /init entry={:#x} sp={:#x}", loaded.entry, sp);
@@ -86,21 +82,38 @@ pub fn kernel_main_x86_64() {
 
 // ── RISC-V entry ───────────────────────────────────────────────────────────────
 
+/// Called by `_start` in `arch/riscv64/boot.rs` with:
+///   `hart_id`  = value of a0 from OpenSBI
+///   `fdt_ptr`  = value of a1 from OpenSBI (physical address of FDT blob)
 #[cfg(target_arch = "riscv64")]
-pub fn kernel_main_riscv64() {
-    use crate::arch::riscv64::{paging, uentry};
+pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
+    use crate::arch::riscv64::{paging, trap, uentry};
     use crate::loader::{elf64, auxv};
     use crate::mm::{heap, pmm};
     use crate::drivers::clint;
 
-    crate::println!("rustos: riscv64 kernel starting");
+    // 1. Trap vector MUST be first — any fault before this is unrecoverable.
+    trap::trap_init();
 
-    pmm::init();
+    crate::println!("rustos: riscv64 kernel starting (hart {})", hart_id);
+
+    // 2. Register real RAM from the FDT so the PMM free list is populated.
+    pmm::init_from_fdt(fdt_ptr);
+    crate::println!(
+        "pmm: {} MiB total, {} MiB free",
+        pmm::total_pages() * 4 / 1024,
+        pmm::free_pages()  * 4 / 1024,
+    );
+
+    // 3. Heap over the real PMM.
     heap::init();
+
+    // 4. Timer.
     clint::init();
 
-    crate::println!("rustos: subsystems initialised");
+    crate::println!("rustos: riscv64 subsystems initialised");
 
+    // 5. Load /init and jump to userspace.
     let initramfs = initramfs::load();
     let elf_bytes = match initramfs.file("/init") {
         Some(b) => b,
@@ -137,14 +150,9 @@ pub fn kernel_main_riscv64() {
     };
 
     let sp = auxv::build_stack(
-        stack_buf,
-        stack_top,
-        &["/init"],
-        &[],
-        loaded.entry,
-        loaded.phdr_va,
-        loaded.phdr_count,
-        loaded.phdr_size,
+        stack_buf, stack_top,
+        &["/init"], &[],
+        loaded.entry, loaded.phdr_va, loaded.phdr_count, loaded.phdr_size,
     );
 
     crate::println!("rustos: jumping to /init entry={:#x} sp={:#x}", loaded.entry, sp);
