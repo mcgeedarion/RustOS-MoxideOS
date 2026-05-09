@@ -10,11 +10,29 @@
 //!   - `sched_yield(2)`         [NR 24]
 //!   - `sched_get_priority_max` [NR 146]
 //!   - `sched_get_priority_min` [NR 147]
+//!   - `setpriority(2)`         [NR 141]
+//!   - `getpriority(2)`         [NR 140]
 //!
 //! The `sched_attr` struct used by `sched_setattr(2)` / `sched_getattr(2)`
 //! (NR 314/315) shares the same kernel path and is handled at the bottom.
+//!
+//! ## RLIMIT_NICE and RLIMIT_RTPRIO enforcement
+//!
+//! `RLIMIT_NICE` limits how far an unprivileged process can **lower** its
+//! nice value (i.e. raise its priority).  The formula mirrors Linux:
+//!
+//!     min_nice = 20 - rlimit_nice_soft
+//!
+//! So `RLIMIT_NICE = 0` → only nice >= 20 (lowest priority).
+//!    `RLIMIT_NICE = 40` → full range (-20..19).
+//!
+//! CAP_SYS_NICE bypasses the limit entirely.
+//!
+//! `RLIMIT_RTPRIO` is the maximum RT priority an unprivileged process may
+//! request.  Priority 0 means no RT scheduling is allowed.
 
 use crate::proc::scheduler::{SchedPolicy, SchedEntity, CPUMASK_ALL};
+use crate::proc::rlimit::{RLIMIT_NICE, RLIMIT_RTPRIO, RLIM_INFINITY};
 use crate::uaccess::{copy_from_user, copy_to_user};
 
 // ── Linux ABI structs ─────────────────────────────────────────────────────────
@@ -30,34 +48,55 @@ pub struct SchedParam {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SchedAttr {
-    /// Size of this struct (for forward compat).
     pub size: u32,
-    /// Scheduling policy (`SCHED_*` constant).
     pub sched_policy: u32,
-    /// Scheduling flags (currently unused).
     pub sched_flags: u64,
-    /// For SCHED_NORMAL/BATCH: nice value (-20..19).
     pub sched_nice: i32,
-    /// For SCHED_FIFO/RR: static priority (1..99).
     pub sched_priority: u32,
-    /// For SCHED_DEADLINE: runtime (ns).
     pub sched_runtime: u64,
-    /// For SCHED_DEADLINE: deadline (ns).
     pub sched_deadline: u64,
-    /// For SCHED_DEADLINE: period (ns).
     pub sched_period: u64,
+}
+
+// ── RLIMIT helpers ────────────────────────────────────────────────────────────
+
+/// Returns the minimum nice value the calling process is allowed to set,
+/// honouring `RLIMIT_NICE`.  Processes with `CAP_SYS_NICE` are unrestricted.
+fn nice_floor(pid: usize) -> i8 {
+    use crate::proc::scheduler::with_proc;
+    let (soft, _) = crate::proc::scheduler::with_proc(pid, |p| p.rlimits.get(RLIMIT_NICE))
+        .unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
+    let privileged = with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice))
+        .unwrap_or(false);
+    if privileged { return -20; }
+    if soft == RLIM_INFINITY { return -20; }
+    // Linux formula: min_nice = 20 - rlim_cur  (clamped to [-20, 19])
+    let floor = 20i64 - soft as i64;
+    floor.clamp(-20, 19) as i8
+}
+
+/// Returns the maximum RT priority the calling process is allowed to request.
+/// 0 means no RT policy is permitted.  `CAP_SYS_NICE` is unrestricted (99).
+fn rt_prio_ceiling(pid: usize) -> u8 {
+    use crate::proc::scheduler::with_proc;
+    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_RTPRIO))
+        .unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
+    let privileged = with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice))
+        .unwrap_or(false);
+    if privileged { return 99; }
+    if soft == RLIM_INFINITY { return 99; }
+    soft.min(99) as u8
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Returns -ESRCH if pid not found, -EPERM if caller lacks CAP_SYS_NICE for RT.
+/// Returns -ESRCH if pid not found, -EPERM if the change violates a limit.
 fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     let policy = match SchedPolicy::from_u32(attr.sched_policy) {
         Some(p) => p,
         None    => return -22, // EINVAL
     };
 
-    // Deadline parameter sanity: runtime <= deadline <= period, all > 0.
     if policy == SchedPolicy::Deadline {
         if attr.sched_runtime == 0
             || attr.sched_deadline == 0
@@ -65,27 +104,41 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
             || attr.sched_runtime > attr.sched_deadline
             || attr.sched_deadline > attr.sched_period
         {
-            return -22; // EINVAL
+            return -22;
+        }
+    }
+
+    // ── RLIMIT_RTPRIO: reject unprivileged RT elevation ───────────────────────
+    if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
+        let ceiling = rt_prio_ceiling(pid);
+        if ceiling == 0 {
+            return -13; // EPERM — RT scheduling not allowed at all
+        }
+        if attr.sched_priority as u8 > ceiling {
+            return -13; // EPERM — requested priority exceeds RLIMIT_RTPRIO
         }
     }
 
     let now_ns = crate::time::monotonic_ns();
 
     crate::proc::scheduler::with_proc_mut(pid, |pcb| {
-        let was_rt = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
+        let was_rt    = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
         let becomes_rt = matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr);
 
         match policy {
             SchedPolicy::Normal => {
-                let nice = attr.sched_nice.clamp(-20, 19) as i8;
+                // ── RLIMIT_NICE: clamp nice to the permitted floor ─────────────
+                let floor = nice_floor(pid);
+                let nice  = attr.sched_nice.clamp(floor as i32, 19) as i8;
                 pcb.sched.nice   = nice;
                 pcb.sched.weight = crate::proc::scheduler::nice_to_weight_pub(nice);
                 pcb.sched.policy = SchedPolicy::Normal;
                 pcb.sched.rt_priority = 0;
             }
             SchedPolicy::Fifo | SchedPolicy::Rr => {
-                let prio = attr.sched_priority.clamp(1, 99) as u8;
-                pcb.sched.rt_priority = prio;
+                let ceiling = rt_prio_ceiling(pid);
+                let prio    = (attr.sched_priority as u8).min(ceiling);
+                pcb.sched.rt_priority = prio.max(1); // enforce minimum 1 for RT
                 pcb.sched.policy = policy;
             }
             SchedPolicy::Deadline => {
@@ -98,24 +151,11 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
             }
         }
 
-        // Reset the RLIMIT_RTTIME accumulator whenever the task enters or
-        // leaves an RT policy.  Rationale:
-        //
-        //   • Entering RT (any → Fifo/Rr): the old counter may be stale from a
-        //     previous RT stint.  Starting from zero prevents a task from
-        //     inheriting a near-exhausted budget the instant it becomes RT again.
-        //
-        //   • Leaving RT (Fifo/Rr → Normal/Deadline): the field is only charged
-        //     and checked under Fifo/Rr; zeroing it here keeps getrusage output
-        //     clean and avoids phantom budget if the task ever returns to RT.
-        //
-        // This mirrors Linux's behaviour: do_sched_setscheduler() calls
-        // rt_watchdog_disable() / sched_rt_avg_update() which implicitly clears
-        // the per-task RT scheduling statistics on class change.
+        // Reset the RLIMIT_RTTIME accumulator on any RT policy change.
         if was_rt || becomes_rt {
             pcb.rt_cpu_time_us = 0;
         }
-    }).map(|_| 0isize).unwrap_or(-3) // -ESRCH if not found
+    }).map(|_| 0isize).unwrap_or(-3)
 }
 
 // ── sched_setscheduler ────────────────────────────────────────────────────────
@@ -124,14 +164,13 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
 pub fn sys_sched_setscheduler(pid: usize, policy: u32, param_uptr: usize) -> isize {
     let mut param = SchedParam::default();
     if copy_from_user(param_uptr as *const SchedParam, &mut param).is_err() {
-        return -14; // EFAULT
+        return -14;
     }
     let attr = SchedAttr {
         size: core::mem::size_of::<SchedAttr>() as u32,
         sched_policy: policy,
         sched_priority: param.sched_priority.clamp(0, 99) as u32,
         sched_nice: 0,
-        // Deadline fields left zero — invalid for SCHED_DEADLINE via this path.
         ..SchedAttr::default()
     };
     apply_sched_attr(pid, &attr)
@@ -142,7 +181,7 @@ pub fn sys_sched_setscheduler(pid: usize, policy: u32, param_uptr: usize) -> isi
 /// `sys_sched_getscheduler(pid)` [NR 145]
 pub fn sys_sched_getscheduler(pid: usize) -> isize {
     crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.policy as i32 as isize)
-        .unwrap_or(-3) // -ESRCH
+        .unwrap_or(-3)
 }
 
 // ── sched_setparam / sched_getparam ──────────────────────────────────────────
@@ -155,10 +194,11 @@ pub fn sys_sched_setparam(pid: usize, param_uptr: usize) -> isize {
     }
     crate::proc::scheduler::with_proc_mut(pid, |pcb| {
         if pcb.sched.policy == SchedPolicy::Normal {
-            // For SCHED_NORMAL the "priority" in sched_param is always 0;
-            // use nice stored elsewhere.  No-op.
+            // No-op for CFS tasks.
         } else {
-            pcb.sched.rt_priority = param.sched_priority.clamp(1, 99) as u8;
+            let ceiling = rt_prio_ceiling(pid);
+            let prio    = (param.sched_priority.clamp(1, 99) as u8).min(ceiling);
+            pcb.sched.rt_priority = prio;
         }
     }).map(|_| 0isize).unwrap_or(-3)
 }
@@ -166,7 +206,7 @@ pub fn sys_sched_setparam(pid: usize, param_uptr: usize) -> isize {
 /// `sys_sched_getparam(pid, param_uptr)` [NR 143]
 pub fn sys_sched_getparam(pid: usize, param_uptr: usize) -> isize {
     let prio = crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.rt_priority as i32)
-        .unwrap_or_else(|| return -3i32);
+        .unwrap_or_else(|| -3i32);
     if prio < 0 { return prio as isize; }
     let param = SchedParam { sched_priority: prio };
     if copy_to_user(param_uptr as *mut SchedParam, &param).is_err() {
@@ -175,34 +215,54 @@ pub fn sys_sched_getparam(pid: usize, param_uptr: usize) -> isize {
     0
 }
 
+// ── setpriority / getpriority ─────────────────────────────────────────────────
+
+/// `sys_setpriority(which, who, prio)` [NR 141]
+///
+/// `which`: 0=PRIO_PROCESS, 1=PRIO_PGRP, 2=PRIO_USER.
+/// `prio` is the **userspace nice value** — already in the conventional
+/// -20..19 range (the kernel's internal range is the same).
+pub fn sys_setpriority(which: i32, who: usize, prio: i32) -> isize {
+    if which != 0 { return -38; } // ENOSYS for PGRP/USER for now
+    let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
+    let floor = nice_floor(pid);
+    let clamped = prio.clamp(floor as i32, 19) as i8;
+    crate::proc::scheduler::with_proc_mut(pid, |p| {
+        p.sched.nice   = clamped;
+        p.sched.weight = crate::proc::scheduler::nice_to_weight_pub(clamped);
+    }).map(|_| 0isize).unwrap_or(-3)
+}
+
+/// `sys_getpriority(which, who)` [NR 140]
+///
+/// Returns `20 - nice` (the kernel convention: higher return value = higher
+/// priority) so the libc wrapper can negate and subtract 20 to get the
+/// conventional nice value.
+pub fn sys_getpriority(which: i32, who: usize) -> isize {
+    if which != 0 { return -38; }
+    let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
+    crate::proc::scheduler::with_proc(pid, |p| (20 - p.sched.nice as i32) as isize)
+        .unwrap_or(-3)
+}
+
 // ── sched_setaffinity ─────────────────────────────────────────────────────────
 
 /// `sys_sched_setaffinity(pid, cpusetsize, mask_uptr)` [NR 203]
-///
-/// Reads up to 8 bytes (64 CPUs) from userspace into the task's `cpumask`.
-/// The mask must not be zero (EINVAL) and must not refer to CPUs that don't
-/// exist on this machine (EINVAL).
 pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
-    if mask_uptr == 0 || cpusetsize == 0 { return -22; } // EINVAL
-
-    // Read up to 8 bytes of the cpu_set_t.
+    if mask_uptr == 0 || cpusetsize == 0 { return -22; }
     let bytes = cpusetsize.min(8);
     let mut raw = [0u8; 8];
-    // copy_from_user bytes into raw[..bytes]
     for i in 0..bytes {
         if copy_from_user((mask_uptr + i) as *const u8, &mut raw[i]).is_err() {
-            return -14; // EFAULT
+            return -14;
         }
     }
     let mask = u64::from_le_bytes(raw);
-    if mask == 0 { return -22; } // EINVAL — must allow at least one CPU
-
-    // Restrict to actually online CPUs.
+    if mask == 0 { return -22; }
     let ncpus = crate::smp::num_online_cpus();
     let online_mask: u64 = if ncpus >= 64 { u64::MAX } else { (1u64 << ncpus) - 1 };
     let effective = mask & online_mask;
     if effective == 0 { return -22; }
-
     crate::proc::scheduler::with_proc_mut(pid, |pcb| {
         pcb.sched.cpumask = effective;
     }).map(|_| 0isize).unwrap_or(-3)
@@ -220,7 +280,6 @@ pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
             return -14;
         }
     }
-    // Zero any remaining bytes in the user buffer.
     let zero: u8 = 0;
     for i in bytes_to_write..cpusetsize {
         let _ = copy_to_user((mask_uptr + i) as *mut u8, &zero);
@@ -231,7 +290,6 @@ pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
 // ── sched_yield ───────────────────────────────────────────────────────────────
 
 /// `sys_sched_yield()` [NR 24]
-/// Re-enqueues the current task at the back of its class queue and reschedules.
 pub fn sys_sched_yield() -> isize {
     crate::proc::scheduler::schedule();
     0
@@ -242,9 +300,9 @@ pub fn sys_sched_yield() -> isize {
 /// `sys_sched_get_priority_max(policy)` [NR 146]
 pub fn sys_sched_get_priority_max(policy: u32) -> isize {
     match policy {
-        1 | 2 => 99,   // SCHED_FIFO / SCHED_RR
-        6     => 0,    // SCHED_DEADLINE (no static priority)
-        _     => 0,    // SCHED_NORMAL
+        1 | 2 => 99,
+        6     => 0,
+        _     => 0,
     }
 }
 
@@ -259,7 +317,6 @@ pub fn sys_sched_get_priority_min(policy: u32) -> isize {
 // ── sched_setattr / sched_getattr (NR 314 / 315) ─────────────────────────────
 
 /// `sys_sched_setattr(pid, attr_uptr, flags)` [NR 314]
-/// Full-featured replacement for sched_setscheduler; supports SCHED_DEADLINE.
 pub fn sys_sched_setattr(pid: usize, attr_uptr: usize, _flags: u32) -> isize {
     if attr_uptr == 0 { return -22; }
     let mut attr = SchedAttr::default();
@@ -285,7 +342,7 @@ pub fn sys_sched_getattr(pid: usize, attr_uptr: usize, _size: u32, _flags: u32) 
         }
     });
     match result {
-        None    => -3, // ESRCH
+        None    => -3,
         Some(a) => {
             if copy_to_user(attr_uptr as *mut SchedAttr, &a).is_err() { -14 } else { 0 }
         }

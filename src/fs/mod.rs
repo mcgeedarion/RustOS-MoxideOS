@@ -6,6 +6,7 @@ pub mod ext2;
 pub mod fanotify;
 pub mod fat32;
 pub mod fcntl;
+pub mod flock;
 pub mod getdents;
 pub mod initramfs;
 pub mod inotify;

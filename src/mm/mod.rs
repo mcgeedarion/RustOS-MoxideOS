@@ -1,7 +1,10 @@
+pub mod core_dump;
 pub mod cow_fault;
 pub mod heap;
 pub mod kstack;
 pub mod memmap;
+pub mod mlock;
 pub mod mmap;
 pub mod page_fault;
 pub mod pmm;
+pub mod rss;
