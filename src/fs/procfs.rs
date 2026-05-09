@@ -7,7 +7,7 @@
 //!   /proc/self/fd/     → directory listing of open fds (getdents)
 //!   /proc/self/maps    → VMA map in Linux /proc/maps format
 //!   /proc/<pid>/maps   → same for any pid
-//!   /proc/self/status  → minimal status fields
+//!   /proc/self/status  → minimal status fields (incl. RtCpuTime)
 //!   /proc/self/stat    → full 52-field stat line (Linux 3.5+ format)
 //!   /proc/<pid>/limits → per-process resource limits (ulimit -a format)
 //!   /proc/uptime       → uptime in seconds
@@ -255,7 +255,7 @@ fn gen_status(pid: usize) -> String {
     use crate::proc::process::State;
 
     // Snapshot the fields we need from the PCB.
-    let (state_ch, ppid, vsize_kb, comm) =
+    let (state_ch, ppid, vsize_kb, comm, rt_cpu_time_us) =
         with_proc(pid, |p| {
             let ch = match p.state {
                 State::Running | State::Ready => 'R',
@@ -264,13 +264,13 @@ fn gen_status(pid: usize) -> String {
             };
             let vsize: u64 = p.vmas.iter().map(|v| (v.end - v.start) as u64).sum();
             let comm = exe_basename(&p.exe_path);
-            (ch, p.ppid, vsize / 1024, comm)
+            (ch, p.ppid, vsize / 1024, comm, p.rt_cpu_time_us)
         })
-        .unwrap_or_else(|| ('R', 1, 0, String::from("rustos")));
+        .unwrap_or_else(|| ('R', 1, 0, String::from("rustos"), 0));
 
     format!(
-        "Name:\t{}\nState:\t{} \nPid:\t{}\nPPid:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\n",
-        comm, state_ch, pid, ppid, vsize_kb, vsize_kb
+        "Name:\t{}\nState:\t{} \nPid:\t{}\nPPid:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nRtCpuTime:\t{} us\n",
+        comm, state_ch, pid, ppid, vsize_kb, vsize_kb, rt_cpu_time_us
     )
 }
 
@@ -323,7 +323,8 @@ fn gen_status(pid: usize) -> String {
 // (39)  processor       sched.last_cpu
 // (40)  rt_priority     sched.rt_priority
 // (41)  policy          sched.policy as u32  (0=NORMAL 1=FIFO 2=RR 6=DEADLINE)
-// (42)  delayacct_blkio_ticks = 0
+// (42)  delayacct_blkio_ticks — overloaded: rt_cpu_time_us (microseconds of
+//       continuous RT CPU time since last voluntary block; 0 for non-RT tasks)
 // (43)  guest_time      = 0
 // (44)  cguest_time     = 0
 // (45)  start_data      brk_base (first data page)
@@ -400,6 +401,8 @@ fn gen_stat(pid: usize) -> String {
             p.brk_base as u64,
             p.brk      as u64,
             p.exit_code as i64,
+            // (42) rt_cpu_time_us — live RT budget accumulator
+            p.rt_cpu_time_us,
         )
     });
 
@@ -409,6 +412,7 @@ fn gen_stat(pid: usize) -> String {
         vsize, rss, start_code, end_code,
         kstkeip, exit_signal, processor, rt_priority, policy,
         start_data, end_data, exit_code,
+        rt_cpu_time_us,
     ) = match snap {
         Some(s) => s,
         None    => return format!("{} (?) Z 1 {} {} 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", pid, pid, pid),
@@ -425,7 +429,7 @@ fn gen_stat(pid: usize) -> String {
          // fields 23-37
          {vsize} {rss} {rsslim} {start_code} {end_code} 0 0 {kstkeip} 0 0 0 0 0 \
          // fields 38-52
-         {exit_signal} {processor} {rt_priority} {policy} 0 0 0 {start_data} {end_data} {start_data} 0 0 0 0 {exit_code}\n",
+         {exit_signal} {processor} {rt_priority} {policy} {rt_cpu_time_us} 0 0 {start_data} {end_data} {start_data} 0 0 0 0 {exit_code}\n",
         pid        = pid,
         comm       = comm,
         state      = state_ch,
@@ -445,6 +449,7 @@ fn gen_stat(pid: usize) -> String {
         processor  = processor,
         rt_priority = rt_priority,
         policy     = policy,
+        rt_cpu_time_us = rt_cpu_time_us,
         start_data = start_data,
         end_data   = end_data,
         exit_code  = exit_code,
