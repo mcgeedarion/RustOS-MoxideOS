@@ -12,11 +12,18 @@
 //!      fresh canary into the new task's `Task::canary` field.
 //!
 //! Canary format (64-bit, matching glibc and musl conventions):
-//!   - Bits [63:8] — 7 random bytes from RDRAND / CSR entropy
+//!   - Bits [63:8] — 7 random bytes from hardware entropy (`arch_entropy()`)
 //!   - Bits  [7:0] — forced to 0x00  (terminates strcpy-style overflows)
+//!
+//! ## Entropy source
+//! Both `init_kernel_canary` and `new_task_canary` now call
+//! `rand::arch_entropy()` instead of the old `rdrand64()` shim.  This
+//! guarantees that on x86_64 the canary is derived from RDRAND (hardware
+//! entropy), and on RISC-V from a hardware timing mix, rather than the
+//! xorshift PRNG whose state can be recovered from a single observed value.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use crate::rand::rdrand64;
+use crate::rand::arch_entropy;
 
 // ───── Global canary used by kernel-mode protected frames ─────────────────────
 
@@ -29,10 +36,15 @@ use crate::rand::rdrand64;
 #[no_mangle]
 pub static __stack_chk_guard: AtomicU64 = AtomicU64::new(0);
 
-/// Initialise the global kernel-mode canary from RDRAND.  Called once from
-/// `security::init()` during early boot, before any kernel threads start.
+/// Initialise the global kernel-mode canary from hardware entropy.
+/// Called once from `security::init()` during early boot, before any
+/// kernel threads start.
+///
+/// Uses `arch_entropy()` — RDRAND on x86_64, hardware CSR mix on RISC-V —
+/// instead of the xorshift PRNG so the canary is not predictable from
+/// observed program output.
 pub fn init_kernel_canary() {
-    let raw = rdrand64();
+    let raw = arch_entropy();
     // Zero the LSB so strcpy-style writes that stop at \0 cannot overwrite
     // the full canary cleanly.
     let canary = raw & !0xFF;
@@ -41,12 +53,15 @@ pub fn init_kernel_canary() {
 }
 
 /// Generate a fresh 8-byte canary value suitable for a new task.
-/// The per-task value is stored in `Task::canary` and written into the
-/// task's TLS area at offset `CANARY_TLS_OFFSET` so userspace glibc/musl
-/// can find it without a syscall.
+///
+/// Called at `fork` / `execve` time.  The value is stored in `Task::canary`
+/// and written into the task's TLS area so userspace glibc/musl can verify
+/// it without a syscall.
+///
+/// Each canary is independently derived from hardware entropy — predicting
+/// one canary from another requires breaking the hardware RNG.
 pub fn new_task_canary() -> u64 {
-    let raw = rdrand64();
-    raw & !0xFF // zero LSB
+    arch_entropy() & !0xFF // zero LSB per glibc/musl convention
 }
 
 /// Per-task canary TLS offset (matches glibc `tcbhead_t.stack_guard` at
@@ -64,7 +79,7 @@ pub unsafe fn install_canary_in_tls(tls_base: *mut u8, canary: u64) {
     core::ptr::write_volatile(ptr, canary);
 }
 
-// ───── __stack_chk_fail ─────────────────────────────────────────────────────────
+// ───── __stack_chk_fail ──────────────────────────────────────────────────────
 
 /// Called by compiler-generated canary-check epilogue when the guard value
 /// has been modified — i.e. a stack buffer overflow has been detected.
@@ -75,7 +90,6 @@ pub unsafe fn install_canary_in_tls(tls_base: *mut u8, canary: u64) {
 /// This function must never return.
 #[no_mangle]
 pub extern "C" fn __stack_chk_fail() -> ! {
-    // Determine whether we are in kernel or user context by checking CPL.
     let in_kernel: bool;
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -85,7 +99,6 @@ pub extern "C" fn __stack_chk_fail() -> ! {
     }
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        // In S-mode sstatus.SPP == 1 means we came from S-mode itself.
         let sstatus: u64;
         core::arch::asm!("csrr {}, sstatus", out(reg) sstatus, options(nostack));
         in_kernel = (sstatus >> 8) & 1 == 1;
@@ -96,14 +109,10 @@ pub extern "C" fn __stack_chk_fail() -> ! {
     if in_kernel {
         panic!("KERNEL STACK CANARY CORRUPTION DETECTED — HALTING");
     } else {
-        // Deliver SIGABRT to current user process.
         let pid = crate::proc::scheduler::current_pid();
         log::error!("canary: stack smashing detected in pid={} — sending SIGABRT", pid);
         crate::proc::signal::send_signal(pid, 6 /* SIGABRT */);
-        // The signal will be delivered on the next return to userspace;
-        // yield to the scheduler immediately.
         crate::proc::scheduler::schedule();
-        // Should not reach here, but enforce `!` return.
         loop { core::hint::spin_loop(); }
     }
 }
@@ -113,8 +122,6 @@ pub extern "C" fn __stack_chk_fail() -> ! {
 /// overflows that haven't yet reached a protected frame epilogue.
 pub fn audit_kernel_canary() {
     let expected = __stack_chk_guard.load(Ordering::Relaxed);
-    // Re-read through a volatile load from the same address to defeat
-    // compiler folding.
     let actual = unsafe {
         core::ptr::read_volatile(
             &__stack_chk_guard as *const AtomicU64 as *const u64

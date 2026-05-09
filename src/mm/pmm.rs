@@ -15,6 +15,11 @@
 //!   free_page() zeroes the page before pushing it onto the free list so
 //!   that no process can read stale data from a previously-owned page.
 //!
+//! ## Contiguous multi-page allocation
+//!   alloc_pages_contig(n) scans the free list for n physically adjacent
+//!   4 KiB frames, removes them atomically, and returns the base PA.
+//!   Used by the kernel allocator for heap objects larger than one page.
+//!
 //! ## Kernel image reservation
 //!   Pages in [_kernel_start, _end) are never handed out.
 //!
@@ -49,14 +54,14 @@ static POOL_FREE_BITS: [AtomicU64; BITMAP_WORDS] = {
 fn pool_bit_set_free(idx: usize) -> bool {
     let word = idx / 64;
     let bit  = 1u64 << (idx % 64);
-    POOL_FREE_BITS[word].fetch_or(bit, Ordering::Relaxed) & bit == 0
+    POOL_FREE_BITS[word].fetch_or(bit, Ordering::AcqRel) & bit == 0
 }
 
 #[inline]
 fn pool_bit_clear_free(idx: usize) {
     let word = idx / 64;
     let bit  = 1u64 << (idx % 64);
-    POOL_FREE_BITS[word].fetch_and(!bit, Ordering::Relaxed);
+    POOL_FREE_BITS[word].fetch_and(!bit, Ordering::AcqRel);
 }
 
 #[inline]
@@ -174,7 +179,6 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
     let struct_base  = base.add(off_struct);
 
     let mut offset: usize = 0;
-    // depth tracks nesting; we only look at depth-1 nodes (children of root).
     let mut depth: i32 = 0;
     let mut in_memory_node = false;
 
@@ -185,18 +189,14 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
 
         match token {
             FDT_BEGIN_NODE => {
-                // Read NUL-terminated node name.
                 let name_ptr = struct_base.add(offset) as *const u8;
                 let mut name_len = 0usize;
                 while name_ptr.add(name_len).read() != 0 { name_len += 1; }
                 let name = core::slice::from_raw_parts(name_ptr, name_len);
 
                 depth += 1;
-                // A memory node at depth 1 is a direct child of root.
-                // Its name starts with "memory" (e.g. "memory@80000000").
                 in_memory_node = depth == 1 && name.starts_with(b"memory");
 
-                // Advance past name + NUL, aligned to 4 bytes.
                 offset += (name_len + 1 + 3) & !3;
             }
             FDT_END_NODE => {
@@ -210,15 +210,12 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
                 offset += 8;
 
                 if in_memory_node {
-                    // Check if property name is "reg".
                     let prop_name_ptr = strings_base.add(prop_nameoff);
                     let mut pnl = 0usize;
                     while prop_name_ptr.add(pnl).read() != 0 { pnl += 1; }
                     let prop_name = core::slice::from_raw_parts(prop_name_ptr, pnl);
 
                     if prop_name == b"reg" {
-                        // QEMU virt machine uses #address-cells=2, #size-cells=2.
-                        // Each reg entry is 2x u64 = 16 bytes: (base, size).
                         let data = struct_base.add(offset);
                         let mut i = 0usize;
                         while i + 16 <= prop_len {
@@ -232,14 +229,12 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
                     }
                 }
 
-                // Advance past property data, aligned to 4 bytes.
                 offset += (prop_len + 3) & !3;
             }
             FDT_NOP => {}
             FDT_END | _ => break,
         }
 
-        // Guard against running off the end of the struct block.
         if offset >= total_size { break; }
     }
 }
@@ -263,6 +258,69 @@ pub fn alloc_page() -> Option<usize> {
         POOL.0.as_ptr() as usize + idx * PAGE_SIZE
     };
     Some(pa)
+}
+
+/// Allocate `n` **physically contiguous** 4 KiB pages.
+///
+/// Scans the free list for a run of `n` adjacent frames.  Removes them
+/// atomically under the free-list lock.  Returns the base physical address
+/// of the first frame, or `None` if no contiguous run of that length exists.
+///
+/// Time complexity: O(|free_list| * n) — acceptable for boot-time large
+/// allocations; not intended for hot-path use.
+pub fn alloc_pages_contig(n: usize) -> Option<usize> {
+    if n == 0 { return None; }
+    if n == 1 { return alloc_page(); }
+
+    let mut list = FREE_LIST.lock();
+
+    // Sort so adjacent physical pages are grouped — makes the scan O(n log n)
+    // overall and much more likely to find contiguous runs in practice.
+    list.sort_unstable();
+
+    let len = list.len();
+    if len < n { return None; }
+
+    // Slide a window of width n looking for n consecutive PAs.
+    'outer: for start in 0..=(len - n) {
+        for k in 1..n {
+            if list[start + k] != list[start + k - 1] + PAGE_SIZE {
+                continue 'outer;
+            }
+        }
+        // Found a contiguous run beginning at index `start`.
+        let base_pa = list[start];
+
+        // Remove the n entries.  We drain from the end of the window first
+        // to keep indices valid (removing higher indices before lower ones).
+        for k in (0..n).rev() {
+            let idx = start + k;
+            list.swap_remove(idx);
+        }
+        FREE_COUNT.fetch_sub(n, Ordering::Relaxed);
+
+        // Clear double-free bits and zero each page.
+        for i in 0..n {
+            let pa = base_pa + i * PAGE_SIZE;
+            if let Some(bit_idx) = pool_index(pa) { pool_bit_clear_free(bit_idx); }
+            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+        }
+
+        return Some(base_pa);
+    }
+
+    None
+}
+
+/// Free `n` physically contiguous pages starting at `base_pa`.
+///
+/// Each page is zeroed and returned to the free list independently.
+/// Panics on misalignment, kernel-image overlap, or detected double-free
+/// (same guarantees as `free_page`).
+pub fn free_pages_contig(base_pa: usize, n: usize) {
+    for i in 0..n {
+        free_page(base_pa + i * PAGE_SIZE);
+    }
 }
 
 /// Return a page to the free list for reuse.
