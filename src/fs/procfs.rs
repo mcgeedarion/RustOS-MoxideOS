@@ -9,6 +9,7 @@
 //!   /proc/<pid>/maps   → same for any pid
 //!   /proc/self/status  → minimal status fields
 //!   /proc/self/stat    → minimal stat line (for getrusage etc.)
+//!   /proc/<pid>/limits → per-process resource limits (ulimit -a format)
 //!   /proc/uptime       → uptime in seconds
 //!   /proc/meminfo      → basic memory figures
 //!   /proc/cpuinfo      → single-CPU stub
@@ -71,27 +72,14 @@ pub fn procfs_fds() -> Vec<usize> {
 
 // ─── readlink support ────────────────────────────────────────────────────────
 
-// procfs_readlink is the single entry point for all /proc readlink targets.
-// It writes up to buf.len() bytes of the target path into buf and returns
-// into the caller's buffer.  This matches how Linux handles readlink on
-// /proc paths.
-//
-// Paths handled:
-//   /proc/self            → /proc/<pid>
-//   /proc/<pid>/exe       → executable path
-//   /proc/self/fd/<N>     → path behind fd N
-//   /proc/<pid>/fd/<N>    → path behind fd N of pid (cross-pid; pid ignored)
-
 pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     let pid = crate::proc::scheduler::current_pid();
 
-    // /proc/self → /proc/<pid>
     if path == "/proc/self" {
         let s = format!("/proc/{}", pid);
         return copy_link(s.as_bytes(), buf);
     }
 
-    // Normalise /proc/self/… → /proc/<pid>/…
     let norm: Cow<str> = if path.starts_with("/proc/self/") {
         Cow::Owned(path.replacen("/proc/self", &format!("/proc/{}", pid), 1))
     } else {
@@ -99,18 +87,14 @@ pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     };
     let p = norm.as_ref();
 
-    // /proc/<pid>/exe
     if let Some((epid, "")) = strip_pid_prefix(p, "/exe") {
         let exe = crate::proc::scheduler::exe_path_of(epid)
             .unwrap_or_else(|| String::from("/init"));
         return copy_link(exe.as_bytes(), buf);
     }
 
-    // /proc/<pid>/fd/<N>
     if let Some((_spid, fdpart)) = strip_pid_prefix(p, "/fd/") {
         if let Ok(fdno) = fdpart.parse::<usize>() {
-            // Prefer a debug name set by the fd creator (e.g. "memfd:<name>").
-            // Fall back to the VFS path, then a synthetic socket string.
             let target = crate::fs::vfs::fd_get_debug_name(fdno)
                 .or_else(|| crate::fs::vfs::fd_to_path(fdno))
                 .unwrap_or_else(|| format!("socket:[{}]", fdno));
@@ -121,8 +105,6 @@ pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     -2 // ENOENT
 }
 
-/// Copy up to `buf.len()` bytes of `src` into `buf`; return bytes copied.
-/// Never writes a NUL terminator (readlink does not NUL-terminate).
 fn copy_link(src: &[u8], buf: &mut [u8]) -> isize {
     let n = src.len().min(buf.len());
     buf[..n].copy_from_slice(&src[..n]);
@@ -142,6 +124,9 @@ fn generate(path: &str) -> Option<Vec<u8>> {
 
     if let Some((mpid, "")) = strip_pid_prefix(p, "/maps") {
         return Some(gen_maps(mpid).into_bytes());
+    }
+    if let Some((lpid, "")) = strip_pid_prefix(p, "/limits") {
+        return Some(gen_limits(lpid).into_bytes());
     }
     if let Some((_, "")) = strip_pid_prefix(p, "/status") {
         return Some(gen_status(pid).into_bytes());
@@ -173,10 +158,8 @@ fn generate(path: &str) -> Option<Vec<u8>> {
         v.push(0);
         return Some(v);
     }
-    // /proc/<pid>/fd/<N> — readable content = symlink target.
     if let Some((_spid, fdpart)) = strip_pid_prefix(p, "/fd/") {
         if let Ok(fdno) = fdpart.parse::<usize>() {
-            // Prefer debug name (e.g. "memfd:foo"), fall back to VFS path.
             if let Some(name) = crate::fs::vfs::fd_get_debug_name(fdno) {
                 return Some(name.into_bytes());
             }
@@ -185,7 +168,6 @@ fn generate(path: &str) -> Option<Vec<u8>> {
             }
         }
     }
-    // /proc/<pid>/fd/ — directory listing of open fd numbers.
     if let Some((_spid, "")) = strip_pid_prefix(p, "/fd") {
         return Some(gen_fd_dir(pid));
     }
@@ -196,6 +178,74 @@ fn generate(path: &str) -> Option<Vec<u8>> {
         return Some(b"tmpfs /dev/shm tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n".to_vec());
     }
     None
+}
+
+// ─── /proc/<pid>/limits generator ────────────────────────────────────────────
+//
+// Produces the same tabular format as Linux's /proc/<pid>/limits:
+//
+//   Limit                     Soft Limit           Hard Limit           Units
+//   Max cpu time              unlimited            unlimited            seconds
+//   Max file size             unlimited            unlimited            bytes
+//   ...
+//
+// "unlimited" is printed whenever the value equals RLIM_INFINITY (u64::MAX).
+
+const RLIM_INFINITY: u64 = u64::MAX;
+
+fn fmt_limit(v: u64) -> alloc::string::String {
+    if v == RLIM_INFINITY {
+        alloc::string::String::from("unlimited")
+    } else {
+        format!("{}", v)
+    }
+}
+
+fn gen_limits(pid: usize) -> String {
+    use crate::proc::rlimit::*;
+
+    // Snapshot the rlimit table for the target pid.
+    let get = |res: usize| -> (u64, u64) {
+        crate::proc::rlimit::getrlimit_for(pid, res)
+    };
+
+    let header = format!(
+        "{:<26}{:<21}{:<21}{}\n",
+        "Limit", "Soft Limit", "Hard Limit", "Units"
+    );
+
+    // (name, resource_index, units_string)
+    let rows: &[(&str, usize, &str)] = &[
+        ("Max cpu time",          RLIMIT_CPU,      "seconds"),
+        ("Max file size",         RLIMIT_FSIZE,    "bytes"),
+        ("Max data size",         RLIMIT_DATA,     "bytes"),
+        ("Max stack size",        RLIMIT_STACK,    "bytes"),
+        ("Max core file size",    RLIMIT_CORE,     "bytes"),
+        ("Max resident set",      RLIMIT_RSS,      "bytes"),
+        ("Max processes",         RLIMIT_NPROC,    "processes"),
+        ("Max open files",        RLIMIT_NOFILE,   "files"),
+        ("Max locked memory",     RLIMIT_MEMLOCK,  "bytes"),
+        ("Max address space",     RLIMIT_AS,       "bytes"),
+        ("Max file locks",        RLIMIT_LOCKS,    "locks"),
+        ("Max pending signals",   RLIMIT_SIGPENDING, "signals"),
+        ("Max msgqueue size",     RLIMIT_MSGQUEUE, "bytes"),
+        ("Max nice priority",     RLIMIT_NICE,     ""),
+        ("Max realtime priority", RLIMIT_RTPRIO,   ""),
+        ("Max realtime timeout",  RLIMIT_RTTIME,   "us"),
+    ];
+
+    let mut out = header;
+    for &(name, res, units) in rows {
+        let (soft, hard) = get(res);
+        out.push_str(&format!(
+            "{:<26}{:<21}{:<21}{}\n",
+            name,
+            fmt_limit(soft),
+            fmt_limit(hard),
+            units
+        ));
+    }
+    out
 }
 
 // ─── /proc stat/status generators ───────────────────────────────────────────
@@ -243,12 +293,6 @@ fn gen_maps(pid: usize) -> String {
 
 // ─── /proc/<pid>/fd/<N> ──────────────────────────────────────────────────────
 
-fn fd_target(fdno: usize) -> Option<String> {
-    crate::fs::vfs::fd_to_path(fdno)
-}
-
-// ─── /proc/<pid>/fd/ directory ───────────────────────────────────────────────
-
 fn gen_fd_dir(pid: usize) -> Vec<u8> {
     let _ = pid;
     let mut out = Vec::new();
@@ -264,9 +308,6 @@ fn gen_fd_dir(pid: usize) -> Vec<u8> {
 
 pub fn procfs_open(path: &str) -> Option<usize> {
     let content = generate(path)?;
-    let fdno = alloc::vec![0usize; 1]
-        .into_iter()
-        .fold(256usize, |acc, _| acc);
     let fdno = next_procfs_fd();
     PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0 });
     Some(fdno)
@@ -284,11 +325,8 @@ fn next_procfs_fd() -> usize {
 
 // ─── strip_pid_prefix helper ─────────────────────────────────────────────────
 
-/// Parse "/proc/<pid><suffix>" and return (pid, rest_after_suffix).
-/// `suffix` is e.g. "/maps", "/fd/", "/exe".
 fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)> {
     let after_proc = path.strip_prefix("/proc/")?;
-    // Find the end of the numeric pid segment.
     let slash = after_proc.find('/').unwrap_or(after_proc.len());
     let pid_str = &after_proc[..slash];
     let pid: usize = pid_str.parse().ok()?;

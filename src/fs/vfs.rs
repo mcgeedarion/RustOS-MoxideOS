@@ -25,21 +25,36 @@ pub fn write(fd: usize, buf: &[u8]) -> isize {
 }
 
 pub fn open(path: &str, flags: u32) -> Result<usize, isize> {
-    crate::fs::fcntl::fd_open(path, flags)
+    crate::fs::fcntl::fd_open(path, flags as i32)
 }
 
 pub fn close(fd: usize) -> isize {
-    crate::fs::fcntl::fd_close(fd)
+    crate::fs::fcntl::fd_close(fd);
+    0
 }
 
 pub fn seek(fd: usize, offset: i64, whence: i32) -> isize {
     crate::fs::fcntl::fd_seek(fd, offset, whence)
 }
 
-// ── fd debug names ───────────────────────────────────────────────────────────
+// ── file_size ─────────────────────────────────────────────────────────────
+//
+// Returns the size in bytes of the file backing `fd`, or None if the fd
+// is not a regular VFS file (pipe, socket, device, synthetic fd).
+// Used by RLIMIT_FSIZE enforcement in io_syscalls::check_fsize_limit.
+
+pub fn file_size(fd: usize) -> Option<usize> {
+    crate::fs::fcntl::fd_size(fd)
+}
+
+// ── fd path / debug-name helpers ─────────────────────────────────────────────
+
+/// Return the VFS path registered for `fd`, if any.
+pub fn fd_to_path(fd: usize) -> Option<alloc::string::String> {
+    crate::fs::fcntl::fd_get_path(fd)
+}
 
 /// Tag an fd with a human-readable name for /proc/<pid>/fd/<n> readlink.
-/// See fcntl::fd_set_debug_name for details.
 pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
     crate::fs::fcntl::fd_set_debug_name(fd, name);
 }
@@ -47,6 +62,36 @@ pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
 /// Retrieve the debug name set by fd_set_debug_name, if any.
 pub fn fd_get_debug_name(fd: usize) -> Option<alloc::string::String> {
     crate::fs::fcntl::fd_get_debug_name(fd)
+}
+
+/// Duplicate `old_fd` as `new_fd`.
+pub fn dup_as(old_fd: usize, new_fd: usize) -> isize {
+    crate::fs::fcntl::dup_as_raw(old_fd, new_fd)
+}
+
+/// Duplicate `fd` using the lowest available fd >= `min_fd`.
+pub fn dup_from(fd: usize, min_fd: usize) -> isize {
+    crate::fs::fcntl::dup_from_raw(fd, min_fd)
+}
+
+/// Create a new file at `path`.
+pub fn create(path: &str) -> Result<(), isize> {
+    crate::fs::fcntl::fd_create(path)
+}
+
+/// Remove a file.
+pub fn unlink(path: &str) -> Result<(), isize> {
+    crate::fs::fcntl::fd_unlink(path)
+}
+
+/// Create a hard link.
+pub fn link(old: &str, new: &str) -> Result<(), isize> {
+    crate::fs::fcntl::fd_link(old, new)
+}
+
+/// Remove a directory.
+pub fn rmdir(path: &str) -> Result<(), isize> {
+    crate::fs::fcntl::fd_rmdir(path)
 }
 
 // ── pread ────────────────────────────────────────────────────────────────
@@ -73,7 +118,6 @@ pub fn pread(fd: usize, buf: *mut u8, len: usize, offset: i64) -> isize {
     // Seek to the requested offset.
     let seeked = seek(fd, offset, SEEK_SET);
     if seeked < 0 {
-        // Restore and bail.
         seek(fd, saved, SEEK_SET);
         return seeked;
     }
