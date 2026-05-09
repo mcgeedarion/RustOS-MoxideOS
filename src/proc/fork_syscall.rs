@@ -1,4 +1,14 @@
 //! sys_fork (NR 57) — implemented using clone_for_fork (CoW + VMA clone).
+//!
+//! ## Bug fix
+//!
+//! ### push_syscall_frame: CS and RSP slots were wrong
+//!   The 17-slot iretq frame: [13]=rip, [14]=cs, [15]=rflags, [16]=rsp.
+//!   Old code: slot 14 = rflags (should be USER_CS=0x23),
+//!             slot 15 = user_rsp (should be rflags),
+//!             slot 16 = rip again (should be user_rsp).
+//!   On first user return the CPU loads 0x202 as CS, causing #GP before
+//!   the fork child ran a single user instruction.
 
 extern crate alloc;
 use crate::mm::kstack::alloc_kstack;
@@ -15,24 +25,20 @@ use crate::arch::x86_64::syscall::sysret_trampoline;
 #[allow(dead_code)]
 fn sysret_trampoline() {}
 
+// Ring-3 selectors.
+const USER_CS: usize = 0x23;
+
 /// sys_fork() -> child_pid (parent) / 0 (child)  [NR 57]
-///
-/// ## RLIMIT_NPROC
-/// Before creating the child we check the caller's RLIMIT_NPROC soft limit
-/// against the current total process count.  If the limit would be exceeded
-/// we return -EAGAIN (-11).
 pub fn sys_fork() -> isize {
     let parent_pid = scheduler::current_pid();
 
-    // ── RLIMIT_NPROC: reject if we would exceed the caller's soft limit ───
+    // RLIMIT_NPROC check.
     {
         use crate::proc::rlimit::{RLIMIT_NPROC, RLIM_INFINITY};
         let (soft, _hard) = crate::proc::rlimit::getrlimit_for(parent_pid, RLIMIT_NPROC);
         if soft != RLIM_INFINITY {
             let count = scheduler::proc_count() as u64;
-            if count >= soft {
-                return -11; // EAGAIN
-            }
+            if count >= soft { return -11; }
         }
     }
 
@@ -84,26 +90,31 @@ pub fn sys_fork() -> isize {
     child_pcb.ptrace_event       = 0;
     child_pcb.robust_list_head   = 0;
     child_pcb.robust_list_len    = 0;
-    // Child starts with clean CPU time accumulators.
     child_pcb.cpu_time_ns        = 0;
     child_pcb.rt_cpu_time_us     = 0;
 
     scheduler::enqueue(child_pcb);
-    // Clone the parent's fd table into the child.  Must happen after enqueue
-    // so the child PCB is visible to the scheduler before its fd table exists.
     crate::fs::process_fd::proc_fd_fork(parent_pid, child_pid);
     child_pid as isize
 }
 
+/// Build the 17-slot iretq frame at the top of the kernel stack.
+///
+/// Frame layout (slot index, 8 bytes each):
+///   [0..12]  zeroed (saved GPRs)
+///   [13]     rip    — userspace resume address
+///   [14]     cs     — USER_CS (0x23)
+///   [15]     rflags — 0x202 (IF=1)
+///   [16]     rsp    — user stack pointer
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
     let base = kstack_top - FRAME_SZ;
     let p    = base as *mut usize;
     unsafe {
         for i in 0..17 { p.add(i).write(0); }
-        p.add(13).write(rip);
-        p.add(14).write(rflags);
-        p.add(15).write(user_rsp);
-        p.add(16).write(rip);
+        p.add(13).write(rip);      // RIP
+        p.add(14).write(USER_CS);  // CS  — FIX: was rflags (0x202)
+        p.add(15).write(rflags);   // RFLAGS — FIX: was user_rsp
+        p.add(16).write(user_rsp); // RSP — FIX: was rip again
     }
 }

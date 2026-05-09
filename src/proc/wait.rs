@@ -7,26 +7,19 @@
 //!   Stopped:       `(stopsig << 8) | 0x7F`             — WIFSTOPPED true
 //!   Continued:     `0xFFFF`                             — WIFCONTINUED true
 //!
-//! ## Bug fixes in this revision
+//! ## Bug fixes
 //!
 //! ### Zombie processes were never reaped (swap_remove on shared ref)
-//!   The scan loop called `with_procs(|procs| { procs.swap_remove(idx) })`,
-//!   but `with_procs` passes `&Vec<Pcb>` (shared), not `&mut Vec<Pcb>`.
-//!   `swap_remove` on a shared reference is a compile error (or, on an
-//!   older draft that somehow compiled, a no-op).  Every zombie stayed in
-//!   PROCS forever (zombie leak + process table growth).
-//!   Fixed: split into a read-only scan pass followed by a separate
-//!   `with_procs_mut` reap pass guarded by `!nowait`.
+//!   Fixed by splitting into read-only scan + separate with_procs_mut reap.
 //!
-//! ### notify_stop used signal_handlers.get() which doesn't exist
-//!   `SignalHandlers` is a plain struct with fixed-size arrays, not a
-//!   collection. `.get(idx)` is undefined on it.  Fixed by direct array
-//!   indexing: `p.signal_handlers.flags[SIGCHLD as usize]`.
+//! ### notify_stop: signal_handlers.flags[] → signal_handlers.table[].flags
+//!   SignalHandlers has `pub table: Vec<SigAction>` where SigAction has
+//!   `.flags: u32`. There is no top-level `.flags` array on SignalHandlers.
+//!   Previous fix wrote `p.signal_handlers.flags[SIGCHLD]` which would
+//!   fail to compile. Corrected to `p.signal_handlers.table[SIGCHLD].flags`.
 //!
-//! ### wait loop called block_current() then schedule() again
-//!   `block_current()` already ends with `schedule()` internally.
-//!   The extra `scheduler::schedule()` after it caused the thread to
-//!   yield twice per wakeup iteration.  Removed the redundant call.
+//! ### wait loop: block_current() then schedule() double-schedule
+//!   Removed redundant scheduler::schedule() after block_current().
 
 use crate::proc::process::State;
 use crate::proc::scheduler;
@@ -78,7 +71,7 @@ pub fn notify_exit(exited_pid: usize) {
     if ppid == 0 { return; }
     scheduler::wake_pid(ppid);
     if exit_signal != 0 {
-        crate::proc::signal::send_signal(ppid, exit_signal);
+        crate::proc::signal::send_signal(ppid, exit_signal as i32);
     }
 }
 
@@ -96,9 +89,15 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     const SIGCHLD: usize = 17;
     const SA_NOCLDSTOP: u32 = 1;
 
-    // FIX: SignalHandlers has no .get() method; access the arrays directly.
+    // FIX: SignalHandlers has `pub table: Vec<SigAction>` where SigAction has
+    // `.flags: u32`. The previous fix incorrectly wrote
+    // `p.signal_handlers.flags[SIGCHLD]` (no such field on SignalHandlers).
+    // Corrected to `p.signal_handlers.table[SIGCHLD].flags`.
     let nocldstop = scheduler::with_proc(ppid, |p| {
-        p.signal_handlers.flags[SIGCHLD] & SA_NOCLDSTOP != 0
+        p.signal_handlers.table
+            .get(SIGCHLD)
+            .map(|h| h.flags & SA_NOCLDSTOP != 0)
+            .unwrap_or(false)
     }).unwrap_or(false);
 
     if !nocldstop {
@@ -155,10 +154,6 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
     let nowait    = options & WNOWAIT    != 0;
 
     loop {
-        // ── Read-only scan pass ───────────────────────────────────────────────────
-        // FIX: previously used with_procs (shared ref) and called swap_remove
-        // on it, which cannot compile/mutate. Now we do a pure read scan here
-        // and a separate mutable reap below.
         let scan = scheduler::with_procs(|procs| {
             // 1. Zombie
             if let Some(idx) = procs.iter().position(|p| {
@@ -208,22 +203,13 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
 
         match scan {
             WaitScan::Harvested { child_pid, wstatus, cpu_ns } => {
-                // ── Mutable reap / state-transition pass ─────────────────────
                 if !nowait {
                     scheduler::with_procs_mut(|procs| {
                         if let Some(idx) = procs.iter().position(|p| p.pid == child_pid) {
                             match procs[idx].state {
-                                State::Zombie => {
-                                    // Reap: remove from process table.
-                                    procs.swap_remove(idx);
-                                }
-                                State::Stopped => {
-                                    // Transition to StopReported so we don't
-                                    // re-report the same stop event.
-                                    procs[idx].state = State::StopReported;
-                                }
+                                State::Zombie    => { procs.swap_remove(idx); }
+                                State::Stopped   => { procs[idx].state = State::StopReported; }
                                 State::Continued => {
-                                    // Back to runnable after reporting.
                                     procs[idx].state = State::Ready;
                                     procs[idx].exit_code = 0;
                                 }
@@ -240,20 +226,13 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                 return child_pid as isize;
             }
 
-            WaitScan::NoChild => return -10, // ECHILD
+            WaitScan::NoChild => return -10,
 
             WaitScan::HasLiving => {
                 if wnohang { return 0; }
-
-                // FIX: block_current() already calls schedule() internally.
-                // The old code called schedule() again after it, causing the
-                // thread to yield twice per wakeup iteration.
                 scheduler::block_current();
-                // Returns here when wake_pid() makes us runnable again.
-
-                // If a signal is pending, return EINTR.
                 let sig_pending = crate::proc::signal::has_pending_signal(caller);
-                if sig_pending { return -4; } // EINTR
+                if sig_pending { return -4; }
             }
         }
     }
