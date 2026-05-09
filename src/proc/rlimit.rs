@@ -5,18 +5,18 @@
 //! for the soft limit.  Only root (CAP_SYS_RESOURCE) may raise the hard limit.
 //!
 //! Resources tracked:
-//!   RLIMIT_CPU     (0)  — CPU time in seconds          (unenforced, stored)
-//!   RLIMIT_FSIZE   (1)  — max file size                (unenforced, stored)
+//!   RLIMIT_CPU     (0)  — CPU time in seconds          (ENFORCED in interrupts)
+//!   RLIMIT_FSIZE   (1)  — max file size                (ENFORCED in write/writev/pwrite64)
 //!   RLIMIT_DATA    (2)  — max data segment size        (unenforced, stored)
-//!   RLIMIT_STACK   (3)  — max stack size               (unenforced, stored)
+//!   RLIMIT_STACK   (3)  — max stack size               (ENFORCED in exec/mmap)
 //!   RLIMIT_CORE    (4)  — max core file size           (unenforced, stored)
 //!   RLIMIT_RSS     (5)  — max resident set size        (unenforced, stored)
-//!   RLIMIT_NPROC   (6)  — max number of processes      (unenforced, stored)
+//!   RLIMIT_NPROC   (6)  — max number of processes      (ENFORCED in fork)
 //!   RLIMIT_NOFILE  (7)  — max open file descriptors    (ENFORCED in fcntl)
 //!   RLIMIT_MEMLOCK (8)  — max locked memory            (unenforced, stored)
 //!   RLIMIT_AS      (9)  — max virtual address space    (ENFORCED in mmap/brk)
 //!   RLIMIT_LOCKS   (10) — max file locks               (unenforced, stored)
-//!   RLIMIT_SIGPENDING (11) — max pending signals       (unenforced, stored)
+//!   RLIMIT_SIGPENDING (11) — max pending signals       (ENFORCED in kill/tgkill/tkill)
 //!   RLIMIT_MSGQUEUE   (12) — max POSIX MQ bytes        (unenforced, stored)
 //!   RLIMIT_NICE    (13) — max nice decrease            (unenforced, stored)
 //!   RLIMIT_RTPRIO  (14) — max real-time priority       (unenforced, stored)
@@ -152,6 +152,27 @@ impl RlimitSet {
         let (soft, _) = self.limits[RLIMIT_AS];
         if soft == RLIM_INFINITY { return false; }
         (current_as as u64).saturating_add(extra_bytes as u64) > soft
+    }
+
+    /// Returns `true` if `requested_bytes` exceeds the soft RLIMIT_STACK limit.
+    ///
+    /// Used in two places:
+    ///   1. `exec.rs`  — clamp the initial stack allocation at execve time.
+    ///   2. `mmap.rs`  — reject `mmap(MAP_GROWSDOWN)` requests whose `length`
+    ///                   would exceed the limit.
+    ///
+    /// RLIM_INFINITY means no limit (returns false).
+    #[inline]
+    pub fn exceeds_stack(&self, requested_bytes: usize) -> bool {
+        let (soft, _) = self.limits[RLIMIT_STACK];
+        if soft == RLIM_INFINITY { return false; }
+        requested_bytes as u64 > soft
+    }
+
+    /// Returns the soft RLIMIT_STACK value in bytes, or RLIM_INFINITY.
+    #[inline]
+    pub fn stack_soft(&self) -> u64 {
+        self.limits[RLIMIT_STACK].0
     }
 }
 

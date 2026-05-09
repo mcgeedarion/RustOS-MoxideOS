@@ -8,12 +8,29 @@
 //!   4.  load_elf_into(new_cr3, data, phdrs) → program_entry
 //!   5.  elf::end_of_bss(phdrs, bias) → call set_brk_base  <── NEW
 //!   6.  If PT_INTERP present: load_interpreter → interp_entry
-//!   7.  Alloc user stack pages into new_cr3
+//!   7.  Alloc user stack pages into new_cr3 (size from RLIMIT_STACK)
 //!   8.  clear_vmas(old) + free_old_address_space(old_cr3) + load_cr3(new_cr3)
 //!   9.  build_initial_stack (writes into new_cr3, now active) → initial_rsp
 //!  10.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
 //!  11.  wake_pid(vfork_parent) if set
 //!  12.  Patch SyscallFrame for SYSRETQ delivery
+//!
+//! ## RLIMIT_STACK
+//!
+//! The initial stack size is derived from the process's soft RLIMIT_STACK
+//! limit at execve time:
+//!
+//!   stack_bytes = min(soft_limit, STACK_MAX)   (STACK_MAX = 64 MiB)
+//!   stack_bytes = max(stack_bytes, STACK_MIN)   (STACK_MIN = 1 page = 4 KiB)
+//!
+//! When the soft limit is RLIM_INFINITY the fallback DEFAULT_STACK_BYTES
+//! (8 MiB) is used — the same value Linux uses for its default ulimit.
+//!
+//! A one-page **guard page** sits immediately below the stack region and is
+//! left intentionally unmapped so stack overflow causes a clean SIGSEGV.
+//!
+//! The stack region is registered in `p.vmas` as `VmaKind::Stack` so
+//! RLIMIT_AS accounting and `/proc/<pid>/maps` both see it.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -22,8 +39,10 @@ use alloc::string::String;
 use crate::arch::{Arch, api::{Paging, PageFlags}};
 use crate::fs::{elf, vfs};
 use crate::mm::{mmap, pmm};
+use crate::mm::mmap::{Vma, VmaKind, MAP_ANON, MAP_GROWSDOWN, PROT_READ, PROT_WRITE, PAGE};
 use crate::proc::{scheduler, thread};
 use crate::proc::fork::SignalHandlers;
+use crate::proc::rlimit::RLIM_INFINITY;
 use crate::security::CapSet;
 use crate::mm::kstack::alloc_kstack;
 use crate::uaccess::copy_from_user;
@@ -33,10 +52,19 @@ use crate::arch::x86_64::syscall::SyscallFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::gdt::update_rsp0;
 
-const PAGE_SIZE:   usize = 4096;
-const STACK_PAGES: usize = 8;
 const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
 const INTERP_BASE: usize = 0x0060_0000;
+
+/// Absolute maximum stack size we will allocate at exec time (64 MiB).
+/// Mirrors Linux's `_STK_LIM` cap in `load_elf_binary`.
+const STACK_MAX: usize = 64 * 1024 * 1024;
+
+/// Minimum stack size — always at least one page.
+const STACK_MIN: usize = PAGE;
+
+/// Fallback stack size when RLIMIT_STACK is RLIM_INFINITY (8 MiB default,
+/// matches Linux `ulimit -s` default).
+const DEFAULT_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// `bias` applied to ET_DYN images by load_elf_into.  We need the same
 /// value here to correctly compute end_of_bss for PIE executables.
@@ -59,6 +87,31 @@ const PRESENT:       u64   = 1;
 const MAX_CSTR_LEN: usize = 4096;
 /// Maximum number of pointer-array entries for argv / envp.
 const MAX_CSTR_ARRAY: usize = 1024;
+
+// ── stack size helper ─────────────────────────────────────────────────────────
+
+/// Compute the stack size for a new process from its RLIMIT_STACK soft limit.
+///
+/// Returns a page-aligned value in `[STACK_MIN, STACK_MAX]`.
+fn stack_bytes_for_pid(pid: usize) -> usize {
+    let soft = scheduler::with_proc(pid, |p| p.rlimits.stack_soft())
+        .unwrap_or(DEFAULT_STACK_BYTES as u64);
+
+    let raw = if soft == RLIM_INFINITY {
+        DEFAULT_STACK_BYTES
+    } else {
+        (soft as usize).min(STACK_MAX)
+    };
+
+    // Round up to page size and enforce minimum.
+    ((raw + PAGE - 1) & !(PAGE - 1)).max(STACK_MIN)
+}
+
+/// Same as `stack_bytes_for_pid` but used by `spawn_user_process` before the
+/// PCB exists in the scheduler table.  Falls back to DEFAULT_STACK_BYTES.
+fn stack_bytes_default() -> usize {
+    DEFAULT_STACK_BYTES
+}
 
 // ── free_old_address_space ────────────────────────────────────────────────
 
@@ -145,8 +198,6 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     };
 
     // ── Derive heap base from the highest PT_LOAD segment ─────────────────────
-    // Must happen right after load_elf_into so brk_base/brk are set
-    // before any PT_INTERP or stack setup that might call sys_brk.
     let elf_bias = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
     let bss_end  = elf::end_of_bss(&phdrs, elf_bias);
 
@@ -161,19 +212,14 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
             }
         } else { (program_entry, 0) };
 
-    let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
-    for i in 0..STACK_PAGES {
-        let va = stack_bottom + i * PAGE_SIZE;
-        let pa = match pmm::alloc_page() {
-            Some(p) => p,
-            None    => { unsafe { free_old_address_space(new_cr3); } return false; }
-        };
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
-        <Arch as Paging>::map_page(
-            new_cr3, va, pa,
-            PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX,
-        );
-    }
+    // ── Allocate user stack (RLIMIT_STACK-aware) ──────────────────────────
+    // spawn_user_process runs before the PCB is enqueued so we use the
+    // default stack size; the limit will be honoured on subsequent execve.
+    let s_bytes  = stack_bytes_default();
+    let stack_bottom = match mmap::alloc_user_stack(new_cr3, STACK_TOP, s_bytes) {
+        Ok(b)  => b,
+        Err(_) => { unsafe { free_old_address_space(new_cr3); } return false; }
+    };
 
     <Arch as Paging>::load_cr3(new_cr3);
 
@@ -200,12 +246,9 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     #[cfg(target_arch = "x86_64")]
     { ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize; }
 
-    // Compute brk_base *before* enqueueing so the PCB is correct from the
-    // first time the scheduler looks at it.  set_brk_base is called below
-    // on `pid` after enqueue so the PCB entry exists.
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    let pcb = crate::proc::process::Pcb {
+    let mut pcb = crate::proc::process::Pcb {
         pid,
         ppid,
         tgid:        pid,
@@ -229,6 +272,20 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         signal_handlers:     SignalHandlers::default(),
         exe_path:            Some(String::from(path)),
     };
+
+    // Register the stack VMA before enqueue so current_as_bytes is accurate.
+    let stack_vma = Vma {
+        start:       stack_bottom,
+        end:         STACK_TOP,
+        prot:        PROT_READ | PROT_WRITE,
+        flags:       MAP_ANON | MAP_GROWSDOWN,
+        kind:        VmaKind::Stack,
+        file_offset: 0,
+    };
+    let idx = pcb.vmas
+        .binary_search_by_key(&stack_vma.start, |v| v.start)
+        .unwrap_or_else(|i| i);
+    pcb.vmas.insert(idx, stack_vma);
 
     scheduler::enqueue(pcb);
     true
@@ -281,10 +338,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     let program_entry = elf::load_elf_into(new_cr3, data, &hdr, &phdrs)
         .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
-    // ── Derive heap base from the highest PT_LOAD segment ─────────────────────
-    // Done here (after load_elf_into, before the point-of-no-return)
-    // so that a failed execve never modifies the caller's brk_base.
-    // set_brk_base() is called in the with_proc_mut block below.
+    // ── Derive heap base ──────────────────────────────────────────────────
     let elf_bias  = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
     let bss_end   = elf::end_of_bss(&phdrs, elf_bias);
     let heap_base = mmap::set_brk_base_compute(bss_end);
@@ -301,21 +355,16 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
             }
         } else { (program_entry, 0) };
 
-    let stack_bottom = STACK_TOP - STACK_PAGES * PAGE_SIZE;
-    for i in 0..STACK_PAGES {
-        let va = stack_bottom + i * PAGE_SIZE;
-        let pa = pmm::alloc_page().ok_or(-12i32)
-            .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
-        <Arch as Paging>::map_page(
-            new_cr3, va, pa,
-            PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX,
-        );
-    }
+    // ── Allocate user stack (RLIMIT_STACK-aware) ──────────────────────────
+    // Read the limit before the point-of-no-return while the old PCB is
+    // still valid.  A failed execve must not have mutated the caller.
+    let s_bytes = stack_bytes_for_pid(pid);
+    let stack_bottom = mmap::alloc_user_stack(new_cr3, STACK_TOP, s_bytes)
+        .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
     let old_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     let pid_key = thread::vma_pid(pid);
-    mmap::clear_vmas(pid_key);
+    mmap::clear_vmas_pub(pid_key);
     if old_cr3 != 0 && old_cr3 != new_cr3 {
         unsafe { free_old_address_space(old_cr3); }
     }
@@ -335,12 +384,26 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         p.signal_handlers = SignalHandlers::default();
         p.vmas            = alloc::vec![];
         p.next_va         = crate::proc::process::Pcb::INITIAL_NEXT_VA;
-        // Set the heap base/break for the new image.
         p.brk_base        = heap_base;
         p.brk             = heap_base;
         p.exe_path        = Some(String::from(path));
         let vfp            = p.vfork_parent;
         p.vfork_parent    = 0;
+
+        // Register the new stack VMA.
+        let stack_vma = Vma {
+            start:       stack_bottom,
+            end:         STACK_TOP,
+            prot:        PROT_READ | PROT_WRITE,
+            flags:       MAP_ANON | MAP_GROWSDOWN,
+            kind:        VmaKind::Stack,
+            file_offset: 0,
+        };
+        let idx = p.vmas
+            .binary_search_by_key(&stack_vma.start, |v| v.start)
+            .unwrap_or_else(|i| i);
+        p.vmas.insert(idx, stack_vma);
+
         vfp
     }).unwrap_or(0);
 
@@ -402,7 +465,7 @@ fn build_initial_stack(
         (AT_PHDR,   phdr_va as u64),
         (AT_PHENT,  core::mem::size_of::<elf::Elf64Phdr>() as u64),
         (AT_PHNUM,  pt_load_count as u64),
-        (AT_PAGESZ, PAGE_SIZE as u64),
+        (AT_PAGESZ, PAGE as u64),
         (AT_ENTRY,  entry_va as u64),
         (AT_RANDOM, random_va as u64),
         (AT_BASE,   interp_base as u64),

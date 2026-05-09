@@ -59,6 +59,13 @@
 //! sys_mmap and sys_brk both check the current process RLIMIT_AS soft limit
 //! before committing any new mapping.  The check uses the sum of all existing
 //! VMA sizes as the current AS usage.  Returns -ENOMEM (-12) on violation.
+//!
+//! ## RLIMIT_STACK enforcement
+//!
+//! sys_mmap rejects MAP_GROWSDOWN requests whose `length` exceeds the soft
+//! RLIMIT_STACK limit, returning -ENOMEM (-12).  This matches Linux's
+//! do_mmap → __do_mmap behaviour for downward-growing stack segments.
+//! The initial stack allocation at execve time is also capped — see exec.rs.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -80,6 +87,9 @@ pub enum VmaKind {
     /// Program break (heap) region. Treated identically to Anonymous for
     /// page-fault handling but tracked separately for /proc/<pid>/status.
     Heap,
+    /// User stack region (MAP_GROWSDOWN or exec-time allocation).
+    /// Grows downward; the page immediately below `start` is the guard page.
+    Stack,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +105,9 @@ pub struct Vma {
 impl Vma {
     #[inline]
     pub fn is_heap(&self) -> bool { matches!(self.kind, VmaKind::Heap) }
+
+    #[inline]
+    pub fn is_stack(&self) -> bool { matches!(self.kind, VmaKind::Stack) }
 }
 
 // ── PROT_* / MAP_* constants ─────────────────────────────────────────────────
@@ -107,6 +120,8 @@ const MAP_SHARED:          u32 = 0x01;
 const MAP_PRIVATE:         u32 = 0x02;
 const MAP_FIXED:           u32 = 0x10;
 pub const MAP_ANON:        u32 = 0x20;
+/// Stack segment grows downward.  Checked against RLIMIT_STACK.
+pub const MAP_GROWSDOWN:   u32 = 0x0100;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 pub const PAGE:            usize = 4096;
 
@@ -199,6 +214,16 @@ pub fn sys_mmap(
     let len = page_align_up(length);
     let pid = scheduler::current_pid();
 
+    // ── RLIMIT_STACK check for MAP_GROWSDOWN ──────────────────────────────
+    // Linux rejects MAP_GROWSDOWN requests whose length exceeds the soft
+    // stack limit.  We mirror that before any AS check so the errno is
+    // ENOMEM (-12) rather than a generic allocation failure.
+    if flags & MAP_GROWSDOWN != 0 {
+        let over = scheduler::with_proc(pid, |p| p.rlimits.exceeds_stack(len))
+            .unwrap_or(false);
+        if over { return -12; } // ENOMEM
+    }
+
     // ── RLIMIT_AS check ───────────────────────────────────────────────────
     // Checked before any allocation.  MAP_FIXED replacements still count
     // (Linux does the same — the old mapping is freed but the new one is
@@ -233,7 +258,7 @@ pub fn sys_mmap(
         }
     }
 
-    // ── Normal (anonymous or file-backed) path ────────────────────────────
+    // ── Normal (anonymous, file-backed, or growsdown stack) path ──────────
     let (va, user_cr3) = scheduler::with_proc_mut(pid, |p| {
         let va = if is_fixed || is_fixed_noreplace {
             addr
@@ -252,8 +277,9 @@ pub fn sys_mmap(
         remove_vma(pid, va, len);
     }
 
-    let is_anon   = flags & MAP_ANON != 0 || fd == usize::MAX;
-    let pte_flags = prot_to_flags(prot);
+    let is_anon      = flags & MAP_ANON != 0 || fd == usize::MAX;
+    let is_growsdown = flags & MAP_GROWSDOWN != 0;
+    let pte_flags    = prot_to_flags(prot);
 
     if is_anon {
         let mut mapped = 0usize;
@@ -276,10 +302,12 @@ pub fn sys_mmap(
                 }
             }
         }
+        // Record as Stack VMA when MAP_GROWSDOWN is set, otherwise Anonymous.
+        let kind = if is_growsdown { VmaKind::Stack } else { VmaKind::Anonymous };
         insert_vma(pid, Vma {
             start: va, end: va + len,
             prot, flags,
-            kind: VmaKind::Anonymous,
+            kind,
             file_offset: 0,
         });
     } else {
@@ -484,6 +512,65 @@ pub fn set_brk_base(pid: usize, end_of_bss: usize) {
     });
 }
 
+/// Compute the brk_base value for a new address space without mutating any
+/// PCB.  Called from exec.rs before the new process is enqueued.
+pub fn set_brk_base_compute(end_of_bss: usize) -> usize {
+    page_align_up(end_of_bss) + PAGE
+}
+
+// ── alloc_user_stack ─────────────────────────────────────────────────────────
+
+/// Allocate `stack_bytes` of anonymous user stack pages into `cr3` immediately
+/// below `stack_top`, leaving a one-page guard below the allocation.
+///
+/// Returns `(stack_bottom, stack_top_after_guard)` where `stack_bottom` is
+/// the lowest mapped VA.  The guard page at `stack_bottom - PAGE` is left
+/// intentionally unmapped.
+///
+/// `stack_bytes` must be a multiple of PAGE.  On PMM exhaustion all already-
+/// mapped pages are freed and `Err(-12)` is returned.
+///
+/// After a successful return the caller should register a `VmaKind::Stack` VMA
+/// covering `[stack_bottom, stack_top]`.
+pub fn alloc_user_stack(
+    cr3:         usize,
+    stack_top:   usize,
+    stack_bytes: usize,
+) -> Result<usize, i32> {
+    let stack_bottom = stack_top - stack_bytes;
+    let pte_flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX;
+    let mut mapped = 0usize;
+
+    for i in 0..stack_bytes / PAGE {
+        let va = stack_bottom + i * PAGE;
+        match crate::mm::pmm::alloc_page() {
+            Some(pa) => {
+                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+                <Arch as Paging>::map_page(cr3, va, pa, pte_flags);
+                mapped += 1;
+            }
+            None => {
+                // Rollback all pages already mapped in this call.
+                for j in 0..mapped {
+                    let rva = stack_bottom + j * PAGE;
+                    if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, rva) {
+                        <Arch as Paging>::unmap_page(rva);
+                        crate::mm::pmm::free_page(pa);
+                    }
+                }
+                return Err(-12);
+            }
+        }
+    }
+    Ok(stack_bottom)
+}
+
+// ── clear_vmas_pub ───────────────────────────────────────────────────────────
+
+pub fn clear_vmas_pub(pid: usize) {
+    clear_vmas_internal(pid);
+}
+
 // ── VMA coalescing helpers ────────────────────────────────────────────────────
 
 fn coalesce_or_insert_heap_vma(pid: usize, brk_base: usize, new_brk: usize) {
@@ -552,6 +639,15 @@ pub fn heap_kb(pid: u32) -> usize {
     scheduler::with_proc(pid as usize, |p| {
         p.vmas.iter()
             .filter(|v| v.is_heap())
+            .map(|v| (v.end - v.start) / 1024)
+            .sum()
+    }).unwrap_or(0)
+}
+
+pub fn stack_kb(pid: u32) -> usize {
+    scheduler::with_proc(pid as usize, |p| {
+        p.vmas.iter()
+            .filter(|v| v.is_stack())
             .map(|v| (v.end - v.start) / 1024)
             .sum()
     }).unwrap_or(0)
