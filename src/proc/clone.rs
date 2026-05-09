@@ -141,9 +141,17 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.ctx        = child_ctx;
     child_pcb.exit_signal        = ca.exit_signal as u32;
     child_pcb.vfork_parent       = if flags & CLONE_VFORK != 0 { parent_pid } else { 0 };
-    child_pcb.child_tid_va       = if flags & CLONE_CHILD_SETTID  != 0 { ca.child_tid as usize } else { 0 };
+    child_pcb.child_tid_va = if flags & CLONE_CHILD_SETTID != 0 {
+        ca.child_tid as usize
+    } else {
+        0
+    };
     child_pcb.child_tid_val      = child_pid as u32;
-    child_pcb.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 { ca.child_tid as usize } else { 0 };
+    child_pcb.clear_child_tid_va = if flags & CLONE_CHILD_CLEARTID != 0 {
+        ca.child_tid as usize
+    } else {
+        0
+    };
     child_pcb.tls_base = child_tls;
     child_pcb.robust_list_head = 0;
     child_pcb.robust_list_len  = 0;

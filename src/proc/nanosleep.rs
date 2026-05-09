@@ -9,8 +9,10 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
     let mut buf = [0u8; 16];
     if copy_from_user(&mut buf, req_va).is_err() { return -14; } // EFAULT
 
-    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    // SAFETY: buf is [0u8; 16]; slices [0..8] and [8..16] are always exactly
+    // 8 bytes so TryFrom<&[u8]> for [u8; 8] cannot fail here.
+    let sec  = i64::from_le_bytes(<[u8; 8]>::try_from(&buf[0..8]).unwrap_or([0; 8]));
+    let nsec = i64::from_le_bytes(<[u8; 8]>::try_from(&buf[8..16]).unwrap_or([0; 8]));
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 { return -22; } // EINVAL
 
     // Yield rather than busy-spin: mark ourselves Blocked and call

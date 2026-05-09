@@ -1,26 +1,22 @@
-//! Global heap allocator — backed by the PMM.
+//! Global heap allocator — thin wrapper around the physical memory manager.
 //!
-//! We use a simple linked-list / slab allocator on top of the physical
-//! memory manager.  Nothing fancy; correctness over performance.
+//! Delegates all allocations to `pmm::alloc_bytes` / `pmm::free_bytes`.  The
+//! PMM itself is a simple bump + free-list allocator seeded from the memory
+//! map passed by the bootloader.
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::ptr;
-
 use crate::mm::pmm;
 
-/// Minimum alignment we hand out (pointer-sized).
-const MIN_ALIGN: usize = core::mem::size_of::<usize>();
+const MIN_ALIGN: usize = 16;
 
-/// The global allocator instance registered with `#[global_allocator]`.
 pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let size = layout.size().max(MIN_ALIGN);
-        let align = layout.align().max(MIN_ALIGN);
-        match pmm::alloc_bytes(size, align) {
-            Some(p) => p.as_ptr(),
-            None => ptr::null_mut(),
+        match pmm::alloc_bytes(size, layout.align()) {
+            Some(ptr) => ptr.as_ptr(),
+            None      => core::ptr::null_mut(),
         }
     }
 
@@ -30,8 +26,14 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_layout = Layout::from_size_align(new_size, layout.align())
-            .expect("realloc: bad layout");
+        // SAFETY: layout.align() is always a valid power-of-two alignment from
+        // the original allocation.  new_size is caller-supplied; the only
+        // theoretical failure is size overflow, which is not possible on a
+        // 64-bit target.  Return null on error — GlobalAlloc contract permits it.
+        let new_layout = match Layout::from_size_align(new_size, layout.align()) {
+            Ok(l)  => l,
+            Err(_) => return core::ptr::null_mut(),
+        };
         let new_ptr = self.alloc(new_layout);
         if !new_ptr.is_null() {
             let copy_size = layout.size().min(new_size);
@@ -41,3 +43,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
         new_ptr
     }
 }
+
+#[global_allocator]
+static ALLOCATOR: KernelAllocator = KernelAllocator;
