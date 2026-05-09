@@ -19,9 +19,10 @@
 //! instead of silently aliasing .bss.
 //!
 //! ### Grow path
-//! Pages are eagerly allocated from the PMM (glibc expects brk pages to be
-//! immediately readable). A full rollback returns `old_brk` unchanged on OOM
-//! so `malloc` can fall through to `mmap(MAP_ANON)`.
+//! Pages are eagerly allocated from the PMM (which guarantees zero-fill on
+//! every returned frame — no extra write_bytes() is needed or safe here).
+//! A full rollback returns `old_brk` unchanged on OOM so `malloc` can fall
+//! through to `mmap(MAP_ANON)`.
 //!
 //! ### Shrink path
 //! Pages in `[new_brk, old_brk)` are unmapped and returned to the PMM.
@@ -72,7 +73,7 @@ use alloc::vec::Vec;
 use crate::arch::{Arch, api::{PageFlags, Paging}};
 use crate::proc::scheduler;
 
-// ── VMA descriptor ───────────────────────────────────────────────────────────
+// ── VMA descriptor ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub enum VmaKind {
@@ -100,6 +101,7 @@ pub struct Vma {
     pub flags:       u32,
     pub kind:        VmaKind,
     pub file_offset: u64,
+    pub locked:      bool,
 }
 
 impl Vma {
@@ -110,7 +112,7 @@ impl Vma {
     pub fn is_stack(&self) -> bool { matches!(self.kind, VmaKind::Stack) }
 }
 
-// ── PROT_* / MAP_* constants ─────────────────────────────────────────────────
+// ── PROT_* / MAP_* constants ──────────────────────────────────────────────────────────────────
 
 pub const PROT_READ:  u32 = 1;
 pub const PROT_WRITE: u32 = 2;
@@ -125,7 +127,7 @@ pub const MAP_GROWSDOWN:   u32 = 0x0100;
 const MAP_FIXED_NOREPLACE: u32 = 0x100000;
 pub const PAGE:            usize = 4096;
 
-// ── RLIMIT_AS helper ──────────────────────────────────────────────────────────
+// ── RLIMIT_AS helper ───────────────────────────────────────────────────────────────────
 
 /// Sum of all VMA byte sizes for `pid`. Used as the current AS measure.
 fn current_as_bytes(pid: usize) -> usize {
@@ -142,7 +144,7 @@ fn check_rlimit_as(pid: usize, extra: usize) -> isize {
     if over { -12 } else { 0 }
 }
 
-// ── VMA helpers ──────────────────────────────────────────────────────────────
+// ── VMA helpers ───────────────────────────────────────────────────────────────────────────
 
 pub fn insert_vma(pid: usize, vma: Vma) {
     scheduler::with_proc_mut(pid, |p| {
@@ -153,9 +155,72 @@ pub fn insert_vma(pid: usize, vma: Vma) {
     });
 }
 
+/// Remove or split VMAs that overlap [addr, addr+len).
+///
+/// Three cases per overlapping VMA:
+///   1. Fully contained  → drop it entirely.
+///   2. Leading remnant  → VMA starts before `addr`; truncate its end.
+///   3. Trailing remnant → VMA ends after `addr+len`; advance its start.
+///   4. Hole in middle   → both a leading and trailing remnant exist;
+///      the original is truncated and a clone covers the trailing portion.
+///
+/// This matches Linux do_munmap() split-vma semantics so partial unmaps
+/// do not silently destroy the unaffected portions of a VMA.
 pub fn remove_vma(pid: usize, addr: usize, len: usize) {
+    let end = match addr.checked_add(len) {
+        Some(e) => e,
+        None    => return, // overflow — caller already validated
+    };
     scheduler::with_proc_mut(pid, |p| {
-        p.vmas.retain(|v| !(v.start < addr + len && v.end > addr));
+        let mut i = 0;
+        while i < p.vmas.len() {
+            let v = &p.vmas[i];
+            let vstart = v.start;
+            let vend   = v.end;
+            // No overlap — skip.
+            if vend <= addr || vstart >= end {
+                i += 1;
+                continue;
+            }
+            // Fully contained — drop.
+            if vstart >= addr && vend <= end {
+                p.vmas.remove(i);
+                // do not increment i; next element has slid down.
+                continue;
+            }
+            // Partial overlap.  We may need to produce two remnants.
+            let has_leading  = vstart < addr;
+            let has_trailing = vend > end;
+
+            if has_leading && has_trailing {
+                // Hole in the middle: clone a trailing VMA first, then
+                // truncate the original to the leading portion.
+                let mut tail = p.vmas[i].clone();
+                tail.start = end;
+                // Adjust file_offset for file-backed VMAs.
+                if let VmaKind::FileBacked(_, ref mut off) = tail.kind {
+                    *off += (end - vstart) as u64;
+                }
+                tail.file_offset = p.vmas[i].file_offset + (end - vstart) as u64;
+                p.vmas[i].end = addr;
+                // Insert tail after the current entry (list stays sorted).
+                p.vmas.insert(i + 1, tail);
+                i += 2;
+            } else if has_leading {
+                // Unmapped region is at the end of this VMA.
+                p.vmas[i].end = addr;
+                i += 1;
+            } else {
+                // has_trailing: unmapped region is at the start of this VMA.
+                let delta = end - vstart;
+                p.vmas[i].start = end;
+                if let VmaKind::FileBacked(_, ref mut off) = p.vmas[i].kind {
+                    *off += delta as u64;
+                }
+                p.vmas[i].file_offset += delta as u64;
+                i += 1;
+            }
+        }
     });
 }
 
@@ -179,7 +244,7 @@ fn clear_vmas_internal(pid: usize) {
     scheduler::with_proc_mut(pid, |p| p.vmas.clear());
 }
 
-// ── free_address_space ───────────────────────────────────────────────────────
+// ── free_address_space ──────────────────────────────────────────────────────────────────
 
 pub fn free_address_space(pid: usize, user_cr3: usize) {
     if user_cr3 == 0 { return; }
@@ -204,7 +269,7 @@ pub fn free_address_space(pid: usize, user_cr3: usize) {
     scheduler::with_proc_mut(pid, |p| p.user_satp = 0);
 }
 
-// ── sys_mmap ─────────────────────────────────────────────────────────────────
+// ── sys_mmap ─────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_mmap(
     addr: usize, length: usize, prot: u32, flags: u32,
@@ -214,24 +279,18 @@ pub fn sys_mmap(
     let len = page_align_up(length);
     let pid = scheduler::current_pid();
 
-    // ── RLIMIT_STACK check for MAP_GROWSDOWN ──────────────────────────────
-    // Linux rejects MAP_GROWSDOWN requests whose length exceeds the soft
-    // stack limit.  We mirror that before any AS check so the errno is
-    // ENOMEM (-12) rather than a generic allocation failure.
+    // ── RLIMIT_STACK check for MAP_GROWSDOWN ───────────────────────────────
     if flags & MAP_GROWSDOWN != 0 {
         let over = scheduler::with_proc(pid, |p| p.rlimits.exceeds_stack(len))
             .unwrap_or(false);
         if over { return -12; } // ENOMEM
     }
 
-    // ── RLIMIT_AS check ───────────────────────────────────────────────────
-    // Checked before any allocation.  MAP_FIXED replacements still count
-    // (Linux does the same — the old mapping is freed but the new one is
-    // accounted, which may transiently exceed limits; accept that for now).
+    // ── RLIMIT_AS check ─────────────────────────────────────────────────────
     let as_check = check_rlimit_as(pid, len);
     if as_check < 0 { return as_check; }
 
-    // ── MAP_FIXED_NOREPLACE collision check ───────────────────────────────
+    // ── MAP_FIXED / MAP_FIXED_NOREPLACE collision check ───────────────────
     let is_fixed           = flags & MAP_FIXED           != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
@@ -246,15 +305,19 @@ pub fn sys_mmap(
     }
 
     // ── Detect GOP framebuffer physical mapping ───────────────────────────
-    if flags & MAP_ANON == 0 {
+    // Check via the driver's fd predicate rather than comparing the file
+    // offset against a physical address (offset is a logical byte position,
+    // not a PA).  gop::is_fb_fd() returns true only for the GOP framebuffer
+    // device file descriptor.
+    if flags & MAP_ANON == 0 && crate::drivers::gop::is_fb_fd(fd) {
         if let Some(info) = crate::drivers::gop::get() {
-            let fb_phys = info.fb_phys as usize;
-            let fb_size = crate::drivers::gop::fb_byte_size(&info);
-            if offset >= fb_phys && offset < fb_phys + fb_size {
-                let max_len  = fb_size - (offset - fb_phys);
-                let safe_len = len.min(max_len);
-                return mmap_phys(addr, safe_len, prot, flags, pid, offset as u64);
-            }
+            let fb_phys   = info.fb_phys as usize;
+            let fb_size   = crate::drivers::gop::fb_byte_size(&info);
+            let phys_off  = fb_phys + offset;
+            let max_len   = fb_size.saturating_sub(offset);
+            let safe_len  = len.min(max_len);
+            if safe_len == 0 { return -22; }
+            return mmap_phys(addr, safe_len, prot, flags, pid, phys_off as u64);
         }
     }
 
@@ -282,6 +345,7 @@ pub fn sys_mmap(
     let pte_flags    = prot_to_flags(prot);
 
     if is_anon {
+        // PMM guarantees zero-filled pages; no write_bytes() needed or safe.
         let mut mapped = 0usize;
         for page_va in (va..va + len).step_by(PAGE) {
             match crate::mm::pmm::alloc_page() {
@@ -302,13 +366,13 @@ pub fn sys_mmap(
                 }
             }
         }
-        // Record as Stack VMA when MAP_GROWSDOWN is set, otherwise Anonymous.
         let kind = if is_growsdown { VmaKind::Stack } else { VmaKind::Anonymous };
         insert_vma(pid, Vma {
             start: va, end: va + len,
             prot, flags,
             kind,
             file_offset: 0,
+            locked: false,
         });
     } else {
         insert_vma(pid, Vma {
@@ -316,6 +380,7 @@ pub fn sys_mmap(
             prot, flags,
             kind: VmaKind::FileBacked(fd, offset as u64),
             file_offset: offset as u64,
+            locked: false,
         });
     }
 
@@ -361,30 +426,37 @@ fn mmap_phys(
         flags,
         kind: VmaKind::PhysMap(offset),
         file_offset: offset,
+        locked: false,
     });
 
     va as isize
 }
 
-// ── sys_munmap ───────────────────────────────────────────────────────────────
+// ── sys_munmap ──────────────────────────────────────────────────────────────────────────
 
 pub fn sys_munmap(addr: usize, length: usize) -> isize {
-    if addr & (PAGE - 1) != 0 { return -22; }
+    if addr & (PAGE - 1) != 0 { return -22; } // EINVAL: not page-aligned
+    if length == 0             { return -22; } // EINVAL: Linux do_munmap()
     let len = page_align_up(length);
+    // Guard against addr+len wrapping usize.
+    let end = match addr.checked_add(len) {
+        Some(e) => e,
+        None    => return -22,
+    };
     let pid = scheduler::current_pid();
 
     let phys_ranges: Vec<(usize, usize)> = scheduler::with_proc(pid, |p| {
         p.vmas.iter()
             .filter(|v| {
                 matches!(v.kind, VmaKind::PhysMap(_))
-                    && v.start < addr + len
+                    && v.start < end
                     && v.end   > addr
             })
-            .map(|v| (v.start.max(addr), v.end.min(addr + len)))
+            .map(|v| (v.start.max(addr), v.end.min(end)))
             .collect()
     }).unwrap_or_default();
 
-    for page_va in (addr..addr + len).step_by(PAGE) {
+    for page_va in (addr..end).step_by(PAGE) {
         let is_phys = phys_ranges.iter().any(|&(s, e)| page_va >= s && page_va < e);
         if is_phys {
             <Arch as Paging>::unmap_page(page_va);
@@ -393,11 +465,12 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
         }
     }
 
+    // remove_vma handles partial overlaps correctly (split-VMA semantics).
     remove_vma(pid, addr, len);
     0
 }
 
-// ── sys_mprotect ─────────────────────────────────────────────────────────────
+// ── sys_mprotect ────────────────────────────────────────────────────────────────────────
 
 pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     if addr & (PAGE - 1) != 0 { return -22; }
@@ -423,7 +496,7 @@ pub fn sys_mprotect(addr: usize, length: usize, prot: u32) -> isize {
     0
 }
 
-// ── sys_brk ──────────────────────────────────────────────────────────────────
+// ── sys_brk ──────────────────────────────────────────────────────────────────────────────
 
 pub fn sys_brk(addr: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -441,7 +514,7 @@ pub fn sys_brk(addr: usize) -> isize {
         PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER | PageFlags::NX;
 
     if new_brk > old_brk {
-        // ── GROW — check RLIMIT_AS first ──────────────────────────────────
+        // ── GROW — check RLIMIT_AS first ─────────────────────────────────
         let extra = new_brk - old_brk;
         let as_check = check_rlimit_as(pid, extra);
         if as_check < 0 { return old_brk as isize; }
@@ -451,11 +524,10 @@ pub fn sys_brk(addr: usize) -> isize {
         let mut mapped_end = grow_start;
 
         for va in (grow_start..grow_end).step_by(PAGE) {
+            // PMM guarantees zero-fill; write_bytes(pa) would dereference a
+            // physical address as a virtual pointer and is neither needed nor safe.
             match crate::mm::pmm::alloc_page() {
                 Some(pa) => {
-                    unsafe {
-                        core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
-                    }
                     <Arch as Paging>::map_page(user_cr3, va, pa, heap_pte_flags);
                     <Arch as Paging>::flush_va(va);
                     mapped_end = va + PAGE;
@@ -501,7 +573,7 @@ pub fn sys_brk(addr: usize) -> isize {
         .unwrap_or(old_brk) as isize
 }
 
-// ── set_brk_base ─────────────────────────────────────────────────────────────
+// ── set_brk_base ────────────────────────────────────────────────────────────────────
 
 pub fn set_brk_base(pid: usize, end_of_bss: usize) {
     let base = page_align_up(end_of_bss);
@@ -518,20 +590,17 @@ pub fn set_brk_base_compute(end_of_bss: usize) -> usize {
     page_align_up(end_of_bss) + PAGE
 }
 
-// ── alloc_user_stack ─────────────────────────────────────────────────────────
+// ── alloc_user_stack ─────────────────────────────────────────────────────────────────
 
 /// Allocate `stack_bytes` of anonymous user stack pages into `cr3` immediately
 /// below `stack_top`, leaving a one-page guard below the allocation.
 ///
-/// Returns `(stack_bottom, stack_top_after_guard)` where `stack_bottom` is
-/// the lowest mapped VA.  The guard page at `stack_bottom - PAGE` is left
-/// intentionally unmapped.
+/// Returns `stack_bottom` (the lowest mapped VA) on success.
+/// On PMM exhaustion all already-mapped pages are freed and `Err(-12)` is
+/// returned.
 ///
-/// `stack_bytes` must be a multiple of PAGE.  On PMM exhaustion all already-
-/// mapped pages are freed and `Err(-12)` is returned.
-///
-/// After a successful return the caller should register a `VmaKind::Stack` VMA
-/// covering `[stack_bottom, stack_top]`.
+/// `stack_bytes` must be a multiple of PAGE.  PMM guarantees zero-fill;
+/// no write_bytes() call is needed.
 pub fn alloc_user_stack(
     cr3:         usize,
     stack_top:   usize,
@@ -545,12 +614,12 @@ pub fn alloc_user_stack(
         let va = stack_bottom + i * PAGE;
         match crate::mm::pmm::alloc_page() {
             Some(pa) => {
-                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+                // PMM guarantees zero-fill; write_bytes(pa as *mut u8) would
+                // dereference a physical address as a VA and is not safe.
                 <Arch as Paging>::map_page(cr3, va, pa, pte_flags);
                 mapped += 1;
             }
             None => {
-                // Rollback all pages already mapped in this call.
                 for j in 0..mapped {
                     let rva = stack_bottom + j * PAGE;
                     if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, rva) {
@@ -565,13 +634,13 @@ pub fn alloc_user_stack(
     Ok(stack_bottom)
 }
 
-// ── clear_vmas_pub ───────────────────────────────────────────────────────────
+// ── clear_vmas_pub ───────────────────────────────────────────────────────────────────
 
 pub fn clear_vmas_pub(pid: usize) {
     clear_vmas_internal(pid);
 }
 
-// ── VMA coalescing helpers ────────────────────────────────────────────────────
+// ── VMA coalescing helpers ──────────────────────────────────────────────────────────
 
 fn coalesce_or_insert_heap_vma(pid: usize, brk_base: usize, new_brk: usize) {
     let extended = scheduler::with_proc_mut(pid, |p| {
@@ -591,6 +660,7 @@ fn coalesce_or_insert_heap_vma(pid: usize, brk_base: usize, new_brk: usize) {
             flags:       MAP_ANON,
             kind:        VmaKind::Heap,
             file_offset: 0,
+            locked:      false,
         });
     }
 }
@@ -608,7 +678,7 @@ fn trim_heap_vma(pid: usize, brk_base: usize, new_brk: usize) {
     });
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────────────────
 
 #[inline]
 pub fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
@@ -621,7 +691,7 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     f
 }
 
-// ── procfs helpers ────────────────────────────────────────────────────────────
+// ── procfs helpers ────────────────────────────────────────────────────────────────────────
 
 pub fn with_vmas<F: FnMut(&Vma)>(pid: u32, mut f: F) {
     scheduler::with_proc(pid as usize, |p| {
