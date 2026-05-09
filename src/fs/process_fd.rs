@@ -29,7 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ── O_* constants ─────────────────────────────────────────────────────────────
+// ── O_* constants ───────────────────────────────────────────────────────────────
 const O_RDONLY:   i32 = 0;
 const O_WRONLY:   i32 = 1;
 const O_RDWR:     i32 = 2;
@@ -101,19 +101,19 @@ impl ProcFdTable {
     fn fds_vec(&self) -> Vec<usize> { self.fds.keys().cloned().collect() }
 }
 
-// ── Global table: pid → ProcFdTable ───────────────────────────────────────────
+// ── Global table: pid → ProcFdTable ─────────────────────────────────────────────
 
 static PROC_FD_TABLES: Mutex<BTreeMap<usize, ProcFdTable>> =
     Mutex::new(BTreeMap::new());
 
-// ── Helper: current pid ───────────────────────────────────────────────────────
+// ── Helper: current pid ─────────────────────────────────────────────────────────────
 
 #[inline]
 fn current_pid() -> usize {
     crate::proc::scheduler::current_pid()
 }
 
-// ── RLIMIT_NOFILE check ───────────────────────────────────────────────────────
+// ── RLIMIT_NOFILE check ───────────────────────────────────────────────────────────
 
 fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
     crate::proc::scheduler::with_proc(pid, |p| {
@@ -121,7 +121,54 @@ fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
     }).unwrap_or(false)
 }
 
-// ── Public lifecycle API ──────────────────────────────────────────────────────
+// ── dup_backing: subsystem-aware backing-fd duplication ───────────────────────
+//
+// Centralises the "how do I duplicate this backing fd" decision that fork,
+// dup2, and future callers all need.  Each subsystem has its own refcount
+// model; routing everything through vfs::dup_from was wrong for non-VFS fds.
+
+/// Duplicate a backing fd, incrementing the appropriate subsystem refcount.
+///
+/// Returns the backing fd the child/duplicate should use:
+///   - For pipe / socket / eventfd / timerfd / inotify / fanotify: same bfd,
+///     refcount incremented via the subsystem's own dup helper.
+///   - For devfs / procfs / sysfs: same bfd, no explicit refcount (singletons
+///     or stateless).
+///   - For VFS fds: a new backing fd from vfs::dup_from (independent seek pos).
+fn dup_backing(bfd: usize) -> usize {
+    if crate::fs::pipe::is_pipe(bfd) {
+        crate::fs::pipe::pipe_dup(bfd);
+        bfd
+    } else if crate::net::socket::is_socket_fd(bfd) {
+        crate::net::socket::socket_dup(bfd);
+        bfd
+    } else if crate::fs::eventfd::is_eventfd(bfd) {
+        crate::fs::eventfd::efd_dup(bfd);
+        bfd
+    } else if crate::fs::timerfd::is_timerfd(bfd) {
+        crate::fs::timerfd::tfd_dup(bfd);
+        bfd
+    } else if crate::fs::inotify::is_inotify_fd(bfd) {
+        crate::fs::inotify::inotify_dup(bfd);
+        bfd
+    } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
+        crate::fs::fanotify::fanotify_dup(bfd);
+        bfd
+    } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
+        // devfs fds are device singletons; share the same bfd.
+        bfd
+    } else if crate::fs::procfs::is_procfs_fd(bfd)
+           || crate::fs::sysfs::is_sysfs_fd(bfd) {
+        // stateless virtual fs; share the same bfd.
+        bfd
+    } else {
+        // VFS: allocate a new backing fd with an independent seek position.
+        let r = crate::fs::vfs::dup_from(bfd, bfd);
+        if r >= 0 { r as usize } else { bfd }
+    }
+}
+
+// ── Public lifecycle API ───────────────────────────────────────────────────────────
 
 /// Allocate a fresh fd table for `pid` and pre-install stdin/stdout/stderr.
 ///
@@ -138,10 +185,16 @@ pub fn proc_fd_alloc(pid: usize, stdin_bfd: usize, stdout_bfd: usize, stderr_bfd
 
 /// Fork the parent's fd table into the child.
 ///
-/// Each backing fd is duplicated via `vfs::dup_from` (lowest available
-/// backing fd >= old backing fd) so both parent and child have independent
-/// fd table entries pointing to the same underlying open-file object.
-/// cloexec is preserved (child inherits it; exec will clear those fds).
+/// Each entry is duplicated via `dup_backing`, which routes to the correct
+/// subsystem:
+///   - Pipe / socket / eventfd / timerfd / inotify / fanotify: same bfd,
+///     subsystem refcount incremented (e.g. pipe_dup bumps read_open /
+///     write_open so the last close of *any* fd on that end signals EOF /
+///     SIGPIPE).
+///   - VFS fds: new backing fd with an independent seek position.
+///   - stdin / stdout / stderr (fd 0-2): shared directly, no dup needed.
+///
+/// cloexec is preserved in the child; exec will clear those fds.
 pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
     let parent_clone: Option<ProcFdTable> = {
         PROC_FD_TABLES.lock().get(&parent_pid).cloned()
@@ -150,16 +203,11 @@ pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
 
     let mut child_table = ProcFdTable::default();
     for (fd, entry) in &parent.fds {
-        // Duplicate the backing fd so parent and child have independent
-        // seek positions (just like Linux fork semantics — they share the
-        // same open-file description, but for simplicity we dup here).
-        // For the standard streams (0/1/2) we just copy the backing fd
-        // number directly; they are tty-backed and duplication is harmless.
+        // fd 0-2: standard streams are tty-backed singletons; share bfd directly.
         let new_bfd = if *fd <= 2 {
             entry.backing_fd
         } else {
-            let r = crate::fs::vfs::dup_from(entry.backing_fd, entry.backing_fd);
-            if r < 0 { entry.backing_fd } else { r as usize }
+            dup_backing(entry.backing_fd)
         };
         child_table.insert(*fd, FdEntry {
             backing_fd: new_bfd,
@@ -201,7 +249,7 @@ pub fn proc_fd_free(pid: usize) {
     }
 }
 
-// ── Public fd-operation API ───────────────────────────────────────────────────
+// ── Public fd-operation API ──────────────────────────────────────────────────────────
 
 /// Open a file for `pid`, enforcing RLIMIT_NOFILE.
 ///
@@ -267,7 +315,7 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     let entry = FdEntry::new(bfd, stored_path, flags);
     let local_fd = {
         let mut lock = PROC_FD_TABLES.lock();
-        // Insert a fresh table if there isn't one (kernel threads, early boot).
+        // Insert a fresh table if there isn’t one (kernel threads, early boot).
         let table = lock.entry(pid).or_default();
         let fd = table.alloc_fd(3); // 0/1/2 reserved for stdio
         table.insert(fd, entry);
@@ -314,14 +362,8 @@ pub fn proc_fd_dup2(pid: usize, old_fd: usize, new_fd: usize) -> isize {
         }
     };
 
-    // Duplicate the backing fd.
-    let new_bfd = crate::fs::vfs::dup_as(old_entry.backing_fd, old_fd + 0x1_0000);
-    if new_bfd < 0 {
-        // Fallback: share the same backing fd (no independent seek pos).
-        // Good enough for tty/pipe/socket where dup just means ref-count.
-        let _ = new_bfd; // ignore error
-    }
-    let new_bfd = if new_bfd >= 0 { new_bfd as usize } else { old_entry.backing_fd };
+    // Duplicate the backing fd via the subsystem-aware helper.
+    let new_bfd = dup_backing(old_entry.backing_fd);
 
     // Close new_fd if open.
     let _ = proc_fd_close(pid, new_fd);
