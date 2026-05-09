@@ -72,6 +72,9 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     let now_ns = crate::time::monotonic_ns();
 
     crate::proc::scheduler::with_proc_mut(pid, |pcb| {
+        let was_rt = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
+        let becomes_rt = matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr);
+
         match policy {
             SchedPolicy::Normal => {
                 let nice = attr.sched_nice.clamp(-20, 19) as i8;
@@ -93,6 +96,24 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
                     now_ns,
                 );
             }
+        }
+
+        // Reset the RLIMIT_RTTIME accumulator whenever the task enters or
+        // leaves an RT policy.  Rationale:
+        //
+        //   • Entering RT (any → Fifo/Rr): the old counter may be stale from a
+        //     previous RT stint.  Starting from zero prevents a task from
+        //     inheriting a near-exhausted budget the instant it becomes RT again.
+        //
+        //   • Leaving RT (Fifo/Rr → Normal/Deadline): the field is only charged
+        //     and checked under Fifo/Rr; zeroing it here keeps getrusage output
+        //     clean and avoids phantom budget if the task ever returns to RT.
+        //
+        // This mirrors Linux's behaviour: do_sched_setscheduler() calls
+        // rt_watchdog_disable() / sched_rt_avg_update() which implicitly clears
+        // the per-task RT scheduling statistics on class change.
+        if was_rt || becomes_rt {
+            pcb.rt_cpu_time_us = 0;
         }
     }).map(|_| 0isize).unwrap_or(-3) // -ESRCH if not found
 }

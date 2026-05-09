@@ -20,7 +20,14 @@
 //!   RLIMIT_MSGQUEUE   (12) — max POSIX MQ bytes        (unenforced, stored)
 //!   RLIMIT_NICE    (13) — max nice decrease            (unenforced, stored)
 //!   RLIMIT_RTPRIO  (14) — max real-time priority       (unenforced, stored)
-//!   RLIMIT_RTTIME  (15) — max real-time CPU time (us)  (unenforced, stored)
+//!   RLIMIT_RTTIME  (15) — max real-time CPU time (us)  (ENFORCED in interrupts/scheduler)
+//!                         soft → SIGXCPU; hard → SIGKILL.
+//!                         Counter (Pcb::rt_cpu_time_us) is charged each timer
+//!                         tick while the task runs under SCHED_FIFO/RR, and
+//!                         reset to zero on every voluntary block (futex_wait,
+//!                         nanosleep, waitpid) via scheduler::block_current().
+//!                         Also reset to zero on any sched_setscheduler /
+//!                         sched_setattr policy change (enter or leave RT).
 
 // ── Resource indices ─────────────────────────────────────────────────────────
 
