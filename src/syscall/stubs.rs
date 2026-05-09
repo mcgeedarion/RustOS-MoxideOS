@@ -10,7 +10,6 @@ use crate::arch::{Arch, api::{Paging, PageFlags}};
 
 // ── NR 18  pwrite64 ──────────────────────────────────────────────────────────────
 
-// Cap at 4 MiB to prevent unbounded kernel heap allocation from one syscall.
 const PWRITE_MAX: usize = 4 * 1024 * 1024;
 
 fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
@@ -27,8 +26,6 @@ fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isi
 
 // ── NR 19  readv ────────────────────────────────────────────────────────────────
 
-// Small iovecs fit on the stack; larger ones get a single heap Vec that is
-// grown once to the maximum iov length and reused across iterations.
 const IOV_STACK_BUF: usize = 4096;
 
 fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
@@ -301,10 +298,6 @@ fn sys_symlink_impl(target_va: usize, link_va: usize) -> isize {
 }
 
 // ── NR 89  readlink ──────────────────────────────────────────────────────────
-//
-// Routes /proc/* paths through procfs_readlink (which handles /proc/self/exe,
-// /proc/self/fd/N, /proc/<pid>/exe, etc.) and falls back to the VFS symlink
-// store for regular filesystem symlinks.
 
 fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     if bufsiz == 0 { return -22; }
@@ -316,7 +309,6 @@ fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
         if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
         return n;
     }
-    // Regular VFS symlink.
     match crate::fs::vfs::lookup(&path) {
         Some(d) if d.starts_with(b"\x00symlink\x00") => {
             let target = &d[9..];
@@ -351,24 +343,15 @@ fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     0
 }
 
-// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ─────────────────────────────
-
-const RLIMIT_STACK:  u32 = 3;
-const RLIMIT_CORE:   u32 = 4;
-const RLIMIT_NOFILE: u32 = 7;
-const RLIM_INFINITY: u64 = u64::MAX;
-
-fn default_rlimit(resource: u32) -> (u64, u64) {
-    match resource {
-        RLIMIT_STACK  => (8 * 1024 * 1024, RLIM_INFINITY),
-        RLIMIT_NOFILE => (1024, 4096),
-        RLIMIT_CORE   => (0, 0),
-        _             => (RLIM_INFINITY, RLIM_INFINITY),
-    }
-}
+// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ─────────────────────────
+//
+// All three now delegate to Pcb::rlimits via proc::rlimit helpers.
+// getrlimit(resource, rlim*)  — reads current process limits
+// setrlimit(resource, rlim*)  — writes current process limits
+// prlimit64(pid, resource, new*, old*)  — generalised read/write
 
 fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
-    let (soft, hard) = default_rlimit(resource);
+    let (soft, hard) = crate::proc::rlimit::getrlimit_for(0, resource as usize);
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&soft.to_le_bytes());
     buf[8..16].copy_from_slice(&hard.to_le_bytes());
@@ -376,15 +359,31 @@ fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
     0
 }
 
-fn sys_setrlimit_impl(_resource: u32, _rlim_va: usize) -> isize { 0 }
+fn sys_setrlimit_impl(resource: u32, rlim_va: usize) -> isize {
+    let mut buf = [0u8; 16];
+    if copy_from_user(&mut buf, rlim_va).is_err() { return -14; }
+    let soft = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let hard = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    crate::proc::rlimit::setrlimit_for(0, resource as usize, soft, hard)
+}
 
-fn sys_prlimit64_impl(_pid: usize, resource: u32, _new_va: usize, old_va: usize) -> isize {
+fn sys_prlimit64_impl(pid: usize, resource: u32, new_va: usize, old_va: usize) -> isize {
+    // Write back the old limits first (before any update).
     if old_va != 0 {
-        let (soft, hard) = default_rlimit(resource);
+        let (soft, hard) = crate::proc::rlimit::getrlimit_for(pid, resource as usize);
         let mut buf = [0u8; 16];
         buf[0..8].copy_from_slice(&soft.to_le_bytes());
         buf[8..16].copy_from_slice(&hard.to_le_bytes());
         if copy_to_user(old_va, &buf).is_err() { return -14; }
+    }
+    // Apply the new limits if provided.
+    if new_va != 0 {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, new_va).is_err() { return -14; }
+        let soft = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let hard = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let r = crate::proc::rlimit::setrlimit_for(pid, resource as usize, soft, hard);
+        if r < 0 { return r; }
     }
     0
 }
@@ -438,8 +437,6 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
 }
 
 // ── NR 101  ptrace ────────────────────────────────────────────────────────────
-//
-// Fully implemented in src/proc/ptrace.rs.  This stub is a thin dispatch shim.
 
 fn sys_ptrace_impl(req: i32, pid: i32, addr: usize, data: usize) -> isize {
     crate::proc::ptrace::sys_ptrace(req, pid, addr, data)
@@ -452,7 +449,6 @@ use alloc::collections::BTreeMap;
 
 static ALTSTACK: SpinMutex<BTreeMap<usize, [u8; 24]>> = SpinMutex::new(BTreeMap::new());
 
-/// Called from do_exit to prevent per-pid leak.
 pub fn altstack_clear_pid(pid: usize) { ALTSTACK.lock().remove(&pid); }
 
 fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
@@ -461,7 +457,7 @@ fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
         let saved = ALTSTACK.lock().get(&pid).copied();
         let mut buf = saved.unwrap_or_else(|| {
             let mut b = [0u8; 24];
-            b[8..12].copy_from_slice(&2i32.to_le_bytes()); // SS_DISABLE
+            b[8..12].copy_from_slice(&2i32.to_le_bytes());
             b
         });
         if copy_to_user(old_ss_va, &buf).is_err() { return -14; }
@@ -526,7 +522,6 @@ const PR_SET_NO_NEW_PRIVS: i32 = 38;
 
 static PROC_NAME: SpinMutex<BTreeMap<usize, [u8; 16]>> = SpinMutex::new(BTreeMap::new());
 
-/// Called from do_exit to prevent per-pid leak.
 pub fn proc_name_clear(pid: usize) { PROC_NAME.lock().remove(&pid); }
 
 fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
@@ -640,9 +635,6 @@ fn sys_renameat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize) -
 }
 
 // ── NR 267  readlinkat ───────────────────────────────────────────────────────
-//
-// Same routing as sys_readlink_impl: /proc/* goes through procfs_readlink;
-// everything else uses the VFS symlink store.
 
 fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     if bufsiz == 0 { return -22; }
@@ -670,10 +662,6 @@ fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize)
 fn sys_utimensat_impl(_dirfd: i32, _path_va: usize, _times_va: usize, _flags: i32) -> isize { 0 }
 
 // ── NR 318  getrandom ────────────────────────────────────────────────────────
-//
-// Fills the user buffer with entropy from RDRAND (or LFSR fallback).
-// Capped at 4096 bytes per call to bound single-syscall latency.
-// Wired as NR 318 in mod.rs dispatch.
 
 const GETRANDOM_MAX: usize = 4096;
 
@@ -690,55 +678,32 @@ fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
     n as isize
 }
 
-// ── NR 319  memfd_create(name_va, flags) ─────────────────────────────────────
-//
-// Linux semantics:
-//   - Creates an anonymous tmpfs file.  The `name` arg is used only for
-//     debugging (/proc/<pid>/fd/<n> shows "memfd:<name>"); it is NOT a path.
-//   - The returned FD behaves exactly like a regular tmpfs FD: ftruncate,
-//     pread/pwrite, mmap(MAP_SHARED) all work.
-//   - MFD_CLOEXEC       (0x1): set FD_CLOEXEC on the returned FD.
-//   - MFD_ALLOW_SEALING (0x2): accepted; seals not enforced yet.
-//   - MFD_HUGETLB       (0x4): no huge-page support → EINVAL.
+// ── NR 319  memfd_create ─────────────────────────────────────────────────────
 
 const MFD_CLOEXEC:       u32 = 0x0001;
 const MFD_ALLOW_SEALING: u32 = 0x0002;
 const MFD_HUGETLB:       u32 = 0x0004;
 
 fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
-    // Reject hugepage requests and unknown flags.
     if flags & MFD_HUGETLB != 0 { return -22; }
     if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 { return -22; }
-
-    // Ensure /dev/shm tmpfs is mounted (idempotent — noop if already up).
     crate::fs::ramfs::tmpfs_mount("/dev/shm", 64 * 1024 * 1024);
-
-    // Allocate an anonymous (unlinked) inode inside the /dev/shm tmpfs.
-    // The returned synthetic path is "/dev/shm/@anon:<ino>" and never
-    // appears in any directory listing.
     let anon_path = match crate::fs::ramfs::tmpfs_create_anon("/dev/shm") {
         Ok(p)  => p,
         Err(e) => return e,
     };
-
-    // Open the anon inode O_RDWR so that ftruncate + mmap(MAP_SHARED) work.
     let fd = match crate::fs::vfs::open(&anon_path, crate::fs::vfs::O_RDWR) {
         Ok(fd)  => fd,
         Err(e)  => return e as isize,
     };
-
-    // Honour MFD_CLOEXEC.
     if flags & MFD_CLOEXEC != 0 {
         crate::fs::fcntl::set_cloexec(fd, true);
     }
-
-    // Tag the FD with "memfd:<name>" for /proc/<pid>/fd/<n> readlink.
     if name_va != 0 {
         if let Some(name) = read_cstr_safe(name_va) {
             crate::fs::vfs::fd_set_debug_name(fd, alloc::format!("memfd:{}", name));
         }
     }
-
     fd as isize
 }
 

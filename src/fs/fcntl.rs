@@ -20,6 +20,10 @@
 //!   O_CLOEXEC / SFD_CLOEXEC / EFD_CLOEXEC / TFD_CLOEXEC already have
 //!   the flag set at creation.  fcntl(F_SETFD, FD_CLOEXEC) lets callers
 //!   set it retroactively.
+//!
+//! ## RLIMIT_NOFILE enforcement
+//!   fd_open checks the current process soft NOFILE limit before allocating
+//!   a new fd.  F_DUPFD also checks the limit because dup produces a new fd.
 
 extern crate alloc;
 use crate::fs::vfs;
@@ -68,6 +72,25 @@ struct FdMeta {
 
 static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
 
+// ── RLIMIT_NOFILE helpers ─────────────────────────────────────────────────────
+
+/// Returns the number of currently open fds tracked in FD_META.
+/// Used to enforce RLIMIT_NOFILE before opening/duping a new fd.
+#[inline]
+fn count_open_fds() -> usize {
+    FD_META.lock().len()
+}
+
+/// Check RLIMIT_NOFILE for the current process.
+/// Returns -24 (EMFILE) if the limit would be exceeded, 0 if OK.
+fn check_nofile_limit() -> isize {
+    let pid = crate::proc::scheduler::current_pid();
+    let would_exceed = crate::proc::scheduler::with_proc(pid, |p| {
+        p.rlimits.exceeds_nofile(count_open_fds())
+    }).unwrap_or(false);
+    if would_exceed { -24 } else { 0 }
+}
+
 // ── cloexec / nonblock / fl_flags ────────────────────────────────────────────
 pub fn set_cloexec(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().cloexec = val;
@@ -99,24 +122,18 @@ pub fn clear_fd_owner(fd: usize) {
     }
 }
 
-// ── fd debug names (for /proc/<pid>/fd/<n> readlink) ─────────────────────────
+// ── fd debug names ────────────────────────────────────────────────────────────
 
-/// Tag an fd with a human-readable name shown by readlink /proc/<pid>/fd/<n>.
-/// Used by memfd_create to store "memfd:<name>", and by any future special fd
-/// that wants a custom /proc path representation.
 pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
     FD_META.lock().entry(fd).or_default().debug_name = Some(name);
 }
 
-/// Retrieve the debug name previously set with fd_set_debug_name.
-/// Returns None if no name has been set (callers fall back to fd_to_path).
 pub fn fd_get_debug_name(fd: usize) -> Option<alloc::string::String> {
     FD_META.lock().get(&fd).and_then(|m| m.debug_name.clone())
 }
 
 // ── close_on_exec ────────────────────────────────────────────────────────────
 
-/// Close all fds with FD_CLOEXEC set (called from execve).
 pub fn close_on_exec() {
     let cloexec_fds: Vec<usize> = {
         let mut meta = FD_META.lock();
@@ -132,8 +149,6 @@ pub fn close_on_exec() {
     }
 }
 
-/// Set FD_CLOEXEC on every fd in [lo, hi] that has metadata.
-/// Used by close_range with CLOSE_RANGE_CLOEXEC.
 pub fn cloexec_range(lo: usize, hi: usize) {
     let mut meta = FD_META.lock();
     for (fd, m) in meta.iter_mut() {
@@ -143,7 +158,6 @@ pub fn cloexec_range(lo: usize, hi: usize) {
     }
 }
 
-/// Close an fd without touching FD_META (caller has already removed the entry).
 pub fn close_fd_no_meta(fd: usize) {
     if crate::fs::pidfd::is_pidfd(fd)           { crate::fs::pidfd::free(fd);                    return; }
     if crate::fs::timerfd::is_timerfd(fd)       { crate::fs::timerfd::sys_close_tfd(fd);         return; }
@@ -154,10 +168,72 @@ pub fn close_fd_no_meta(fd: usize) {
     vfs::close(fd);
 }
 
-/// Close an fd and remove its metadata.
 fn sys_close_fd(fd: usize) {
     close_fd_meta(fd);
     close_fd_no_meta(fd);
+}
+
+// ── fd_open — RLIMIT_NOFILE enforced here ─────────────────────────────────────
+//
+// This is the single choke point for all new fd allocations that go through
+// the VFS path (open, openat, creat, memfd_create, pipe, socket, etc.).
+// The fd number is assigned by the underlying layer (ext2/tmpfs/ramfs/etc.),
+// so we check *before* calling through and register the metadata afterwards.
+//
+// NOTE: pipe(2), socket(2), eventfd, timerfd, signalfd, pidfd all call
+// their own alloc helpers which bypass fd_open.  Those paths register
+// their fds via set_cloexec / set_fd_owner etc., but they do NOT touch
+// FD_META directly on creation.  For now RLIMIT_NOFILE is only enforced
+// on the vfs::open path (open/openat/creat).  The special-fd paths can
+// be wired in a follow-up.
+
+/// Open a path and register the resulting fd in FD_META.
+/// Returns Err(-24) (EMFILE) if RLIMIT_NOFILE would be exceeded.
+pub fn fd_open(path: &str, flags: i32) -> Result<usize, isize> {
+    // Enforce RLIMIT_NOFILE before allocating.
+    let limit_check = check_nofile_limit();
+    if limit_check < 0 { return Err(limit_check); }
+
+    let fd = vfs::open_raw(path, flags as u32)?;
+
+    // Register in FD_META so future limit checks include this fd.
+    FD_META.lock().entry(fd).or_default();
+
+    if flags & O_CLOEXEC != 0 {
+        FD_META.lock().entry(fd).or_default().cloexec = true;
+    }
+
+    Ok(fd)
+}
+
+/// Read from fd (thin forwarder, no limit check needed).
+pub fn fd_read(fd: usize, buf: &mut [u8]) -> isize {
+    vfs::read_raw(fd, buf)
+}
+
+/// Write to fd.
+pub fn fd_write(fd: usize, buf: &[u8]) -> isize {
+    vfs::write_raw(fd, buf)
+}
+
+/// Seek on fd.
+pub fn fd_seek(fd: usize, offset: i64, whence: i32) -> isize {
+    vfs::seek_raw(fd, offset, whence)
+}
+
+/// Close fd and remove metadata.
+pub fn fd_close(fd: usize) {
+    sys_close_fd(fd);
+}
+
+/// Return the path registered for fd, if any.
+pub fn fd_get_path(fd: usize) -> Option<alloc::string::String> {
+    vfs::path_of_raw(fd)
+}
+
+/// Return the size of the file underlying fd.
+pub fn fd_size(fd: usize) -> Option<usize> {
+    vfs::size_of_raw(fd)
 }
 
 // ── sys_fcntl ────────────────────────────────────────────────────────────────
@@ -165,7 +241,13 @@ fn sys_close_fd(fd: usize) {
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
+            // RLIMIT_NOFILE applies to dup as well (POSIX).
+            let limit_check = check_nofile_limit();
+            if limit_check < 0 { return limit_check; }
+
             let new_fd = vfs::dup_from(fd, arg) as usize;
+            // Register new_fd in FD_META.
+            FD_META.lock().entry(new_fd).or_default();
             if cmd == F_DUPFD_CLOEXEC { set_cloexec(new_fd, true); }
             new_fd as isize
         }
@@ -216,9 +298,17 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
 
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
     if oldfd == newfd { return oldfd as isize; }
+    // dup2 replaces newfd — not a new allocation if newfd was already open.
+    // Only check the limit when newfd is not already open.
+    let newfd_open = FD_META.lock().contains_key(&newfd);
+    if !newfd_open {
+        let limit_check = check_nofile_limit();
+        if limit_check < 0 { return limit_check; }
+    }
     sys_close_fd(newfd);
     let r = vfs::dup_as(oldfd, newfd);
     if r >= 0 {
+        FD_META.lock().entry(newfd).or_default();
         let cloexec = is_cloexec(oldfd);
         set_cloexec(newfd, cloexec);
     }
