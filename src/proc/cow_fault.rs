@@ -7,9 +7,24 @@
 //!   bit 1  W  — write
 //!   bit 2  U  — user
 //! A CoW fault has P=1, W=1, U=1 (error_code & 0x7 == 0x7).
+//!
+//! ## Bug fix: use the faulting process's CR3, not kernel_cr3()
+//!
+//! CoW faults happen in *userspace* page tables. The original code called
+//! `<Arch as Paging>::kernel_cr3()` which returns the kernel's own page
+//! table root — a completely different mapping that contains only kernel
+//! virtual addresses. Walking that tree for a user virtual address will
+//! always fail (None from virt_to_phys / pte_read), so `handle_cow_fault`
+//! always returned false, and every CoW write fault was delivered as a
+//! SIGSEGV instead of being transparently resolved.
+//!
+//! Fixed by reading `user_satp` from the current process's Pcb.
+//! Falls back to `false` gracefully if no PCB is found (should never
+//! happen in the user-fault path, but is safe in the kernel path).
 
 use crate::arch::{Arch, api::{Paging, PageFlags}};
 use crate::mm::pmm;
+use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
 
@@ -35,24 +50,25 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
 /// Handle a write fault that may be a CoW page.
 /// Returns true if resolved; false if genuine access violation.
 pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
-    // P=1, W=1, U=1
+    // P=1, W=1, U=1  — only handle user write-faults on present pages.
     if error_code & 0x7 != 0x7 { return false; }
 
-    let cr3 = <Arch as Paging>::kernel_cr3();
+    // FIX: use the current process's user CR3, not the kernel's.
+    // CoW PTEs live in the userspace page tables rooted at user_satp.
+    // Querying kernel_cr3() would always return None for user VAs.
+    let pid = scheduler::current_pid();
+    let cr3 = match scheduler::with_proc(pid, |p| p.user_satp) {
+        Some(c) if c != 0 => c,
+        _ => return false,
+    };
 
     // Resolve VA → current PTE value via virt_to_phys.
-    // We need the raw PTE flags, not just the PA, so fall back to
-    // the arch-internal walk if Paging::virt_to_phys drops flags.
-    // For now: check virt_to_phys succeeds (page is present), then
-    // do the COW_BIT check through the arch helper.
     let old_pa = match <Arch as Paging>::virt_to_phys(cr3, faulting_va) {
         Some(pa) => pa,
         None     => return false,
     };
 
-    // Arch-specific: read the raw PTE to check COW_BIT.
-    // We keep the raw-walk helpers in cow_fault so the HAL doesn't
-    // need a "get_pte" method (which would be too low-level).
+    // Read the raw PTE to check the COW_BIT (bit 9, software-defined).
     let pte_val = match unsafe { pte_read(cr3, faulting_va) } {
         Some(v) => v,
         None    => return false,
@@ -62,8 +78,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
 
     let new_pa = match pmm::alloc_page() {
         Some(p) => p,
-        // OOM: leave the page read-only rather than killing the process
-        // immediately; the caller can send SIGKILL if desired.
+        // OOM: return false; the page fault dispatcher can send SIGKILL.
         None    => return false,
     };
 
@@ -75,20 +90,18 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         );
     }
 
-    // Rebuild flags: restore WRITE, clear COW_BIT, keep USER + PRESENT.
+    // Restore WRITE, clear COW_BIT, keep USER + PRESENT.
     let flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER;
     <Arch as Paging>::map_page(cr3, faulting_va & !0xFFF, new_pa, flags);
     <Arch as Paging>::flush_va(faulting_va & !0xFFF);
 
     // Release the original physical page now that the VA points to new_pa.
-    // Failure to do this was a silent per-fault page leak.
     pmm::free_page(old_pa);
 
     true
 }
 
 // ── low-level PTE read (x86-64 4-level / RISC-V Sv39 compatible) ─────────
-// Used only to check COW_BIT; kept here so arch::api stays clean.
 
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT:   u64 = 1;
