@@ -11,6 +11,23 @@
 //! `PIPE_FD_BASE` (0x8000_0000).  This keeps them well clear of VFS fds,
 //! devfs fds, and socket fds, so `is_pipe(bfd)` is a single range check.
 //!
+//! ## Backing-fd lifetime
+//!
+//! Two bfds are allocated per pipe: an even one (read end) and an odd one
+//! (write end = read_bfd + 1).  Both are keys in PIPE_TABLE pointing at the
+//! *same* Arc<Mutex<PipeInner>>.  Closing one end removes only *that* key;
+//! the peer's key (and Arc clone) stays until the peer is closed.  The
+//! PipeInner is freed when the last Arc clone is dropped, i.e. when both
+//! ends have been closed by all holders.
+//!
+//! ## Refcounting (dup / fork)
+//!
+//! PipeInner.read_open / write_open count how many process-local fds point
+//! at each end across all processes.  `pipe_dup(bfd)` increments the
+//! appropriate counter; `sys_close_pipe(bfd)` decrements it.  When
+//! write_open reaches zero the read end sees EOF; when read_open reaches
+//! zero the write end receives SIGPIPE.
+//!
 //! ## Blocking
 //!
 //! Blocking reads/writes spin-yield until data/space is available or the
@@ -154,6 +171,30 @@ pub fn is_pipe(bfd: usize) -> bool {
     PIPE_TABLE.lock().contains(bfd)
 }
 
+// ── Dup ──────────────────────────────────────────────────────────────────────
+
+/// Called by `sys_dup`, `sys_dup2`, and the fork fd-table copy whenever a
+/// pipe-end fd is duplicated or inherited into a new process.
+///
+/// Increments `read_open` (even bfd = read end) or `write_open` (odd bfd =
+/// write end) in the shared `PipeInner` so that the last `close()` of *any*
+/// fd pointing at that end is what finally signals EOF or SIGPIPE to the peer.
+///
+/// A no-op if `bfd` is not in the pipe table (safe to call unconditionally).
+pub fn pipe_dup(bfd: usize) {
+    if bfd < PIPE_FD_BASE { return; }
+    let pipe = match PIPE_TABLE.lock().get(bfd) {
+        Some(p) => p,
+        None    => return,
+    };
+    let mut inner = pipe.lock();
+    if bfd & 1 == 0 {
+        inner.read_open  = inner.read_open.saturating_add(1);
+    } else {
+        inner.write_open = inner.write_open.saturating_add(1);
+    }
+}
+
 // ── Read / write ──────────────────────────────────────────────────────────────
 
 /// Read up to `buf.len()` bytes from the read end of a pipe.
@@ -273,14 +314,27 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
 
 /// Called by `close_backing` when a pipe-end fd is closed.
 ///
-/// Decrements the appropriate refcount in `PipeInner`.  When both refcounts
-/// reach zero the entry is removed from the table and the Arc is dropped.
+/// ## What this does
+///
+/// 1. Decrements `read_open` or `write_open` in the shared `PipeInner`.
+/// 2. Removes only *this* bfd's entry from `PIPE_TABLE`, so the bfd can no
+///    longer be used for reads/writes.
+/// 3. The peer bfd's entry remains intact.  The peer's Arc clone of PipeInner
+///    keeps the buffer alive; the peer will see EOF (read end) or SIGPIPE
+///    (write end) only once the relevant refcount reaches zero.
+/// 4. The PipeInner (and its 64 KiB buffer) is freed only when the last Arc
+///    clone is dropped, i.e. when both bfd entries have been removed.
+///
+/// This is a no-op if `bfd` is not in the table.
 pub fn sys_close_pipe(bfd: usize) {
+    // Clone the Arc out of the table under the table lock, then drop the
+    // table lock before taking the inner lock to avoid lock-order issues.
     let pipe = match PIPE_TABLE.lock().get(bfd) {
         Some(p) => p,
         None    => return,
     };
 
+    // Decrement the refcount for this end.
     {
         let mut inner = pipe.lock();
         if bfd & 1 == 0 {
@@ -291,9 +345,14 @@ pub fn sys_close_pipe(bfd: usize) {
             inner.write_open = inner.write_open.saturating_sub(1);
         }
     }
-    // Drop the Arc reference from the table.
+
+    // Remove only this end's entry from the table.
+    // The peer's entry (and Arc clone) stays until the peer is closed.
     PIPE_TABLE.lock().remove(bfd);
-    // The Arc itself is dropped when the last clone goes away.
+
+    // `pipe` (the local Arc clone obtained above) is dropped here.
+    // If this was the last clone (strong_count goes to 0), PipeInner is freed.
+    // Otherwise the peer's clone keeps it alive.
 }
 
 // ── sys_pipe / sys_pipe2 ──────────────────────────────────────────────────────
@@ -351,8 +410,7 @@ pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     let rd_flags = if cloexec { O_CLOEXEC } else { 0 };
     let wr_flags = 1 | if cloexec { O_CLOEXEC } else { 0 };
 
-    // Check RLIMIT_NOFILE before installing (proc_fd_install will insert
-    // unconditionally; do the check manually here).
+    // Check RLIMIT_NOFILE before installing.
     {
         use crate::fs::process_fd::proc_fd_list;
         let open_count = proc_fd_list(pid).len();
