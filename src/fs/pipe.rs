@@ -43,6 +43,24 @@
 //! - `pipe_read` returns 0 (EOF) when all writers have closed and the
 //!   buffer is empty.
 //! - `pipe2` honours O_CLOEXEC and O_NONBLOCK.
+//!
+//! ## Poll / select / epoll readiness
+//!
+//! `is_pipe_fd(user_fd)` and `pipe_poll(user_fd, events)` are the two
+//! functions called by `poll::fd_ready`.  They translate the user-visible fd
+//! to a backing fd via the per-process fd table before inspecting PipeInner.
+//!
+//! Readiness semantics (matching Linux pipe(7)):
+//!
+//! | End        | POLLIN ready when                         |
+//! |------------|-------------------------------------------|
+//! | read end   | len > 0  (data available)                 |
+//! | read end   | write_open == 0  → POLLHUP (+ POLLIN)     |
+//!
+//! | End        | POLLOUT ready when                        |
+//! |------------|-------------------------------------------|
+//! | write end  | space() > 0  (room to write)              |
+//! | write end  | read_open == 0  → POLLERR  (broken pipe)  |
 
 extern crate alloc;
 use alloc::sync::Arc;
@@ -161,7 +179,7 @@ fn alloc_pipe_fds() -> (usize, usize) {
     (read_bfd, write_bfd)
 }
 
-// ── Public predicate ──────────────────────────────────────────────────────────
+// ── Public predicates ─────────────────────────────────────────────────────────
 
 /// Return `true` if `bfd` is a pipe backing fd (either read or write end).
 #[inline]
@@ -169,6 +187,117 @@ pub fn is_pipe(bfd: usize) -> bool {
     // Fast path: all pipe bfds are >= PIPE_FD_BASE.
     if bfd < PIPE_FD_BASE { return false; }
     PIPE_TABLE.lock().contains(bfd)
+}
+
+/// Return `true` if the **user-visible** fd `user_fd` (for the calling
+/// process) resolves to a pipe backing fd.
+///
+/// Called by `poll::fd_ready` to route the fd to `pipe_poll`.
+pub fn is_pipe_fd(user_fd: usize) -> bool {
+    let pid = crate::proc::scheduler::current_pid();
+    let bfd = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
+    if bfd < 0 { return false; }
+    is_pipe(bfd as usize)
+}
+
+// ── Poll / select / epoll readiness ──────────────────────────────────────────
+
+/// Return the subset of `events` that are currently ready on the pipe end
+/// identified by the **user-visible** fd `user_fd`.
+///
+/// This is the function called by `poll::fd_ready` for pipe fds.
+///
+/// ## Readiness rules
+///
+/// ### Read end (even backing fd)
+///
+/// | Condition                    | Bits returned              |
+/// |------------------------------|----------------------------|
+/// | `len > 0`                    | POLLIN \| POLLRDNORM        |
+/// | `write_open == 0` (EOF/HUP)  | POLLHUP \| POLLIN \| POLLRDNORM |
+/// | Both of the above            | POLLHUP \| POLLIN \| POLLRDNORM |
+/// | Buffer empty, writer alive   | 0 (not ready)              |
+///
+/// POLLHUP is always set when `write_open == 0`, even if the buffer is
+/// still empty (Linux behaviour: HUP triggers without data so the reader
+/// unblocks and gets EOF on the next `read`).
+///
+/// ### Write end (odd backing fd)
+///
+/// | Condition                    | Bits returned              |
+/// |------------------------------|----------------------------|
+/// | `space() > 0`                | POLLOUT \| POLLWRNORM       |
+/// | `read_open == 0` (EPIPE)     | POLLERR                    |
+/// | Both of the above            | POLLOUT \| POLLWRNORM \| POLLERR |
+/// | Buffer full, reader alive    | 0 (not ready)              |
+///
+/// POLLERR is always set when `read_open == 0`; a write attempt will
+/// deliver SIGPIPE + EPIPE regardless of available buffer space.
+///
+/// ### Invalid / unknown fd
+///
+/// Returns POLLNVAL if `user_fd` does not resolve to a pipe backing fd.
+pub fn pipe_poll(user_fd: usize, events: u32) -> u32 {
+    use crate::fs::poll::{
+        POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, POLLHUP, POLLERR, POLLNVAL,
+    };
+
+    // Resolve user-visible fd → backing fd for the current process.
+    let pid = crate::proc::scheduler::current_pid();
+    let bfd_raw = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
+    if bfd_raw < 0 {
+        return POLLNVAL;
+    }
+    let bfd = bfd_raw as usize;
+
+    // Look up the shared PipeInner.
+    let pipe = match PIPE_TABLE.lock().get(bfd) {
+        Some(p) => p,
+        None    => return POLLNVAL,
+    };
+    let inner = pipe.lock();
+
+    // Odd bfd = write end; even bfd = read end.
+    let is_write_end = bfd & 1 != 0;
+
+    if is_write_end {
+        // ── Write-end readiness ───────────────────────────────────────────────
+        let mut ready = 0u32;
+
+        // POLLERR: all read-ends are closed — next write → SIGPIPE + EPIPE.
+        // Report unconditionally (regardless of requested events) so that
+        // poll/select always surface a broken pipe.
+        if inner.read_open == 0 {
+            ready |= POLLERR;
+        }
+
+        // POLLOUT: room in the buffer for at least one byte.
+        if events & (POLLOUT | POLLWRNORM) != 0 && inner.space() > 0 {
+            ready |= POLLOUT | POLLWRNORM;
+        }
+
+        ready
+    } else {
+        // ── Read-end readiness ────────────────────────────────────────────────
+        let mut ready = 0u32;
+
+        // POLLHUP: all write-ends are closed.  Unconditional — wakes the
+        // reader so it can drain the remaining data and then get EOF.
+        if inner.write_open == 0 {
+            ready |= POLLHUP;
+            // Also assert POLLIN so that select(readfds) wakes up correctly
+            // (select does not expose POLLHUP directly; it maps it to a
+            // readable condition just like Linux does).
+            ready |= POLLIN | POLLRDNORM;
+        }
+
+        // POLLIN: data available to read.
+        if events & (POLLIN | POLLRDNORM) != 0 && inner.len > 0 {
+            ready |= POLLIN | POLLRDNORM;
+        }
+
+        ready
+    }
 }
 
 // ── Dup ──────────────────────────────────────────────────────────────────────
