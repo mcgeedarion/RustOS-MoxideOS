@@ -32,10 +32,9 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
     let delta_ns = sec as u64 * 1_000_000_000 + nsec as u64;
     if delta_ns == 0 { return 0; }
 
-    let ret = sleep_ns(delta_ns);
+    let ret = sleep_ns_internal(delta_ns);
 
     if ret == -4 /* EINTR */ && rem_va != 0 {
-        // Write back remaining time so the caller can restart the sleep.
         let rem = scheduler::with_proc(scheduler::current_pid(), |p| {
             p.sleep_deadline_ns
                 .saturating_sub(read_monotonic_ns())
@@ -49,7 +48,6 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
         return -4; // EINTR
     }
 
-    // Normal completion: zero remainder.
     if rem_va != 0 {
         let _ = copy_to_user(rem_va, &[0u8; 16]);
     }
@@ -60,8 +58,6 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
 pub fn sys_clock_nanosleep(
     _clockid: u32, flags: i32, req_va: usize, rem_va: usize,
 ) -> isize {
-    // Delegate: for now treat all clocks as CLOCK_MONOTONIC (relative).
-    // TIMER_ABSTIME (flags & 1): convert to relative delta.
     let mut buf = [0u8; 16];
     if copy_from_user(&mut buf, req_va).is_err() { return -14; }
 
@@ -71,7 +67,6 @@ pub fn sys_clock_nanosleep(
 
     let req_ns = sec as u64 * 1_000_000_000 + nsec as u64;
     let delta_ns = if flags & 1 != 0 {
-        // Absolute: deadline = req_ns; delta = max(deadline - now, 0).
         let now = read_monotonic_ns();
         if req_ns <= now { return 0; }
         req_ns - now
@@ -80,7 +75,7 @@ pub fn sys_clock_nanosleep(
     };
 
     if delta_ns == 0 { return 0; }
-    let ret = sleep_ns(delta_ns);
+    let ret = sleep_ns_internal(delta_ns);
 
     if ret == -4 && rem_va != 0 && flags & 1 == 0 {
         let rem = scheduler::with_proc(scheduler::current_pid(), |p| {
@@ -116,21 +111,20 @@ pub fn sys_clock_gettime(_clockid: u32, timespec_va: usize) -> isize {
 
 /// Block the current task for `delta_ns` nanoseconds.
 ///
+/// Public so that `time::timer::clock_nanosleep` can delegate here without
+/// duplicating the blocking protocol.
+///
 /// Returns 0 on normal completion, -4 (EINTR) if woken early by a signal.
 /// On return, `p.sleep_deadline_ns` still holds the original deadline so the
 /// caller can compute the remaining time.
-fn sleep_ns(delta_ns: u64) -> isize {
+pub fn sleep_ns_internal(delta_ns: u64) -> isize {
     let pid      = scheduler::current_pid();
     let deadline = read_monotonic_ns() + delta_ns;
 
-    // Record deadline in PCB *before* arming the timer to avoid a race where
-    // the tick fires before we block (the callback would try to wake an
-    // already-Ready task — harmless but cleaner to avoid).
     scheduler::with_proc_mut(pid, |p| {
         p.sleep_deadline_ns = deadline;
     });
 
-    // Arm wakeup timer.
     let timer_id = add_oneshot(deadline, move |_| {
         scheduler::with_proc_mut(pid, |p| {
             p.sleep_deadline_ns = 0;
@@ -139,8 +133,6 @@ fn sleep_ns(delta_ns: u64) -> isize {
                 p.state = crate::proc::process::State::Ready;
             }
         });
-        // scheduler::wake_pid is a no-op here; the state transition above
-        // is sufficient for the CFS run queue to pick the task up next tick.
         scheduler::wake_pid(pid);
     });
 
@@ -151,16 +143,11 @@ fn sleep_ns(delta_ns: u64) -> isize {
     scheduler::block_current();
     scheduler::schedule();
 
-    // We have been woken up.  Check whether it was the timer (normal) or a
-    // signal (EINTR).
     let interrupted = scheduler::with_proc(pid, |p| {
-        // If deadline is still non-zero the timer never fired — we were
-        // interrupted before the deadline.
         p.sleep_deadline_ns != 0
     }).unwrap_or(false);
 
     if interrupted {
-        // Cancel the pending timer to prevent a spurious wake later.
         let tid = scheduler::with_proc(pid, |p| p.sleep_timer_id).unwrap_or(0);
         if tid != 0 { cancel_timer(tid); }
         scheduler::with_proc_mut(pid, |p| p.sleep_timer_id = 0);
