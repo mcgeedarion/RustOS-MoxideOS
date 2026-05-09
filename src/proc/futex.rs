@@ -46,7 +46,7 @@ use spin::Mutex;
 use crate::proc::{scheduler, thread, process::State};
 use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants ───────────────────────────────────────────────────────────────────────
 
 pub const FUTEX_WAIT:         u32 = 0;
 pub const FUTEX_WAKE:         u32 = 1;
@@ -65,7 +65,7 @@ pub const FUTEX_CLOCK_RT:     u32 = 256;
 /// Match-any bitset: used by plain WAIT/WAKE (no bitset argument).
 pub const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFF_FFFF;
 
-// ── Futex key ─────────────────────────────────────────────────────────────────
+// ── Futex key ─────────────────────────────────────────────────────────────────────
 
 /// A futex key is (address_space_id, virtual_address).
 ///
@@ -97,7 +97,7 @@ impl FutexKey {
     }
 }
 
-// ── Waiter struct ────────────────────────────────────────────────────────────
+// ── Waiter struct ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct Waiter {
@@ -108,7 +108,7 @@ struct Waiter {
 /// Maps FutexKey → list of blocked (pid, bitset) pairs.
 static WAITERS: Mutex<BTreeMap<FutexKey, Vec<Waiter>>> = Mutex::new(BTreeMap::new());
 
-// ── Low-level wait / wake ────────────────────────────────────────────────────
+// ── Low-level wait / wake ───────────────────────────────────────────────────────
 
 /// Block the current task on `addr` with a bitset mask.
 ///
@@ -135,12 +135,8 @@ pub fn futex_wait_bitset(addr: usize, expected: u32, bitset: u32) -> Result<(), 
         map.entry(key).or_default().push(Waiter { pid, bitset });
     } // WAITERS released — safe to acquire scheduler lock
 
-    // Step 2: mark self Blocked.
-    scheduler::with_procs(|procs| {
-        if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-            p.state = State::Blocked;
-        }
-    });
+    // Step 2: mark self Blocked and reset RT budget if applicable.
+    scheduler::block_current();
 
     // Step 3: yield — rescheduled by futex_wake_bitset / futex_wake_addr.
     scheduler::schedule();
@@ -188,7 +184,7 @@ pub fn futex_wake_addr(addr: usize, count: usize) {
     futex_wake_bitset(addr, count, FUTEX_BITSET_MATCH_ANY);
 }
 
-// ── Requeue ──────────────────────────────────────────────────────────────────
+// ── Requeue ──────────────────────────────────────────────────────────────────────
 
 /// Move up to `requeue_count` waiters from `src` to `dst` without waking them.
 /// Both keys are in the calling thread's address space.
@@ -207,7 +203,7 @@ fn futex_requeue_inner(src: FutexKey, dst: FutexKey, requeue_count: usize) -> us
     n
 }
 
-// ── Clear all waiters for a dying thread ─────────────────────────────────────
+// ── Clear all waiters for a dying thread ─────────────────────────────────────────────
 
 /// Remove `pid` from every futex wait queue.  Called by do_exit.
 /// Needed so a killed/crashed thread doesn't leave stale waiter entries.
@@ -219,7 +215,7 @@ pub fn futex_clear_pid(pid: usize) {
     map.retain(|_, list| !list.is_empty());
 }
 
-// ── Robust list on-exit handler ───────────────────────────────────────────────
+// ── Robust list on-exit handler ───────────────────────────────────────────────────
 
 /// Called by do_exit to process the robust futex list.
 /// Walks the user-space linked list and performs FUTEX_WAKE on each owned futex
@@ -312,7 +308,7 @@ fn wake_robust_futex(entry_va: usize, futex_offset: isize, tid: usize) {
     }
 }
 
-// ── sys_futex [NR 202] ────────────────────────────────────────────────────────
+// ── sys_futex [NR 202] ────────────────────────────────────────────────────────────
 
 /// sys_futex(uaddr, op, val, timeout_or_val2, uaddr2, val3)
 pub fn sys_futex(uaddr: usize, op: u32, val: u32,
@@ -387,7 +383,7 @@ pub fn sys_futex(uaddr: usize, op: u32, val: u32,
     }
 }
 
-// ── sys_set_robust_list [NR 273] / sys_get_robust_list [NR 274] ────────────────
+// ── sys_set_robust_list [NR 273] / sys_get_robust_list [NR 274] ──────────────────
 
 /// set_robust_list(head, len)  [NR 273]
 pub fn sys_set_robust_list(head: usize, len: usize) -> isize {

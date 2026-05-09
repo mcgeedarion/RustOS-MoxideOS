@@ -21,7 +21,7 @@ use core::cmp::Reverse;
 use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
 use crate::sync::spinlock::SpinLock;
 
-// ── Constants ───────────────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────────────
 
 /// Scheduler tick period in nanoseconds (1 ms).
 pub const TICK_NS: u64 = 1_000_000;
@@ -32,7 +32,7 @@ pub const BALANCE_TICKS: u64 = 10;
 /// All CPUs allowed (default affinity mask for a 64-CPU system).
 pub const CPUMASK_ALL: u64 = u64::MAX;
 
-// ── Scheduling policy ──────────────────────────────────────────────────────
+// ── Scheduling policy ────────────────────────────────────────────────────────
 
 /// Linux-compatible scheduling policy selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,12 +64,12 @@ impl SchedPolicy {
     }
 }
 
-// ── SchedEntity ───────────────────────────────────────────────────────────────
+// ── SchedEntity ────────────────────────────────────────────────────────────────
 
 /// Per-task scheduler state embedded in every `Pcb`.
 #[derive(Debug, Clone)]
 pub struct SchedEntity {
-    // ── CFS (SCHED_NORMAL) ────────────────────────────────────────────────
+    // ── CFS (SCHED_NORMAL) ─────────────────────────────────────────────────────
     /// Accumulated virtual runtime in nanoseconds.
     pub vruntime: u64,
     /// CFS weight derived from nice value.
@@ -77,11 +77,11 @@ pub struct SchedEntity {
     /// Static nice level (-20..19).
     pub nice: i8,
 
-    // ── Real-time (SCHED_FIFO / SCHED_RR) ──────────────────────────────────
+    // ── Real-time (SCHED_FIFO / SCHED_RR) ────────────────────────────────────
     /// Real-time priority 1-99 (99 = highest).  0 for SCHED_NORMAL.
     pub rt_priority: u8,
 
-    // ── Deadline (SCHED_DEADLINE) ─────────────────────────────────────────
+    // ── Deadline (SCHED_DEADLINE) ─────────────────────────────────────────────
     /// CBS runtime budget per period (nanoseconds).
     pub dl_runtime: u64,
     /// Relative deadline (nanoseconds, measured from period start).
@@ -95,7 +95,7 @@ pub struct SchedEntity {
     /// Time of next period replenishment (nanoseconds since boot).
     pub dl_next_replenish: u64,
 
-    // ── Common ─────────────────────────────────────────────────────────────────
+    // ── Common ───────────────────────────────────────────────────────────────────
     /// Active scheduling policy for this task.
     pub policy: SchedPolicy,
     /// CPU affinity bitmask (bit N = allowed on CPU N).
@@ -144,7 +144,7 @@ impl SchedEntity {
     }
 }
 
-// ── Weight table ────────────────────────────────────────────────────────────────
+// ── Weight table ────────────────────────────────────────────────────────────────────
 
 fn nice_to_weight(nice: i8) -> u64 {
     let n = nice.clamp(-20, 19) as i64;
@@ -179,7 +179,7 @@ impl PartialOrd for CfsEntry {
 }
 unsafe impl Send for CfsEntry {}
 
-// ── Deadline run-queue entry ──────────────────────────────────────────────────────
+// ── Deadline run-queue entry ─────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct DlEntry {
@@ -197,7 +197,7 @@ impl PartialOrd for DlEntry {
 }
 unsafe impl Send for DlEntry {}
 
-// ── Per-CPU RunQueue ────────────────────────────────────────────────────────────
+// ── Per-CPU RunQueue ───────────────────────────────────────────────────────────
 
 pub struct RunQueue {
     cfs_heap: BinaryHeap<CfsEntry>,
@@ -330,7 +330,7 @@ impl Default for RunQueue {
     fn default() -> Self { Self::new() }
 }
 
-// ── Load balancer ───────────────────────────────────────────────────────────────
+// ── Load balancer ──────────────────────────────────────────────────────────────────
 
 pub fn load_balance(this_cpu: u32) {
     let n = crate::smp::num_online_cpus();
@@ -363,7 +363,7 @@ pub fn load_balance(this_cpu: u32) {
     }
 }
 
-// ── Core scheduler ──────────────────────────────────────────────────────────────
+// ── Core scheduler ─────────────────────────────────────────────────────────────────
 
 pub fn ap_idle() -> ! {
     let cpu_id = crate::smp::percpu::current_cpu_id();
@@ -392,7 +392,7 @@ pub fn schedule() {
     }
 }
 
-// ── Public helpers ──────────────────────────────────────────────────────────────
+// ── Public helpers ───────────────────────────────────────────────────────────────
 
 /// Return the total number of live (non-zombie) processes across all CPUs.
 /// Used by RLIMIT_NPROC enforcement in fork and by sys_sysinfo.
@@ -406,7 +406,41 @@ pub fn proc_count() -> usize {
     n
 }
 
-// ── Context switch (arch-specific, unchanged) ────────────────────────────
+/// Mark the current process as `Blocked` and, if it is an RT task
+/// (`SCHED_FIFO` or `SCHED_RR`), reset its `rt_cpu_time_us` accumulator
+/// to zero.
+///
+/// ## Linux semantics
+/// Linux resets the RLIMIT_RTTIME budget counter (`task->rt.timeout`)
+/// whenever an RT task voluntarily deschedules — i.e. blocks on I/O, a
+/// futex, nanosleep, waitpid, or any other blocking primitive.  The
+/// accumulator only grows during *continuous* RT execution; it is not a
+/// per-period quota like SCHED_DEADLINE’s CBS budget.
+///
+/// ## Callers
+/// Every kernel path that *voluntarily* blocks the current task must call
+/// this helper instead of writing `p.state = State::Blocked` directly:
+///
+///   - `futex::futex_wait_bitset`
+///   - `nanosleep::sys_nanosleep`
+///   - `wait::sys_waitpid`
+///
+/// Involuntary preemption (timer IRQ) does **not** reset the accumulator.
+///
+/// ## Note
+/// This function only sets the state; the caller is responsible for calling
+/// `schedule()` afterwards to yield the CPU.
+pub fn block_current() {
+    let pid = current_pid();
+    with_proc_mut(pid, |p| {
+        p.state = crate::proc::process::State::Blocked;
+        if matches!(p.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
+            p.rt_cpu_time_us = 0;
+        }
+    });
+}
+
+// ── Context switch (arch-specific, unchanged) ────────────────────────────────
 
 #[naked]
 unsafe extern "C" fn context_switch(

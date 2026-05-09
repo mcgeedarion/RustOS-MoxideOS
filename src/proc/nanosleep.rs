@@ -2,7 +2,6 @@
 
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::proc::scheduler;
-use crate::proc::process::State;
 
 /// sys_nanosleep(req_va, rem_va)  [NR 35]
 pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
@@ -15,23 +14,20 @@ pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 { return -22; } // EINVAL
 
     // Yield rather than busy-spin: mark ourselves Blocked and call
-    // schedule() so other processes can run. Sleep duration is not
-    // precise (we wake on the next schedule() call back to us) because
-    // there is no hardware timer callback yet.
+    // schedule() so other processes can run.
+    // For RT tasks, block_current() also resets rt_cpu_time_us per
+    // RLIMIT_RTTIME semantics (the budget only counts continuous RT CPU time).
+    //
     // TODO: register a timer event that calls scheduler::wake_pid(pid)
     //       after (sec * 1e9 + nsec) nanoseconds for precise semantics.
     if sec > 0 || nsec > 0 {
-        let pid = scheduler::current_pid();
-        scheduler::with_procs(|procs| {
-            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                p.state = State::Blocked;
-            }
-        });
+        scheduler::block_current();
         scheduler::schedule();
         // Restore Ready so the process continues normally after wakeup.
-        scheduler::with_procs(|procs| {
-            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                if p.state == State::Blocked { p.state = State::Ready; }
+        let pid = scheduler::current_pid();
+        scheduler::with_proc_mut(pid, |p| {
+            if p.state == crate::proc::process::State::Blocked {
+                p.state = crate::proc::process::State::Ready;
             }
         });
     }

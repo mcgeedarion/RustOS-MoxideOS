@@ -7,7 +7,7 @@ use crate::uaccess::copy_to_user;
 pub const WNOHANG:   u32 = 1;
 pub const WUNTRACED: u32 = 2;
 
-// ── notify_exit ────────────────────────────────────────────────────────────
+// ── notify_exit ────────────────────────────────────────────────────────────────
 
 pub fn notify_exit(exited_pid: usize) {
     let (ppid, exit_signal) = scheduler::with_proc(exited_pid, |p| (p.ppid, p.exit_signal))
@@ -19,7 +19,7 @@ pub fn notify_exit(exited_pid: usize) {
     }
 }
 
-// ── sys_waitpid [NR 7 / NR 61] ─────────────────────────────────────────────
+// ── sys_waitpid [NR 7 / NR 61] ─────────────────────────────────────────────────
 
 pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
     let caller  = scheduler::current_pid();
@@ -59,7 +59,7 @@ pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
             return child_pid as isize;
         }
 
-        // ── No zombie found ────────────────────────────────────────────────
+        // ── No zombie found ────────────────────────────────────────────────────
         if wnohang { return 0; }
 
         // has_child requires a full scan — must check all procs by ppid.
@@ -76,7 +76,9 @@ pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
         if !has_child { return -10; } // ECHILD
 
         // Block self, yield, re-mark Ready.
-        scheduler::with_proc_mut(caller, |p| p.state = State::Blocked);
+        // block_current() resets rt_cpu_time_us for RT tasks per RLIMIT_RTTIME
+        // semantics — waiting for a child is a voluntary sleep.
+        scheduler::block_current();
         scheduler::schedule();
         scheduler::with_proc_mut(caller, |p| {
             if p.state == State::Blocked { p.state = State::Ready; }
@@ -84,7 +86,7 @@ pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
     }
 }
 
-// ── wstatus decode helpers ──────────────────────────────────────────────────
+// ── wstatus decode helpers ────────────────────────────────────────────────────────
 
 #[inline] pub fn wifexited(ws: i32)   -> bool { (ws & 0x7F) == 0 }
 #[inline] pub fn wexitstatus(ws: i32) -> i32  { (ws >> 8) & 0xFF }
