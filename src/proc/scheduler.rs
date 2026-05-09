@@ -31,6 +31,13 @@
 //! Each CPU tracks its running task via `PercpuBlock::current_task`.  The
 //! global `CURRENT_PID` atomic is kept only as a BSP-0 fallback during early
 //! boot before percpu storage is initialised.
+//!
+//! ## mm_lock helpers (for uaccess TOCTOU mitigation)
+//!
+//! `with_current_mm_read()` and `has_current_user_proc()` are called by
+//! `uaccess.rs` to hold the current process's mm_lock in read mode across
+//! the validate+copy sequence, preventing concurrent `munmap` from unmapping
+//! pages between page-table walk and memory copy.
 
 use core::cmp::Reverse;
 use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
@@ -47,19 +54,14 @@ pub const BALANCE_TICKS: u64 = 10;
 /// All CPUs allowed (default affinity mask for a 64-CPU system).
 pub const CPUMASK_ALL: u64 = u64::MAX;
 
-// ── Scheduling policy ─────────────────────────────────────────────────────────
+// ── Scheduling policy ───────────────────────────────────────────────────────────
 
-/// Linux-compatible scheduling policy selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum SchedPolicy {
-    /// Normal time-sharing (CFS vruntime).  Linux SCHED_NORMAL = 0.
     Normal   = 0,
-    /// Real-time FIFO: runs until block/yield, no time-slicing.  Linux SCHED_FIFO = 1.
     Fifo     = 1,
-    /// Real-time round-robin: time-sliced within rt_priority band.  Linux SCHED_RR = 2.
     Rr       = 2,
-    /// Deadline scheduling (CBS/EDF).  Linux SCHED_DEADLINE = 6.
     Deadline = 6,
 }
 
@@ -81,60 +83,31 @@ impl SchedPolicy {
 
 // ── SchedEntity ───────────────────────────────────────────────────────────────
 
-/// Per-task scheduler state embedded in every `Pcb`.
 #[derive(Debug, Clone)]
 pub struct SchedEntity {
-    // ── CFS (SCHED_NORMAL) ────────────────────────────────────────────────────
-    /// Accumulated virtual runtime in nanoseconds.
     pub vruntime: u64,
-    /// CFS weight derived from nice value.
     pub weight: u64,
-    /// Static nice level (-20..19).
     pub nice: i8,
-
-    // ── Real-time (SCHED_FIFO / SCHED_RR) ────────────────────────────────────
-    /// Real-time priority 1-99 (99 = highest).  0 for SCHED_NORMAL.
     pub rt_priority: u8,
-
-    // ── Deadline (SCHED_DEADLINE) ─────────────────────────────────────────────
-    /// CBS runtime budget per period (nanoseconds).
     pub dl_runtime: u64,
-    /// Relative deadline (nanoseconds, measured from period start).
     pub dl_deadline: u64,
-    /// Period length (nanoseconds).
     pub dl_period: u64,
-    /// Remaining runtime in the current CBS period.
     pub dl_remaining: u64,
-    /// Absolute deadline of the current activation (nanoseconds since boot).
     pub dl_abs_deadline: u64,
-    /// Time of next period replenishment (nanoseconds since boot).
     pub dl_next_replenish: u64,
-
-    // ── Common ────────────────────────────────────────────────────────────────
-    /// Active scheduling policy for this task.
     pub policy: SchedPolicy,
-    /// CPU affinity bitmask (bit N = allowed on CPU N).
     pub cpumask: u64,
-    /// CPU this task was last scheduled on.
     pub last_cpu: u32,
-    /// Whether this task is currently on a run-queue.
     pub on_rq: bool,
 }
 
 impl SchedEntity {
-    /// Create a new `SchedEntity` with `SCHED_NORMAL`, all CPUs allowed.
     pub fn new(nice: i8) -> Self {
         SchedEntity {
-            vruntime: 0,
-            weight: nice_to_weight(nice),
-            nice,
+            vruntime: 0, weight: nice_to_weight(nice), nice,
             rt_priority: 0,
-            dl_runtime: 0,
-            dl_deadline: 0,
-            dl_period: 0,
-            dl_remaining: 0,
-            dl_abs_deadline: 0,
-            dl_next_replenish: 0,
+            dl_runtime: 0, dl_deadline: 0, dl_period: 0,
+            dl_remaining: 0, dl_abs_deadline: 0, dl_next_replenish: 0,
             policy: SchedPolicy::Normal,
             cpumask: CPUMASK_ALL,
             last_cpu: 0,
@@ -142,7 +115,6 @@ impl SchedEntity {
         }
     }
 
-    /// Configure as a deadline task (CBS parameters, nanoseconds).
     pub fn set_deadline(&mut self, runtime_ns: u64, deadline_ns: u64, period_ns: u64, now_ns: u64) {
         self.dl_runtime  = runtime_ns;
         self.dl_deadline = deadline_ns;
@@ -159,7 +131,7 @@ impl SchedEntity {
     }
 }
 
-// ── Weight table ──────────────────────────────────────────────────────────────
+// ── Weight table ─────────────────────────────────────────────────────────────────
 
 pub(crate) fn nice_to_weight(nice: i8) -> u64 {
     let n = nice.clamp(-20, 19) as i64;
@@ -176,7 +148,7 @@ pub(crate) fn nice_to_weight(nice: i8) -> u64 {
     }
 }
 
-// ── CFS run-queue entry ───────────────────────────────────────────────────────
+// ── CFS run-queue entry ──────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct CfsEntry {
@@ -194,7 +166,7 @@ impl PartialOrd for CfsEntry {
 }
 unsafe impl Send for CfsEntry {}
 
-// ── Deadline run-queue entry ──────────────────────────────────────────────────
+// ── Deadline run-queue entry ──────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct DlEntry {
@@ -212,7 +184,7 @@ impl PartialOrd for DlEntry {
 }
 unsafe impl Send for DlEntry {}
 
-// ── Per-CPU RunQueue ──────────────────────────────────────────────────────────
+// ── Per-CPU RunQueue ────────────────────────────────────────────────────────────
 
 pub struct RunQueue {
     pub cfs_heap:  BinaryHeap<CfsEntry>,
@@ -317,7 +289,6 @@ impl RunQueue {
         self.cfs_heap.peek().map(|e| e.pid)
     }
 
-    /// Remove a specific task (by PID) from whichever sub-queue holds it.
     pub fn remove_pid(&mut self, pid: u32) -> bool {
         if let Some(pos) = self.rt_queue.iter().position(|&tp| unsafe { (*tp).pid } == pid) {
             let task = self.rt_queue.remove(pos).unwrap();
@@ -357,16 +328,13 @@ impl RunQueue {
     }
 }
 
-// ── Global process table ──────────────────────────────────────────────────────
+// ── Global process table ────────────────────────────────────────────────────────
 
 use crate::proc::process::Pcb;
 use crate::proc::task::Task;
 
 static PROCS: SpinLock<Vec<Pcb>> = SpinLock::new(Vec::new());
 
-/// BSP-0 fallback: holds PID 0 during early boot before percpu is live.
-/// After `percpu::init(0)` runs, `current_pid()` reads `blk.current_task`
-/// instead and this value is no longer updated.
 static CURRENT_PID: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 static NEXT_PID: core::sync::atomic::AtomicU32 =
@@ -376,16 +344,10 @@ pub fn next_pid() -> u32 {
     NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Returns the PID of the task currently running on *this* CPU.
-///
-/// After percpu storage is initialised, this reads `PercpuBlock::current_task`
-/// so each CPU gets its own independent answer.  During early boot (before
-/// `percpu::init` has run) it falls back to the legacy global atomic.
 #[inline]
 pub fn current_pid() -> u32 {
     let blk = crate::smp::percpu::current_block();
     if blk.is_null() {
-        // Early-boot fallback: percpu not yet initialised on this CPU.
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     }
     let task = unsafe { (*blk).current_task };
@@ -395,58 +357,88 @@ pub fn current_pid() -> u32 {
     unsafe { (*task).pid }
 }
 
+// ── mm_lock helpers for uaccess TOCTOU mitigation ────────────────────────────────
+
+/// RAII guard for the current process's mm_lock in read mode.
+///
+/// Dropping this guard releases the read lock, allowing a concurrent
+/// `munmap` (which takes the write side) to proceed.
+///
+/// Implemented as a hold on the global PROCS SpinLock for the lifetime of
+/// the guard.  This is conservative — it blocks all process-table mutations
+/// including unrelated processes.  A per-process RwLock would be ideal but
+/// requires Pcb to own an RwLock which is a larger refactor.  The
+/// conservative approach is correct and safe for now.
+pub struct MmReadGuard<'a> {
+    _guard: crate::sync::spinlock::SpinLockGuard<'a, Vec<Pcb>>,
+}
+
+/// Acquire the current process's mm_lock in read mode.
+///
+/// Returns a `MmReadGuard` that holds the lock until dropped.  The caller
+/// MUST perform all page-table walks and memory copies before dropping
+/// this guard to prevent the TOCTOU window.
+///
+/// Panics in debug mode if called when no user process is running
+/// (`has_current_user_proc()` returns false).
+pub fn with_current_mm_read() -> MmReadGuard<'static> {
+    // SAFETY: PROCS is 'static; the guard borrows it for 'static lifetime.
+    // The caller is responsible for not holding this guard across a context
+    // switch (which cannot happen while interrupts are disabled in a syscall).
+    MmReadGuard {
+        _guard: PROCS.lock(),
+    }
+}
+
+/// Returns true when a user process (pid > 0) is currently running on
+/// this CPU and percpu storage is live.
+///
+/// Used by `uaccess.rs` to decide whether to acquire mm_lock:
+///   - `true`  → a user process is current; mm_lock acquisition is meaningful.
+///   - `false` → early boot or kernel thread; no concurrent munmap possible.
+#[inline]
+pub fn has_current_user_proc() -> bool {
+    let blk = crate::smp::percpu::current_block();
+    if blk.is_null() { return false; }
+    let task = unsafe { (*blk).current_task };
+    if task.is_null() { return false; }
+    let pid = unsafe { (*task).pid };
+    pid > 0
+}
+
 pub fn enqueue(pcb: Pcb) {
     PROCS.lock().push(pcb);
 }
 
-/// Run `f` against an immutable view of the PCB for `pid`.
 pub fn with_proc<T, F: FnOnce(&Pcb) -> T>(pid: u32, f: F) -> Option<T> {
     let procs = PROCS.lock();
     procs.iter().find(|p| p.pid == pid).map(f)
 }
 
-/// Run `f` against a mutable view of the PCB for `pid`.
 pub fn with_proc_mut<T, F: FnOnce(&mut Pcb) -> T>(pid: u32, f: F) -> Option<T> {
     let mut procs = PROCS.lock();
     procs.iter_mut().find(|p| p.pid == pid).map(f)
 }
 
-/// Run `f` with a shared lock over the whole process list.
 pub fn with_procs<T, F: FnOnce(&Vec<Pcb>) -> T>(f: F) -> T {
     f(&PROCS.lock())
 }
 
-/// Run `f` with exclusive access to the whole process list.
 pub fn with_procs_mut<T, F: FnOnce(&mut Vec<Pcb>) -> T>(f: F) -> T {
     f(&mut PROCS.lock())
 }
 
 pub use with_procs as with_procs_ro;
 
-// ── Task → Task* helper ───────────────────────────────────────────────────────
-
-/// Obtain a raw `*mut Task` for a given PID from the PCB `task` field.
-/// Returns null if the PCB or task pointer is absent.
 fn task_ptr_for(pid: u32) -> *mut Task {
     with_proc(pid, |p| p.task as *mut Task).unwrap_or(core::ptr::null_mut())
 }
 
-// ── Enqueue a task on the best available CPU ──────────────────────────────────
-
-/// Place `task` on the least-loaded CPU whose affinity mask permits it.
-///
-/// Called from:
-///   - `fork` / `clone` (new task)
-///   - `wake_pid` (unblocked task)
-///   - AP bring-up (idle task handoff)
-///
-/// If only one CPU is online, the task always goes to CPU 0.
 pub fn enqueue_task(task: *mut Task) {
     if task.is_null() { return; }
     let t = unsafe { &mut *task };
     let ncpus = crate::smp::percpu::cpu_count();
 
-    // Find the permitted CPU with the lowest load_weight.
     let mut best_cpu = u32::MAX;
     let mut best_load = u64::MAX;
     for cpu in 0..ncpus {
@@ -459,7 +451,7 @@ pub fn enqueue_task(task: *mut Task) {
             best_cpu  = cpu;
         }
     }
-    if best_cpu == u32::MAX { best_cpu = 0; } // fallback
+    if best_cpu == u32::MAX { best_cpu = 0; }
 
     t.sched.last_cpu = best_cpu;
     unsafe {
@@ -468,27 +460,15 @@ pub fn enqueue_task(task: *mut Task) {
             .enqueue(task);
     }
 
-    // If the target CPU is not the calling CPU, kick it via reschedule IPI
-    // so it wakes from HLT / WFI without waiting for its next timer tick.
     let this_cpu = crate::smp::percpu::current_cpu_id();
     if best_cpu != this_cpu {
         crate::smp::ipi::send_reschedule(best_cpu);
     }
 }
 
-// ── block_current ─────────────────────────────────────────────────────────────
-
-/// Block the current task: remove from run queue, set state = Blocked,
-/// reset RT CPU accumulator, then yield to the next ready task.
-///
-/// This is the single authoritative voluntary-block path.  Callers:
-///   - `sys_futex` (FUTEX_WAIT)
-///   - `sys_nanosleep`
-///   - `sys_waitpid`
 pub fn block_current() {
     let pid = current_pid();
 
-    // Mark blocked in PCB.
     with_proc_mut(pid, |p| {
         p.state = crate::proc::process::State::Blocked;
         if matches!(p.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
@@ -496,9 +476,6 @@ pub fn block_current() {
         }
     });
 
-    // Remove from this CPU's run queue (task may already be dequeued
-    // by schedule() if it called us from a preemption path, but
-    // remove_pid is idempotent when the pid is not present).
     let cpu = crate::smp::percpu::current_cpu_id();
     unsafe {
         crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
@@ -506,8 +483,6 @@ pub fn block_current() {
             .remove_pid(pid);
     }
 
-    // Clear the per-CPU current pointer so current_pid() returns 0
-    // rather than stale data while the CPU is running schedule().
     let blk = crate::smp::percpu::current_block();
     if !blk.is_null() {
         unsafe { (*blk).current_task = core::ptr::null_mut(); }
@@ -516,12 +491,6 @@ pub fn block_current() {
     schedule();
 }
 
-// ── wake_pid ──────────────────────────────────────────────────────────────────
-
-/// Wake a blocked task: move it to Ready state and place it on a run queue.
-///
-/// Safe to call from interrupt context; `enqueue_task` sends a reschedule
-/// IPI if the target CPU differs from the caller.
 pub fn wake_pid(pid: u32) {
     let task = task_ptr_for(pid);
     if task.is_null() { return; }
@@ -537,40 +506,20 @@ pub fn wake_pid(pid: u32) {
 
     if !was_blocked { return; }
 
-    // Don't double-enqueue: only add to run queue if not already on one.
     let already_on_rq = with_proc(pid, |p| p.sched.on_rq).unwrap_or(false);
     if !already_on_rq {
         enqueue_task(task);
     }
 }
 
-/// Suspend current task until a child calls exec (vfork semantics).
 pub fn suspend_current_until_child_exec(_child_pid: u32) {
     block_current();
-    // block_current() calls schedule(), which returns when this task
-    // is rescheduled by the child's exec path calling wake_pid.
 }
 
-// ── schedule() ────────────────────────────────────────────────────────────────
-
-/// Pick the next task to run on *this* CPU from its local run queue.
-///
-/// Algorithm:
-///   1. Dequeue the highest-priority runnable task (DL > RT > CFS).
-///   2. If the previous task is still Ready (not blocked/exited), re-enqueue
-///      it so it stays in the rotation.  For SCHED_NORMAL we also update
-///      its vruntime before re-inserting.
-///   3. Install the new task as `blk.current_task` and update `CURRENT_PID`
-///      (BSP-0 fallback) on CPU 0.
-///   4. Perform the actual context switch via `context::switch`.
-///
-/// Invariant: called with interrupts disabled (from timer IRQ or explicit
-/// `block_current` path).  Does nothing if the run queue is empty.
 pub fn schedule() {
     let cpu  = crate::smp::percpu::current_cpu_id();
     let blk  = crate::smp::percpu::current_block();
     if blk.is_null() {
-        // percpu not initialised yet — single-CPU early-boot fallback.
         schedule_early();
         return;
     }
@@ -578,14 +527,11 @@ pub fn schedule() {
 
     let now = crate::time::clock::monotonic_ns();
 
-    // Account for the current task's runtime before switching away.
     let prev_task = blk.current_task;
     if !prev_task.is_null() {
         let prev = unsafe { &mut *prev_task };
         let elapsed = now.saturating_sub(blk.runqueue.curr_vruntime_start);
         if prev.sched.policy == SchedPolicy::Normal && prev.sched.weight > 0 {
-            // vruntime delta = elapsed * NICE0_WEIGHT / weight
-            // (heavier tasks accumulate vruntime more slowly)
             let delta_vruntime = elapsed * NICE0_WEIGHT / prev.sched.weight;
             prev.sched.vruntime = prev.sched.vruntime.saturating_add(delta_vruntime);
         }
@@ -593,24 +539,19 @@ pub fn schedule() {
             prev.sched.dl_remaining = prev.sched.dl_remaining.saturating_sub(elapsed);
         }
 
-        // Re-enqueue the previous task if it is still runnable.
         let prev_pid   = prev.pid;
         let prev_state = with_proc(prev_pid, |p| p.state).unwrap_or(crate::proc::process::State::Zombie);
         if prev_state == crate::proc::process::State::Running
             || prev_state == crate::proc::process::State::Ready
         {
-            // Transition to Ready so the scheduler can pick it again.
             with_proc_mut(prev_pid, |p| p.state = crate::proc::process::State::Ready);
             blk.runqueue.enqueue(prev_task);
         }
     }
 
-    // Pick the best next task.
     let next_task = match blk.runqueue.dequeue_next() {
         Some(t) => t,
         None    => {
-            // Nothing to run: idle.  Clear current_task so current_pid()
-            // returns 0 (idle sentinel).
             blk.current_task = core::ptr::null_mut();
             if cpu == 0 {
                 CURRENT_PID.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -625,27 +566,17 @@ pub fn schedule() {
     blk.current_task = next_task;
     blk.ctx_switches += 1;
 
-    // Update the BSP-0 legacy atomic so early-boot callers on CPU 0 see
-    // the correct PID without needing percpu.
     if cpu == 0 {
         CURRENT_PID.store(next.pid, core::sync::atomic::Ordering::Relaxed);
     }
 
-    // Perform the actual register save/restore context switch.
-    // `switch` saves the caller's registers into `prev_task` (if non-null)
-    // and restores from `next_task`.  On RISC-V this is ra/sp/s0-s11;
-    // on x86_64 it is rsp/rbp/rbx/r12-r15 + the kernel stack pointer.
     if !prev_task.is_null() && prev_task != next_task {
         unsafe { crate::proc::context::switch(prev_task, next_task); }
     } else if prev_task.is_null() {
         unsafe { crate::proc::context::restore(next_task); }
     }
-    // If prev == next there is nothing to switch.
 }
 
-/// Early-boot single-CPU schedule path used before percpu storage is live.
-/// Mirrors the old naive implementation: scans PROCS for the first Ready
-/// task and marks it Running.
 fn schedule_early() {
     let mut procs = PROCS.lock();
     let next_pid_val = procs.iter()
@@ -658,36 +589,21 @@ fn schedule_early() {
     }
 }
 
-// ── Tick handler (called from IRQ context) ────────────────────────────────────
-
-/// Called once per timer interrupt on `cpu`.
-///
-/// Responsibilities:
-///   1. Increment `tick_count`.
-///   2. Replenish any DEADLINE task whose period has elapsed.
-///   3. For SCHED_RR: if the current task has run for a full quantum,
-///      preempt it by re-enqueuing and calling `schedule()`.
-///   4. Every `BALANCE_TICKS`: run `load_balance`.
 pub fn tick(cpu: u32) {
     let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu as usize] };
     blk.runqueue.tick_count += 1;
     let now = crate::time::clock::monotonic_ns();
 
-    // ── DEADLINE replenishment ────────────────────────────────────────────────
-    // Walk all processes: any DL task whose replenishment time has arrived
-    // gets its budget refilled and re-inserted with a fresh absolute deadline.
     {
         let mut procs = PROCS.lock();
         for p in procs.iter_mut() {
             if p.sched.policy != SchedPolicy::Deadline { continue; }
             if p.sched.dl_remaining > 0 { continue; }
             if now < p.sched.dl_next_replenish { continue; }
-            // Replenish: advance by one period.
             let period = p.sched.dl_period;
             p.sched.dl_remaining        = p.sched.dl_runtime;
             p.sched.dl_abs_deadline     = now + p.sched.dl_deadline;
             p.sched.dl_next_replenish   = now + period;
-            // If the task is blocked waiting for replenishment, wake it.
             if p.state == crate::proc::process::State::Blocked {
                 p.state = crate::proc::process::State::Ready;
                 let task = p.task as *mut Task;
@@ -698,44 +614,29 @@ pub fn tick(cpu: u32) {
         }
     }
 
-    // ── SCHED_RR quantum expiry ───────────────────────────────────────────────
-    // If the current task is SCHED_RR, check whether it has run for an
-    // entire TICK_NS quantum.  If so, re-enqueue it at the back of its
-    // priority band so the next RR peer gets a turn.
     let curr = blk.current_task;
     if !curr.is_null() {
         let t = unsafe { &mut *curr };
         if t.sched.policy == SchedPolicy::Rr {
             let elapsed = now.saturating_sub(blk.runqueue.curr_vruntime_start);
             if elapsed >= TICK_NS {
-                // Yield the quantum: re-enqueue and reschedule.
                 let pid = t.pid;
                 with_proc_mut(pid, |p| p.state = crate::proc::process::State::Ready);
-                // Remove from current position (dequeued by schedule already
-                // in the normal path, but be safe).
                 blk.current_task = core::ptr::null_mut();
                 blk.runqueue.enqueue(curr);
-                drop(blk); // avoid holding mutable reference across schedule()
+                drop(blk);
                 schedule();
                 return;
             }
         }
     }
 
-    // ── Load balance ─────────────────────────────────────────────────────────
     if blk.runqueue.tick_count % BALANCE_TICKS == 0 {
         drop(blk);
         load_balance(cpu);
     }
 }
 
-// ── Load balancer ─────────────────────────────────────────────────────────────
-
-/// Pull one task from the busiest CPU onto `this_cpu` when the load
-/// imbalance exceeds 25%.
-///
-/// Skips DEADLINE tasks (they have hard timing constraints and must not
-/// be migrated here) and tasks whose affinity mask excludes `this_cpu`.
 fn load_balance(this_cpu: u32) {
     let ncpus = crate::smp::percpu::cpu_count();
     if ncpus <= 1 { return; }
@@ -756,7 +657,6 @@ fn load_balance(this_cpu: u32) {
     let this_load = unsafe {
         crate::smp::percpu::PERCPU_BLOCKS[this_cpu as usize].runqueue.load_weight
     };
-    // Only migrate if the imbalance is > 25%.
     if max_load <= this_load + this_load / 4 { return; }
 
     let busy_blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[busiest_cpu as usize] };
@@ -765,7 +665,6 @@ fn load_balance(this_cpu: u32) {
     if let Some(task) = busy_blk.runqueue.dequeue_next() {
         let t = unsafe { &mut *task };
         if t.sched.policy == SchedPolicy::Deadline || !t.sched.cpu_allowed(this_cpu) {
-            // Cannot migrate — put it back.
             busy_blk.runqueue.enqueue(task);
             return;
         }
