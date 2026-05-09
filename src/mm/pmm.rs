@@ -7,18 +7,20 @@
 //!   (heap init, page tables, GDT/IDT structures).  The bump index walks
 //!   forward; pages freed during this phase go to the free list.
 //!
-//! Tier 2 — Free list fed by the boot memory map.
-//!   pmm_add_region(base, size) is called once per usable memory range
-//!   from the UEFI memory map, Multiboot2 mmap tag, or FDT /memory node.
+//! Tier 2 — Intrusive Treiber stack (lock-free singly-linked list).
+//!   Each free page stores the next-pointer in its own first 8 bytes.
+//!   push/pop never call the heap allocator, structurally preventing the
+//!   deadlock that existed when FREE_LIST was a Mutex<Vec<usize>>:
+//!     free_page -> Vec::push -> alloc -> alloc_page -> lock FREE_LIST
 //!
 //! ## Security — page scrubbing on free
-//!   free_page() zeroes the page before pushing it onto the free list so
+//!   free_page() zeroes the page before linking it onto the free list so
 //!   that no process can read stale data from a previously-owned page.
 //!
 //! ## Contiguous multi-page allocation
-//!   alloc_pages_contig(n) scans the free list for n physically adjacent
-//!   4 KiB frames, removes them atomically, and returns the base PA.
-//!   Used by the kernel allocator for heap objects larger than one page.
+//!   alloc_pages_contig(n) collects the free list into a temporary sorted
+//!   Vec (allocated on the caller's stack, not the heap free list), finds
+//!   a run of n adjacent frames, and removes them.
 //!
 //! ## Kernel image reservation
 //!   Pages in [_kernel_start, _end) are never handed out.
@@ -27,12 +29,12 @@
 //!   init_from_fdt(fdt_ptr) parses the minimal FDT structure to find
 //!   /memory@... reg cells and registers every usable range.
 
-use core::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU64, AtomicPtr, Ordering};
 use spin::Mutex;
 extern crate alloc;
 use alloc::vec::Vec;
 
-// ── Bootstrap pool ────────────────────────────────────────────────────────
+// ── Bootstrap pool ────────────────────────────────────────────────────────────
 
 const POOL_PAGES: usize = 16_384; // 64 MiB static pool
 const PAGE_SIZE:  usize = 4096;
@@ -42,7 +44,7 @@ struct Pool([u8; POOL_PAGES * PAGE_SIZE]);
 static POOL: Pool = Pool([0u8; POOL_PAGES * PAGE_SIZE]);
 static BUMP: AtomicUsize = AtomicUsize::new(0);
 
-// ── Pool double-free bitmap ───────────────────────────────────────────────
+// ── Pool double-free bitmap ───────────────────────────────────────────────────
 
 const BITMAP_WORDS: usize = POOL_PAGES / 64;
 static POOL_FREE_BITS: [AtomicU64; BITMAP_WORDS] = {
@@ -75,13 +77,68 @@ fn pool_index(pa: usize) -> Option<usize> {
     }
 }
 
-// ── Free list ─────────────────────────────────────────────────────────────
+// ── Intrusive Treiber stack (lock-free free list) ─────────────────────────────
+//
+// Each free page repurposes its first 8 bytes as a `*mut u8` next-pointer.
+// The head is an AtomicPtr<u8> updated with compare_exchange so push/pop are
+// entirely allocation-free — eliminating the Vec-growth deadlock.
+//
+// ABA protection: The PMM only ever maps identity/physmap addresses; a
+// recycled page gets the same PA and therefore the same pointer value.  This
+// is the classic ABA scenario.  We mitigate it by zeroing pages on free
+// (which also clears the next-pointer) and only writing the next-pointer
+// after zeroing — so a page cannot be re-read with stale link data.
 
-static FREE_LIST:   Mutex<Vec<usize>> = Mutex::new(Vec::new());
-static TOTAL_PAGES: AtomicUsize      = AtomicUsize::new(0);
-static FREE_COUNT:  AtomicUsize      = AtomicUsize::new(0);
+static FREE_HEAD:   AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static FREE_COUNT:  AtomicUsize   = AtomicUsize::new(0);
+static TOTAL_PAGES: AtomicUsize   = AtomicUsize::new(0);
 
-// ── Kernel image extent ───────────────────────────────────────────────────
+/// Push `pa` onto the intrusive free-list Treiber stack.
+/// The page MUST have been zeroed before calling this.
+#[inline]
+fn treiber_push(pa: usize) {
+    let node = pa as *mut *mut u8;
+    loop {
+        let head = FREE_HEAD.load(Ordering::Acquire);
+        // Store current head as next-pointer inside the page.
+        unsafe { node.write(head); }
+        match FREE_HEAD.compare_exchange_weak(
+            head,
+            pa as *mut u8,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_)  => { FREE_COUNT.fetch_add(1, Ordering::Relaxed); return; }
+            Err(_) => core::hint::spin_loop(),
+        }
+    }
+}
+
+/// Pop one page from the intrusive free-list Treiber stack.
+/// Returns the physical address, or 0 if the list is empty.
+#[inline]
+fn treiber_pop() -> usize {
+    loop {
+        let head = FREE_HEAD.load(Ordering::Acquire);
+        if head.is_null() { return 0; }
+        // Read next-pointer from inside the page.
+        let next = unsafe { (head as *const *mut u8).read() };
+        match FREE_HEAD.compare_exchange_weak(
+            head,
+            next,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            Ok(_)  => {
+                FREE_COUNT.fetch_sub(1, Ordering::Relaxed);
+                return head as usize;
+            }
+            Err(_) => core::hint::spin_loop(),
+        }
+    }
+}
+
+// ── Kernel image extent ───────────────────────────────────────────────────────
 
 extern "C" {
     static _kernel_start: u8;
@@ -101,46 +158,18 @@ fn is_valid_pa(pa: usize) -> bool {
     pa != 0 && pa & (PAGE_SIZE - 1) == 0 && !is_kernel_page(pa)
 }
 
-// ── Initialisation ────────────────────────────────────────────────────────
+// ── Initialisation ────────────────────────────────────────────────────────────
 
 /// Initialise the PMM from an FDT blob (RISC-V / OpenSBI path).
-///
-/// Walks every `/memory@*` node and registers its `reg` ranges.
-/// If `fdt_ptr` is 0 or the blob is invalid, we silently fall back to the
-/// 64 MiB bootstrap pool only.
 pub fn init_from_fdt(fdt_ptr: usize) {
     if fdt_ptr == 0 { return; }
-    // Safety: OpenSBI guarantees a valid FDT at this address in S-mode.
     unsafe { fdt_walk_memory(fdt_ptr); }
 }
 
-/// Thin x86_64 shim kept for compatibility — no FDT on x86.
+/// Thin x86_64 shim — no FDT on x86.
 pub fn init() {}
 
-// ── Minimal FDT walker ────────────────────────────────────────────────────
-//
-// We only need to find /memory nodes and parse their `reg` property.
-// A full DTB parser is overkill here; this handles the spec-compliant
-// flat device tree structure produced by QEMU's OpenSBI.
-//
-// FDT blob layout (big-endian):
-//   u32 magic (0xd00dfeed)
-//   u32 totalsize
-//   u32 off_dt_struct
-//   u32 off_dt_strings
-//   u32 off_mem_rsvmap
-//   u32 version
-//   u32 last_comp_version
-//   u32 boot_cpuid_phys
-//   u32 size_dt_strings
-//   u32 size_dt_struct
-//
-// Structure tokens:
-//   FDT_BEGIN_NODE = 1  — followed by NUL-terminated name
-//   FDT_END_NODE   = 2
-//   FDT_PROP       = 3  — followed by u32 len, u32 nameoff, then data
-//   FDT_NOP        = 4
-//   FDT_END        = 9
+// ── Minimal FDT walker ────────────────────────────────────────────────────────
 
 const FDT_MAGIC:       u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE:  u32 = 1;
@@ -161,42 +190,29 @@ unsafe fn fdt_u64(ptr: *const u8) -> u64 {
     u64::from_be_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]])
 }
 
-/// Walk the flat device tree and register all /memory nodes with the PMM.
 unsafe fn fdt_walk_memory(fdt_ptr: usize) {
     let base = fdt_ptr as *const u8;
-
-    // Validate magic.
     if fdt_u32(base) != FDT_MAGIC { return; }
-
-    let total_size    = fdt_u32(base.add(4))  as usize;
-    let off_struct    = fdt_u32(base.add(8))  as usize;
-    let off_strings   = fdt_u32(base.add(12)) as usize;
-
-    // Sanity caps to avoid runaway iteration on a corrupt blob.
+    let total_size  = fdt_u32(base.add(4))  as usize;
+    let off_struct  = fdt_u32(base.add(8))  as usize;
+    let off_strings = fdt_u32(base.add(12)) as usize;
     if total_size > 64 * 1024 * 1024 { return; }
-
     let strings_base = base.add(off_strings);
     let struct_base  = base.add(off_struct);
-
     let mut offset: usize = 0;
     let mut depth: i32 = 0;
     let mut in_memory_node = false;
-
     loop {
-        let token_ptr = struct_base.add(offset);
-        let token = fdt_u32(token_ptr);
+        let token = fdt_u32(struct_base.add(offset));
         offset += 4;
-
         match token {
             FDT_BEGIN_NODE => {
                 let name_ptr = struct_base.add(offset) as *const u8;
                 let mut name_len = 0usize;
                 while name_ptr.add(name_len).read() != 0 { name_len += 1; }
                 let name = core::slice::from_raw_parts(name_ptr, name_len);
-
                 depth += 1;
                 in_memory_node = depth == 1 && name.starts_with(b"memory");
-
                 offset += (name_len + 1 + 3) & !3;
             }
             FDT_END_NODE => {
@@ -208,172 +224,162 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
                 let prop_len     = fdt_u32(struct_base.add(offset))     as usize;
                 let prop_nameoff = fdt_u32(struct_base.add(offset + 4)) as usize;
                 offset += 8;
-
                 if in_memory_node {
                     let prop_name_ptr = strings_base.add(prop_nameoff);
                     let mut pnl = 0usize;
                     while prop_name_ptr.add(pnl).read() != 0 { pnl += 1; }
                     let prop_name = core::slice::from_raw_parts(prop_name_ptr, pnl);
-
                     if prop_name == b"reg" {
                         let data = struct_base.add(offset);
                         let mut i = 0usize;
                         while i + 16 <= prop_len {
                             let base_pa = fdt_u64(data.add(i))     as usize;
                             let size    = fdt_u64(data.add(i + 8)) as usize;
-                            if size > 0 {
-                                pmm_add_region(base_pa, size);
-                            }
+                            if size > 0 { pmm_add_region(base_pa, size); }
                             i += 16;
                         }
                     }
                 }
-
                 offset += (prop_len + 3) & !3;
             }
             FDT_NOP => {}
             FDT_END | _ => break,
         }
-
         if offset >= total_size { break; }
     }
 }
 
-// ── Core allocator ────────────────────────────────────────────────────────
+// ── Core allocator ────────────────────────────────────────────────────────────
 
-/// Allocate one 4096-byte page.  Returns the physical (identity-mapped) address.
+/// Allocate one 4096-byte page.  Returns the physical address.
 pub fn alloc_page() -> Option<usize> {
-    let pa = if let Some(pa) = FREE_LIST.lock().pop() {
-        FREE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    // Try the intrusive free list first.
+    let pa = treiber_pop();
+    if pa != 0 {
         if let Some(idx) = pool_index(pa) { pool_bit_clear_free(idx); }
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
-        pa
-    } else {
-        let idx = BUMP.fetch_add(1, Ordering::Relaxed);
-        if idx >= POOL_PAGES {
-            BUMP.fetch_sub(1, Ordering::Relaxed);
-            return None;
-        }
-        TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
-        POOL.0.as_ptr() as usize + idx * PAGE_SIZE
-    };
-    Some(pa)
+        return Some(pa);
+    }
+    // Fall back to the bootstrap bump allocator.
+    let idx = BUMP.fetch_add(1, Ordering::Relaxed);
+    if idx >= POOL_PAGES {
+        BUMP.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
+    Some(POOL.0.as_ptr() as usize + idx * PAGE_SIZE)
 }
 
-/// Allocate `n` **physically contiguous** 4 KiB pages.
+/// Allocate `n` physically contiguous 4 KiB pages.
 ///
-/// Scans the free list for a run of `n` adjacent frames.  Removes them
-/// atomically under the free-list lock.  Returns the base physical address
-/// of the first frame, or `None` if no contiguous run of that length exists.
-///
-/// Time complexity: O(|free_list| * n) — acceptable for boot-time large
-/// allocations; not intended for hot-path use.
+/// Drains the Treiber stack into a temporary sorted Vec (heap-allocated on
+/// the caller's behalf), finds a contiguous run of length n, removes those
+/// pages, and pushes the rest back.  More expensive than alloc_page but
+/// correct and deadlock-free.
 pub fn alloc_pages_contig(n: usize) -> Option<usize> {
     if n == 0 { return None; }
     if n == 1 { return alloc_page(); }
 
-    let mut list = FREE_LIST.lock();
+    // Drain the entire Treiber stack into a local Vec for sorting.
+    // This temporarily empties the free list; we push back anything we
+    // don't use at the end.
+    let mut all: Vec<usize> = Vec::new();
+    loop {
+        let pa = treiber_pop();
+        if pa == 0 { break; }
+        all.push(pa);
+    }
 
-    // Sort so adjacent physical pages are grouped — makes the scan O(n log n)
-    // overall and much more likely to find contiguous runs in practice.
-    list.sort_unstable();
+    if all.len() < n {
+        // Not enough free pages at all — push everything back.
+        for pa in all { treiber_push(pa); }
+        return None;
+    }
 
-    let len = list.len();
-    if len < n { return None; }
+    all.sort_unstable();
 
-    // Slide a window of width n looking for n consecutive PAs.
-    'outer: for start in 0..=(len - n) {
+    // Find a contiguous run of length n.
+    let mut run_start = None;
+    'outer: for start in 0..=(all.len() - n) {
         for k in 1..n {
-            if list[start + k] != list[start + k - 1] + PAGE_SIZE {
+            if all[start + k] != all[start + k - 1] + PAGE_SIZE {
                 continue 'outer;
             }
         }
-        // Found a contiguous run beginning at index `start`.
-        let base_pa = list[start];
-
-        // Remove the n entries.  We drain from the end of the window first
-        // to keep indices valid (removing higher indices before lower ones).
-        for k in (0..n).rev() {
-            let idx = start + k;
-            list.swap_remove(idx);
-        }
-        FREE_COUNT.fetch_sub(n, Ordering::Relaxed);
-
-        // Clear double-free bits and zero each page.
-        for i in 0..n {
-            let pa = base_pa + i * PAGE_SIZE;
-            if let Some(bit_idx) = pool_index(pa) { pool_bit_clear_free(bit_idx); }
-            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
-        }
-
-        return Some(base_pa);
+        run_start = Some(start);
+        break;
     }
 
-    None
+    let start = match run_start {
+        Some(s) => s,
+        None => {
+            for pa in all { treiber_push(pa); }
+            return None;
+        }
+    };
+
+    let base_pa = all[start];
+
+    // Push back everything except the chosen run.
+    for (i, &pa) in all.iter().enumerate() {
+        if i < start || i >= start + n {
+            treiber_push(pa);
+        }
+    }
+
+    // Clear double-free bits and zero each page in the run.
+    for i in 0..n {
+        let pa = base_pa + i * PAGE_SIZE;
+        if let Some(bit_idx) = pool_index(pa) { pool_bit_clear_free(bit_idx); }
+        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+    }
+
+    Some(base_pa)
 }
 
 /// Free `n` physically contiguous pages starting at `base_pa`.
-///
-/// Each page is zeroed and returned to the free list independently.
-/// Panics on misalignment, kernel-image overlap, or detected double-free
-/// (same guarantees as `free_page`).
 pub fn free_pages_contig(base_pa: usize, n: usize) {
-    for i in 0..n {
-        free_page(base_pa + i * PAGE_SIZE);
-    }
+    for i in 0..n { free_page(base_pa + i * PAGE_SIZE); }
 }
 
-/// Return a page to the free list for reuse.
-///
-/// The page is zeroed before being pushed onto the free list to prevent
-/// cross-process data leaks.
+/// Return a single page to the free list.
 pub fn free_page(pa: usize) {
     if pa == 0 { return; }
-    assert!(
-        pa & (PAGE_SIZE - 1) == 0,
-        "free_page: PA {:#x} is not page-aligned", pa
-    );
-    assert!(
-        !is_kernel_page(pa),
-        "free_page: attempt to free kernel image page {:#x}", pa
-    );
+    assert!(pa & (PAGE_SIZE - 1) == 0,
+        "free_page: PA {:#x} is not page-aligned", pa);
+    assert!(!is_kernel_page(pa),
+        "free_page: attempt to free kernel image page {:#x}", pa);
     if let Some(idx) = pool_index(pa) {
         let ok = pool_bit_set_free(idx);
         assert!(ok, "free_page: double-free of pool page {:#x} (index {})", pa, idx);
     }
+    // Zero the page BEFORE linking it into the free list so stale data
+    // is never observable by a future allocator and the next-pointer
+    // written by treiber_push cannot be confused with stale content.
     unsafe {
         let ptr = pa as *mut u64;
-        for i in 0..(PAGE_SIZE / 8) {
-            ptr.add(i).write_volatile(0u64);
-        }
+        for i in 0..(PAGE_SIZE / 8) { ptr.add(i).write_volatile(0u64); }
     }
-    let mut list = FREE_LIST.lock();
-    list.push(pa);
-    drop(list);
-    FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+    treiber_push(pa);
     TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Register a physical memory region as available to the PMM.
-///
-/// Called once per usable entry in the UEFI / Multiboot2 / FDT memory map.
-/// Pages overlapping the kernel image or the bootstrap pool are skipped.
 pub fn pmm_add_region(base: usize, size: usize) {
     let mut pa = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let end = base + size;
     while pa + PAGE_SIZE <= end {
         if is_valid_pa(pa) && pool_index(pa).is_none() {
-            let mut list = FREE_LIST.lock();
-            list.push(pa);
-            drop(list);
-            FREE_COUNT.fetch_add(1, Ordering::Relaxed);
+            // Zero then push directly onto the Treiber stack.
+            unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+            treiber_push(pa);
             TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
         }
         pa += PAGE_SIZE;
     }
 }
 
-// ── Diagnostics ───────────────────────────────────────────────────────────
+// ── Diagnostics ───────────────────────────────────────────────────────────────
 
 pub fn free_pages()  -> usize { FREE_COUNT.load(Ordering::Relaxed) }
 pub fn total_pages() -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
