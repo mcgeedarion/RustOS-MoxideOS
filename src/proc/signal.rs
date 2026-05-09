@@ -88,6 +88,10 @@ const CLD_EXITED:  i32 = 1;
 const CLD_KILLED:  i32 = 2;
 const SEGV_MAPERR: i32 = 1;
 
+// SI_USER: signal sent by kill(2), raise(3), or similar userspace call.
+// Linux sets si_code = SI_USER (0) for signals sent via kill/tgkill/tkill.
+const SI_USER: i32 = 0;
+
 // ── Signal storage ─────────────────────────────────────────────────────────────────────
 
 static PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
@@ -127,9 +131,72 @@ pub struct SignalHandlers {
 
 // ── Public API ─────────────────────────────────────────────────────────────────────────
 
+/// Kernel-internal signal delivery — always succeeds, never quota-checked.
+///
+/// Use for: hardware faults (SIGSEGV, SIGBUS, SIGFPE), job-control signals
+/// (SIGCHLD), timer expiry (SIGALRM), and kernel-enforcement signals
+/// (SIGXCPU, SIGXFSZ, SIGKILL from RLIMIT_RTTIME / RLIMIT_CPU).
+///
+/// Do NOT call this from syscall paths where the signal originates from
+/// a userspace request (kill, tgkill, tkill, sigqueue) — use
+/// `send_signal_user` instead so RLIMIT_SIGPENDING is enforced.
 pub fn send_signal(pid: usize, sig: i32) -> isize {
     if sig <= 0 || sig > 64 { return -22; } // EINVAL
     send_signal_info(pid, SigInfo { sig: sig as u32, code: SI_KERNEL, ..Default::default() });
+    0
+}
+
+/// Userspace-sourced signal delivery — enforces RLIMIT_SIGPENDING.
+///
+/// Called by kill(2), tgkill(2), tkill(2), and rt_sigqueueinfo(2).
+/// Returns:
+///   0       on success
+///   -EINVAL if `sig` is out of range
+///   -EAGAIN if the target process's pending-signal queue has reached the
+///           RLIMIT_SIGPENDING soft limit (matches Linux EAGAIN semantics
+///           for rt_sigqueueinfo; plain kill/tgkill silently drop on Linux
+///           but we follow the stricter rt_sigqueueinfo contract uniformly).
+///
+/// SIGKILL (9) and SIGSTOP (19) are unconditionally delivered — they cannot
+/// be dropped.  This matches Linux: these signals bypass the per-process
+/// queue and are never subject to RLIMIT_SIGPENDING.
+pub fn send_signal_user(pid: usize, sig: i32) -> isize {
+    if sig <= 0 || sig > 64 { return -22; } // EINVAL
+
+    // SIGKILL / SIGSTOP bypass quota — they must always get through.
+    let bypass = sig == 9 || sig == 19;
+
+    if !bypass {
+        // Count the current queue length for the target process.
+        let queue_len = {
+            let map = PENDING.lock();
+            map.get(&pid).map_or(0, |q| q.len())
+        };
+
+        // Read the soft RLIMIT_SIGPENDING limit for the *target* process.
+        // Linux measures this across the entire user (uid), but we simplify
+        // to per-process — a safe, conservative approximation.
+        let (soft, _hard) = crate::proc::rlimit::getrlimit_for(pid,
+            crate::proc::rlimit::RLIMIT_SIGPENDING);
+
+        let limit = if soft == crate::proc::rlimit::RLIM_INFINITY {
+            usize::MAX
+        } else {
+            soft as usize
+        };
+
+        if queue_len >= limit {
+            return -11; // EAGAIN — queue full
+        }
+    }
+
+    let caller_pid = scheduler::current_pid();
+    send_signal_info(pid, SigInfo {
+        sig:  sig as u32,
+        code: SI_USER,
+        pid:  caller_pid as u32,
+        ..Default::default()
+    });
     0
 }
 
@@ -448,271 +515,4 @@ pub fn sys_rt_sigaction(
             }
         }
         old
-    }).unwrap_or((0, 0, 0));
-
-    if old_act_va != 0 && old_act_va < USER_SPACE_END {
-        let _ = copy_to_user(old_act_va,      &old_handler.to_ne_bytes());
-        let _ = copy_to_user(old_act_va + 8,  &(old_flags as u64).to_ne_bytes());
-        let _ = copy_to_user(old_act_va + 16, &old_restorer.to_ne_bytes());
-        let _ = copy_to_user(old_act_va + 24, &0u64.to_ne_bytes());
-    }
-    0
-}
-
-// ── sys_rt_sigprocmask [NR 14] ──────────────────────────────────────────────────────────────
-
-pub fn sys_rt_sigprocmask(how: u32, set_va: usize, oldset_va: usize, _sz: usize) -> isize {
-    let pid = scheduler::current_pid();
-    let cur = get_sigmask(pid);
-
-    if oldset_va != 0 && oldset_va < USER_SPACE_END {
-        let _ = copy_to_user(oldset_va, &cur.to_ne_bytes());
-    }
-    if set_va == 0 || set_va >= USER_SPACE_END { return 0; }
-
-    let mut set_bytes = [0u8; 8];
-    if copy_from_user(&mut set_bytes, set_va).is_err() { return -14; }
-    let new_set = u64::from_ne_bytes(set_bytes);
-
-    let updated = match how {
-        SIG_BLOCK   => cur | new_set,
-        SIG_UNBLOCK => cur & !new_set,
-        SIG_SETMASK => new_set,
-        _ => return -22,
-    };
-    // SIGKILL (9) and SIGSTOP (19) cannot be masked.
-    set_sigmask(pid, updated & !((1u64 << 9) | (1u64 << 19)));
-    0
-}
-
-// ── Signal frame layout ────────────────────────────────────────────────────────────────────────
-
-const UCONTEXT_SIZE:     usize = 256;
-const SIGINFO_SIZE:      usize = 80;
-const RETADDR_SIZE:      usize = 8;
-const SIGNAL_FRAME_SIZE: usize = UCONTEXT_SIZE + SIGINFO_SIZE + RETADDR_SIZE;
-const GREGS_OFFSET:      usize = 40;
-
-#[inline] fn greg_off(i: usize) -> usize { GREGS_OFFSET + i * 8 }
-
-const REG_R8:      usize = 0;
-const REG_R9:      usize = 1;
-const REG_R10:     usize = 2;
-const REG_R11:     usize = 3;
-const REG_R12:     usize = 4;
-const REG_R13:     usize = 5;
-const REG_R14:     usize = 6;
-const REG_R15:     usize = 7;
-const REG_RDI:     usize = 8;
-const REG_RSI:     usize = 9;
-const REG_RBP:     usize = 10;
-const REG_RBX:     usize = 11;
-const REG_RDX:     usize = 12;
-const REG_RAX:     usize = 13;
-const REG_RCX:     usize = 14;
-const REG_RSP:     usize = 15;
-const REG_RIP:     usize = 16;
-const REG_EFL:     usize = 17;
-const REG_CSGSFS:  usize = 18;
-const REG_OLDMASK: usize = 21;
-const REG_CR2:     usize = 22;
-
-// ── check_pending_signal ─────────────────────────────────────────────────────────────────────
-
-pub fn check_pending_signal(frame: &mut SyscallFrame) {
-    let pid = scheduler::current_pid();
-    if pid == 0 { return; }
-    let mask = get_sigmask(pid);
-
-    let info = {
-        let mut q = PENDING.lock();
-        let queue = match q.get_mut(&pid) { Some(q) => q, None => return };
-
-        // Fast path: front signal is unmasked (the common case).
-        if let Some(front) = queue.front() {
-            if front.sig > 0 && (mask >> front.sig) & 1 == 0 {
-                queue.pop_front().unwrap_or_default()
-            } else {
-                // Slow path: scan for first unmasked signal.
-                let pos = queue.iter().position(|s| s.sig > 0 && (mask >> s.sig) & 1 == 0);
-                match pos {
-                    Some(i) => queue.remove(i).unwrap_or_default(),
-                    None    => return,
-                }
-            }
-        } else {
-            return;
-        }
-    };
-    if info.sig == 0 { return; }
-
-    let (handler_va, sa_flags, restorer) = scheduler::with_proc(pid, |p| (
-        p.signal_handlers.handlers[info.sig as usize],
-        p.signal_handlers.flags[info.sig as usize],
-        p.signal_handlers.restorer,
-    )).unwrap_or((0, 0, 0));
-
-    if handler_va == 0 {
-        match info.sig {
-            17 | 28 => {}
-            _ => { crate::proc::exit::sys_exit(-(info.sig as i32)); }
-        }
-        return;
-    }
-
-    if sa_flags & SA_NODEFER == 0 {
-        set_sigmask(pid, mask | (1u64 << info.sig));
-    }
-
-    let mut sp = frame.rsp;
-    if sa_flags & SA_ONSTACK != 0 {
-        if let Some(alt) = ALTSTACK.lock().get(&pid).copied() {
-            if alt.ss_flags & SS_DISABLE == 0 && alt.ss_size >= 2048 {
-                let alt_hi = alt.ss_sp.wrapping_add(alt.ss_size);
-                if !(frame.rsp >= alt.ss_sp && frame.rsp < alt_hi) {
-                    sp = alt_hi;
-                    if alt.ss_flags & SS_AUTODISARM != 0 {
-                        ALTSTACK.lock().entry(pid)
-                            .and_modify(|a| a.ss_flags |= SS_DISABLE);
-                    }
-                }
-            }
-        }
-    }
-
-    let sp = (sp.wrapping_sub(128).wrapping_sub(SIGNAL_FRAME_SIZE)) & !0xF;
-
-    if !validate_user_ptr(sp, SIGNAL_FRAME_SIZE) {
-        PENDING.lock().entry(pid).or_default().push_front(info);
-        return;
-    }
-
-    let uc_va  = sp;
-    let si_va  = sp + UCONTEXT_SIZE;
-    let ret_va = sp + UCONTEXT_SIZE + SIGINFO_SIZE;
-
-    let mut kframe = [0u8; SIGNAL_FRAME_SIZE];
-
-    kframe[16..24].copy_from_slice(&frame.rsp.to_ne_bytes());
-
-    macro_rules! wgreg {
-        ($idx:expr, $val:expr) => {
-            let off = GREGS_OFFSET + $idx * 8;
-            kframe[off..off+8].copy_from_slice(&($val as u64).to_ne_bytes());
-        };
-    }
-    wgreg!(REG_R8,      frame.r8);
-    wgreg!(REG_R9,      frame.r9);
-    wgreg!(REG_R10,     frame.r10);
-    wgreg!(REG_R11,     frame.r11);
-    wgreg!(REG_R12,     frame.r12);
-    wgreg!(REG_R13,     frame.r13);
-    wgreg!(REG_R14,     frame.r14);
-    wgreg!(REG_R15,     frame.r15);
-    wgreg!(REG_RDI,     frame.rdi);
-    wgreg!(REG_RSI,     frame.rsi);
-    wgreg!(REG_RBP,     frame.rbp);
-    wgreg!(REG_RBX,     frame.rbx);
-    wgreg!(REG_RDX,     frame.rdx);
-    wgreg!(REG_RAX,     frame.rax);
-    wgreg!(REG_RCX,     frame.rcx);
-    wgreg!(REG_RSP,     frame.rsp);
-    wgreg!(REG_RIP,     frame.rip);
-    wgreg!(REG_EFL,     frame.r11);
-    wgreg!(REG_CSGSFS,  0x002B_0033u64);
-    wgreg!(REG_OLDMASK, mask);
-    wgreg!(REG_CR2,     info.addr as u64);
-    kframe[240..248].copy_from_slice(&mask.to_ne_bytes());
-
-    let si = &mut kframe[UCONTEXT_SIZE..UCONTEXT_SIZE + SIGINFO_SIZE];
-    si[0..4].copy_from_slice(&(info.sig as i32).to_ne_bytes());
-    si[8..12].copy_from_slice(&info.code.to_ne_bytes());
-    match info.sig {
-        17 => si[24..28].copy_from_slice(&info.status.to_ne_bytes()),
-        11 | 7 | 8 => si[16..24].copy_from_slice(&info.addr.to_ne_bytes()),
-        _ => {}
-    }
-
-    let ret_addr = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
-        restorer
-    } else {
-        match build_inline_trampoline(sp) {
-            Some(va) => va,
-            None => {
-                PENDING.lock().entry(pid).or_default().push_front(info);
-                return;
-            }
-        }
-    };
-    kframe[UCONTEXT_SIZE + SIGINFO_SIZE..].copy_from_slice(&ret_addr.to_ne_bytes());
-
-    if copy_to_user(sp, &kframe).is_err() {
-        PENDING.lock().entry(pid).or_default().push_front(info);
-        return;
-    }
-
-    frame.rdi = info.sig as usize;
-    frame.rsi = si_va;
-    frame.rdx = uc_va;
-    frame.rip = handler_va;
-    frame.rsp = ret_va;
-}
-
-// ── sys_rt_sigreturn [NR 15] ───────────────────────────────────────────────────────────────
-
-pub fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> isize {
-    let pid = scheduler::current_pid();
-    let uc_va = frame.rsp.wrapping_sub(UCONTEXT_SIZE + SIGINFO_SIZE);
-    if !validate_user_ptr(uc_va, UCONTEXT_SIZE + 8) { return -14; }
-
-    let mut kframe = [0u8; UCONTEXT_SIZE + 8];
-    if copy_from_user(&mut kframe, uc_va).is_err() { return -14; }
-
-    macro_rules! rgreg {
-        ($idx:expr) => {{
-            let off = GREGS_OFFSET + $idx * 8;
-            usize::from_ne_bytes(kframe[off..off+8].try_into().unwrap())
-        }};
-    }
-
-    frame.r8     = rgreg!(REG_R8);
-    frame.r9     = rgreg!(REG_R9);
-    frame.r10    = rgreg!(REG_R10);
-    frame.r11    = rgreg!(REG_EFL);
-    frame.r12    = rgreg!(REG_R12);
-    frame.r13    = rgreg!(REG_R13);
-    frame.r14    = rgreg!(REG_R14);
-    frame.r15    = rgreg!(REG_R15);
-    frame.rdi    = rgreg!(REG_RDI);
-    frame.rsi    = rgreg!(REG_RSI);
-    frame.rbp    = rgreg!(REG_RBP);
-    frame.rbx    = rgreg!(REG_RBX);
-    frame.rdx    = rgreg!(REG_RDX);
-    frame.rax    = rgreg!(REG_RAX);
-    frame.rcx    = rgreg!(REG_RCX);
-    frame.rsp    = rgreg!(REG_RSP);
-    frame.rip    = rgreg!(REG_RIP);
-
-    let old_mask = u64::from_ne_bytes(kframe[240..248].try_into().unwrap());
-    set_sigmask(pid, old_mask);
-    0
-}
-
-// ── Inline trampoline (fallback when SA_RESTORER not set) ──────────────────────────────
-
-fn build_inline_trampoline(sp: usize) -> Option<usize> {
-    // mov rax, 15 (NR_rt_sigreturn); syscall
-    const CODE: [u8; 9] = [0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00, 0x0F, 0x05];
-    let va = sp.wrapping_sub(16);
-    copy_to_user(va, &CODE).ok().map(|_| va)
-}
-
-// ── altstack_clear_pid / proc_name_clear ──────────────────────────────────────────────
-//
-// Called by do_exit to clean up per-pid side tables.
-
-pub fn altstack_clear_pid(pid: usize) {
-    ALTSTACK.lock().remove(&pid);
-    SIGMASK.lock().remove(&pid);
-    PENDING.lock().remove(&pid);
-}
+    }).unwrap_or((0, 
