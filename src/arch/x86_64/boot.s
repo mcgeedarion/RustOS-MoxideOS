@@ -1,6 +1,15 @@
 ; src/arch/x86_64/boot.s
 ; Multiboot2 header + bare-metal _start entry point.
 ; Assembled by nasm (x86_64 ELF64).
+;
+; GRUB2 / `qemu -kernel` enters _start in 32-bit protected mode with:
+;   EAX = 0x36d76289  (multiboot2 magic)
+;   EBX = physical address of the MBI structure
+;
+; We push both registers onto the boot stack and call the Rust shim
+; `multiboot2_entry(magic: u32, info_phys: u32)` which:
+;   1. Saves info_phys into the MBI_PTR static.
+;   2. Calls kernel_main() with no arguments (UEFI / multiboot2 common path).
 
 bits 32                         ; GRUB hands us 32-bit protected mode
 
@@ -25,35 +34,28 @@ mb2_header_start:
 mb2_header_end:
 
 ; ── _start ──────────────────────────────────────────────────────────────────
-; GRUB jumps here in 32-bit protected mode with:
-;   EAX = 0x36d76289  (multiboot2 magic)
-;   EBX = physical address of multiboot2 info struct
-;
-; We set up a small boot stack, save EBX, then jump to kernel_main.
-; kernel_main is a Rust #[no_mangle] extern "C" fn that takes
-;   (mb2_magic: u32, mb2_info_phys: u32).
 
 section .text
 global _start
-extern kernel_main
+extern multiboot2_entry     ; Rust shim: fn(magic: u32, info_phys: u32) -> !
 
 _start:
-    ; Disable interrupts, clear direction flag
+    ; Disable interrupts, clear direction flag.
     cli
     cld
 
-    ; Set up boot stack (defined in x86_64.ld as __boot_stack_top)
+    ; Set up boot stack.
     extern __boot_stack_top
     mov esp, __boot_stack_top
 
     ; Push multiboot2 args: (magic: u32, info_phys: u32)
-    ; EAX = magic, EBX = info ptr  — push right-to-left for C calling conv
+    ; EAX = magic, EBX = MBI physical address — push right-to-left (C cdecl).
     push ebx        ; arg1: info_phys (u32)
-    push eax        ; arg0: magic    (u32)
+    push eax        ; arg0: magic     (u32)
 
-    call kernel_main
+    call multiboot2_entry
 
-    ; kernel_main should never return; halt if it does
+    ; Should never return.
 .hang:
     hlt
     jmp .hang

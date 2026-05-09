@@ -1,7 +1,7 @@
 //! Architecture-independent kernel entry points and init-process launcher.
 //!
 //! Two entry points exist, selected at compile time by target architecture:
-//!   - `kernel_main` (x86_64)   — called from the x86_64 UEFI or multiboot2 stub
+//!   - `kernel_main` (x86_64)   — called from multiboot2_entry() or uefi_start()
 //!   - `kernel_main_riscv64`    — called from the RISC-V SBI stub (boot.rs)
 //!
 //! x86_64 boot sequence:
@@ -18,7 +18,7 @@
 //!
 //! RISC-V boot sequence:
 //!   1. trap_init()       — install stvec, enable SIE (must be first)
-//!   2. init_from_fdt()   — parse FDT /memory nodes → PMM free list
+//!   2. init_from_fdt()   — parse FDT /memory + /chosen → PMM + initramfs range
 //!   3. heap::init()      — slab/linked-list allocator over PMM
 //!   4. time::init()      — calibrate CLINT mtime clocksource, timerfd, itimers
 //!   5. smp::init()       — SBI HSM hart bringup
@@ -30,7 +30,7 @@
 use crate::initramfs;
 
 // ── x86_64 entry ──────────────────────────────────────────────────────────────
-// (unchanged — the real x86_64 path lives in src/arch/x86_64/kernel_main.rs)
+// (The real x86_64 entry lives in src/arch/x86_64/kernel_main.rs)
 
 #[cfg(target_arch = "x86_64")]
 pub fn kernel_main_x86_64() {
@@ -46,16 +46,8 @@ pub fn kernel_main_x86_64() {
     gdt::init();
     idt::init();
     apic::init();
-
-    // Clocksource calibration (TSC / HPET fallback), timerfd table, itimer list.
-    // Must run after the APIC timer is active so TSC calibration has a reference.
     crate::time::init();
-
-    // Bring up application processors.  Requires the heap, GDT, IDT, and APIC
-    // to all be live before any AP executes code.
     crate::smp::init();
-
-    // Initialise the PTY registry and /dev/pts pseudo-filesystem.
     crate::tty::init();
 
     crate::println!("rustos: subsystems initialised");
@@ -70,7 +62,6 @@ pub fn kernel_main_x86_64() {
     };
 
     let cr3 = unsafe { paging::alloc_pml4() };
-
     let loaded = match elf64::load(elf_bytes, cr3) {
         Some(l) => l,
         None => {
@@ -94,13 +85,10 @@ pub fn kernel_main_x86_64() {
     let stack_buf: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut(stack_page_va as *mut u8, PAGE)
     };
-
     let sp = auxv::build_stack(
-        stack_buf, stack_top,
-        &["/init"], &[],
+        stack_buf, stack_top, &["/init"], &[],
         loaded.entry, loaded.phdr_va, loaded.phdr_count, loaded.phdr_size,
     );
-
     crate::println!("rustos: jumping to /init entry={:#x} sp={:#x}", loaded.entry, sp);
     unsafe { uentry::jump_to_user(loaded.entry, sp, cr3); }
 }
@@ -121,8 +109,11 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
 
     crate::println!("rustos: riscv64 kernel starting (hart {})", hart_id);
 
-    // 2. Register real RAM from the FDT so the PMM free list is populated.
-    pmm::init_from_fdt(fdt_ptr);
+    // 2. Walk the FDT: registers /memory regions with PMM and records the
+    //    initramfs range from /chosen linux,initrd-start/end.
+    //    This replaces the old pmm::init_from_fdt() stub and must come before
+    //    heap::init() so the PMM free list is populated first.
+    unsafe { crate::arch::riscv64::fdt::init_from_fdt(fdt_ptr); }
     crate::println!(
         "pmm: {} MiB total, {} MiB free",
         pmm::total_pages() * 4 / 1024,
@@ -132,20 +123,19 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     // 3. Heap over the real PMM.
     heap::init();
 
-    // 4. Timekeeping: calibrate CLINT mtime, set clocksource, init timerfd/itimer
-    //    tables.  Replaces the bare clint::init() call — time::init() calls it
-    //    internally under the ClintMtime path.
+    // 4. Timekeeping.
     crate::time::init();
 
     // 5. Bring up additional harts via SBI HSM.
     crate::smp::init();
 
-    // 6. Initialise the PTY registry and /dev/pts pseudo-filesystem.
+    // 6. PTY registry + /dev/pts.
     crate::tty::init();
 
     crate::println!("rustos: riscv64 subsystems initialised");
 
     // 7. Load /init and jump to userspace.
+    //    initramfs::load() will use the range set by init_from_fdt() above.
     let initramfs = initramfs::load();
     let elf_bytes = match initramfs.file("/init") {
         Some(b) => b,
@@ -156,7 +146,6 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     };
 
     let satp_ppn = unsafe { paging::alloc_root_page_table() };
-
     let loaded = match elf64::load(elf_bytes, satp_ppn) {
         Some(l) => l,
         None => {
@@ -180,13 +169,10 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     let stack_buf: &mut [u8] = unsafe {
         core::slice::from_raw_parts_mut(stack_page_va as *mut u8, PAGE)
     };
-
     let sp = auxv::build_stack(
-        stack_buf, stack_top,
-        &["/init"], &[],
+        stack_buf, stack_top, &["/init"], &[],
         loaded.entry, loaded.phdr_va, loaded.phdr_count, loaded.phdr_size,
     );
-
     crate::println!("rustos: jumping to /init entry={:#x} sp={:#x}", loaded.entry, sp);
     unsafe { uentry::jump_to_user(loaded.entry, sp, satp_ppn); }
 }

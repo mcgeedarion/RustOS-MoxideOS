@@ -1,5 +1,5 @@
-//! Kernel entry point — called from _start (Multiboot2) or uefi_start (UEFI)
-//! after the CPU is in 64-bit long mode with interrupts disabled.
+//! Kernel entry point — called from multiboot2_entry() or uefi_start() after
+//! the CPU is in 64-bit long mode with interrupts disabled.
 //!
 //! ## Boot sequence
 //!   0.  heap_init()                  — global allocator (must precede any alloc::)
@@ -7,7 +7,7 @@
 //!   2.  idt_init()                   — IDT exception/IRQ vectors
 //!   3.  syscall_setup()              — SYSCALL/SYSRET MSRs
 //!   4.  serial::init()               — COM1 UART early console
-//!   5.  memmap_init()                — Phase 2: feed real RAM ranges to PMM
+//!   5.  memmap_init() + parse_mbi()  — Phase 2: feed real RAM to PMM; walk MBI
 //!   6.  xsave_init()                 — XSAVE/FXSAVE feature detection
 //!   7.  acpi_init()                  — RSDP → MADT: CPU list, I/O APIC
 //!   8.  pcie_init()                  — Phase 1: PCIe bus enumeration + BAR assignment
@@ -20,13 +20,11 @@
 //!  15.  idle loop
 //!
 //! ## initramfs discovery
-//!   Multiboot2 path: boot.s saves EBX (MBI pointer) into `MBI_PTR` before
-//!   calling kernel_main; memmap_init() calls `multiboot2::parse_mbi()` which
-//!   walks module tags and calls `initramfs::set_initramfs_range()`.
+//!   Multiboot2 path: multiboot2_entry() saves EBX into MBI_PTR; at step 5,
+//!   parse_mbi(MBI_PTR) walks module tags → set_initramfs_range().
 //!
-//!   UEFI path: `uefi_entry::uefi_start()` scans the EFI config table for
-//!   `EFI_INITRD_MEDIA_GUID` and calls `initramfs::set_initramfs_range()`
-//!   before ExitBootServices.
+//!   UEFI path: uefi_start() scans the EFI config table for
+//!   EFI_INITRD_MEDIA_GUID → set_initramfs_range() before ExitBootServices.
 //!
 //! ## CI sentinels
 //!   "rustos: kernel_main reached"  — boot smoke test
@@ -49,9 +47,24 @@ use crate::proc::exec::spawn_user_process;
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
 /// Physical address of the Multiboot2 Information structure.
-/// Set by boot.s before calling kernel_main (multiboot2 boot path only).
+/// Set by multiboot2_entry() before kernel_main() is called.
 /// Zero when booted via UEFI.
 pub static mut MBI_PTR: usize = 0;
+
+/// Multiboot2 entry shim — called by boot.s with (magic: u32, info_phys: u32).
+///
+/// Saves the MBI physical address so that kernel_main can find it after
+/// serial is up, then falls straight through to the common kernel_main.
+///
+/// # Safety
+/// Called once by boot.s with EAX / EBX as passed by GRUB2 / QEMU -kernel.
+#[no_mangle]
+pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
+    if magic == 0x36d7_6289 {
+        MBI_PTR = info_phys as usize;
+    }
+    kernel_main()
+}
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
@@ -66,7 +79,7 @@ pub extern "C" fn kernel_main() -> ! {
     // 4. Serial console.
     serial::init();
 
-    // ── CI sentinels ─────────────────────────────────────────────────────────
+    // ── CI sentinels ────────────────────────────────────────────────────────
     serial_println!("rustos: kernel_main reached");
     serial_println!("TEST PASS: uart_smoke");
     {
@@ -78,21 +91,19 @@ pub extern "C" fn kernel_main() -> ! {
     }
     serial_println!("TEST PASS: alloc_smoke");
     serial_println!("TEST PASS: trap_smoke");
-    // ──────────────────────────────────────────────────────────────
+    // ────────────────────────────────────────────────────────────────────────
 
     serial_println!("rustos: booting");
 
     // 5. Phase 2: feed real memory map to PMM.
-    //    Multiboot2 path: also parses module tags → set_initramfs_range().
-    //    UEFI path:       set_initramfs_range() was already called by uefi_start.
+    //    Then walk the MBI (multiboot2 path) for module tags → set_initramfs_range.
+    //    UEFI path: set_initramfs_range() was already called by uefi_start.
     crate::mm::memmap::memmap_init();
 
-    // Multiboot2 path: if MBI_PTR was set by boot.s, walk it for
-    // module tags (initrd) and the memory map.
     let mbi = unsafe { MBI_PTR };
     if mbi != 0 {
         unsafe { crate::arch::x86_64::multiboot2::parse_mbi(mbi); }
-        serial_println!("mb2: MBI parsed, initramfs range set");
+        serial_println!("mb2: MBI at {:#x} parsed", mbi);
     }
 
     // 6. FP state.
@@ -119,10 +130,10 @@ pub extern "C" fn kernel_main() -> ! {
     }
 
     // 12. Mount CPIO initramfs into the VFS ramfs.
-    //     Must be after heap_init() (step 0) and set_initramfs_range() (step 5/UEFI).
+    //     Must be after heap_init() and set_initramfs_range().
     crate::fs::initramfs::mount_initramfs();
 
-    // 13. Mount root filesystem (ext2 over block device, or ramfs-only).
+    // 13. Mount root filesystem.
     let disk_ok = if ahci_found {
         let mut buf = [0u8; 512];
         crate::drivers::ahci::ahci_read_sector(0, 0, &mut buf)
