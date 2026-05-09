@@ -6,20 +6,11 @@
 use crate::proc::scheduler::{SchedPolicy, NICE0_WEIGHT};
 
 // Re-export so syscall/sched.rs can call it via the public path.
-/// Public wrapper around the internal `nice_to_weight` function.
+/// Delegate to the canonical implementation in `scheduler::nice_to_weight`.
+/// Having a single definition prevents the two copies from diverging (M3).
+#[inline]
 pub fn nice_to_weight_pub(nice: i8) -> u64 {
-    let n = nice.clamp(-20, 19) as i64;
-    let base: u64 = 1024;
-    if n == 0 { return base; }
-    if n > 0 {
-        let mut w = base;
-        for _ in 0..n { w = w * 4 / 5; }
-        w.max(1)
-    } else {
-        let mut w = base;
-        for _ in 0..(-n) { w = w * 5 / 4; }
-        w
-    }
+    crate::proc::scheduler::nice_to_weight(nice)
 }
 
 /// Admission test for a new SCHED_DEADLINE task on `cpu`.

@@ -4,7 +4,7 @@ use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::proc::scheduler;
 
 /// sys_nanosleep(req_va, rem_va)  [NR 35]
-pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
+pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
     // Read `struct timespec { tv_sec: i64, tv_nsec: i64 }` from user.
     let mut buf = [0u8; 16];
     if copy_from_user(&mut buf, req_va).is_err() { return -14; } // EFAULT
@@ -23,7 +23,8 @@ pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
     if sec > 0 || nsec > 0 {
         scheduler::block_current();
         scheduler::schedule();
-        // Restore Ready so the process continues normally after wakeup.
+        // Re-cache pid after schedule() — the current task pointer may have
+        // changed on a SMP migration path (M1 latent fix).
         let pid = scheduler::current_pid();
         scheduler::with_proc_mut(pid, |p| {
             if p.state == crate::proc::process::State::Blocked {
@@ -31,6 +32,15 @@ pub fn sys_nanosleep(req_va: usize, _rem_va: usize) -> isize {
             }
         });
     }
+
+    // Write zeroed remainder back to userspace (M1).
+    // The sleep completed fully; once a real per-process timer is wired,
+    // write the actual remaining time here on EINTR.
+    if rem_va != 0 {
+        let zero = [0u8; 16];
+        let _ = copy_to_user(rem_va, &zero);
+    }
+
     0
 }
 
