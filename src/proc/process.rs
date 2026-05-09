@@ -62,17 +62,17 @@ pub struct Pcb {
     pub signal_handlers: SignalHandlers,
     pub exe_path: Option<String>,
 
-    // ── Namespace set ─────────────────────────────────────────────────────────
+    // ── Namespace set ────────────────────────────────────────────────────────────────
     pub ns: NsSet,
 
-    // ── seccomp filter chain ──────────────────────────────────────────────────
+    // ── seccomp filter chain ─────────────────────────────────────────────────────
     pub seccomp: FilterChain,
 
-    // ── NPTL / robust futex ───────────────────────────────────────────────────
+    // ── NPTL / robust futex ──────────────────────────────────────────────────────
     pub robust_list_head: usize,
     pub robust_list_len:  usize,
 
-    // ── ptrace ────────────────────────────────────────────────────────────────
+    // ── ptrace ───────────────────────────────────────────────────────────────
     pub ptrace_state: PtraceState,
     pub ptrace_event: u64,
 
@@ -80,6 +80,16 @@ pub struct Pcb {
     /// Per-process resource limits.  Inherited on fork; shared across
     /// CLONE_THREAD threads (both get a clone, Linux semantics are identical).
     pub rlimits: RlimitSet,
+
+    // ── CPU time accounting (for RLIMIT_CPU) ───────────────────────────────
+    /// Accumulated CPU time in nanoseconds.  Incremented once per timer tick
+    /// (TICK_NS = 1 ms) while this process is the running task.
+    /// Compared in seconds against the RLIMIT_CPU soft/hard limits:
+    ///   soft  → SIGXCPU delivered every second until the process exits or
+    ///            raises its limit (POSIX allows an implementation-defined
+    ///            grace period; we use 1-second intervals matching Linux).
+    ///   hard  → SIGKILL sent immediately.
+    pub cpu_time_ns: u64,
 }
 
 impl Pcb {

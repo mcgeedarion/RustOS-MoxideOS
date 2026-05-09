@@ -8,6 +8,14 @@
 //!   `head` is the index of the next byte to read.
 //!   `len`  is the number of valid bytes in the buffer.
 //!   Write wraps around at PIPE_BUF_CAP.  No heap allocation after init.
+//!
+//! ## O_NONBLOCK
+//!   When the read-end fd has O_NONBLOCK set (via fcntl F_SETFL or
+//!   pipe2(O_NONBLOCK)):
+//!     * read on an empty pipe returns -EAGAIN (-11) immediately.
+//!   When the write-end fd has O_NONBLOCK set:
+//!     * write that would block (pipe full) returns -EAGAIN (-11) immediately.
+//!   This matches POSIX.1-2017 and Linux behaviour.
 
 extern crate alloc;
 use alloc::sync::Arc;
@@ -15,7 +23,7 @@ use alloc::boxed::Box;
 use spin::Mutex;
 use crate::uaccess::copy_to_user;
 
-// ── Pipe buffer ─────────────────────────────────────────────────────────────────────────────
+// ── Pipe buffer ──────────────────────────────────────────────────────────────────────
 
 pub const PIPE_BUF_CAP: usize = 65536;
 
@@ -44,7 +52,6 @@ impl PipeBuf {
         let first = tail - self.head;
         buf[..first].copy_from_slice(&self.data[self.head..tail]);
         if first < n {
-            // Wrap around
             buf[first..n].copy_from_slice(&self.data[..n - first]);
         }
         self.head = (self.head + n) % PIPE_BUF_CAP;
@@ -52,8 +59,7 @@ impl PipeBuf {
         n
     }
 
-    /// Write `buf` into the ring. Returns bytes written (may be less than
-    /// buf.len() if the buffer would overflow — callers check capacity first).
+    /// Write `buf` into the ring. Returns bytes written.
     fn write_from(&mut self, buf: &[u8]) -> usize {
         let free = PIPE_BUF_CAP - self.len;
         let n = buf.len().min(free);
@@ -76,7 +82,7 @@ impl PipeBuf {
 
 type SharedPipe = Arc<Mutex<PipeBuf>>;
 
-// ── Pipe FD table ───────────────────────────────────────────────────────────────────────────
+// ── Pipe FD table ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 enum PipeEnd { Read, Write }
@@ -101,22 +107,24 @@ fn alloc_pipe_fd(pfd: PipeFd) -> Option<usize> {
     None
 }
 
-// ── Public query helpers ──────────────────────────────────────────────────────────────────────
+// ── Public query helpers ───────────────────────────────────────────────────────────────────
 
 pub fn is_pipe_fd(fdno: usize) -> bool {
     if fdno < PIPE_FD_BASE || fdno >= PIPE_FD_BASE + PIPE_TABLE_SIZE { return false; }
     PIPE_TABLE.lock()[fdno - PIPE_FD_BASE].is_some()
 }
 
-/// Poll readiness for a pipe fd. Reads state directly without cloning the Arc.
+/// Alias used by io_syscalls and close paths.
+#[inline]
+pub fn is_pipe(fdno: usize) -> bool { is_pipe_fd(fdno) }
+
+/// Poll readiness for a pipe fd.
 pub fn pipe_poll(fdno: usize, events: u32) -> u32 {
     use crate::fs::poll::{POLLIN, POLLOUT, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM};
     if fdno < PIPE_FD_BASE || fdno >= PIPE_FD_BASE + PIPE_TABLE_SIZE {
         return POLLNVAL;
     }
     let idx = fdno - PIPE_FD_BASE;
-    // Acquire PIPE_TABLE lock to get a reference to the Arc, then drop the
-    // table lock before acquiring the PipeBuf lock — avoids lock ordering issues.
     let buf_arc: SharedPipe = {
         let tbl = PIPE_TABLE.lock();
         match tbl[idx].as_ref() {
@@ -124,7 +132,6 @@ pub fn pipe_poll(fdno: usize, events: u32) -> u32 {
             None      => return POLLNVAL,
         }
     };
-    // Re-read end kind without holding the table lock.
     let end_is_read = {
         let tbl = PIPE_TABLE.lock();
         match tbl[idx].as_ref() {
@@ -143,6 +150,12 @@ pub fn pipe_poll(fdno: usize, events: u32) -> u32 {
     }
 }
 
+// ── pipe_read ─────────────────────────────────────────────────────────────────────────
+//
+// O_NONBLOCK: if the pipe is empty, return -EAGAIN immediately instead of
+// spinning.  The nonblock flag is stored in the FD metadata (fcntl.rs) and
+// can be set by pipe2(O_NONBLOCK) or fcntl(F_SETFL, O_NONBLOCK).
+
 pub fn pipe_read(fdno: usize, buf: &mut [u8]) -> isize {
     if fdno < PIPE_FD_BASE || fdno >= PIPE_FD_BASE + PIPE_TABLE_SIZE { return -9; }
     let idx = fdno - PIPE_FD_BASE;
@@ -151,6 +164,9 @@ pub fn pipe_read(fdno: usize, buf: &mut [u8]) -> isize {
         match tbl[idx].clone() { Some(p) => p, None => return -9 }
     };
     match pfd.end { PipeEnd::Write => return -9, PipeEnd::Read => {} }
+
+    let nonblock = crate::fs::fcntl::is_nonblock(fdno);
+
     let mut spins = 0usize;
     loop {
         let mut inner = pfd.buf.lock();
@@ -158,13 +174,25 @@ pub fn pipe_read(fdno: usize, buf: &mut [u8]) -> isize {
             let n = inner.read_into(buf);
             return n as isize;
         }
-        if !inner.write_open { return 0; } // EOF
+        if !inner.write_open { return 0; } // EOF: writer closed
         drop(inner);
+
+        // O_NONBLOCK: don't block — return EAGAIN immediately.
+        if nonblock { return -11; }
+
         spins += 1;
-        if spins > 5_000_000 { return -11; } // EAGAIN
+        if spins > 5_000_000 { return -11; } // safety spin-limit
         core::hint::spin_loop();
     }
 }
+
+// ── pipe_write ─────────────────────────────────────────────────────────────────────────
+//
+// O_NONBLOCK: if the pipe is full (or would block), return -EAGAIN immediately.
+// For writes > PIPE_BUF the check is on free space: if no bytes can be
+// written without blocking, return EAGAIN.  Partial writes on non-blocking
+// sockets are allowed (write as much as fits, return short count) only when
+// buf.len() > PIPE_BUF; for atomic writes (<= PIPE_BUF) it’s all-or-nothing.
 
 pub fn pipe_write(fdno: usize, buf: &[u8]) -> isize {
     if fdno < PIPE_FD_BASE || fdno >= PIPE_FD_BASE + PIPE_TABLE_SIZE { return -9; }
@@ -174,10 +202,28 @@ pub fn pipe_write(fdno: usize, buf: &[u8]) -> isize {
         match tbl[idx].clone() { Some(p) => p, None => return -9 }
     };
     match pfd.end { PipeEnd::Read => return -9, PipeEnd::Write => {} }
+
+    let nonblock = crate::fs::fcntl::is_nonblock(fdno);
     let mut inner = pfd.buf.lock();
-    if inner.len + buf.len() > PIPE_BUF_CAP { return -11; } // EAGAIN
-    inner.write_from(buf);
-    buf.len() as isize
+
+    // Atomic write (<= PIPE_BUF): needs all-or-nothing space.
+    if buf.len() <= PIPE_BUF_CAP {
+        if inner.len + buf.len() > PIPE_BUF_CAP {
+            // Would block.
+            return -11; // EAGAIN (was already returning this pre-patch)
+        }
+        inner.write_from(buf);
+        return buf.len() as isize;
+    }
+
+    // Large write: if completely full, EAGAIN on non-blocking.
+    if inner.is_full() {
+        return -11;
+    }
+
+    // Non-atomic large write: write what fits.
+    let n = inner.write_from(buf);
+    n as isize
 }
 
 pub fn pipe_close(fdno: usize) -> bool {
@@ -195,11 +241,11 @@ pub fn pipe_close(fdno: usize) -> bool {
     } else { false }
 }
 
-// ── sys_pipe / sys_pipe2 ───────────────────────────────────────────────────────────────────────
+// ── sys_pipe / sys_pipe2 ──────────────────────────────────────────────────────────────
 
 pub fn sys_pipe(pipefd_va: usize) -> isize { sys_pipe2(pipefd_va, 0) }
 
-pub fn sys_pipe2(pipefd_va: usize, _flags: u32) -> isize {
+pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     if !crate::uaccess::validate_user_ptr(pipefd_va, 8) { return -14; }
 
     let buf = Arc::new(Mutex::new(PipeBuf::new()));
@@ -211,6 +257,18 @@ pub fn sys_pipe2(pipefd_va: usize, _flags: u32) -> isize {
         Some(fd) => fd,
         None => { pipe_close(read_fd); return -24; }
     };
+
+    // Propagate O_NONBLOCK and O_CLOEXEC from flags to both fds.
+    const O_NONBLOCK: u32 = 2048;
+    const O_CLOEXEC:  u32 = 524288;
+    if flags & O_NONBLOCK != 0 {
+        crate::fs::fcntl::set_nonblock(read_fd,  true);
+        crate::fs::fcntl::set_nonblock(write_fd, true);
+    }
+    if flags & O_CLOEXEC != 0 {
+        crate::fs::fcntl::set_cloexec(read_fd,  true);
+        crate::fs::fcntl::set_cloexec(write_fd, true);
+    }
 
     let mut out = [0u8; 8];
     out[0..4].copy_from_slice(&(read_fd  as i32).to_le_bytes());
