@@ -13,24 +13,13 @@
 //!   9.  build_initial_stack (writes into new_cr3, now active) → initial_rsp
 //!  10.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
 //!  11.  wake_pid(vfork_parent) if set
-//!  12.  Patch SyscallFrame for SYSRETQ delivery
+//!  12.  Patch SyscallFrame (x86_64) or TrapFrame (riscv64) for delivery
 //!
-//! ## RLIMIT_STACK
+//! ## spawn_user_process_from_bytes
 //!
-//! The initial stack size is derived from the process's soft RLIMIT_STACK
-//! limit at execve time:
-//!
-//!   stack_bytes = min(soft_limit, STACK_MAX)   (STACK_MAX = 64 MiB)
-//!   stack_bytes = max(stack_bytes, STACK_MIN)   (STACK_MIN = 1 page = 4 KiB)
-//!
-//! When the soft limit is RLIM_INFINITY the fallback DEFAULT_STACK_BYTES
-//! (8 MiB) is used — the same value Linux uses for its default ulimit.
-//!
-//! A one-page **guard page** sits immediately below the stack region and is
-//! left intentionally unmapped so stack overflow causes a clean SIGSEGV.
-//!
-//! The stack region is registered in `p.vmas` as `VmaKind::Stack` so
-//! RLIMIT_AS accounting and `/proc/<pid>/maps` both see it.
+//!   Used by kernel_main to launch pid 1 (/init) directly from the in-memory
+//!   CPIO slice without going through the VFS.  Reuses all the same ELF
+//!   loading and PCB setup logic as spawn_user_process.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -56,18 +45,15 @@ const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
 const INTERP_BASE: usize = 0x0060_0000;
 
 /// Absolute maximum stack size we will allocate at exec time (64 MiB).
-/// Mirrors Linux's `_STK_LIM` cap in `load_elf_binary`.
 const STACK_MAX: usize = 64 * 1024 * 1024;
 
 /// Minimum stack size — always at least one page.
 const STACK_MIN: usize = PAGE;
 
-/// Fallback stack size when RLIMIT_STACK is RLIM_INFINITY (8 MiB default,
-/// matches Linux `ulimit -s` default).
+/// Fallback stack size when RLIMIT_STACK is RLIM_INFINITY (8 MiB default).
 const DEFAULT_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-/// `bias` applied to ET_DYN images by load_elf_into.  We need the same
-/// value here to correctly compute end_of_bss for PIE executables.
+/// `bias` applied to ET_DYN images by load_elf_into.
 const ELF_DYN_BIAS: usize = 0x0040_0000;
 
 const AT_NULL:   u64 =  0;
@@ -90,9 +76,6 @@ const MAX_CSTR_ARRAY: usize = 1024;
 
 // ── stack size helper ─────────────────────────────────────────────────────────
 
-/// Compute the stack size for a new process from its RLIMIT_STACK soft limit.
-///
-/// Returns a page-aligned value in `[STACK_MIN, STACK_MAX]`.
 fn stack_bytes_for_pid(pid: usize) -> usize {
     let soft = scheduler::with_proc(pid, |p| p.rlimits.stack_soft())
         .unwrap_or(DEFAULT_STACK_BYTES as u64);
@@ -102,61 +85,39 @@ fn stack_bytes_for_pid(pid: usize) -> usize {
     } else {
         (soft as usize).min(STACK_MAX)
     };
-
-    // Round up to page size and enforce minimum.
     ((raw + PAGE - 1) & !(PAGE - 1)).max(STACK_MIN)
 }
 
-/// Same as `stack_bytes_for_pid` but used by `spawn_user_process` before the
-/// PCB exists in the scheduler table.  Falls back to DEFAULT_STACK_BYTES.
-fn stack_bytes_default() -> usize {
-    DEFAULT_STACK_BYTES
-}
+fn stack_bytes_default() -> usize { DEFAULT_STACK_BYTES }
 
 // ── free_old_address_space ────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
-
-/// Public wrapper used by fork_syscall to free a child CR3 on OOM.
-/// Safety: `cr3` must be a valid page-table root that was fully initialised
-/// by `clone_for_fork` and is not currently loaded in any CPU.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn free_child_address_space(cr3: usize) {
-    unsafe { free_old_address_space(cr3); }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub unsafe fn free_child_address_space(_cr3: usize) {}
     let pml4 = cr3 as *const u64;
     for pml4i in 0..256usize {
         let pml4e = *pml4.add(pml4i);
         if pml4e & PRESENT == 0 { continue; }
         let pdpt_pa = (pml4e & ADDR_MASK) as usize;
         let pdpt = pdpt_pa as *const u64;
-
         for pdpti in 0..512usize {
             let pdpte = *pdpt.add(pdpti);
             if pdpte & PRESENT == 0 { continue; }
             if pdpte & (1 << 7) != 0 { continue; }
             let pd_pa = (pdpte & ADDR_MASK) as usize;
             let pd = pd_pa as *const u64;
-
             for pdi in 0..512usize {
                 let pde = *pd.add(pdi);
                 if pde & PRESENT == 0 { continue; }
                 if pde & (1 << 7) != 0 { continue; }
                 let pt_pa = (pde & ADDR_MASK) as usize;
                 let pt = pt_pa as *const u64;
-
                 for pti in 0..512usize {
                     let pte = *pt.add(pti);
                     if pte & PRESENT == 0 { continue; }
                     let page_pa = (pte & ADDR_MASK) as usize;
-                    let va = ((pml4i << 39) | (pdpti << 30) | (pdi << 21) | (pti << 12)) as usize;
-                    if va < USER_HALF_END {
-                        pmm::free_page(page_pa);
-                    }
+                    let va = ((pml4i << 39)|(pdpti << 30)|(pdi << 21)|(pti << 12)) as usize;
+                    if va < USER_HALF_END { pmm::free_page(page_pa); }
                 }
                 pmm::free_page(pt_pa);
             }
@@ -167,17 +128,26 @@ pub unsafe fn free_child_address_space(_cr3: usize) {}
     pmm::free_page(cr3);
 }
 
+/// Public wrapper used by fork_syscall to free a child CR3 on OOM.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn free_child_address_space(cr3: usize) {
+    unsafe { free_old_address_space(cr3); }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn free_child_address_space(_cr3: usize) {}
+
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn free_old_address_space(_cr3: usize) {}
 
-// ── spawn_user_process ───────────────────────────────────────────────────────────────
+// ── spawn_user_process (open via VFS) ────────────────────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
         Ok(fd) => fd, Err(_) => return false,
     };
     let file_size = vfs::fstat(fd).unwrap_or(0);
-    const MAX_ELF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    const MAX_ELF_SIZE: usize = 64 * 1024 * 1024;
     if file_size == 0 || file_size > MAX_ELF_SIZE { vfs::close(fd); return false; }
     let mut data_buf = alloc::vec![0u8; file_size];
     let n = vfs::pread(fd, data_buf.as_mut_ptr(), data_buf.len(), 0);
@@ -185,6 +155,20 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     if n <= 0 { return false; }
     let data = &data_buf[..n as usize];
 
+    spawn_user_process_from_bytes(data, path, argv, envp)
+}
+
+/// Launch a new process from an in-memory ELF image (e.g. from initramfs).
+///
+/// This is the canonical path for pid 1: kernel_main reads the /init bytes
+/// directly from the CPIO slice and hands them here without going through
+/// the VFS.  The process is enqueued in the scheduler as usual.
+pub fn spawn_user_process_from_bytes(
+    data: &[u8],
+    path: &str,
+    argv: &[&str],
+    envp: &[&str],
+) -> bool {
     let hdr   = match elf::parse_elf_header(data) { Ok(h) => h, Err(_) => return false };
     let phdrs = elf::parse_phdrs(data, &hdr);
 
@@ -193,17 +177,18 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     };
 
     let program_entry = match elf::load_elf_into(new_cr3, data, &hdr, &phdrs) {
-        Ok(e) => e,
+        Ok(e)  => e,
         Err(_) => { unsafe { free_old_address_space(new_cr3); } return false; }
     };
 
-    // ── Derive heap base from the highest PT_LOAD segment ─────────────────────
     let elf_bias = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
     let bss_end  = elf::end_of_bss(&phdrs, elf_bias);
 
     let phdr_va = phdrs.iter()
         .find(|ph| ph.p_type == elf::PT_PHDR)
         .map_or(0, |ph| ph.p_vaddr as usize);
+    let phdr_count = phdrs.len();
+    let phdr_size  = core::mem::size_of::<elf::Elf64Phdr>();
 
     let (entry_va, interp_base_val) =
         if let Some(interp_path) = elf::find_interp(data, &phdrs) {
@@ -212,10 +197,7 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
             }
         } else { (program_entry, 0) };
 
-    // ── Allocate user stack (RLIMIT_STACK-aware) ──────────────────────────
-    // spawn_user_process runs before the PCB is enqueued so we use the
-    // default stack size; the limit will be honoured on subsequent execve.
-    let s_bytes  = stack_bytes_default();
+    let s_bytes      = stack_bytes_default();
     let stack_bottom = match mmap::alloc_user_stack(new_cr3, STACK_TOP, s_bytes) {
         Ok(b)  => b,
         Err(_) => { unsafe { free_old_address_space(new_cr3); } return false; }
@@ -238,6 +220,7 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         Some(k) => k,
         None    => { unsafe { free_old_address_space(new_cr3); } return false; }
     };
+
     let pid  = scheduler::next_pid();
     let ppid = scheduler::current_pid();
 
@@ -245,6 +228,8 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     ctx.rsp = kstack_top;
     #[cfg(target_arch = "x86_64")]
     { ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize; }
+    #[cfg(target_arch = "riscv64")]
+    { ctx.ra  = crate::arch::riscv64::trap::sret_trampoline as usize; }
 
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
@@ -273,7 +258,6 @@ pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
         exe_path:            Some(String::from(path)),
     };
 
-    // Register the stack VMA before enqueue so current_as_bytes is accurate.
     let stack_vma = Vma {
         start:       stack_bottom,
         end:         STACK_TOP,
@@ -295,7 +279,7 @@ pub fn sys_execve_from_path(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ─────────────────────────────────────────────────────────────────────
+// ── sys_execve [NR 59] — x86_64 ──────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
@@ -309,7 +293,25 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize,
     }
 }
 
-// ── do_execve ───────────────────────────────────────────────────────────────────────────
+// ── sys_execve [NR 221 on rv64] — RISC-V ─────────────────────────────────
+//
+// On RISC-V execve replaces the calling process in-place just as on x86_64.
+// The difference is that we patch sepc/a0/sp in the trap frame (TrapFrame)
+// rather than a SyscallFrame.  If the current process called us from a
+// kernel-spawned context (e.g. pid 1 bootstrap) the frame pointer may be
+// null; in that case we just enqueue a fresh PCB via spawn_user_process.
+
+#[cfg(target_arch = "riscv64")]
+pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    let argv = match collect_cstr_array(argv_va) { Ok(v) => v, Err(e) => return e as isize };
+    let envp = match collect_cstr_array(envp_va) { Ok(v) => v, Err(e) => return e as isize };
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+    if spawn_user_process(&path, &argv_refs, &envp_refs) { 0 } else { -8 }
+}
+
+// ── do_execve (x86_64 only) ──────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(path: &str, argv: &[String], envp: &[String],
@@ -319,7 +321,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
 
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|e| e)?;
     let file_size = vfs::fstat(fd).unwrap_or(0);
-    const MAX_ELF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+    const MAX_ELF_SIZE: usize = 64 * 1024 * 1024;
     if file_size == 0 || file_size > MAX_ELF_SIZE {
         vfs::close(fd);
         return Err(-8); // ENOEXEC
@@ -338,7 +340,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     let program_entry = elf::load_elf_into(new_cr3, data, &hdr, &phdrs)
         .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
-    // ── Derive heap base ──────────────────────────────────────────────────
     let elf_bias  = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
     let bss_end   = elf::end_of_bss(&phdrs, elf_bias);
     let heap_base = mmap::set_brk_base_compute(bss_end);
@@ -355,15 +356,12 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
             }
         } else { (program_entry, 0) };
 
-    // ── Allocate user stack (RLIMIT_STACK-aware) ──────────────────────────
-    // Read the limit before the point-of-no-return while the old PCB is
-    // still valid.  A failed execve must not have mutated the caller.
-    let s_bytes = stack_bytes_for_pid(pid);
+    let s_bytes      = stack_bytes_for_pid(pid);
     let stack_bottom = mmap::alloc_user_stack(new_cr3, STACK_TOP, s_bytes)
         .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
-    let old_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
-    let pid_key = thread::vma_pid(pid);
+    let old_cr3  = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
+    let pid_key  = thread::vma_pid(pid);
     mmap::clear_vmas_pub(pid_key);
     if old_cr3 != 0 && old_cr3 != new_cr3 {
         unsafe { free_old_address_space(old_cr3); }
@@ -376,7 +374,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     )?;
 
-    // Single with_proc_mut: update all PCB fields after point-of-no-return.
     let vfork_parent = scheduler::with_proc_mut(pid, |p| {
         p.user_satp       = new_cr3;
         p.pc              = entry_va;
@@ -390,7 +387,6 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
         let vfp            = p.vfork_parent;
         p.vfork_parent    = 0;
 
-        // Register the new stack VMA.
         let stack_vma = Vma {
             start:       stack_bottom,
             end:         STACK_TOP,
@@ -403,13 +399,11 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
             .binary_search_by_key(&stack_vma.start, |v| v.start)
             .unwrap_or_else(|i| i);
         p.vmas.insert(idx, stack_vma);
-
         vfp
     }).unwrap_or(0);
 
     let kst = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
     if kst != 0 { update_rsp0(kst); }
-
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
     frame.rcx = entry_va;
@@ -421,9 +415,7 @@ pub fn do_execve(path: &str, argv: &[String], envp: &[String],
     Ok(())
 }
 
-// ── build_initial_stack ───────────────────────────────────────────────────────────────────────
-// CR3 must already be loaded to new_cr3 before calling this.
-// Writes directly to user VAs (valid because CR3 is active).
+// ── build_initial_stack ───────────────────────────────────────────────────
 
 fn build_initial_stack(
     stack_top:   usize,
@@ -436,9 +428,9 @@ fn build_initial_stack(
     interp_base: usize,
 ) -> Result<usize, i32>
 {
-    let mut string_buf:    Vec<u8>   = Vec::new();
-    let mut argv_offsets:  Vec<usize> = Vec::new();
-    let mut envp_offsets:  Vec<usize> = Vec::new();
+    let mut string_buf:   Vec<u8>    = Vec::new();
+    let mut argv_offsets: Vec<usize> = Vec::new();
+    let mut envp_offsets: Vec<usize> = Vec::new();
 
     for s in argv {
         argv_offsets.push(string_buf.len());
@@ -451,10 +443,8 @@ fn build_initial_stack(
         string_buf.push(0);
     }
     let random_offset = string_buf.len();
-    let rand_a = crate::rand::next_u64().to_le_bytes();
-    let rand_b = crate::rand::next_u64().to_le_bytes();
-    string_buf.extend_from_slice(&rand_a);
-    string_buf.extend_from_slice(&rand_b);
+    string_buf.extend_from_slice(&crate::rand::next_u64().to_le_bytes());
+    string_buf.extend_from_slice(&crate::rand::next_u64().to_le_bytes());
 
     let str_total      = (string_buf.len() + 15) & !15;
     let string_va_base = stack_top - str_total;
@@ -488,17 +478,17 @@ fn build_initial_stack(
 
     let mut wp = initial_rsp as *mut u64;
     unsafe {
-        wp.write(argc as u64);          wp = wp.add(1);
+        wp.write(argc as u64);         wp = wp.add(1);
         for off in &argv_offsets { wp.write((string_va_base + off) as u64); wp = wp.add(1); }
-        wp.write(0);                    wp = wp.add(1);
+        wp.write(0);                   wp = wp.add(1);
         for off in &envp_offsets { wp.write((string_va_base + off) as u64); wp = wp.add(1); }
-        wp.write(0);                    wp = wp.add(1);
+        wp.write(0);                   wp = wp.add(1);
         for (atype, aval) in auxv { wp.write(*atype); wp = wp.add(1); wp.write(*aval); wp = wp.add(1); }
     }
     Ok(initial_rsp)
 }
 
-// ── load_interpreter ─────────────────────────────────────────────────────────────────────────
+// ── load_interpreter ─────────────────────────────────────────────────────
 
 fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     let fd  = vfs::open(interp_path, vfs::O_RDONLY).map_err(|e| e)?;
@@ -513,7 +503,7 @@ fn load_interpreter(cr3: usize, interp_path: &str) -> Result<usize, i32> {
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── string helpers ───────────────────────────────────────────────────────────────────────────
+// ── string helpers ────────────────────────────────────────────────────────
 
 /// Read a NUL-terminated string from user VA `va` into a kernel String.
 pub fn read_cstr_safe(va: usize) -> Option<String> {
@@ -540,7 +530,7 @@ pub fn collect_cstr_array(array_va: usize) -> Result<Vec<String>, i32> {
     Ok(out)
 }
 
-// ── clear_vmas helper ───────────────────────────────────────────────────────────────────
+// ── clear_vmas helper ─────────────────────────────────────────────────────
 
 pub fn clear_vmas(pid_key: u32) {
     crate::mm::mmap::clear_vmas_pub(pid_key as usize);

@@ -1,214 +1,129 @@
-//! Auxiliary vector (auxv) builder.
+//! Build the initial user stack (argv / envp / auxv) for a new process.
 //!
-//! The auxv is placed on the initial user stack by execve, above envp.
-//! musl's __init_tls and dynamic linker use several of these entries to
-//! bootstrap — the critical ones are AT_PHDR, AT_PHNUM, AT_PHENT,
-//! AT_ENTRY, AT_PAGESZ, AT_RANDOM, and AT_SECURE.
+//! Called by kernel_main (boot path) and proc::exec (execve path) after the
+//! ELF has been loaded and the stack pages have been allocated.
 //!
-//! ## Stack layout built by execve (top = high addr, grows down)
-//!   [stack top]
-//!   ... (128-byte red zone guard)
-//!   auxv pairs: { AT_*, value } × N, terminated by { AT_NULL, 0 }
-//!   envp strings (null-terminated)
-//!   envp[] pointer array (null-terminated)
-//!   argv strings (null-terminated)
-//!   argv[] pointer array (null-terminated)
-//!   argc (u64)
-//!   [RSP points here on entry]
+//! Layout (grows downward, RSP points at argc):
 //!
-//! All values are 8-byte aligned.
+//!   [strings + 16-byte AT_RANDOM value]
+//!   [argv pointers, NULL terminator]
+//!   [envp pointers, NULL terminator]
+//!   [auxv key/value pairs, AT_NULL terminator]
+//!   <- initial RSP (16-byte aligned)
 
 extern crate alloc;
+use alloc::string::String;
 use alloc::vec::Vec;
-use crate::loader::elf64::LoadedElf;
 
-// ── AT_* type tags ────────────────────────────────────────────────────────
+// AT_* tags needed by musl/glibc startup.
+const AT_NULL:   u64 =  0;
+const AT_PHDR:   u64 =  3;
+const AT_PHENT:  u64 =  4;
+const AT_PHNUM:  u64 =  5;
+const AT_PAGESZ: u64 =  6;
+const AT_BASE:   u64 =  7;
+const AT_FLAGS:  u64 =  8;
+const AT_ENTRY:  u64 =  9;
+const AT_RANDOM: u64 = 25;
 
-pub const AT_NULL:    usize = 0;
-pub const AT_PHDR:    usize = 3;
-pub const AT_PHENT:   usize = 4;
-pub const AT_PHNUM:   usize = 5;
-pub const AT_PAGESZ:  usize = 6;
-pub const AT_BASE:    usize = 7;   // interpreter base (ld.so load addr)
-pub const AT_FLAGS:   usize = 8;
-pub const AT_ENTRY:   usize = 9;
-pub const AT_UID:     usize = 11;
-pub const AT_EUID:    usize = 12;
-pub const AT_GID:     usize = 13;
-pub const AT_EGID:    usize = 14;
-pub const AT_HWCAP:   usize = 16;
-pub const AT_CLKTCK:  usize = 17;
-pub const AT_SECURE:  usize = 23;
-pub const AT_RANDOM:  usize = 25;  // pointer to 16 random bytes
-pub const AT_HWCAP2:  usize = 26;
-pub const AT_EXECFN:  usize = 31;  // pointer to executable filename
+const PAGE: usize = 4096;
 
-// ── Builder ───────────────────────────────────────────────────────────────
-
-/// One auxv entry (Elf64_auxv_t: a_type, a_val each u64).
-#[derive(Clone, Copy)]
-pub struct AuxvEntry {
-    pub a_type: usize,
-    pub a_val:  usize,
-}
-
-/// Build the auxv vector for a newly exec'd process.
+/// Build the initial stack for a newly exec'd process.
 ///
-/// `elf`      — result from elf64::load()
-/// `phdr_va`  — virtual address of the ELF program header table in user space
-/// `phnum`    — number of program headers
-/// `phent`    — size of each program header (usually 56)
-/// `execfn`   — pointer to the executable path string on the user stack
-/// `random_va`— pointer to 16 random bytes on the user stack
-pub fn build(
-    elf:       &LoadedElf,
-    phdr_va:   usize,
-    phnum:     usize,
-    phent:     usize,
-    execfn:    usize,
-    random_va: usize,
-) -> Vec<AuxvEntry> {
-    let mut v = Vec::new();
-    macro_rules! push { ($t:expr, $v:expr) => { v.push(AuxvEntry { a_type: $t, a_val: $v }); } }
-
-    push!(AT_PAGESZ,  4096);
-    push!(AT_CLKTCK,  100);
-    push!(AT_PHDR,    phdr_va);
-    push!(AT_PHENT,   phent);
-    push!(AT_PHNUM,   phnum);
-    push!(AT_BASE,    elf.base);
-    push!(AT_FLAGS,   0);
-    push!(AT_ENTRY,   elf.entry);
-    push!(AT_UID,     0);
-    push!(AT_EUID,    0);
-    push!(AT_GID,     0);
-    push!(AT_EGID,    0);
-    push!(AT_HWCAP,   0x078b_fbfd); // typical x86_64 HWCAP (FPU,VSE,DE,PSE...)
-    push!(AT_HWCAP2,  0);
-    push!(AT_SECURE,  0);
-    push!(AT_RANDOM,  random_va);
-    push!(AT_EXECFN,  execfn);
-    push!(AT_NULL,    0);  // terminator
-    v
-}
-
-/// Write the full initial stack (argc, argv, envp, auxv, strings) into
-/// `stack_buf` (a mutable kernel-side slice of the user stack page).
-/// Returns the user-space RSP to set on entry.
+/// - `stack_buf`:   a mutable slice of the top stack page (writable kernel VA).
+/// - `stack_top`:   the highest user VA of the stack (exclusive).
+/// - `argv`:        argument strings (argv[0] = program path).
+/// - `envp`:        environment strings.
+/// - `entry`:       ELF entry point (AT_ENTRY).
+/// - `phdr_va`:     virtual address of the PHDR table (AT_PHDR).
+/// - `phdr_count`:  number of program headers (AT_PHNUM).
+/// - `phdr_size`:   size of one phdr in bytes (AT_PHENT).
 ///
-/// `stack_top_va` — the user virtual address of the *top* of the stack page.
-/// `argv`         — argument strings (argv[0] = program name).
-/// `envp`         — environment strings.
-/// `elf`          — loaded ELF info for auxv.
-/// `image`        — original ELF bytes (used to extract phdr info).
-pub fn write_initial_stack(
-    stack_buf:    &mut [u8],
-    stack_top_va: usize,
-    argv:         &[&str],
-    envp:         &[&str],
-    elf:          &LoadedElf,
-    image:        &[u8],
+/// Returns the initial RSP value (user VA, 16-byte aligned).
+pub fn build_stack(
+    stack_buf:   &mut [u8],
+    stack_top:   usize,
+    argv:        &[&str],
+    envp:        &[&str],
+    entry:       usize,
+    phdr_va:     usize,
+    phdr_count:  usize,
+    phdr_size:   usize,
 ) -> usize {
-    // We build the stack bottom-up in a local Vec<u64> then copy.
-    // Strategy: write strings at the bottom of the page, pointers above them.
-    let page = 4096usize;
-    let mut string_off: usize = 0; // offset from buf start, grows upward
-    let mut ptrs: Vec<u64> = Vec::new(); // will be reversed
+    // --- pack strings + AT_RANDOM into stack_buf from the top down ----------
+    let buf_va_base = stack_top - stack_buf.len(); // user VA of stack_buf[0]
 
-    // Helper: write a &str into buf, return its user VA.
-    let mut write_str = |s: &str| -> usize {
-        let bytes = s.as_bytes();
-        let len   = bytes.len() + 1; // include null terminator
-        let off   = string_off;
-        stack_buf[off..off + bytes.len()].copy_from_slice(bytes);
-        stack_buf[off + bytes.len()] = 0;
-        string_off += len;
-        // VA: stack_top_va - page + off  (buf[0] = lowest addr in page)
-        stack_top_va - page + off
-    };
+    let mut string_bytes: Vec<u8> = Vec::new();
+    let mut argv_offsets: Vec<usize> = Vec::new();
+    let mut envp_offsets: Vec<usize> = Vec::new();
 
-    // Write 16 cryptographically-seeded random bytes for AT_RANDOM.
-    // glibc uses these as its stack-canary seed and pointer-encryption key —
-    // they must be unique per process per boot, never a fixed constant.
-    let random_bytes: [u8; 16] = {
-        let a = crate::rand::next_u64().to_le_bytes();
-        let b = crate::rand::next_u64().to_le_bytes();
-        let mut buf = [0u8; 16];
-        buf[..8].copy_from_slice(&a);
-        buf[8..].copy_from_slice(&b);
-        buf
-    };
-    // Write the bytes as a raw blob (not a NUL-terminated string) so that
-    // bytes with value 0 are preserved verbatim.
-    let random_va = {
-        let off = string_off;
-        stack_buf[off..off + 16].copy_from_slice(&random_bytes);
-        string_off += 16;
-        stack_top_va - page + off
-    };
+    for s in argv {
+        argv_offsets.push(string_bytes.len());
+        string_bytes.extend_from_slice(s.as_bytes());
+        string_bytes.push(0);
+    }
+    for s in envp {
+        envp_offsets.push(string_bytes.len());
+        string_bytes.extend_from_slice(s.as_bytes());
+        string_bytes.push(0);
+    }
+    // 16-byte AT_RANDOM value placed right after the strings.
+    let random_offset = string_bytes.len();
+    let rand_a = crate::rand::next_u64().to_le_bytes();
+    let rand_b = crate::rand::next_u64().to_le_bytes();
+    string_bytes.extend_from_slice(&rand_a);
+    string_bytes.extend_from_slice(&rand_b);
 
-    // Write execfn (argv[0]).
-    let execfn_va = if argv.is_empty() {
-        write_str("(unknown)")
-    } else {
-        write_str(argv[0])
-    };
+    // Align string block to 16 bytes.
+    let str_total      = (string_bytes.len() + 15) & !15;
+    let string_va_base = stack_top - str_total;
+    let random_va      = string_va_base + random_offset;
 
-    // Write all argv strings.
-    let argv_vas: Vec<usize> = argv.iter().map(|s| write_str(s)).collect();
-    // Write all envp strings.
-    let envp_vas: Vec<usize> = envp.iter().map(|s| write_str(s)).collect();
-
-    // ── Now build the pointer/value area from the top of the page down ──
-    // We'll write into a separate aligned buffer, then place it.
-    // Round string_off up to 8-byte alignment for the pointer area.
-    string_off = (string_off + 7) & !7;
-
-    // Extract phdr info from ELF image.
-    let (phdr_offset, phnum, phent) = if image.len() >= 0x40 {
-        let ehdr = unsafe { &*(image.as_ptr() as *const crate::loader::elf64_phdr_info) };
-        // Parse manually to avoid importing the struct:
-        let phoff  = u64::from_le_bytes(image[0x20..0x28].try_into().unwrap_or([0;8])) as usize;
-        let phnum  = u16::from_le_bytes(image[0x38..0x3A].try_into().unwrap_or([0;2])) as usize;
-        let phent  = u16::from_le_bytes(image[0x36..0x38].try_into().unwrap_or([0;2])) as usize;
-        (phoff, phnum, phent)
-    } else {
-        (0, 0, 56)
-    };
-
-    // phdr VA: elf.base + phdr_offset
-    let phdr_va = elf.base + phdr_offset;
-
-    let auxv = build(elf, phdr_va, phnum, phent, execfn_va, random_va);
-
-    // Build pointer table area (we'll place it starting at string_off).
-    // Layout (from low to high in stack_buf, i.e. low VA to high VA):
-    //   argc (u64)
-    //   argv[0..n] (u64 each), 0-terminated
-    //   envp[0..m] (u64 each), 0-terminated
-    //   auxv[0..k] (two u64 each), AT_NULL-terminated
-    // RSP points at argc.
-
-    let ptr_base_off = string_off; // offset in stack_buf where pointers start
-    let ptr_base_va  = stack_top_va - page + ptr_base_off;
-
-    let mut write_u64 = |val: u64, off: &mut usize| {
-        let b = val.to_le_bytes();
-        stack_buf[*off..*off+8].copy_from_slice(&b);
-        *off += 8;
-    };
-
-    let mut off = ptr_base_off;
-    write_u64(argv.len() as u64, &mut off);       // argc
-    for va in &argv_vas { write_u64(*va as u64, &mut off); }  // argv[]
-    write_u64(0, &mut off);                       // argv null
-    for va in &envp_vas { write_u64(*va as u64, &mut off); }  // envp[]
-    write_u64(0, &mut off);                       // envp null
-    for e in &auxv {
-        write_u64(e.a_type as u64, &mut off);
-        write_u64(e.a_val  as u64, &mut off);
+    // Copy string block into stack_buf (relative offset from buf base).
+    let buf_string_off = string_va_base - buf_va_base;
+    if buf_string_off + string_bytes.len() <= stack_buf.len() {
+        stack_buf[buf_string_off..buf_string_off + string_bytes.len()]
+            .copy_from_slice(&string_bytes);
     }
 
-    // RSP = VA of argc
-    ptr_base_va
+    // --- build pointer table below string block ------------------------------
+    let auxv: &[(u64, u64)] = &[
+        (AT_PHDR,   phdr_va    as u64),
+        (AT_PHENT,  phdr_size  as u64),
+        (AT_PHNUM,  phdr_count as u64),
+        (AT_PAGESZ, PAGE       as u64),
+        (AT_ENTRY,  entry      as u64),
+        (AT_BASE,   0_u64),
+        (AT_FLAGS,  0_u64),
+        (AT_RANDOM, random_va  as u64),
+        (AT_NULL,   0_u64),
+    ];
+
+    let argc           = argv.len();
+    let ptrtable_words = 1 + (argc + 1) + (envp.len() + 1) + auxv.len() * 2;
+    let ptrtable_bytes = ptrtable_words * 8;
+    let rsp_raw        = string_va_base - ptrtable_bytes;
+    let initial_rsp    = rsp_raw & !0xF_usize;
+
+    // Write pointer table into stack_buf.
+    let table_buf_off = initial_rsp - buf_va_base;
+    let mut off = table_buf_off;
+
+    macro_rules! write64 {
+        ($val:expr) => {
+            if off + 8 <= stack_buf.len() {
+                stack_buf[off..off + 8].copy_from_slice(&($val as u64).to_ne_bytes());
+                off += 8;
+            }
+        };
+    }
+
+    write64!(argc);
+    for ao in &argv_offsets { write64!(string_va_base + ao); }
+    write64!(0u64); // argv null
+    for eo in &envp_offsets { write64!(string_va_base + eo); }
+    write64!(0u64); // envp null
+    for (atype, aval) in auxv { write64!(atype); write64!(aval); }
+
+    initial_rsp
 }
