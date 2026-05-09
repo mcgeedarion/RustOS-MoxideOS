@@ -21,6 +21,7 @@
 //!   fanotify fd     → fanotify::fanotify_read
 //!   eventfd fd      → eventfd::eventfd_read
 //!   timerfd fd      → timerfd::timerfd_read
+//!   pipe fd         → pipe::pipe_read
 //!   socket fd       → socket::socket_read
 //!   default         → vfs::read
 //!
@@ -28,6 +29,7 @@
 //!   stdout/stderr   → tty
 //!   devfs fd        → devfs::write
 //!   fanotify fd     → fanotify::fanotify_write  (permission responses)
+//!   pipe fd         → pipe::pipe_write
 //!   socket fd       → socket::socket_write
 //!   default         → vfs::write  (RLIMIT_FSIZE enforced before this call)
 //!
@@ -138,6 +140,8 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
         n = crate::fs::eventfd::eventfd_read(bfd, &mut kbuf);
     } else if crate::fs::timerfd::is_timerfd(bfd) {
         n = crate::fs::timerfd::timerfd_read(bfd, &mut kbuf);
+    } else if crate::fs::pipe::is_pipe(bfd) {
+        n = crate::fs::pipe::pipe_read(bfd, &mut kbuf);
     } else if crate::net::socket::is_socket_fd(bfd) {
         n = crate::net::socket::socket_read(bfd, &mut kbuf);
     } else {
@@ -172,6 +176,9 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return crate::fs::fanotify::fanotify_write(bfd, &kbuf);
+    }
+    if crate::fs::pipe::is_pipe(bfd) {
+        return crate::fs::pipe::pipe_write(bfd, &kbuf[..count]);
     }
     if crate::net::socket::is_socket_fd(bfd) {
         return crate::net::socket::socket_write(bfd, &kbuf);
@@ -252,9 +259,15 @@ pub fn sys_dup(fd: usize) -> isize {
     if bfd_r < 0 { return bfd_r; }
     let bfd = bfd_r as usize;
 
-    // Duplicate backing fd.
-    let new_bfd_r = crate::fs::vfs::dup_from(bfd, bfd);
-    let new_bfd = if new_bfd_r >= 0 { new_bfd_r as usize } else { bfd };
+    // For pipe ends, dup just installs another process-local fd pointing at
+    // the same backing fd and bumps the open-end refcount in PipeInner.
+    let new_bfd = if crate::fs::pipe::is_pipe(bfd) {
+        crate::fs::pipe::pipe_dup(bfd);
+        bfd
+    } else {
+        let r = crate::fs::vfs::dup_from(bfd, bfd);
+        if r >= 0 { r as usize } else { bfd }
+    };
 
     // Retrieve entry metadata to preserve flags.
     let entry = match crate::fs::process_fd::proc_fd_get(pid, fd) {
@@ -349,6 +362,7 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     let is_vfs = bfd != 1 && bfd != 2
         && crate::fs::devfs::get_dev_fd(bfd).is_none()
         && !crate::fs::fanotify::is_fanotify_fd(bfd)
+        && !crate::fs::pipe::is_pipe(bfd)
         && !crate::net::socket::is_socket_fd(bfd);
 
     if is_vfs && total_len > 0 {
@@ -358,14 +372,13 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
         }
     }
 
-    // Re-use sys_write with the already-resolved bfd to avoid double lookup.
+    // Re-use write_bfd with the already-resolved bfd to avoid double lookup.
     let mut written = 0isize;
     for i in 0..iovcnt {
         let mut raw = [0u8; 16];
         if copy_from_user(&mut raw, iov_va + i * iov_size).is_err() { return -14; }
         let iov: IoVec = unsafe { core::mem::transmute(raw) };
         if iov.len == 0 { continue; }
-        // Write directly via backing fd (skip the local→backing resolve again).
         let n = write_bfd(bfd, iov.base, iov.len);
         if n < 0 { return if written > 0 { written } else { n }; }
         written += n;
@@ -385,7 +398,6 @@ pub fn sys_readv(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
         if copy_from_user(&mut raw, ptr).is_err() { return -14; }
         let iov: IoVec = unsafe { core::mem::transmute(raw) };
         if iov.len == 0 { continue; }
-        // Read directly via backing fd.
         let n = read_bfd(bfd, iov.base, iov.len);
         if n < 0 { return n; }
         total += n;
@@ -421,6 +433,8 @@ fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
         n = crate::fs::eventfd::eventfd_read(bfd, &mut kbuf);
     } else if crate::fs::timerfd::is_timerfd(bfd) {
         n = crate::fs::timerfd::timerfd_read(bfd, &mut kbuf);
+    } else if crate::fs::pipe::is_pipe(bfd) {
+        n = crate::fs::pipe::pipe_read(bfd, &mut kbuf);
     } else if crate::net::socket::is_socket_fd(bfd) {
         n = crate::net::socket::socket_read(bfd, &mut kbuf);
     } else {
@@ -443,6 +457,9 @@ fn write_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return crate::fs::fanotify::fanotify_write(bfd, &kbuf);
+    }
+    if crate::fs::pipe::is_pipe(bfd) {
+        return crate::fs::pipe::pipe_write(bfd, &kbuf[..count]);
     }
     if crate::net::socket::is_socket_fd(bfd) {
         return crate::net::socket::socket_write(bfd, &kbuf);
