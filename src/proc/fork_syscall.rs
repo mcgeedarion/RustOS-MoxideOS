@@ -18,13 +18,13 @@ fn sysret_trampoline() {}
 /// sys_fork() -> child_pid (parent) / 0 (child)  [NR 57]
 ///
 /// ## RLIMIT_NPROC
-/// Before creating the child we check the caller’s RLIMIT_NPROC soft limit
+/// Before creating the child we check the caller's RLIMIT_NPROC soft limit
 /// against the current total process count.  If the limit would be exceeded
 /// we return -EAGAIN (-11).
 pub fn sys_fork() -> isize {
     let parent_pid = scheduler::current_pid();
 
-    // ── RLIMIT_NPROC: reject if we would exceed the caller’s soft limit ───
+    // ── RLIMIT_NPROC: reject if we would exceed the caller's soft limit ───
     {
         use crate::proc::rlimit::{RLIMIT_NPROC, RLIM_INFINITY};
         let (soft, _hard) = crate::proc::rlimit::getrlimit_for(parent_pid, RLIMIT_NPROC);
@@ -89,6 +89,9 @@ pub fn sys_fork() -> isize {
     child_pcb.rt_cpu_time_us     = 0;
 
     scheduler::enqueue(child_pcb);
+    // Clone the parent's fd table into the child.  Must happen after enqueue
+    // so the child PCB is visible to the scheduler before its fd table exists.
+    crate::fs::process_fd::proc_fd_fork(parent_pid, child_pid);
     child_pid as isize
 }
 

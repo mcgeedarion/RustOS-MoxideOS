@@ -9,11 +9,12 @@
 //!   2. clear_child_tid      — zero futex word + FUTEX_WAKE (unblocks pthread_join)
 //!   3. unregister_thread
 //!   4. altstack_clear_pid + proc_name_clear + futex_clear_pid
-//!   5. free_address_space (last thread in group only)
-//!   6. free_kstack + State → Zombie
-//!   7. wake vfork_parent
-//!   8. notify_exit (wakes parent waitpid)
-//!   9. schedule()   — never returns
+//!   5. proc_fd_free         — close all open fds (before address space is freed)
+//!   6. free_address_space (last thread in group only)
+//!   7. free_kstack + State → Zombie
+//!   8. wake vfork_parent
+//!   9. notify_exit (wakes parent waitpid)
+//!  10. schedule()   — never returns
 
 extern crate alloc;
 
@@ -79,15 +80,21 @@ pub fn do_exit(pid: usize, code: i32) {
     crate::syscall::proc_name_clear(pid);
     crate::sync::futex::futex_clear_pid(pid);
 
+    // 5 — close all open fds before the address space is torn down.
+    // Some backing fds (pipes, sockets) may hold references into the
+    // process address space; closing them first ensures those refs drop
+    // cleanly before the pages are unmapped.
+    crate::fs::process_fd::proc_fd_free(pid);
+
     if is_last_live_thread(pid, tgid) {
         let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
         free_address_space(pid, user_satp);
     }
 
-    let vfork_parent = zombify(pid, code); // 6
-    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); } // 7
-    wait::notify_exit(pid);  // 8
-    scheduler::schedule();   // 9 — never returns
+    let vfork_parent = zombify(pid, code); // 7
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); } // 8
+    wait::notify_exit(pid);  // 9
+    scheduler::schedule();   // 10 — never returns
 
     loop { <Arch as Cpu>::halt(); }
 }
@@ -119,6 +126,7 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::syscall::altstack_clear_pid(sibling);
         crate::syscall::proc_name_clear(sibling);
         crate::sync::futex::futex_clear_pid(sibling);
+        crate::fs::process_fd::proc_fd_free(sibling);
         let vfork_parent = zombify(sibling, status);
         if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
     }
