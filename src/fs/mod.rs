@@ -17,6 +17,7 @@ pub mod overlayfs;
 pub mod pidfd;
 pub mod pipe;
 pub mod poll;
+pub mod process_fd;
 pub mod procfs;
 pub mod ramfs;
 pub mod shm;
