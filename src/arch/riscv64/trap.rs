@@ -38,9 +38,26 @@
 //!     4. `clint::set_next_event(hart, TICK_NS)` — re-arm mtimecmp so the
 //!        next tick fires TICK_NS nanoseconds from now.
 //!     5. Re-enable STIE in `sie`.
+//!
+//! ## Anonymous mmap page-fault flow (demand paging)
+//!
+//! When user-space touches a page inside a VmaKind::Anonymous (or Heap/Stack)
+//! region that has no PTE yet, scause = 13 (load) or 15 (store).
+//!
+//!   1. stval = faulting VA (not necessarily page-aligned).
+//!   2. `find_vma` looks up the VMA containing that address.
+//!   3. Allocate a fresh zeroed page from PMM.
+//!   4. Map it into the current Sv39 address space with PTE bits derived
+//!      from the VMA's `prot` field (R/W/X + U, never more than prot allows).
+//!   5. Issue `sfence.vma` to flush the TLB for that VA.
+//!   6. Return — `sret` replays the faulting instruction.
+//!
+//! File-backed VMAs (VmaKind::FileBacked) are not yet demand-paged from disk;
+//! they zero-fill for now (TODO: call vfs::pread into the new page).
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
+use crate::mm::mmap::{VmaKind, PROT_READ, PROT_WRITE, PROT_EXEC};
 
 /// Trap frame saved by `riscv_trap_entry`.
 /// Layout must exactly match the store order in the entry asm.
@@ -173,7 +190,7 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
         // Supervisor timer interrupt (scause code 5).
         //
         // Sequence:
-        //   1. Clear STIE *first* so the interrupt won’t re-fire while we
+        //   1. Clear STIE *first* so the interrupt won't re-fire while we
         //      are still inside the handler.
         //   2. Advance the monotonic clock by one tick.
         //   3. Expire due timer-wheel entries (nanosleep wakeups, etc.).
@@ -196,7 +213,6 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
             crate::proc::scheduler::schedule();
 
             // 5. Re-arm mtimecmp for the next tick on hart 0.
-            //    For SMP, each hart should use its own hartid.
             crate::arch::riscv64::clint::set_next_event(
                 0,
                 crate::proc::scheduler::TICK_NS,
@@ -206,19 +222,15 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
             let sie2 = csrr!("sie");
             csrw!("sie", sie2 | (1usize << 5));
         }
-        // ──────────────────────────────────────────────────────────────
         // Supervisor external interrupt (PLIC).
-        // ──────────────────────────────────────────────────────────────
-        9 => {
-            // crate::drivers::plic::handle_irq();
-        }
+        9 => { /* crate::drivers::plic::handle_irq(); */ }
         _ => {}
     }
 }
 
 fn handle_exception(frame: &mut TrapFrame, code: usize) {
     match code {
-        // ─── ecall from U-mode ───────────────────────────────────────────────────────
+        // ─── ecall from U-mode ───────────────────────────────────────────
         8 => {
             let nr = frame.a7;
             let ret = crate::syscall::dispatch(
@@ -229,27 +241,91 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             frame.a0   = ret as usize;
             frame.sepc = frame.sepc.wrapping_add(4);
         }
-        // ─── Page faults ───────────────────────────────────────────────────────────
+
+        // ─── Page faults: instruction(12), load(13), store/AMO(15) ─────
+        //
+        // Demand-paging for anonymous VMAs (Anonymous, Heap, Stack) and
+        // file-backed VMAs (zero-fill fallback until vfs::pread is wired).
+        //
+        // Protection check: a store fault (15) into a read-only VMA must
+        // NOT be satisfied — fall through to SIGSEGV.
         12 | 13 | 15 => {
             let stval = csrr!("stval");
+            let faulting_va = stval & !0xFFF;   // page-align the faulting address
             let pid   = crate::proc::scheduler::current_pid();
-            if let Some(_vma) = crate::mm::mmap::find_vma(pid as u32, stval) {
-                if let Some(pa) = crate::mm::pmm::alloc_page() {
-                    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
-                    riscv_map_page(stval & !0xFFF, pa);
+
+            // Locate the VMA covering the faulting address.
+            if let Some(vma) = crate::mm::mmap::find_vma(pid, stval) {
+
+                // ── Protection check ──────────────────────────────────────
+                // Store fault into a non-writable VMA → SIGSEGV (not COW yet).
+                if code == 15 && vma.prot & PROT_WRITE == 0 {
+                    crate::proc::signal::send_sigsegv(pid, stval);
                     return;
                 }
+                // Instruction fetch fault into a non-executable VMA → SIGSEGV.
+                if code == 12 && vma.prot & PROT_EXEC == 0 {
+                    crate::proc::signal::send_sigsegv(pid, stval);
+                    return;
+                }
+
+                // ── Allocate a fresh zeroed page ──────────────────────────
+                let pa = match crate::mm::pmm::alloc_page() {
+                    Some(pa) => pa,
+                    None => {
+                        // OOM — send SIGSEGV (Linux sends SIGKILL via OOM killer;
+                        // SIGSEGV is acceptable for a single-process kernel).
+                        crate::proc::signal::send_sigsegv(pid, stval);
+                        return;
+                    }
+                };
+                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
+
+                // ── For file-backed VMAs: copy the file page into PA ──────
+                // TODO: replace zero-fill with vfs::pread(vma.fd, pa, PAGE, file_off)
+                // once the VFS pread interface is stable.
+                //
+                // let file_off = vma.file_offset + (faulting_va - vma.start) as u64;
+                // if let VmaKind::FileBacked(fd, _) = vma.kind {
+                //     let _ = crate::fs::vfs::pread(fd, pa as *mut u8, 4096, file_off as usize);
+                // }
+
+                // ── Build PTE flags from VMA prot ─────────────────────────
+                // Sv39 PTE bits: V=0, R=1, W=2, X=3, U=4, G=5, A=6, D=7
+                // Always set V + U.  Add R/W/X from prot.
+                let mut pte_bits: u64 = (1 << 0)   // V (valid)
+                                      | (1 << 4);  // U (user)
+                if vma.prot & PROT_READ  != 0 { pte_bits |= 1 << 1; } // R
+                if vma.prot & PROT_WRITE != 0 { pte_bits |= 1 << 2; } // W
+                if vma.prot & PROT_EXEC  != 0 { pte_bits |= 1 << 3; } // X
+                // Sv39 requires at least one of R/X set for a leaf PTE.
+                // If somehow prot was 0, default to read-only.
+                if pte_bits & 0b1110 == 0 { pte_bits |= 1 << 1; }
+
+                // ── Map the page ──────────────────────────────────────────
+                riscv_map_page(faulting_va, pa, pte_bits);
+
+                // ── TLB shootdown ─────────────────────────────────────────
+                // sfence.vma ensures the core's TLB sees the new PTE before
+                // sret replays the faulting instruction.
+                unsafe { asm!("sfence.vma {va}, zero", va = in(reg) faulting_va); }
+                return;
             }
+
+            // No VMA covers the address — genuine segfault.
             crate::proc::signal::send_sigsegv(pid, stval);
         }
-        // ─── Illegal instruction ─────────────────────────────────────────────────────
+
+        // ─── Illegal instruction ─────────────────────────────────────────
         2 => {
             let pid = crate::proc::scheduler::current_pid();
             crate::proc::signal::send_signal(pid, 4); // SIGILL
         }
+
+        // ─── Anything else → SIGSEGV ─────────────────────────────────────
         _ => {
             let pid = crate::proc::scheduler::current_pid();
-            crate::proc::signal::send_signal(pid, 11); // SIGSEGV
+            crate::proc::signal::send_signal(pid, 11);
         }
     }
 }
@@ -271,31 +347,69 @@ pub fn trap_init() {
     csrw!("sstatus", sstatus | (1 << 1));
 }
 
-// ─── Page table helpers (Sv39) ──────────────────────────────────────────────────────────────
+// ─── sret trampoline (used by exec.rs) ─────────────────────────────────────
+
+/// Jump to user-space after a fresh execve / spawn on RISC-V.
+///
+/// Calling convention: the new PCB has pc = entry_va, sp = initial_rsp.
+/// This trampoline loads sepc = pc, sets sstatus.SPP = 0 (U-mode), and srets.
+#[naked]
+#[no_mangle]
+pub unsafe extern "C" fn sret_trampoline() -> ! {
+    asm!(
+        // At this point we are on the kernel stack of the new process.
+        // a0 = entry VA, a1 = user SP  (set by the scheduler before jumping here)
+        "csrw sepc, a0",
+        "mv   sp, a1",
+        // Clear SPP (bit 8) so sret returns to U-mode; set SPIE (bit 5).
+        "li   t0, 0x120",   // bit 8 = SPP, bit 5 = SPIE
+        "csrc sstatus, t0",
+        "li   t0, 0x20",
+        "csrs sstatus, t0",
+        "sret",
+        options(noreturn)
+    );
+}
+
+// ─── Sv39 page-mapping helper ───────────────────────────────────────────────
 
 /// Map a single 4 KiB page in the current Sv39 page table.
-/// `va` and `pa` must be 4 KiB aligned.
-fn riscv_map_page(va: usize, pa: usize) {
+///
+/// `va` and `pa` must be 4 KiB-aligned.  `pte_bits` supplies the leaf PTE
+/// permission/flag bits (V, R, W, X, U …) — the PA PPN is OR-ed in.
+///
+/// This function allocates intermediate page-table pages from the PMM as
+/// needed; it panics if PMM is exhausted while building the walk.
+fn riscv_map_page(va: usize, pa: usize, pte_bits: u64) {
     let satp  = get_satp();
     let root  = (satp & 0x0FFF_FFFF_FFFF) << 12;
     let vpn   = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
-    let ppn   = pa >> 12;
+    let ppn   = (pa >> 12) as u64;
+
     unsafe {
         let mut pt = root as *mut u64;
+
+        // Walk VPN[2] → VPN[1] (levels 2 and 1), allocating intermediate
+        // tables on demand.
         for level in (1..=2).rev() {
             let pte_ptr = pt.add(vpn[level]);
             let pte = core::ptr::read_volatile(pte_ptr);
             if pte & 1 == 0 {
-                let next = crate::mm::pmm::alloc_page().unwrap_or(0);
-                core::ptr::write_bytes(next as *mut u8, 0, 4096);
-                core::ptr::write_volatile(pte_ptr, ((next >> 12) << 10) | 1);
-                pt = next as *mut u64;
+                // Not valid — allocate a new page-table page.
+                let next_pa = crate::mm::pmm::alloc_page()
+                    .expect("OOM while walking page table in trap handler");
+                core::ptr::write_bytes(next_pa as *mut u8, 0, 4096);
+                // Non-leaf PTE: only V set, PPN points to next level.
+                core::ptr::write_volatile(pte_ptr, ((next_pa as u64 >> 12) << 10) | 1);
+                pt = next_pa as *mut u64;
             } else {
+                // Already valid — follow the pointer.
                 pt = (((pte >> 10) << 12) as usize) as *mut u64;
             }
         }
+
+        // VPN[0] — write the leaf PTE.
         let leaf = pt.add(vpn[0]);
-        // RWX + Valid + User
-        core::ptr::write_volatile(leaf, ((ppn as u64) << 10) | 0xCF);
+        core::ptr::write_volatile(leaf, (ppn << 10) | pte_bits);
     }
 }
