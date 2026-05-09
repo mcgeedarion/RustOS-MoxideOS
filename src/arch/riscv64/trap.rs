@@ -27,6 +27,17 @@
 //!   a7 = syscall number
 //!   a0..a5 = arguments
 //!   a0 = return value
+//!
+//! ## Timer tick (scause = 0x8000_0000_0000_0005)
+//!
+//!   Every supervisor timer interrupt:
+//!     1. `time::tick_advance(TICK_NS)` — advance the monotonic clock.
+//!     2. `time::timer::expire_timers()` — fire due wheel entries (nanosleep
+//!        wakeups, ITIMER_REAL, timerfd callbacks, …).
+//!     3. `proc::scheduler::schedule()` — context switch if needed.
+//!     4. `clint::set_next_event(hart, TICK_NS)` — re-arm mtimecmp so the
+//!        next tick fires TICK_NS nanoseconds from now.
+//!     5. Re-enable STIE in `sie`.
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
@@ -59,18 +70,9 @@ const TRAP_FRAME_SIZE: usize = 34 * 8;
 #[naked]
 #[no_mangle]
 pub unsafe extern "C" fn riscv_trap_entry() {
-    // We use sscratch to temporarily hold the stack pointer while we
-    // build the frame.  sscratch is initialised to 0 in S-mode so we
-    // check it: if it is 0 we came from kernel mode and sp is already
-    // a valid kernel stack pointer; otherwise it holds the per-process
-    // kernel stack top (for future SMP use — for now always 0).
     asm!(
-        // Allocate frame on stack.
         "addi sp, sp, -{frame_size}",
-
-        // Save all 31 non-sp GPRs.
         "sd   ra,  0*8(sp)",
-        // sp saved below after we know the original value
         "sd   gp,  2*8(sp)",
         "sd   tp,  3*8(sp)",
         "sd   t0,  4*8(sp)",
@@ -100,28 +102,18 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t4, 28*8(sp)",
         "sd   t5, 29*8(sp)",
         "sd   t6, 30*8(sp)",
-
-        // Save original sp: original sp = current sp + frame_size.
         "addi t0, sp, {frame_size}",
         "sd   t0, 1*8(sp)",
-
-        // Save sepc and sstatus.
         "csrr t0, sepc",
         "sd   t0, 31*8(sp)",
         "csrr t0, sstatus",
         "sd   t0, 32*8(sp)",
-
-        // Call riscv_trap_handler(&mut TrapFrame).
         "mv   a0, sp",
         "call {handler}",
-
-        // Restore sepc and sstatus.
         "ld   t0, 31*8(sp)",
         "csrw sepc, t0",
         "ld   t0, 32*8(sp)",
         "csrw sstatus, t0",
-
-        // Restore GPRs (skip sp for now).
         "ld   ra,  0*8(sp)",
         "ld   gp,  2*8(sp)",
         "ld   tp,  3*8(sp)",
@@ -152,12 +144,8 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "ld   t4, 28*8(sp)",
         "ld   t5, 29*8(sp)",
         "ld   t6, 30*8(sp)",
-
-        // Restore sp last.
         "ld   sp,  1*8(sp)",
-
         "sret",
-
         frame_size = const TRAP_FRAME_SIZE,
         handler    = sym riscv_trap_handler,
         options(noreturn)
@@ -181,13 +169,47 @@ pub extern "C" fn riscv_trap_handler(frame: &mut TrapFrame) {
 
 fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
     match code {
+        // ──────────────────────────────────────────────────────────────
+        // Supervisor timer interrupt (scause code 5).
+        //
+        // Sequence:
+        //   1. Clear STIE *first* so the interrupt won’t re-fire while we
+        //      are still inside the handler.
+        //   2. Advance the monotonic clock by one tick.
+        //   3. Expire due timer-wheel entries (nanosleep wakeups, etc.).
+        //   4. Run the scheduler — may switch to a newly-woken task.
+        //   5. Re-arm mtimecmp so the next tick fires TICK_NS from now.
+        //   6. Re-enable STIE so future ticks are delivered.
+        // ──────────────────────────────────────────────────────────────
         5 => {
-            // Supervisor timer interrupt — clear STIE to de-assert.
+            // 1. Clear STIE to de-assert while handling.
             let sie = csrr!("sie");
             csrw!("sie", sie & !(1usize << 5));
+
+            // 2. Advance monotonic clock.
+            crate::time::tick_advance(crate::proc::scheduler::TICK_NS);
+
+            // 3. Fire due timer-wheel entries.
+            crate::time::timer::expire_timers();
+
+            // 4. Scheduler tick (may switch tasks).
+            crate::proc::scheduler::schedule();
+
+            // 5. Re-arm mtimecmp for the next tick on hart 0.
+            //    For SMP, each hart should use its own hartid.
+            crate::arch::riscv64::clint::set_next_event(
+                0,
+                crate::proc::scheduler::TICK_NS,
+            );
+
+            // 6. Re-enable STIE.
+            let sie2 = csrr!("sie");
+            csrw!("sie", sie2 | (1usize << 5));
         }
+        // ──────────────────────────────────────────────────────────────
+        // Supervisor external interrupt (PLIC).
+        // ──────────────────────────────────────────────────────────────
         9 => {
-            // Supervisor external interrupt (PLIC).
             // crate::drivers::plic::handle_irq();
         }
         _ => {}
@@ -196,7 +218,7 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
 
 fn handle_exception(frame: &mut TrapFrame, code: usize) {
     match code {
-        // ─── ecall from U-mode ─────────────────────────────────────────────
+        // ─── ecall from U-mode ───────────────────────────────────────────────────────
         8 => {
             let nr = frame.a7;
             let ret = crate::syscall::dispatch(
@@ -207,7 +229,7 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             frame.a0   = ret as usize;
             frame.sepc = frame.sepc.wrapping_add(4);
         }
-        // ─── Page faults ───────────────────────────────────────────────────
+        // ─── Page faults ───────────────────────────────────────────────────────────
         12 | 13 | 15 => {
             let stval = csrr!("stval");
             let pid   = crate::proc::scheduler::current_pid();
@@ -220,7 +242,7 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             }
             crate::proc::signal::send_sigsegv(pid, stval);
         }
-        // ─── Illegal instruction ───────────────────────────────────────────
+        // ─── Illegal instruction ─────────────────────────────────────────────────────
         2 => {
             let pid = crate::proc::scheduler::current_pid();
             crate::proc::signal::send_signal(pid, 4); // SIGILL
@@ -249,7 +271,7 @@ pub fn trap_init() {
     csrw!("sstatus", sstatus | (1 << 1));
 }
 
-// ─── Page table helpers (Sv39) ────────────────────────────────────────────────
+// ─── Page table helpers (Sv39) ──────────────────────────────────────────────────────────────
 
 /// Map a single 4 KiB page in the current Sv39 page table.
 /// `va` and `pa` must be 4 KiB aligned.
@@ -258,28 +280,22 @@ fn riscv_map_page(va: usize, pa: usize) {
     let root  = (satp & 0x0FFF_FFFF_FFFF) << 12;
     let vpn   = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
     let ppn   = pa >> 12;
-    const PTE_V: usize = 1;
-    const PTE_R: usize = 2;
-    const PTE_W: usize = 4;
-    const PTE_U: usize = 16;
-
     unsafe {
-        let mut table = root as *mut usize;
+        let mut pt = root as *mut u64;
         for level in (1..=2).rev() {
-            let pte_ptr = table.add(vpn[level]);
-            let pte     = pte_ptr.read_volatile();
-            if pte & PTE_V == 0 {
-                let new_pa = crate::mm::pmm::alloc_page().expect("OOM in riscv_map_page");
-                core::ptr::write_bytes(new_pa as *mut u8, 0, 4096);
-                let new_ppn = new_pa >> 12;
-                pte_ptr.write_volatile((new_ppn << 10) | PTE_V);
-                table = new_pa as *mut usize;
+            let pte_ptr = pt.add(vpn[level]);
+            let pte = core::ptr::read_volatile(pte_ptr);
+            if pte & 1 == 0 {
+                let next = crate::mm::pmm::alloc_page().unwrap_or(0);
+                core::ptr::write_bytes(next as *mut u8, 0, 4096);
+                core::ptr::write_volatile(pte_ptr, ((next >> 12) << 10) | 1);
+                pt = next as *mut u64;
             } else {
-                table = ((pte >> 10) << 12) as *mut usize;
+                pt = (((pte >> 10) << 12) as usize) as *mut u64;
             }
         }
-        let leaf = table.add(vpn[0]);
-        leaf.write_volatile((ppn << 10) | PTE_V | PTE_R | PTE_W | PTE_U);
-        core::arch::asm!("sfence.vma {va}, zero", va = in(reg) va);
+        let leaf = pt.add(vpn[0]);
+        // RWX + Valid + User
+        core::ptr::write_volatile(leaf, ((ppn as u64) << 10) | 0xCF);
     }
 }
