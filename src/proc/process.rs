@@ -103,6 +103,15 @@ pub struct Pcb {
     /// Only charged / checked when `sched.policy` is Fifo or Rr.
     /// Never inherited by fork children (reset to 0 in fork_syscall.rs).
     pub rt_cpu_time_us: u64,
+
+    // ── nanosleep / timer blocking ───────────────────────────────────────────
+    /// Absolute monotonic deadline (ns) for the current sleep.
+    /// 0 = not sleeping.  Written by sys_nanosleep / clock_nanosleep before
+    /// blocking; read by the wakeup callback to compute `rem`.
+    pub sleep_deadline_ns: u64,
+    /// Timer-wheel ID of the pending sleep wakeup timer.
+    /// 0 = no timer armed.  Cancelled on EINTR so the wheel entry is freed.
+    pub sleep_timer_id: u64,
 }
 
 impl Pcb {
