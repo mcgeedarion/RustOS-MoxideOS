@@ -104,7 +104,8 @@ pub fn cancel_timer(id: u64) {
     if let Some(w) = WHEEL.lock().as_mut() { w.cancel(id); }
 }
 
-/// Called from the tick handler to expire due timers.
+/// Called from the tick handler (both arches) to expire due timers.
+/// Must be called with interrupts disabled or from an IRQ context.
 pub fn expire_timers() {
     let now = read_monotonic_ns();
     if let Some(w) = WHEEL.lock().as_mut() { w.expire(now); }
@@ -119,8 +120,8 @@ pub const TIMER_ABSTIME: i32 = 1;
 /// Kernel implementation of `clock_nanosleep(2)` and `nanosleep(2)`.
 ///
 /// Puts the calling task to sleep until `deadline_ns` (absolute) on the
-/// given clock.  Uses the timer wheel to schedule a wakeup, then calls
-/// `proc::sleep_until` to block the task.
+/// given clock.  Delegates to `proc::nanosleep::sleep_ns_internal` which owns
+/// the blocking protocol (deadline recording, EINTR detection, rem output).
 ///
 /// Returns `Ok(())` on normal completion, `Err(-EINTR)` if interrupted.
 pub fn clock_nanosleep(
@@ -132,27 +133,20 @@ pub fn clock_nanosleep(
     if !req.is_valid() { return Err(-22); } // EINVAL
 
     let deadline_ns = if flags & TIMER_ABSTIME != 0 {
-        // Absolute time: convert to monotonic deadline.
         let now_real = clock::clock_gettime(clk_id).map(|t| t.to_ns()).unwrap_or(0);
         let req_ns   = req.to_ns();
         if req_ns <= now_real { return Ok(()); } // already in the past
-        let delta = req_ns - now_real;
-        read_monotonic_ns() + delta
+        read_monotonic_ns() + (req_ns - now_real)
     } else {
-        // Relative time.
         let delta_ns = req.to_ns();
         if delta_ns == 0 { return Ok(()); }
         read_monotonic_ns() + delta_ns
     };
 
-    // Register a wakeup timer; suspend the current task.
-    // Integration point: replace with actual task blocking.
-    let task_id = current_task_id();
-    let _timer_id = add_oneshot(deadline_ns, move |_| wakeup_task(task_id));
-
-    // Spin-wait fallback until scheduler blocking is wired in.
-    while read_monotonic_ns() < deadline_ns {
-        core::hint::spin_loop();
+    let delta_ns = deadline_ns.saturating_sub(read_monotonic_ns());
+    if delta_ns > 0 {
+        crate::proc::nanosleep::sleep_ns_internal(delta_ns)
+            .map_err(|e| e)?;
     }
     Ok(())
 }
@@ -200,7 +194,6 @@ impl ItimerState {
     pub fn set(&mut self, which: u32, new: ItimerVal) -> Result<ItimerVal, isize> {
         if which > ITIMER_PROF { return Err(-22); }
         let old = self.timers[which as usize];
-        // Cancel existing.
         if self.timer_ids[which as usize] != 0 {
             cancel_timer(self.timer_ids[which as usize]);
             self.timer_ids[which as usize] = 0;
@@ -230,17 +223,10 @@ impl ItimerState {
 
 fn deliver_itimer_signal(task_id: u64, which: u32) {
     let sig = match which {
-        ITIMER_REAL    => 14u8, // SIGALRM
-        ITIMER_VIRTUAL => 26u8, // SIGVTALRM
-        ITIMER_PROF    => 27u8, // SIGPROF
+        ITIMER_REAL    => 14u32, // SIGALRM
+        ITIMER_VIRTUAL => 26u32, // SIGVTALRM
+        ITIMER_PROF    => 27u32, // SIGPROF
         _              => return,
     };
-    // Integration point:
-    // crate::proc::signal::send_to_task(task_id, sig);
-    crate::serial_println!("[itimer] signal {} → task {}", sig, task_id);
+    crate::proc::signal::send_signal(task_id as usize, sig);
 }
-
-// ── Scheduler integration stubs ───────────────────────────────────────────────
-
-fn current_task_id() -> u64 { 0 } // replace with crate::proc::current().id
-fn wakeup_task(_id: u64) {}        // replace with crate::proc::wakeup(id)
