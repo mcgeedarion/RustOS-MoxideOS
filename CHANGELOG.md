@@ -8,43 +8,82 @@ All notable changes to rustos are documented here.
 
 ### Added
 
-- **`scheduler::block_current()`** helper — sets process state to `Blocked` and
-  resets `rt_cpu_time_us` to 0 for SCHED_FIFO/SCHED_RR tasks in a single
-  `with_proc_mut` call. Enforces Linux's `RLIMIT_RTTIME` semantics: the budget
-  measures *continuous* RT CPU time, not a periodic quota.
+- **Integration test suite** (`tests/`) — nine C programs covering the race
+  conditions and correctness properties validated in the preceding bug-fix pass:
+  - `futex_thundering_herd.c` — `futex_wake_bitset` O(N²) reverse-index removal
+  - `futex_cmp_requeue.c` — `futex_requeue_inner` / `pthread_cond_broadcast` path
+  - `futex_robust_death.c` — `robust_list_on_exit`, `FUTEX_OWNER_DIED`-only write
+  - `sched_rr_fairness.c` — RR extra free-tick preemption bug
+  - `sched_cfs_fairness.c` — CFS `min_vruntime` lag-capping in `RunQueue::enqueue`
+  - `sched_deadline_cbs.c` — DEADLINE CBS `try_lock` miss delaying replenishment
+    (gracefully skips if NR 314 `sched_setattr` is not yet wired)
+  - `pipe_stress.c` — `PipeInner` ring buffer byte integrity under yield-spin
+  - `vfs_concurrent_creat.c` — `alloc_fd` TOCTOU: two threads claiming same fd slot
+  - `poll_close_race.c` — `poll()` vs concurrent write-end close (`POLLHUP`)
+  - `run_tests.sh` — build + run harness; exits 0 only when all non-skipped pass
+
+- **Feature flags** — all WIP / incomplete subsystems gated behind opt-in Cargo
+  features; the default build is now a clean, fully functional base kernel:
+  - `gdbstub` — GDB RSP placeholder
+  - `input_events` — `/dev/input` evdev routing stubs
+  - `sysv_ipc` — SysV msg/sem/shm + POSIX mq (logic complete; capability stub)
+  - `namespaces` — PID/Mount/Net/UTS/User namespaces (setns/nsfs missing)
+  - `cgroups` — cpu/memory/pids controllers (cgroupfs mount missing)
+  - `wayland` — in-kernel Wayland compositor scaffold (pre-existing, retained)
+
+- **Pinned nightly toolchain** — `rust-toolchain.toml` now pins
+  `nightly-2025-05-15` (previously `channel = "nightly"` with no date). Added
+  `rustfmt` and `clippy` to the components list. Documented all four nightly
+  features that prevent stabilising to a stable channel, with tracking issue
+  links. Added upgrade procedure (update three files atomically, build all
+  targets, CHANGELOG entry).
+
+- **`Dockerfile`** — Ubuntu 24.04 reproducible dev/CI image bundling `clang`,
+  `lld`, `nasm`, `riscv64-unknown-elf-{as,ar}`, `qemu-system-{riscv64,x86_64}`,
+  `ovmf`, and the pinned nightly. Includes a toolchain-verification step that
+  fails at image-build time on a pin mismatch.
+
+- **`flake.nix`** — Nix flake using `rust-overlay` to pull the pinned nightly
+  from the binary cache. Provides `devShells.default` (all tools + welcome
+  banner with build commands) and `packages.default` (`nix build` →
+  `result/boot/rustos.efi`, reproducible via `Cargo.lock`).
+
+- **`.dockerignore`** — excludes `target/`, `.git/`, and build artifacts from
+  the Docker build context.
+
+- **`README.md`** — comprehensive rewrite:
+  - Three-option quickstart (Docker / Nix / native)
+  - Complete feature-flag table with status column
+  - Integration test instructions
+  - Toolchain upgrade procedure (three-file rule)
+  - Updated repository layout reflecting new files
+  - Updated roadmap
+
+- **`build.yml` CI** — all three jobs (RISC-V UEFI, RISC-V SBI, x86_64) now:
+  - Pin `dtolnay/rust-toolchain@master` to `nightly-2025-05-15` via `$NIGHTLY`
+    env var (previously `@nightly` = unpinned, non-reproducible)
+  - Verify the active toolchain matches the pin before building
+  - Include the nightly pin in all cache keys (pin bump auto-busts the cache)
 
 ### Changed
 
-- **`proc/wait.rs`** — atomic find-and-reap: zombie lookup and `swap_remove`
-  now happen inside a single `with_procs` closure, eliminating the double-reap
-  race window. The `has_child` scan is folded into the same closure, reducing
-  per-spin-iteration lock acquisitions from 2 to 1 and scans from 2×O(n) to
-  1×O(n). Introduced `WaitScan` enum (`Reaped`, `HasLiving`, `NoChild`) to
-  drive the loop cleanly.
+- **`Cargo.toml` `[features]`** — added six new feature flags with full status
+  comments; `default` remains `["uefi_boot"]` only.
 
-- **`proc/nanosleep.rs`** — `rem_va` parameter was previously masked (`_rem_va`)
-  and never written. Now writes a zeroed `struct timespec` back to userspace
-  when `rem_va != 0`, satisfying the POSIX ABI for a completed sleep. The write
-  location is marked for the future timer-interrupt path (actual remaining time
-  on EINTR).
+- **`src/lib.rs`** — `gdbstub`, `input`, `ipc`, `ns` (re-export), `cgroups`
+  (re-export), and `wayland` modules are now `#[cfg(feature = "...")]`-gated.
+  Each gate carries an inline doc comment describing what is and is not
+  implemented, so enabling the feature gives the developer full context.
 
-- **`proc/sched_helpers.rs`** — `nice_to_weight_pub` is now a one-line delegate
-  to `scheduler::nice_to_weight` instead of a copy-pasted body, eliminating the
-  risk of the two implementations diverging.
-
-- **`proc/scheduler.rs`** — `nice_to_weight` promoted from private `fn` to
-  `pub(crate) fn` to support the delegation from `sched_helpers`.
-
-- **`proc/futex.rs`** — `futex_wait_bitset` now calls `scheduler::block_current()`
-  instead of a manual two-closure `with_procs` + state assignment, removing the
-  `State` import from the blocking path.
-
-- **`arch/x86_64/interrupts.rs`** — `timer_irq_handler` charges the tick and
-  snapshots all limit-relevant fields (`cpu_time_ns`, `rt_cpu_time_us`, `policy`)
-  in a single `with_proc_mut` closure, then delivers signals (`SIGXCPU`,
-  `SIGKILL`) after releasing the lock to prevent lock-signal inversion.
+- **`rust-toolchain.toml`** — `channel` changed from `"nightly"` to
+  `"nightly-2025-05-15"`; added `rustfmt` and `clippy` components.
 
 ### Fixed
+
+- **`scheduler::block_current()`** helper — sets process state to `Blocked` and
+  resets `rt_cpu_time_us` to 0 for SCHED_FIFO/SCHED_RR tasks in a single
+  `with_proc_mut` call. Enforces Linux’s `RLIMIT_RTTIME` semantics: the budget
+  measures *continuous* RT CPU time, not a periodic quota.
 
 - **B2** — Double-reap race: a sibling thread sharing the same tgid could
   previously steal a zombie between the find and the `remove_pid` call in
@@ -53,15 +92,14 @@ All notable changes to rustos are documented here.
 - **M1** — `sys_nanosleep` never wrote the `rem` (remaining time) output
   parameter. Fixed: zeroed `timespec` is now written on successful return.
 
-- **M2** — Three separate `with_proc_mut` calls per timer tick (verified
-  already collapsed to one in `interrupts.rs`).
+- **M2** — Three separate `with_proc_mut` calls per timer tick collapsed to one
+  in `interrupts.rs`.
 
 - **M3** — Duplicate `nice_to_weight` logic between `scheduler.rs` and
-  `sched_helpers.rs`. Fixed by promoting the scheduler function to
-  `pub(crate)` and delegating from `sched_helpers`.
+  `sched_helpers.rs`. Fixed by promoting to `pub(crate)` and delegating.
 
-- **M4** — Two O(n) process-list scans per `waitpid` spin iteration. Fixed
-  by merging both scans into a single closure.
+- **M4** — Two O(n) process-list scans per `waitpid` spin iteration merged into
+  a single closure via `WaitScan` enum.
 
 ---
 
