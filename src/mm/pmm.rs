@@ -136,9 +136,13 @@ extern "C" {
 }
 
 #[inline]
-fn kernel_start_pa() -> usize { unsafe { &_kernel_start as *const u8 as usize } }
+fn kernel_start_pa() -> usize {
+    unsafe { &_kernel_start as *const u8 as usize }
+}
 #[inline]
-fn kernel_end_pa()   -> usize { unsafe { &_end as *const u8 as usize } }
+fn kernel_end_pa() -> usize {
+    unsafe { &_end as *const u8 as usize }
+}
 #[inline]
 fn is_kernel_page(pa: usize) -> bool {
     pa >= kernel_start_pa() && pa < kernel_end_pa()
@@ -196,7 +200,11 @@ fn efi_mem_type_is_usable(t: u32) -> bool {
 /// # Safety
 /// Must be called after ExitBootServices.  `map_ptr` must point to valid
 /// memory containing at least `map_size` bytes of EFI memory descriptors.
-pub unsafe fn pmm_add_efi_map(map_ptr: usize, map_size: usize, desc_size: usize) {
+pub unsafe fn pmm_add_efi_map(
+    map_ptr:   usize,
+    map_size:  usize,
+    desc_size: usize,
+) {
     if map_ptr == 0 || map_size == 0 || desc_size == 0 { return; }
 
     // EfiMemDescriptor has a fixed layout but firmware may use a larger
@@ -387,17 +395,30 @@ pub fn free_pages_contig(base_pa: usize, n: usize) {
 
 pub fn free_page(pa: usize) {
     if pa == 0 { return; }
-    assert!(pa & (PAGE_SIZE - 1) == 0,
-        "free_page: PA {:#x} is not page-aligned", pa);
-    assert!(!is_kernel_page(pa),
-        "free_page: attempt to free kernel image page {:#x}", pa);
+    assert!(
+        pa & (PAGE_SIZE - 1) == 0,
+        "free_page: PA {:#x} is not page-aligned",
+        pa,
+    );
+    assert!(
+        !is_kernel_page(pa),
+        "free_page: attempt to free kernel image page {:#x}",
+        pa,
+    );
     if let Some(idx) = pool_index(pa) {
         let ok = pool_bit_set_free(idx);
-        assert!(ok, "free_page: double-free of pool page {:#x} (index {})", pa, idx);
+        assert!(
+            ok,
+            "free_page: double-free of pool page {:#x} (index {})",
+            pa,
+            idx,
+        );
     }
     unsafe {
         let ptr = pa as *mut u64;
-        for i in 0..(PAGE_SIZE / 8) { ptr.add(i).write_volatile(0u64); }
+        for i in 0..(PAGE_SIZE / 8) {
+            ptr.add(i).write_volatile(0u64);
+        }
     }
     treiber_push(pa);
     TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);

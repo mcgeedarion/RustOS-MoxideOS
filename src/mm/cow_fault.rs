@@ -31,7 +31,11 @@ fn to_virt(pa: usize) -> usize {
 
 /// Create a CoW copy of the parent's address space for a fork() child.
 /// Returns the child's CR3/SATP physical address, or 0 on OOM.
-pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) -> usize {
+pub fn clone_for_fork(
+    parent_pid: usize,
+    child_pid:  usize,
+    parent_cr3: usize,
+) -> usize {
     let child_cr3 = match <Arch as Paging>::clone_address_space(parent_cr3) {
         Some(c) => c,
         None    => return 0,
@@ -157,7 +161,8 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
 // Each walker returns the *leaf* PTE value (4 KiB granule only).
 // Large-page PTEs return None — they are not CoW-eligible.
 
-const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000; // x86-64 PTE physical address mask
+// x86-64 PTE physical address mask
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT:   u64 = 1;
 /// Bit 7 in a PDPTE/PDE: page-size flag (1 GiB / 2 MiB large page).
 const PAGE_SIZE_BIT: u64 = 1 << 7;
@@ -179,12 +184,14 @@ unsafe fn pte_read(cr3: usize, va: usize) -> Option<u64> {
     let pdpt_base = to_virt((pml4e & ADDR_MASK) as usize);
     let pdpte = *((pdpt_base + pdpti * 8) as *const u64);
     if pdpte & PRESENT == 0 { return None; }
-    if pdpte & PAGE_SIZE_BIT != 0 { return None; } // 1 GiB page
+    // 1 GiB large page — not CoW-eligible.
+    if pdpte & PAGE_SIZE_BIT != 0 { return None; }
 
     let pd_base = to_virt((pdpte & ADDR_MASK) as usize);
     let pde = *((pd_base + pdi * 8) as *const u64);
     if pde & PRESENT == 0 { return None; }
-    if pde & PAGE_SIZE_BIT != 0 { return None; } // 2 MiB page
+    // 2 MiB large page — not CoW-eligible.
+    if pde & PAGE_SIZE_BIT != 0 { return None; }
 
     let pt_base = to_virt((pde & ADDR_MASK) as usize);
     Some(*((pt_base + pti * 8) as *const u64))
@@ -222,13 +229,15 @@ unsafe fn pte_read(satp_pa: usize, va: usize) -> Option<u64> {
     let pgd_base = to_virt(satp_pa);
     let pgde = *((pgd_base + vpn2 * 8) as *const u64);
     if pgde & RV_PTE_VALID == 0 { return None; }
-    if pgde & RV_PTE_RWX_MASK != 0 { return None; } // 1 GiB leaf — not CoW-eligible
+    // 1 GiB leaf — large pages are not CoW-eligible.
+    if pgde & RV_PTE_RWX_MASK != 0 { return None; }
 
     // Level 1 (PMD)
     let pmd_base = to_virt(rv_pte_to_pa(pgde));
     let pmde = *((pmd_base + vpn1 * 8) as *const u64);
     if pmde & RV_PTE_VALID == 0 { return None; }
-    if pmde & RV_PTE_RWX_MASK != 0 { return None; } // 2 MiB leaf — not CoW-eligible
+    // 2 MiB leaf — large pages are not CoW-eligible.
+    if pmde & RV_PTE_RWX_MASK != 0 { return None; }
 
     // Level 0 (PT)
     let pt_base = to_virt(rv_pte_to_pa(pmde));

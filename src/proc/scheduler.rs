@@ -712,9 +712,13 @@ where
     proc_table::with_proc(pid, f)
 }
 #[inline]
-pub fn with_proc_mut<T, F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> T>(
-    pid: usize, f: F,
-) -> Option<T> {
+pub fn with_proc_mut<T, F>(
+    pid: usize,
+    f: F,
+) -> Option<T>
+where
+    F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> T,
+{
     proc_table::with_proc_mut(pid, f)
 }
 #[inline]
