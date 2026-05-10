@@ -15,27 +15,32 @@
 //!   8. time::init()            — clocksource calibration (TSC/HPET), timerfd, itimers
 //!   9. smp::init()             — enumerate MADT CPUs, bring up APs
 //!  10. tty::init()             — PTY registry + /dev/pts
-//!  11. drivers::nic::init()    — NIC driver (e3/virtio-net)
+//!  11. drivers::nic::init()    — NIC driver (e1000e/virtio-net)
 //!  12. dhcp::init()            — DORA handshake; sets ip/gw/mask in ip layer
 //!  13. spawn pid 1 from /init  — scheduler takes over
 //!
 //! RISC-V boot sequence:
-//!   1. trap_init()             — install stvec, enable SIE (must be first)
-//!   2. init_from_fdt()         — parse FDT /memory + /chosen → PMM + initramfs range
+//!   1. trap_init()             — install stvec, enable SSIE/STIE/SEIE (must be first)
+//!   2. init_from_fdt()         — parse FDT: /memory → PMM, /chosen → initramfs,
+//!                                            /soc/plic → plic::set_base(),
+//!                                            virtio_mmio@ → virtio_net_mmio::probe()
 //!   3. heap::init()            — slab/linked-list allocator over PMM
 //!   4. initramfs::mount()      — populate VFS from CPIO
-//!   5. time::init()            — calibrate CLINT mtime clocksource, timerfd, itimers
-//!   6. smp::init()             — SBI HSM hart bringup
-//!   7. tty::init()             — PTY registry + /dev/pts
-//!   8. drivers::nic::init()    — NIC driver
-//!   9. dhcp::init()            — DORA handshake
-//!  10. spawn pid 1 from /init  — scheduler takes over
+//!   5. plic::init()            — set S-mode context threshold=0, PLIC ready to deliver
+//!   6. virtio_net_mmio::enable_plic_irq()
+//!                              — register NIC IRQ with PLIC; enables interrupt-driven RX
+//!   7. time::init()            — calibrate CLINT mtime clocksource, timerfd, itimers
+//!   8. smp::init()             — SBI HSM hart bringup
+//!   9. tty::init()             — PTY registry + /dev/pts
+//!  10. drivers::nic::init()    — NIC abstraction layer init (rx_poll fallback path)
+//!  11. dhcp::init()            — DORA handshake
+//!  12. spawn pid 1 from /init  — scheduler takes over
 
 #![allow(unused_imports)]
 
 use crate::initramfs;
 
-// ── x86_64 entry ──────────────────────────────────────────────────────────────
+// ── x86_64 entry ────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn kernel_main_x86_64() {
@@ -47,33 +52,23 @@ pub fn kernel_main_x86_64() {
 
     pmm::init();
     heap::init();
-
-    // Mount the initramfs into the VFS before anything can call open(2).
     crate::fs::initramfs::mount_initramfs();
-
     gdt::init();
     idt::init();
     apic::init();
     crate::time::init();
     crate::smp::init();
     crate::tty::init();
-
-    // NIC must come up before DHCP so the send path has a working Ethernet layer.
     crate::drivers::nic::init();
-
-    // Run the DHCP DORA handshake; on success this updates ip::OUR_IP,
-    // GATEWAY_IP and SUBNET_MASK so all subsequent network calls use the
-    // leased address.  On failure a 169.254.x.x link-local fallback is set.
     crate::net::dhcp::init();
     crate::println!(
         "rustos: network up — ip={:?} gw={:?}",
         crate::net::ip::our_ip().to_be_bytes(),
         crate::net::dhcp::leased_gateway().to_be_bytes(),
     );
-
     crate::println!("rustos: subsystems initialised — launching /init");
 
-    let handle   = initramfs::load();
+    let handle    = initramfs::load();
     let elf_bytes = match handle.file("/init") {
         Some(b) => b,
         None => {
@@ -81,19 +76,16 @@ pub fn kernel_main_x86_64() {
             loop { unsafe { core::arch::asm!("hlt"); } }
         }
     };
-
     if !crate::proc::exec::spawn_user_process_from_bytes(elf_bytes, "/init", &["/init"], &[]) {
         crate::println!("rustos: FATAL: failed to spawn /init");
         loop { unsafe { core::arch::asm!("hlt"); } }
     }
     crate::println!("rustos: pid 1 enqueued");
     crate::println!("TEST PASS: initramfs_load");
-
-    // Hand control to the scheduler — does not return.
     crate::proc::scheduler::run();
 }
 
-// ── RISC-V entry ───────────────────────────────────────────────────────────────
+// ── RISC-V entry ────────────────────────────────────────────────────────────────────────
 
 /// Called by `_start` in `arch/riscv64/boot.rs` with:
 ///   `hart_id` = value of a0 from OpenSBI
@@ -103,10 +95,14 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     use crate::arch::riscv64::trap;
     use crate::mm::{heap, pmm};
 
+    // 1. Trap vector + SSIE/STIE/SEIE must be active before anything faults.
     trap::trap_init();
 
     crate::println!("rustos: riscv64 kernel starting (hart {})", hart_id);
+    crate::println!("kernel_main reached");
 
+    // 2. Walk the FDT: registers PMM regions, finds initramfs, sets PLIC base,
+    //    probes virtio_mmio devices (virtio_net_mmio::probe is called here).
     unsafe { crate::arch::riscv64::fdt::init_from_fdt(fdt_ptr); }
     crate::println!(
         "pmm: {} MiB total, {} MiB free",
@@ -114,12 +110,27 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
         pmm::free_pages()  * 4 / 1024,
     );
 
+    // 3. Heap must come up before any Box/Vec/String allocations.
     heap::init();
+
+    // 4. VFS from CPIO.
     crate::fs::initramfs::mount_initramfs();
+
+    // 5. PLIC: set threshold=0 so any enabled IRQ with priority ≥1 is delivered.
+    //    Must happen after fdt::init_from_fdt (which calls plic::set_base).
+    if crate::drivers::plic::init() {
+        // 6. Register the virtio-net MMIO IRQ with the PLIC.
+        //    From now on, RX is interrupt-driven (scause 0x8000…9 → plic::handle_irq
+        //    → virtio_net_mmio_irq → rx_poll + drain_tx).
+        crate::drivers::virtio_net_mmio::enable_plic_irq();
+    } else {
+        crate::println!("plic: not available — NIC will use polled RX");
+    }
+
+    // 7–12. Remaining subsystems.
     crate::time::init();
     crate::smp::init();
     crate::tty::init();
-
     crate::drivers::nic::init();
     crate::net::dhcp::init();
     crate::println!(
@@ -138,13 +149,11 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
             loop { unsafe { core::arch::asm!("wfi"); } }
         }
     };
-
     if !crate::proc::exec::spawn_user_process_from_bytes(elf_bytes, "/init", &["/init"], &[]) {
         crate::println!("rustos: FATAL: failed to spawn /init");
         loop { unsafe { core::arch::asm!("wfi"); } }
     }
     crate::println!("rustos: pid 1 enqueued");
     crate::println!("TEST PASS: initramfs_load");
-
     crate::proc::scheduler::run();
 }

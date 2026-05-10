@@ -34,12 +34,19 @@
 //!   Queue 1: TX  — driver posts read-only frames.
 //!   Split-ring, QUEUE_SIZE = 256.
 //!
-//! ## Public API (mirrors virtio_net)
+//! ## PLIC wiring
+//!   After `probe()` succeeds, `kernel_main` calls `enable_plic_irq()` which
+//!   registers `virtio_net_mmio_irq` as the PLIC handler for the IRQ number
+//!   stored by probe.  From that point on RX is interrupt-driven instead of
+//!   polled.
+//!
+//! ## Public API
 //!   probe(base, irq)          — called from FDT walker
+//!   enable_plic_irq()         — called from kernel_main after plic::init()
 //!   send_frame(frame: &[u8])  — transmit one Ethernet frame
-//!   rx_poll()                 — drain RX ring into net stack
+//!   rx_poll()                 — drain RX ring into net stack (polled fallback)
 //!   mac_address() -> [u8;6]
-//!   virtio_net_mmio_irq()     — call from PLIC interrupt handler
+//!   virtio_net_mmio_irq()     — PLIC interrupt handler
 
 use crate::drivers::nic::{register_nic, NicDevice};
 use crate::mm::pmm;
@@ -59,7 +66,7 @@ const REG_DRIVER_FEAT_SEL:   usize = 0x024;
 const REG_QUEUE_SEL:         usize = 0x030;
 const REG_QUEUE_NUM_MAX:     usize = 0x034;
 const REG_QUEUE_NUM:         usize = 0x038;
-const REG_QUEUE_READY:       usize = 0x044; // modern only
+const REG_QUEUE_READY:       usize = 0x044;
 const REG_QUEUE_NOTIFY:      usize = 0x050;
 const REG_INTERRUPT_STATUS:  usize = 0x060;
 const REG_INTERRUPT_ACK:     usize = 0x064;
@@ -70,77 +77,45 @@ const REG_QUEUE_AVAIL_LO:    usize = 0x090;
 const REG_QUEUE_AVAIL_HI:    usize = 0x094;
 const REG_QUEUE_USED_LO:     usize = 0x0A0;
 const REG_QUEUE_USED_HI:     usize = 0x0A4;
-const REG_CONFIG_MAC:        usize = 0x100; // 6 bytes
+const REG_CONFIG_MAC:        usize = 0x100;
 
-// Magic value and device ID.
-const MMIO_MAGIC: u32   = 0x7472_6976; // "virt"
+const MMIO_MAGIC: u32   = 0x7472_6976;
 const DEV_ID_NET: u32   = 1;
 
-// Device status bits (same as PCI virtio).
 const STATUS_ACK:         u32 = 0x01;
 const STATUS_DRIVER:      u32 = 0x02;
 const STATUS_DRIVER_OK:   u32 = 0x04;
 const STATUS_FEATURES_OK: u32 = 0x08;
 const STATUS_FAILED:      u32 = 0x80;
 
-// Feature bits.
-const FEAT_MAC:  u32 = 1 << 5;
-const FEAT_CSUM: u32 = 1 << 0;
-// VirtIO 1.0 VERSION_1 in feature word 1.
+const FEAT_MAC:       u32 = 1 << 5;
+const FEAT_CSUM:      u32 = 1 << 0;
 const FEAT_VERSION_1: u32 = 1 << 0;
 
-// Descriptor flags.
 const VRING_DESC_F_WRITE: u16 = 2;
 
 const QUEUE_SIZE:    usize = 256;
-const NET_HDR_LEN:   usize = 12;  // virtio_net_hdr (no MRG_RXBUF)
+const NET_HDR_LEN:   usize = 12;
 const RX_BUF_SIZE:   usize = 4096;
 
 // ── MMIO accessors ────────────────────────────────────────────────────────────────
 
-#[inline]
-unsafe fn mmio_r32(base: usize, off: usize) -> u32 {
+#[inline] unsafe fn mmio_r32(base: usize, off: usize) -> u32 {
     core::ptr::read_volatile((base + off) as *const u32)
 }
-
-#[inline]
-unsafe fn mmio_w32(base: usize, off: usize, val: u32) {
+#[inline] unsafe fn mmio_w32(base: usize, off: usize, val: u32) {
     core::ptr::write_volatile((base + off) as *mut u32, val);
 }
-
-#[inline]
-unsafe fn mmio_rb(base: usize, off: usize) -> u8 {
+#[inline] unsafe fn mmio_rb(base: usize, off: usize) -> u8 {
     core::ptr::read_volatile((base + off) as *const u8)
 }
 
-// ── Split virtqueue (identical layout to virtio_net.rs) ────────────────────────
+// ── Split virtqueue ───────────────────────────────────────────────────────────────────
 
-#[repr(C)]
-struct VirtDesc {
-    addr:  u64,
-    len:   u32,
-    flags: u16,
-    next:  u16,
-}
-
-#[repr(C)]
-struct VirtAvail {
-    flags:      u16,
-    idx:        u16,
-    ring:       [u16; QUEUE_SIZE],
-    used_event: u16,
-}
-
-#[repr(C)]
-struct VirtUsedElem { id: u32, len: u32 }
-
-#[repr(C)]
-struct VirtUsed {
-    flags:       u16,
-    idx:         u16,
-    ring:        [VirtUsedElem; QUEUE_SIZE],
-    avail_event: u16,
-}
+#[repr(C)] struct VirtDesc  { addr: u64, len: u32, flags: u16, next: u16 }
+#[repr(C)] struct VirtAvail { flags: u16, idx: u16, ring: [u16; QUEUE_SIZE], used_event: u16 }
+#[repr(C)] struct VirtUsedElem { id: u32, len: u32 }
+#[repr(C)] struct VirtUsed  { flags: u16, idx: u16, ring: [VirtUsedElem; QUEUE_SIZE], avail_event: u16 }
 
 #[derive(Clone, Copy, Default)]
 struct TxMeta { base_pa: usize, pages: usize }
@@ -151,14 +126,12 @@ struct Virtqueue {
     used:      *mut VirtUsed,
     free_head: usize,
     last_used: u16,
-    bufs:      [*mut u8;   QUEUE_SIZE],
-    tx_meta:   [TxMeta;    QUEUE_SIZE],
-    /// Physical address of the descriptor table (needed for MMIO programming).
+    bufs:      [*mut u8;  QUEUE_SIZE],
+    tx_meta:   [TxMeta;   QUEUE_SIZE],
     desc_pa:   usize,
     avail_pa:  usize,
     used_pa:   usize,
 }
-
 unsafe impl Send for Virtqueue {}
 unsafe impl Sync for Virtqueue {}
 
@@ -172,23 +145,17 @@ fn alloc_pages(n: usize) -> usize {
 impl Virtqueue {
     const fn zeroed() -> Self {
         Self {
-            desc:      core::ptr::null_mut(),
-            avail:     core::ptr::null_mut(),
-            used:      core::ptr::null_mut(),
-            free_head: 0,
-            last_used: 0,
-            bufs:      [core::ptr::null_mut(); QUEUE_SIZE],
-            tx_meta:   [TxMeta { base_pa: 0, pages: 0 }; QUEUE_SIZE],
-            desc_pa:   0,
-            avail_pa:  0,
-            used_pa:   0,
+            desc: core::ptr::null_mut(), avail: core::ptr::null_mut(),
+            used: core::ptr::null_mut(), free_head: 0, last_used: 0,
+            bufs: [core::ptr::null_mut(); QUEUE_SIZE],
+            tx_meta: [TxMeta { base_pa: 0, pages: 0 }; QUEUE_SIZE],
+            desc_pa: 0, avail_pa: 0, used_pa: 0,
         }
     }
-
     unsafe fn alloc(&mut self) {
-        let desc_bytes  = core::mem::size_of::<VirtDesc>() * QUEUE_SIZE; // 4096
-        let avail_bytes = 6 + QUEUE_SIZE * 2;                              // 518
-        let pages_da = (desc_bytes + avail_bytes + 4095) / 4096;
+        let desc_bytes  = core::mem::size_of::<VirtDesc>() * QUEUE_SIZE;
+        let avail_bytes = 6 + QUEUE_SIZE * 2;
+        let pages_da    = (desc_bytes + avail_bytes + 4095) / 4096;
         let dp = alloc_pages(pages_da);
         self.desc_pa  = dp;
         self.avail_pa = dp + desc_bytes;
@@ -197,12 +164,9 @@ impl Virtqueue {
         let up = alloc_pages(1);
         self.used_pa = up;
         self.used  = up as *mut VirtUsed;
-        for i in 0..QUEUE_SIZE - 1 {
-            (*self.desc.add(i)).next = (i + 1) as u16;
-        }
+        for i in 0..QUEUE_SIZE - 1 { (*self.desc.add(i)).next = (i + 1) as u16; }
         self.free_head = 0;
     }
-
     unsafe fn add_rx_buf(&mut self, buf: *mut u8, len: u32) {
         let idx = self.alloc_desc();
         let d = &mut *self.desc.add(idx);
@@ -211,17 +175,14 @@ impl Virtqueue {
         self.bufs[idx] = buf;
         self.push_avail(idx);
     }
-
     unsafe fn add_tx_buf(&mut self, buf: *const u8, len: u32, base_pa: usize, pages: usize) {
         let idx = self.alloc_desc();
         let d = &mut *self.desc.add(idx);
-        d.addr = buf as u64; d.len = len;
-        d.flags = 0; d.next = 0;
+        d.addr = buf as u64; d.len = len; d.flags = 0; d.next = 0;
         self.bufs[idx]    = buf as *mut u8;
         self.tx_meta[idx] = TxMeta { base_pa, pages };
         self.push_avail(idx);
     }
-
     unsafe fn drain_used(&mut self, mut f: impl FnMut(*mut u8, u32, TxMeta)) -> bool {
         fence(Ordering::Acquire);
         let mut drained = false;
@@ -236,7 +197,6 @@ impl Virtqueue {
         }
         drained
     }
-
     #[inline] unsafe fn alloc_desc(&mut self) -> usize {
         let idx = self.free_head;
         self.free_head = (*self.desc.add(idx)).next as usize;
@@ -258,105 +218,66 @@ impl Virtqueue {
 // ── Device state ───────────────────────────────────────────────────────────────────
 
 struct MmioDev {
-    base: usize,   // MMIO base VA (identity-mapped on RISC-V)
+    base: usize,
     mac:  [u8; 6],
+    irq:  u32,   // PLIC IRQ number, 0 = unknown
     rxq:  Virtqueue,
     txq:  Virtqueue,
 }
-
 unsafe impl Send for MmioDev {}
 unsafe impl Sync for MmioDev {}
 
 static DEV: Mutex<Option<MmioDev>> = Mutex::new(None);
 
-// ── Probe (called from FDT walker) ───────────────────────────────────────────
+// ── Probe ─────────────────────────────────────────────────────────────────────────────
 
-/// Probe a VirtIO-MMIO net device at `base` (identity-mapped PA).
-///
-/// `irq` is the PLIC interrupt number from the FDT `interrupts` property;
-/// currently stored for future PLIC wiring (we fall back to polled RX for now).
-///
-/// Returns `true` if the device was successfully initialised and registered
-/// with the NIC abstraction layer.
-pub fn probe(base: usize, _irq: u32) -> bool {
+pub fn probe(base: usize, irq: u32) -> bool {
     unsafe {
-        // Validate magic + version + device ID.
         let magic   = mmio_r32(base, REG_MAGIC);
         let version = mmio_r32(base, REG_VERSION);
         let dev_id  = mmio_r32(base, REG_DEVICE_ID);
-
-        if magic != MMIO_MAGIC {
-            return false;
-        }
-        if dev_id == 0 {
-            // Device ID 0 means "no device" — QEMU populates MMIO bus slots
-            // with placeholder regions.
-            return false;
-        }
-        if dev_id != DEV_ID_NET {
-            // Not a network device (could be blk, console, …).
-            return false;
-        }
+        if magic != MMIO_MAGIC { return false; }
+        if dev_id == 0         { return false; }
+        if dev_id != DEV_ID_NET { return false; }
         if version != 1 && version != 2 {
             crate::println!("virtio_net_mmio: unknown version {} at {:#x}", version, base);
             return false;
         }
-
         crate::println!("virtio_net_mmio: found net device at {:#x} (v{})", base, version);
-
-        if version == 2 {
-            init_modern(base)
-        } else {
-            init_legacy(base)
-        }
+        if version == 2 { init_modern(base, irq) } else { init_legacy(base, irq) }
     }
 }
 
-// ── Modern init (VirtIO 1.x, version == 2) ──────────────────────────────────
+// ── Modern init ────────────────────────────────────────────────────────────────────
 
-unsafe fn init_modern(base: usize) -> bool {
-    // Reset.
+unsafe fn init_modern(base: usize, irq: u32) -> bool {
     mmio_w32(base, REG_STATUS, 0);
     mmio_w32(base, REG_STATUS, STATUS_ACK);
     mmio_w32(base, REG_STATUS, STATUS_ACK | STATUS_DRIVER);
-
-    // Negotiate features: word 0 — MAC + CSUM; word 1 — VERSION_1.
     mmio_w32(base, REG_DEVICE_FEAT_SEL, 0);
     let f0 = mmio_r32(base, REG_DEVICE_FEATURES) & (FEAT_MAC | FEAT_CSUM);
     mmio_w32(base, REG_DRIVER_FEAT_SEL, 0);
     mmio_w32(base, REG_DRIVER_FEATURES, f0);
-
     mmio_w32(base, REG_DEVICE_FEAT_SEL, 1);
     let f1 = mmio_r32(base, REG_DEVICE_FEATURES) & FEAT_VERSION_1;
     mmio_w32(base, REG_DRIVER_FEAT_SEL, 1);
     mmio_w32(base, REG_DRIVER_FEATURES, f1);
-
     mmio_w32(base, REG_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
     if mmio_r32(base, REG_STATUS) & STATUS_FEATURES_OK == 0 {
         mmio_w32(base, REG_STATUS, STATUS_FAILED);
         crate::println!("virtio_net_mmio: FEATURES_OK rejected at {:#x}", base);
         return false;
     }
-
-    // Read MAC from config space.
     let mut mac = [0u8; 6];
     for i in 0..6 { mac[i] = mmio_rb(base, REG_CONFIG_MAC + i); }
-
-    // Set up RX (queue 0) and TX (queue 1).
     let mut rxq = Virtqueue::zeroed();
     let mut txq = Virtqueue::zeroed();
     setup_queue_modern(base, 0, &mut rxq);
     setup_queue_modern(base, 1, &mut txq);
-
-    // Pre-fill RX queue.
     prefill_rx(&mut rxq);
-    // Notify device about the posted RX descriptors.
     mmio_w32(base, REG_QUEUE_NOTIFY, 0);
-
-    mmio_w32(base, REG_STATUS,
-             STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-
-    finalize(base, mac, rxq, txq);
+    mmio_w32(base, REG_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+    finalize(base, mac, irq, rxq, txq);
     true
 }
 
@@ -365,9 +286,7 @@ unsafe fn setup_queue_modern(base: usize, qi: u32, q: &mut Virtqueue) {
     let qmax = mmio_r32(base, REG_QUEUE_NUM_MAX) as usize;
     let qsz  = QUEUE_SIZE.min(qmax);
     mmio_w32(base, REG_QUEUE_NUM, qsz as u32);
-
     q.alloc();
-
     mmio_w32(base, REG_QUEUE_DESC_LO,  (q.desc_pa  & 0xFFFF_FFFF) as u32);
     mmio_w32(base, REG_QUEUE_DESC_HI,  (q.desc_pa  >> 32) as u32);
     mmio_w32(base, REG_QUEUE_AVAIL_LO, (q.avail_pa & 0xFFFF_FFFF) as u32);
@@ -377,37 +296,25 @@ unsafe fn setup_queue_modern(base: usize, qi: u32, q: &mut Virtqueue) {
     mmio_w32(base, REG_QUEUE_READY, 1);
 }
 
-// ── Legacy init (VirtIO 0.9 / version == 1) ───────────────────────────────
+// ── Legacy init ────────────────────────────────────────────────────────────────────
 
-unsafe fn init_legacy(base: usize) -> bool {
-    // Legacy MMIO: GuestPageSize must be written before queue setup.
-    mmio_w32(base, 0x028, 4096); // GuestPageSize
-
+unsafe fn init_legacy(base: usize, irq: u32) -> bool {
+    mmio_w32(base, 0x028, 4096);
     mmio_w32(base, REG_STATUS, 0);
     mmio_w32(base, REG_STATUS, STATUS_ACK | STATUS_DRIVER);
-
     let dev_feats = mmio_r32(base, REG_DEVICE_FEATURES);
     mmio_w32(base, REG_DRIVER_FEATURES, dev_feats & (FEAT_MAC | FEAT_CSUM));
-
     mmio_w32(base, REG_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
-
-    // Read MAC.
     let mut mac = [0u8; 6];
     for i in 0..6 { mac[i] = mmio_rb(base, REG_CONFIG_MAC + i); }
-
-    // Legacy queue setup: write queue PFN (PA >> 12).
     let mut rxq = Virtqueue::zeroed();
     let mut txq = Virtqueue::zeroed();
     setup_queue_legacy(base, 0, &mut rxq);
     setup_queue_legacy(base, 1, &mut txq);
-
     prefill_rx(&mut rxq);
     mmio_w32(base, REG_QUEUE_NOTIFY, 0);
-
-    mmio_w32(base, REG_STATUS,
-             STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
-
-    finalize(base, mac, rxq, txq);
+    mmio_w32(base, REG_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+    finalize(base, mac, irq, rxq, txq);
     true
 }
 
@@ -417,11 +324,10 @@ unsafe fn setup_queue_legacy(base: usize, qi: u32, q: &mut Virtqueue) {
     let qsz  = QUEUE_SIZE.min(qmax);
     mmio_w32(base, REG_QUEUE_NUM, qsz as u32);
     q.alloc();
-    // Legacy: QueuePFN register at 0x040, value = desc_pa >> 12
     mmio_w32(base, 0x040, (q.desc_pa >> 12) as u32);
 }
 
-// ── Common helpers ─────────────────────────────────────────────────────────────────
+// ── Common ────────────────────────────────────────────────────────────────────────────
 
 unsafe fn prefill_rx(rxq: &mut Virtqueue) {
     for _ in 0..QUEUE_SIZE / 2 {
@@ -431,9 +337,9 @@ unsafe fn prefill_rx(rxq: &mut Virtqueue) {
     }
 }
 
-fn finalize(base: usize, mac: [u8; 6], rxq: Virtqueue, txq: Virtqueue) {
+fn finalize(base: usize, mac: [u8; 6], irq: u32, rxq: Virtqueue, txq: Virtqueue) {
     crate::net::eth::set_mac(mac);
-    *DEV.lock() = Some(MmioDev { base, mac, rxq, txq });
+    *DEV.lock() = Some(MmioDev { base, mac, irq, rxq, txq });
     register_nic(NicDevice {
         send_frame: |frame| send_frame(frame),
         rx_poll:    rx_poll,
@@ -448,9 +354,28 @@ fn finalize(base: usize, mac: [u8; 6], rxq: Virtqueue, txq: Virtqueue) {
     );
 }
 
+// ── PLIC wiring ─────────────────────────────────────────────────────────────────────
+
+/// Register the virtio-net interrupt with the PLIC.
+///
+/// Call this from `kernel_main` after `plic::init()` succeeds.  From this
+/// point on, incoming frames wake the kernel via a PLIC IRQ (scause = 0x8..9)
+/// rather than being discovered only on the next `rx_poll()` call.
+///
+/// If the IRQ number stored by `probe()` is 0 (not found in FDT), this is a
+/// no-op and polled mode remains active.
+pub fn enable_plic_irq() {
+    let irq = DEV.lock().as_ref().map(|d| d.irq).unwrap_or(0);
+    if irq == 0 {
+        crate::println!("virtio_net_mmio: no IRQ from FDT — staying in polled mode");
+        return;
+    }
+    crate::drivers::plic::enable_irq(irq, virtio_net_mmio_irq);
+    crate::println!("virtio_net_mmio: IRQ {} registered with PLIC — interrupt-driven RX enabled", irq);
+}
+
 // ── TX ──────────────────────────────────────────────────────────────────────────
 
-/// Transmit one Ethernet frame over VirtIO-MMIO.
 pub fn send_frame(frame: &[u8]) -> bool {
     let mut guard = DEV.lock();
     let Some(dev) = guard.as_mut() else { return false; };
@@ -461,14 +386,13 @@ pub fn send_frame(frame: &[u8]) -> bool {
     unsafe {
         core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(NET_HDR_LEN), frame.len());
         dev.txq.add_tx_buf(buf, total as u32, base_pa, pages);
-        mmio_w32(dev.base, REG_QUEUE_NOTIFY, 1); // queue 1 = TX
+        mmio_w32(dev.base, REG_QUEUE_NOTIFY, 1);
     }
     true
 }
 
 // ── RX ──────────────────────────────────────────────────────────────────────────
 
-/// Drain completed RX descriptors and forward frames into the net stack.
 pub fn rx_poll() {
     let mut guard = DEV.lock();
     let Some(dev) = guard.as_mut() else { return; };
@@ -477,19 +401,17 @@ pub fn rx_poll() {
         dev.rxq.drain_used(|buf, len, _meta| {
             if len as usize > NET_HDR_LEN {
                 let frame = core::slice::from_raw_parts(
-                    buf.add(NET_HDR_LEN),
-                    len as usize - NET_HDR_LEN,
+                    buf.add(NET_HDR_LEN), len as usize - NET_HDR_LEN,
                 );
                 crate::net::eth::receive_frame(frame);
             }
             core::ptr::write_bytes(buf, 0, RX_BUF_SIZE);
             dev.rxq.add_rx_buf(buf, RX_BUF_SIZE as u32);
         });
-        mmio_w32(base, REG_QUEUE_NOTIFY, 0); // notify device: RX descs recycled
+        mmio_w32(base, REG_QUEUE_NOTIFY, 0);
     }
 }
 
-/// Drain TX used ring and free bounce buffers back to the PMM.
 fn drain_tx() {
     let mut guard = DEV.lock();
     let Some(dev) = guard.as_mut() else { return; };
@@ -504,11 +426,6 @@ fn drain_tx() {
 
 // ── IRQ handler ───────────────────────────────────────────────────────────────────
 
-/// Call from the PLIC external interrupt handler when the virtio-net IRQ fires.
-///
-/// Reads InterruptStatus, ACKs via InterruptACK, then drains RX + TX.
-/// The PLIC wiring (enabling the IRQ at the PLIC claim register) is handled
-/// by `drivers::plic::handle_irq()` in the supervisor external interrupt path.
 pub fn virtio_net_mmio_irq() {
     let guard = DEV.lock();
     let Some(dev) = guard.as_ref() else { return; };
@@ -527,7 +444,6 @@ pub fn virtio_net_mmio_irq() {
 pub fn mac_address() -> [u8; 6] {
     DEV.lock().as_ref().map(|d| d.mac).unwrap_or([0u8; 6])
 }
-
 pub fn is_present() -> bool {
     DEV.lock().is_some()
 }
