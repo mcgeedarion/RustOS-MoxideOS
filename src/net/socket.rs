@@ -168,6 +168,40 @@ fn next_ephemeral() -> u16 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// UDP demultiplexer — called from udp::receive
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Route an incoming UDP datagram to the right socket or kernel service.
+///
+/// Priority order:
+///   1. Port 68 (DHCP client)  → dhcp::receive
+///   2. Registered user socket  → enqueue in rx_queue
+pub fn demux_udp(src_ip: u32, src_port: u16, dst_port: u16, data: &[u8]) {
+    // DHCP client port — handled by the kernel DHCP module, not user sockets.
+    if dst_port == crate::net::dhcp::DHCP_CLIENT_PORT {
+        crate::net::dhcp::receive(src_ip, data);
+        return;
+    }
+
+    // Find a user-space UDP socket bound to this port and enqueue.
+    let mut table = UDP_SOCKETS.lock();
+    for slot in table.iter_mut() {
+        if let Some(sock) = slot {
+            if let SocketState::Udp { local_port, ref mut rx_queue } = sock.state {
+                if local_port == dst_port {
+                    rx_queue.push_back(UdpDatagram {
+                        src_ip,
+                        src_port,
+                        data: data.to_vec(),
+                    });
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Syscall implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -511,7 +545,7 @@ pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
             };
             if dst_ip == 0 || dst_port == 0 { return -107; } // ENOTCONN
             let src_ip = crate::net::ip::local_ip();
-            crate::net::udp::send(src_ip, lp, dst_ip, dst_port, &kbuf);
+            crate::net::udp::send(lp, dst_ip, dst_port, &kbuf);
             return len as isize;
         }
         _ => return -107,
@@ -632,7 +666,6 @@ pub fn sys_getsockname(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> i
 pub fn sys_getpeername(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> isize {
     let table = UDP_SOCKETS.lock();
     if let Some(Some(sock)) = table.get(sock_idx) {
-        // For connected TCP/UDP peers also check recvfrom return path.
         if sock.peer_ip != 0 {
             let mut addr = [0u8; 16];
             addr[0] = 0; addr[1] = AF_INET as u8;
@@ -648,7 +681,6 @@ pub fn sys_getpeername(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> i
 /// `setsockopt(sockfd, level, optname, optval_va, optlen)`
 pub fn sys_setsockopt(sock_idx: usize, _level: i32, opt: i32,
                       optval_va: usize, optlen: u32) -> isize {
-    // O_NONBLOCK is set via fcntl, but some programs use FIONBIO via setsockopt.
     if opt == 0x8004 /* FIONBIO */ && optlen >= 4 {
         let mut v = [0u8; 4];
         if crate::uaccess::copy_from_user(&mut v, optval_va).is_ok() {
@@ -668,7 +700,6 @@ pub fn sys_getsockopt(_sock_idx: usize, _level: i32, _opt: i32,
 pub fn sys_close_socket(sock_idx: usize) {
     let mut table = UDP_SOCKETS.lock();
     if let Some(slot) = table.get_mut(sock_idx) {
-        // If this is a UnixConn, mark our TX end closed so the peer sees EOF.
         if let Some(Socket { state: SocketState::UnixConn(ref conn), .. }) = *slot {
             conn.close_tx();
         }
@@ -697,7 +728,6 @@ pub fn socket_write(fd: usize, buf: &[u8]) -> isize {
 }
 
 /// Poll readiness — called from poll::fd_ready.
-/// Returns Some(ready_events) when fd is a socket, None otherwise.
 pub fn socket_poll(fd: usize, events: u32) -> Option<u32> {
     let table = UDP_SOCKETS.lock();
     let sock = table.get(fd)?.as_ref()?;
@@ -732,7 +762,7 @@ pub fn sys_shutdown(sock_idx: usize, how: i32) -> isize {
     let mut table = UDP_SOCKETS.lock();
     let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) {
         Some(s) => s,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
     match &sock.state {
         SocketState::UnixConn(conn) => {
@@ -755,16 +785,16 @@ pub fn sys_shutdown(sock_idx: usize, how: i32) -> isize {
 
 /// `socketpair(domain, type, protocol, sv[2])`
 pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isize {
-    if domain != AF_UNIX         { return -97; } // EAFNOSUPPORT
-    if kind & 0xF != SOCK_STREAM { return -22; } // EINVAL
-    if sv_va == 0                { return -14; } // EFAULT
+    if domain != AF_UNIX         { return -97; }
+    if kind & 0xF != SOCK_STREAM { return -22; }
+    if sv_va == 0                { return -14; }
     let (conn_a, conn_b) = UnixConn::new_pair();
     let make_sock = |conn: UnixConn| -> Socket {
         Socket {
             domain: AF_UNIX, kind: SOCK_STREAM, proto: 0,
             state: SocketState::UnixConn(conn),
             local_port: 0, peer_ip: 0, peer_port: 0,
-            nonblocking: (kind & 0x800) != 0, // SOCK_NONBLOCK
+            nonblocking: (kind & 0x800) != 0,
         }
     };
     let mut table = UDP_SOCKETS.lock();
@@ -778,12 +808,10 @@ pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isiz
     let fd0 = alloc_slot(&mut table, make_sock(conn_a));
     let fd1 = alloc_slot(&mut table, make_sock(conn_b));
     drop(table);
-    // Apply SOCK_CLOEXEC if requested.
     if kind & 0x80000 != 0 {
         crate::fs::fcntl::set_cloexec(fd0, true);
         crate::fs::fcntl::set_cloexec(fd1, true);
     }
-    // Write [fd0, fd1] as two i32s into user sv[2].
     let pair = [fd0 as i32, fd1 as i32];
     let bytes: [u8; 8] = unsafe { core::mem::transmute(pair) };
     if crate::uaccess::copy_to_user(sv_va, &bytes).is_err() { return -14; }
@@ -797,7 +825,6 @@ pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isiz
 #[repr(C)]
 struct UserIovec { base: usize, len: usize }
 
-/// Flatten a user-space iovec array into a single kernel Vec<u8>.
 fn gather_iovec(iov_va: usize, iovcnt: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let iov_size = core::mem::size_of::<UserIovec>();
@@ -814,8 +841,6 @@ fn gather_iovec(iov_va: usize, iovcnt: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Scatter kernel bytes into user-space iovec array.
-/// Returns total bytes written.
 fn scatter_iovec(iov_va: usize, iovcnt: usize, data: &[u8]) -> usize {
     let mut written = 0usize;
     let iov_size = core::mem::size_of::<UserIovec>();
@@ -833,17 +858,6 @@ fn scatter_iovec(iov_va: usize, iovcnt: usize, data: &[u8]) -> usize {
     written
 }
 
-// msghdr layout (Linux x86-64 ABI, 64-bit pointers):
-//   void        *msg_name;       // 8 bytes
-//   socklen_t    msg_namelen;    // 4 bytes
-//   int          _pad0;          // 4 bytes (padding)
-//   struct iovec *msg_iov;       // 8 bytes
-//   size_t       msg_iovlen;     // 8 bytes
-//   void        *msg_control;    // 8 bytes
-//   size_t       msg_controllen; // 8 bytes
-//   int          msg_flags;      // 4 bytes
-//   int          _pad1;          // 4 bytes
-//   Total: 56 bytes
 #[repr(C)]
 struct UserMsghdr {
     msg_name:       usize,
@@ -880,7 +894,6 @@ pub fn sys_recvmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
     if crate::uaccess::copy_from_user(msg_va, &mut raw).is_err() { return -14; }
     let hdr: UserMsghdr = unsafe { core::mem::transmute(raw) };
     if hdr.msg_iovlen == 0 { return 0; }
-    // Compute total receive capacity from the full iovec.
     let total_cap: usize = {
         let iov_size = core::mem::size_of::<UserIovec>();
         let mut cap = 0usize;

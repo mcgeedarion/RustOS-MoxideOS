@@ -15,7 +15,9 @@
 //!   8. time::init()            — clocksource calibration (TSC/HPET), timerfd, itimers
 //!   9. smp::init()             — enumerate MADT CPUs, bring up APs
 //!  10. tty::init()             — PTY registry + /dev/pts
-//!  11. spawn pid 1 from /init  — scheduler takes over
+//!  11. drivers::nic::init()    — NIC driver (e3/virtio-net)
+//!  12. dhcp::init()            — DORA handshake; sets ip/gw/mask in ip layer
+//!  13. spawn pid 1 from /init  — scheduler takes over
 //!
 //! RISC-V boot sequence:
 //!   1. trap_init()             — install stvec, enable SIE (must be first)
@@ -25,7 +27,9 @@
 //!   5. time::init()            — calibrate CLINT mtime clocksource, timerfd, itimers
 //!   6. smp::init()             — SBI HSM hart bringup
 //!   7. tty::init()             — PTY registry + /dev/pts
-//!   8. spawn pid 1 from /init  — scheduler takes over
+//!   8. drivers::nic::init()    — NIC driver
+//!   9. dhcp::init()            — DORA handshake
+//!  10. spawn pid 1 from /init  — scheduler takes over
 
 #![allow(unused_imports)]
 
@@ -54,11 +58,21 @@ pub fn kernel_main_x86_64() {
     crate::smp::init();
     crate::tty::init();
 
+    // NIC must come up before DHCP so the send path has a working Ethernet layer.
+    crate::drivers::nic::init();
+
+    // Run the DHCP DORA handshake; on success this updates ip::OUR_IP,
+    // GATEWAY_IP and SUBNET_MASK so all subsequent network calls use the
+    // leased address.  On failure a 169.254.x.x link-local fallback is set.
+    crate::net::dhcp::init();
+    crate::println!(
+        "rustos: network up — ip={:?} gw={:?}",
+        crate::net::ip::our_ip().to_be_bytes(),
+        crate::net::dhcp::leased_gateway().to_be_bytes(),
+    );
+
     crate::println!("rustos: subsystems initialised — launching /init");
 
-    // Locate /init bytes directly in the CPIO slice (no VFS open needed at
-    // this point; mount_initramfs has already populated the VFS for later
-    // open() calls from user-space).
     let handle   = initramfs::load();
     let elf_bytes = match handle.file("/init") {
         Some(b) => b,
@@ -68,8 +82,6 @@ pub fn kernel_main_x86_64() {
         }
     };
 
-    // Spawn pid 1: load the ELF, build the initial stack, enqueue in the
-    // scheduler.  The scheduler's first context switch will jump to entry.
     if !crate::proc::exec::spawn_user_process_from_bytes(elf_bytes, "/init", &["/init"], &[]) {
         crate::println!("rustos: FATAL: failed to spawn /init");
         loop { unsafe { core::arch::asm!("hlt"); } }
@@ -91,13 +103,10 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     use crate::arch::riscv64::trap;
     use crate::mm::{heap, pmm};
 
-    // 1. Trap vector MUST be first — any fault before this is unrecoverable.
     trap::trap_init();
 
     crate::println!("rustos: riscv64 kernel starting (hart {})", hart_id);
 
-    // 2. Walk the FDT: registers /memory regions with PMM and records the
-    //    initramfs range from /chosen linux,initrd-start/end.
     unsafe { crate::arch::riscv64::fdt::init_from_fdt(fdt_ptr); }
     crate::println!(
         "pmm: {} MiB total, {} MiB free",
@@ -105,24 +114,22 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
         pmm::free_pages()  * 4 / 1024,
     );
 
-    // 3. Heap over the real PMM.
     heap::init();
-
-    // 4. Mount the initramfs into the VFS.
     crate::fs::initramfs::mount_initramfs();
-
-    // 5. Timekeeping.
     crate::time::init();
-
-    // 6. Bring up additional harts via SBI HSM.
     crate::smp::init();
-
-    // 7. PTY registry + /dev/pts.
     crate::tty::init();
+
+    crate::drivers::nic::init();
+    crate::net::dhcp::init();
+    crate::println!(
+        "rustos: network up — ip={:?} gw={:?}",
+        crate::net::ip::our_ip().to_be_bytes(),
+        crate::net::dhcp::leased_gateway().to_be_bytes(),
+    );
 
     crate::println!("rustos: riscv64 subsystems initialised — launching /init");
 
-    // 8. Spawn pid 1.
     let handle    = initramfs::load();
     let elf_bytes = match handle.file("/init") {
         Some(b) => b,
@@ -139,6 +146,5 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     crate::println!("rustos: pid 1 enqueued");
     crate::println!("TEST PASS: initramfs_load");
 
-    // 9. Hand control to the scheduler — does not return.
     crate::proc::scheduler::run();
 }
