@@ -33,7 +33,7 @@
 - **SMP**: AP bringup (APIC trampoline / SBI HSM), per-CPU blocks, IPI dispatch, MM RwLock per address space
 - **Security**: ASLR, stack canaries, PTI, SMEP/SMAP, seccomp-BPF, capability set
 - **Timers**: real `nanosleep` / `clock_nanosleep` — clock-aware absolute sleeps, EINTR/remainder correctness, `CLOCK_PROCESS_CPUTIME_ID` / `CLOCK_THREAD_CPUTIME_ID`
-- **GDB stub**: full x86_64 RSP implementation over UART — breakpoints, stepping, thread enumeration, `qXfer:features:read`, `vCont`, binary memory writes
+- **GDB stub**: full RSP implementation over UART/SBI console for both **x86_64** and **RISC-V** — breakpoints, single-step, thread enumeration, `qXfer:features:read`, `vCont`, binary memory writes
 - **musl libc port** — see [`docs/musl_port.md`](docs/musl_port.md)
 
 ---
@@ -57,7 +57,7 @@ rustos/
 │   │                   #   namespaces (ns/), cgroups v1 (cgroups/)
 │   ├── sync/           # futex, RwLock, Condvar, WaitQueue
 │   ├── ipc/            # SysV msg/sem/shm, POSIX mq  [feature: sysv_ipc]
-│   ├── gdbstub/        # GDB RSP stub (x86_64 complete) [feature: gdbstub]
+│   ├── gdbstub/        # GDB RSP stub — x86_64 (rsp.rs) + RISC-V (rsp_riscv.rs) [feature: gdbstub]
 │   ├── input/          # /dev/input evdev layer         [feature: input_events]
 │   └── wayland/        # Wayland compositor scaffold    [feature: wayland]
 ├── tests/              # C integration tests (run on Linux host or in-kernel)
@@ -179,7 +179,7 @@ cargo build \
 # RISC-V SBI
 ./run_qemu_riscv.sh --sbi
 
-# RISC-V GDB
+# RISC-V GDB (QEMU gdbserver on :1235)
 ./run_qemu_riscv.sh --gdb
 gdb-multiarch \
   -ex 'set arch riscv:rv64' \
@@ -192,39 +192,101 @@ the correct architecture. For RISC-V use port `:1235`; for x86_64 use `:1234`.
 
 ---
 
-## GDB Debugging (x86_64)
+## GDB Debugging
 
-The `gdbstub` feature provides a full GDB Remote Serial Protocol implementation
-over UART (COM1). Enable it and attach GDB directly to the running kernel — no
-QEMU gdbserver required.
+The `gdbstub` Cargo feature builds a full GDB Remote Serial Protocol stub into
+the kernel itself. Both architectures are supported — no QEMU gdbserver required.
+
+### x86_64
+
+The stub runs over COM1 (raw UART, I/O ports `0x3F8`–`0x3FD`). Enable it and
+attach GDB directly to the running kernel:
 
 ```bash
-# Build with stub enabled
+# Build
 cargo build --target x86_64-unknown-none \
   --no-default-features --features gdbstub \
   -Z build-std=core,alloc,compiler_builtins
 
-# Launch QEMU (no -s/-S flags needed — stub runs inside the kernel)
+# Launch QEMU (no -s/-S flags needed)
 ./run_qemu.sh
 
-# In another terminal
+# Attach
 gdb target/x86_64-unknown-none/debug/rustos \
   -ex 'target remote /dev/ttyS0'   # or tcp::1234 via socat
 ```
 
-**Supported RSP packets:** `?`, `g/G`, `p/P`, `m/M`, `X` (binary write), `s`, `c`,
-`Z0/z0` (SW breakpoints, up to 16), `H`, `T`, `vCont`, `vKill`, `D`, `k`,
-`qSupported`, `qfThreadInfo/qsThreadInfo`, `qC`, `qOffsets`,
-`qXfer:features:read:target.xml`.
-
-Wire the stub from your `#DB` / `#BP` exception handler:
+Wire the stub from your `#DB`/`#BP` exception handler:
 
 ```rust
 #[cfg(feature = "gdbstub")]
 crate::gdbstub::gdb_trap(regs, scheduler::current_pid());
 ```
 
-> **Note:** RISC-V RSP register file support is a planned follow-up.
+### RISC-V
+
+The stub runs over the SBI legacy console (`EID=1`/`EID=2` ecalls), which maps
+to the QEMU serial port — no separate UART driver needed.
+
+```bash
+# Build (UEFI)
+cargo build \
+  --no-default-features --features gdbstub \
+  -Z build-std=core,alloc,compiler_builtins
+
+# Build (SBI)
+cargo build \
+  --target riscv64gc-unknown-none-elf \
+  --no-default-features --features gdbstub \
+  -Z build-std=core,alloc,compiler_builtins
+
+# Launch QEMU
+./run_qemu_riscv.sh
+
+# Attach — gdb-multiarch understands riscv:rv64 and fetches target.xml
+gdb-multiarch target/riscv64-uefi/debug/rustos.efi \
+  -ex 'set arch riscv:rv64' \
+  -ex 'target remote /dev/ttyS1'   # or tcp::1235 via socat
+```
+
+The stub is wired into `handle_exception` (scause = 3, Breakpoint) in
+`src/arch/riscv64/trap.rs`. It activates on any `ebreak` instruction.
+To call it explicitly from Rust:
+
+```rust
+#[cfg(feature = "gdbstub")]
+crate::gdbstub::gdb_trap_rv(
+    frame as *mut crate::gdbstub::RvSavedRegs,
+    scheduler::current_pid() as u32,
+);
+```
+
+### RSP Packet Support (both architectures)
+
+| Packet | Description |
+|--------|-------------|
+| `?` | Stop reason (T05 SIGTRAP + thread ID) |
+| `g`/`G` | Read/write all registers |
+| `p`/`P` | Read/write single register |
+| `m`/`M` | Read/write memory (hex) |
+| `X` | Write memory (binary, RSP-escaped) |
+| `s`/`c` | Single-step / continue (optional address) |
+| `Z0`/`z0` | Insert/remove SW breakpoint (up to 16) |
+| `Z1`–`Z4` | HW breakpoints — returns `E01`, GDB falls back to SW |
+| `H`/`T` | Thread select / thread alive |
+| `vCont` | `s` and `c` actions |
+| `vKill`/`D`/`k` | Kill / detach |
+| `qSupported` | Advertises `swbreak+`, `vContSupported+`, `qXfer:features:read+` |
+| `qfThreadInfo`/`qsThreadInfo` | Thread enumeration (all live kernel PIDs) |
+| `qC`/`qOffsets`/`qAttached` | Session metadata |
+| `qXfer:features:read:target.xml` | Architecture XML (`i386:x86-64` or `riscv:rv64`) |
+
+### Register Files
+
+| Arch | Registers | `g`/`G` size | Single-step mechanism |
+|------|-----------|-------------|----------------------|
+| x86_64 | 24 (rax–r15, rip, eflags, cs/ss/ds/es/fs/gs) | 192 hex bytes | `RFLAGS.TF` |
+| RISC-V | 33 (zero–t6, pc) | 528 hex bytes | `sstatus.SSTEP` (bit 1) |
 
 ---
 
@@ -236,7 +298,7 @@ All WIP or incomplete subsystems are behind opt-in feature flags.
 | Feature | Default | Status | Enable with |
 |---------|---------|--------|-------------|
 | `uefi_boot` | ✅ on | Stable | (always on by default) |
-| `gdbstub` | ❌ off | **x86_64 complete** — RSP over UART, SW breakpoints, thread enum, `target.xml` | `--features gdbstub` |
+| `gdbstub` | ❌ off | **Complete** — x86_64 (UART) + RISC-V (SBI); SW breakpoints, single-step, thread enum, `target.xml` | `--features gdbstub` |
 | `sysv_ipc` | ❌ off | Logic complete; `CAP_IPC_OWNER` stub | `--features sysv_ipc` |
 | `namespaces` | ❌ off | 5 NS types done; `setns`/nsfs missing | `--features namespaces` |
 | `cgroups` | ❌ off | Knob API done; cgroupfs mount missing | `--features cgroups` |
@@ -364,7 +426,6 @@ Steps:
 
 ## Roadmap
 
-- [ ] RISC-V GDB RSP register file (`gdbstub` parity with x86_64)
 - [ ] Scheduler load balancing across CPUs (SMP work-stealing)
 - [ ] Full TCP/IP stack (`src/net/`) — connect/accept/send/recv
 - [ ] AMD/Intel GPU DRM/KMS driver

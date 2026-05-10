@@ -102,7 +102,7 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t0, 32*8(sp)",
         "mv   a0, sp",
         "call {handler}",
-        // ── trap_return ────────────────────────────────────────────────────────
+        // ── trap_return ─────────────────────────────────────────────────────────────
         // Also jumped to directly by task_entry_trampoline (context.rs) and
         // by do_execve_riscv after rebuilding the TrapFrame in-place.
         ".global trap_return",
@@ -186,6 +186,35 @@ fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
 
 fn handle_exception(frame: &mut TrapFrame, code: usize) {
     match code {
+        // ── Breakpoint (ebreak / gdbstub) ─────────────────────────────────────────
+        3 => {
+            #[cfg(feature = "gdbstub")]
+            {
+                // Hand off to the GDB stub.  The stub blocks on SBI console
+                // until GDB sends D (detach) or k (kill), modifying the live
+                // TrapFrame in-place for any register/PC writes GDB issues.
+                // We return immediately after — do NOT call check_and_deliver
+                // here because the stub may have rewritten sepc/sstatus and
+                // we must not clobber that with a signal frame.
+                let pid = crate::proc::scheduler::current_pid();
+                unsafe {
+                    crate::gdbstub::gdb_trap_rv(
+                        frame as *mut TrapFrame as *mut crate::gdbstub::RvSavedRegs,
+                        pid as u32,
+                    );
+                }
+                return;
+            }
+            // gdbstub feature disabled: deliver SIGTRAP to the faulting task.
+            #[cfg(not(feature = "gdbstub"))]
+            {
+                let pid = crate::proc::scheduler::current_pid();
+                crate::proc::signal::send_signal(pid as usize, 5); // SIGTRAP
+                crate::proc::signal::check_and_deliver(frame);
+            }
+        }
+
+        // ── Syscall ────────────────────────────────────────────────────────────
         8 => {
             let nr = frame.a7;
 
@@ -206,6 +235,8 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             frame.sepc = frame.sepc.wrapping_add(4);
             crate::proc::signal::check_and_deliver(frame);
         }
+
+        // ── Page faults ─────────────────────────────────────────────────────
         12 | 13 | 15 => {
             let stval       = csrr!("stval");
             let faulting_va = stval & !0xFFF;
@@ -242,11 +273,15 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             crate::proc::signal::send_sigsegv(pid as usize, stval);
             crate::proc::signal::check_and_deliver(frame);
         }
+
+        // ── Illegal instruction ───────────────────────────────────────────────
         2 => {
             let pid = crate::proc::scheduler::current_pid();
             crate::proc::signal::send_signal(pid as usize, 4);
             crate::proc::signal::check_and_deliver(frame);
         }
+
+        // ── All other exceptions ──────────────────────────────────────────────
         _ => {
             let pid = crate::proc::scheduler::current_pid();
             crate::proc::signal::send_signal(pid as usize, 11);
