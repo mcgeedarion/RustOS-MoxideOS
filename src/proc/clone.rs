@@ -10,6 +10,19 @@
 //! deep copy via `Pcb::fork_signal_handlers()`, so the parent and child
 //! have independent dispositions after the fork.
 //!
+//! ## CLONE_VM and mm_lock
+//!
+//! When CLONE_VM is set (threads sharing an address space) the child reuses
+//! the parent's `mm_lock` Arc so that ALL threads in the group block on the
+//! same `RwLock<()>` during uaccess validate+copy.  A concurrent munmap in
+//! any thread will therefore block uaccess in every other thread in the group
+//! until the VMA mutation is complete.
+//!
+//! When CLONE_VM is NOT set (fork/vfork) the child gets an independent
+//! `mm_lock` (the default from `Pcb::zeroed()` via the PCB clone path).
+//! The child's address space is logically independent after the fork, so its
+//! mm_lock must not block on the parent's munmap activity.
+//!
 //! ## Arch-specific first-entry paths
 //!
 //! ### x86_64
@@ -45,7 +58,7 @@ fn sysret_trampoline() {}
 const USER_CS: usize = 0x23;
 const USER_SS: usize = 0x1b;
 
-// ── CLONE_* flag bits ──────────────────────────────────────────────────────
+// ── CLONE_* flag bits ───────────────────────────────────────────────────────────
 
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
@@ -79,7 +92,7 @@ pub struct CloneArgs {
     pub cgroup:       u64,
 }
 
-// ── sys_clone3 ────────────────────────────────────────────────────────────
+// ── sys_clone3 ─────────────────────────────────────────────────────────────────
 
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let clone_args_sz = core::mem::size_of::<CloneArgs>();
@@ -169,14 +182,14 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         0
     };
 
-    // ── Build child PCB ─────────────────────────────────────────────────
+    // ── Build child PCB ───────────────────────────────────────────────────────────
     //
     // Start with a clone of the parent PCB so most fields are inherited.
     // Then override the fields that must differ in the child.
     let mut child_pcb: Pcb = scheduler::with_proc(parent_pid, |p| p.clone())
         .unwrap_or_else(make_blank_pcb);
 
-    // ── Signal handler table ─────────────────────────────────────────────
+    // ── Signal handler table ───────────────────────────────────────────────────
     //
     // CLONE_SIGHAND: share the parent's Arc — child and parent see the same
     //   table; sigaction() by either immediately affects the other.
@@ -194,6 +207,23 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         scheduler::with_proc(parent_pid, |p| p.fork_signal_handlers())
             .unwrap_or_else(|| Arc::new(spin::Mutex::new(
                 crate::proc::fork::SignalHandlers::default())))
+    };
+
+    // ── mm_lock sharing ─────────────────────────────────────────────────────────
+    //
+    // CLONE_VM (threads): share the parent's mm_lock so that a munmap in any
+    //   thread of the group blocks uaccess in every other thread.
+    //
+    // No CLONE_VM (fork/vfork): child got a deep-cloned mm_lock Arc from the
+    //   Pcb::clone() above.  We replace it with a fresh independent RwLock so
+    //   that parent and child don't serialize on each other's mm operations.
+    child_pcb.mm_lock = if is_vm_clone {
+        // Share — both threads block on the same RwLock during uaccess.
+        scheduler::with_proc(parent_pid, |p| p.share_mm_lock())
+            .unwrap_or_else(|| Arc::new(spin::RwLock::new(())))
+    } else {
+        // Fork — child has its own independent address space copy.
+        Arc::new(spin::RwLock::new(()))
     };
 
     child_pcb.pid        = child_pid;
@@ -215,10 +245,84 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     } else {
         0
     };
-    child_pcb.tls_base = child_tls;
+    child_pcb.tls_base         = child_tls;
     child_pcb.robust_list_head = 0;
     child_pcb.robust_list_len  = 0;
-    child_pcb.ptrace_state = PtraceState::None;
-    child_pcb.ptrace_event = 0;
+    child_pcb.ptrace_state     = PtraceState::None;
+    child_pcb.ptrace_event     = 0;
     // Clear per-thread pending signal queue for the child.
-    child_pcb.pen
+    child_pcb.pending_signals.clear();
+
+    // rlimits: inherit from parent (already in the clone).
+    // ns: inherit from parent (already in the clone).
+    // seccomp: inherit from parent (already in the clone).
+
+    // ── Namespace cloning ────────────────────────────────────────────────
+    if flags & CLONE_NEWNS != 0 {
+        child_pcb.ns = scheduler::with_proc(parent_pid, |p| p.ns.clone_for_unshare())
+            .unwrap_or_default();
+    }
+
+    // ── Enqueue ──────────────────────────────────────────────────────────
+    let child_pid_usize = child_pid as usize;
+    scheduler::enqueue(child_pcb);
+
+    // ── CLONE_VFORK: suspend parent until child calls exec or exit ───────
+    if flags & CLONE_VFORK != 0 {
+        scheduler::suspend_current_until_child_exec(child_pid_usize);
+    }
+
+    child_pid as isize
+}
+
+// ── Internal helpers ───────────────────────────────────────────────────────────────
+
+fn make_blank_pcb() -> Pcb {
+    Pcb::zeroed()
+}
+
+// ── x86_64 frame helpers ──────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn push_syscall_frame(
+    kstack_top: usize,
+    pc:         usize,
+    rflags:     usize,
+    user_sp:    usize,
+) {
+    // 17-slot iretq frame layout (from top of kstack downward):
+    //   [kstack_top - 8*17 .. kstack_top]
+    //   slot 0: ss, 1: rsp, 2: rflags, 3: cs, 4: rip,
+    //   5–16: scratch regs (rax, rbx, …) zero-filled
+    let frame = unsafe {
+        core::slice::from_raw_parts_mut(
+            (kstack_top - 17 * 8) as *mut usize,
+            17,
+        )
+    };
+    frame.iter_mut().for_each(|x| *x = 0);
+    frame[0]  = USER_SS;
+    frame[1]  = if user_sp != 0 { user_sp } else { kstack_top };
+    frame[2]  = rflags;
+    frame[3]  = USER_CS;
+    frame[4]  = pc;
+}
+
+// ── RISC-V frame helper ───────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "riscv64")]
+fn push_trap_frame_riscv(
+    kstack_top: usize,
+    pc:         usize,
+    user_sp:    usize,
+    tls:        usize,
+) {
+    use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE};
+    let frame_ptr = (kstack_top - TRAP_FRAME_SIZE) as *mut TrapFrame;
+    unsafe {
+        frame_ptr.write_bytes(0, 1);
+        (*frame_ptr).sepc = pc;
+        (*frame_ptr).regs[2]  = if user_sp != 0 { user_sp } else { kstack_top }; // sp
+        (*frame_ptr).regs[4]  = tls; // tp
+    }
+}
