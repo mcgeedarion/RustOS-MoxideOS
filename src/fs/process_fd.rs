@@ -14,6 +14,10 @@
 //! process-local fd numbers; the dispatch functions below translate them to
 //! backing fds before forwarding to the existing subsystem helpers.
 //!
+//! Both stores are kept in sync by fcntl::sys_fcntl (F_SETFL, F_SETFD) so
+//! flag-aware paths (sys_write O_APPEND, proc_fd_close_on_exec) always see
+//! current values regardless of which store they query.
+//!
 //! # Lifecycle
 //!
 //! | Event            | Call                          |
@@ -37,7 +41,8 @@ const O_CREAT:    u32 = 0o100;
 const O_TRUNC:    u32 = 0o1000;
 const O_APPEND:   u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
-const O_CLOEXEC:  u32 = 0o2000000;
+/// Public alias for O_CLOEXEC, used by io_syscalls::sys_dup.
+pub const O_CLOEXEC_FLAG: u32 = 0o2000000;
 
 // RLIMIT_NOFILE index
 const RLIMIT_NOFILE: usize = 7;
@@ -70,23 +75,21 @@ impl FdEntry {
         FdEntry {
             backing_fd,
             path,
-            cloexec:  flags & O_CLOEXEC  != 0,
-            nonblock: flags & O_NONBLOCK != 0,
+            cloexec:  flags & O_CLOEXEC_FLAG != 0,
+            nonblock: flags & O_NONBLOCK      != 0,
             fl_flags: fl,
         }
     }
 }
 
-// ── ProcFdTable ───────────────────────────────────────────────────────────────
+// ── ProcFdTable ────────────────────────────────────────────────────────────────
 
-/// Per-process fd table: maps process-local fd → FdEntry.
 #[derive(Clone, Default)]
 struct ProcFdTable {
     fds: BTreeMap<usize, FdEntry>,
 }
 
 impl ProcFdTable {
-    /// Return the lowest fd >= `min` not already in use.
     fn alloc_fd(&self, min: usize) -> usize {
         let mut n = min;
         while self.fds.contains_key(&n) { n += 1; }
@@ -101,19 +104,17 @@ impl ProcFdTable {
     fn fds_vec(&self) -> Vec<usize> { self.fds.keys().cloned().collect() }
 }
 
-// ── Global table: pid → ProcFdTable ─────────────────────────────────────────────
+// ── Global table: pid → ProcFdTable ─────────────────────────────────────────────────────
 
 static PROC_FD_TABLES: Mutex<BTreeMap<usize, ProcFdTable>> =
     Mutex::new(BTreeMap::new());
-
-// ── Helper: current pid ─────────────────────────────────────────────────────────────
 
 #[inline]
 fn current_pid() -> usize {
     crate::proc::scheduler::current_pid()
 }
 
-// ── RLIMIT_NOFILE check ───────────────────────────────────────────────────────────
+// ── RLIMIT_NOFILE check ─────────────────────────────────────────────────────────────
 
 fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
     crate::proc::scheduler::with_proc(pid, |p| {
@@ -121,20 +122,8 @@ fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
     }).unwrap_or(false)
 }
 
-// ── dup_backing: subsystem-aware backing-fd duplication ───────────────────────
-//
-// Centralises the "how do I duplicate this backing fd" decision that fork,
-// dup2, and future callers all need.  Each subsystem has its own refcount
-// model; routing everything through vfs::dup_from was wrong for non-VFS fds.
+// ── dup_backing ────────────────────────────────────────────────────────────────
 
-/// Duplicate a backing fd, incrementing the appropriate subsystem refcount.
-///
-/// Returns the backing fd the child/duplicate should use:
-///   - For pipe / socket / eventfd / timerfd / inotify / fanotify: same bfd,
-///     refcount incremented via the subsystem's own dup helper.
-///   - For devfs / procfs / sysfs: same bfd, no explicit refcount (singletons
-///     or stateless).
-///   - For VFS fds: a new backing fd from vfs::dup_from (independent seek pos).
 fn dup_backing(bfd: usize) -> usize {
     if crate::fs::pipe::is_pipe(bfd) {
         crate::fs::pipe::pipe_dup(bfd);
@@ -155,26 +144,18 @@ fn dup_backing(bfd: usize) -> usize {
         crate::fs::fanotify::fanotify_dup(bfd);
         bfd
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
-        // devfs fds are device singletons; share the same bfd.
         bfd
     } else if crate::fs::procfs::is_procfs_fd(bfd)
            || crate::fs::sysfs::is_sysfs_fd(bfd) {
-        // stateless virtual fs; share the same bfd.
         bfd
     } else {
-        // VFS: allocate a new backing fd with an independent seek position.
         let r = crate::fs::vfs::dup_from(bfd, bfd);
         if r >= 0 { r as usize } else { bfd }
     }
 }
 
-// ── Public lifecycle API ───────────────────────────────────────────────────────────
+// ── Public lifecycle API ─────────────────────────────────────────────────────────────
 
-/// Allocate a fresh fd table for `pid` and pre-install stdin/stdout/stderr.
-///
-/// `stdin_bfd`, `stdout_bfd`, `stderr_bfd` are the kernel-internal backing
-/// fds for the standard streams.  Pass 0 / 1 / 2 for the initial process;
-/// after fork they are cloned by `proc_fd_fork`.
 pub fn proc_fd_alloc(pid: usize, stdin_bfd: usize, stdout_bfd: usize, stderr_bfd: usize) {
     let mut table = ProcFdTable::default();
     table.insert(0, FdEntry { backing_fd: stdin_bfd,  path: None, cloexec: false, nonblock: false, fl_flags: O_RDONLY });
@@ -183,18 +164,6 @@ pub fn proc_fd_alloc(pid: usize, stdin_bfd: usize, stdout_bfd: usize, stderr_bfd
     PROC_FD_TABLES.lock().insert(pid, table);
 }
 
-/// Fork the parent's fd table into the child.
-///
-/// Each entry is duplicated via `dup_backing`, which routes to the correct
-/// subsystem:
-///   - Pipe / socket / eventfd / timerfd / inotify / fanotify: same bfd,
-///     subsystem refcount incremented (e.g. pipe_dup bumps read_open /
-///     write_open so the last close of *any* fd on that end signals EOF /
-///     SIGPIPE).
-///   - VFS fds: new backing fd with an independent seek position.
-///   - stdin / stdout / stderr (fd 0-2): shared directly, no dup needed.
-///
-/// cloexec is preserved in the child; exec will clear those fds.
 pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
     let parent_clone: Option<ProcFdTable> = {
         PROC_FD_TABLES.lock().get(&parent_pid).cloned()
@@ -203,7 +172,6 @@ pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
 
     let mut child_table = ProcFdTable::default();
     for (fd, entry) in &parent.fds {
-        // fd 0-2: standard streams are tty-backed singletons; share bfd directly.
         let new_bfd = if *fd <= 2 {
             entry.backing_fd
         } else {
@@ -220,8 +188,6 @@ pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
     PROC_FD_TABLES.lock().insert(child_pid, child_table);
 }
 
-/// Close all FD_CLOEXEC fds for `pid`.  Called just before loading the new
-/// ELF image in execve so the child does not inherit parent fds.
 pub fn proc_fd_close_on_exec(pid: usize) {
     let cloexec_fds: Vec<(usize, usize)> = {
         let lock = PROC_FD_TABLES.lock();
@@ -239,7 +205,6 @@ pub fn proc_fd_close_on_exec(pid: usize) {
     }
 }
 
-/// Close every fd and remove the table.  Called from sys_exit / sys_exit_group.
 pub fn proc_fd_free(pid: usize) {
     let table = PROC_FD_TABLES.lock().remove(&pid);
     if let Some(t) = table {
@@ -249,29 +214,16 @@ pub fn proc_fd_free(pid: usize) {
     }
 }
 
-// ── Public fd-operation API ──────────────────────────────────────────────────────────
+// ── Public fd-operation API ─────────────────────────────────────────────────────────────
 
-/// Open a file for `pid`, enforcing RLIMIT_NOFILE.
-///
-/// Returns the process-local fd on success, or a negative errno.
-///
-/// Dispatch order (mirrors io_syscalls::sys_open):
-///   1. /dev/…    → devfs
-///   2. /proc/…   → procfs
-///   3. /sys/…    → sysfs
-///   4. everything → vfs (ext2 / ramfs / fat32 / overlayfs / tmpfs)
-///      O_CREAT: create then reopen if ENOENT.
-///      O_TRUNC:  zero file after open.
 pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
-    // --- RLIMIT_NOFILE check ---
     {
         let lock = PROC_FD_TABLES.lock();
         if let Some(t) = lock.get(&pid) {
-            if check_nofile(pid, t) { return -24; } // EMFILE
+            if check_nofile(pid, t) { return -24; }
         }
     }
 
-    // --- resolve backing fd ---
     let (bfd, stored_path): (isize, Option<String>) =
         if let Some(fd) = crate::fs::devfs::try_open(path, flags) {
             (fd as isize, None)
@@ -282,19 +234,17 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
             let fd = crate::fs::sysfs::sysfs_open(path, flags);
             (fd, Some(path.into()))
         } else {
-            // VFS path
             match crate::fs::vfs::open(path, flags) {
                 Ok(fd) => (fd as isize, Some(path.into())),
                 Err(e) => {
                     if flags & O_CREAT != 0 && e == -2 {
-                        // ENOENT + O_CREAT: create then reopen.
                         if crate::fs::vfs::create(path).is_ok() {
                             match crate::fs::vfs::open(path, flags & !O_CREAT) {
                                 Ok(fd) => (fd as isize, Some(path.into())),
                                 Err(e2) => (e2, None),
                             }
                         } else {
-                            (-13, None) // EACCES
+                            (-13, None)
                         }
                     } else {
                         (e, None)
@@ -306,18 +256,15 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     if bfd < 0 { return bfd; }
     let bfd = bfd as usize;
 
-    // O_TRUNC: zero the file if it is a regular VFS file.
     if flags & O_TRUNC != 0 && stored_path.is_some() {
         let _ = crate::fs::vfs_ops::truncate_fd(bfd, 0);
     }
 
-    // --- allocate process-local fd ---
     let entry = FdEntry::new(bfd, stored_path, flags);
     let local_fd = {
         let mut lock = PROC_FD_TABLES.lock();
-        // Insert a fresh table if there isn’t one (kernel threads, early boot).
         let table = lock.entry(pid).or_default();
-        let fd = table.alloc_fd(3); // 0/1/2 reserved for stdio
+        let fd = table.alloc_fd(3);
         table.insert(fd, entry);
         fd
     };
@@ -325,53 +272,39 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     local_fd as isize
 }
 
-/// Close a single fd for `pid`.
-///
-/// Returns 0 on success, -9 (EBADF) if the fd is not open.
 pub fn proc_fd_close(pid: usize, fd: usize) -> isize {
     let entry = PROC_FD_TABLES.lock()
         .get_mut(&pid)
         .and_then(|t| t.remove(fd));
 
     match entry {
-        None => -9, // EBADF
+        None => -9,
         Some(e) => {
-            // Don't close backing fds for stdin/stdout/stderr;
-            // they are shared with the tty and must stay alive.
             if fd > 2 { close_backing(e.backing_fd); }
-            // Also remove from the legacy FD_META table.
             crate::fs::fcntl::close_fd_meta(e.backing_fd);
             0
         }
     }
 }
 
-/// Duplicate `old_fd` as `new_fd` (dup2 semantics).
-///
-/// If `new_fd` is already open it is closed first.  If `old_fd == new_fd`
-/// returns `new_fd` unchanged.
 pub fn proc_fd_dup2(pid: usize, old_fd: usize, new_fd: usize) -> isize {
     if old_fd == new_fd { return old_fd as isize; }
 
-    // Get old entry.
     let old_entry = {
         let lock = PROC_FD_TABLES.lock();
         match lock.get(&pid).and_then(|t| t.get(old_fd)).cloned() {
             Some(e) => e,
-            None    => return -9, // EBADF
+            None    => return -9,
         }
     };
 
-    // Duplicate the backing fd via the subsystem-aware helper.
     let new_bfd = dup_backing(old_entry.backing_fd);
-
-    // Close new_fd if open.
     let _ = proc_fd_close(pid, new_fd);
 
     let new_entry = FdEntry {
         backing_fd: new_bfd,
         path:       old_entry.path.clone(),
-        cloexec:    false, // dup clears cloexec (POSIX)
+        cloexec:    false,
         nonblock:   old_entry.nonblock,
         fl_flags:   old_entry.fl_flags,
     };
@@ -383,12 +316,10 @@ pub fn proc_fd_dup2(pid: usize, old_fd: usize, new_fd: usize) -> isize {
     new_fd as isize
 }
 
-/// Return the FdEntry for `(pid, fd)`, or None if not open.
 pub fn proc_fd_get(pid: usize, fd: usize) -> Option<FdEntry> {
     PROC_FD_TABLES.lock().get(&pid)?.get(fd).cloned()
 }
 
-/// Return the backing fd for `(pid, fd)`, or -9 (EBADF).
 pub fn proc_fd_backing(pid: usize, fd: usize) -> isize {
     match proc_fd_get(pid, fd) {
         Some(e) => e.backing_fd as isize,
@@ -396,7 +327,6 @@ pub fn proc_fd_backing(pid: usize, fd: usize) -> isize {
     }
 }
 
-/// Set O_CLOEXEC flag on a process-local fd.
 pub fn proc_fd_set_cloexec(pid: usize, fd: usize, val: bool) {
     PROC_FD_TABLES.lock()
         .get_mut(&pid)
@@ -404,7 +334,6 @@ pub fn proc_fd_set_cloexec(pid: usize, fd: usize, val: bool) {
         .map(|e| e.cloexec = val);
 }
 
-/// Set O_NONBLOCK flag on a process-local fd.
 pub fn proc_fd_set_nonblock(pid: usize, fd: usize, val: bool) {
     PROC_FD_TABLES.lock()
         .get_mut(&pid)
@@ -412,7 +341,6 @@ pub fn proc_fd_set_nonblock(pid: usize, fd: usize, val: bool) {
         .map(|e| e.nonblock = val);
 }
 
-/// Get the open-file status flags (F_GETFL) for a process-local fd.
 pub fn proc_fd_getfl(pid: usize, fd: usize) -> i32 {
     PROC_FD_TABLES.lock()
         .get(&pid)
@@ -421,7 +349,6 @@ pub fn proc_fd_getfl(pid: usize, fd: usize) -> i32 {
         .unwrap_or(O_RDWR)
 }
 
-/// Set open-file status flags (F_SETFL) for a process-local fd.
 pub fn proc_fd_setfl(pid: usize, fd: usize, flags: i32) {
     PROC_FD_TABLES.lock()
         .get_mut(&pid)
@@ -432,8 +359,6 @@ pub fn proc_fd_setfl(pid: usize, fd: usize, flags: i32) {
         });
 }
 
-/// Return the VFS path for `(pid, fd)`, used by AT_FDCWD resolution and
-/// /proc/<pid>/fd/<n> readlink.
 pub fn proc_fd_path(pid: usize, fd: usize) -> Option<String> {
     PROC_FD_TABLES.lock()
         .get(&pid)?
@@ -442,7 +367,6 @@ pub fn proc_fd_path(pid: usize, fd: usize) -> Option<String> {
         .clone()
 }
 
-/// Return all open fd numbers for `pid` (used by close_range, procfs, …).
 pub fn proc_fd_list(pid: usize) -> Vec<usize> {
     PROC_FD_TABLES.lock()
         .get(&pid)
@@ -450,11 +374,6 @@ pub fn proc_fd_list(pid: usize) -> Vec<usize> {
         .unwrap_or_default()
 }
 
-/// Install a pre-allocated backing fd (e.g. a pipe end, socket, eventfd) as
-/// the given process-local fd, or the lowest available if `preferred` is None.
-///
-/// Called by pipe(2), socket(2), and similar that produce a backing fd
-/// outside the normal open path.
 pub fn proc_fd_install(
     pid:    usize,
     bfd:    usize,
@@ -473,15 +392,13 @@ pub fn proc_fd_install(
     fd
 }
 
-// ── Internal: close a backing fd through the right subsystem ─────────────────
+// ── Internal: close a backing fd through the right subsystem ─────────────────────
 
 fn close_backing(bfd: usize) {
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         crate::fs::devfs::close(bfd);
     } else if crate::fs::procfs::is_procfs_fd(bfd) {
-        // procfs fds have no explicit close; drop is sufficient.
     } else if crate::fs::sysfs::is_sysfs_fd(bfd) {
-        // same
     } else if crate::fs::inotify::is_inotify_fd(bfd) {
         crate::fs::inotify::inotify_close(bfd);
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
