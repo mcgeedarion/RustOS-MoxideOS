@@ -2,30 +2,35 @@
 //!
 //! ## Delivery model
 //!
-//!   1. send_signal(pid, sig) pushes a SigInfo onto PENDING[pid].
-//!   2. At every trap return (ecall, page fault, IPI/timer interrupt),
-//!      `check_and_deliver(frame)` is called.
-//!   3. For a registered SA_SIGACTION handler the kernel:
-//!      a. Optionally switches sp to the alternate stack (SA_ONSTACK).
-//!      b. Carves an arch-specific SignalFrame from the top of the user stack.
-//!      c. Sets up registers so userspace jumps to the handler.
-//!   4. SA_RESTORER / sig_return_trampoline does `rt_sigreturn` ecall/syscall.
-//!   5. sys_rt_sigreturn restores the saved frame from the SignalFrame.
+//! ### Thread-directed signals  (tgkill, tkill, raise)
+//!
+//!   send_signal(tid, sig) -> pushed to PENDING[tid]
+//!   Delivered only to that specific thread in check_and_deliver.
+//!
+//! ### Group-directed signals  (kill, sigqueue, SIGCHLD to parent)
+//!
+//!   send_signal_group(tgid, sig) -> pushed to GROUP_PENDING[tgid]
+//!   At check_and_deliver time, any thread in the group whose mask
+//!   allows the signal may claim and handle it (first-come-first-served
+//!   atomic removal from the group queue).
+//!
+//! ### Delivery order in check_and_deliver
+//!
+//!   1. Per-TID PENDING (thread-directed, highest priority)
+//!   2. GROUP_PENDING   (group-directed, any unblocked thread)
 //!
 //! ## Post-S2 locking notes
 //!
-//!   - `send_signal_info` calls `scheduler::wake_pid(pid: usize)` (usize, not u32).
-//!   - `check_and_deliver` uses `with_proc_mut(pid, |p, pl| pl.set_state(…))` for
-//!     SIGSTOP, instead of `with_procs_mut`.
-//!   - `sys_rt_sigsuspend` / `sys_rt_sigtimedwait` use `with_proc_mut` for
-//!     Blocked transitions instead of the old `with_procs_mut` linear scan.
+//!   - send_signal_group_info wakes all threads in the group.
+//!   - check_and_deliver uses with_proc_mut for SIGSTOP.
+//!   - sys_rt_sigsuspend / sys_rt_sigtimedwait use with_proc_mut.
 
 extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use spin::Mutex;
 
 use crate::proc::{scheduler, process::State};
-use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr, USER_SPACE_END};
+use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
 
 // ── Signal metadata ───────────────────────────────────────────────────
 
@@ -46,16 +51,25 @@ const CLD_KILLED:  i32 = 2;
 const SEGV_MAPERR: i32 = 1;
 const SI_USER:     i32 = 0;
 
+/// Signals that are ignored by default (SIGCHLD=17, SIGURG=23, SIGWINCH=28).
 const SIG_IGN_DEFAULT: u64 =
     (1u64 << 17) | (1u64 << 23) | (1u64 << 28);
 
+/// Signals that stop by default (SIGTSTP=20, SIGTTIN=21, SIGTTOU=22, SIGSTOP=19+1).
 const SIG_STOP_DEFAULT: u64 =
     (1u64 << 19) | (1u64 << 20) | (1u64 << 21) | (1u64 << 22);
 
-// ── Signal storage ────────────────────────────────────────────────────
+// ── Signal storage ───────────────────────────────────────────────────
 
+/// Thread-directed pending signals, keyed by TID.
 static PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
     Mutex::new(BTreeMap::new());
+
+/// Group-directed pending signals, keyed by TGID.
+static GROUP_PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Per-TID signal mask.
 static SIGMASK: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
 // ── Alternate stack ───────────────────────────────────────────────────
@@ -68,36 +82,38 @@ const SS_AUTODISARM: i32 = 0x80000000u32 as i32;
 
 static ALTSTACK: Mutex<BTreeMap<usize, AltStack>> = Mutex::new(BTreeMap::new());
 
-// ── SA_* flags ────────────────────────────────────────────────────────
+// ── SA_* flags ───────────────────────────────────────────────────────────
 
 const SA_ONSTACK:  u32 = 0x08000000;
 const SA_RESTORER: u32 = 0x04000000;
 const SA_NODEFER:  u32 = 0x40000000;
 
-// ── sigprocmask how constants ─────────────────────────────────────────
+// ── sigprocmask how ──────────────────────────────────────────────────────
 
 const SIG_BLOCK:   u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
 
-// ── Public send API ───────────────────────────────────────────────────
+// ── Thread-directed send API ───────────────────────────────────────────
 
-pub fn send_signal(pid: usize, sig: i32) -> isize {
+/// Send `sig` to a specific thread (TID).  Used by tkill/tgkill/raise.
+pub fn send_signal(tid: usize, sig: i32) -> isize {
     if sig <= 0 || sig > 64 { return -22; }
-    send_signal_info(pid, SigInfo { sig: sig as u32, code: SI_KERNEL, ..Default::default() });
+    send_signal_info(tid, SigInfo { sig: sig as u32, code: SI_KERNEL, ..Default::default() });
     0
 }
 
-pub fn send_signal_user(pid: usize, sig: i32) -> isize {
+/// Rate-limited user-originated thread-directed send.
+pub fn send_signal_user(tid: usize, sig: i32) -> isize {
     if sig <= 0 || sig > 64 { return -22; }
     let bypass = sig == 9 || sig == 19;
     if !bypass {
         let queue_len = {
             let map = PENDING.lock();
-            map.get(&pid).map_or(0, |q| q.len())
+            map.get(&tid).map_or(0, |q| q.len())
         };
         let (soft, _hard) = crate::proc::rlimit::getrlimit_for(
-            pid, crate::proc::rlimit::RLIMIT_SIGPENDING);
+            tid, crate::proc::rlimit::RLIMIT_SIGPENDING);
         let limit = if soft == crate::proc::rlimit::RLIM_INFINITY {
             usize::MAX
         } else {
@@ -106,7 +122,7 @@ pub fn send_signal_user(pid: usize, sig: i32) -> isize {
         if queue_len >= limit { return -11; }
     }
     let caller_pid = scheduler::current_pid();
-    send_signal_info(pid, SigInfo {
+    send_signal_info(tid, SigInfo {
         sig:  sig as u32,
         code: SI_USER,
         pid:  caller_pid as u32,
@@ -115,15 +131,44 @@ pub fn send_signal_user(pid: usize, sig: i32) -> isize {
     0
 }
 
-pub fn send_signal_info(pid: usize, info: SigInfo) {
+/// Low-level: push info onto per-TID PENDING and wake that thread.
+pub fn send_signal_info(tid: usize, info: SigInfo) {
     if info.sig == 0 || info.sig > 64 { return; }
-    PENDING.lock().entry(pid).or_default().push_back(info);
-    // wake_pid takes usize (post-S2).
-    scheduler::wake_pid(pid);
+    PENDING.lock().entry(tid).or_default().push_back(info);
+    scheduler::wake_pid(tid);
 }
 
+// ── Group-directed send API ───────────────────────────────────────────
+
+/// Send `sig` to the thread group identified by `tgid`.
+/// Used by kill(2) and sigqueue(2).
+pub fn send_signal_group(tgid: usize, sig: i32) -> isize {
+    if sig <= 0 || sig > 64 { return -22; }
+    send_signal_group_info(tgid, SigInfo {
+        sig: sig as u32,
+        code: SI_KERNEL,
+        ..Default::default()
+    });
+    0
+}
+
+/// Low-level: push info onto GROUP_PENDING[tgid] and wake all threads
+/// in the group so any unblocked one can claim it quickly.
+pub fn send_signal_group_info(tgid: usize, info: SigInfo) {
+    if info.sig == 0 || info.sig > 64 { return; }
+    GROUP_PENDING.lock().entry(tgid).or_default().push_back(info);
+    // Wake every member so the first unblocked one claims the signal.
+    let members = crate::proc::thread::threads_of(tgid);
+    for tid in members {
+        scheduler::wake_pid(tid);
+    }
+}
+
+/// SIGCHLD to a process (group leader).  Always group-directed.
 pub fn send_sigchld(parent_pid: usize, child_pid: usize, exit_code: i32, killed: bool) {
-    send_signal_info(parent_pid, SigInfo {
+    let tgid = crate::proc::thread::tgid_of(parent_pid);
+    let tgid = if tgid != 0 { tgid } else { parent_pid };
+    send_signal_group_info(tgid, SigInfo {
         sig:    17,
         code:   if killed { CLD_KILLED } else { CLD_EXITED },
         pid:    child_pid as u32,
@@ -132,6 +177,7 @@ pub fn send_sigchld(parent_pid: usize, child_pid: usize, exit_code: i32, killed:
     });
 }
 
+/// SIGSEGV is always thread-directed (fault belongs to the faulting thread).
 pub fn send_sigsegv(pid: usize, fault_addr: usize) {
     send_signal_info(pid, SigInfo {
         sig: 11, code: SEGV_MAPERR, addr: fault_addr, ..Default::default()
@@ -139,7 +185,16 @@ pub fn send_sigsegv(pid: usize, fault_addr: usize) {
 }
 
 pub fn has_pending_signal(pid: usize) -> bool {
-    PENDING.lock().get(&pid).map_or(false, |q| !q.is_empty())
+    if PENDING.lock().get(&pid).map_or(false, |q| !q.is_empty()) {
+        return true;
+    }
+    // Also check group queue.
+    let tgid = crate::proc::thread::tgid_of(pid);
+    let tgid = if tgid != 0 { tgid } else { pid };
+    let mask = get_sigmask(pid);
+    GROUP_PENDING.lock().get(&tgid).map_or(false, |q| {
+        q.iter().any(|s| s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0)
+    })
 }
 
 pub fn get_sigmask(pid: usize) -> u64 {
@@ -151,26 +206,58 @@ pub fn set_sigmask(pid: usize, mask: u64) {
 }
 
 // ── check_and_deliver ─────────────────────────────────────────────────
+//
+// Called at every trap return. Runs two passes:
+//   Pass 1: per-TID PENDING (thread-directed)
+//   Pass 2: GROUP_PENDING   (group-directed, any unblocked thread claims)
+//
+// Returns once a signal has been delivered to a frame, or when both
+// queues are empty / fully masked.
+
+/// Pick one deliverable SigInfo from either queue, removing it atomically.
+/// Returns (info, from_group).
+fn dequeue_signal(pid: usize) -> Option<(SigInfo, bool)> {
+    let mask = get_sigmask(pid);
+
+    // Pass 1: thread-directed.
+    {
+        let mut map = PENDING.lock();
+        if let Some(queue) = map.get_mut(&pid) {
+            let pos = queue.iter().position(|s| {
+                s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0
+            });
+            if let Some(i) = pos {
+                return Some((queue.remove(i).unwrap(), false));
+            }
+        }
+    }
+
+    // Pass 2: group-directed.
+    let tgid = crate::proc::thread::tgid_of(pid);
+    let tgid = if tgid != 0 { tgid } else { pid };
+    {
+        let mut map = GROUP_PENDING.lock();
+        if let Some(queue) = map.get_mut(&tgid) {
+            let pos = queue.iter().position(|s| {
+                s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0
+            });
+            if let Some(i) = pos {
+                return Some((queue.remove(i).unwrap(), true));
+            }
+        }
+    }
+
+    None
+}
 
 #[cfg(target_arch = "riscv64")]
 pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
     let pid = scheduler::current_pid() as usize;
 
     loop {
-        let info = {
-            let mask = get_sigmask(pid);
-            let mut map = PENDING.lock();
-            let queue = match map.get_mut(&pid) {
-                Some(q) => q,
-                None    => return,
-            };
-            let pos = queue.iter().position(|s| {
-                s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0
-            });
-            match pos {
-                Some(i) => queue.remove(i).unwrap(),
-                None    => return,
-            }
+        let (info, _from_group) = match dequeue_signal(pid) {
+            Some(x) => x,
+            None    => return,
         };
 
         let sig = info.sig as usize;
@@ -188,7 +275,6 @@ pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
             0 => {
                 if (SIG_IGN_DEFAULT >> sig) & 1 != 0 { continue; }
                 if (SIG_STOP_DEFAULT >> sig) & 1 != 0 {
-                    // Use per-process lock, not global table scan.
                     scheduler::with_proc_mut(pid, |p, pl| {
                         pl.set_state(p, State::Blocked);
                     });
@@ -216,20 +302,9 @@ pub fn check_and_deliver(frame: &mut crate::arch::x86_64::syscall::SyscallFrame)
     let pid = scheduler::current_pid() as usize;
 
     loop {
-        let info = {
-            let mask = get_sigmask(pid);
-            let mut map = PENDING.lock();
-            let queue = match map.get_mut(&pid) {
-                Some(q) => q,
-                None    => return,
-            };
-            let pos = queue.iter().position(|s| {
-                s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0
-            });
-            match pos {
-                Some(i) => queue.remove(i).unwrap(),
-                None    => return,
-            }
+        let (info, _from_group) = match dequeue_signal(pid) {
+            Some(x) => x,
+            None    => return,
         };
 
         let sig = info.sig as usize;
@@ -408,7 +483,7 @@ fn push_sigframe_x86(
     frame.rflags = 0x202;
 }
 
-// ── sys_rt_sigreturn ──────────────────────────────────────────────────
+// ── sys_rt_sigreturn ───────────────────────────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_rt_sigreturn(frame: &mut crate::arch::riscv64::trap::TrapFrame) -> isize {
@@ -452,7 +527,7 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) 
     0
 }
 
-// ── sys_rt_sigpending [NR 127] ────────────────────────────────────────
+// ── sys_rt_sigpending [NR 127] ────────────────────────────────────────────
 
 pub fn sys_rt_sigpending(set_va: usize, sigsetsize: usize) -> isize {
     if sigsetsize != 8 { return -22; }
@@ -469,11 +544,24 @@ pub fn sys_rt_sigpending(set_va: usize, sigsetsize: usize) -> isize {
             }
         }
     }
+    // Also include group-pending signals not currently blocked.
+    {
+        let tgid = crate::proc::thread::tgid_of(pid);
+        let tgid = if tgid != 0 { tgid } else { pid };
+        let map = GROUP_PENDING.lock();
+        if let Some(queue) = map.get(&tgid) {
+            for info in queue.iter() {
+                if info.sig >= 1 && info.sig <= 64 {
+                    pending_set |= 1u64 << info.sig;
+                }
+            }
+        }
+    }
     if !copy_to_user(set_va, &pending_set.to_ne_bytes()) { return -14; }
     0
 }
 
-// ── sys_rt_sigsuspend [NR 130] ────────────────────────────────────────
+// ── sys_rt_sigsuspend [NR 130] ───────────────────────────────────────────
 
 pub fn sys_rt_sigsuspend(mask_va: usize, sigsetsize: usize) -> isize {
     if sigsetsize != 8 { return -22; }
@@ -485,21 +573,30 @@ pub fn sys_rt_sigsuspend(mask_va: usize, sigsetsize: usize) -> isize {
     let old_mask = get_sigmask(pid);
     set_sigmask(pid, new_mask);
     loop {
-        {
-            let map = PENDING.lock();
-            if let Some(queue) = map.get(&pid) {
-                for info in queue.iter() {
-                    if info.sig >= 1 && info.sig <= 64
-                        && (new_mask >> info.sig) & 1 == 0
-                    {
-                        drop(map);
-                        set_sigmask(pid, old_mask);
-                        return -4; // EINTR
-                    }
-                }
-            }
+        // Check both per-TID and group queues.
+        let has_deliverable = {
+            let tid_ok = {
+                let map = PENDING.lock();
+                map.get(&pid).map_or(false, |q| {
+                    q.iter().any(|s| s.sig >= 1 && s.sig <= 64
+                        && (new_mask >> s.sig) & 1 == 0)
+                })
+            };
+            let grp_ok = if !tid_ok {
+                let tgid = crate::proc::thread::tgid_of(pid);
+                let tgid = if tgid != 0 { tgid } else { pid };
+                let map = GROUP_PENDING.lock();
+                map.get(&tgid).map_or(false, |q| {
+                    q.iter().any(|s| s.sig >= 1 && s.sig <= 64
+                        && (new_mask >> s.sig) & 1 == 0)
+                })
+            } else { false };
+            tid_ok || grp_ok
+        };
+        if has_deliverable {
+            set_sigmask(pid, old_mask);
+            return -4; // EINTR
         }
-        // Use per-process lock — not global table scan.
         scheduler::with_proc_mut(pid, |p, pl| {
             pl.set_state(p, State::Blocked);
         });
@@ -507,7 +604,7 @@ pub fn sys_rt_sigsuspend(mask_va: usize, sigsetsize: usize) -> isize {
     }
 }
 
-// ── sys_rt_sigtimedwait [NR 128] ─────────────────────────────────────
+// ── sys_rt_sigtimedwait [NR 128] ─────────────────────────────────────────
 
 pub fn sys_rt_sigtimedwait(
     uset_va:    usize,
@@ -536,7 +633,10 @@ pub fn sys_rt_sigtimedwait(
     };
 
     let pid = scheduler::current_pid() as usize;
+    let tgid = { let t = crate::proc::thread::tgid_of(pid); if t != 0 { t } else { pid } };
+
     loop {
+        // Try per-TID first, then group.
         let found: Option<SigInfo> = {
             let mut map = PENDING.lock();
             if let Some(queue) = map.get_mut(&pid) {
@@ -545,7 +645,16 @@ pub fn sys_rt_sigtimedwait(
                 });
                 pos.and_then(|i| queue.remove(i))
             } else { None }
-        };
+        }.or_else(|| {
+            let mut map = GROUP_PENDING.lock();
+            if let Some(queue) = map.get_mut(&tgid) {
+                let pos = queue.iter().position(|s| {
+                    s.sig >= 1 && s.sig <= 64 && (wait_set >> s.sig) & 1 != 0
+                });
+                pos.and_then(|i| queue.remove(i))
+            } else { None }
+        });
+
         if let Some(info) = found {
             if uinfo_va != 0 && uinfo_va < USER_SPACE_END {
                 let mut si = [0u8; 80];
@@ -563,21 +672,27 @@ pub fn sys_rt_sigtimedwait(
         if let Some(dl) = deadline_ns {
             if crate::proc::nanosleep::now_ns() >= dl { return -11; }
         }
+        // EINTR if a non-waited unblocked signal is already pending.
         {
             let mask = get_sigmask(pid);
-            let map = PENDING.lock();
-            if let Some(queue) = map.get(&pid) {
-                for info in queue.iter() {
-                    if info.sig >= 1 && info.sig <= 64
-                        && (wait_set >> info.sig) & 1 == 0
-                        && (mask     >> info.sig) & 1 == 0
-                    {
-                        return -4; // EINTR
-                    }
-                }
-            }
+            let tid_intr = {
+                let map = PENDING.lock();
+                map.get(&pid).map_or(false, |q| {
+                    q.iter().any(|s| s.sig >= 1 && s.sig <= 64
+                        && (wait_set >> s.sig) & 1 == 0
+                        && (mask     >> s.sig) & 1 == 0)
+                })
+            };
+            let grp_intr = if !tid_intr {
+                let map = GROUP_PENDING.lock();
+                map.get(&tgid).map_or(false, |q| {
+                    q.iter().any(|s| s.sig >= 1 && s.sig <= 64
+                        && (wait_set >> s.sig) & 1 == 0
+                        && (mask     >> s.sig) & 1 == 0)
+                })
+            } else { false };
+            if tid_intr || grp_intr { return -4; }
         }
-        // Block via per-process lock only.
         scheduler::with_proc_mut(pid, |p, pl| {
             pl.set_state(p, State::Blocked);
         });
@@ -585,7 +700,7 @@ pub fn sys_rt_sigtimedwait(
     }
 }
 
-// ── sys_sigaltstack [NR 131] ──────────────────────────────────────────
+// ── sys_sigaltstack [NR 131] ───────────────────────────────────────────────
 
 pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
     let pid = scheduler::current_pid() as usize;
@@ -620,7 +735,7 @@ pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
     0
 }
 
-// ── sys_rt_sigaction [NR 13] ──────────────────────────────────────────
+// ── sys_rt_sigaction [NR 13] ───────────────────────────────────────────────
 
 pub fn sys_rt_sigaction(
     sig: u32, new_act_va: usize, old_act_va: usize, _sigsetsize: usize,
@@ -648,7 +763,6 @@ pub fn sys_rt_sigaction(
             && copy_from_user(&mut f_bytes, new_act_va + 8).is_ok()
             && copy_from_user(&mut r_bytes, new_act_va + 16).is_ok()
         {
-            // Grow handler/flags vecs if needed.
             if h.handlers.len() <= idx { h.handlers.resize(idx + 1, 0); }
             if h.flags.len()    <= idx { h.flags.resize(idx + 1, 0); }
             h.handlers[idx] = usize::from_ne_bytes(h_bytes);
@@ -666,7 +780,7 @@ pub fn sys_rt_sigaction(
     0
 }
 
-// ── sys_rt_sigprocmask [NR 14] ───────────────────────────────────────────
+// ── sys_rt_sigprocmask [NR 14] ──────────────────────────────────────────────
 
 pub fn sys_rt_sigprocmask(
     how: u32, set_va: usize, oldset_va: usize, sigsetsize: usize,
@@ -692,10 +806,40 @@ pub fn sys_rt_sigprocmask(
     0
 }
 
-// ── altstack_clear_pid ─────────────────────────────────────────────────────
+// ── sys_kill [NR 62] ─────────────────────────────────────────────────────────
+//
+// kill(pid, sig) is group-directed: the signal goes to all threads that
+// constitute the target process, and any unblocked one may deliver it.
 
+pub fn sys_kill(pid: i32, sig: i32) -> isize {
+    if sig != 0 && (sig < 1 || sig > 64) { return -22; }
+    match pid {
+        p if p > 0 => {
+            let tgid = p as usize;
+            // Verify target exists.
+            let exists = crate::proc::thread::threads_of(tgid).len() > 0
+                || scheduler::with_proc(tgid, |_| ()).is_some();
+            if !exists { return -3; } // ESRCH
+            if sig == 0 { return 0; } // existence check only
+            send_signal_group(tgid, sig)
+        }
+        // pid==0: send to caller's process group. pid==-1: broadcast.
+        // pid < -1: send to |pid| process group.
+        // Not yet implemented; return ESRCH for safety.
+        _ => -3,
+    }
+}
+
+// ── Cleanup ───────────────────────────────────────────────────────────────────
+
+/// Remove all per-TID signal state when a thread exits.
 pub fn altstack_clear_pid(pid: usize) {
     ALTSTACK.lock().remove(&pid);
     SIGMASK.lock().remove(&pid);
     PENDING.lock().remove(&pid);
+}
+
+/// Remove GROUP_PENDING entry when the last thread of a group exits.
+pub fn group_pending_clear(tgid: usize) {
+    GROUP_PENDING.lock().remove(&tgid);
 }
