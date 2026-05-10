@@ -15,6 +15,8 @@ env:
 jobs:
   # ────────────────────────────────────────────────────────────────────────
   # RISC-V: OpenSBI → _start (boot.rs) → kernel_main
+  # Includes virtio-net-device (VirtIO-MMIO + SLIRP NAT) so the MMIO NIC
+  # driver probe path is exercised on every CI run via the FDT walker.
   # ────────────────────────────────────────────────────────────────────────
   riscv-smoke:
     name: RISC-V Build + QEMU Boot
@@ -51,23 +53,46 @@ jobs:
             { echo "ELF not found"; exit 1; }
           file target/riscv64gc-unknown-none-elf/debug/rustos
 
-      - name: QEMU boot smoke test
+      # virtio-net-device uses the VirtIO-MMIO bus that the QEMU virt machine
+      # exposes by default (no PCIe required).  QEMU generates a DTB that
+      # includes a virtio_mmio@<base> node for the NIC; the FDT walker in
+      # src/arch/riscv64/fdt.rs discovers it and calls virtio_net_mmio::probe().
+      # SLIRP user networking — no TAP, no root, works on GitHub Actions runners.
+      - name: QEMU boot + NIC probe smoke test (RISC-V)
         run: |
-          timeout 8 qemu-system-riscv64 \
+          timeout 10 qemu-system-riscv64 \
             -machine virt \
             -cpu rv64 \
             -m 256M \
             -bios default \
             -kernel target/riscv64gc-unknown-none-elf/debug/rustos \
+            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
+            -device virtio-net-device,netdev=net0,id=nic0 \
             -serial stdio \
             -display none \
             -no-reboot \
             -d guest_errors,cpu_reset \
             2>&1 | tee qemu-riscv.log || true
           cat qemu-riscv.log
+
+          # Core boot check.
           grep -q 'kernel_main reached' qemu-riscv.log && \
             echo "✅ BOOT SMOKE TEST PASSED" || \
             { echo "❌ BOOT SMOKE TEST FAILED"; exit 1; }
+
+          # NIC driver probe check.
+          # virtio_net_mmio::probe() is called from the FDT walker; it reads
+          # MagicValue/Version/DeviceID from MMIO and prints:
+          #   "virtio_net_mmio: found net device at <base> (v<N>)"
+          #   "virtio_net_mmio: device ready"
+          #   "nic: registered device 0 MAC xx:xx:xx:xx:xx:xx"
+          grep -q 'virtio_net_mmio: device ready' qemu-riscv.log && \
+            echo "✅ RISC-V NIC PROBE PASSED" || \
+            { echo "❌ RISC-V NIC PROBE FAILED (virtio_net_mmio::probe did not print 'device ready')"; exit 1; }
+
+          grep -q 'nic: registered device 0' qemu-riscv.log && \
+            echo "✅ RISC-V NIC REGISTERED" || \
+            { echo "❌ RISC-V NIC REGISTER FAILED"; exit 1; }
 
       - name: CL test pass
         run: |
@@ -129,12 +154,6 @@ jobs:
             { echo "ELF not found"; exit 1; }
           file target/x86_64-unknown-none/debug/rustos
 
-      # virtio-net-pci uses user-mode NAT (SLIRP) — no TAP, no root needed
-      # on GitHub Actions runners.  The kernel's virtio_net_probe() will find
-      # the device on the q35 PCI bus and print:
-      #   "virtio_net: modern MAC xx:xx:xx:xx:xx:xx"
-      #   "virtio_net: device ready"
-      #   "nic: registered device 0 MAC xx:xx:xx:xx:xx:xx"
       - name: QEMU UEFI boot + NIC probe smoke test
         run: |
           cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
@@ -155,16 +174,13 @@ jobs:
             2>&1 | tee qemu-x86.log || true
           cat qemu-x86.log
 
-          # Core boot check
           grep -q 'kernel_main reached' qemu-x86.log && \
             echo "✅ x86 BOOT SMOKE TEST PASSED" || \
             { echo "❌ x86 BOOT SMOKE TEST FAILED"; exit 1; }
 
-          # NIC driver probe check — virtio_net_probe() must have found the
-          # device and registered it with the NIC abstraction layer.
           grep -q 'virtio_net: device ready' qemu-x86.log && \
             echo "✅ NIC PROBE PASSED" || \
-            { echo "❌ NIC PROBE FAILED (virtio_net_probe did not print 'device ready')"; exit 1; }
+            { echo "❌ NIC PROBE FAILED"; exit 1; }
 
           grep -q 'nic: registered device 0' qemu-x86.log && \
             echo "✅ NIC REGISTERED" || \

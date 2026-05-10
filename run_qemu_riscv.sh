@@ -10,13 +10,25 @@
 #   ./run_qemu_riscv.sh --sbi                 # SBI, debug build
 #   ./run_qemu_riscv.sh --gdb                 # UEFI + GDB halt on :1235
 #   ./run_qemu_riscv.sh --sbi --gdb           # SBI  + GDB halt on :1235
+#   ./run_qemu_riscv.sh --no-net              # disable virtio-net-device
 #   ./run_qemu_riscv.sh disk.img              # UEFI + virtio-blk disk
 #   ./run_qemu_riscv.sh --sbi disk.img        # SBI  + virtio-blk disk
+#
+# Networking (default — user-mode NAT, no root required):
+#   -device virtio-net-device exposes a VirtIO-MMIO NIC on the `virt`
+#   machine bus.  OpenSBI passes the QEMU-generated DTB to the kernel;
+#   the FDT walker finds the virtio_mmio@<base> node, reads `compatible`,
+#   `reg`, and `interrupts`, then calls virtio_net_mmio::probe(base, irq).
+#   QEMU's SLIRP user backend provides NAT at 10.0.2.0/24.
+#
+#   Note: use `-device virtio-net-device` (MMIO) for the `virt` machine,
+#   NOT `-device virtio-net-pci` (which requires a PCIe bus the virt
+#   machine only provides when -machine virt,aclint=on,pcie=on is set).
 #
 # GDB workflow:
 #   Terminal 1:  ./run_qemu_riscv.sh --gdb [--sbi] [disk.img]
 #   Terminal 2:  gdb-multiarch -ex 'set arch riscv:rv64' \
-#                              -ex 'file target/riscv64-uefi/release/rustos.efi' \
+#                              -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \
 #                              -ex 'target remote :1235'
 #
 # Requirements:
@@ -31,18 +43,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GDB_MODE=0
 BOOT="uefi"
+NET_MODE=1   # 1 = user-mode NAT virtio-net (default), 0 = disabled
 DISK=""
 
 for arg in "$@"; do
   case "$arg" in
-    --gdb)  GDB_MODE=1 ;;
-    --sbi)  BOOT="sbi" ;;
-    --uefi) BOOT="uefi" ;;
-    *)      DISK="$arg" ;;
+    --gdb)    GDB_MODE=1 ;;
+    --sbi)    BOOT="sbi" ;;
+    --uefi)   BOOT="uefi" ;;
+    --no-net) NET_MODE=0 ;;
+    *)        DISK="$arg" ;;
   esac
 done
 
-# ── GDB banner helper ───────────────────────────────────────────────────────────
+# ── GDB banner helper ────────────────────────────────────────────────────────────────
 gdb_banner() {
   local sym_file
   if [[ "$BOOT" == "uefi" ]]; then
@@ -51,15 +65,29 @@ gdb_banner() {
     sym_file="target/riscv64gc-unknown-none-elf/debug/rustos"
   fi
   echo
-  echo "  ┌─────────────────────────────────────────────────────┐"
+  echo "  ┌───────────────────────────────────────────────────┐"
   echo "  │ GDB mode: kernel halted at entry point.             │"
   echo "  │ In another terminal, run:                           │"
   echo "  │   gdb-multiarch \\                                   │"
   echo "  │     -ex 'set arch riscv:rv64' \\                     │"
   echo "  │     -ex 'file ${sym_file}' \\"
   echo "  │     -ex 'target remote :1235'                       │"
-  echo "  └─────────────────────────────────────────────────────┘"
+  echo "  └───────────────────────────────────────────────────┘"
   echo
+}
+
+# ── Net args helper ────────────────────────────────────────────────────────────────
+add_net_args() {
+  local -n arr=$1   # nameref to the array
+  if [[ $NET_MODE -eq 1 ]]; then
+    echo "[*] Network: virtio-net-device (MMIO, user-mode NAT, guest 10.0.2.15/24)"
+    arr+=(
+      -netdev "user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15"
+      -device "virtio-net-device,netdev=net0,id=nic0"
+    )
+  else
+    echo "[*] Network: disabled (--no-net)"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,7 +97,6 @@ if [[ "$BOOT" == "uefi" ]]; then
   echo "[*] Building rustos (RISC-V UEFI release)..."
   bash "$SCRIPT_DIR/build_riscv.sh"
 
-  # Locate EDK2 RISC-V firmware.
   FW_SEARCH=(
     "/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd"
     "/usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd"
@@ -114,6 +141,8 @@ if [[ "$BOOT" == "uefi" ]]; then
     -d guest_errors,cpu_reset
   )
 
+  add_net_args QEMU_ARGS
+
   if [[ -n "$DISK" ]]; then
     QEMU_ARGS+=(
       -drive "id=vblk0,file=${DISK},format=raw,if=none"
@@ -153,6 +182,8 @@ QEMU_ARGS=(
   -no-reboot
   -d guest_errors,cpu_reset
 )
+
+add_net_args QEMU_ARGS
 
 if [[ -n "$DISK" ]]; then
   echo "[*] Attaching disk: $DISK"
