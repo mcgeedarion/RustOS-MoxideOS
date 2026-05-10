@@ -16,6 +16,11 @@
 //!   before the task returns to userspace.  The same call is made after
 //!   interrupt handlers that call `schedule()` (timer IRQ, IPI reschedule)
 //!   because those may wake a task that has a pending signal.
+//!
+//!   NR 139 (rt_sigreturn) is intercepted **before** `dispatch` is called so
+//!   that `sys_rt_sigreturn` receives the live TrapFrame pointer.  It must NOT
+//!   call `check_and_deliver` afterwards — the restored frame already is the
+//!   pre-signal state.
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
@@ -97,7 +102,7 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t0, 32*8(sp)",
         "mv   a0, sp",
         "call {handler}",
-        // ── trap_return ────────────────────────────────────────────────────
+        // ── trap_return ────────────────────────────────────────────────────────
         // Also jumped to directly by task_entry_trampoline (context.rs) and
         // by do_execve_riscv after rebuilding the TrapFrame in-place.
         ".global trap_return",
@@ -159,7 +164,6 @@ fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
             unsafe { asm!("csrci sip, 2", options(nostack, nomem)); }
             let cpu_id = crate::smp::percpu::current_cpu_id();
             crate::smp::ipi::dispatch(cpu_id);
-            // Signal check after reschedule IPI so woken tasks see signals.
             crate::proc::signal::check_and_deliver(frame);
         }
         5 => {
@@ -173,7 +177,6 @@ fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
             );
             let sie2 = csrr!("sie");
             csrw!("sie", sie2 | (1usize << 5));
-            // Deliver any signals queued for this task.
             crate::proc::signal::check_and_deliver(frame);
         }
         9 => { crate::drivers::plic::handle_irq(); }
@@ -184,13 +187,23 @@ fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
 fn handle_exception(frame: &mut TrapFrame, code: usize) {
     match code {
         8 => {
-            let nr  = frame.a7;
+            let nr = frame.a7;
+
+            // NR 139 (rt_sigreturn) must be handled here, not through
+            // dispatch(), so that sys_rt_sigreturn can modify the live
+            // TrapFrame directly.  Do NOT call check_and_deliver after it —
+            // the restored frame IS the pre-signal state.
+            if nr == 139 {
+                frame.sepc = frame.sepc.wrapping_add(4);
+                crate::proc::signal::sys_rt_sigreturn(frame);
+                return;
+            }
+
             let ret = crate::syscall::dispatch(
                 nr, frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5,
             );
             frame.a0   = ret as usize;
             frame.sepc = frame.sepc.wrapping_add(4);
-            // Deliver pending signals before returning to userspace.
             crate::proc::signal::check_and_deliver(frame);
         }
         12 | 13 | 15 => {

@@ -16,6 +16,13 @@
 //!   NR 286  timerfd_settime                  => fs::timerfd::sys_timerfd_settime
 //!   NR 287  timerfd_gettime                  => fs::timerfd::sys_timerfd_gettime
 //!
+//! ## NR 15  rt_sigreturn
+//!   Intercepted BEFORE dispatch() at the arch entry point:
+//!     x86_64: rust_syscall_handler in arch/x86_64/syscall.rs
+//!     riscv64: handle_exception(code=8) in arch/riscv64/trap.rs
+//!   The dispatch() arm for NR 15 below is therefore unreachable in normal
+//!   operation and exists only as a safe fallback.
+//!
 //! ## Socket NRs (NR 41-55)
 //!   41  socket       42  connect     43  accept      44  sendto
 //!   45  recvfrom     46  sendmsg     47  recvmsg     48  shutdown
@@ -235,38 +242,21 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                    _ => -22,
                },
         // ── socket syscalls (NR 41-55, 288) ─────────────────────────────────────────────
-        // NR 41  socket(domain, type, protocol)
         41  => crate::net::socket::sys_socket(a as i32, b as i32, c as i32),
-        // NR 42  connect(sockfd, addr, addrlen)
         42  => crate::net::socket::sys_connect(a, b, c as u32),
-        // NR 43  accept(sockfd, addr, addrlen)
         43  => crate::net::socket::sys_accept(a, b, c),
-        // NR 44  sendto(sockfd, buf, len, flags, dest_addr, addrlen)
         44  => crate::net::socket::sys_sendto(a, b, c, d as i32, e, f as u32),
-        // NR 45  recvfrom(sockfd, buf, len, flags, src_addr, addrlen)
         45  => crate::net::socket::sys_recvfrom(a, b, c, d as i32, e, f),
-        // NR 46  sendmsg(sockfd, msg, flags)
         46  => crate::net::socket::sys_sendmsg(a, b, c as i32),
-        // NR 47  recvmsg(sockfd, msg, flags)
         47  => crate::net::socket::sys_recvmsg(a, b, c as i32),
-        // NR 48  shutdown(sockfd, how)
         48  => crate::net::socket::sys_shutdown(a, b as i32),
-        // NR 49  bind(sockfd, addr, addrlen)
         49  => crate::net::socket::sys_bind(a, b, c as u32),
-        // NR 50  listen(sockfd, backlog)
         50  => crate::net::socket::sys_listen(a, b as i32),
-        // NR 51  getsockname(sockfd, addr, addrlen)
         51  => crate::net::socket::sys_getsockname(a, b, c),
-        // NR 52  getpeername(sockfd, addr, addrlen)
         52  => crate::net::socket::sys_getpeername(a, b, c),
-        // NR 53  socketpair(domain, type, protocol, sv)
         53  => crate::net::socket::sys_socketpair(a as i32, b as i32, c as i32, d),
-        // NR 54  setsockopt(sockfd, level, optname, optval, optlen)
         54  => crate::net::socket::sys_setsockopt(a, b as i32, c as i32, d, e as u32),
-        // NR 55  getsockopt(sockfd, level, optname, optval, optlen)
         55  => crate::net::socket::sys_getsockopt(a, b as i32, c as i32, d, e),
-        // NR 288 accept4(sockfd, addr, addrlen, flags)
-        // flags: SOCK_NONBLOCK=0x800, SOCK_CLOEXEC=0x80000
         288 => {
             let fd = crate::net::socket::sys_accept(a, b, c);
             if fd >= 0 {
@@ -281,11 +271,8 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
             fd
         }
         // ── timerfd ───────────────────────────────────────────────────────────────────────────
-        // NR 283  timerfd_create(clockid, flags)
         283 => crate::fs::timerfd::sys_timerfd_create(a as u32, b as u32),
-        // NR 286  timerfd_settime(fd, flags, new_value_va, old_value_va)
         286 => crate::fs::timerfd::sys_timerfd_settime(a, b as i32, c, d),
-        // NR 287  timerfd_gettime(fd, curr_value_va)
         287 => crate::fs::timerfd::sys_timerfd_gettime(a, b),
         // ── inotify ──────────────────────────────────────────────────────────────────────────
         253 => crate::fs::inotify::sys_inotify_init1(0),
@@ -555,7 +542,9 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        crate::proc::signal::sys_rt_sigprocmask(how, b, c, d),
                    _ => -22,
                },
-        15  => sys_rt_sigreturn_impl(),
+        // NR 15 (rt_sigreturn) is intercepted at the arch entry point before
+        // dispatch() is called.  This arm is a safe ENOSYS fallback only.
+        15  => -38,
         24  => sys_sched_yield_impl(),
         34  => sys_pause_impl(),
         35  => crate::proc::nanosleep::sys_nanosleep(a, b),
