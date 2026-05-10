@@ -31,7 +31,11 @@
 //!   fanotify fd     → fanotify::fanotify_write  (permission responses)
 //!   pipe fd         → pipe::pipe_write
 //!   socket fd       → socket::socket_write
-//!   default         → vfs::write  (RLIMIT_FSIZE enforced before this call)
+//!   default         → vfs::write  (O_APPEND + RLIMIT_FSIZE enforced)
+//!
+//! ## O_APPEND
+//!   POSIX §2.9.7: if O_APPEND is set, the file offset is set to EOF
+//!   prior to each write.  Applies only to regular VFS files.
 //!
 //! ## RLIMIT_FSIZE enforcement
 //!   Before any regular-file write (vfs path), the current file size is
@@ -44,7 +48,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use crate::fs::vfs;
 use crate::fs::process_fd::{proc_fd_backing, proc_fd_close, proc_fd_dup2,
-                             proc_fd_install, proc_fd_open};
+                             proc_fd_install, proc_fd_open, proc_fd_get,
+                             proc_fd_getfl};
 use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
@@ -53,8 +58,6 @@ use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 fn cpid() -> usize { crate::proc::scheduler::current_pid() }
 
 // ── Seek-offset table for procfs / sysfs synthetic fds ──────────────────────
-// Keyed on *backing* fd numbers so the offset is stable across the local→
-// backing translation.
 
 use spin::Mutex;
 static SYNTH_OFFSET: Mutex<alloc::collections::BTreeMap<usize, usize>> =
@@ -74,16 +77,15 @@ fn synth_offset_remove(bfd: usize) {
 }
 
 // ── Translate user fd → backing fd ──────────────────────────────────────────
-//
-// For fds 0/1/2 (stdin/stdout/stderr) the local fd IS the backing fd;
-// skip the table lookup to keep the common tty path fast.
-// Returns a negative errno if the fd is not open.
 
 #[inline]
 fn resolve(fd: usize) -> isize {
     if fd <= 2 { return fd as isize; }
     proc_fd_backing(cpid(), fd)
 }
+
+// ── O_APPEND constant (matches process_fd.rs) ────────────────────────────────
+const O_APPEND: i32 = 0o2000;
 
 // ── RLIMIT_FSIZE helper ──────────────────────────────────────────────────────
 
@@ -184,10 +186,20 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
         return crate::net::socket::socket_write(bfd, &kbuf);
     }
 
+    // Regular VFS file: enforce O_APPEND and RLIMIT_FSIZE.
     let safe_count = match check_fsize_limit(bfd, count) {
         Ok(n)  => n,
         Err(e) => return e,
     };
+
+    // O_APPEND: atomically seek to EOF before each write (POSIX §2.9.7).
+    if fd > 2 {
+        let fl = proc_fd_getfl(cpid(), fd);
+        if fl & O_APPEND != 0 {
+            vfs::seek(bfd, 0, vfs::SEEK_END);
+        }
+    }
+
     vfs::write(bfd, &kbuf[..safe_count])
 }
 
@@ -203,10 +215,6 @@ pub fn sys_open(path_va: usize, flags: u32, mode: u32) -> isize {
 }
 
 /// sys_openat(dirfd, path_va, flags, mode)  [NR 257]
-///
-/// dirfd == AT_FDCWD (-100) → use cwd, same as sys_open.
-/// dirfd is a real fd → resolve relative paths against it.
-/// Absolute paths always ignore dirfd (POSIX).
 pub fn sys_openat(dirfd: i32, path_va: usize, flags: u32, mode: u32) -> isize {
     let path = match read_cstr_safe(path_va) {
         Some(p) => p,
@@ -214,15 +222,13 @@ pub fn sys_openat(dirfd: i32, path_va: usize, flags: u32, mode: u32) -> isize {
     };
     let pid = cpid();
 
-    // Absolute path or AT_FDCWD: behave exactly like sys_open.
     if path.starts_with('/') || dirfd == -100 {
         return proc_fd_open(pid, &path, flags, mode);
     }
 
-    // Relative path + real dirfd: prefix with dirfd's path.
     let dir_path = match crate::fs::process_fd::proc_fd_path(pid, dirfd as usize) {
         Some(p) => p,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
     let full = if dir_path.ends_with('/') {
         alloc::format!("{}{}", dir_path, path)
@@ -236,7 +242,6 @@ pub fn sys_openat(dirfd: i32, path_va: usize, flags: u32, mode: u32) -> isize {
 
 /// sys_close(fd)  [NR 3]
 pub fn sys_close(fd: usize) -> isize {
-    // synth_offset cleanup: need the backing fd before we remove the entry.
     if fd > 2 {
         let bfd = proc_fd_backing(cpid(), fd);
         if bfd >= 0 {
@@ -252,15 +257,12 @@ pub fn sys_close(fd: usize) -> isize {
 // ── sys_dup / sys_dup2 / sys_dup3 ────────────────────────────────────────────
 
 /// sys_dup(fd)  [NR 32]
-/// Duplicate fd using the lowest available process-local fd >= 3.
 pub fn sys_dup(fd: usize) -> isize {
     let pid = cpid();
     let bfd_r = proc_fd_backing(pid, fd);
     if bfd_r < 0 { return bfd_r; }
     let bfd = bfd_r as usize;
 
-    // For pipe ends, dup just installs another process-local fd pointing at
-    // the same backing fd and bumps the open-end refcount in PipeInner.
     let new_bfd = if crate::fs::pipe::is_pipe(bfd) {
         crate::fs::pipe::pipe_dup(bfd);
         bfd
@@ -269,13 +271,11 @@ pub fn sys_dup(fd: usize) -> isize {
         if r >= 0 { r as usize } else { bfd }
     };
 
-    // Retrieve entry metadata to preserve flags.
     let entry = match crate::fs::process_fd::proc_fd_get(pid, fd) {
         Some(e) => e,
         None    => return -9,
     };
 
-    // Install without cloexec (dup always clears it).
     let flags = (entry.fl_flags as u32) & !crate::fs::process_fd::O_CLOEXEC_FLAG;
     proc_fd_install(pid, new_bfd, entry.path.clone(), flags, None) as isize
 }
@@ -286,9 +286,8 @@ pub fn sys_dup2(old_fd: usize, new_fd: usize) -> isize {
 }
 
 /// sys_dup3(old_fd, new_fd, flags)  [NR 292]
-/// Like dup2 but errors if old_fd == new_fd, and honours O_CLOEXEC in flags.
 pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> isize {
-    if old_fd == new_fd { return -22; } // EINVAL
+    if old_fd == new_fd { return -22; }
     let r = proc_fd_dup2(cpid(), old_fd, new_fd);
     if r >= 0 && flags & 0o2000000 != 0 {
         crate::fs::process_fd::proc_fd_set_cloexec(cpid(), new_fd, true);
@@ -301,6 +300,7 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> isize {
 /// sys_pread64(fd, buf_va, count, offset)  [NR 17]
 pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
+    if offset < 0  { return -22; }  // EINVAL: negative offset is invalid
     if !validate_user_ptr(buf_va, count) { return -14; }
     let bfd = match resolve(fd) { n if n < 0 => return n, n => n as usize };
     let mut kbuf = alloc::vec![0u8; count];
@@ -310,16 +310,23 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
     n
 }
 
-// ── sys_pwrite64 (RLIMIT_FSIZE-aware) ────────────────────────────────────────
+// ── sys_pwrite64 ─────────────────────────────────────────────────────────────
 
 /// sys_pwrite64(fd, buf_va, count, offset)  [NR 18]
+///
+/// Writes `count` bytes from `buf_va` to `fd` at `offset` without altering
+/// the fd's current position.  RLIMIT_FSIZE is enforced against the
+/// absolute write end-point (offset + count).
 pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
-    if count == 0 { return 0; }
-    if offset < 0  { return -22; }
+    if count == 0  { return 0; }
+    if offset < 0  { return -22; }  // EINVAL: negative offset is invalid for pwrite
+
     let bfd = match resolve(fd) { n if n < 0 => return n, n => n as usize };
+
     let mut kbuf = alloc::vec![0u8; count];
     if copy_from_user(&mut kbuf, buf_va).is_err() { return -14; }
 
+    // RLIMIT_FSIZE: check against the absolute end-point, not current file size.
     let pid = cpid();
     let (soft, _) = crate::proc::rlimit::getrlimit_for(0, RLIMIT_FSIZE);
     if soft != RLIM_INFINITY {
@@ -330,11 +337,8 @@ pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isiz
         }
     }
 
-    let old_pos = vfs::seek(bfd, 0, vfs::SEEK_CUR) as i64;
-    vfs::seek(bfd, offset, vfs::SEEK_SET);
-    let n = vfs::write(bfd, &kbuf);
-    vfs::seek(bfd, old_pos, vfs::SEEK_SET);
-    n
+    // Use direct positional write — does not move the fd's seek position.
+    vfs::pwrite(bfd, kbuf.as_ptr(), count, offset)
 }
 
 // ── sys_writev ────────────────────────────────────────────────────────────────
@@ -370,9 +374,15 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
             Ok(_)  => {}
             Err(e) => return e,
         }
+        // O_APPEND: seek to EOF before the first iov write.
+        if fd > 2 {
+            let fl = proc_fd_getfl(cpid(), fd);
+            if fl & O_APPEND != 0 {
+                vfs::seek(bfd, 0, vfs::SEEK_END);
+            }
+        }
     }
 
-    // Re-use write_bfd with the already-resolved bfd to avoid double lookup.
     let mut written = 0isize;
     for i in 0..iovcnt {
         let mut raw = [0u8; 16];
@@ -406,8 +416,7 @@ pub fn sys_readv(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     total
 }
 
-// ── Internal bfd-direct read/write (skip process-fd lookup) ─────────────────
-// Used by readv/writev after the one-time resolve at the top of each syscall.
+// ── Internal bfd-direct read/write ──────────────────────────────────────────
 
 fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     if !validate_user_ptr(buf_va, count) { return -14; }

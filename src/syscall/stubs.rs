@@ -8,20 +8,15 @@ use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::arch::{Arch, api::{Paging, PageFlags}};
 
-// ── NR 18  pwrite64 ──────────────────────────────────────────────────────────────
-
-const PWRITE_MAX: usize = 4 * 1024 * 1024;
+// ── NR 18  pwrite64 ─────────────────────────────────────────────────────────
+//
+// Delegate to io_syscalls::sys_pwrite64 which owns the correct
+// proc_fd_backing translation, RLIMIT_FSIZE check, and direct vfs::pwrite
+// call.  The old seek-save/restore pattern here was both racy on SMP and
+// operated on the raw user fd number instead of the backing fd.
 
 fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
-    if count == 0 { return 0; }
-    let count = count.min(PWRITE_MAX);
-    let mut buf = alloc::vec![0u8; count];
-    if copy_from_user(&mut buf, buf_va).is_err() { return -14; }
-    let old = crate::fs::vfs::seek(fd, 0, crate::fs::vfs::SEEK_CUR) as i64;
-    crate::fs::vfs::seek(fd, offset, crate::fs::vfs::SEEK_SET);
-    let n = crate::fs::vfs::write(fd, &buf);
-    crate::fs::vfs::seek(fd, old, crate::fs::vfs::SEEK_SET);
-    n
+    crate::fs::io_syscalls::sys_pwrite64(fd, buf_va, count, offset)
 }
 
 // ── NR 19  readv ────────────────────────────────────────────────────────────────
@@ -91,33 +86,6 @@ fn sys_sched_yield_impl() -> isize {
 }
 
 // ── NR 25  mremap ──────────────────────────────────────────────────────────────
-//
-// Linux mremap semantics:
-//
-//   mremap(old_addr, old_size, new_size, flags[, new_addr])
-//
-//   flags:
-//     MREMAP_MAYMOVE  (1) — allowed to relocate when in-place grow fails
-//     MREMAP_FIXED    (2) — new_addr must be used (implies MAYMOVE)
-//     MREMAP_DONTUNMAP(4) — keep old mapping after move (not implemented → EINVAL)
-//
-// Strategy
-// ────────
-// 1. Validate alignment and sizes.
-// 2. Shrink:       unmap tail pages + shrink VMA.  Always succeeds.
-// 3. Same size:    no-op.
-// 4. Grow in-place:
-//    a. Check that [old_end, old_end+delta) is free.
-//    b. Allocate PMM pages there, map them, extend VMA.
-//    c. On OOM fall through to move if MAYMOVE, else -ENOMEM.
-// 5. Move (MREMAP_MAYMOVE or MREMAP_FIXED):
-//    a. Pick destination (hint if FIXED, else bump next_va).
-//    b. Re-point each present PTE: map at dst_va, unmap at src_va
-//       (the physical frame is NOT freed — we just reuse it at the new VA).
-//    c. Zero-fill the extension pages with fresh PMM frames.
-//    d. Replace the VMA record.
-//
-// MREMAP_DONTUNMAP is not implemented (rare; added in Linux 5.7).
 
 const MREMAP_MAYMOVE:   usize = 1;
 const MREMAP_FIXED:     usize = 2;
@@ -143,14 +111,12 @@ fn sys_mremap_impl(
     let cr3     = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if cr3 == 0 { return -12; }
 
-    // Source VMA must cover the entire old range.
     let vma = match crate::mm::mmap::find_vma(pid, old_addr) {
         Some(v) if v.start <= old_addr && v.end >= old_addr + old_len => v,
         _ => return -22,
     };
     let is_phys = matches!(vma.kind, crate::mm::mmap::VmaKind::PhysMap(_));
 
-    // ── Shrink ──────────────────────────────────────────────────────────
     if new_len < old_len {
         let tail_start = old_addr + new_len;
         let tail_len   = old_len  - new_len;
@@ -170,16 +136,12 @@ fn sys_mremap_impl(
         return old_addr as isize;
     }
 
-    // ── Same size ────────────────────────────────────────────────────────
     if new_len == old_len { return old_addr as isize; }
 
-    // ── Grow ─────────────────────────────────────────────────────────────
     let delta   = new_len - old_len;
     let old_end = old_addr + old_len;
 
-    // If MREMAP_FIXED, skip in-place attempt and go straight to move.
     if flags & MREMAP_FIXED == 0 {
-        // Check that [old_end, old_end+delta) is completely free.
         let range_free = crate::proc::scheduler::with_proc(pid, |p| {
             !p.vmas.iter().any(|v| v.start < old_end + delta && v.end > old_end)
         }).unwrap_or(false);
@@ -208,7 +170,6 @@ fn sys_mremap_impl(
                 });
                 return old_addr as isize;
             }
-            // OOM rollback of partial in-place extension.
             for j in 0..mapped {
                 let rva = old_end + j * PAGE;
                 if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, rva) {
@@ -217,19 +178,15 @@ fn sys_mremap_impl(
                     crate::mm::pmm::free_page(pa);
                 }
             }
-            // Fall through to move if MAYMOVE.
         }
     }
 
-    // ── Move ─────────────────────────────────────────────────────────────
     if flags & MREMAP_MAYMOVE != 0 || flags & MREMAP_FIXED != 0 {
         return mremap_move(pid, cr3, old_addr, old_len, new_len, flags, new_addr, &vma);
     }
-    -12 // ENOMEM: can't grow and MAYMOVE not permitted
+    -12
 }
 
-/// Copy the mapping from `old_addr..old_addr+old_len` to a new location and
-/// extend to `new_len` bytes (zero-filling the extension with PMM pages).
 fn mremap_move(
     pid:      usize,
     cr3:      usize,
@@ -243,10 +200,8 @@ fn mremap_move(
     const PAGE: usize = 4096;
     let is_phys = matches!(vma.kind, crate::mm::mmap::VmaKind::PhysMap(_));
 
-    // Choose the destination VA.
     let dst = if flags & MREMAP_FIXED != 0 {
         if hint == 0 || hint & (PAGE - 1) != 0 { return -22; }
-        // Remove any existing mapping at the destination.
         crate::mm::mmap::sys_munmap(hint, new_len);
         hint
     } else {
@@ -261,20 +216,17 @@ fn mremap_move(
 
     let pte_flags = prot_to_flags_mremap(vma.prot);
 
-    // Re-point existing PTEs (physical frames are reused, not copied).
     for i in 0..(old_len / PAGE) {
         let src_va = old_addr + i * PAGE;
         let dst_va = dst      + i * PAGE;
         if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, src_va) {
             <Arch as Paging>::map_page(cr3, dst_va, pa, pte_flags);
             <Arch as Paging>::flush_va(dst_va);
-            // Invalidate old PTE without freeing the frame.
             <Arch as Paging>::unmap_page(src_va);
             <Arch as Paging>::flush_va(src_va);
         }
     }
 
-    // Zero-fill extension pages.
     for i in (old_len / PAGE)..(new_len / PAGE) {
         let dst_va = dst + i * PAGE;
         match crate::mm::pmm::alloc_page() {
@@ -283,11 +235,10 @@ fn mremap_move(
                 <Arch as Paging>::map_page(cr3, dst_va, pa, pte_flags);
                 <Arch as Paging>::flush_va(dst_va);
             }
-            None => return -12, // ENOMEM (partial mapping left; POSIX-undefined)
+            None => return -12,
         }
     }
 
-    // Replace VMA record.
     crate::mm::mmap::remove_vma(pid, old_addr, old_len);
     crate::mm::mmap::insert_vma(pid, crate::mm::mmap::Vma {
         start: dst, end: dst + new_len,
@@ -298,8 +249,6 @@ fn mremap_move(
     dst as isize
 }
 
-/// Prot-to-PageFlags translation matching mmap.rs::prot_to_flags.
-/// Duplicated here so stubs.rs has no cross-module import cycle.
 #[inline]
 fn prot_to_flags_mremap(prot: u32) -> PageFlags {
     let mut f = PageFlags::PRESENT | PageFlags::USER;
@@ -309,65 +258,23 @@ fn prot_to_flags_mremap(prot: u32) -> PageFlags {
 }
 
 // ── NR 28  madvise ─────────────────────────────────────────────────────────────
-//
-// Linux madvise semantics for the advices we implement:
-//
-//   MADV_NORMAL      (0) — no-op: reset to default readahead behaviour
-//   MADV_DONTNEED    (4) — free the physical pages and mark the VMA
-//                          demand-pageable; subsequent reads return zeroes
-//   MADV_FREE       (8)  — lazily free pages (we treat as DONTNEED)
-//   MADV_WILLNEED   (3)  — prefetch (no-op; we have no readahead)
-//   MADV_SEQUENTIAL (2)  — no-op
-//   MADV_RANDOM     (1)  — no-op
-//   MADV_DONTFORK  (10)  — no-op (CoW fork handles this adequately)
-//   MADV_DOFORK    (11)  — no-op
-//   MADV_DONTDUMP  (16)  — no-op
-//   MADV_DODUMP    (17)  — no-op
-//   MADV_MERGEABLE  (12) — no-op (no KSM)
-//   MADV_HUGEPAGE   (14) — no-op (no THP yet)
-//   MADV_NOHUGEPAGE (15) — no-op
-//   Anything else        — return -EINVAL
-//
-// The critical difference from the old stub: MADV_DONTNEED now actually
-// releases physical frames and unmaps the PTEs so subsequent accesses fault
-// back through the demand-paging handler and see zeroes.  The old code
-// merely zero-filled the pages in place, which wasted memory and could
-// cause glibc malloc to misuse "freed" heap memory.
 
 fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
     const PAGE: usize = 4096;
 
-    // Align addr down, end up (Linux rounds inward for addr, outward for end).
     let aligned_addr = addr & !(PAGE - 1);
     let end          = (addr + length + PAGE - 1) & !(PAGE - 1);
     if aligned_addr >= end && length != 0 { return -22; }
 
     match advice {
-        // No-op advices — accepted silently.
-        0  | // MADV_NORMAL
-        1  | // MADV_RANDOM
-        2  | // MADV_SEQUENTIAL
-        3  | // MADV_WILLNEED
-        10 | // MADV_DONTFORK
-        11 | // MADV_DOFORK
-        12 | // MADV_MERGEABLE
-        13 | // MADV_UNMERGEABLE
-        14 | // MADV_HUGEPAGE
-        15 | // MADV_NOHUGEPAGE
-        16 | // MADV_DONTDUMP
-        17   // MADV_DODUMP
-        => return 0,
+        0  | 1  | 2  | 3  | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 => return 0,
 
-        4 | // MADV_DONTNEED
-        8   // MADV_FREE — lazily free; we treat as DONTNEED for simplicity
-        => {
+        4 | 8 => {
             let pid = crate::proc::scheduler::current_pid();
             let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp)
                 .unwrap_or(0);
             if cr3 == 0 { return 0; }
 
-            // Only free pages that belong to PMM-owned VMAs.  PhysMap
-            // VMAs (MMIO/framebuffer) must never have their pages freed.
             let is_phys_range = |va: usize| -> bool {
                 matches!(
                     crate::mm::mmap::find_vma(pid, va),
@@ -378,10 +285,6 @@ fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
             for va in (aligned_addr..end).step_by(PAGE) {
                 if is_phys_range(va) { continue; }
                 if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, va) {
-                    // Unmap the PTE — the next access will demand-fault
-                    // through page_fault::handle_demand_fault and return
-                    // a fresh zero page (Anonymous/Heap/Stack) or re-read
-                    // the file page (FileBacked).
                     <Arch as Paging>::unmap_page(va);
                     <Arch as Paging>::flush_va(va);
                     crate::mm::pmm::free_page(pa);
@@ -390,7 +293,7 @@ fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
             0
         }
 
-        _ => -22, // EINVAL
+        _ => -22,
     }
 }
 
@@ -433,20 +336,42 @@ fn sys_vfork_impl() -> isize {
     crate::proc::fork_syscall::sys_fork()
 }
 
-// ── NR 62  kill ────────────────────────────────────────────────────────────────
+// ── NR 62  kill ─────────────────────────────────────────────────────────────────
+//
+// Routing table (POSIX §2.7):
+//   pid > 0  → send to process group of pid   (group-directed)
+//   pid == 0 → send to the caller's own group (group-directed)
+//   pid == -1 → broadcast to all processes     (not yet: -ESRCH)
+//   pid < -1 → send to process group |pid|    (group-directed)
 
 fn sys_kill_impl(pid: isize, sig: u32) -> isize {
-    if sig == 0 { return 0; }
+    if sig == 0  { return 0; }
     if sig > 64  { return -22; }
-    let target = if pid == 0 {
-        crate::proc::scheduler::current_pid()
-    } else if pid > 0 {
-        pid as usize
-    } else {
-        (-pid) as usize
-    };
-    crate::proc::signal::send_signal(target, sig);
-    0
+    match pid {
+        p if p > 0 => {
+            // Group-directed to target tgid.
+            crate::proc::signal::send_signal_group(p as usize, sig as i32);
+            0
+        }
+        0 => {
+            // Group-directed to the caller's own process group.
+            let tgid = crate::proc::thread::tgid_of(
+                crate::proc::scheduler::current_pid()
+            );
+            let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
+            crate::proc::signal::send_signal_group(tgid, sig as i32);
+            0
+        }
+        -1 => {
+            // Broadcast not yet implemented.
+            -3 // ESRCH
+        }
+        p => {
+            // pid < -1: send to process group |pid|.
+            crate::proc::signal::send_signal_group((-p) as usize, sig as i32);
+            0
+        }
+    }
 }
 
 // ── NR 63  uname ───────────────────────────────────────────────────────────────
@@ -682,16 +607,13 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
 fn sys_times_impl(buf_va: usize) -> isize {
     const CLOCKS_PER_SEC: u64 = 100;
     const NS_PER_TICK:    u64 = 1_000_000_000 / CLOCKS_PER_SEC;
-
     let now_ns   = crate::time::monotonic_ns();
     let elapsed  = (now_ns / NS_PER_TICK) as i64;
-
     if buf_va != 0 {
         let pid    = crate::proc::scheduler::current_pid();
         let cpu_ns = crate::proc::scheduler::with_proc(pid, |p| p.cpu_time_ns)
             .unwrap_or(0);
         let utime  = (cpu_ns / NS_PER_TICK) as i64;
-
         let mut kbuf = [0u8; 32];
         kbuf[0..8].copy_from_slice(&utime.to_le_bytes());
         if copy_to_user(buf_va, &kbuf).is_err() { return -14; }
