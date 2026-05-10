@@ -44,18 +44,13 @@ pub const IPPROTO_UDP: i32 = 17;
 
 // ── Unix socket pipe-pair ────────────────────────────────────────────────────
 
-/// A shared ring-buffer connecting two Unix socket endpoints.
-/// When both endpoints drop their reference the buffer is freed.
 struct UnixPipe {
     buf:    VecDeque<u8>,
-    closed: bool,  // true when the *writing* end called shutdown/close
+    closed: bool,
 }
 
-/// One end of a connected Unix socket pair.
 struct UnixConn {
-    /// Ring buffer for data flowing *into* this endpoint (written by peer).
     rx: alloc::sync::Arc<Mutex<UnixPipe>>,
-    /// Ring buffer for data flowing *out* of this endpoint (read by peer).
     tx: alloc::sync::Arc<Mutex<UnixPipe>>,
 }
 
@@ -72,8 +67,6 @@ impl UnixConn {
         self.tx.lock().buf.extend(data.iter().copied());
     }
 
-    /// Read up to `len` bytes.  Returns 0 if the peer closed and the buffer
-    /// is empty (EOF), or -EAGAIN if no data is available yet.
     fn read(&self, len: usize) -> alloc::vec::Vec<u8> {
         let mut pipe = self.rx.lock();
         let n = len.min(pipe.buf.len());
@@ -92,36 +85,26 @@ impl UnixConn {
 
 // ── Unix listening socket backlog ─────────────────────────────────────────────
 
-/// An incoming-but-not-yet-accepted Unix connection.  The server-side
-/// `UnixConn` waits in the backlog until `accept()` is called.
 struct PendingUnix {
     server_conn: UnixConn,
 }
 
-/// Per-path Unix listener state.
 struct UnixListener {
-    backlog: VecDeque<PendingUnix>,
+    backlog:     VecDeque<PendingUnix>,
     max_backlog: usize,
 }
 
 // ── Socket state ─────────────────────────────────────────────────────────────
 
 pub enum SocketState {
-    /// AF_INET UDP socket.
-    Udp { local_port: u16, rx_queue: VecDeque<UdpDatagram> },
-    /// AF_INET TCP active connection.
-    TcpActive  { conn_idx: usize },
-    /// AF_INET TCP listening socket.
-    TcpListen  { listen_idx: usize },
-    /// AF_UNIX connected socket (one end of a pipe-pair).
+    Udp       { local_port: u16, rx_queue: VecDeque<UdpDatagram> },
+    TcpActive { conn_idx: usize },
+    TcpListen { listen_idx: usize },
     UnixConn(UnixConn),
-    /// AF_UNIX listening socket (bound to a path, calling listen()).
     UnixListen { path: String },
-    /// Freshly created, not yet bound.
     Unbound,
 }
 
-/// Received UDP datagram.
 pub struct UdpDatagram {
     pub src_ip:   u32,
     pub src_port: u16,
@@ -152,10 +135,8 @@ impl Socket {
 
 // ── Global tables ─────────────────────────────────────────────────────────────
 
-/// All kernel socket descriptors.  Index = socket slot number.
 pub static UDP_SOCKETS: Mutex<Vec<Option<Socket>>> = Mutex::new(Vec::new());
 
-/// Unix socket listener table: path → listener state.
 static UNIX_LISTENERS: Mutex<BTreeMap<String, UnixListener>> =
     Mutex::new(BTreeMap::new());
 
@@ -174,16 +155,27 @@ fn next_ephemeral() -> u16 {
 /// Route an incoming UDP datagram to the right socket or kernel service.
 ///
 /// Priority order:
-///   1. Port 68 (DHCP client)  → dhcp::receive
-///   2. Registered user socket  → enqueue in rx_queue
+///   1. Port 68  (DHCP client reply)       → dhcp::receive
+///   2. Ephemeral kernel port (DNS query)  → dns::receive
+///   3. Registered user UDP socket         → enqueue in rx_queue
 pub fn demux_udp(src_ip: u32, src_port: u16, dst_port: u16, data: &[u8]) {
-    // DHCP client port — handled by the kernel DHCP module, not user sockets.
+    // 1. DHCP client port — always kernel-owned.
     if dst_port == crate::net::dhcp::DHCP_CLIENT_PORT {
         crate::net::dhcp::receive(src_ip, data);
         return;
     }
 
-    // Find a user-space UDP socket bound to this port and enqueue.
+    // 2. Ephemeral kernel ports (currently used by DNS resolver).
+    //    src_port == 53 identifies a DNS reply; dst_port is our ephemeral
+    //    source port that was registered via udp::register_ephemeral.
+    if src_port == crate::net::dns::DNS_PORT
+        && udp::is_ephemeral(dst_port)
+    {
+        crate::net::dns::receive(src_ip, data);
+        return;
+    }
+
+    // 3. User-space UDP socket bound to this port.
     let mut table = UDP_SOCKETS.lock();
     for slot in table.iter_mut() {
         if let Some(sock) = slot {
@@ -205,15 +197,14 @@ pub fn demux_udp(src_ip: u32, src_port: u16, dst_port: u16, data: &[u8]) {
 // Syscall implementations
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `socket(domain, type, protocol)` → slot index (≥0) or negative errno.
 pub fn sys_socket(domain: i32, kind: i32, proto: i32) -> isize {
     match domain {
         d if d == AF_INET || d == AF_UNIX => {}
-        _ => return -97, // EAFNOSUPPORT
+        _ => return -97,
     }
     match kind & 0xF {
         k if k == SOCK_STREAM || k == SOCK_DGRAM => {}
-        _ => return -22, // EINVAL
+        _ => return -22,
     }
     let sock = Socket::new(domain, kind & 0xF, proto);
     let mut table = UDP_SOCKETS.lock();
@@ -225,15 +216,7 @@ pub fn sys_socket(domain: i32, kind: i32, proto: i32) -> isize {
     (table.len() - 1) as isize
 }
 
-/// `bind(sockfd, addr, addrlen)`
-///
-/// For `AF_UNIX`: `addr` is a `sockaddr_un`:
-///   `{ u16 family=AF_UNIX, char sun_path[108] }`
-///   The path is read as a NUL-terminated string from `sun_path`.
-///
-/// For `AF_INET`: `addr` is `sockaddr_in` as before.
 pub fn sys_bind(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
-    // Read at least 16 bytes to cover sockaddr_in; for AF_UNIX read 110.
     let mut hdr = [0u8; 2];
     if crate::uaccess::copy_from_user(addr_va, &mut hdr).is_err() { return -14; }
     let family = u16::from_ne_bytes(hdr) as i32;
@@ -241,11 +224,10 @@ pub fn sys_bind(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
     let mut table = UDP_SOCKETS.lock();
     let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) {
         Some(s) => s,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
 
     if family == AF_UNIX {
-        // sockaddr_un: u16 family + up to 108 bytes sun_path (NUL-terminated)
         let mut sun = [0u8; 110];
         let _ = crate::uaccess::copy_from_user(addr_va, &mut sun);
         let path_bytes = &sun[2..];
@@ -254,7 +236,6 @@ pub fn sys_bind(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
             Ok(p) => p,
             Err(_) => return -22,
         };
-        // Register in the Unix listener table under this path.
         let mut listeners = UNIX_LISTENERS.lock();
         listeners.entry(path.into()).or_insert_with(|| UnixListener {
             backlog: VecDeque::new(),
@@ -279,10 +260,9 @@ pub fn sys_bind(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
         return 0;
     }
 
-    -22 // EINVAL
+    -22
 }
 
-/// `listen(sockfd, backlog)`
 pub fn sys_listen(sock_idx: usize, backlog: i32) -> isize {
     let table = UDP_SOCKETS.lock();
     let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) {
@@ -297,7 +277,6 @@ pub fn sys_listen(sock_idx: usize, backlog: i32) -> isize {
         return 0;
     }
     if sock.domain == AF_INET && sock.kind == SOCK_STREAM {
-        // TCP listen — handled by tcp layer
         let port = sock.local_port;
         drop(table);
         let idx = crate::net::tcp::listen(port);
@@ -310,7 +289,6 @@ pub fn sys_listen(sock_idx: usize, backlog: i32) -> isize {
     0
 }
 
-/// `accept(sockfd, addr_va, addrlen_va)` → new socket fd or negative errno.
 pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
     // ── AF_UNIX ──────────────────────────────────────────────────────────────
     {
@@ -341,7 +319,6 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
                         } else {
                             t2.push(Some(new_sock)); t2.len() - 1
                         };
-                        // Write a minimal AF_UNIX sockaddr back if requested.
                         if addr_va != 0 {
                             let sa = [AF_UNIX as u8, 0u8];
                             let _ = crate::uaccess::copy_to_user(addr_va, &sa);
@@ -352,13 +329,12 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
                         }
                         return new_idx as isize;
                     }
-                    // No pending connection yet — yield and retry.
                     crate::proc::scheduler::yield_now();
                     let nonblock = {
                         let t = UDP_SOCKETS.lock();
                         t.get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.nonblocking).unwrap_or(false)
                     };
-                    if nonblock { return -11; } // EAGAIN
+                    if nonblock { return -11; }
                 }
             }
         }
@@ -372,7 +348,6 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
             _ => return -22,
         }
     };
-
     loop {
         if let Some(conn_idx) = crate::net::tcp::accept(listen_idx) {
             let (peer_ip, peer_port) = crate::net::tcp::peer_addr(conn_idx);
@@ -411,7 +386,6 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
     }
 }
 
-/// `connect(sockfd, addr_va, addrlen)`
 pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
     let mut hdr = [0u8; 2];
     if crate::uaccess::copy_from_user(addr_va, &mut hdr).is_err() { return -14; }
@@ -425,24 +399,16 @@ pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
         let path = match core::str::from_utf8(&path_bytes[..nul]) {
             Ok(p) => p, Err(_) => return -22,
         };
-
-        // Build a pipe-pair: client holds conn_b, server gets conn_a via backlog.
         let (conn_a, conn_b) = UnixConn::new_pair();
-
-        // Push conn_a into the server's backlog.
         {
             let mut listeners = UNIX_LISTENERS.lock();
             let listener = match listeners.get_mut(path) {
                 Some(l) => l,
-                None    => return -111, // ECONNREFUSED
+                None    => return -111,
             };
-            if listener.backlog.len() >= listener.max_backlog {
-                return -111; // ECONNREFUSED — backlog full
-            }
+            if listener.backlog.len() >= listener.max_backlog { return -111; }
             listener.backlog.push_back(PendingUnix { server_conn: conn_a });
         }
-
-        // Wire our (client) end.
         let mut table = UDP_SOCKETS.lock();
         if let Some(Some(sock)) = table.get_mut(sock_idx) {
             sock.state = SocketState::UnixConn(conn_b);
@@ -454,7 +420,7 @@ pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
     if family == AF_INET {
         let mut addr = [0u8; 16];
         if crate::uaccess::copy_from_user(addr_va, &mut addr).is_err() { return -14; }
-        let port  = u16::from_be_bytes([addr[2], addr[3]]);
+        let port   = u16::from_be_bytes([addr[2], addr[3]]);
         let dst_ip = u32::from_be_bytes([addr[4], addr[5], addr[6], addr[7]]);
 
         let kind = {
@@ -500,12 +466,10 @@ pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
     -22
 }
 
-/// `send(sockfd, buf, len, flags)` — shorthand without address.
 pub fn sys_send(sock_idx: usize, buf_va: usize, len: usize, _flags: i32) -> isize {
     sys_sendto(sock_idx, buf_va, len, 0, 0, 0)
 }
 
-/// `sendto(sockfd, buf, len, flags, dest_addr, addrlen)`
 pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                   dest_addr: usize, addrlen: u32) -> isize {
     if len == 0 { return 0; }
@@ -534,8 +498,8 @@ pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                 let mut a = [0u8; 8];
                 drop(table);
                 if crate::uaccess::copy_from_user(dest_addr, &mut a).is_err() { return -14; }
-                (u32::from_be_bytes([a[4],a[5],a[6],a[7]]),
-                 u16::from_be_bytes([a[2],a[3]]))
+                (u32::from_be_bytes([a[4], a[5], a[6], a[7]]),
+                 u16::from_be_bytes([a[2], a[3]]))
             } else {
                 let t = UDP_SOCKETS.lock();
                 let s = t.get(sock_idx).and_then(|s| s.as_ref()).unwrap();
@@ -543,21 +507,20 @@ pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                 drop(t);
                 r
             };
-            if dst_ip == 0 || dst_port == 0 { return -107; } // ENOTCONN
-            let src_ip = crate::net::ip::local_ip();
-            crate::net::udp::send(lp, dst_ip, dst_port, &kbuf);
+            if dst_ip == 0 || dst_port == 0 { return -107; }
+            // FIX: was crate::net::ip::local_ip() which doesn't exist.
+            let _src_ip = ip::our_ip();
+            udp::send(lp, dst_ip, dst_port, &kbuf);
             return len as isize;
         }
         _ => return -107,
     }
 }
 
-/// `recv(sockfd, buf, len, flags)` — shorthand without address.
 pub fn sys_recv(sock_idx: usize, buf_va: usize, len: usize, _flags: i32) -> isize {
     sys_recvfrom(sock_idx, buf_va, len, 0, 0, 0)
 }
 
-/// `recvfrom(sockfd, buf, len, flags, src_addr, addrlen)`
 pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                     src_addr: usize, addrlen_va: usize) -> isize {
     if len == 0 { return 0; }
@@ -573,7 +536,6 @@ pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                 SocketState::UnixConn(conn) => {
                     let d = conn.read(len);
                     if d.is_empty() {
-                        // Check if peer closed.
                         if conn.rx.lock().closed { return 0; }
                         if sock.nonblocking { return -11; }
                         drop(table);
@@ -596,18 +558,15 @@ pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                     }
                     if n < 0 { return n; }
                     kbuf.truncate(n as usize);
-                    return {
-                        if crate::uaccess::copy_to_user(buf_va, &kbuf).is_err() { -14 }
-                        else { n }
-                    };
+                    return if crate::uaccess::copy_to_user(buf_va, &kbuf).is_err() { -14 } else { n };
                 }
-                SocketState::Udp { rx_queue, .. } => {
-                    // Must work around borrow checker: clone the queue entry.
-                    // This is a lock-held path; keep it short.
+                SocketState::Udp { .. } => {
                     let nb = sock.nonblocking;
                     if let Some(dg) = {
                         let mut t2 = UDP_SOCKETS.lock();
-                        if let Some(Some(Socket { state: SocketState::Udp { ref mut rx_queue, .. }, .. })) = t2.get_mut(sock_idx) {
+                        if let Some(Some(Socket {
+                            state: SocketState::Udp { ref mut rx_queue, .. }, ..
+                        })) = t2.get_mut(sock_idx) {
                             rx_queue.pop_front()
                         } else { None }
                     } {
@@ -619,7 +578,7 @@ pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                         continue;
                     }
                 }
-                _ => return -107, // ENOTCONN
+                _ => return -107,
             }
         };
 
@@ -640,12 +599,10 @@ pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
     }
 }
 
-/// `getsockname(sockfd, addr_va, addrlen_va)`
 pub fn sys_getsockname(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> isize {
     let table = UDP_SOCKETS.lock();
     if let Some(Some(sock)) = table.get(sock_idx) {
         if sock.domain == AF_UNIX {
-            // Return a minimal sockaddr_un with just the family.
             let mut ua = [0u8; 110];
             let fam = AF_UNIX as u16;
             ua[0..2].copy_from_slice(&fam.to_ne_bytes());
@@ -662,7 +619,6 @@ pub fn sys_getsockname(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> i
     -9
 }
 
-/// `getpeername(sockfd, addr_va, addrlen_va)`
 pub fn sys_getpeername(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> isize {
     let table = UDP_SOCKETS.lock();
     if let Some(Some(sock)) = table.get(sock_idx) {
@@ -678,10 +634,9 @@ pub fn sys_getpeername(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> i
     0
 }
 
-/// `setsockopt(sockfd, level, optname, optval_va, optlen)`
 pub fn sys_setsockopt(sock_idx: usize, _level: i32, opt: i32,
                       optval_va: usize, optlen: u32) -> isize {
-    if opt == 0x8004 /* FIONBIO */ && optlen >= 4 {
+    if opt == 0x8004 && optlen >= 4 {
         let mut v = [0u8; 4];
         if crate::uaccess::copy_from_user(&mut v, optval_va).is_ok() {
             let nb = u32::from_ne_bytes(v) != 0;
@@ -692,11 +647,9 @@ pub fn sys_setsockopt(sock_idx: usize, _level: i32, opt: i32,
     0
 }
 
-/// `getsockopt(sockfd, level, optname, optval_va, optlen_va)`
 pub fn sys_getsockopt(_sock_idx: usize, _level: i32, _opt: i32,
                       _optval_va: usize, _optlen_va: usize) -> isize { 0 }
 
-/// `close` on a socket fd — clean up the socket slot.
 pub fn sys_close_socket(sock_idx: usize) {
     let mut table = UDP_SOCKETS.lock();
     if let Some(slot) = table.get_mut(sock_idx) {
@@ -708,26 +661,22 @@ pub fn sys_close_socket(sock_idx: usize) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Socket FD bridge helpers (used by io_syscalls, fcntl, poll)
+// Socket FD bridge helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns true when `fd` corresponds to an allocated socket slot.
 pub fn is_socket_fd(fd: usize) -> bool {
     let t = UDP_SOCKETS.lock();
     fd < t.len() && t[fd].is_some()
 }
 
-/// Kernel-internal read from a socket (used by sys_read dispatch).
 pub fn socket_read(fd: usize, buf: &mut [u8]) -> isize {
     sys_recv(fd, buf.as_mut_ptr() as usize, buf.len(), 0)
 }
 
-/// Kernel-internal write to a socket (used by sys_write dispatch).
 pub fn socket_write(fd: usize, buf: &[u8]) -> isize {
     sys_send(fd, buf.as_ptr() as usize, buf.len(), 0)
 }
 
-/// Poll readiness — called from poll::fd_ready.
 pub fn socket_poll(fd: usize, events: u32) -> Option<u32> {
     let table = UDP_SOCKETS.lock();
     let sock = table.get(fd)?.as_ref()?;
@@ -740,16 +689,16 @@ pub fn socket_poll(fd: usize, events: u32) -> Option<u32> {
                 .unwrap_or(false);
             (r, false)
         }
-        SocketState::Udp { rx_queue, .. } => (!rx_queue.is_empty(), true),
+        SocketState::Udp { rx_queue, .. }  => (!rx_queue.is_empty(), true),
         SocketState::TcpActive { conn_idx } =>
             (crate::net::tcp::rx_available(*conn_idx), true),
         SocketState::TcpListen { .. } => (false, false),
-        SocketState::Unbound => (false, true),
+        SocketState::Unbound           => (false, true),
     };
     use crate::fs::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
     let mut r = 0u32;
-    if readable  && events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
-    if writable  && events & POLLOUT != 0 { r |= POLLOUT | POLLWRNORM; }
+    if readable && events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
+    if writable && events & POLLOUT != 0 { r |= POLLOUT | POLLWRNORM; }
     Some(r)
 }
 
@@ -757,7 +706,6 @@ pub fn socket_poll(fd: usize, events: u32) -> Option<u32> {
 // sys_shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `shutdown(sockfd, how)`  how: SHUT_RD=0, SHUT_WR=1, SHUT_RDWR=2
 pub fn sys_shutdown(sock_idx: usize, how: i32) -> isize {
     let mut table = UDP_SOCKETS.lock();
     let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) {
@@ -783,7 +731,6 @@ pub fn sys_shutdown(sock_idx: usize, how: i32) -> isize {
 // sys_socketpair  — AF_UNIX SOCK_STREAM only
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `socketpair(domain, type, protocol, sv[2])`
 pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isize {
     if domain != AF_UNIX         { return -97; }
     if kind & 0xF != SOCK_STREAM { return -22; }
@@ -819,7 +766,7 @@ pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isiz
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sys_sendmsg / sys_recvmsg  (msghdr iovec flattening)
+// sys_sendmsg / sys_recvmsg
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -873,7 +820,6 @@ struct UserMsghdr {
 
 const MSGHDR_SIZE: usize = core::mem::size_of::<UserMsghdr>();
 
-/// `sendmsg(sockfd, msg, flags)`
 pub fn sys_sendmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
     if msg_va == 0 { return -14; }
     let mut raw = [0u8; MSGHDR_SIZE];
@@ -887,7 +833,6 @@ pub fn sys_sendmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
                flags, hdr.msg_name, hdr.msg_namelen)
 }
 
-/// `recvmsg(sockfd, msg, flags)`
 pub fn sys_recvmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
     if msg_va == 0 { return -14; }
     let mut raw = [0u8; MSGHDR_SIZE];
