@@ -25,22 +25,66 @@ linked_list_allocator = { version = "0.10", default-features = false, features =
 cc = "1"
 
 [features]
-# RISC-V UEFI boot path (EDK2 RiscVVirt) — enabled by default.
-# When enabled:
-#   - src/arch/riscv64/uefi_entry.rs replaces src/arch/riscv64/boot.rs
-#   - build target is riscv64-uefi.json (PE/COFF via lld-link)
-#   - Use: cargo xtask build
-# To use SBI boot instead:
-#   - cargo xtask build --arch riscv64 --boot sbi
+# ── Default build: clean, fully functional, testable base kernel ──────────────
+# Includes: scheduler (CFS/RR/DEADLINE), VFS (ext2/fat32/tmpfs/devfs/procfs),
+#           mm (VMM/PMM/COW/mmap), proc (futex/signals/threads/clone),
+#           net (TCP/UDP/Unix sockets), SMP (AP bringup/IPI/percpu),
+#           security (ASLR/canary/PTI/SMEP/SMAP/seccomp/capset),
+#           tty, console, UEFI boot path, drivers, syscall table.
+#
+# cargo build                           → default (base kernel)
+# cargo build --features sysv_ipc       → + SysV IPC + POSIX mq
+# cargo build --features namespaces     → + PID/Mount/Net/UTS/User ns
+# cargo build --features cgroups        → + cgroups v1 controllers
+# cargo build --features gdbstub        → + GDB RSP stub (WIP)
+# cargo build --features input_events   → + /dev/input evdev layer (WIP)
+# cargo build --features wayland        → + Wayland compositor scaffold (WIP)
 default = ["uefi_boot"]
+
+# ── Boot path ─────────────────────────────────────────────────────────────────
+# RISC-V UEFI boot (EDK2 RiscVVirt / PE-COFF via lld-link).
+# Disable to use SBI direct boot: cargo xtask build --arch riscv64 --boot sbi
 uefi_boot = []
 
-# Wayland compositor subsystem. Not part of the default kernel build.
-# Enable with: cargo build --features wayland
-# All code under src/wayland/ is cfg-gated on this feature.
-wayland = []
+# ── WIP / optional subsystems ────────────────────────────────────────────────
+# None of these are included in the default build. Each can be enabled
+# independently; they carry no inter-dependencies unless noted.
 
-[lib]
-name = "rustos"
-path = "src/lib.rs"
-crate-type = ["staticlib"]
+# GDB remote serial protocol stub.
+# Status: placeholder module only — no GDB RSP framing or packet handling yet.
+# Enable: cargo build --features gdbstub
+gdbstub = []
+
+# Linux /dev/input evdev routing layer (keyboard + mouse dispatch).
+# Status: stub no-ops — event routing to /dev/input/eventN not yet wired.
+# Enable: cargo build --features input_events
+input_events = []
+
+# System V IPC (msgget/msgsnd/msgrcv/msgctl, semget/semop/semctl,
+# shmget/shmat/shmdt/shmctl) and POSIX message queues (mq_open/send/receive).
+# Status: data structures and logic complete; CAP_IPC_OWNER capability checks
+#         are integration stubs that always grant access.
+# Enable: cargo build --features sysv_ipc
+sysv_ipc = []
+
+# Linux-compatible namespace isolation.
+# Implemented: CLONE_NEWPID, CLONE_NEWNS (mount), CLONE_NEWNET,
+#              CLONE_NEWUTS, CLONE_NEWUSER.
+# Status: namespace types fully implemented; setns(2) and /proc/self/ns
+#         nsfs inodes not yet wired into the syscall table.
+# Enable: cargo build --features namespaces
+namespaces = []
+
+# cgroups v1 resource controllers: cpu (shares + CFS bandwidth),
+# memory (hard limit + OOM), pids (fork limit).
+# Status: hierarchy + knob read/write API complete; /sys/fs/cgroup cgroupfs
+#         VFS mount and syscall wiring not yet complete.
+# Note: integrates with the scheduler CFS bandwidth limiter when both
+#       cgroups and the default scheduler are active.
+# Enable: cargo build --features cgroups
+cgroups = []
+
+# Wayland compositor subsystem (in-kernel Wayland protocol server).
+# Status: directory scaffolded, no protocol implementation yet.
+# Enable: cargo build --features wayland
+wayland = []
