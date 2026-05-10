@@ -5,7 +5,9 @@
 // x86_64. It is NOT declared here because cfg_attr cannot gate #![feature]
 // on a per-arch basis in a way rustc accepts for bare-metal targets.
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
-#![allow(dead_code, unused_variables)]
+// NOTE: do NOT add #![allow(dead_code)] or #![allow(unused_variables)] here.
+// Use targeted per-item or per-module suppressions instead so that rustc
+// keeps reporting real dead-code and unused-variable warnings everywhere else.
 extern crate alloc;
 
 // ── Core kernel — always compiled in every build ──────────────────────────────
@@ -114,7 +116,9 @@ pub mod cgroups {
 
 /// Wayland compositor subsystem (in-kernel Wayland protocol server).
 ///
-/// Directory scaffolded; no protocol implementation exists yet.
+/// The kernel retains only a thin vblank pass-through
+/// (`compositor::vblank_notify`). All compositor logic lives in the
+/// privileged userspace process at `userspace/wayland/compositor.c`.
 ///
 /// Enable: `cargo build --features wayland`
 #[cfg(feature = "wayland")]
