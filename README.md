@@ -250,7 +250,7 @@ Each process exposes 7 namespace symlinks. Tools like `nsenter(1)` use them:
 /proc/self/ns/time → time:[4026531834]
 ```
 
-Openng a `/proc/<pid>/ns/<name>` path returns a fd that can be passed directly
+Opening a `/proc/<pid>/ns/<name>` path returns a fd that can be passed directly
 to `setns(2)` — the fd carries both the symlink content (for `read()`) and the
 ns identity (for `setns()`) via the same synthetic fd number.
 
@@ -377,18 +377,6 @@ Three files must always agree on the nightly date:
 4. `docker build -t rustos-dev .` to verify the image.
 5. `nix develop --command cargo build` to verify the flake.
 6. Add a CHANGELOG entry.
-
----
-
-## Roadmap
-
-- [ ] Scheduler load balancing across CPUs (SMP work-stealing)
-- [ ] Full TCP/IP stack (`src/net/`) — connect/accept/send/recv
-- [ ] AMD/Intel GPU DRM/KMS driver
-- [ ] `io_uring` support
-- [ ] Expanded musl libc syscall coverage
-- [ ] Graduate `cgroups` feature into default
-- [ ] `/dev/input` evdev routing (`input_events`)
 
 ---
 
