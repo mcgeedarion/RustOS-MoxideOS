@@ -13,25 +13,30 @@
 //!   9.  build_initial_stack → initial_rsp
 //!  10.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
 //!  11.  wake_pid(vfork_parent) if set
-//!  12.  Patch SyscallFrame (x86_64) or enqueue new PCB (riscv64)
+//!  12.  Patch SyscallFrame (x86_64) OR rebuild TrapFrame on kstack (riscv64)
 //!
-//! ## Bug fixes in this revision
+//! ## RISC-V in-place exec (do_execve_riscv)
+//!
+//!   On RISC-V execve arrives through the ecall/trap path. By the time
+//!   `sys_execve_noframe` is called the current task's TrapFrame is already
+//!   at `kstack_top - TRAP_FRAME_SIZE`. We overwrite it in-place via
+//!   `rebuild_trap_frame_riscv`, then update the Context so that the next
+//!   context switch (or the eventual trap_return at the end of this trap
+//!   handler invocation) enters the new program correctly:
+//!
+//!     ctx.ra  = task_entry_trampoline   — schedule() → switch_riscv → ret here
+//!     ctx.sp  = kstack_top - TRAP_FRAME_SIZE  — kernel sp for trap_return
+//!     ctx.s0  = 0                       — clean fp chain
+//!
+//!   This keeps the same PID, TID, kstack, and FD table, matching Linux
+//!   execve semantics. FDs with O_CLOEXEC are already closed by
+//!   proc_fd_close_on_exec before this point.
+//!
+//! ## Bug fixes (carried forward)
 //!
 //! ### copy_from_user argument order was swapped
-//!   Signature: `copy_from_user(&mut dst_buf, src_va: usize)`.
-//!   All call sites in sys_execve and read_cstr_array had the args
-//!   transposed — passing the VA as the slice and the buffer pointer
-//!   as the VA. Path and argv were always garbage/EFAULT.
-//!
 //! ### build_initial_stack NULL sentinel was before pointer arrays
-//!   ELF ABI (low→high): argc | argv[] | NULL | envp[] | NULL | auxv
-//!   Old code pushed NULL then the pointers, placing NULL at the top
-//!   of each array instead of after it. musl/glibc read past the end.
-//!
 //! ### do_execve re-read vfork_parent after zeroing it
-//!   with_proc_mut zeroed p.vfork_parent and returned the old value,
-//!   but the return was ignored; a second with_proc call re-read 0.
-//!   wake_pid(0) never unblocks the vfork parent.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -79,7 +84,7 @@ const PRESENT:       u64   = 1;
 const MAX_CSTR_LEN:   usize = 4096;
 const MAX_CSTR_ARRAY: usize = 1024;
 
-// ── stack size helper ─────────────────────────────────────────────────────────────
+// ── stack size helper ──────────────────────────────────────────────────────────────────────
 
 fn stack_bytes_for_pid(pid: usize) -> usize {
     let soft = scheduler::with_proc(pid, |p| p.rlimits.stack_soft())
@@ -94,7 +99,7 @@ fn stack_bytes_for_pid(pid: usize) -> usize {
 
 fn stack_bytes_default() -> usize { DEFAULT_STACK_BYTES }
 
-// ── free_old_address_space ────────────────────────────────────────────────────────────
+// ── free_old_address_space ────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
@@ -140,7 +145,7 @@ pub unsafe fn free_child_address_space(_cr3: usize) {}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn free_old_address_space(_cr3: usize) {}
 
-// ── new_user_address_space ──────────────────────────────────────────────────────────
+// ── new_user_address_space ────────────────────────────────────────────────────────────────
 
 fn new_user_address_space() -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
@@ -177,7 +182,7 @@ fn load_cr3(cr3: usize) {
     }
 }
 
-// ── spawn_user_process (open via VFS) ──────────────────────────────────────────────
+// ── spawn_user_process (boot-time, no running task) ─────────────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
@@ -263,17 +268,29 @@ pub fn spawn_user_process_from_bytes(
     let ppid = scheduler::current_pid();
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    let mut ctx = crate::proc::context::Context::zero();
-    ctx.rsp = kstack_top;
-    #[cfg(target_arch = "x86_64")]
-    { ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize; }
+    // For spawn (boot-time) on RISC-V: build the initial TrapFrame so the
+    // task can enter user mode via task_entry_trampoline → trap_return.
     #[cfg(target_arch = "riscv64")]
-    { ctx.ra  = crate::arch::riscv64::trap::sret_trampoline as usize; }
+    rebuild_trap_frame_riscv(kstack_top, entry_va, initial_rsp, 0);
+
+    let mut ctx = crate::proc::context::Context::zero();
+    #[cfg(target_arch = "x86_64")]
+    {
+        ctx.rsp = kstack_top;
+        ctx.rip = crate::arch::x86_64::syscall::sysret_trampoline as usize;
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        ctx.ra = crate::proc::context::task_entry_trampoline as usize;
+        ctx.sp = kstack_top
+            - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
+    }
 
     let mut pcb = crate::proc::process::Pcb {
         pid,
         ppid,
         tgid:                pid,
+        pgid:                pid,
         state:               crate::proc::process::State::Ready,
         exit_code:           0,
         caps:                CapSet::empty(),
@@ -285,13 +302,17 @@ pub fn spawn_user_process_from_bytes(
         vmas:                alloc::vec![],
         next_va:             crate::proc::process::Pcb::INITIAL_NEXT_VA,
         brk_base:            heap_base,
-        brk_current:         heap_base,
+        brk:                 heap_base,
         signal_handlers:     SignalHandlers::default(),
         ..crate::proc::process::Pcb::zeroed()
     };
-    pcb.exe_path = String::from(path);
+    pcb.exe_path = Some(String::from(path));
 
     scheduler::enqueue(pcb);
+    let task_ptr = scheduler::task_ptr_for_pid(pid as usize);
+    if !task_ptr.is_null() {
+        scheduler::enqueue_task(task_ptr);
+    }
     true
 }
 
@@ -299,7 +320,7 @@ pub fn spawn_process(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ────────────────────────────────────────────────────────────
+// ── sys_execve [NR 59] ───────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(
@@ -308,7 +329,6 @@ pub fn sys_execve(
     envp_va:  usize,
     frame:    &mut SyscallFrame,
 ) -> isize {
-    // FIX: copy_from_user(&mut dst, src_va) — args were transposed.
     let mut path_buf = alloc::vec![0u8; MAX_CSTR_LEN];
     if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
     let nul = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
@@ -316,19 +336,23 @@ pub fn sys_execve(
         Ok(s) => s.to_string(),
         Err(_) => return -14,
     };
-
     let argv = read_cstr_array(argv_va);
     let envp = read_cstr_array(envp_va);
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
-
     match do_execve(&path, &argv_refs, &envp_refs, frame) {
         Ok(_)  => 0,
         Err(e) => e,
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+/// RISC-V execve entry point (called from trap handler, no SyscallFrame).
+///
+/// Performs a full in-place exec: replaces the current task's address space,
+/// rewrites the TrapFrame at kstack_top - TRAP_FRAME_SIZE, and updates the
+/// Context so that the scheduler enters user mode correctly on next dispatch.
+/// Returns 0 on success or a negative errno on failure.
+#[cfg(target_arch = "riscv64")]
 pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
     let mut path_buf = alloc::vec![0u8; MAX_CSTR_LEN];
     if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
@@ -341,10 +365,13 @@ pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isi
     let envp = read_cstr_array(envp_va);
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
-    if spawn_user_process(&path, &argv_refs, &envp_refs) { 0 } else { -8 }
+    match do_execve_riscv(&path, &argv_refs, &envp_refs) {
+        Ok(_)  => 0,
+        Err(e) => e,
+    }
 }
 
-// ── do_execve (x86_64 only) ─────────────────────────────────────────────────────────────────
+// ── do_execve (x86_64) ───────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(
@@ -368,7 +395,6 @@ pub fn do_execve(
 
     let hdr   = elf::parse_elf_header(data).map_err(|_| -8isize)?;
     let phdrs = elf::parse_phdrs_with_hdr(data, &hdr).ok_or(-8isize)?;
-
     let new_cr3 = new_user_address_space().ok_or(-12isize)?;
 
     let program_entry = elf::load_elf_into(new_cr3, data, &hdr, &phdrs)
@@ -390,7 +416,7 @@ pub fn do_execve(
             (program_entry, 0)
         };
 
-    let stack_sz = stack_bytes_for_pid(pid);
+    let stack_sz = stack_bytes_for_pid(pid as usize);
     mmap::alloc_user_stack(new_cr3, STACK_TOP, stack_sz)
         .map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
@@ -402,27 +428,22 @@ pub fn do_execve(
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     ).map_err(|e| { unsafe { free_old_address_space(new_cr3); } e })?;
 
-    let old_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
-    mmap::clear_vmas_pub(pid);
-    if old_cr3 != 0 {
-        unsafe { free_old_address_space(old_cr3); }
-    }
+    let old_cr3 = scheduler::with_proc(pid as usize, |p| p.user_satp).unwrap_or(0);
+    mmap::clear_vmas_pub(pid as usize);
+    if old_cr3 != 0 { unsafe { free_old_address_space(old_cr3); } }
     load_cr3(new_cr3);
-    update_rsp0(scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0));
+    update_rsp0(scheduler::with_proc(pid as usize, |p| p.kstack_top).unwrap_or(0));
 
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    // FIX: capture vfork_parent from the with_proc_mut return value directly.
-    // The old code zeroed p.vfork_parent inside the closure but then did a
-    // second with_proc read which returned 0, so wake_pid(0) was always called.
-    let vfork_parent = scheduler::with_proc_mut(pid, |p| {
+    let vfork_parent = scheduler::with_proc_mut(pid as usize, |p| {
         p.user_satp       = new_cr3;
         p.pc              = entry_va;
         p.sp              = initial_rsp;
         p.signal_handlers = SignalHandlers::default();
-        p.exe_path        = String::from(path);
+        p.exe_path        = Some(String::from(path));
         p.brk_base        = heap_base;
-        p.brk_current     = heap_base;
+        p.brk             = heap_base;
         let vp = p.vfork_parent;
         p.vfork_parent    = 0;
         vp
@@ -433,11 +454,164 @@ pub fn do_execve(
     frame.rip    = entry_va;
     frame.rsp    = initial_rsp;
     frame.rflags = 0x202;
+    Ok(())
+}
+
+// ── do_execve_riscv (in-place exec for RISC-V) ───────────────────────────────────────
+
+/// Replace the current task's address space in-place.
+///
+/// Steps:
+///   1.  Load and map the new ELF into a fresh page table root.
+///   2.  Allocate a new user stack in the new address space.
+///   3.  Close O_CLOEXEC file descriptors.
+///   4.  Tear down the old address space and switch to the new one.
+///   5.  Build the initial argv/envp/auxv stack.
+///   6.  Write a new `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE`.
+///   7.  Update `pcb.ctx` so `schedule()` → `switch_riscv` → `ret` lands at
+///       `task_entry_trampoline`, which jumps to `trap_return` and `sret`s.
+///   8.  Update PCB metadata (satp, pc, sp, exe_path, brk, signals).
+///   9.  Wake vfork parent if applicable.
+///
+/// The function returns `Ok(())`. Because the TrapFrame has already been
+/// overwritten on the kstack, the trap handler's normal restore path will
+/// `sret` into the new program when this ecall returns.
+#[cfg(target_arch = "riscv64")]
+fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize> {
+    use crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
+    use crate::proc::context::task_entry_trampoline;
+
+    let pid = scheduler::current_pid();
+    crate::fs::process_fd::proc_fd_close_on_exec(pid);
+
+    // ── 1–2. Load ELF into fresh address space ─────────────────────────────
+    let fd = vfs::open(path, vfs::O_RDONLY).map_err(|_| -8isize)?;
+    let file_size = vfs::fstat(fd).unwrap_or(0);
+    const MAX_ELF: usize = 64 * 1024 * 1024;
+    if file_size == 0 || file_size > MAX_ELF { vfs::close(fd); return Err(-8); }
+    let mut data: Vec<u8> = alloc::vec![0u8; file_size];
+    let n = vfs::pread(fd, data.as_mut_ptr(), file_size, 0);
+    vfs::close(fd);
+    if n <= 0 { return Err(-8); }
+    let data = &data[..n as usize];
+
+    let hdr   = elf::parse_elf_header(data).map_err(|_| -8isize)?;
+    let phdrs = elf::parse_phdrs_with_hdr(data, &hdr).ok_or(-8isize)?;
+    let new_satp = new_user_address_space().ok_or(-12isize)?;
+
+    let program_entry = elf::load_elf_into(new_satp, data, &hdr, &phdrs)
+        .map_err(|e| { unsafe { free_old_address_space(new_satp); } e })?;
+
+    let elf_bias = if hdr.e_type == elf::ET_DYN { ELF_DYN_BIAS } else { 0 };
+    let bss_end  = elf::end_of_bss(&phdrs, elf_bias);
+
+    let phdr_va = phdrs.iter()
+        .find(|ph| ph.p_type == elf::PT_PHDR)
+        .map_or(0, |ph| ph.p_vaddr as usize + elf_bias);
+
+    let (entry_va, interp_base_val) =
+        if let Some(interp_path) = elf::find_interp(data, &phdrs) {
+            let e = load_interpreter(new_satp, interp_path)
+                .map_err(|e| { unsafe { free_old_address_space(new_satp); } e })?;
+            (e, INTERP_BASE)
+        } else {
+            (program_entry, 0)
+        };
+
+    let stack_sz = stack_bytes_for_pid(pid as usize);
+    mmap::alloc_user_stack(new_satp, STACK_TOP, stack_sz)
+        .map_err(|e| { unsafe { free_old_address_space(new_satp); } e })?;
+
+    let argv_strings: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
+    let envp_strings: Vec<String> = envp.iter().map(|s| String::from(*s)).collect();
+
+    let initial_sp = build_initial_stack(
+        STACK_TOP, &argv_strings, &envp_strings,
+        &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
+    ).map_err(|e| { unsafe { free_old_address_space(new_satp); } e })?;
+
+    // ── 3–4. Tear down old address space, activate new one ─────────────────
+    let old_satp = scheduler::with_proc(pid as usize, |p| p.user_satp).unwrap_or(0);
+    mmap::clear_vmas_pub(pid as usize);
+    if old_satp != 0 { unsafe { free_old_address_space(old_satp); } }
+    load_cr3(new_satp);   // load_cr3 handles RISC-V satp + sfence.vma
+
+    let heap_base = mmap::set_brk_base_compute(bss_end);
+
+    // ── 5. Retrieve kstack_top before mutating PCB ─────────────────────────
+    let kstack_top = scheduler::with_proc(pid as usize, |p| p.kstack_top)
+        .unwrap_or(0);
+    if kstack_top == 0 { return Err(-1); }
+
+    // ── 6. Rebuild TrapFrame in place on the kstack ────────────────────────
+    //
+    // The TrapFrame slot is always at kstack_top - TRAP_FRAME_SIZE.
+    // We zero the old frame and populate the new program's entry state.
+    // TLS (tp) starts as 0; the runtime will set it via set_thread_area
+    // or clone(CLONE_SETTLS) in userspace.
+    rebuild_trap_frame_riscv(kstack_top, entry_va, initial_sp, 0 /* tls */);
+
+    // ── 7. Update Context ───────────────────────────────────────────────────────────────
+    //
+    // Whether this task is scheduled next via switch_riscv (preempted before
+    // the ecall handler returns) or resumes through the normal trap exit path,
+    // both paths end at trap_return which restores the TrapFrame we just wrote.
+    let new_ctx = crate::proc::context::Context {
+        ra:  task_entry_trampoline as usize,
+        sp:  kstack_top - TRAP_FRAME_SIZE,
+        s0:  0,
+        ..crate::proc::context::Context::zero()
+    };
+
+    // ── 8. Update PCB metadata ───────────────────────────────────────────────────────────
+    let vfork_parent = scheduler::with_proc_mut(pid as usize, |p| {
+        p.user_satp       = new_satp;
+        p.pc              = entry_va;
+        p.sp              = initial_sp;
+        p.ctx             = new_ctx;
+        p.signal_handlers = SignalHandlers::default();
+        p.exe_path        = Some(String::from(path));
+        p.brk_base        = heap_base;
+        p.brk             = heap_base;
+        p.tls_base        = 0;
+        let vp = p.vfork_parent;
+        p.vfork_parent    = 0;
+        vp
+    }).unwrap_or(0);
+
+    // ── 9. Wake vfork parent ─────────────────────────────────────────────────────────────
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
     Ok(())
 }
 
-// ── read_cstr_array ──────────────────────────────────────────────────────────────────
+// ── rebuild_trap_frame_riscv ──────────────────────────────────────────────────────────
+
+/// Overwrite the `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE` with a fresh
+/// frame for the new program.
+///
+/// Used by both `do_execve_riscv` (in-place exec) and `spawn_user_process`
+/// (boot-time first task) on RISC-V.
+///
+/// `sstatus` is set with SPIE=1 (interrupts enabled after sret) and SPP=0
+/// (return to U-mode).  All registers except `sp`, `tp`, `a0`, and `sepc`
+/// are zeroed so the new program starts with a clean register state.
+#[cfg(target_arch = "riscv64")]
+fn rebuild_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, tls: usize) {
+    use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE, SSTATUS_SPIE, SSTATUS_SPP};
+    let frame_va = kstack_top - TRAP_FRAME_SIZE;
+    unsafe {
+        core::ptr::write_bytes(frame_va as *mut u8, 0, TRAP_FRAME_SIZE);
+        let f = frame_va as *mut TrapFrame;
+        (*f).sp      = user_sp;
+        (*f).tp      = tls;
+        (*f).a0      = 0;
+        (*f).sepc    = entry_pc;
+        (*f).sstatus = SSTATUS_SPIE & !SSTATUS_SPP;
+    }
+}
+
+// ── read_cstr_array ───────────────────────────────────────────────────────────────────────
 
 fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     if ptr_array_va == 0 { return Vec::new(); }
@@ -446,7 +620,6 @@ fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     loop {
         if i >= MAX_CSTR_ARRAY { break; }
         let ptr_va = ptr_array_va + i * 8;
-        // FIX: copy_from_user(&mut dst, src_va) — was transposed.
         let mut ptr_buf = [0u8; 8];
         if copy_from_user(&mut ptr_buf, ptr_va).is_err() { break; }
         let ptr = usize::from_ne_bytes(ptr_buf);
@@ -464,17 +637,7 @@ fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     result
 }
 
-// ── build_initial_stack ─────────────────────────────────────────────────────────────────
-//
-// ELF initial stack layout (low address → high address, stack grows down):
-//
-//   [low]                                     [high = stack_top]
-//   argc | argv[0..n-1] | NULL | envp[0..n-1] | NULL | auxv | padding | strings | random
-//
-// Since we push by decrementing sp, we must push in REVERSE order
-// (push last element first). The NULL sentinel must be pushed AFTER all
-// pointers (which means it lands at a lower address, i.e. after them in
-// the array when read forwards).
+// ── build_initial_stack ──────────────────────────────────────────────────────────────────────
 
 fn build_initial_stack(
     stack_top: usize,
@@ -511,13 +674,11 @@ fn build_initial_stack(
         }};
     }
 
-    // 1. Write string data high in the stack (env then arg, each NUL-terminated).
-    //    Collect the user-space VAs of each string as we go.
     let mut env_ptrs: Vec<usize> = Vec::new();
     for e in envp.iter().rev() {
-        push_u8!(0);                         // NUL terminator
-        push_bytes!(e.as_bytes());           // string bytes
-        env_ptrs.push(sp);                  // VA of start of string
+        push_u8!(0);
+        push_bytes!(e.as_bytes());
+        env_ptrs.push(sp);
     }
     env_ptrs.reverse();
 
@@ -529,7 +690,6 @@ fn build_initial_stack(
     }
     arg_ptrs.reverse();
 
-    // 2. 16-byte random seed for AT_RANDOM.
     sp -= 16;
     sp &= !0xf;
     let random_va = sp;
@@ -537,10 +697,8 @@ fn build_initial_stack(
                       0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef];
     unsafe { ptr::copy_nonoverlapping(rand_bytes.as_ptr(), sp as *mut u8, 16); }
 
-    // 3. Align.
     sp &= !0xf;
 
-    // 4. Auxvec (NULL-terminated), pushed in reverse so AT_NULL lands lowest.
     let phdr_count = phdrs.len();
     let phdr_size  = core::mem::size_of::<elf::Elf64Phdr>();
     let auxv: &[(u64,u64)] = &[
@@ -558,26 +716,18 @@ fn build_initial_stack(
         push_usize!(t as usize);
     }
 
-    // 5. envp: NULL sentinel first (lowest address), then pointers in reverse.
-    //    FIX: old code pushed NULL then pointers, placing NULL ABOVE pointers.
-    //    Correct: push pointers (reversed, so they land in order), then NULL.
     for &p in env_ptrs.iter().rev() { push_usize!(p); }
-    push_usize!(0); // NULL terminator at lowest address of envp array
+    push_usize!(0);
 
-    // 6. argv: same fix.
     for &p in arg_ptrs.iter().rev() { push_usize!(p); }
-    push_usize!(0); // NULL terminator at lowest address of argv array
+    push_usize!(0);
 
-    // 7. argc
     push_usize!(argv.len());
-
-    // 8. 16-byte alignment for ABI compliance.
     sp &= !0xf;
-
     Ok(sp)
 }
 
-// ── load_interpreter ───────────────────────────────────────────────────────────────────
+// ── load_interpreter ────────────────────────────────────────────────────────────────────────
 
 fn load_interpreter(cr3: usize, path: &str) -> Result<usize, isize> {
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|_| -8isize)?;
@@ -592,13 +742,12 @@ fn load_interpreter(cr3: usize, path: &str) -> Result<usize, isize> {
     vfs::close(fd);
     if n <= 0 { return Err(-8); }
     let idata = &idata[..n as usize];
-
     let ihdr   = elf::parse_elf_header(idata).map_err(|_| -8isize)?;
     let iphdrs = elf::parse_phdrs_with_hdr(idata, &ihdr).ok_or(-8isize)?;
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── clear_vmas wrapper ────────────────────────────────────────────────────────────────
+// ── clear_vmas wrapper ──────────────────────────────────────────────────────────────────────
 
 pub fn clear_vmas(pid_key: u32) {
     mmap::clear_vmas_pub(pid_key as usize);
