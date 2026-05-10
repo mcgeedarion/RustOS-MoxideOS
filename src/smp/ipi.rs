@@ -25,6 +25,13 @@
 //!   1. Clear SIP.SSIP to acknowledge the interrupt.
 //!   2. Call `ipi::dispatch(cpu_id)` — reads & clears `ipi_pending` atomically
 //!      then dispatches each set bit.
+//!
+//! ## `schedule_on(task, cpu)` integration
+//!   When the scheduler pins a task to a specific remote CPU via
+//!   `schedule_on`, it calls `send_reschedule(cpu)` after enqueuing the task
+//!   onto that CPU's runqueue.  The remote CPU wakes from `wfi` (or preempts
+//!   its current timeslice) and calls `schedule()`, which picks up the newly
+//!   enqueued task.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::smp::{MAX_CPUS, num_online_cpus, cpu_info};
@@ -60,12 +67,24 @@ static mut SHOOTDOWN_REQS: [ShootdownReq; MAX_CPUS] = [ShootdownReq {
 
 static SHOOTDOWN_ACK: AtomicU64 = AtomicU64::new(0);
 
-// ── Send ──────────────────────────────────────────────────────────────────────────
+// ── Internal: set pending bit on target CPU ────────────────────────────────────
+
+#[inline]
+fn set_pending(cpu: u32, kind: IpiKind) {
+    unsafe {
+        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
+            .ipi_pending
+            .fetch_or(1 << (kind as u8), Ordering::Release);
+    }
+}
+
+// ── Send ──────────────────────────────────────────────────────────────────────
 
 /// Send an IPI to a single target CPU.
 ///
-/// Caller must have already set the target's `ipi_pending` bits *before*
-/// calling this, so the handler is guaranteed to see them.
+/// Caller MUST have already called `set_pending` (or set the bit via
+/// `fetch_or` directly) before calling this so the handler is guaranteed to
+/// see the pending bit even if it runs before this function returns.
 #[inline]
 pub fn send(target_cpu: u32, kind: IpiKind) {
     #[cfg(target_arch = "x86_64")]
@@ -82,11 +101,20 @@ pub fn send(target_cpu: u32, kind: IpiKind) {
     }
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = kind; // kind encoded in ipi_pending bits, not in the IPI itself
+        let _ = kind;
         if let Some(info) = cpu_info(target_cpu) {
             crate::arch::riscv64::smp::send_ipi(info.hw_id as usize);
         }
     }
+}
+
+/// Set the pending bit for `kind` on `target_cpu` then fire the IPI.
+/// This is the primary public send API — always use this over calling
+/// `set_pending` + `send` separately unless you need a batched send.
+#[inline]
+pub fn send_to(target_cpu: u32, kind: IpiKind) {
+    set_pending(target_cpu, kind);
+    send(target_cpu, kind);
 }
 
 /// Broadcast an IPI to all CPUs except the current one.
@@ -94,34 +122,35 @@ pub fn broadcast_except_self(kind: IpiKind) {
     let me = crate::smp::percpu::current_cpu_id();
     for cpu in 0..num_online_cpus() {
         if cpu != me {
-            // Write pending bits first, then send.
-            unsafe {
-                let blk_ptr = &crate::smp::percpu::PERCPU_BLOCKS[cpu as usize];
-                blk_ptr.ipi_pending.fetch_or(1 << (kind as u8), Ordering::Release);
-            }
-            send(cpu, kind);
+            send_to(cpu, kind);
         }
     }
 }
 
-// ── Receive dispatch ────────────────────────────────────────────────────────────────
+/// Send a reschedule IPI to `target_cpu` (no-op if target == self).
+/// This is what `enqueue_task` and `schedule_on` call after pushing a
+/// task onto a remote CPU's runqueue.
+#[inline]
+pub fn send_reschedule(target_cpu: u32) {
+    let me = crate::smp::percpu::current_cpu_id();
+    if target_cpu != me {
+        send_to(target_cpu, IpiKind::Reschedule);
+    }
+}
+
+/// Alias kept for backwards compatibility with `smp::ipi::reschedule`.
+#[inline]
+pub fn reschedule(target_cpu: u32) { send_reschedule(target_cpu); }
+
+// ── Receive dispatch ───────────────────────────────────────────────────────────────
 
 /// Called from the supervisor software interrupt handler (RISC-V scause = 1)
 /// after SIP.SSIP has been cleared.  Atomically drains all pending IPI bits
 /// and dispatches each one.
-///
-/// This is also called on x86_64 from the APIC IPI vector handlers (which
-/// have already decoded the kind from the vector number and set the bit
-/// before calling here), but on x86_64 the vectors fire directly so this
-/// function is a fallback path not normally used.
 pub fn dispatch(cpu_id: u32) {
     let blk = unsafe { &crate::smp::percpu::PERCPU_BLOCKS[cpu_id as usize] };
-    // Atomically read and clear all pending bits.
     let pending = blk.ipi_pending.swap(0, Ordering::AcqRel);
-    if pending == 0 {
-        // Spurious SSIP (can happen if SBI raises it for other reasons).
-        return;
-    }
+    if pending == 0 { return; } // spurious SSIP
 
     if pending & (1 << IpiKind::TlbShootdown as u8) != 0 {
         handle_tlb_shootdown(cpu_id);
@@ -130,26 +159,26 @@ pub fn dispatch(cpu_id: u32) {
         crate::proc::scheduler::schedule();
     }
     if pending & (1 << IpiKind::FuncCall as u8) != 0 {
-        // Future: drain deferred work queue.
+        // Future: drain per-CPU deferred-work ring.
     }
     if pending & (1 << IpiKind::PanicHalt as u8) != 0 {
-        // Another hart panicked; halt this one.
         crate::println!("smp: cpu {} halted by IPI_PANIC_HALT", cpu_id);
         loop {
             #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("wfi", options(nostack, nomem)); }
+            unsafe { core::arch::asm!("wfi",  options(nostack, nomem)); }
             #[cfg(target_arch = "x86_64")]
-            unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+            unsafe { core::arch::asm!("hlt",  options(nostack, nomem)); }
         }
     }
 }
 
 // ── TLB shootdown ─────────────────────────────────────────────────────────────────
 
-/// Flush `[start, end)` on all CPUs.  Blocks until all CPUs acknowledge.
+/// Flush `[start, end)` on all CPUs that may have `asid` mapped.
+/// Blocks until all CPUs acknowledge via `SHOOTDOWN_ACK`.
 pub fn tlb_shootdown(start: u64, end: u64, asid: u16) {
     let me = crate::smp::percpu::current_cpu_id();
-    let n = num_online_cpus();
+    let n  = num_online_cpus();
     if n <= 1 { return; }
 
     let mut ack_mask: u64 = 0;
@@ -190,22 +219,7 @@ fn local_tlb_flush(start: u64, end: u64) {
         }
     }
     #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!("sfence.vma", options(nostack));
-    }
-}
-
-/// Send a reschedule IPI to `target_cpu` (no-op if target == self).
-#[inline]
-pub fn reschedule(target_cpu: u32) {
-    let me = crate::smp::percpu::current_cpu_id();
-    if target_cpu != me {
-        unsafe {
-            crate::smp::percpu::PERCPU_BLOCKS[target_cpu as usize]
-                .ipi_pending.fetch_or(1 << IpiKind::Reschedule as u8, Ordering::Release);
-        }
-        send(target_cpu, IpiKind::Reschedule);
-    }
+    unsafe { core::arch::asm!("sfence.vma", options(nostack)); }
 }
 
 /// Halt all other CPUs (used by panic handler).
