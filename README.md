@@ -1,13 +1,19 @@
 # rustos
 
-A Rust-based operating system kernel targeting **x86_64** and **RISC-V (rv64gc)**,
-with growing Linux ABI compatibility. Boots via UEFI (x86_64 and RISC-V EDK2) or
-OpenSBI (RISC-V SBI). Runs under QEMU with virtio block, GPU, and network devices.
+> A Rust-based operating system kernel targeting **x86_64** and **RISC-V (rv64gc)**,
+> with growing Linux ABI compatibility. Boots via UEFI (x86_64 and RISC-V EDK2) or
+> OpenSBI (RISC-V SBI). Runs under QEMU with virtio block, GPU, and network devices.
+
+![build](https://img.shields.io/github/actions/workflow/status/mcgeedarion/rustos/build.yml?label=build)
+![license](https://img.shields.io/badge/license-MIT-blue)
+![rust](https://img.shields.io/badge/rust-nightly--2025--05--15-orange)
+![arch](https://img.shields.io/badge/arch-x86__64%20%7C%20riscv64-lightgrey)
+![version](https://img.shields.io/badge/version-0.2.0-green)
 
 > **Toolchain:** `nightly-2025-05-15` (pinned in `rust-toolchain.toml`).  
 > Nightly is required for `naked_functions`, `alloc_error_handler`,
 > `core_intrinsics`, `abi_x86_interrupt`, and `-Z build-std`.  
-> See [Upgrading the toolchain pin](#upgrading-the-toolchain-pin) before bumping.
+> See [Upgrading the Toolchain Pin](#upgrading-the-toolchain-pin) before bumping.
 
 ---
 
@@ -18,14 +24,16 @@ OpenSBI (RISC-V SBI). Runs under QEMU with virtio block, GPU, and network device
 - **Scheduler**: CFS (`SCHED_NORMAL`), `SCHED_FIFO`, `SCHED_RR`, `SCHED_DEADLINE`;
   per-CPU run queues; EDF with CBS admission control
 - **Memory**: 4-level page tables (x86_64) / Sv39+Sv48 (RISC-V), demand paging,
-  Copy-on-Write (COW), ASLR
-- **Filesystems**: ext2, FAT32/VFAT, tmpfs, devfs, procfs, initramfs (cpio), VFS layer
+  Copy-on-Write (COW), ASLR, **slab allocator** (8–1024 byte caches, per-cache SMP locks)
+- **Filesystems**: ext2, **ext4**, FAT32/VFAT, tmpfs, devfs, procfs (`/proc/slabinfo`), initramfs (cpio), VFS layer
 - **Drivers**: virtio-blk, virtio-net, virtio-gpu, PS/2 keyboard, UART, PCIe enumeration
 - **Linux syscall compatibility**: ~80 syscalls (see [Syscall Table](#syscall-table-selected))
 - **Resource limits**: `RLIMIT_CPU` and `RLIMIT_RTTIME` with SIGXCPU/SIGKILL enforcement
 - **IPC**: futex (WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE, robust lists), pipes, Unix sockets
-- **SMP**: AP bringup (APIC trampoline / SBI HSM), per-CPU blocks, IPI dispatch
+- **SMP**: AP bringup (APIC trampoline / SBI HSM), per-CPU blocks, IPI dispatch, MM RwLock per address space
 - **Security**: ASLR, stack canaries, PTI, SMEP/SMAP, seccomp-BPF, capability set
+- **Timers**: real `nanosleep` / `clock_nanosleep` — clock-aware absolute sleeps, EINTR/remainder correctness, `CLOCK_PROCESS_CPUTIME_ID` / `CLOCK_THREAD_CPUTIME_ID`
+- **GDB stub**: full x86_64 RSP implementation over UART — breakpoints, stepping, thread enumeration, `qXfer:features:read`, `vCont`, binary memory writes
 - **musl libc port** — see [`docs/musl_port.md`](docs/musl_port.md)
 
 ---
@@ -39,8 +47,8 @@ rustos/
 │   │   ├── x86_64/     # IDT, APIC, GDT, paging, SMP trampoline
 │   │   └── riscv64/    # PLIC, trap handler, SBI/UEFI entry
 │   ├── proc/           # scheduler, fork, exec, wait, signals, futex, rlimit
-│   ├── mm/             # VMM, PMM, page tables, COW, mmap
-│   ├── fs/             # VFS, ext2, FAT32, tmpfs, devfs, procfs, initramfs
+│   ├── mm/             # VMM, PMM, slab, page tables, COW, mmap
+│   ├── fs/             # VFS, ext2, ext4, FAT32, tmpfs, devfs, procfs, initramfs
 │   ├── drivers/        # virtio-{blk,net,gpu}, PS/2, UART, NVMe, PCIe
 │   ├── syscall/        # syscall dispatch + individual handlers
 │   ├── net/            # TCP/UDP/IP stack
@@ -49,9 +57,9 @@ rustos/
 │   │                   #   namespaces (ns/), cgroups v1 (cgroups/)
 │   ├── sync/           # futex, RwLock, Condvar, WaitQueue
 │   ├── ipc/            # SysV msg/sem/shm, POSIX mq  [feature: sysv_ipc]
-│   ├── gdbstub/        # GDB RSP stub placeholder    [feature: gdbstub]
-│   ├── input/          # /dev/input evdev layer       [feature: input_events]
-│   └── wayland/        # Wayland compositor scaffold  [feature: wayland]
+│   ├── gdbstub/        # GDB RSP stub (x86_64 complete) [feature: gdbstub]
+│   ├── input/          # /dev/input evdev layer         [feature: input_events]
+│   └── wayland/        # Wayland compositor scaffold    [feature: wayland]
 ├── tests/              # C integration tests (run on Linux host or in-kernel)
 ├── userspace/          # Minimal init + shell
 ├── xtask/              # cargo xtask build system
@@ -184,6 +192,42 @@ the correct architecture. For RISC-V use port `:1235`; for x86_64 use `:1234`.
 
 ---
 
+## GDB Debugging (x86_64)
+
+The `gdbstub` feature provides a full GDB Remote Serial Protocol implementation
+over UART (COM1). Enable it and attach GDB directly to the running kernel — no
+QEMU gdbserver required.
+
+```bash
+# Build with stub enabled
+cargo build --target x86_64-unknown-none \
+  --no-default-features --features gdbstub \
+  -Z build-std=core,alloc,compiler_builtins
+
+# Launch QEMU (no -s/-S flags needed — stub runs inside the kernel)
+./run_qemu.sh
+
+# In another terminal
+gdb target/x86_64-unknown-none/debug/rustos \
+  -ex 'target remote /dev/ttyS0'   # or tcp::1234 via socat
+```
+
+**Supported RSP packets:** `?`, `g/G`, `p/P`, `m/M`, `X` (binary write), `s`, `c`,
+`Z0/z0` (SW breakpoints, up to 16), `H`, `T`, `vCont`, `vKill`, `D`, `k`,
+`qSupported`, `qfThreadInfo/qsThreadInfo`, `qC`, `qOffsets`,
+`qXfer:features:read:target.xml`.
+
+Wire the stub from your `#DB` / `#BP` exception handler:
+
+```rust
+#[cfg(feature = "gdbstub")]
+crate::gdbstub::gdb_trap(regs, scheduler::current_pid());
+```
+
+> **Note:** RISC-V RSP register file support is a planned follow-up.
+
+---
+
 ## Feature Flags
 
 The **default build** is a clean, fully functional, testable base kernel.
@@ -192,10 +236,10 @@ All WIP or incomplete subsystems are behind opt-in feature flags.
 | Feature | Default | Status | Enable with |
 |---------|---------|--------|-------------|
 | `uefi_boot` | ✅ on | Stable | (always on by default) |
+| `gdbstub` | ❌ off | **x86_64 complete** — RSP over UART, SW breakpoints, thread enum, `target.xml` | `--features gdbstub` |
 | `sysv_ipc` | ❌ off | Logic complete; `CAP_IPC_OWNER` stub | `--features sysv_ipc` |
 | `namespaces` | ❌ off | 5 NS types done; `setns`/nsfs missing | `--features namespaces` |
 | `cgroups` | ❌ off | Knob API done; cgroupfs mount missing | `--features cgroups` |
-| `gdbstub` | ❌ off | Placeholder; no RSP impl | `--features gdbstub` |
 | `input_events` | ❌ off | Stub no-ops; evdev routing missing | `--features input_events` |
 | `wayland` | ❌ off | Scaffold only | `--features wayland` |
 
@@ -253,46 +297,25 @@ Soft crossing → `SIGXCPU` (repeated each second); hard → `SIGKILL`.
 | 1 | `write` | ✅ |
 | 2 | `open` | ✅ |
 | 3 | `close` | ✅ |
-| 7 | `waitpid` (compat) | ✅ |
+| 7 | `poll` | ✅ |
 | 9 | `mmap` | ✅ |
 | 11 | `munmap` | ✅ |
 | 12 | `brk` | ✅ |
 | 22 | `pipe` | ✅ |
-| 35 | `nanosleep` | ✅ |
+| 35 | `nanosleep` | ✅ clock-aware, EINTR/rem correct |
 | 56 | `clone` | ✅ |
 | 57 | `fork` | ✅ |
 | 59 | `execve` | ✅ |
 | 60 | `exit` | ✅ |
 | 61 | `wait4` | ✅ |
 | 72 | `fcntl` | ✅ |
-| 7 | `poll` | ✅ |
-| 202 | `futex` | ✅ (WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE/robust) |
+| 202 | `futex` | ✅ WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE/robust |
 | 218 | `set_tid_address` | ✅ |
-| 228 | `clock_gettime` | ✅ |
+| `clock_gettime` | 228 | ✅ all clock IDs including CPUTIME |
+| `clock_nanosleep` | 230 | ✅ TIMER_ABSTIME, clock-aware |
 | 302 | `prlimit64` | ✅ |
 | 314 | `sched_setattr` | ✅ |
 | 315 | `sched_getattr` | ✅ |
-
----
-
-## Upgrading the Toolchain Pin
-
-Three files must always agree on the nightly date:
-
-| File | Key |
-|------|-----|
-| `rust-toolchain.toml` | `channel = "nightly-YYYY-MM-DD"` |
-| `Dockerfile` | `ARG NIGHTLY_DATE=YYYY-MM-DD` |
-| `flake.nix` | `pkgs.rust-bin.nightly."YYYY-MM-DD"` |
-
-Steps:
-1. Update the date in all three files in a single commit.
-2. `cargo build` for each of the three targets (RISC-V UEFI, RISC-V SBI, x86_64).
-3. Fix any API churn (check the nightly release notes for breaking changes to
-   `naked_functions`, `alloc_error_handler`, or `-Z build-std`).
-4. `docker build -t rustos-dev .` to verify the image.
-5. `nix develop --command cargo build` to verify the flake.
-6. Add a CHANGELOG entry documenting the bump and reason.
 
 ---
 
@@ -318,17 +341,38 @@ cargo xtask clean
 
 ---
 
+## Upgrading the Toolchain Pin
+
+Three files must always agree on the nightly date:
+
+| File | Key |
+|------|-----|
+| `rust-toolchain.toml` | `channel = "nightly-YYYY-MM-DD"` |
+| `Dockerfile` | `ARG NIGHTLY_DATE=YYYY-MM-DD` |
+| `flake.nix` | `pkgs.rust-bin.nightly."YYYY-MM-DD"` |
+
+Steps:
+1. Update the date in all three files in a single commit.
+2. `cargo build` for each of the three targets (RISC-V UEFI, RISC-V SBI, x86_64).
+3. Fix any API churn (check the nightly release notes for breaking changes to
+   `naked_functions`, `alloc_error_handler`, or `-Z build-std`).
+4. `docker build -t rustos-dev .` to verify the image.
+5. `nix develop --command cargo build` to verify the flake.
+6. Add a CHANGELOG entry documenting the bump and reason.
+
+---
+
 ## Roadmap
 
-- [ ] Real per-process `nanosleep` timer (APIC one-shot / RISC-V timer interrupt)
+- [ ] RISC-V GDB RSP register file (`gdbstub` parity with x86_64)
 - [ ] Scheduler load balancing across CPUs (SMP work-stealing)
 - [ ] Full TCP/IP stack (`src/net/`) — connect/accept/send/recv
 - [ ] AMD/Intel GPU DRM/KMS driver
-- [ ] Expanded musl libc syscall coverage
 - [ ] `io_uring` support
+- [ ] Expanded musl libc syscall coverage
 - [ ] Graduate `namespaces` + `cgroups` features into default
 - [ ] Wire `sysv_ipc` syscall dispatch entries
-- [ ] GDB RSP implementation in `gdbstub`
+- [ ] `/dev/input` evdev routing (`input_events`)
 
 ---
 
