@@ -3,6 +3,8 @@
 //! Reads the FDT blob passed by OpenSBI in `a1` to:
 //!   1. Register physical RAM regions with the PMM (`pmm::add_region`).
 //!   2. Record the initramfs location (`initramfs::set_initramfs_range`).
+//!   3. Discover VirtIO-MMIO devices and call their probe functions.
+//!      Currently handled: DeviceID 1 (net) → `virtio_net_mmio::probe(base, irq)`.
 //!
 //! Only the subset of the FDT spec needed for QEMU `virt` machine is
 //! implemented — big-endian u32 token stream, no dynamic allocation required.
@@ -28,7 +30,7 @@ const FDT_PROP:        u32 = 3;
 const FDT_NOP:         u32 = 4;
 const FDT_END:         u32 = 9;
 
-// ── Header ────────────────────────────────────────────────────────────────
+// ── Header ────────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 struct FdtHeader {
@@ -54,20 +56,18 @@ impl FdtHeader {
     fn off_dt_strings(&self) -> u32 { u32::from_be(self.off_dt_strings) }
 }
 
-// ── Helper: read big-endian u32 from a byte slice ─────────────────────────
+// ── Helper: read big-endian integers from a byte slice ─────────────────────────
 
 #[inline]
 fn be32(b: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([b[off], b[off+1], b[off+2], b[off+3]])
 }
 
-/// Read a NUL-terminated ASCII string from `bytes` starting at `off`.
 fn cstr(bytes: &[u8], off: usize) -> &str {
     let end = bytes[off..].iter().position(|&c| c == 0).unwrap_or(0);
     core::str::from_utf8(&bytes[off..off + end]).unwrap_or("")
 }
 
-/// Read big-endian u64 from a byte slice (used for /memory reg cells).
 #[inline]
 fn be64(b: &[u8], off: usize) -> u64 {
     u64::from_be_bytes([
@@ -76,15 +76,27 @@ fn be64(b: &[u8], off: usize) -> u64 {
     ])
 }
 
-// ── Kernel page base + size (keep initramfs pages out of the PMM) ─────────
+// ── Kernel page base + size (keep initramfs pages out of the PMM) ─────────────
 
 extern "C" {
     static _kernel_end: u8;
 }
 
-// ── Main walker ───────────────────────────────────────────────────────────
+// ── Node state during walk ────────────────────────────────────────────────────────
 
-/// Walk the FDT blob and initialise the PMM and initramfs range.
+/// State tracked for a single virtio_mmio node as we collect its properties.
+#[derive(Default)]
+struct VirtioMmioNode {
+    base: usize,  // from `reg`
+    irq:  u32,    // from `interrupts`
+    /// true once we have confirmed the `compatible` property says virtio,mmio
+    is_virtio: bool,
+}
+
+// ── Main walker ───────────────────────────────────────────────────────────────────
+
+/// Walk the FDT blob and initialise the PMM, initramfs range, and VirtIO
+/// MMIO devices.
 ///
 /// # Safety
 /// `fdt_ptr` must be the physical address of a valid DTB blob as passed by
@@ -105,17 +117,16 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
 
     crate::println!("fdt: blob at {:#x}, {} bytes", fdt_ptr, total);
 
-    // Walking state.
-    let mut pos:         usize = 0;      // byte offset into `structs`
+    let mut pos:         usize = 0;
     let mut depth:       usize = 0;
-    let mut in_memory:   bool  = false;  // inside a /memory node
-    let mut in_chosen:   bool  = false;  // inside /chosen node
+    let mut in_memory:   bool  = false;
+    let mut in_chosen:   bool  = false;
+    let mut in_virtio:   bool  = false;  // inside a virtio_mmio node
+    let mut vmmio:       VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
     let mut initrd_start: u64  = 0;
     let mut initrd_end:   u64  = 0;
 
-    // Kernel end physical address — pages before this are reserved.
     let kernel_end_pa = &_kernel_end as *const u8 as usize;
-    // Round up to 4 KiB boundary.
     let kernel_end_pa = (kernel_end_pa + 0xFFF) & !0xFFF;
 
     loop {
@@ -125,7 +136,6 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
 
         match token {
             FDT_BEGIN_NODE => {
-                // Node name is a NUL-terminated string, padded to u32.
                 let name_start = pos;
                 let name_end   = structs[pos..].iter().position(|&c| c == 0)
                                      .unwrap_or(0) + pos + 1;
@@ -137,9 +147,20 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                 if depth == 1 {
                     in_memory = node_name == "memory" || node_name.starts_with("memory@");
                     in_chosen = node_name == "chosen";
+                    // Detect virtio_mmio@<addr> nodes at depth 1.
+                    in_virtio = node_name.starts_with("virtio_mmio@");
+                    if in_virtio {
+                        // Parse base address from node name (e.g. "virtio_mmio@10001000").
+                        let addr_str = &node_name["virtio_mmio@".len()..];
+                        vmmio = VirtioMmioNode {
+                            base: usize::from_str_radix(addr_str, 16).unwrap_or(0),
+                            irq:  0,
+                            is_virtio: false,
+                        };
+                    }
                 } else {
                     in_memory = false;
-                    // keep in_chosen across depth so sub-props are captured
+                    in_virtio = false;
                 }
                 depth += 1;
             }
@@ -147,8 +168,15 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
             FDT_END_NODE => {
                 if depth > 0 { depth -= 1; }
                 if depth == 1 {
+                    // Leaving a top-level node.
+                    if in_virtio && vmmio.is_virtio && vmmio.base != 0 {
+                        // Probe the device; virtio_net_mmio::probe() checks
+                        // DeviceID internally and returns false for non-net devices.
+                        crate::drivers::virtio_net_mmio::probe(vmmio.base, vmmio.irq);
+                    }
                     in_memory = false;
                     in_chosen = false;
+                    in_virtio = false;
                 }
             }
 
@@ -160,78 +188,91 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                 let prop_data   = if pos + prop_len <= structs.len() {
                     &structs[pos..pos + prop_len]
                 } else { &[] };
-                pos = (pos + prop_len + 3) & !3; // align to u32
+                pos = (pos + prop_len + 3) & !3;
 
+                // ── /memory reg ──────────────────────────────────────────────────────
                 if in_memory && prop_name == "reg" {
-                    // reg is a list of (address, size) pairs, each 8 bytes (2 × #address-cells=2)
                     let mut i = 0usize;
                     while i + 16 <= prop_data.len() {
                         let base = be64(prop_data, i)     as usize;
                         let size = be64(prop_data, i + 8) as usize;
                         i += 16;
                         if size == 0 { continue; }
-                        // Reserve the kernel image pages; offer the rest to the PMM.
                         let free_start = if base < kernel_end_pa { kernel_end_pa } else { base };
-                        // Also exclude the FDT blob itself from the free pool.
                         let fdt_start  = fdt_ptr & !0xFFF;
                         let fdt_end    = (fdt_ptr + total + 0xFFF) & !0xFFF;
-
                         let region_end = base + size;
-
-                        // Offer [free_start, fdt_start) if non-empty.
                         if free_start < fdt_start && fdt_start <= region_end {
                             pmm::add_region(free_start, fdt_start - free_start);
                             crate::println!("pmm: region {:#x}..{:#x} ({} MiB)",
-                                free_start, fdt_start,
-                                (fdt_start - free_start) / 0x10_0000);
+                                free_start, fdt_start, (fdt_start - free_start) / 0x10_0000);
                         }
-                        // Offer [fdt_end, region_end) if non-empty.
                         if fdt_end < region_end {
                             pmm::add_region(fdt_end, region_end - fdt_end);
                             crate::println!("pmm: region {:#x}..{:#x} ({} MiB)",
-                                fdt_end, region_end,
-                                (region_end - fdt_end) / 0x10_0000);
+                                fdt_end, region_end, (region_end - fdt_end) / 0x10_0000);
                         }
-                        // If fdt is outside this region, just offer the whole range.
                         if fdt_end <= free_start || fdt_start >= region_end {
                             if free_start < region_end {
                                 pmm::add_region(free_start, region_end - free_start);
                                 crate::println!("pmm: region {:#x}..{:#x} ({} MiB)",
-                                    free_start, region_end,
-                                    (region_end - free_start) / 0x10_0000);
+                                    free_start, region_end, (region_end - free_start) / 0x10_0000);
                             }
                         }
                     }
                 }
 
+                // ── /chosen ────────────────────────────────────────────────────────────
                 if in_chosen {
                     match prop_name {
                         "linux,initrd-start" => {
-                            initrd_start = if prop_data.len() == 8 {
-                                be64(prop_data, 0)
-                            } else if prop_data.len() == 4 {
-                                be32(prop_data, 0) as u64
-                            } else { 0 };
+                            initrd_start = if prop_data.len() == 8 { be64(prop_data, 0) }
+                                           else if prop_data.len() == 4 { be32(prop_data, 0) as u64 }
+                                           else { 0 };
                         }
                         "linux,initrd-end" => {
-                            initrd_end = if prop_data.len() == 8 {
-                                be64(prop_data, 0)
-                            } else if prop_data.len() == 4 {
-                                be32(prop_data, 0) as u64
-                            } else { 0 };
+                            initrd_end = if prop_data.len() == 8 { be64(prop_data, 0) }
+                                         else if prop_data.len() == 4 { be32(prop_data, 0) as u64 }
+                                         else { 0 };
+                        }
+                        _ => {}
+                    }
+                }
+
+                // ── virtio_mmio@ node properties ────────────────────────────────────
+                if in_virtio {
+                    match prop_name {
+                        "compatible" => {
+                            // Expect "virtio,mmio" as a NUL-terminated string.
+                            let s = core::str::from_utf8(
+                                prop_data.split(|&c| c == 0).next().unwrap_or(&[])
+                            ).unwrap_or("");
+                            vmmio.is_virtio = s == "virtio,mmio";
+                        }
+                        "reg" => {
+                            // reg: (addr, size) pair, each 8 bytes on RISC-V.
+                            if prop_data.len() >= 8 {
+                                let addr = be64(prop_data, 0) as usize;
+                                if addr != 0 { vmmio.base = addr; }
+                            }
+                        }
+                        "interrupts" => {
+                            // PLIC interrupt number: 4-byte big-endian cell.
+                            if prop_data.len() >= 4 {
+                                vmmio.irq = be32(prop_data, 0);
+                            }
                         }
                         _ => {}
                     }
                 }
             }
 
-            FDT_NOP => { /* skip */ }
-
+            FDT_NOP => {}
             FDT_END | _ => { break; }
         }
     }
 
-    // Register the initramfs location found in /chosen.
+    // Register the initramfs found in /chosen.
     if initrd_start != 0 && initrd_end > initrd_start {
         let len = (initrd_end - initrd_start) as usize;
         crate::println!("initramfs: found at {:#x}, {} bytes", initrd_start as usize, len);
