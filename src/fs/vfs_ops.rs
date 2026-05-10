@@ -1,8 +1,10 @@
 //! VFS mutation / query operations — dispatched through the mount table.
 //!
 //! Every function here:
-//!   1. Calls `mount::resolve(path)` to get an `FsHandle`
-//!   2. Dispatches to the correct backend (ext2, fat32, tmpfs, overlayfs, devfs, procfs, sysfs)
+//!   1. For stat/lstat: checks dcache first; on miss calls mount::resolve +
+//!      backend, then populates the cache.
+//!   2. For write-side ops: calls the backend, then invalidates the dcache
+//!      entry so subsequent stat calls see fresh data.
 //!   3. Returns the standard POSIX errno-compatible isize / Result
 //!
 //! ## Backends wired
@@ -24,6 +26,7 @@ use alloc::{
 
 use crate::fs::mount::{self, FsType, OverlayOpts};
 use crate::fs::overlayfs::OverlayMount;
+use crate::fs::dcache;
 
 // ── Stat result (kernel-internal) ────────────────────────────────────────────────
 
@@ -97,7 +100,7 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
 pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Ext2 => {
             use crate::fs::fcntl::{fd_open, fd_write, fd_close};
             let fd = fd_open(path, 0x241).map_err(|e| e)?;
@@ -120,7 +123,9 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
             crate::fs::overlayfs::write(&om, &h.subpath, data)
         }
         FsType::Devfs | FsType::Procfs | FsType::Sysfs => Err(-30),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── pread / pwrite — offset-based I/O ────────────────────────────────────────
@@ -148,7 +153,7 @@ pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
 pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_pwrite(path, offset, data),
         FsType::Ext2 | FsType::Fat32 => {
             let mut full = read_all(path).unwrap_or_default();
@@ -159,7 +164,9 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
             Ok(data.len())
         }
         _ => Err(-38),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── truncate ────────────────────────────────────────────────────────────────────
@@ -167,7 +174,7 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_truncate(path, len),
         FsType::Ext2 => {
             crate::fs::ext2::sys_truncate(path, len as u64).map(|_| ())
@@ -180,7 +187,9 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
             fs.truncate(&mut f, len as u64)
         }
         _ => Err(-38),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── create ────────────────────────────────────────────────────────────────────
@@ -188,7 +197,7 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
 pub fn create(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Ext2 => {
             use crate::fs::fcntl::{fd_open, fd_close};
             let fd = fd_open(path, 0x241).map_err(|e| e)?;
@@ -204,7 +213,9 @@ pub fn create(path: &str) -> Result<(), isize> {
             crate::fs::overlayfs::create(&om, &h.subpath).map(|_| ())
         }
         _ => Err(-1),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────
@@ -214,11 +225,16 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let h_n = mount::resolve(new)?;
     if h_e.fstype != h_n.fstype { return Err(-18); }
     if h_e.is_readonly() { return Err(-30); }
-    match h_e.fstype {
+    let result = match h_e.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_link(existing, new),
         FsType::Ext2  => crate::fs::ext2::sys_link(existing, new).map(|_| ()),
         _             => Err(-38),
+    };
+    if result.is_ok() {
+        dcache::invalidate(existing);
+        dcache::invalidate(new);
     }
+    result
 }
 
 // ── mkdir ─────────────────────────────────────────────────────────────────────
@@ -226,7 +242,7 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
 pub fn mkdir(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Ext2 => crate::fs::ext2::sys_mkdir(path, 0o755).map(|_| ()),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
@@ -240,7 +256,9 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
             crate::fs::overlayfs::mkdir(&om, &h.subpath)
         }
         _ => Err(-1),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── rmdir ─────────────────────────────────────────────────────────────────────
@@ -248,7 +266,7 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
 pub fn rmdir(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_rmdir(path),
         FsType::Ext2  => crate::fs::ext2::sys_rmdir(path).map(|_| ()),
         FsType::Fat32 => {
@@ -258,7 +276,9 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
             fs.rmdir(&h.subpath)
         }
         _ => Err(-1),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── unlink ────────────────────────────────────────────────────────────────────
@@ -266,7 +286,7 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
 pub fn unlink(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Ext2 => crate::fs::ext2::sys_unlink(path).map(|_| ()),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
@@ -280,7 +300,9 @@ pub fn unlink(path: &str) -> Result<(), isize> {
             crate::fs::overlayfs::unlink(&om, &h.subpath)
         }
         _ => Err(-1),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── rename ────────────────────────────────────────────────────────────────────
@@ -290,11 +312,16 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_n = mount::resolve(new)?;
     if h_o.fstype != h_n.fstype { return Err(-18); }
     if h_o.is_readonly() { return Err(-30); }
-    match h_o.fstype {
+    let result = match h_o.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_rename(old, new),
         FsType::Ext2  => crate::fs::ext2::sys_rename(old, new).map(|_| ()),
         _             => Err(-38),
+    };
+    if result.is_ok() {
+        dcache::invalidate(old);
+        dcache::invalidate(new);
     }
+    result
 }
 
 // ── stat / lstat ──────────────────────────────────────────────────────────────
@@ -303,8 +330,17 @@ pub fn stat(path: &str) -> Result<KStat, isize> { stat_impl(path, false) }
 pub fn lstat(path: &str) -> Result<KStat, isize> { stat_impl(path, true) }
 
 fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
+    // lstat skips symlink resolution — don't serve a cached stat for it
+    // if the cache entry was populated via a regular stat (which may have
+    // followed a symlink).  For simplicity, bypass the cache for lstat.
+    if !lstat {
+        if let Some(entry) = dcache::lookup(path) {
+            return Ok(entry.stat);
+        }
+    }
+
     let h = mount::resolve(path)?;
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Ext2 => {
             let s = if lstat {
                 crate::fs::ext2::sys_lstat(path).map_err(|e| e as isize)?
@@ -347,7 +383,15 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
         FsType::Devfs  => crate::fs::devfs::stat(&h.subpath),
         FsType::Procfs => crate::fs::procfs::stat(&h.subpath),
         FsType::Sysfs  => crate::fs::sysfs::stat(&h.subpath),
+    };
+
+    // Populate cache on successful non-lstat lookup.
+    if !lstat {
+        if let Ok(ref s) = result {
+            dcache::insert(path, h.fstype, s.ino, s.clone());
+        }
     }
+    result
 }
 
 // ── statfs ────────────────────────────────────────────────────────────────────
@@ -357,7 +401,6 @@ pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Tmpfs  => crate::fs::tmpfs::tmpfs_statfs(path),
-        // Stub for other types: return zeros.
         _ => Ok(KStatfs::default()),
     }
 }
@@ -413,11 +456,13 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
 pub fn symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let h = mount::resolve(link_path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_symlink(target, link_path),
         FsType::Ext2  => crate::fs::ext2::sys_symlink(target, link_path).map(|_| ()),
         _             => Err(-38),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(link_path); }
+    result
 }
 
 pub fn readlink(path: &str) -> Result<String, isize> {
@@ -434,21 +479,25 @@ pub fn readlink(path: &str) -> Result<String, isize> {
 pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_chmod(path, mode),
         FsType::Ext2  => crate::fs::ext2::sys_chmod(path, mode).map(|_| ()),
         _             => Err(-38),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
-    match h.fstype {
+    let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_chown(path, uid, gid),
         FsType::Ext2  => crate::fs::ext2::sys_chown(path, uid, gid).map(|_| ()),
         _             => Err(-38),
-    }
+    };
+    if result.is_ok() { dcache::invalidate(path); }
+    result
 }
 
 // ── open (VFS-level, returns kernel fd) ──────────────────────────────────────
@@ -523,13 +572,11 @@ pub fn parse_size(s: &str) -> Option<usize> {
             return Some(n * mult);
         }
     }
-    // Percentage of total RAM.
     if let Some(num_str) = s.strip_suffix('%') {
         let pct: usize = num_str.trim().parse().ok()?;
         let total = crate::mm::pmm::total_pages() * 4096;
         return Some((total / 100) * pct);
     }
-    // Case-insensitive suffixes.
     let sl = s.to_ascii_lowercase();
     for (suffix, mult) in &[
         ("tib", 1024usize*1024*1024*1024),

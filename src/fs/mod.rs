@@ -1,4 +1,5 @@
 pub mod close_range;
+pub mod dcache;
 pub mod devfs;
 pub mod elf;
 pub mod eventfd;
