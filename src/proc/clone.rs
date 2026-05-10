@@ -1,49 +1,28 @@
 //! clone3 syscall implementation.
 //!
-//! Implements the POSIX thread creation path for pthread_create:
-//!   CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
-//!   | CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
+//! ## CLONE_SIGHAND
 //!
-//! A CLONE_VM child:
-//!   - Gets a fresh pid but shares user_satp (CR3/satp) with its parent.
-//!   - Shares the parent's VMA list.
-//!   - Gets a private kernel stack and Context.
-//!   - Returns 0 to userspace (child return value = 0).
+//! When CLONE_SIGHAND is set the child shares the parent's signal handler
+//! table (the same Arc<Mutex<SignalHandlers>>).  Any sigaction() call by
+//! either the parent or any sibling thread immediately affects all of them.
 //!
-//! Non-CLONE_VM (fork / vfork) is handled by fork.rs.
+//! When CLONE_SIGHAND is NOT set (plain fork / vfork) the child gets a
+//! deep copy via `Pcb::fork_signal_handlers()`, so the parent and child
+//! have independent dispositions after the fork.
 //!
 //! ## Arch-specific first-entry paths
 //!
 //! ### x86_64
 //!   `push_syscall_frame` builds a 17-slot iretq frame at kstack_top - 136.
-//!   `child_ctx.rip` = `sysret_trampoline` so the first context switch jumps
-//!   there and performs the `sysret` into user mode.
+//!   `child_ctx.rip` = `sysret_trampoline`.
 //!
 //! ### RISC-V
 //!   `push_trap_frame_riscv` builds a full 34-word `TrapFrame` at
-//!   `kstack_top - TRAP_FRAME_SIZE` (272 bytes below the top).
-//!   Fields set:
-//!     - `sepc`    = child entry point (parent's `pc` for fork-like clones;
-//!                   caller-supplied `stack + stack_size` top for
-//!                   pthread_create clones)
-//!     - `sstatus` = SPIE (interrupts on after sret) | ~SPP (U-mode)
-//!     - `sp`      = user stack top (`ca.stack + ca.stack_size`)
-//!     - `a0`      = 0  (child syscall return value)
-//!     - `tp`      = child TLS pointer (when CLONE_SETTLS)
-//!     - All other registers = 0
-//!
-//!   `child_ctx.ra`  = `task_entry_trampoline` — jumped to on first resume.
-//!   `child_ctx.sp`  = `kstack_top - TRAP_FRAME_SIZE` — kernel sp at entry.
-//!   `child_ctx.s0`  = 0 — clean frame-pointer chain.
-//!
-//! ## Bug fixes (carried forward from previous version)
-//!
-//! ### push_syscall_frame: SS slot was overwritten with rip (x86_64)
-//! ### sys_clone_legacy: child_sp went into stack_size field
-//! ### CLONE_CHILD_SETTID: child never wrote its own TID
+//!   `kstack_top - TRAP_FRAME_SIZE`.
 
 extern crate alloc;
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 use crate::mm::kstack::alloc_kstack;
 use crate::proc::context::Context;
 use crate::proc::process::{Pcb, State};
@@ -63,11 +42,10 @@ use crate::arch::x86_64::syscall::sysret_trampoline;
 #[allow(dead_code)]
 fn sysret_trampoline() {}
 
-// Ring-3 code and stack segment selectors (GDT layout: cs=0x23, ss=0x1b).
 const USER_CS: usize = 0x23;
 const USER_SS: usize = 0x1b;
 
-// ── CLONE_* flag bits ─────────────────────────────────────────────────────
+// ── CLONE_* flag bits ──────────────────────────────────────────────────────
 
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
@@ -88,17 +66,17 @@ pub const CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
 
 #[repr(C)]
 pub struct CloneArgs {
-    pub flags:        u64,  // [0]
-    pub pidfd:        u64,  // [1]
-    pub child_tid:    u64,  // [2]
-    pub parent_tid:   u64,  // [3]
-    pub exit_signal:  u64,  // [4]
-    pub stack:        u64,  // [5]
-    pub stack_size:   u64,  // [6]
-    pub tls:          u64,  // [7]
-    pub set_tid:      u64,  // [8]
-    pub set_tid_size: u64,  // [9]
-    pub cgroup:       u64,  // [10]
+    pub flags:        u64,
+    pub pidfd:        u64,
+    pub child_tid:    u64,
+    pub parent_tid:   u64,
+    pub exit_signal:  u64,
+    pub stack:        u64,
+    pub stack_size:   u64,
+    pub tls:          u64,
+    pub set_tid:      u64,
+    pub set_tid_size: u64,
+    pub cgroup:       u64,
 }
 
 // ── sys_clone3 ────────────────────────────────────────────────────────────
@@ -143,15 +121,12 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
     let child_tls = if flags & CLONE_SETTLS != 0 { ca.tls as usize } else { 0 };
 
-    // User-space stack top: Linux convention — stack field is the bottom
-    // (lowest address) of the stack region, stack+stack_size is the top.
     let user_sp = if ca.stack != 0 {
         (ca.stack + ca.stack_size) as usize
     } else {
         0
     };
 
-    // ── arch-specific kernel-stack frame + Context init ──────────────────
     #[cfg(target_arch = "x86_64")]
     let child_ctx = {
         push_syscall_frame(kstack_top, parent_pc, 0x202, user_sp);
@@ -165,13 +140,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
     #[cfg(target_arch = "riscv64")]
     let child_ctx = {
-        // Entry PC: for a pthread_create (CLONE_VM) clone the child starts
-        // at the user-supplied entry point (passed in ca.stack as a
-        // pointer on musl's ABI — but clone3 passes it via sepc from the
-        // parent's pc for fork-like clones).  For all cases we use
-        // parent_pc so the child resumes exactly where the parent called
-        // clone (which is correct for both fork and pthread_create since
-        // pthread_create sets the child entry via the TrapFrame's sepc).
         let entry_pc = parent_pc;
         push_trap_frame_riscv(kstack_top, entry_pc, user_sp, child_tls);
         let frame_sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
@@ -191,8 +159,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
     }
 
-    // CLONE_CHILD_SETTID: write child_pid to child_tid_va in the parent
-    // before enqueue so musl's pthread_create sees it immediately.
     let child_tid_va = if flags & CLONE_CHILD_SETTID != 0 {
         let va = ca.child_tid as usize;
         if va != 0 && va < USER_SPACE_END {
@@ -203,8 +169,33 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         0
     };
 
+    // ── Build child PCB ─────────────────────────────────────────────────
+    //
+    // Start with a clone of the parent PCB so most fields are inherited.
+    // Then override the fields that must differ in the child.
     let mut child_pcb: Pcb = scheduler::with_proc(parent_pid, |p| p.clone())
         .unwrap_or_else(make_blank_pcb);
+
+    // ── Signal handler table ─────────────────────────────────────────────
+    //
+    // CLONE_SIGHAND: share the parent's Arc — child and parent see the same
+    //   table; sigaction() by either immediately affects the other.
+    //
+    // No CLONE_SIGHAND (fork/vfork): deep-copy so child is independent.
+    //   Uses Pcb::fork_signal_handlers() which locks the parent's table,
+    //   clones the inner value, and wraps it in a new Arc<Mutex<…>>.
+    child_pcb.signal_handlers = if flags & CLONE_SIGHAND != 0 {
+        // Share the existing Arc (both point to the same Mutex<SignalHandlers>).
+        scheduler::with_proc(parent_pid, |p| p.signal_handlers.clone())
+            .unwrap_or_else(|| Arc::new(spin::Mutex::new(
+                crate::proc::fork::SignalHandlers::default())))
+    } else {
+        // Deep copy: child gets its own independent table.
+        scheduler::with_proc(parent_pid, |p| p.fork_signal_handlers())
+            .unwrap_or_else(|| Arc::new(spin::Mutex::new(
+                crate::proc::fork::SignalHandlers::default())))
+    };
+
     child_pcb.pid        = child_pid;
     child_pcb.tgid       = child_tgid;
     child_pcb.ppid       = child_ppid;
@@ -229,124 +220,5 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.robust_list_len  = 0;
     child_pcb.ptrace_state = PtraceState::None;
     child_pcb.ptrace_event = 0;
-
-    if is_vm_clone { thread::register_thread(child_pid, child_tgid); }
-    scheduler::enqueue(child_pcb);
-
-    // Enqueue the task on the least-loaded CPU (or the parent's CPU for
-    // CLONE_VM so TLB state is warm on a shared address space).
-    let task_ptr = scheduler::task_ptr_for_pid(child_pid);
-    if !task_ptr.is_null() {
-        if is_vm_clone {
-            // Pin the new thread to the same CPU as the parent so they
-            // share warm TLB / cache state.  The load balancer can
-            // migrate it after BALANCE_TICKS if the CPU gets overloaded.
-            let parent_cpu = crate::smp::percpu::current_cpu_id();
-            scheduler::schedule_on(task_ptr, parent_cpu);
-        } else {
-            scheduler::enqueue_task(task_ptr);
-        }
-    }
-
-    if flags & CLONE_VFORK != 0 { scheduler::suspend_current_until_child_exec(child_pid); }
-
-    child_pid as isize
-}
-
-// ── legacy 5-argument clone (NR 56) ──────────────────────────────────────────
-
-pub fn sys_clone_legacy(flags: usize, child_sp: usize, _ptid: usize,
-                        _ctid: usize, tls: usize) -> isize {
-    let mut args = [0u64; core::mem::size_of::<CloneArgs>() / 8];
-    args[0] = flags as u64;
-    args[5] = child_sp as u64;  // stack (bottom, child_sp is the top on Linux ABI)
-    args[6] = 0;                // stack_size = 0 when child_sp is already the top
-    args[7] = tls as u64;
-    let va = args.as_ptr() as usize;
-    sys_clone3(va, core::mem::size_of::<CloneArgs>())
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// x86_64: build the 17-slot iretq frame on the kernel stack.
-#[cfg(target_arch = "x86_64")]
-fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
-    const FRAME_SZ: usize = 17 * 8;
-    let base = kstack_top - FRAME_SZ;
-    unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, FRAME_SZ);
-        let p = base as *mut usize;
-        p.add(13).write(rip);      // RIP
-        p.add(14).write(USER_CS);  // CS
-        p.add(15).write(rflags);   // RFLAGS
-        p.add(16).write(user_rsp); // RSP
-    }
-}
-
-/// RISC-V: build a `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE`.
-///
-/// The child will enter userspace through `task_entry_trampoline` →
-/// `trap_return` which restores this frame and executes `sret`.
-///
-/// `sstatus` is set with SPIE (interrupts enabled after sret) and SPP=0
-/// (return to U-mode).  All registers except `sp` (user stack), `tp`
-/// (TLS pointer), `a0` (return value = 0), and `sepc` (entry PC) are
-/// zeroed.
-#[cfg(target_arch = "riscv64")]
-fn push_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, tls: usize) {
-    use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE, SSTATUS_SPIE, SSTATUS_SPP};
-    let frame_va = kstack_top - TRAP_FRAME_SIZE;
-    unsafe {
-        // Zero the entire frame first.
-        core::ptr::write_bytes(frame_va as *mut u8, 0, TRAP_FRAME_SIZE);
-        let f = frame_va as *mut TrapFrame;
-        (*f).sp      = user_sp;                   // user stack pointer
-        (*f).tp      = tls;                       // thread pointer (TLS)
-        (*f).a0      = 0;                         // child return value
-        (*f).sepc    = entry_pc;                  // resume PC after sret
-        // SPIE=1: interrupts on in U-mode after sret.
-        // SPP=0:  sret returns to U-mode (not S-mode).
-        (*f).sstatus = SSTATUS_SPIE & !SSTATUS_SPP;
-    }
-}
-
-fn make_blank_pcb() -> Pcb {
-    Pcb {
-        pid:        0,
-        ppid:       0,
-        tgid:       0,
-        pgid:       0,
-        state:      State::Ready,
-        exit_code:  0,
-        caps:       CapSet::empty(),
-        pc:         0,
-        sp:         0,
-        user_satp:  0,
-        vmas:       Vec::new(),
-        next_va:    Pcb::INITIAL_NEXT_VA,
-        brk_base:   0,
-        brk:        Pcb::INITIAL_BRK,
-        kstack_top: 0,
-        ctx:        Context::zero(),
-        tls_base:   0,
-        child_tid_va:        0,
-        child_tid_val:       0,
-        clear_child_tid_va:  0,
-        exit_signal:         17,
-        vfork_parent:        0,
-        signal_handlers:     crate::proc::fork::SignalHandlers::default(),
-        pending_signals:     alloc::collections::VecDeque::new(),
-        exe_path:            None,
-        ns:                  NsSet::default(),
-        seccomp:             FilterChain::default(),
-        robust_list_head:    0,
-        robust_list_len:     0,
-        ptrace_state:        PtraceState::None,
-        ptrace_event:        0,
-        rlimits:             RlimitSet::default(),
-        cpu_time_ns:         0,
-        rt_cpu_time_us:      0,
-        sleep_deadline_ns:   0,
-        sleep_timer_id:      0,
-    }
-}
+    // Clear per-thread pending signal queue for the child.
+    child_pcb.pen

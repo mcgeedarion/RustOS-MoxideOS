@@ -15,13 +15,6 @@
 //!   8. wake vfork_parent
 //!   9. notify_exit (wakes parent waitpid)
 //!  10. schedule()   — never returns
-//!
-//! ## Bug fix
-//!
-//! ### Wrong module path for futex_clear_pid
-//!   `crate::sync::futex` does not exist. `futex_clear_pid` lives in
-//!   `crate::proc::futex`. Both do_exit and sys_exit_group had this
-//!   wrong path, which fails to compile. Fixed to `crate::proc::futex`.
 
 extern crate alloc;
 
@@ -35,7 +28,7 @@ use crate::proc::{scheduler, thread, wait};
 use crate::proc::wait::encode_exit;
 use crate::uaccess::copy_to_user;
 
-// ── clear_child_tid ───────────────────────────────────────────────────────────────
+// ── clear_child_tid ─────────────────────────────────────────────────────────
 
 fn clear_child_tid(pid: usize) {
     let va = scheduler::with_proc_mut(pid, |p| {
@@ -48,7 +41,7 @@ fn clear_child_tid(pid: usize) {
     futex_wake_addr(va, 1);
 }
 
-// ── is_last_live_thread ────────────────────────────────────────────────────────────
+// ── is_last_live_thread ───────────────────────────────────────────────────
 
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     scheduler::with_procs_ro(|procs| {
@@ -58,7 +51,7 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     })
 }
 
-// ── zombify ────────────────────────────────────────────────────────────────────
+// ── zombify ────────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
     let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p| {
@@ -73,7 +66,7 @@ fn zombify(pid: usize, code: i32) -> usize {
     vfork_parent
 }
 
-// ── do_exit ────────────────────────────────────────────────────────────────────
+// ── do_exit ────────────────────────────────────────────────────────────
 
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
@@ -82,9 +75,9 @@ pub fn do_exit(pid: usize, code: i32) {
     clear_child_tid(pid);
     thread::unregister_thread(pid);
 
-    crate::syscall::altstack_clear_pid(pid);
+    // Clean up per-pid signal state (PENDING queue, SIGMASK, ALTSTACK).
+    crate::proc::signal::altstack_clear_pid(pid);
     crate::syscall::proc_name_clear(pid);
-    // FIX: was `crate::sync::futex::futex_clear_pid` which does not exist.
     crate::proc::futex::futex_clear_pid(pid);
 
     crate::fs::process_fd::proc_fd_free(pid);
@@ -102,14 +95,14 @@ pub fn do_exit(pid: usize, code: i32) {
     loop { <Arch as Cpu>::halt(); }
 }
 
-// ── sys_exit [NR 60] ──────────────────────────────────────────────────────────────
+// ── sys_exit [NR 60] ────────────────────────────────────────────────────────
 
 pub fn sys_exit(status: i32) -> isize {
     do_exit(scheduler::current_pid(), status);
     0
 }
 
-// ── sys_exit_group [NR 231] ───────────────────────────────────────────────────────────
+// ── sys_exit_group [NR 231] ─────────────────────────────────────────────────
 
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
@@ -126,9 +119,8 @@ pub fn sys_exit_group(status: i32) -> isize {
         robust_list_on_exit(sibling);
         clear_child_tid(sibling);
         thread::unregister_thread(sibling);
-        crate::syscall::altstack_clear_pid(sibling);
+        crate::proc::signal::altstack_clear_pid(sibling);
         crate::syscall::proc_name_clear(sibling);
-        // FIX: was `crate::sync::futex::futex_clear_pid` which does not exist.
         crate::proc::futex::futex_clear_pid(sibling);
         crate::fs::process_fd::proc_fd_free(sibling);
         let vfork_parent = zombify(sibling, status);
