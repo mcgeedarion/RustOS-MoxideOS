@@ -10,17 +10,24 @@
 //! For production use this should be replaced with a hierarchical timer wheel
 //! (Linux `hrtimer` style).
 //!
-//! ## POSIX interval timers (getitimer / setitimer)
+//! ## POSIX interval timers  (getitimer / setitimer)
 //!
 //! Three per-process timers:
 //!
-//! | Name             | Signal   | Clocks           |
-//! |------------------|----------|------------------|
-//! | ITIMER_REAL      | SIGALRM  | CLOCK_REALTIME   |
-//! | ITIMER_VIRTUAL   | SIGVTALRM| CLOCK_PROCESS_CPUTIME |
-//! | ITIMER_PROF      | SIGPROF  | utime + stime    |
+//! | Name             | Signal   | Clocks                    |
+//! |------------------|----------|---------------------------|
+//! | ITIMER_REAL      | SIGALRM  | CLOCK_REALTIME            |
+//! | ITIMER_VIRTUAL   | SIGVTALRM| CLOCK_PROCESS_CPUTIME_ID  |
+//! | ITIMER_PROF      | SIGPROF  | user + kernel time        |
 //!
 //! Per-process `ItimerState` is stored in `proc::Task` (integration point).
+//!
+//! ## clock_nanosleep (kernel helper)
+//!
+//! `clock_nanosleep()` is a convenience wrapper around
+//! `proc::nanosleep::sleep_until_ns` for use by kernel code that already
+//! has an absolute monotonic deadline.  Userspace syscalls go through
+//! `proc::nanosleep::sys_clock_nanosleep` instead.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
@@ -28,9 +35,13 @@ use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::time::{Timespec, read_monotonic_ns, NSEC_PER_SEC};
 
-// ─────────────────────────────────────────────────────────────────────────────
+/// Passed as `flags` to `clock_nanosleep` and `sys_clock_nanosleep`
+/// to indicate the request time is an absolute deadline.
+pub const TIMER_ABSTIME: i32 = 1;
+
+// ───────────────────────────────────────────────────────────────────────────────
 // Timer wheel
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
 
 pub type TimerCallback = fn(u64); // arg is the timer ID
 
@@ -111,54 +122,39 @@ pub fn expire_timers() {
     if let Some(w) = WHEEL.lock().as_mut() { w.expire(now); }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// clock_nanosleep / nanosleep
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// clock_nanosleep (kernel-internal helper)
+// ───────────────────────────────────────────────────────────────────────────────
 
-pub const TIMER_ABSTIME: i32 = 1;
-
-/// Kernel implementation of `clock_nanosleep(2)` and `nanosleep(2)`.
+/// Kernel-internal helper: sleep until `deadline_ns` on CLOCK_MONOTONIC.
 ///
-/// Puts the calling task to sleep until `deadline_ns` (absolute) on the
-/// given clock.  Delegates to `proc::nanosleep::sleep_ns_internal` which owns
-/// the blocking protocol (deadline recording, EINTR detection, rem output).
+/// Used by drivers and kernel threads that already have an absolute
+/// monotonic deadline.  Userspace syscalls use
+/// `proc::nanosleep::sys_clock_nanosleep` instead.
 ///
 /// Returns `Ok(())` on normal completion, `Err(-EINTR)` if interrupted.
 pub fn clock_nanosleep(
-    clk_id: i32,
-    flags:  i32,
-    req:    Timespec,
+    _clk_id: i32,
+    _flags:  i32,
+    req:     Timespec,
 ) -> Result<(), isize> {
-    use crate::time::clock;
-    if !req.is_valid() { return Err(-22); } // EINVAL
-
-    let deadline_ns = if flags & TIMER_ABSTIME != 0 {
-        let now_real = clock::clock_gettime(clk_id).map(|t| t.to_ns()).unwrap_or(0);
-        let req_ns   = req.to_ns();
-        if req_ns <= now_real { return Ok(()); } // already in the past
-        read_monotonic_ns() + (req_ns - now_real)
-    } else {
-        let delta_ns = req.to_ns();
-        if delta_ns == 0 { return Ok(()); }
-        read_monotonic_ns() + delta_ns
-    };
-
-    let delta_ns = deadline_ns.saturating_sub(read_monotonic_ns());
-    if delta_ns > 0 {
-        crate::proc::nanosleep::sleep_ns_internal(delta_ns)
-            .map_err(|e| e)?;
-    }
+    if !req.is_valid() { return Err(-22); }
+    let delta_ns = req.to_ns();
+    if delta_ns == 0 { return Ok(()); }
+    // Delegate to the canonical blocking primitive.
+    let ret = crate::proc::nanosleep::sleep_ns_internal(delta_ns);
+    if ret < 0 { return Err(ret); }
     Ok(())
 }
 
-/// `nanosleep(2)` — CLOCK_MONOTONIC relative sleep.
+/// `nanosleep(2)` — CLOCK_MONOTONIC relative sleep (kernel helper).
 pub fn nanosleep(req: Timespec) -> Result<(), isize> {
     clock_nanosleep(crate::time::clock::CLOCK_MONOTONIC, 0, req)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
 // POSIX interval timers  (setitimer / getitimer)
-// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
 
 pub const ITIMER_REAL:    u32 = 0; // SIGALRM on expiry
 pub const ITIMER_VIRTUAL: u32 = 1; // SIGVTALRM (user-time only)
@@ -175,16 +171,16 @@ pub struct ItimerVal {
 
 /// Per-process interval timer state (three timers).
 pub struct ItimerState {
-    pub timers:   [ItimerVal; 3],
+    pub timers:    [ItimerVal; 3],
     /// Kernel timer IDs (for cancellation).
-    timer_ids: [u64; 3],
-    pub task_id:  u64,
+    timer_ids:     [u64; 3],
+    pub task_id:   u64,
 }
 
 impl ItimerState {
     pub fn new(task_id: u64) -> Self {
         ItimerState {
-            timers:   [ItimerVal::default(); 3],
+            timers:    [ItimerVal::default(); 3],
             timer_ids: [0; 3],
             task_id,
         }
