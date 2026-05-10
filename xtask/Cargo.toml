@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [[bin]]
@@ -8,3 +8,6 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+# No external deps — everything uses std::process::Command.
+# Keep it that way: xtask must build with a vanilla `cargo` even before
+# the toolchain file has been applied to the workspace.

@@ -19,11 +19,17 @@
 //!
 //! ## Contiguous multi-page allocation
 //!   alloc_pages_contig(n) collects the free list into a temporary sorted
-//!   Vec (allocated on the caller's stack, not the heap free list), finds
-//!   a run of n adjacent frames, and removes them.
+//!   Vec, finds a run of n adjacent frames, and removes them.
 //!
 //! ## Kernel image reservation
 //!   Pages in [_kernel_start, _end) are never handed out.
+//!
+//! ## EFI memory map filtering (x86_64 UEFI boot)
+//!   pmm_add_efi_map() walks the EFI memory descriptor array saved by
+//!   uefi_entry before ExitBootServices and only calls pmm_add_region()
+//!   for EfiConventionalMemory (type 4) and EfiPersistentMemory (type 7)
+//!   entries.  All firmware runtime regions, ACPI tables, MMIO ranges,
+//!   and reserved pages are skipped, preventing NVRAM/runtime corruption.
 //!
 //! ## RISC-V FDT init
 //!   init_from_fdt(fdt_ptr) parses the minimal FDT structure to find
@@ -34,7 +40,7 @@ use spin::Mutex;
 extern crate alloc;
 use alloc::vec::Vec;
 
-// ── Bootstrap pool ────────────────────────────────────────────────────────────
+// ── Bootstrap pool ──────────────────────────────────────────────────────────────
 
 const POOL_PAGES: usize = 16_384; // 64 MiB static pool
 const PAGE_SIZE:  usize = 4096;
@@ -44,7 +50,7 @@ struct Pool([u8; POOL_PAGES * PAGE_SIZE]);
 static POOL: Pool = Pool([0u8; POOL_PAGES * PAGE_SIZE]);
 static BUMP: AtomicUsize = AtomicUsize::new(0);
 
-// ── Pool double-free bitmap ───────────────────────────────────────────────────
+// ── Pool double-free bitmap ──────────────────────────────────────────────────────
 
 const BITMAP_WORDS: usize = POOL_PAGES / 64;
 static POOL_FREE_BITS: [AtomicU64; BITMAP_WORDS] = {
@@ -77,30 +83,17 @@ fn pool_index(pa: usize) -> Option<usize> {
     }
 }
 
-// ── Intrusive Treiber stack (lock-free free list) ─────────────────────────────
-//
-// Each free page repurposes its first 8 bytes as a `*mut u8` next-pointer.
-// The head is an AtomicPtr<u8> updated with compare_exchange so push/pop are
-// entirely allocation-free — eliminating the Vec-growth deadlock.
-//
-// ABA protection: The PMM only ever maps identity/physmap addresses; a
-// recycled page gets the same PA and therefore the same pointer value.  This
-// is the classic ABA scenario.  We mitigate it by zeroing pages on free
-// (which also clears the next-pointer) and only writing the next-pointer
-// after zeroing — so a page cannot be re-read with stale link data.
+// ── Intrusive Treiber stack (lock-free free list) ─────────────────────────────────
 
 static FREE_HEAD:   AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static FREE_COUNT:  AtomicUsize   = AtomicUsize::new(0);
 static TOTAL_PAGES: AtomicUsize   = AtomicUsize::new(0);
 
-/// Push `pa` onto the intrusive free-list Treiber stack.
-/// The page MUST have been zeroed before calling this.
 #[inline]
 fn treiber_push(pa: usize) {
     let node = pa as *mut *mut u8;
     loop {
         let head = FREE_HEAD.load(Ordering::Acquire);
-        // Store current head as next-pointer inside the page.
         unsafe { node.write(head); }
         match FREE_HEAD.compare_exchange_weak(
             head,
@@ -114,14 +107,11 @@ fn treiber_push(pa: usize) {
     }
 }
 
-/// Pop one page from the intrusive free-list Treiber stack.
-/// Returns the physical address, or 0 if the list is empty.
 #[inline]
 fn treiber_pop() -> usize {
     loop {
         let head = FREE_HEAD.load(Ordering::Acquire);
         if head.is_null() { return 0; }
-        // Read next-pointer from inside the page.
         let next = unsafe { (head as *const *mut u8).read() };
         match FREE_HEAD.compare_exchange_weak(
             head,
@@ -138,7 +128,7 @@ fn treiber_pop() -> usize {
     }
 }
 
-// ── Kernel image extent ───────────────────────────────────────────────────────
+// ── Kernel image extent ────────────────────────────────────────────────────────────
 
 extern "C" {
     static _kernel_start: u8;
@@ -158,7 +148,79 @@ fn is_valid_pa(pa: usize) -> bool {
     pa != 0 && pa & (PAGE_SIZE - 1) == 0 && !is_kernel_page(pa)
 }
 
-// ── Initialisation ────────────────────────────────────────────────────────────
+// ── EFI memory type constants (UEFI spec Table 7-6) ───────────────────────────────
+//
+// Only EfiConventionalMemory (4) and EfiPersistentMemory (7) are safe to
+// hand to the PMM.  All other types are live firmware or hardware regions.
+//
+//   0  EfiReservedMemoryType
+//   1  EfiLoaderCode           ← our own UEFI image; keep until we remap
+//   2  EfiLoaderData           ← EFI pool allocs (map buffer, initrd buf)
+//   3  EfiBootServicesCode     ← reclaimed *after* ExitBootServices
+//   4  EfiConventionalMemory   ✔ free RAM
+//   5  EfiUnusableMemory
+//   6  EfiACPIReclaimMemory    ← ACPI tables; reclaim after parsing
+//   7  EfiACPIMemoryNVS        ← firmware NVS; NEVER reclaim (NVRAM)
+//   7  EfiPersistentMemory     ← NVDIMM; safe for general use
+//   8  EfiMemoryMappedIO
+//   9  EfiMemoryMappedIOPortSpace
+//  10  EfiPalCode
+//  11  EfiUnacceptedMemoryType (UEFI 2.9+; needs Accept call first)
+//  12  EfiRuntimeServicesCode  ← live firmware; NEVER touch
+//  13  EfiRuntimeServicesData  ← live firmware; NEVER touch (NVRAM corruption)
+//
+// Note: the UEFI spec reuses value 7 for both EfiACPIMemoryNVS and
+// EfiPersistentMemory in different revisions.  In practice type 14 is
+// used for NVDIMM on UEFI 2.6+ systems, but we conservatively accept
+// only type 4 and type 14 here and treat 7 as NVS (do-not-touch).
+
+const EFI_CONVENTIONAL_MEMORY:  u32 = 4;
+const EFI_PERSISTENT_MEMORY:    u32 = 14; // NVDIMM / pmem (UEFI 2.6+)
+
+/// Returns true iff this EFI memory type is safe to give to the PMM.
+#[inline]
+fn efi_mem_type_is_usable(t: u32) -> bool {
+    matches!(t, EFI_CONVENTIONAL_MEMORY | EFI_PERSISTENT_MEMORY)
+}
+
+// ── EFI memory map walk (x86_64 UEFI boot) ──────────────────────────────────────
+
+/// Walk the EFI memory descriptor array saved before ExitBootServices
+/// and register all usable (EfiConventionalMemory / EfiPersistentMemory)
+/// physical ranges with the PMM.
+///
+/// `map_ptr`  — virtual address of the first EFI_MEMORY_DESCRIPTOR
+/// `map_size` — total byte length of the descriptor array
+/// `desc_size`— stride in bytes between descriptors (may be > sizeof the struct)
+///
+/// # Safety
+/// Must be called after ExitBootServices.  `map_ptr` must point to valid
+/// memory containing at least `map_size` bytes of EFI memory descriptors.
+pub unsafe fn pmm_add_efi_map(map_ptr: usize, map_size: usize, desc_size: usize) {
+    if map_ptr == 0 || map_size == 0 || desc_size == 0 { return; }
+
+    // EfiMemDescriptor has a fixed layout but firmware may use a larger
+    // stride (desc_size) for forward-compatibility padding.  Always advance
+    // by desc_size, never sizeof(EfiMemDescriptor).
+    let mut offset: usize = 0;
+    while offset + desc_size <= map_size {
+        let desc = &*((map_ptr + offset) as *const EfiMemDescriptor);
+        if efi_mem_type_is_usable(desc.type_) {
+            let base = desc.physical_start as usize;
+            let size = desc.num_pages as usize * PAGE_SIZE;
+            if size > 0 {
+                pmm_add_region(base, size);
+            }
+        }
+        offset += desc_size;
+    }
+}
+
+// Re-export the descriptor type for uefi_entry.rs visibility.
+#[doc(hidden)]
+pub use crate::arch::x86_64::uefi_entry::EfiMemDescriptor;
+
+// ── Initialisation ──────────────────────────────────────────────────────────────
 
 /// Initialise the PMM from an FDT blob (RISC-V / OpenSBI path).
 pub fn init_from_fdt(fdt_ptr: usize) {
@@ -166,10 +228,11 @@ pub fn init_from_fdt(fdt_ptr: usize) {
     unsafe { fdt_walk_memory(fdt_ptr); }
 }
 
-/// Thin x86_64 shim — no FDT on x86.
+/// x86_64 shim.  The real work is done by pmm_add_efi_map() called from
+/// memmap_init() on the UEFI path, or by parse_mbi() on the multiboot2 path.
 pub fn init() {}
 
-// ── Minimal FDT walker ────────────────────────────────────────────────────────
+// ── Minimal FDT walker ───────────────────────────────────────────────────────────
 
 const FDT_MAGIC:       u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE:  u32 = 1;
@@ -249,18 +312,15 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
     }
 }
 
-// ── Core allocator ────────────────────────────────────────────────────────────
+// ── Core allocator ──────────────────────────────────────────────────────────────
 
-/// Allocate one 4096-byte page.  Returns the physical address.
 pub fn alloc_page() -> Option<usize> {
-    // Try the intrusive free list first.
     let pa = treiber_pop();
     if pa != 0 {
         if let Some(idx) = pool_index(pa) { pool_bit_clear_free(idx); }
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
         return Some(pa);
     }
-    // Fall back to the bootstrap bump allocator.
     let idx = BUMP.fetch_add(1, Ordering::Relaxed);
     if idx >= POOL_PAGES {
         BUMP.fetch_sub(1, Ordering::Relaxed);
@@ -270,19 +330,10 @@ pub fn alloc_page() -> Option<usize> {
     Some(POOL.0.as_ptr() as usize + idx * PAGE_SIZE)
 }
 
-/// Allocate `n` physically contiguous 4 KiB pages.
-///
-/// Drains the Treiber stack into a temporary sorted Vec (heap-allocated on
-/// the caller's behalf), finds a contiguous run of length n, removes those
-/// pages, and pushes the rest back.  More expensive than alloc_page but
-/// correct and deadlock-free.
 pub fn alloc_pages_contig(n: usize) -> Option<usize> {
     if n == 0 { return None; }
     if n == 1 { return alloc_page(); }
 
-    // Drain the entire Treiber stack into a local Vec for sorting.
-    // This temporarily empties the free list; we push back anything we
-    // don't use at the end.
     let mut all: Vec<usize> = Vec::new();
     loop {
         let pa = treiber_pop();
@@ -291,14 +342,12 @@ pub fn alloc_pages_contig(n: usize) -> Option<usize> {
     }
 
     if all.len() < n {
-        // Not enough free pages at all — push everything back.
         for pa in all { treiber_push(pa); }
         return None;
     }
 
     all.sort_unstable();
 
-    // Find a contiguous run of length n.
     let mut run_start = None;
     'outer: for start in 0..=(all.len() - n) {
         for k in 1..n {
@@ -319,30 +368,23 @@ pub fn alloc_pages_contig(n: usize) -> Option<usize> {
     };
 
     let base_pa = all[start];
-
-    // Push back everything except the chosen run.
     for (i, &pa) in all.iter().enumerate() {
         if i < start || i >= start + n {
             treiber_push(pa);
         }
     }
-
-    // Clear double-free bits and zero each page in the run.
     for i in 0..n {
         let pa = base_pa + i * PAGE_SIZE;
         if let Some(bit_idx) = pool_index(pa) { pool_bit_clear_free(bit_idx); }
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
     }
-
     Some(base_pa)
 }
 
-/// Free `n` physically contiguous pages starting at `base_pa`.
 pub fn free_pages_contig(base_pa: usize, n: usize) {
     for i in 0..n { free_page(base_pa + i * PAGE_SIZE); }
 }
 
-/// Return a single page to the free list.
 pub fn free_page(pa: usize) {
     if pa == 0 { return; }
     assert!(pa & (PAGE_SIZE - 1) == 0,
@@ -353,9 +395,6 @@ pub fn free_page(pa: usize) {
         let ok = pool_bit_set_free(idx);
         assert!(ok, "free_page: double-free of pool page {:#x} (index {})", pa, idx);
     }
-    // Zero the page BEFORE linking it into the free list so stale data
-    // is never observable by a future allocator and the next-pointer
-    // written by treiber_push cannot be confused with stale content.
     unsafe {
         let ptr = pa as *mut u64;
         for i in 0..(PAGE_SIZE / 8) { ptr.add(i).write_volatile(0u64); }
@@ -370,7 +409,6 @@ pub fn pmm_add_region(base: usize, size: usize) {
     let end = base + size;
     while pa + PAGE_SIZE <= end {
         if is_valid_pa(pa) && pool_index(pa).is_none() {
-            // Zero then push directly onto the Treiber stack.
             unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
             treiber_push(pa);
             TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);

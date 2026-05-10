@@ -5,6 +5,7 @@
 //!   drm               — DRM/KMS stub backed by GOP or virtio-gpu
 //!   framebuffer       — Unified FB abstraction (virtio-gpu > GOP fallback)
 //!   virtio_gpu        — VirtIO GPU device (virtio-gpu-pci, device ID 0x1050)
+//!   vga               — VGA text mode (80×25, 16-colour) [x86_64 only]
 //!   ahci              — AHCI SATA controller
 //!   nvme              — NVMe host controller
 //!   pcie              — PCIe ECAM enumeration
@@ -46,6 +47,8 @@ pub mod pcie;
 pub mod plic;
 pub mod tty;
 pub mod usb;
+#[cfg(target_arch = "x86_64")]
+pub mod vga;
 pub mod virtio_blk;
 pub mod virtio_gpu;
 pub mod virtio_input;
