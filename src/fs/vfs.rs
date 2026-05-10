@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 // Re-export the seek constants used by callers.
-pub use crate::fs::fcntl::{SEEK_SET, SEEK_CUR};
+pub use crate::fs::fcntl::{SEEK_SET, SEEK_CUR, SEEK_END};
 
 // ── fd-table dispatch stubs ───────────────────────────────────────────────
 // These are thin forwarders into fcntl's fd table. They exist so callers
@@ -95,7 +95,7 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
 }
 
 // ── pread ────────────────────────────────────────────────────────────────
-// Kernel-internal positional read. Saves and restores the file offset so
+// Kernel-internal positional read.  Saves and restores the file offset so
 // pread has no side-effect on the fd's seek position (POSIX pread64).
 //
 // `buf` must be a kernel virtual address (e.g. a freshly allocated page
@@ -104,6 +104,14 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
 // Returns:
 //   >= 0   number of bytes read
 //   <  0   negative errno (-9 EBADF, -5 EIO, etc.)
+//
+// # Reentrancy caveat
+// The seek-save / seek-to-offset / read / seek-restore sequence is not
+// atomic.  Concurrent calls on the *same* fd will race.  All current
+// callers (ELF loader, page-fault handler) either hold the scheduler
+// lock or operate on fds not shared between concurrently runnable threads,
+// so this is safe in practice.  A proper per-fd position lock is the
+// correct long-term fix.
 //
 // Called from:
 //   - mm/page_fault.rs: FileBacked VMA demand fault
@@ -129,6 +137,50 @@ pub fn pread(fd: usize, buf: *mut u8, len: usize, offset: i64) -> isize {
     let n = read(fd, kbuf);
 
     // Restore position regardless of read result.
+    seek(fd, saved, SEEK_SET);
+
+    n
+}
+
+// ── pwrite ───────────────────────────────────────────────────────────────
+// Kernel-internal positional write.  Saves and restores the file offset so
+// pwrite has no side-effect on the fd's seek position (POSIX pwrite64).
+//
+// `buf` must be a kernel virtual address.  Unlike sys_pwrite64, no
+// user-space copy is performed by this function.
+//
+// Returns:
+//   >= 0   number of bytes written
+//   <  0   negative errno (-9 EBADF, -28 ENOSPC, etc.)
+//
+// # Reentrancy caveat
+// Same as pread: the seek-save/restore sequence is not atomic.  Concurrent
+// calls on the same fd race.  sys_pwrite64 serialises through the scheduler
+// at syscall entry, so it is safe for the current single-CPU implementation.
+//
+// Called from:
+//   - fs/io_syscalls.rs: sys_pwrite64
+pub fn pwrite(fd: usize, buf: *const u8, len: usize, offset: i64) -> isize {
+    if len == 0 { return 0; }
+
+    // Save current position.
+    let saved = seek(fd, 0, SEEK_CUR);
+    if saved < 0 { return saved; }   // fd doesn't support seek (pipe, socket)
+
+    // Seek to the requested offset.
+    let seeked = seek(fd, offset, SEEK_SET);
+    if seeked < 0 {
+        seek(fd, saved, SEEK_SET);
+        return seeked;
+    }
+
+    // Write directly from the caller-supplied kernel buffer.
+    // SAFETY: caller guarantees `buf` points to `len` bytes of valid
+    // kernel-mapped readable memory.
+    let kbuf = unsafe { core::slice::from_raw_parts(buf, len) };
+    let n = write(fd, kbuf);
+
+    // Restore position regardless of write result.
     seek(fd, saved, SEEK_SET);
 
     n
