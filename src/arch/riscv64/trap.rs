@@ -1,62 +1,37 @@
 //! RISC-V supervisor-mode trap handler.
 //!
 //! ## Entry stub
-//!   `riscv_trap_entry` is a naked function placed in `.text` that:
-//!     1. Saves all 32 GPRs + sepc + sstatus onto the kernel stack.
-//!     2. Passes a pointer to that frame as the first argument.
-//!     3. Calls `riscv_trap_handler`.
-//!     4. Restores registers and executes `sret`.
+//!   `riscv_trap_entry` saves all 32 GPRs + sepc + sstatus onto the kernel
+//!   stack (272 bytes = 34 × 8), passes a `*mut TrapFrame` as `a0`, and calls
+//!   `riscv_trap_handler`. On return it restores everything and `sret`s.
 //!
-//! ## trap_return (new-task first entry)
+//! ## trap_return (new-task / exec first entry)
+//!   A `.global trap_return` label is embedded in `riscv_trap_entry` just
+//!   before the restore sequence.  `task_entry_trampoline` (context.rs)
+//!   jumps here so new tasks enter userspace through the same path.
 //!
-//!   `trap_return` is the symmetric counterpart to the restore tail of
-//!   `riscv_trap_entry`.  It is jumped to (not called) by
-//!   `task_entry_trampoline` when a brand-new task is being entered for
-//!   the first time.  At that point:
-//!     - `sp` already points to a fully initialised `TrapFrame` that
-//!       `clone.rs` built with `push_trap_frame_riscv`.
-//!     - No caller context needs to be saved — we are entering user mode
-//!       for the first time from this task's kernel stack.
-//!   The function restores `sepc` and `sstatus` from the frame, reloads
-//!   all GPRs, and executes `sret`.
-//!
-//! ## Trap sources
-//!   Exceptions (scause MSB = 0):
-//!     0  Instruction address misaligned
-//!     2  Illegal instruction
-//!     5  Load access fault
-//!     7  Store/AMO access fault
-//!     8  Environment call from U-mode (ecall → syscall)
-//!     12 Instruction page fault
-//!     13 Load page fault
-//!     15 Store page fault
-//!
-//!   Interrupts (scause MSB = 1):
-//!     1  Supervisor software interrupt → IPI dispatch
-//!     5  Supervisor timer interrupt    → tick + schedule + re-arm
-//!     9  Supervisor external interrupt → PLIC claim/complete loop
-//!
-//! ## IPI flow (scause code 1)
-//!   1. Clear SIP.SSIP to acknowledge (write-0 via csrc).
-//!   2. Read logical cpu_id from PercpuBlock (tp-relative).
-//!   3. Call `ipi::dispatch(cpu_id)` which reads & clears `ipi_pending`
-//!      atomically and dispatches each kind.
+//! ## Signal delivery hook
+//!   After every ecall (scause = 8) the handler calls
+//!   `signal::check_and_deliver(frame)` so that pending signals are delivered
+//!   before the task returns to userspace.  The same call is made after
+//!   interrupt handlers that call `schedule()` (timer IRQ, IPI reschedule)
+//!   because those may wake a task that has a pending signal.
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
 use crate::mm::mmap::{VmaKind, PROT_READ, PROT_WRITE, PROT_EXEC};
 
-/// Trap frame saved by `riscv_trap_entry`.
+/// Trap frame saved by `riscv_trap_entry` (34 × 8 = 272 bytes).
 ///
-/// Layout (34 × 8 = 272 bytes):
-///   index  0: ra      index  1: sp     index  2: gp     index  3: tp
-///   index  4: t0      index  5: t1     index  6: t2
-///   index  7: s0      index  8: s1
-///   index  9: a0 … index 16: a7
-///   index 17: s2 … index 26: s11
-///   index 27: t3 … index 30: t6
-///   index 31: sepc    index 32: sstatus
-///   index 33: (pad / reserved)
+/// Field order matches the `sd` / `ld` offsets in the naked entry stub.
+/// index  0: ra      index  1: sp     index  2: gp     index  3: tp
+/// index  4: t0      index  5: t1     index  6: t2
+/// index  7: s0      index  8: s1
+/// index  9: a0 … index 16: a7
+/// index 17: s2 … index 26: s11
+/// index 27: t3 … index 30: t6
+/// index 31: sepc    index 32: sstatus
+/// index 33: (pad)
 #[repr(C)]
 pub struct TrapFrame {
     pub ra: usize,  pub sp:  usize, pub gp:  usize, pub tp:  usize,
@@ -72,13 +47,11 @@ pub struct TrapFrame {
     pub sstatus: usize,
 }
 
-pub const TRAP_FRAME_SIZE: usize = 34 * 8;
+pub const TRAP_FRAME_SIZE: usize = 34 * 8;   // 272
 
-// sstatus bits
-/// SPP = 0 → return to U-mode on sret.
-pub const SSTATUS_SPP:  usize = 1 << 8;
-/// SPIE = 1 → interrupts enabled in user mode after sret.
-pub const SSTATUS_SPIE: usize = 1 << 5;
+// sstatus bits used by clone/exec/signal frame setup.
+pub const SSTATUS_SPP:  usize = 1 << 8;   // 1 = S-mode, 0 = U-mode
+pub const SSTATUS_SPIE: usize = 1 << 5;   // interrupts enabled after sret
 
 #[naked]
 #[no_mangle]
@@ -115,7 +88,7 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t4, 28*8(sp)",
         "sd   t5, 29*8(sp)",
         "sd   t6, 30*8(sp)",
-        // Save user sp: kstack_sp + TRAP_FRAME_SIZE = pre-trap user sp.
+        // Save user sp: kstack_sp + TRAP_FRAME_SIZE was the pre-trap sp.
         "addi t0, sp, {frame_size}",
         "sd   t0, 1*8(sp)",
         "csrr t0, sepc",
@@ -124,9 +97,9 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t0, 32*8(sp)",
         "mv   a0, sp",
         "call {handler}",
-        // ── trap_return ── (also jumped to directly by task_entry_trampoline)
-        // Exposed as a global label so context::task_entry_trampoline can
-        // jump here without duplicating the restore sequence.
+        // ── trap_return ────────────────────────────────────────────────────
+        // Also jumped to directly by task_entry_trampoline (context.rs) and
+        // by do_execve_riscv after rebuilding the TrapFrame in-place.
         ".global trap_return",
         "trap_return:",
         "ld   t0, 31*8(sp)",
@@ -180,12 +153,14 @@ pub extern "C" fn riscv_trap_handler(frame: &mut TrapFrame) {
     else       { handle_exception(frame, code); }
 }
 
-fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
+fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
     match code {
         1 => {
             unsafe { asm!("csrci sip, 2", options(nostack, nomem)); }
             let cpu_id = crate::smp::percpu::current_cpu_id();
             crate::smp::ipi::dispatch(cpu_id);
+            // Signal check after reschedule IPI so woken tasks see signals.
+            crate::proc::signal::check_and_deliver(frame);
         }
         5 => {
             let sie = csrr!("sie");
@@ -198,6 +173,8 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
             );
             let sie2 = csrr!("sie");
             csrw!("sie", sie2 | (1usize << 5));
+            // Deliver any signals queued for this task.
+            crate::proc::signal::check_and_deliver(frame);
         }
         9 => { crate::drivers::plic::handle_irq(); }
         _ => {}
@@ -207,12 +184,14 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
 fn handle_exception(frame: &mut TrapFrame, code: usize) {
     match code {
         8 => {
-            let nr = frame.a7;
+            let nr  = frame.a7;
             let ret = crate::syscall::dispatch(
                 nr, frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5,
             );
             frame.a0   = ret as usize;
             frame.sepc = frame.sepc.wrapping_add(4);
+            // Deliver pending signals before returning to userspace.
+            crate::proc::signal::check_and_deliver(frame);
         }
         12 | 13 | 15 => {
             let stval       = csrr!("stval");
@@ -220,14 +199,22 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             let pid         = crate::proc::scheduler::current_pid();
             if let Some(vma) = crate::mm::mmap::find_vma(pid, stval) {
                 if code == 15 && vma.prot & PROT_WRITE == 0 {
-                    crate::proc::signal::send_sigsegv(pid, stval); return;
+                    crate::proc::signal::send_sigsegv(pid as usize, stval);
+                    crate::proc::signal::check_and_deliver(frame);
+                    return;
                 }
                 if code == 12 && vma.prot & PROT_EXEC == 0 {
-                    crate::proc::signal::send_sigsegv(pid, stval); return;
+                    crate::proc::signal::send_sigsegv(pid as usize, stval);
+                    crate::proc::signal::check_and_deliver(frame);
+                    return;
                 }
                 let pa = match crate::mm::pmm::alloc_page() {
                     Some(pa) => pa,
-                    None => { crate::proc::signal::send_sigsegv(pid, stval); return; }
+                    None => {
+                        crate::proc::signal::send_sigsegv(pid as usize, stval);
+                        crate::proc::signal::check_and_deliver(frame);
+                        return;
+                    }
                 };
                 unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
                 let mut pte_bits: u64 = (1 << 0) | (1 << 4);
@@ -239,15 +226,18 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
                 unsafe { asm!("sfence.vma {va}, zero", va = in(reg) faulting_va); }
                 return;
             }
-            crate::proc::signal::send_sigsegv(pid, stval);
+            crate::proc::signal::send_sigsegv(pid as usize, stval);
+            crate::proc::signal::check_and_deliver(frame);
         }
         2 => {
             let pid = crate::proc::scheduler::current_pid();
-            crate::proc::signal::send_signal(pid, 4);
+            crate::proc::signal::send_signal(pid as usize, 4);
+            crate::proc::signal::check_and_deliver(frame);
         }
         _ => {
             let pid = crate::proc::scheduler::current_pid();
-            crate::proc::signal::send_signal(pid, 11);
+            crate::proc::signal::send_signal(pid as usize, 11);
+            crate::proc::signal::check_and_deliver(frame);
         }
     }
 }
