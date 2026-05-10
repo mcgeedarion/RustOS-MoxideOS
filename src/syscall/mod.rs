@@ -15,6 +15,7 @@
 //!   NR 283  timerfd_create                   => fs::timerfd::sys_timerfd_create
 //!   NR 286  timerfd_settime                  => fs::timerfd::sys_timerfd_settime
 //!   NR 287  timerfd_gettime                  => fs::timerfd::sys_timerfd_gettime
+//!   NR 93   lchown                           => p0_gaps::sys_lchown_impl
 //!
 //! ## NR 15  rt_sigreturn
 //!   Intercepted BEFORE dispatch() at the arch entry point:
@@ -683,6 +684,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         90  => sys_chmod_impl(a, b as u32),
         91  => sys_fchmod_impl(a, b as u32),
         92  => sys_chown_impl(a, b as u32, c as u32),
+        93  => sys_lchown_impl(a, b as u32, c as u32),
         94  => sys_fchown_impl(a, b as u32, c as u32),
         101 => sys_ptrace_impl(a as i32, b as i32, c, d),
         103 => sys_syslog_impl(a as i32, b, c as i32),
