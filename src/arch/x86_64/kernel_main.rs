@@ -3,7 +3,8 @@
 //!
 //! ## Boot sequence
 //!   0a. serial::early_init()         — 16550 TX-only, no alloc, no heap
-//!   0b. heap_init()                  — global allocator (panics now visible)
+//!   0b. vga::init()                  — VGA text mode (x86 only, no-op if GOP)
+//!   0c. heap_init()                  — global allocator (panics now visible)
 //!   1.  gdt_init()                   — GDT + TSS + GSBASE
 //!   2.  idt_init()                   — IDT exception/IRQ vectors
 //!   3.  syscall_setup()              — SYSCALL/SYSRET MSRs
@@ -20,13 +21,16 @@
 //!  14.  spawn_init()                 — PID 1
 //!  15.  idle loop
 //!
-//! ## Why serial::early_init() comes before heap_init()
-//!   heap_init() can panic if the kernel image layout assumptions are wrong
-//!   (e.g. _end symbol not where expected, or BSS not zeroed by firmware).
+//! ## Why serial::early_init() comes before everything
+//!   heap_init() can panic if the kernel image layout assumptions are wrong.
 //!   Without serial::early_init() that panic is completely invisible on real
-//!   hardware — the machine silently reboots or hangs.  early_init() programs
-//!   the 16550 divisor and enables the FIFO using only I/O port instructions
-//!   and no heap allocation, so it is safe to call before heap_init().
+//!   hardware.  early_init() uses only I/O port instructions and no heap.
+//!
+//! ## VGA text mode
+//!   vga::init() probes the BIOS Data Area (0x0449) to see if the firmware
+//!   left the display in a text mode.  If UEFI/GOP took over it returns false
+//!   and the GOP framebuffer driver stays in control.  Either way the call
+//!   is safe unconditionally.
 
 use core::arch::asm;
 use crate::arch::x86_64::{
@@ -58,7 +62,14 @@ pub extern "C" fn kernel_main() -> ! {
     //     Uses only IN/OUT instructions — no heap, no globals, no allocation.
     serial::early_init();
 
-    // 0b. Heap — any panic from here is visible on the UART.
+    // 0b. VGA text mode — before heap_init so panics appear on screen too.
+    //     Returns false (silent no-op) when GOP/UEFI owns the display.
+    #[cfg(target_arch = "x86_64")]
+    let vga_active = crate::drivers::vga::init();
+    #[cfg(not(target_arch = "x86_64"))]
+    let vga_active = false;
+
+    // 0c. Heap — any panic from here is visible on the UART (and VGA if active).
     crate::allocator::heap_init();
 
     // 1–3. CPU structures.
@@ -69,7 +80,14 @@ pub extern "C" fn kernel_main() -> ! {
     // 4. Full serial reinit (IRQ-driven, FIFO thresholds, line discipline).
     serial::init();
 
-    // ── CI sentinels ──────────────────────────────────────────────────────────
+    if vga_active {
+        serial_println!("vga: text mode active (80x25)");
+        vga_println!("RustOS — VGA text mode");
+    } else {
+        serial_println!("vga: GOP/framebuffer mode (VGA text mode inactive)");
+    }
+
+    // ── CI sentinels ─────────────────────────────────────────────────────────────
     serial_println!("rustos: kernel_main reached");
     serial_println!("TEST PASS: uart_smoke");
     {
@@ -81,7 +99,7 @@ pub extern "C" fn kernel_main() -> ! {
     }
     serial_println!("TEST PASS: alloc_smoke");
     serial_println!("TEST PASS: trap_smoke");
-    // ─────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────
 
     serial_println!("rustos: booting");
 

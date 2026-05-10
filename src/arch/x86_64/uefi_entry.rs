@@ -11,6 +11,8 @@
 //!        a. EFI_INITRD_MEDIA_GUID LoadFile2 protocol  (systemd-boot / GRUB2 / real HW)
 //!        b. OVMF vendor config-table fallback          (QEMU -initrd flag)
 //!   5. Obtain the EFI memory map dynamically and call ExitBootServices.
+//!      ExitBootServices is retried once on EFI_INVALID_PARAMETER per
+//!      UEFI spec §7.4.6 (required for AMI/Insyde firmware compatibility).
 //!   6. Switch to the kernel boot stack and tail-call kernel_main().
 //!
 //! ## Memory layout after ExitBootServices
@@ -19,16 +21,28 @@
 //!   - The static PMM pool inside the kernel image is immediately usable.
 //!   - The GOP framebuffer physical address is in drivers::gop::GOP_INFO
 //!     (zeroed when GOP was unavailable — serial-only mode).
+//!
+//! ## ExitBootServices retry rationale
+//!   Some firmware implementations (especially AMI BIOS on ASUS/Gigabyte/MSI
+//!   boards and Insyde H2O on many Lenovo/HP/Dell laptops) modify the memory
+//!   map between our GetMemoryMap call and ExitBootServices, invalidating the
+//!   map key.  The UEFI spec (Table 7-1, EFI_BOOT_SERVICES.ExitBootServices)
+//!   explicitly permits this and requires callers to handle it by calling
+//!   GetMemoryMap again and retrying.  Failing to do so means ExitBootServices
+//!   returns EFI_INVALID_PARAMETER, and if we ignore that (as the old code
+//!   did with `let _ = exit_fn(...)`) we proceed with boot services still
+//!   active, which causes unpredictable memory corruption.
 
 use core::arch::asm;
 
-// ─── EFI types (bare-minimum subset) ─────────────────────────────────────────
+// ─── EFI types (bare-minimum subset) ─────────────────────────────────────────────
 
 type EfiStatus = usize;
 type EfiHandle = *mut core::ffi::c_void;
 
-const EFI_SUCCESS:     EfiStatus = 0;
-const EFI_BUFFER_TOO_SMALL: EfiStatus = 0x8000_0000_0000_0005;
+const EFI_SUCCESS:           EfiStatus = 0;
+const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
+const EFI_BUFFER_TOO_SMALL:  EfiStatus = 0x8000_0000_0000_0005;
 
 #[repr(C)]
 struct EfiTableHeader {
@@ -96,13 +110,13 @@ struct EfiBootServices {
 const EFI_LOADER_DATA: u32 = 2;
 
 #[repr(C)]
-struct EfiMemDescriptor {
-    type_:          u32,
-    _pad:           u32,
-    physical_start: u64,
-    virtual_start:  u64,
-    num_pages:      u64,
-    attribute:      u64,
+pub struct EfiMemDescriptor {
+    pub type_:          u32,
+    pub _pad:           u32,
+    pub physical_start: u64,
+    pub virtual_start:  u64,
+    pub num_pages:      u64,
+    pub attribute:      u64,
 }
 
 #[repr(C)]
@@ -111,16 +125,7 @@ struct EfiConfigTable {
     table: *mut core::ffi::c_void,
 }
 
-// ─── LoadFile2 protocol for initramfs ─────────────────────────────────────────
-//
-// EFI_LOAD_FILE2_PROTOCOL.LoadFile signature:
-//   EFI_STATUS LoadFile(
-//       EFI_LOAD_FILE2_PROTOCOL  *This,
-//       EFI_DEVICE_PATH_PROTOCOL *FilePath,   // ignored for initrd
-//       BOOLEAN                   BootPolicy, // must be FALSE
-//       UINTN                    *BufferSize,
-//       VOID                     *Buffer      // NULL to query size
-//   );
+// ─── LoadFile2 protocol for initramfs ───────────────────────────────────────────
 
 #[repr(C)]
 struct EfiLoadFile2Protocol {
@@ -133,7 +138,7 @@ struct EfiLoadFile2Protocol {
     ) -> EfiStatus,
 }
 
-// ─── Fixed offsets into EFI_BOOT_SERVICES ─────────────────────────────────────
+// ─── Fixed offsets into EFI_BOOT_SERVICES ───────────────────────────────────────
 
 /// `EFI_BOOT_SERVICES.LocateHandleBuffer` at offset 0x0B0.
 const LOCATE_HANDLE_BUFFER_OFFSET: usize = 0x0B0;
@@ -160,7 +165,7 @@ type HandleProtocolFn = unsafe extern "efiapi" fn(
 const EXIT_BOOT_SERVICES_OFFSET: usize = 0x190;
 type ExitBootServicesFn = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 
-// ─── GUIDs ────────────────────────────────────────────────────────────────────
+// ─── GUIDs ─────────────────────────────────────────────────────────────────
 
 // ACPI 2.0: {8868e871-e4f1-11d3-bc22-0080c73c8881}
 const ACPI2_GUID: [u64; 2] = [
@@ -169,19 +174,23 @@ const ACPI2_GUID: [u64; 2] = [
 ];
 
 // EFI_INITRD_MEDIA_GUID: {5568e427-68fc-4f3d-ac74-ca555231cc68}
-// Used both as the LoadFile2 protocol GUID (real HW / systemd-boot / GRUB2)
-// and as the OVMF vendor config-table GUID (QEMU -initrd fallback).
 const INITRD_MEDIA_GUID: [u64; 2] = [
     0x4f3d_fc68_27e4_6855,
     0x68cc_3152_55ca_74ac,
 ];
 
-// ─── Globals set before kernel_main runs ──────────────────────────────────────
+// ─── Globals set before kernel_main runs ───────────────────────────────────────
 
 /// Physical address of the RSDP (ACPI 2.0). 0 = not found.
 pub static mut RSDP_PHYS: u64 = 0;
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
+/// Saved EFI memory map — used by pmm_add_efi_map() in memmap_init().
+/// Set before ExitBootServices; read-only thereafter.
+pub static mut EFI_MAP_PTR:   usize = 0;
+pub static mut EFI_MAP_SIZE:  usize = 0;
+pub static mut EFI_DESC_SIZE: usize = 0;
+
+// ─── Entry point ────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub unsafe extern "efiapi" fn uefi_start(
@@ -196,7 +205,6 @@ pub unsafe extern "efiapi" fn uefi_start(
     efi_print(st.con_out, "RustOS (x86_64) booting via UEFI...\r\n");
 
     // 2. Capture GOP framebuffer — graceful fallback if firmware has no GOP.
-    //    (headless servers, serial-only setups)
     let gop_ok = crate::drivers::gop::capture_from_boot_services(
         st.boot_services as *mut core::ffi::c_void,
     );
@@ -204,7 +212,7 @@ pub unsafe extern "efiapi" fn uefi_start(
         efi_print(st.con_out, "rustos: GOP not available — serial-only mode\r\n");
     }
 
-    // 3 & 4. Walk EFI configuration table for ACPI RSDP and OVMF initrd fallback.
+    // 3 & 4. Walk EFI configuration table for ACPI RSDP and OVMF initrd.
     let cfg = core::slice::from_raw_parts(
         st.configuration_table,
         st.num_table_entries,
@@ -214,7 +222,6 @@ pub unsafe extern "efiapi" fn uefi_start(
         if entry.guid == ACPI2_GUID {
             RSDP_PHYS = entry.table as u64;
         }
-        // OVMF/QEMU vendor config-table initrd: [phys_start: u64, size: u64]
         if entry.guid == INITRD_MEDIA_GUID {
             let data = entry.table as *const u64;
             let phys_start = *data        as usize;
@@ -227,15 +234,11 @@ pub unsafe extern "efiapi" fn uefi_start(
     }
 
     // 4a. LoadFile2 protocol initramfs (real bootloaders: systemd-boot, GRUB2).
-    //     Only attempted when the OVMF vendor-table path didn't fire.
     if !ovmf_initrd_found {
         load_initrd_via_loadfile2(st.boot_services as *mut core::ffi::c_void, bs_base);
     }
 
     // 5. Get EFI memory map with a dynamically sized buffer.
-    //    First call with map_size=0 returns EFI_BUFFER_TOO_SMALL and tells us
-    //    the exact number of bytes required.  We add 2 KiB headroom because
-    //    AllocatePool itself can add descriptors between the two calls.
     let mut map_size:  usize = 0;
     let mut map_key:   usize = 0;
     let mut desc_size: usize = 0;
@@ -249,8 +252,7 @@ pub unsafe extern "efiapi" fn uefi_start(
         &mut desc_size,
         &mut desc_ver,
     );
-    // map_size now holds the required byte count; add 2 KiB headroom.
-    map_size += 2048;
+    map_size += 2048; // headroom for AllocatePool descriptor
 
     // Allocate buffer from EFI pool.
     let mut map_buf: *mut u8 = core::ptr::null_mut();
@@ -260,7 +262,7 @@ pub unsafe extern "efiapi" fn uefi_start(
         loop { asm!("hlt", options(nostack, nomem)); }
     }
 
-    // Second call: populate the map.
+    // Populate the map.
     let status = (bs.get_memory_map)(
         &mut map_size,
         map_buf as *mut EfiMemDescriptor,
@@ -273,11 +275,59 @@ pub unsafe extern "efiapi" fn uefi_start(
         loop { asm!("hlt", options(nostack, nomem)); }
     }
 
-    // 6. ExitBootServices (map_buf is no longer usable after this returns).
-    let exit_fn = *((bs_base + EXIT_BOOT_SERVICES_OFFSET) as *const ExitBootServicesFn);
-    let _ = exit_fn(image_handle, map_key);
+    // Save map metadata for pmm_add_efi_map() (called from memmap_init()).
+    EFI_MAP_PTR   = map_buf as usize;
+    EFI_MAP_SIZE  = map_size;
+    EFI_DESC_SIZE = desc_size;
 
-    // 7. Switch to kernel boot stack and call kernel_main.
+    // 5b. ExitBootServices — with mandatory retry on EFI_INVALID_PARAMETER.
+    //
+    // UEFI spec §7.4.6: firmware is permitted to add/remove descriptors
+    // between GetMemoryMap and ExitBootServices, invalidating map_key.
+    // When that happens ExitBootServices returns EFI_INVALID_PARAMETER.
+    // We must call GetMemoryMap again to get a fresh key and retry once.
+    // If it fails a second time the firmware is broken; halt rather than
+    // continuing with boot services alive (would silently corrupt memory).
+    let exit_fn = *((bs_base + EXIT_BOOT_SERVICES_OFFSET) as *const ExitBootServicesFn);
+
+    let mut exit_status = exit_fn(image_handle, map_key);
+
+    if exit_status == EFI_INVALID_PARAMETER {
+        // Re-probe the map key.  Use the same buffer — size should be
+        // sufficient (we added 2 KiB headroom above).
+        let mut retry_map_size  = map_size;
+        let mut retry_map_key:  usize = 0;
+        let mut retry_desc_size: usize = desc_size;
+        let mut retry_desc_ver:  u32   = desc_ver;
+
+        let remap_status = (bs.get_memory_map)(
+            &mut retry_map_size,
+            map_buf as *mut EfiMemDescriptor,
+            &mut retry_map_key,
+            &mut retry_desc_size,
+            &mut retry_desc_ver,
+        );
+
+        if remap_status == EFI_SUCCESS {
+            // Update saved metadata with potentially-updated descriptor.
+            EFI_MAP_SIZE  = retry_map_size;
+            EFI_DESC_SIZE = retry_desc_size;
+            exit_status   = exit_fn(image_handle, retry_map_key);
+        }
+        // If remap_status != SUCCESS the firmware is badly broken;
+        // fall through to the halt below.
+    }
+
+    if exit_status != EFI_SUCCESS {
+        // Cannot call efi_print here — boot services may be partially torn
+        // down.  Halt; the serial port will show nothing, but there is no
+        // safe path forward.
+        loop { asm!("hlt", options(nostack, nomem)); }
+    }
+
+    // 6. Switch to kernel boot stack and call kernel_main.
+    // (map_buf is no longer usable via EFI pool APIs after this point,
+    //  but we saved the raw pointer in EFI_MAP_PTR before ExitBootServices.)
     extern "C" { fn kernel_main() -> !; }
     asm!(
         "lea rsp, [rip + __boot_stack_top]",
@@ -290,7 +340,7 @@ pub unsafe extern "efiapi" fn uefi_start(
     );
 }
 
-// ─── LoadFile2 initramfs (real hardware / systemd-boot / GRUB2) ───────────────
+// ─── LoadFile2 initramfs (real hardware / systemd-boot / GRUB2) ─────────────────
 
 unsafe fn load_initrd_via_loadfile2(
     boot_services: *mut core::ffi::c_void,
@@ -298,13 +348,11 @@ unsafe fn load_initrd_via_loadfile2(
 ) {
     let bs = &*(boot_services as *mut EfiBootServices);
 
-    // Resolve LocateHandleBuffer and HandleProtocol from their fixed offsets.
     let locate_handle_buffer: LocateHandleBufferFn =
         *((bs_base + LOCATE_HANDLE_BUFFER_OFFSET) as *const LocateHandleBufferFn);
     let handle_protocol: HandleProtocolFn =
         *((bs_base + HANDLE_PROTOCOL_OFFSET) as *const HandleProtocolFn);
 
-    // Find handles that support the EFI_INITRD_MEDIA_GUID LoadFile2 protocol.
     let mut num_handles: usize = 0;
     let mut handle_buf: *mut EfiHandle = core::ptr::null_mut();
     let status = locate_handle_buffer(
@@ -314,44 +362,28 @@ unsafe fn load_initrd_via_loadfile2(
         &mut num_handles,
         &mut handle_buf,
     );
-    if status != EFI_SUCCESS || num_handles == 0 {
-        // No LoadFile2 handle for initrd — not an error, just no initrd available.
-        return;
-    }
+    if status != EFI_SUCCESS || num_handles == 0 { return; }
 
-    // Use the first handle.
     let handle = *handle_buf;
-
-    // Get the LoadFile2 protocol interface.
     let mut lf2_iface: *mut core::ffi::c_void = core::ptr::null_mut();
     let status = handle_protocol(handle, &INITRD_MEDIA_GUID, &mut lf2_iface);
-    if status != EFI_SUCCESS || lf2_iface.is_null() {
-        return;
-    }
+    if status != EFI_SUCCESS || lf2_iface.is_null() { return; }
     let lf2 = &*(lf2_iface as *mut EfiLoadFile2Protocol);
 
-    // First LoadFile call with buffer=NULL to query the initrd size.
     let mut initrd_size: usize = 0;
     let status = (lf2.load_file)(
         lf2_iface as *mut EfiLoadFile2Protocol,
         core::ptr::null_mut(),
-        0, // BootPolicy = FALSE
+        0,
         &mut initrd_size,
         core::ptr::null_mut(),
     );
-    // EFI_BUFFER_TOO_SMALL is the expected success response when buffer=NULL.
-    if status != EFI_BUFFER_TOO_SMALL || initrd_size == 0 {
-        return;
-    }
+    if status != EFI_BUFFER_TOO_SMALL || initrd_size == 0 { return; }
 
-    // Allocate EfiLoaderData pages for the initrd.
     let mut initrd_buf: *mut u8 = core::ptr::null_mut();
     let alloc_status = (bs.allocate_pool)(EFI_LOADER_DATA, initrd_size, &mut initrd_buf);
-    if alloc_status != EFI_SUCCESS || initrd_buf.is_null() {
-        return;
-    }
+    if alloc_status != EFI_SUCCESS || initrd_buf.is_null() { return; }
 
-    // Second LoadFile call: actually read the initrd.
     let status = (lf2.load_file)(
         lf2_iface as *mut EfiLoadFile2Protocol,
         core::ptr::null_mut(),
@@ -362,10 +394,9 @@ unsafe fn load_initrd_via_loadfile2(
     if status == EFI_SUCCESS {
         crate::initramfs::set_initramfs_range(initrd_buf as usize, initrd_size);
     }
-    // On failure we simply leave initramfs range at (0, 0); kernel will warn.
 }
 
-// ─── EFI text output helper ───────────────────────────────────────────────────
+// ─── EFI text output helper ──────────────────────────────────────────────────────
 
 unsafe fn efi_print(con_out: *mut EfiSimpleTextOutput, s: &str) {
     let mut buf = [0u16; 128];
