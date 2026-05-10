@@ -30,39 +30,47 @@ cc = "1"
 #           mm (VMM/PMM/COW/mmap), proc (futex/signals/threads/clone),
 #           net (TCP/UDP/Unix sockets), SMP (AP bringup/IPI/percpu),
 #           security (ASLR/canary/PTI/SMEP/SMAP/seccomp/capset),
-#           tty, console, UEFI boot path, drivers, syscall table.
+#           tty, console, UEFI boot path, drivers, syscall table,
+#           SysV IPC + POSIX mq.
 #
-# cargo build                           → default (base kernel)
-# cargo build --features sysv_ipc       → + SysV IPC + POSIX mq
+# cargo build                           → default (base kernel + SysV IPC)
 # cargo build --features namespaces     → + PID/Mount/Net/UTS/User ns
 # cargo build --features cgroups        → + cgroups v1 controllers
 # cargo build --features gdbstub        → + GDB RSP stub
 # cargo build --features input_events   → + /dev/input evdev layer (WIP)
 # cargo build --features wayland        → + Wayland compositor scaffold (WIP)
-default = ["uefi_boot"]
+default = ["uefi_boot", "sysv_ipc"]
 
 # ── Boot path ────────────────────────────────────────────────────────────────────
 # RISC-V UEFI boot (EDK2 RiscVVirt / PE-COFF via lld-link).
 # Disable to use SBI direct boot: cargo xtask build --arch riscv64 --boot sbi
 uefi_boot = []
 
+# ── Stable subsystems (on by default) ────────────────────────────────────────
+
+# System V IPC (msgget/msgsnd/msgrcv/msgctl, semget/semop/semctl,
+# shmget/shmat/shmdt/shmctl) and POSIX message queues (mq_open/send/receive).
+#
+# Status: Stable. NR 29-31, 64-71, 240-245 fully wired in syscall dispatch.
+#   - IpcPerm uid/gid/mode enforcement: complete.
+#   - CAP_IPC_OWNER capability check: always grants (pre-namespace behavior);
+#     full enforcement requires namespaces feature.
+#   - src/ipc/{msg,sem,shm,mq}.rs carry no cfg gate — the feature flag exists
+#     to allow stripped builds (e.g. embedded targets) that don't need IPC.
+sysv_ipc = []
+
 # ── WIP / optional subsystems ────────────────────────────────────────────────
-# None of these are included in the default build. Each can be enabled
-# independently; they carry no inter-dependencies unless noted.
+# None of these are included in the default build unless noted above.
+# Each can be enabled independently; they carry no inter-dependencies unless noted.
 
 # GDB remote serial protocol stub.
 #
-# Status: fully implemented (serial.rs + rsp.rs).
-#   - Packet engine: ?, g/G, p/P, m/M, s, c, Z0/z0, H, qSupported,
-#     qAttached, qC, qfThreadInfo, qsThreadInfo, qOffsets, vCont?,
-#     vCont;s, vCont;c, vKill, D, k.
-#   - SW breakpoints: up to 16 simultaneous INT3 slots.
-#   - Serial I/O: polling COM1 (x86_64) / SBI console_getchar (RISC-V).
-#
-# Integration: call `crate::gdbstub::gdb_trap(regs)` from your INT3 / #DB
-#   exception handler, where `regs: *mut gdbstub::SavedRegs` points at the
-#   live register save frame.  SavedRegs layout must match the trap-entry
-#   push order (rax, rbx, rcx, rdx, rsi, rdi, rbp, r8–r15, rip, rflags).
+# Status: fully implemented — x86_64 (UART/COM1) and RISC-V (SBI console).
+#   - Packet engine: ?, g/G, p/P, m/M, X, s, c, Z0/z0, H, T, qSupported,
+#     qAttached, qC, qfThreadInfo, qsThreadInfo, qOffsets, vCont, vKill, D, k.
+#   - SW breakpoints: up to 16 simultaneous (INT3 on x86_64, ebreak on RISC-V).
+#   - x86_64 single-step: RFLAGS.TF; RISC-V single-step: sstatus.SSTEP.
+#   - Entry points: gdb_trap(regs, pid) [x86_64] / gdb_trap_rv(regs, pid) [rv64].
 #
 # Enable: cargo build --features gdbstub
 gdbstub = []
@@ -71,13 +79,6 @@ gdbstub = []
 # Status: stub no-ops — event routing to /dev/input/eventN not yet wired.
 # Enable: cargo build --features input_events
 input_events = []
-
-# System V IPC (msgget/msgsnd/msgrcv/msgctl, semget/semop/semctl,
-# shmget/shmat/shmdt/shmctl) and POSIX message queues (mq_open/send/receive).
-# Status: data structures and logic complete; CAP_IPC_OWNER capability checks
-#         are integration stubs that always grant access.
-# Enable: cargo build --features sysv_ipc
-sysv_ipc = []
 
 # Linux-compatible namespace isolation.
 # Implemented: CLONE_NEWPID, CLONE_NEWNS (mount), CLONE_NEWNET,

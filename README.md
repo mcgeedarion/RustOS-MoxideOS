@@ -29,7 +29,7 @@
 - **Drivers**: virtio-blk, virtio-net, virtio-gpu, PS/2 keyboard, UART, PCIe enumeration
 - **Linux syscall compatibility**: ~80 syscalls (see [Syscall Table](#syscall-table-selected))
 - **Resource limits**: `RLIMIT_CPU` and `RLIMIT_RTTIME` with SIGXCPU/SIGKILL enforcement
-- **IPC**: futex (WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE, robust lists), pipes, Unix sockets
+- **IPC**: SysV msg/sem/shm (NR 29–31, 64–71), POSIX mq (NR 240–245), futex (WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE, robust lists), pipes, Unix sockets
 - **SMP**: AP bringup (APIC trampoline / SBI HSM), per-CPU blocks, IPI dispatch, MM RwLock per address space
 - **Security**: ASLR, stack canaries, PTI, SMEP/SMAP, seccomp-BPF, capability set
 - **Timers**: real `nanosleep` / `clock_nanosleep` — clock-aware absolute sleeps, EINTR/remainder correctness, `CLOCK_PROCESS_CPUTIME_ID` / `CLOCK_THREAD_CPUTIME_ID`
@@ -56,7 +56,7 @@ rustos/
 │   ├── security/       # ASLR, canaries, PTI, SMEP/SMAP, seccomp, capset,
 │   │                   #   namespaces (ns/), cgroups v1 (cgroups/)
 │   ├── sync/           # futex, RwLock, Condvar, WaitQueue
-│   ├── ipc/            # SysV msg/sem/shm, POSIX mq  [feature: sysv_ipc]
+│   ├── ipc/            # SysV msg/sem/shm + POSIX mq  [default: on]
 │   ├── gdbstub/        # GDB RSP stub — x86_64 (rsp.rs) + RISC-V (rsp_riscv.rs) [feature: gdbstub]
 │   ├── input/          # /dev/input evdev layer         [feature: input_events]
 │   └── wayland/        # Wayland compositor scaffold    [feature: wayland]
@@ -292,22 +292,22 @@ crate::gdbstub::gdb_trap_rv(
 
 ## Feature Flags
 
-The **default build** is a clean, fully functional, testable base kernel.
+The **default build** includes the base kernel plus SysV IPC.
 All WIP or incomplete subsystems are behind opt-in feature flags.
 
 | Feature | Default | Status | Enable with |
 |---------|---------|--------|-------------|
 | `uefi_boot` | ✅ on | Stable | (always on by default) |
+| `sysv_ipc` | ✅ on | **Stable** — SysV msg/sem/shm + POSIX mq; NR 29–31, 64–71, 240–245 | (on by default) |
 | `gdbstub` | ❌ off | **Complete** — x86_64 (UART) + RISC-V (SBI); SW breakpoints, single-step, thread enum, `target.xml` | `--features gdbstub` |
-| `sysv_ipc` | ❌ off | Logic complete; `CAP_IPC_OWNER` stub | `--features sysv_ipc` |
 | `namespaces` | ❌ off | 5 NS types done; `setns`/nsfs missing | `--features namespaces` |
 | `cgroups` | ❌ off | Knob API done; cgroupfs mount missing | `--features cgroups` |
 | `input_events` | ❌ off | Stub no-ops; evdev routing missing | `--features input_events` |
 | `wayland` | ❌ off | Scaffold only | `--features wayland` |
 
 ```bash
-# Full WIP build (all features)
-cargo build --features sysv_ipc,namespaces,cgroups,gdbstub,input_events,wayland
+# Full WIP build (all optional features)
+cargo build --features namespaces,cgroups,gdbstub,input_events,wayland
 ```
 
 To graduate a feature into `default`: replace all capability stubs with real
@@ -364,17 +364,22 @@ Soft crossing → `SIGXCPU` (repeated each second); hard → `SIGKILL`.
 | 11 | `munmap` | ✅ |
 | 12 | `brk` | ✅ |
 | 22 | `pipe` | ✅ |
+| 29–31 | `shmget`/`shmat`/`shmctl` | ✅ |
 | 35 | `nanosleep` | ✅ clock-aware, EINTR/rem correct |
 | 56 | `clone` | ✅ |
 | 57 | `fork` | ✅ |
 | 59 | `execve` | ✅ |
 | 60 | `exit` | ✅ |
 | 61 | `wait4` | ✅ |
+| 64–66 | `semget`/`semop`/`semctl` | ✅ |
+| 67 | `shmdt` | ✅ |
+| 68–71 | `msgget`/`msgsnd`/`msgrcv`/`msgctl` | ✅ |
 | 72 | `fcntl` | ✅ |
 | 202 | `futex` | ✅ WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE/robust |
 | 218 | `set_tid_address` | ✅ |
-| `clock_gettime` | 228 | ✅ all clock IDs including CPUTIME |
-| `clock_nanosleep` | 230 | ✅ TIMER_ABSTIME, clock-aware |
+| 228 | `clock_gettime` | ✅ all clock IDs including CPUTIME |
+| 230 | `clock_nanosleep` | ✅ TIMER_ABSTIME, clock-aware |
+| 240–245 | `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/`mq_getsetattr` | ✅ |
 | 302 | `prlimit64` | ✅ |
 | 314 | `sched_setattr` | ✅ |
 | 315 | `sched_getattr` | ✅ |
@@ -432,7 +437,6 @@ Steps:
 - [ ] `io_uring` support
 - [ ] Expanded musl libc syscall coverage
 - [ ] Graduate `namespaces` + `cgroups` features into default
-- [ ] Wire `sysv_ipc` syscall dispatch entries
 - [ ] `/dev/input` evdev routing (`input_events`)
 
 ---
