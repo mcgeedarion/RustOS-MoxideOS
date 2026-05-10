@@ -16,6 +16,8 @@
 //!   NR 286  timerfd_settime                  => fs::timerfd::sys_timerfd_settime
 //!   NR 287  timerfd_gettime                  => fs::timerfd::sys_timerfd_gettime
 //!   NR 93   lchown                           => p0_gaps::sys_lchown_impl
+//!   NR 27   mincore                          => openat2_mincore::sys_mincore
+//!   NR 437  openat2                          => openat2_mincore::sys_openat2_impl
 //!
 //! ## NR 15  rt_sigreturn
 //!   Intercepted BEFORE dispatch() at the arch entry point:
@@ -65,7 +67,7 @@ use alloc::vec::Vec;
 use crate::ipc::{msg, sem, shm, mq};
 
 include!("p0_gaps.rs");
-include!("socket_gaps.rs");
+include!("openat2_mincore.rs");
 include!("stubs.rs");
 include!("posix_full.rs");
 
@@ -196,6 +198,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         19  => sys_readv_impl(a, b, c),
         20  => crate::fs::io_syscalls::sys_writev(a, b, c),
         22  => crate::fs::pipe::sys_pipe(a),
+        27  => sys_mincore(a, b, c),
         32  => crate::fs::vfs::dup(a),
         33  => crate::fs::fcntl::sys_dup2(a, b),
         40  => sys_sendfile_impl(a, b, c, d),
@@ -236,6 +239,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         327 => sys_preadv2_impl(a, b, c, d, e, f as i32),
         328 => sys_pwritev2_impl(a, b, c, d, e, f as i32),
         332 => sys_statx_impl(a as i32, b, c as u32, d as u32, e),
+        437 => sys_openat2_impl(a as i32, b, c, d),
         // NR 334  close_range(first, last, flags)
         334 => match (arg_u32(a), arg_u32(b), arg_u32(c)) {
                    (Some(first), Some(last), Some(flags)) =>
