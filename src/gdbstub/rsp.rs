@@ -1,4 +1,5 @@
 //! GDB Remote Serial Protocol engine — x86_64.
+#![cfg(target_arch = "x86_64")]
 //!
 //! ## Register numbering  (GDB x86_64 ABI, matches `g`/`G` packet order)
 //!

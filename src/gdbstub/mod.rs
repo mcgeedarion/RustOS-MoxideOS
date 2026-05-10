@@ -1,49 +1,81 @@
-//! GDB remote serial protocol (RSP) stub — x86_64.
+//! GDB Remote Serial Protocol (RSP) stub.
 //!
 //! Enabled via `cargo build --features gdbstub`.
 //!
-//! # Integration
+//! ## Architecture support
 //!
-//! Call [`gdb_trap`] from any INT3 / debug-exception handler, passing a
-//! pointer to the interrupted register frame and the current PID:
+//! | Arch    | Status   | Entry point          | Serial I/O       |
+//! |---------|----------|----------------------|------------------|
+//! | x86_64  | Complete | `gdb_trap`           | COM1 (raw UART)  |
+//! | RISC-V  | Complete | `gdb_trap_rv`        | SBI console      |
+//!
+//! ## x86_64 integration
+//!
+//! Call [`gdb_trap`] from your `#DB` / `#BP` exception handler:
 //!
 //! ```ignore
-//! // Inside your #[naked] trap handler, after saving all registers:
-//! #[cfg(feature = "gdbstub")]
+//! #[cfg(all(feature = "gdbstub", target_arch = "x86_64"))]
 //! crate::gdbstub::gdb_trap(
 //!     regs as *mut crate::gdbstub::SavedRegs,
 //!     crate::proc::scheduler::current_pid(),
 //! );
 //! ```
 //!
-//! The stub blocks on COM1 (x86_64) until GDB sends a `D` (detach) or
-//! `k` (kill) packet, then returns so the kernel can resume normal
-//! execution.
+//! ## RISC-V integration
 //!
-//! # RISC-V
+//! Call [`gdb_trap_rv`] from the breakpoint exception path in
+//! `arch/riscv64/trap.rs` (exception code 3 = Breakpoint):
 //!
-//! RISC-V support is a planned follow-up.  The SavedRegs layout and
-//! register numbering are x86_64-specific; `cfg(target_arch = "x86_64")`
-//! gates compilation in lib.rs.
+//! ```ignore
+//! #[cfg(all(feature = "gdbstub", target_arch = "riscv64"))]
+//! crate::gdbstub::gdb_trap_rv(
+//!     frame as *mut crate::gdbstub::RvSavedRegs,
+//!     crate::proc::scheduler::current_pid(),
+//! );
+//! ```
+//!
+//! `RvSavedRegs` is layout-compatible with `TrapFrame` — cast directly.
 
 pub mod serial;
+
+#[cfg(target_arch = "x86_64")]
 pub mod rsp;
 
+#[cfg(target_arch = "riscv64")]
+pub mod rsp_riscv;
+
+// ── x86_64 re-exports ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
 pub use rsp::SavedRegs;
 
-/// Entry point called from a breakpoint or debug-exception handler.
+/// Entry point from a breakpoint or debug-exception handler (x86_64).
 ///
-/// Blocks until GDB detaches.  Modifies `regs` in-place so that the
-/// interrupted context is updated with any register writes GDB issued.
-///
-/// `stopped_pid` identifies the task that triggered the trap and is used
-/// in `?`, `qC`, and thread-stop-reply packets.  Pass
-/// `crate::proc::scheduler::current_pid()` from the trap handler.
+/// Blocks on COM1 until GDB detaches or kills.  Modifies `regs` in-place
+/// so the interrupted context reflects any register writes GDB issued.
 ///
 /// # Safety
-/// `regs` must point to the live, writable register save area on the
-/// interrupted kernel/user stack frame.  The pointer must remain valid
-/// for the entire duration of the GDB session.
+/// `regs` must point to the live, writable x86_64 register save frame.
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn gdb_trap(regs: *mut SavedRegs, stopped_pid: u32) {
     rsp::run_session(regs, stopped_pid);
+}
+
+// ── RISC-V re-exports ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "riscv64")]
+pub use rsp_riscv::SavedRegs as RvSavedRegs;
+
+/// Entry point from the RISC-V breakpoint exception handler (exception code 3).
+///
+/// Blocks on SBI console until GDB detaches or kills.  Modifies `regs`
+/// in-place — sepc and sstatus changes are reflected when the trap handler
+/// `sret`s back to the interrupted context.
+///
+/// # Safety
+/// `regs` must be a valid pointer to the live `TrapFrame` on the kernel stack.
+/// `RvSavedRegs` is `#[repr(C)]` and layout-compatible with `TrapFrame`.
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn gdb_trap_rv(regs: *mut RvSavedRegs, stopped_pid: u32) {
+    rsp_riscv::run_session(regs, stopped_pid);
 }
