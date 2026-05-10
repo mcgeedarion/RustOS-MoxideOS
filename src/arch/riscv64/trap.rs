@@ -7,6 +7,19 @@
 //!     3. Calls `riscv_trap_handler`.
 //!     4. Restores registers and executes `sret`.
 //!
+//! ## trap_return (new-task first entry)
+//!
+//!   `trap_return` is the symmetric counterpart to the restore tail of
+//!   `riscv_trap_entry`.  It is jumped to (not called) by
+//!   `task_entry_trampoline` when a brand-new task is being entered for
+//!   the first time.  At that point:
+//!     - `sp` already points to a fully initialised `TrapFrame` that
+//!       `clone.rs` built with `push_trap_frame_riscv`.
+//!     - No caller context needs to be saved — we are entering user mode
+//!       for the first time from this task's kernel stack.
+//!   The function restores `sepc` and `sstatus` from the frame, reloads
+//!   all GPRs, and executes `sret`.
+//!
 //! ## Trap sources
 //!   Exceptions (scause MSB = 0):
 //!     0  Instruction address misaligned
@@ -27,31 +40,23 @@
 //!   1. Clear SIP.SSIP to acknowledge (write-0 via csrc).
 //!   2. Read logical cpu_id from PercpuBlock (tp-relative).
 //!   3. Call `ipi::dispatch(cpu_id)` which reads & clears `ipi_pending`
-//!      atomically and dispatches each kind:
-//!        bit 0 = TlbShootdown  → ipi::handle_tlb_shootdown()
-//!        bit 1 = Reschedule    → proc::scheduler::schedule()
-//!        bit 2 = FuncCall      → (future deferred-work queue)
-//!        bit 3 = PanicHalt     → halt this hart
-//!
-//! ## Timer tick (scause = 0x8000_0000_0000_0005)
-//!
-//!   Every supervisor timer interrupt:
-//!     1. `time::tick_advance(TICK_NS)` — advance the monotonic clock.
-//!     2. `time::timer::expire_timers()` — fire due wheel entries.
-//!     3. `proc::scheduler::schedule()` — context switch if needed.
-//!     4. `clint::set_next_event(hart, TICK_NS)` — re-arm mtimecmp.
-//!     5. Re-enable STIE in `sie`.
-//!
-//! ## Anonymous mmap page-fault flow (demand paging)
-//!
-//! When user-space touches a page inside a VmaKind::Anonymous (or Heap/Stack)
-//! region that has no PTE yet, scause = 13 (load) or 15 (store).
+//!      atomically and dispatches each kind.
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
 use crate::mm::mmap::{VmaKind, PROT_READ, PROT_WRITE, PROT_EXEC};
 
 /// Trap frame saved by `riscv_trap_entry`.
+///
+/// Layout (34 × 8 = 272 bytes):
+///   index  0: ra      index  1: sp     index  2: gp     index  3: tp
+///   index  4: t0      index  5: t1     index  6: t2
+///   index  7: s0      index  8: s1
+///   index  9: a0 … index 16: a7
+///   index 17: s2 … index 26: s11
+///   index 27: t3 … index 30: t6
+///   index 31: sepc    index 32: sstatus
+///   index 33: (pad / reserved)
 #[repr(C)]
 pub struct TrapFrame {
     pub ra: usize,  pub sp:  usize, pub gp:  usize, pub tp:  usize,
@@ -67,7 +72,13 @@ pub struct TrapFrame {
     pub sstatus: usize,
 }
 
-const TRAP_FRAME_SIZE: usize = 34 * 8;
+pub const TRAP_FRAME_SIZE: usize = 34 * 8;
+
+// sstatus bits
+/// SPP = 0 → return to U-mode on sret.
+pub const SSTATUS_SPP:  usize = 1 << 8;
+/// SPIE = 1 → interrupts enabled in user mode after sret.
+pub const SSTATUS_SPIE: usize = 1 << 5;
 
 #[naked]
 #[no_mangle]
@@ -104,6 +115,7 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t4, 28*8(sp)",
         "sd   t5, 29*8(sp)",
         "sd   t6, 30*8(sp)",
+        // Save user sp: kstack_sp + TRAP_FRAME_SIZE = pre-trap user sp.
         "addi t0, sp, {frame_size}",
         "sd   t0, 1*8(sp)",
         "csrr t0, sepc",
@@ -112,6 +124,11 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t0, 32*8(sp)",
         "mv   a0, sp",
         "call {handler}",
+        // ── trap_return ── (also jumped to directly by task_entry_trampoline)
+        // Exposed as a global label so context::task_entry_trampoline can
+        // jump here without duplicating the restore sequence.
+        ".global trap_return",
+        "trap_return:",
         "ld   t0, 31*8(sp)",
         "csrw sepc, t0",
         "ld   t0, 32*8(sp)",
@@ -165,27 +182,11 @@ pub extern "C" fn riscv_trap_handler(frame: &mut TrapFrame) {
 
 fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
     match code {
-        // ────────────────────────────────────────────────────────────────
-        // Supervisor software interrupt (code 1) — IPI.
-        //
-        // Protocol:
-        //   1. Clear SIP.SSIP (write-0) to acknowledge.  This must happen
-        //      *before* dispatch so the CPU can receive the next IPI.
-        //   2. Read logical cpu_id from PercpuBlock (tp-relative, set by
-        //      percpu::init on both BSP and APs).
-        //   3. Atomically drain ipi_pending and dispatch each bit.
-        // ────────────────────────────────────────────────────────────────
         1 => {
-            // Clear SSIP to allow the next IPI to raise SSIP again.
-            // Using csrc (atomic clear bits): csrc sip, 0x2
             unsafe { asm!("csrci sip, 2", options(nostack, nomem)); }
             let cpu_id = crate::smp::percpu::current_cpu_id();
             crate::smp::ipi::dispatch(cpu_id);
         }
-
-        // ────────────────────────────────────────────────────────────────
-        // Supervisor timer interrupt (code 5).
-        // ────────────────────────────────────────────────────────────────
         5 => {
             let sie = csrr!("sie");
             csrw!("sie", sie & !(1usize << 5));
@@ -198,12 +199,7 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
             let sie2 = csrr!("sie");
             csrw!("sie", sie2 | (1usize << 5));
         }
-
-        // ────────────────────────────────────────────────────────────────
-        // Supervisor external interrupt (code 9) — PLIC.
-        // ────────────────────────────────────────────────────────────────
         9 => { crate::drivers::plic::handle_irq(); }
-
         _ => {}
     }
 }
@@ -218,12 +214,10 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             frame.a0   = ret as usize;
             frame.sepc = frame.sepc.wrapping_add(4);
         }
-
         12 | 13 | 15 => {
-            let stval      = csrr!("stval");
+            let stval       = csrr!("stval");
             let faulting_va = stval & !0xFFF;
-            let pid        = crate::proc::scheduler::current_pid();
-
+            let pid         = crate::proc::scheduler::current_pid();
             if let Some(vma) = crate::mm::mmap::find_vma(pid, stval) {
                 if code == 15 && vma.prot & PROT_WRITE == 0 {
                     crate::proc::signal::send_sigsegv(pid, stval); return;
@@ -247,7 +241,6 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             }
             crate::proc::signal::send_sigsegv(pid, stval);
         }
-
         2 => {
             let pid = crate::proc::scheduler::current_pid();
             crate::proc::signal::send_signal(pid, 4);
@@ -261,10 +254,8 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
 
 pub fn trap_init() {
     set_stvec(riscv_trap_entry as usize);
-    // Enable SSIE (software/IPI=1), STIE (timer=5), SEIE (external/PLIC=9).
     let sie = csrr!("sie");
     csrw!("sie", sie | (1 << 1) | (1 << 5) | (1 << 9));
-    // Enable supervisor-mode interrupts globally (sstatus.SIE = 1).
     let sstatus = csrr!("sstatus");
     csrw!("sstatus", sstatus | (1 << 1));
 }

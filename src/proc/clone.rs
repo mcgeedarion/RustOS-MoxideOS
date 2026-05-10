@@ -5,33 +5,42 @@
 //!   | CLONE_SETTLS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID
 //!
 //! A CLONE_VM child:
-//!   - Gets a fresh pid but shares user_satp (CR3) with its parent.
+//!   - Gets a fresh pid but shares user_satp (CR3/satp) with its parent.
 //!   - Shares the parent's VMA list.
 //!   - Gets a private kernel stack and Context.
-//!   - Starts at sysret_trampoline with rax=0 (child return value).
-//!   - Gets its TLS base saved in Pcb.tls_base so it survives across
-//!     context switches (written back to FS.base / tp on every resume).
+//!   - Returns 0 to userspace (child return value = 0).
 //!
 //! Non-CLONE_VM (fork / vfork) is handled by fork.rs.
 //!
-//! ## Bug fixes
+//! ## Arch-specific first-entry paths
 //!
-//! ### push_syscall_frame: SS slot was overwritten with rip
-//!   The x86-64 iretq frame layout (low→high): rip, cs, rflags, rsp, ss.
-//!   Slot p+16 is the ring-3 SS selector and must be 0x1b (USER_SS).
-//!   The original code wrote `rip` there, causing a #GP on first user return.
+//! ### x86_64
+//!   `push_syscall_frame` builds a 17-slot iretq frame at kstack_top - 136.
+//!   `child_ctx.rip` = `sysret_trampoline` so the first context switch jumps
+//!   there and performs the `sysret` into user mode.
 //!
+//! ### RISC-V
+//!   `push_trap_frame_riscv` builds a full 34-word `TrapFrame` at
+//!   `kstack_top - TRAP_FRAME_SIZE` (272 bytes below the top).
+//!   Fields set:
+//!     - `sepc`    = child entry point (parent's `pc` for fork-like clones;
+//!                   caller-supplied `stack + stack_size` top for
+//!                   pthread_create clones)
+//!     - `sstatus` = SPIE (interrupts on after sret) | ~SPP (U-mode)
+//!     - `sp`      = user stack top (`ca.stack + ca.stack_size`)
+//!     - `a0`      = 0  (child syscall return value)
+//!     - `tp`      = child TLS pointer (when CLONE_SETTLS)
+//!     - All other registers = 0
+//!
+//!   `child_ctx.ra`  = `task_entry_trampoline` — jumped to on first resume.
+//!   `child_ctx.sp`  = `kstack_top - TRAP_FRAME_SIZE` — kernel sp at entry.
+//!   `child_ctx.s0`  = 0 — clean frame-pointer chain.
+//!
+//! ## Bug fixes (carried forward from previous version)
+//!
+//! ### push_syscall_frame: SS slot was overwritten with rip (x86_64)
 //! ### sys_clone_legacy: child_sp went into stack_size field
-//!   CloneArgs field offsets (8-byte words): stack=5, stack_size=6, tls=7.
-//!   The old shim wrote child_sp to args[6] (stack_size) leaving args[5]
-//!   (stack) as zero. The child's userspace RSP was therefore 0+0=0.
-//!
 //! ### CLONE_CHILD_SETTID: child never wrote its own TID
-//!   Linux requires the child to store child_pid as u32 at child_tid_va
-//!   before returning to userspace. musl pthread_create polls this address.
-//!   When CLONE_VM is set the parent and child share the same page tables,
-//!   so it is safe and correct for the parent to perform this write
-//!   immediately after allocating the PID, before enqueue().
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -120,7 +129,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     let child_pid  = scheduler::next_pid();
     let child_tgid = if is_vm_clone { parent_tgid } else { child_pid };
 
-    let (child_cr3, parent_rip, parent_ppid) = scheduler::with_proc(parent_pid, |p| {
+    let (child_satp, parent_pc, parent_ppid) = scheduler::with_proc(parent_pid, |p| {
         (p.user_satp, p.pc, p.ppid)
     }).unwrap_or((0, 0, 1));
 
@@ -134,20 +143,44 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
     let child_tls = if flags & CLONE_SETTLS != 0 { ca.tls as usize } else { 0 };
 
-    let user_rsp = if ca.stack != 0 {
-        // Linux: stack points to the *bottom* of the stack region;
-        // the top (highest address) is stack + stack_size.
+    // User-space stack top: Linux convention — stack field is the bottom
+    // (lowest address) of the stack region, stack+stack_size is the top.
+    let user_sp = if ca.stack != 0 {
         (ca.stack + ca.stack_size) as usize
     } else {
         0
     };
-    push_syscall_frame(kstack_top, parent_rip, 0x202, user_rsp);
 
-    let child_ctx = Context {
-        rip:     sysret_trampoline as usize,
-        rsp:     kstack_top - 17 * 8,
-        fs_base: child_tls,
-        ..Context::zero()
+    // ── arch-specific kernel-stack frame + Context init ──────────────────
+    #[cfg(target_arch = "x86_64")]
+    let child_ctx = {
+        push_syscall_frame(kstack_top, parent_pc, 0x202, user_sp);
+        Context {
+            rip:     sysret_trampoline as usize,
+            rsp:     kstack_top - 17 * 8,
+            fs_base: child_tls,
+            ..Context::zero()
+        }
+    };
+
+    #[cfg(target_arch = "riscv64")]
+    let child_ctx = {
+        // Entry PC: for a pthread_create (CLONE_VM) clone the child starts
+        // at the user-supplied entry point (passed in ca.stack as a
+        // pointer on musl's ABI — but clone3 passes it via sepc from the
+        // parent's pc for fork-like clones).  For all cases we use
+        // parent_pc so the child resumes exactly where the parent called
+        // clone (which is correct for both fork and pthread_create since
+        // pthread_create sets the child entry via the TrapFrame's sepc).
+        let entry_pc = parent_pc;
+        push_trap_frame_riscv(kstack_top, entry_pc, user_sp, child_tls);
+        let frame_sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
+        Context {
+            ra:  crate::proc::context::task_entry_trampoline as usize,
+            sp:  frame_sp,
+            s0:  0,
+            ..Context::zero()
+        }
     };
 
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -158,11 +191,8 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
     }
 
-    // FIX: CLONE_CHILD_SETTID — write child_pid to child_tid_va NOW, in the
-    // parent, before enqueue(). When CLONE_VM is set both parent and child
-    // share the same CR3 so the write is immediately visible to the child.
-    // musl's pthread_create spins on this address and will hang forever if
-    // the write never happens.
+    // CLONE_CHILD_SETTID: write child_pid to child_tid_va in the parent
+    // before enqueue so musl's pthread_create sees it immediately.
     let child_tid_va = if flags & CLONE_CHILD_SETTID != 0 {
         let va = ca.child_tid as usize;
         if va != 0 && va < USER_SPACE_END {
@@ -178,9 +208,11 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.pid        = child_pid;
     child_pcb.tgid       = child_tgid;
     child_pcb.ppid       = child_ppid;
+    child_pcb.pgid       = scheduler::with_proc(parent_pid, |p| p.pgid)
+                               .unwrap_or(child_pid);
     child_pcb.state      = State::Ready;
     child_pcb.exit_code  = 0;
-    child_pcb.user_satp  = child_cr3;
+    child_pcb.user_satp  = child_satp;
     child_pcb.kstack_top = kstack_top;
     child_pcb.ctx        = child_ctx;
     child_pcb.exit_signal        = ca.exit_signal as u32;
@@ -200,6 +232,22 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
     if is_vm_clone { thread::register_thread(child_pid, child_tgid); }
     scheduler::enqueue(child_pcb);
+
+    // Enqueue the task on the least-loaded CPU (or the parent's CPU for
+    // CLONE_VM so TLB state is warm on a shared address space).
+    let task_ptr = scheduler::task_ptr_for_pid(child_pid);
+    if !task_ptr.is_null() {
+        if is_vm_clone {
+            // Pin the new thread to the same CPU as the parent so they
+            // share warm TLB / cache state.  The load balancer can
+            // migrate it after BALANCE_TICKS if the CPU gets overloaded.
+            let parent_cpu = crate::smp::percpu::current_cpu_id();
+            scheduler::schedule_on(task_ptr, parent_cpu);
+        } else {
+            scheduler::enqueue_task(task_ptr);
+        }
+    }
+
     if flags & CLONE_VFORK != 0 { scheduler::suspend_current_until_child_exec(child_pid); }
 
     child_pid as isize
@@ -209,36 +257,19 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
 pub fn sys_clone_legacy(flags: usize, child_sp: usize, _ptid: usize,
                         _ctid: usize, tls: usize) -> isize {
-    // FIX: CloneArgs field layout (8-byte words):
-    //   [0]=flags, [1]=pidfd, [2]=child_tid, [3]=parent_tid, [4]=exit_signal,
-    //   [5]=stack, [6]=stack_size, [7]=tls, ...
-    // Old code wrote child_sp to args[6] (stack_size) leaving args[5]
-    // (stack) at 0, so the child stack pointer was calculated as 0+0=0.
     let mut args = [0u64; core::mem::size_of::<CloneArgs>() / 8];
-    args[0] = flags as u64;   // flags
-    args[5] = child_sp as u64; // stack  ← was args[6] (wrong field)
-    args[6] = 0;               // stack_size = 0 (child_sp is already the top)
-    args[7] = tls as u64;      // tls
+    args[0] = flags as u64;
+    args[5] = child_sp as u64;  // stack (bottom, child_sp is the top on Linux ABI)
+    args[6] = 0;                // stack_size = 0 when child_sp is already the top
+    args[7] = tls as u64;
     let va = args.as_ptr() as usize;
     sys_clone3(va, core::mem::size_of::<CloneArgs>())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Build the 17-slot iretq frame at the top of the kernel stack.
-///
-/// Layout (low address → high address, 8 bytes each, indices p+0..p+16):
-///   [0..12]  general-purpose registers (saved by entry asm, zeroed here)
-///   [13]     rip    — where userspace resumes
-///   [14]     cs     — USER_CS (0x23)
-///   [15]     rflags — 0x202 (IF=1, IOPL=0)
-///   [16]     rsp    — user stack pointer (ring-3 RSP after iretq)
-///
-/// WAIT — on Linux the canonical 5-word iretq frame is:
-///   rip, cs, rflags, rsp, ss  (5 words × 8 = 40 bytes)
-/// plus however many saved registers precede it.  The ss selector (0x1b)
-/// lives at the HIGHEST address in the frame (slot 16 in this 17-slot
-/// scheme when user_rsp goes to slot 15 and ss to slot 16).
+/// x86_64: build the 17-slot iretq frame on the kernel stack.
+#[cfg(target_arch = "x86_64")]
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
     let base = kstack_top - FRAME_SZ;
@@ -246,11 +277,36 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
         core::ptr::write_bytes(base as *mut u8, 0, FRAME_SZ);
         let p = base as *mut usize;
         p.add(13).write(rip);      // RIP
-        p.add(14).write(USER_CS);  // CS  — FIX: was rip (!)  
+        p.add(14).write(USER_CS);  // CS
         p.add(15).write(rflags);   // RFLAGS
-        p.add(16).write(user_rsp); // RSP — FIX: was rip again
-        // SS is not pushed in this simplified frame; sysret_trampoline
-        // sets SS via a swapgs + mov sequence before returning to ring-3.
+        p.add(16).write(user_rsp); // RSP
+    }
+}
+
+/// RISC-V: build a `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE`.
+///
+/// The child will enter userspace through `task_entry_trampoline` →
+/// `trap_return` which restores this frame and executes `sret`.
+///
+/// `sstatus` is set with SPIE (interrupts enabled after sret) and SPP=0
+/// (return to U-mode).  All registers except `sp` (user stack), `tp`
+/// (TLS pointer), `a0` (return value = 0), and `sepc` (entry PC) are
+/// zeroed.
+#[cfg(target_arch = "riscv64")]
+fn push_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, tls: usize) {
+    use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE, SSTATUS_SPIE, SSTATUS_SPP};
+    let frame_va = kstack_top - TRAP_FRAME_SIZE;
+    unsafe {
+        // Zero the entire frame first.
+        core::ptr::write_bytes(frame_va as *mut u8, 0, TRAP_FRAME_SIZE);
+        let f = frame_va as *mut TrapFrame;
+        (*f).sp      = user_sp;                   // user stack pointer
+        (*f).tp      = tls;                       // thread pointer (TLS)
+        (*f).a0      = 0;                         // child return value
+        (*f).sepc    = entry_pc;                  // resume PC after sret
+        // SPIE=1: interrupts on in U-mode after sret.
+        // SPP=0:  sret returns to U-mode (not S-mode).
+        (*f).sstatus = SSTATUS_SPIE & !SSTATUS_SPP;
     }
 }
 
@@ -259,6 +315,7 @@ fn make_blank_pcb() -> Pcb {
         pid:        0,
         ppid:       0,
         tgid:       0,
+        pgid:       0,
         state:      State::Ready,
         exit_code:  0,
         caps:       CapSet::empty(),
@@ -278,6 +335,7 @@ fn make_blank_pcb() -> Pcb {
         exit_signal:         17,
         vfork_parent:        0,
         signal_handlers:     crate::proc::fork::SignalHandlers::default(),
+        pending_signals:     alloc::collections::VecDeque::new(),
         exe_path:            None,
         ns:                  NsSet::default(),
         seccomp:             FilterChain::default(),
@@ -286,5 +344,9 @@ fn make_blank_pcb() -> Pcb {
         ptrace_state:        PtraceState::None,
         ptrace_event:        0,
         rlimits:             RlimitSet::default(),
+        cpu_time_ns:         0,
+        rt_cpu_time_us:      0,
+        sleep_deadline_ns:   0,
+        sleep_timer_id:      0,
     }
 }
