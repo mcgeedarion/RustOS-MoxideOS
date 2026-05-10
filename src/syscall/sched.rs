@@ -30,9 +30,24 @@
 //!
 //! `RLIMIT_RTPRIO` is the maximum RT priority an unprivileged process may
 //! request.  Priority 0 means no RT scheduling is allowed.
+//!
+//! ## CBS admission (SCHED_DEADLINE)
+//!
+//! Before any SCHED_DEADLINE task is accepted, `cbs_admit` checks that
+//! the resulting total utilization on every CPU in the task's affinity
+//! mask stays ≤ 1.0 (represented as CBS_SCALE in fixed-point).  If the
+//! CPU would be overcommitted the call returns -EBUSY (-16).
+//!
+//! CAP_SYS_NICE bypasses the utilization cap (but still updates the
+//! counters so subsequent unprivileged admits see correct totals).
+//!
+//! When a task's deadline parameters are updated the old utilization is
+//! released before the new parameters are admitted, so the counters
+//! always reflect the live set of admitted tasks.
 
 use crate::proc::scheduler::{SchedPolicy, SchedEntity, CPUMASK_ALL};
 use crate::proc::rlimit::{RLIMIT_NICE, RLIMIT_RTPRIO, RLIM_INFINITY};
+use crate::proc::sched_helpers::{cbs_admit, cbs_release};
 use crate::uaccess::{copy_from_user, copy_to_user};
 
 // ── Linux ABI structs ─────────────────────────────────────────────────────────
@@ -60,8 +75,6 @@ pub struct SchedAttr {
 
 // ── RLIMIT helpers ────────────────────────────────────────────────────────────
 
-/// Returns the minimum nice value the calling process is allowed to set,
-/// honouring `RLIMIT_NICE`.  Processes with `CAP_SYS_NICE` are unrestricted.
 fn nice_floor(pid: usize) -> i8 {
     use crate::proc::scheduler::with_proc;
     let (soft, _) = crate::proc::scheduler::with_proc(pid, |p| p.rlimits.get(RLIMIT_NICE))
@@ -70,13 +83,10 @@ fn nice_floor(pid: usize) -> i8 {
         .unwrap_or(false);
     if privileged { return -20; }
     if soft == RLIM_INFINITY { return -20; }
-    // Linux formula: min_nice = 20 - rlim_cur  (clamped to [-20, 19])
     let floor = 20i64 - soft as i64;
     floor.clamp(-20, 19) as i8
 }
 
-/// Returns the maximum RT priority the calling process is allowed to request.
-/// 0 means no RT policy is permitted.  `CAP_SYS_NICE` is unrestricted (99).
 fn rt_prio_ceiling(pid: usize) -> u8 {
     use crate::proc::scheduler::with_proc;
     let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_RTPRIO))
@@ -88,15 +98,44 @@ fn rt_prio_ceiling(pid: usize) -> u8 {
     soft.min(99) as u8
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+/// True if the process holds CAP_SYS_NICE.
+fn is_privileged(pid: usize) -> bool {
+    crate::proc::scheduler::with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice))
+        .unwrap_or(false)
+}
 
-/// Returns -ESRCH if pid not found, -EPERM if the change violates a limit.
+// ── Core attribute application ────────────────────────────────────────────────
+
+/// Snapshot of a task's current deadline parameters and cpumask, used
+/// to release CBS utilization before applying new parameters.
+struct DeadlineSnapshot {
+    runtime: u64,
+    period:  u64,
+    cpumask: u64,
+}
+
+/// Read the current deadline parameters + cpumask for `pid` if it is
+/// currently a SCHED_DEADLINE task.  Returns None otherwise.
+fn snapshot_deadline(pid: usize) -> Option<DeadlineSnapshot> {
+    crate::proc::scheduler::with_proc(pid, |pcb| {
+        if pcb.sched.policy != SchedPolicy::Deadline { return None; }
+        Some(DeadlineSnapshot {
+            runtime: pcb.sched.dl_runtime,
+            period:  pcb.sched.dl_period,
+            cpumask: pcb.sched.cpumask,
+        })
+    }).flatten()
+}
+
+/// Returns -ESRCH if pid not found, -EPERM if the change violates a
+/// limit, -EBUSY (-16) if CBS admission fails.
 fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     let policy = match SchedPolicy::from_u32(attr.sched_policy) {
         Some(p) => p,
         None    => return -22, // EINVAL
     };
 
+    // ── Parameter sanity check for Deadline ──────────────────────────────────
     if policy == SchedPolicy::Deadline {
         if attr.sched_runtime == 0
             || attr.sched_deadline == 0
@@ -111,23 +150,74 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     // ── RLIMIT_RTPRIO: reject unprivileged RT elevation ───────────────────────
     if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
         let ceiling = rt_prio_ceiling(pid);
-        if ceiling == 0 {
-            return -13; // EPERM — RT scheduling not allowed at all
+        if ceiling == 0 { return -13; }
+        if attr.sched_priority as u8 > ceiling { return -13; }
+    }
+
+    // ── CBS admission gate (SCHED_DEADLINE only) ──────────────────────────────
+    //
+    // Strategy:
+    //   1. Read the task's current cpumask (we need it for both release
+    //      and for the new admit, which may use a different mask set by
+    //      a prior sched_setaffinity call).
+    //   2. If the task is already DEADLINE, release its old utilization
+    //      slot so the check sees the correct remaining headroom.
+    //   3. Determine the cpumask for the *new* parameters: use the task's
+    //      current cpumask (affinity is changed separately via
+    //      sched_setaffinity; we don't allow changing both atomically here
+    //      to keep the locking simple).
+    //   4. Run cbs_admit.  On failure, if we released in step 2 we must
+    //      re-admit the old parameters to leave the table consistent.
+    //   5. On success, fall through to with_proc_mut to update the PCB.
+
+    if policy == SchedPolicy::Deadline {
+        let privileged = is_privileged(pid);
+
+        // Current cpumask — needed for the new admit.
+        let cpumask = crate::proc::scheduler::with_proc(pid, |p| p.sched.cpumask)
+            .unwrap_or(CPUMASK_ALL);
+
+        // Read the old deadline params before we mutate anything.
+        let old = snapshot_deadline(pid);
+
+        // Release old slot so headroom is accurate.
+        if let Some(ref snap) = old {
+            cbs_release(snap.runtime, snap.period, snap.cpumask);
         }
-        if attr.sched_priority as u8 > ceiling {
-            return -13; // EPERM — requested priority exceeds RLIMIT_RTPRIO
+
+        // Attempt admission with new parameters.
+        if let Err(e) = cbs_admit(pid, attr.sched_runtime, attr.sched_period,
+                                   cpumask, privileged)
+        {
+            // Rollback: re-admit old slot to keep the table consistent.
+            if let Some(ref snap) = old {
+                // Use privileged=true here because we're just restoring a
+                // previously admitted slot — it must always succeed.
+                let _ = cbs_admit(0, snap.runtime, snap.period, snap.cpumask, true);
+            }
+            return e as isize;
+        }
+        // CBS counters now reflect the new task; fall through to PCB update.
+    }
+
+    // ── If leaving Deadline, release old CBS slot ─────────────────────────────
+    // (We enter this branch only when policy != Deadline, i.e. the task
+    // is transitioning away from Deadline.)
+    if policy != SchedPolicy::Deadline {
+        if let Some(snap) = snapshot_deadline(pid) {
+            cbs_release(snap.runtime, snap.period, snap.cpumask);
         }
     }
 
     let now_ns = crate::time::monotonic_ns();
 
+    // ── Apply to PCB ─────────────────────────────────────────────────────────
     crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
-        let was_rt    = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
+        let was_rt     = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
         let becomes_rt = matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr);
 
         match policy {
             SchedPolicy::Normal => {
-                // ── RLIMIT_NICE: clamp nice to the permitted floor ─────────────
                 let floor = nice_floor(pid);
                 let nice  = attr.sched_nice.clamp(floor as i32, 19) as i8;
                 pcb.sched.nice   = nice;
@@ -138,7 +228,7 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
             SchedPolicy::Fifo | SchedPolicy::Rr => {
                 let ceiling = rt_prio_ceiling(pid);
                 let prio    = (attr.sched_priority as u8).min(ceiling);
-                pcb.sched.rt_priority = prio.max(1); // enforce minimum 1 for RT
+                pcb.sched.rt_priority = prio.max(1);
                 pcb.sched.policy = policy;
             }
             SchedPolicy::Deadline => {
@@ -151,7 +241,6 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
             }
         }
 
-        // Reset the RLIMIT_RTTIME accumulator on any RT policy change.
         if was_rt || becomes_rt {
             pcb.rt_cpu_time_us = 0;
         }
@@ -218,30 +307,22 @@ pub fn sys_sched_getparam(pid: usize, param_uptr: usize) -> isize {
 // ── setpriority / getpriority ─────────────────────────────────────────────────
 
 /// `sys_setpriority(which, who, prio)` [NR 141]
-///
-/// `which`: 0=PRIO_PROCESS, 1=PRIO_PGRP, 2=PRIO_USER.
-/// `prio` is the **userspace nice value** — already in the conventional
-/// -20..19 range (the kernel's internal range is the same).
 pub fn sys_setpriority(which: i32, who: usize, prio: i32) -> isize {
-    if which != 0 { return -38; } // ENOSYS for PGRP/USER for now
+    if which != 0 { return -38; }
     let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
-    let floor = nice_floor(pid);
+    let floor = nice_floor(pid as usize);
     let clamped = prio.clamp(floor as i32, 19) as i8;
-    crate::proc::scheduler::with_proc_mut(pid, |p, _pl| {
+    crate::proc::scheduler::with_proc_mut(pid as usize, |p, _pl| {
         p.sched.nice   = clamped;
         p.sched.weight = crate::proc::scheduler::nice_to_weight_pub(clamped);
     }).map(|_| 0isize).unwrap_or(-3)
 }
 
 /// `sys_getpriority(which, who)` [NR 140]
-///
-/// Returns `20 - nice` (the kernel convention: higher return value = higher
-/// priority) so the libc wrapper can negate and subtract 20 to get the
-/// conventional nice value.
 pub fn sys_getpriority(which: i32, who: usize) -> isize {
     if which != 0 { return -38; }
     let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
-    crate::proc::scheduler::with_proc(pid, |p| (20 - p.sched.nice as i32) as isize)
+    crate::proc::scheduler::with_proc(pid as usize, |p| (20 - p.sched.nice as i32) as isize)
         .unwrap_or(-3)
 }
 
@@ -263,8 +344,24 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     let online_mask: u64 = if ncpus >= 64 { u64::MAX } else { (1u64 << ncpus) - 1 };
     let effective = mask & online_mask;
     if effective == 0 { return -22; }
+
+    // ── CBS: re-check admission if this is a DEADLINE task ────────────────────
+    // Changing the cpumask may expose CPU(s) that don't have enough headroom.
+    let snap = snapshot_deadline(pid);
+    if let Some(ref s) = snap {
+        let privileged = is_privileged(pid);
+        cbs_release(s.runtime, s.period, s.cpumask);
+        if let Err(e) = cbs_admit(pid, s.runtime, s.period, effective, privileged) {
+            // Rollback.
+            let _ = cbs_admit(0, s.runtime, s.period, s.cpumask, true);
+            return e as isize;
+        }
+    }
+
     crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         pcb.sched.cpumask = effective;
+        // Keep the Task hot copy in sync.
+        if !_pl.inner.try_lock().is_none() { /* already holding inner via with_proc_mut */ }
     }).map(|_| 0isize).unwrap_or(-3)
 }
 

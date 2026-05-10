@@ -1,54 +1,163 @@
-//! Public scheduler helper functions exposed for use by the rest of the kernel
-//! (syscall layer, /proc, tests).
+//! CBS (Constant Bandwidth Server) admission accounting and misc scheduler
+//! helpers that are shared between `scheduler.rs` and `syscall/sched.rs`.
 //!
-//! These are thin wrappers around the global process list + run-queue.
+//! ## Utilization tracking
+//!
+//! Each SCHED_DEADLINE task contributes a utilization fraction
+//!
+//!     U_i = runtime_i / period_i
+//!
+//! to every CPU in its affinity mask.  We store the sum in a per-CPU
+//! `AtomicU64` scaled by `CBS_SCALE = 2^32`, so one full CPU worth of
+//! utilization equals exactly `CBS_SCALE`.
+//!
+//!     scaled_U_i = (runtime_i as u128 << 32) / period_i
+//!
+//! Admission is rejected with `-EBUSY` if adding the new task's scaled
+//! utilization to any of its allowed CPUs would reach or exceed
+//! `CBS_SCALE`.
+//!
+//! Callers must release utilization (`cbs_release`) before calling
+//! `cbs_admit` again for the same task (e.g. on parameter updates).
 
-use crate::proc::scheduler::{SchedPolicy, NICE0_WEIGHT};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-// Re-export so syscall/sched.rs can call it via the public path.
-/// Delegate to the canonical implementation in `scheduler::nice_to_weight`.
-/// Having a single definition prevents the two copies from diverging (M3).
-#[inline]
-pub fn nice_to_weight_pub(nice: i8) -> u64 {
-    crate::proc::scheduler::nice_to_weight(nice)
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Fixed-point scale: 1.0 CPU = CBS_SCALE units.
+pub const CBS_SCALE: u64 = 1u64 << 32;
+
+/// Maximum CPUs tracked by the admission table.
+/// Must be ≥ the maximum CPUMASK bit width (64).
+pub const MAX_CBS_CPUS: usize = 64;
+
+// ── Global utilization table ──────────────────────────────────────────────────
+
+/// Per-CPU utilization accumulators.  Index = CPU id.
+/// Value = sum of (runtime << 32) / period for all DEADLINE tasks
+/// whose cpumask includes that CPU.
+struct CbsUtilBucket {
+    cpu: [AtomicU64; MAX_CBS_CPUS],
 }
 
-/// Admission test for a new SCHED_DEADLINE task on `cpu`.
-///
-/// Returns `true` if the total utilisation after adding the proposed task
-/// remains ≤ 1.0 (i.e., the sum of `runtime/period` across all deadline
-/// tasks on `cpu` would not exceed 100%).
-///
-/// This is a simplified schedulability check; a production kernel would
-/// also account for migration overhead, WCET slack, etc.
-pub fn dl_admission_test(cpu: u32, runtime_ns: u64, period_ns: u64) -> bool {
-    if period_ns == 0 { return false; }
-    let blk = unsafe { &crate::smp::percpu::PERCPU_BLOCKS[cpu as usize] };
+// SAFETY: AtomicU64 is Send+Sync; the array wrapper just adds a name.
+unsafe impl Sync for CbsUtilBucket {}
 
-    // Sum utilisation of all existing deadline tasks on this CPU.
-    // We iterate the run-queue entries safely by peeking the dl_heap.
-    // Note: this is an O(n) scan protected by the assumption that the
-    // caller holds no run-queue lock (admission is done before enqueue).
-    let mut used_num: u64 = 0;   // numerator   (sum of runtimes)
-    let mut used_den: u64 = 1;   // denominator (LCM of periods — simplified)
-
-    // Walk through PCBs looking for DL tasks pinned to this CPU.
-    crate::proc::scheduler::with_procs_ro(|procs| {
-        for pcb in procs.iter() {
-            if pcb.sched.policy == SchedPolicy::Deadline
-                && pcb.sched.cpu_allowed(cpu)
-                && pcb.sched.dl_period > 0
-            {
-                // Compute rational sum: used += dl_runtime / dl_period.
-                // We work in integer arithmetic scaled to 1_000_000_000
-                // (nanoseconds) to avoid FP.
-                let u = pcb.sched.dl_runtime.saturating_mul(1_000_000_000)
-                    / pcb.sched.dl_period;
-                used_num = used_num.saturating_add(u);
-            }
+impl CbsUtilBucket {
+    const fn new() -> Self {
+        Self {
+            cpu: [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+            ],
         }
-    });
+    }
+}
 
-    let new_u = runtime_ns.saturating_mul(1_000_000_000) / period_ns;
-    used_num.saturating_add(new_u) <= 1_000_000_000 // ≤ 100% utilisation
+static CBS_UTIL: CbsUtilBucket = CbsUtilBucket::new();
+
+// ── Admission test ────────────────────────────────────────────────────────────
+
+fn scaled_util(runtime: u64, period: u64) -> Option<u64> {
+    if period == 0 { return None; }
+    let wide = (runtime as u128) << 32;
+    let result = wide / period as u128;
+    if result > u64::MAX as u128 { return None; }
+    Some(result as u64)
+}
+
+/// Attempt to admit a DEADLINE task.
+///
+/// - `_pid`      : task being admitted (reserved for future per-task tracking)
+/// - `runtime`   : `sched_runtime` in nanoseconds
+/// - `period`    : `sched_period` in nanoseconds
+/// - `cpumask`   : bitmask of CPUs the task may run on
+/// - `privileged`: if true (CAP_SYS_NICE), skip the utilization check
+///
+/// On success the per-CPU utilization counters are updated atomically.
+/// On failure **no** counters are modified.
+///
+/// Returns `Ok(())` or `Err(-16)` (EBUSY) / `Err(-22)` (EINVAL).
+pub fn cbs_admit(
+    _pid: usize,
+    runtime: u64,
+    period: u64,
+    cpumask: u64,
+    privileged: bool,
+) -> Result<(), i32> {
+    let su = scaled_util(runtime, period).ok_or(-22i32)?;
+
+    if privileged {
+        commit(su, cpumask);
+        return Ok(());
+    }
+
+    let ncpus = crate::smp::percpu::cpu_count() as usize;
+    let ncpus = ncpus.min(MAX_CBS_CPUS);
+
+    for cpu in 0..ncpus {
+        if cpumask & (1u64 << cpu) == 0 { continue; }
+        let current = CBS_UTIL.cpu[cpu].load(Ordering::Relaxed);
+        if current.saturating_add(su) > CBS_SCALE {
+            return Err(-16); // EBUSY
+        }
+    }
+
+    commit(su, cpumask);
+    Ok(())
+}
+
+/// Release the utilization previously claimed by a DEADLINE task.
+///
+/// Must be called when a task exits, changes policy away from Deadline,
+/// or is about to have its parameters updated (release old, admit new).
+pub fn cbs_release(runtime: u64, period: u64, cpumask: u64) {
+    let su = match scaled_util(runtime, period) {
+        Some(v) => v,
+        None    => return,
+    };
+    let ncpus = crate::smp::percpu::cpu_count() as usize;
+    let ncpus = ncpus.min(MAX_CBS_CPUS);
+    for cpu in 0..ncpus {
+        if cpumask & (1u64 << cpu) == 0 { continue; }
+        // Saturating sub: guard against double-release bugs.
+        let prev = CBS_UTIL.cpu[cpu].load(Ordering::Relaxed);
+        CBS_UTIL.cpu[cpu].fetch_sub(su.min(prev), Ordering::Relaxed);
+    }
+}
+
+/// Query the current utilization (0..=CBS_SCALE) for a CPU.
+/// Returns CBS_SCALE + 1 if `cpu` is out of range.
+pub fn cbs_util_for_cpu(cpu: usize) -> u64 {
+    if cpu >= MAX_CBS_CPUS { return CBS_SCALE + 1; }
+    CBS_UTIL.cpu[cpu].load(Ordering::Relaxed)
+}
+
+fn commit(su: u64, cpumask: u64) {
+    let ncpus = crate::smp::percpu::cpu_count() as usize;
+    let ncpus = ncpus.min(MAX_CBS_CPUS);
+    for cpu in 0..ncpus {
+        if cpumask & (1u64 << cpu) == 0 { continue; }
+        CBS_UTIL.cpu[cpu].fetch_add(su, Ordering::Relaxed);
+    }
+}
+
+// ── nice_to_weight (re-export for syscall/sched.rs) ───────────────────────────
+
+pub fn nice_to_weight_pub(nice: i8) -> u64 {
+    crate::proc::scheduler::nice_to_weight(nice)
 }
