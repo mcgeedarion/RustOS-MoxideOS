@@ -8,15 +8,16 @@
 //!   3. Returns the standard POSIX errno-compatible isize / Result
 //!
 //! ## Backends wired
-//! | FsType     | Module        | Notes                              |
-//! |------------|---------------|------------------------------------|  
-//! | Ext2       | fs::ext2      | read-write root; full inode ops    |
-//! | Fat32      | fs::fat32     | ESP + USB; VFAT LFN                |
-//! | Tmpfs      | fs::tmpfs     | /tmp /run /dev/shm (size-limited)  |
-//! | Overlayfs  | fs::overlayfs | copy-up + whiteout merge           |
-//! | Devfs      | fs::devfs     | character / block device nodes     |
-//! | Procfs     | fs::procfs    | /proc virtual files                |
-//! | Sysfs      | fs::sysfs     | /sys virtual files                 |
+//! | FsType     | Module        | Notes                                  |
+//! |------------|---------------|----------------------------------------|
+//! | Ext2       | fs::ext2      | read-write root; full inode ops        |
+//! | Ext4       | fs::ext4      | read-only root; extents + 64-bit blk   |
+//! | Fat32      | fs::fat32     | ESP + USB; VFAT LFN                    |
+//! | Tmpfs      | fs::tmpfs     | /tmp /run /dev/shm (size-limited)      |
+//! | Overlayfs  | fs::overlayfs | copy-up + whiteout merge               |
+//! | Devfs      | fs::devfs     | character / block device nodes         |
+//! | Procfs     | fs::procfs    | /proc virtual files                    |
+//! | Sysfs      | fs::sysfs     | /sys virtual files                     |
 
 extern crate alloc;
 use alloc::{
@@ -28,7 +29,7 @@ use crate::fs::mount::{self, FsType, OverlayOpts};
 use crate::fs::overlayfs::OverlayMount;
 use crate::fs::dcache;
 
-// ── Stat result (kernel-internal) ────────────────────────────────────────────────
+// ── Stat result (kernel-internal) ─────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct KStat {
@@ -60,14 +61,15 @@ pub struct KStatfs {
 
 // Well-known f_type magic numbers (matches Linux)
 const FSTYPE_EXT2:    u64 = 0xEF53;
-const FSTYPE_FAT32:   u64 = 0x4d44;   // MSDOS_SUPER_MAGIC
+const FSTYPE_EXT4:    u64 = 0xEF53; // same magic; kernel identifies ext4 via sb incompat flags
+const FSTYPE_FAT32:   u64 = 0x4d44;
 const FSTYPE_TMPFS:   u64 = 0x0102_1994;
 const FSTYPE_OVERLAY: u64 = 0x794c_7630;
 const FSTYPE_DEVTMPFS:u64 = 0x1373;
 const FSTYPE_PROC:    u64 = 0x9fa0;
 const FSTYPE_SYSFS:   u64 = 0x6265_6572;
 
-// ── read_all / write_all ─────────────────────────────────────────────────────
+// ── read_all / write_all ───────────────────────────────────────────────────
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
@@ -84,6 +86,10 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
             }
             fd_close(fd);
             Ok(data)
+        }
+        FsType::Ext4 => {
+            let ino = crate::fs::ext4::stat(path).ok_or(-2isize)?;
+            crate::fs::ext4::read_file_by_ino(ino).ok_or(-2isize)
         }
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
@@ -117,6 +123,7 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
             fd_close(fd);
             if n < 0 { Err(n as isize) } else { Ok(()) }
         }
+        FsType::Ext4 => Err(-30), // EROFS: ext4 driver is read-only
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut f = crate::fs::fat32::fat_open(&mp, &h.subpath)
@@ -137,7 +144,7 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     result
 }
 
-// ── pread / pwrite — offset-based I/O ────────────────────────────────────────
+// ── pread / pwrite ───────────────────────────────────────────────────────────
 
 pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
@@ -165,13 +172,14 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
             write_all(path, &full)?;
             Ok(data.len())
         }
+        FsType::Ext4 => Err(-30), // read-only
         _ => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(path); }
     result
 }
 
-// ── truncate ────────────────────────────────────────────────────────────────────
+// ── truncate ──────────────────────────────────────────────────────────────────
 
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -181,6 +189,7 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
         FsType::Ext2 => {
             crate::fs::ext2::sys_truncate(path, len as u64).map(|_| ())
         }
+        FsType::Ext4 => Err(-30),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut f = crate::fs::fat32::fat_open(&mp, &h.subpath)?;
@@ -198,12 +207,6 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     result
 }
 
-// ── truncate_fd ──────────────────────────────────────────────────────────────────
-//
-// fd-based truncate used by sys_ftruncate.  Reverse-maps the kernel backing
-// fd to its registered VFS path, then delegates to the path-based truncate().
-// Returns -EBADF if the fd has no associated path (pipe, socket, anon fd).
-
 pub fn truncate_fd(bfd: usize, len: usize) -> Result<(), isize> {
     let path = crate::fs::fcntl::fd_get_path(bfd).ok_or(-9isize)?;
     truncate(&path, len)
@@ -220,6 +223,7 @@ pub fn create(path: &str) -> Result<(), isize> {
             let fd = fd_open(path, 0x241).map_err(|e| e)?;
             fd_close(fd); Ok(())
         }
+        FsType::Ext4 => Err(-30),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             crate::fs::fat32::fat_creat(&mp, &h.subpath).map(|_| ())
@@ -245,6 +249,7 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let result = match h_e.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_link(existing, new),
         FsType::Ext2  => crate::fs::ext2::sys_link(existing, new).map(|_| ()),
+        FsType::Ext4  => Err(-30),
         FsType::Overlayfs => {
             let om = overlay_mount(&h_e)?;
             crate::fs::overlayfs::link(&om, &h_e.subpath, &h_n.subpath)
@@ -258,13 +263,14 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     result
 }
 
-// ── mkdir ─────────────────────────────────────────────────────────────────────
+// ── mkdir ────────────────────────────────────────────────────────────────────
 
 pub fn mkdir(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     let result = match h.fstype {
         FsType::Ext2 => crate::fs::ext2::sys_mkdir(path, 0o755).map(|_| ()),
+        FsType::Ext4 => Err(-30),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
@@ -282,7 +288,7 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── rmdir ─────────────────────────────────────────────────────────────────────
+// ── rmdir ────────────────────────────────────────────────────────────────────
 
 pub fn rmdir(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -290,6 +296,7 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_rmdir(path),
         FsType::Ext2  => crate::fs::ext2::sys_rmdir(path).map(|_| ()),
+        FsType::Ext4  => Err(-30),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
@@ -302,13 +309,14 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── unlink ────────────────────────────────────────────────────────────────────
+// ── unlink ───────────────────────────────────────────────────────────────────
 
 pub fn unlink(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     let result = match h.fstype {
         FsType::Ext2 => crate::fs::ext2::sys_unlink(path).map(|_| ()),
+        FsType::Ext4 => Err(-30),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
@@ -326,7 +334,7 @@ pub fn unlink(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── rename ────────────────────────────────────────────────────────────────────
+// ── rename ──────────────────────────────────────────────────────────────────
 
 pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_o = mount::resolve(old)?;
@@ -336,6 +344,7 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let result = match h_o.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_rename(old, new),
         FsType::Ext2  => crate::fs::ext2::sys_rename(old, new).map(|_| ()),
+        FsType::Ext4  => Err(-30),
         FsType::Overlayfs => {
             let om = overlay_mount(&h_o)?;
             crate::fs::overlayfs::rename(&om, &h_o.subpath, &h_n.subpath)
@@ -349,7 +358,7 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     result
 }
 
-// ── stat / lstat ──────────────────────────────────────────────────────────────
+// ── stat / lstat ────────────────────────────────────────────────────────────
 
 pub fn stat(path: &str) -> Result<KStat, isize> { stat_impl(path, false) }
 pub fn lstat(path: &str) -> Result<KStat, isize> { stat_impl(path, true) }
@@ -371,6 +380,20 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
             };
             Ok(KStat {
                 ino: s.ino as u64, mode: s.mode, nlink: s.nlink,
+                uid: s.uid, gid: s.gid, size: s.size,
+                atime: s.atime, mtime: s.mtime, ctime: s.ctime,
+                blksize: s.blksize as u64, blocks: s.blocks,
+                is_dir: (s.mode & 0o170000) == 0o040000,
+            })
+        }
+        FsType::Ext4 => {
+            let s = if lstat {
+                crate::fs::ext4::sys_lstat(path).map_err(|e| e as isize)?
+            } else {
+                crate::fs::ext4::sys_stat(path).map_err(|e| e as isize)?
+            };
+            Ok(KStat {
+                ino: s.ino, mode: s.mode, nlink: s.nlink,
                 uid: s.uid, gid: s.gid, size: s.size,
                 atime: s.atime, mtime: s.mtime, ctime: s.ctime,
                 blksize: s.blksize as u64, blocks: s.blocks,
@@ -415,7 +438,7 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
     result
 }
 
-// ── statfs ────────────────────────────────────────────────────────────────────
+// ── statfs ───────────────────────────────────────────────────────────────────
 
 pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     let h = mount::resolve(path)?;
@@ -425,6 +448,17 @@ pub fn statfs(path: &str) -> Result<KStatfs, isize> {
             let s = crate::fs::ext2::sys_statfs(path).map_err(|e| e as isize)?;
             Ok(KStatfs {
                 f_type:    FSTYPE_EXT2,
+                f_bsize:   s.f_bsize as u64,
+                f_blocks:  s.f_blocks,
+                f_bfree:   s.f_bfree,
+                f_bavail:  s.f_bavail,
+                f_namelen: s.f_namelen as u64,
+            })
+        }
+        FsType::Ext4  => {
+            let s = crate::fs::ext4::sys_statfs(path).map_err(|e| e as isize)?;
+            Ok(KStatfs {
+                f_type:    FSTYPE_EXT4,
                 f_bsize:   s.f_bsize as u64,
                 f_blocks:  s.f_blocks,
                 f_bfree:   s.f_bfree,
@@ -473,7 +507,7 @@ pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     }
 }
 
-// ── readdir ───────────────────────────────────────────────────────────────────
+// ── readdir ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
@@ -489,6 +523,13 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
     match h.fstype {
         FsType::Ext2 => {
             let entries = crate::fs::ext2::readdir(path).map_err(|e| e as isize)?;
+            Ok(entries.into_iter().map(|e| DirEntry {
+                name: e.name, ino: e.ino as u64,
+                is_dir: e.is_dir, mode: e.mode, size: e.size,
+            }).collect())
+        }
+        FsType::Ext4 => {
+            let entries = crate::fs::ext4::readdir(path).map_err(|e| e as isize)?;
             Ok(entries.into_iter().map(|e| DirEntry {
                 name: e.name, ino: e.ino as u64,
                 is_dir: e.is_dir, mode: e.mode, size: e.size,
@@ -519,11 +560,7 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
     }
 }
 
-// ── symlink / readlink ────────────────────────────────────────────────────────
-//
-// Fat32 has no symlink support in VFAT — return -EPERM (-1) for both.
-// Overlayfs: symlink creates the link in the upper layer (no copy-up needed
-// for a new name). readlink checks upper first, then falls back to lower.
+// ── symlink / readlink ─────────────────────────────────────────────────────
 
 pub fn symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let h = mount::resolve(link_path)?;
@@ -531,11 +568,12 @@ pub fn symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_symlink(target, link_path),
         FsType::Ext2  => crate::fs::ext2::sys_symlink(target, link_path).map(|_| ()),
+        FsType::Ext4  => Err(-30),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::symlink(&om, target, &h.subpath)
         }
-        FsType::Fat32 => Err(-1),  // EPERM: VFAT has no symlink support
+        FsType::Fat32 => Err(-1),
         _             => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(link_path); }
@@ -547,20 +585,17 @@ pub fn readlink(path: &str) -> Result<String, isize> {
     match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_readlink(path),
         FsType::Ext2  => crate::fs::ext2::sys_readlink(path).map_err(|e| e as isize),
+        FsType::Ext4  => crate::fs::ext4::sys_readlink(path).map_err(|e| e as isize),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::readlink(&om, &h.subpath)
         }
-        FsType::Fat32 => Err(-22), // EINVAL: not a symlink (VFAT can't have them)
+        FsType::Fat32 => Err(-22),
         _             => Err(-22),
     }
 }
 
-// ── chmod / chown ─────────────────────────────────────────────────────────────
-//
-// Fat32 has no permission bits — return -EPERM for both chmod and chown.
-// Overlayfs: copy up the inode to the upper layer if needed, then update
-// the mode/uid/gid on the upper copy.
+// ── chmod / chown ───────────────────────────────────────────────────────────
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -568,12 +603,13 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_chmod(path, mode),
         FsType::Ext2  => crate::fs::ext2::sys_chmod(path, mode).map(|_| ()),
+        FsType::Ext4  => Err(-30),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::copy_up_if_needed(&om, &h.subpath)?;
             crate::fs::overlayfs::chmod(&om, &h.subpath, mode)
         }
-        FsType::Fat32 => Err(-1),  // EPERM: VFAT has no permission bits
+        FsType::Fat32 => Err(-1),
         _             => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(path); }
@@ -586,37 +622,34 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_chown(path, uid, gid),
         FsType::Ext2  => crate::fs::ext2::sys_chown(path, uid, gid).map(|_| ()),
+        FsType::Ext4  => Err(-30),
         FsType::Overlayfs => {
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::copy_up_if_needed(&om, &h.subpath)?;
             crate::fs::overlayfs::chown(&om, &h.subpath, uid, gid)
         }
-        FsType::Fat32 => Err(-1),  // EPERM: VFAT has no ownership model
+        FsType::Fat32 => Err(-1),
         _             => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(path); }
     result
 }
 
-// ── open (VFS-level, returns kernel fd) ──────────────────────────────────────
+// ── open (VFS-level) ──────────────────────────────────────────────────────────
 
 pub fn open(path: &str, flags: u32) -> Result<usize, isize> {
     crate::fs::fcntl::fd_open(path, flags as i32)
 }
 
-// ── fd_path (reverse-map fd → path) ──────────────────────────────────────────
-
 pub fn fd_path(fd: usize) -> Option<String> {
     crate::fs::fcntl::fd_get_path(fd)
 }
-
-// ── file_size ──────────────────────────────────────────────────────────────────
 
 pub fn file_size(fd: usize) -> usize {
     crate::fs::fcntl::fd_size(fd).unwrap_or(0)
 }
 
-// ── mount / overlay helpers ───────────────────────────────────────────────────
+// ── mount / overlay helpers ──────────────────────────────────────────────────────
 
 fn overlay_mount(h: &mount::FsHandle) -> Result<OverlayMount, isize> {
     let mounts = crate::fs::overlayfs::OVERLAY_MOUNTS.lock();
@@ -636,12 +669,10 @@ fn mount_point_for(subpath: &str, full_path: &str) -> String {
     if trimmed.is_empty() { "/".to_string() } else { trimmed }
 }
 
-/// Mount a tmpfs instance at the given mount-point with a size limit.
 pub fn tmpfs_mount(mount_point: &str, size_limit: usize) {
     crate::fs::tmpfs::tmpfs_mount(mount_point, size_limit);
 }
 
-/// Mount an overlayfs instance.
 pub fn overlay_mount_at(mp: &str, opts: OverlayOpts) -> Result<(), isize> {
     let om = OverlayMount {
         lower:  opts.lower.clone(),
@@ -653,8 +684,6 @@ pub fn overlay_mount_at(mp: &str, opts: OverlayOpts) -> Result<(), isize> {
     mounts.insert(mp.to_string(), om);
     Ok(())
 }
-
-// ── parse_size — human-readable size helper (used by mount(2) handler) ────────
 
 pub fn parse_size(s: &str) -> Option<usize> {
     let s = s.trim();
