@@ -7,7 +7,7 @@
 //!         │
 //!         └── ProcLock { pid, tgid, state_atom, inner: Mutex<Pcb> }
 //!                                                           │
-//!                                                      Pcb { task: *mut Task, sched, … }
+//!                                                      Pcb { task: *mut Task, sched, mm_lock, … }
 //!                                                           │
 //!                                                      Task { pcb: *mut Pcb, pid, sched }
 //! ```
@@ -24,11 +24,25 @@
 //! `scheduler.rs` keeps its per-CPU `RunQueue` separately and never needs to
 //! lock `PROC_TABLE` on the hot path; it accesses the task pointer directly.
 //!
+//! ## mm_lock (TOCTOU fix)
+//!
+//! `Pcb::mm_lock` is a `spin::RwLock<()>` that guards the virtual-memory
+//! state of the process (`vmas`, `user_satp`, `brk`).  Two rules apply:
+//!
+//!   - **Writers** (`munmap`, `mmap`, `brk`, `exec`) take the write side
+//!     before modifying `vmas` or remapping pages.
+//!   - **Readers** (`uaccess::copy_from_user`, `copy_to_user`, `read_path`)
+//!     take the read side across the entire validate+copy sequence.
+//!
+//! This closes the TOCTOU window where a concurrent `munmap` could unmap
+//! pages between `pages_mapped` and the actual memory copy.
+//!
 //! ### Deadlock-free ordering
 //!
 //!   1. Acquire `PROC_TABLE` lock (briefly, for lookup).
 //!   2. Clone the `Arc<ProcLock>` for the target pid, then release table lock.
 //!   3. Acquire `ProcLock::inner`.
+//!   4. While holding `inner`, take `mm_lock` (read or write as needed).
 //!   Never hold PROC_TABLE while holding any inner lock.
 
 extern crate alloc;
@@ -127,7 +141,9 @@ impl ProcLock {
     }
 
     pub fn load_state(&self) -> State {
-        State::from_u8(self.state_atom.load(core::sync::atomic::Ordering::Acquire))
+        State::from_u8(
+            self.state_atom.load(core::sync::atomic::Ordering::Acquire)
+        )
     }
 }
 
@@ -142,6 +158,11 @@ impl ProcLock {
 /// - `sched`: `SchedEntity` mirrored into `Task::sched` — kept in sync by
 ///            the scheduler.  `sched_helpers.rs` and `scheduler.rs` read it
 ///            from the Pcb to avoid an extra pointer deref in low-frequency paths.
+///
+/// ### mm_lock
+/// Protects `vmas`, `user_satp`, `brk`, and related VMA state against
+/// concurrent mmap/munmap while uaccess is performing a page walk + copy.
+/// See module-level docs for the lock ordering rules.
 #[derive(Clone)]
 pub struct Pcb {
     // Identity
@@ -160,8 +181,12 @@ pub struct Pcb {
     // Address space
     pub user_satp: usize,
 
-    // Virtual memory
+    // Virtual memory areas + mm_lock
+    //
+    // Writers (munmap, mmap, brk, exec) must take mm_lock for write.
+    // Readers (uaccess validate+copy) take mm_lock for read.
     pub vmas:     Vec<Vma>,
+    pub mm_lock:  Arc<spin::RwLock<()>>,
     pub next_va:  usize,
     pub brk_base: usize,
     pub brk:      usize,
@@ -243,6 +268,7 @@ impl Pcb {
             sp:                  0,
             user_satp:           0,
             vmas:                Vec::new(),
+            mm_lock:             Arc::new(spin::RwLock::new(())),
             next_va:             Self::INITIAL_NEXT_VA,
             brk_base:            0,
             brk:                 Self::INITIAL_BRK,
@@ -277,5 +303,12 @@ impl Pcb {
     pub fn fork_signal_handlers(&self) -> Arc<Mutex<SignalHandlers>> {
         let copy = self.signal_handlers.lock().clone();
         Arc::new(Mutex::new(copy))
+    }
+
+    /// Clone the mm_lock Arc so that threads in the same address space
+    /// (clone(CLONE_VM)) share a single RwLock.
+    #[inline]
+    pub fn share_mm_lock(&self) -> Arc<spin::RwLock<()>> {
+        Arc::clone(&self.mm_lock)
     }
 }

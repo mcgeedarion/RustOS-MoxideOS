@@ -38,6 +38,13 @@
 //! `inner` to decide whether to bother waking.  If Blocked, it locks inner,
 //! confirms, sets Ready, then enqueues.  This keeps the common "not blocked"
 //! path lock-free.
+//!
+//! ## mm_lock helpers
+//!
+//! `MmReadGuard` and `with_current_mm_read()` are the public surface used by
+//! `uaccess` to hold the current process's `mm_lock` for reading across the
+//! entire validate+copy sequence, preventing a concurrent munmap from
+//! unmapping pages between the page-table walk and the actual copy.
 
 use core::cmp::Reverse;
 use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
@@ -199,14 +206,14 @@ unsafe impl Send for DlEntry {}
 // ── Per-CPU RunQueue ──────────────────────────────────────────────────────────
 
 pub struct RunQueue {
-    pub cfs_heap:           BinaryHeap<CfsEntry>,
-    pub min_vruntime:       u64,
-    pub rt_queue:           VecDeque<*mut crate::proc::task_types::Task>,
-    pub dl_heap:            BinaryHeap<DlEntry>,
-    pub nr_running:         u32,
-    pub load_weight:        u64,
-    pub tick_count:         u64,
-    pub curr_vruntime_start:u64,
+    pub cfs_heap:            BinaryHeap<CfsEntry>,
+    pub min_vruntime:        u64,
+    pub rt_queue:            VecDeque<*mut crate::proc::task_types::Task>,
+    pub dl_heap:             BinaryHeap<DlEntry>,
+    pub nr_running:          u32,
+    pub load_weight:         u64,
+    pub tick_count:          u64,
+    pub curr_vruntime_start: u64,
 }
 
 unsafe impl Send for RunQueue {}
@@ -519,7 +526,10 @@ pub fn tick(cpu: u32) {
                         && inner.rt_cpu_time_us >= soft
                 };
                 if kill {
-                    crate::proc::signal::send_signal(t.pid as usize, 24 /* SIGXCPU */);
+                    crate::proc::signal::send_signal(
+                        t.pid as usize,
+                        24, // SIGXCPU
+                    );
                 }
             }
         }
@@ -672,6 +682,44 @@ pub fn wake_pid(pid: usize) {
 
 pub fn suspend_current_until_child_exec(_child_pid: usize) {
     block_current();
+}
+
+// ── mm_lock helpers (used by uaccess) ────────────────────────────────────────
+
+/// RAII guard returned by `with_current_mm_read`.  Holds the read side of
+/// the current process's `mm_lock` until dropped.
+///
+/// Callers must not acquire any inner `ProcLock` while holding this guard,
+/// or the deadlock-free lock ordering documented in `process.rs` is violated.
+pub struct MmReadGuard {
+    // The Arc keeps the RwLock alive even if the process exits while we hold
+    // the read side.  The guard borrows from the Arc.
+    _arc:   alloc::sync::Arc<spin::RwLock<()>>,
+    _guard: spin::RwLockReadGuard<'static, ()>,
+}
+
+// SAFETY: MmReadGuard is held on a single CPU and never sent across threads.
+unsafe impl Send for MmReadGuard {}
+
+/// Acquire the current process's `mm_lock` for reading and return a RAII
+/// guard.  The guard must be held across the entire page-walk + copy sequence
+/// to prevent a concurrent munmap from unmapping pages mid-copy.
+///
+/// # Panics
+/// Panics if there is no current user process (`has_current_user_proc()` is
+/// false).  Callers should check first or use `mm_read_guard()` in uaccess.
+pub fn with_current_mm_read() -> MmReadGuard {
+    let pid = current_pid() as usize;
+    let arc = proc_table::with_proc(pid, |pcb| alloc::sync::Arc::clone(&pcb.mm_lock))
+        .expect("with_current_mm_read: no current process");
+    // SAFETY: we extend the lifetime of the guard to 'static by pairing it
+    // with the owning Arc stored in MmReadGuard.  The Arc ensures the RwLock
+    // is not freed while the guard lives.
+    let guard = unsafe {
+        let raw: *const spin::RwLock<()> = alloc::sync::Arc::as_ptr(&arc);
+        (*raw).read()
+    };
+    MmReadGuard { _arc: arc, _guard: guard }
 }
 
 // ── current_pid ───────────────────────────────────────────────────────────────
