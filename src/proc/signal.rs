@@ -17,17 +17,19 @@
 //!
 //!   user_sp before delivery
 //!    │
-//!    ▼  [0..272)  saved TrapFrame  (all 34 × 8 bytes of the kernel TrapFrame
-//!                                   — sepc = interrupted PC, sp = user sp, …)
-//!       [272..352) siginfo_t       (80 bytes: sig, code, pid, addr)
-//!       [352..360) restorer VA     (8 bytes: where ra points)
-//!    ── new user sp ─────────────────────────────────────────────────────
+//!    ▼  [0..272)    saved TrapFrame  (34 × 8 bytes)
+//!       [272..352)  siginfo_t        (80 bytes)
+//!       [352..360)  saved sigmask    (8 bytes — old mask before delivery)
+//!       [360..368)  restorer VA      (8 bytes; or synthesized trampoline if 0)
+//!       [368..376)  trampoline[0]    li a7, 139   (only written when no SA_RESTORER)
+//!       [376..384)  trampoline[1]    ecall
+//!    ── new user sp (16-byte aligned) ──────────────────────────────────
 //!
 //!   On entry to the handler:
 //!     a0 = signum
 //!     a1 = &siginfo (sigframe + 272)
 //!     a2 = 0        (no ucontext_t yet)
-//!     ra = restorer
+//!     ra = restorer VA (points into trampoline if SA_RESTORER absent)
 //!     sepc = handler VA
 //!     sp = new user sp (sigframe base, 16-byte aligned)
 //!
@@ -35,14 +37,28 @@
 //!
 //!   user rsp before delivery
 //!    │
-//!    ▼  [0..256)   ucontext_t  (rip, rsp, rflags, all GP regs)
-//!       [256..336) siginfo_t   (80 bytes)
-//!       [336..344) retaddr     (8 bytes: restorer VA)
-//!    ── new user rsp ────────────────────────────────────────────────────
+//!    ▼  [0..320)    ucontext_t  (rip, rsp, rflags, all GP regs, uc_sigmask)
+//!       [320..400)  siginfo_t   (80 bytes)
+//!       [400..408)  retaddr     (8 bytes: restorer VA)
+//!    ── new user rsp (16-byte aligned) ─────────────────────────────────
 //!
-//!   On entry to the handler:
+//!   ucontext_t layout (offsets from frame base):
+//!     +0    uc_flags
+//!     +8    uc_link
+//!     +16   uc_stack (ss_sp u64, ss_flags i32, _pad i32, ss_size u64 = 24 bytes)
+//!     +40   uc_mcontext.gregs[23]:
+//!             [0]  r8    [1]  r9    [2]  r10   [3]  r11   [4]  r12
+//!             [5]  r13   [6]  r14   [7]  r15   [8]  rdi   [9]  rsi
+//!             [10] rbp   [11] rbx   [12] rdx   [13] rax   [14] rcx
+//!             [15] rsp   [16] rip   [17] efl   [18..22] zero
+//!     +224  uc_mcontext.fpregs ptr (8 bytes, zeroed)
+//!     +232  (pad to uc_sigmask)
+//!     +296  uc_sigmask (8 bytes — old sigmask before delivery)
+//!     +304  (pad to 320)
+//!
+//!   On entry to handler:
 //!     rdi = signum
-//!     rsi = &siginfo_t  (frame + 256)
+//!     rsi = &siginfo_t  (frame + 320)
 //!     rdx = &ucontext_t (frame + 0)
 //!     rip = handler VA
 //!
@@ -200,21 +216,12 @@ pub fn set_sigmask(pid: usize, mask: u64) {
 // Pops one unmasked signal from the queue and either:
 //   a) runs the default action (terminate / stop / ignore), or
 //   b) pushes an arch-specific SignalFrame and redirects execution.
-//
-// The `frame` pointer is the TrapFrame sitting on the kernel stack,
-// which the trap-entry stub will restore when this handler returns.
-// Modifying `frame.sepc` / `frame.a0` etc. directly changes what the
-// CPU sees when it executes `sret`.
-//
-// This function is arch-agnostic: it dispatches to the arch-specific
-// push_sigframe_* helper which does the actual frame surgery.
 
 #[cfg(target_arch = "riscv64")]
 pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
     let pid = scheduler::current_pid() as usize;
 
     loop {
-        // Pop the first unmasked signal from the queue.
         let info = {
             let mask = get_sigmask(pid);
             let mut map = PENDING.lock();
@@ -224,7 +231,7 @@ pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
             };
             let pos = queue.iter().position(|s| {
                 s.sig >= 1 && s.sig <= 64
-                    && (mask >> s.sig) & 1 == 0   // not masked
+                    && (mask >> s.sig) & 1 == 0
             });
             match pos {
                 Some(i) => queue.remove(i).unwrap(),
@@ -234,7 +241,6 @@ pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
 
         let sig = info.sig as usize;
 
-        // Fetch the registered handler (0 = SIG_DFL, 1 = SIG_IGN).
         let (handler, sa_flags, restorer) = scheduler::with_proc(pid, |p| (
             p.signal_handlers.handlers[sig],
             p.signal_handlers.flags[sig],
@@ -242,31 +248,25 @@ pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
         )).unwrap_or((0, 0, 0));
 
         match handler {
-            // ── SIG_DFL ──────────────────────────────────────────────
             0 => {
-                if (SIG_IGN_DEFAULT >> sig) & 1 != 0 {
-                    continue; // ignored by default
-                }
+                if (SIG_IGN_DEFAULT >> sig) & 1 != 0 { continue; }
                 if (SIG_STOP_DEFAULT >> sig) & 1 != 0 {
                     scheduler::with_proc_mut(pid, |p| p.state = State::Blocked);
                     scheduler::schedule();
                     continue;
                 }
-                // Terminate.
                 crate::proc::exit::do_exit(pid, -(sig as i32));
                 return;
             }
-            // ── SIG_IGN ──────────────────────────────────────────────
             1 => { continue; }
-            // ── User handler ─────────────────────────────────────────
             handler_va => {
-                // Block the signal during its own handler (unless SA_NODEFER).
+                // Save pre-delivery mask; block signal during handler (unless SA_NODEFER).
+                let old_mask = get_sigmask(pid);
                 if sa_flags & SA_NODEFER == 0 {
-                    let old = get_sigmask(pid);
-                    set_sigmask(pid, old | (1u64 << sig));
+                    set_sigmask(pid, old_mask | (1u64 << sig));
                 }
-                push_sigframe_riscv(frame, &info, handler_va, restorer, sa_flags);
-                return; // deliver one signal per trap exit
+                push_sigframe_riscv(frame, &info, handler_va, restorer, sa_flags, old_mask);
+                return;
             }
         }
     }
@@ -315,11 +315,11 @@ pub fn check_and_deliver(frame: &mut crate::arch::x86_64::syscall::SyscallFrame)
             }
             1 => { continue; }
             handler_va => {
+                let old_mask = get_sigmask(pid);
                 if sa_flags & SA_NODEFER == 0 {
-                    let old = get_sigmask(pid);
-                    set_sigmask(pid, old | (1u64 << sig));
+                    set_sigmask(pid, old_mask | (1u64 << sig));
                 }
-                push_sigframe_x86(frame, &info, handler_va, restorer, sa_flags);
+                push_sigframe_x86(frame, &info, handler_va, restorer, sa_flags, old_mask);
                 return;
             }
         }
@@ -328,24 +328,24 @@ pub fn check_and_deliver(frame: &mut crate::arch::x86_64::syscall::SyscallFrame)
 
 // ── push_sigframe_riscv ───────────────────────────────────────────────
 //
-// Carves a RiscvSigFrame from the user stack and redirects the TrapFrame
-// so that sret lands at the handler.
+// Frame layout on user stack (grows down):
 //
-// Frame layout on the user stack (grows down):
+//   base_sp (user sp before signal)
+//     - TRAP_FRAME_SIZE  (272): saved TrapFrame
+//     - 80:               siginfo_t
+//     - 8:                saved sigmask (old mask before delivery)
+//     - 8:                restorer VA slot
+//     - 16:               trampoline (li a7,139 + ecall) — only used when
+//                         SA_RESTORER absent; otherwise zeroed
+//   ─── new_sp (16-byte aligned) ────────────────────────────────────────
 //
-//   [user sp before signal]
-//     -272  saved TrapFrame  (copy of the kernel TrapFrame — all 34 words)
-//     -352  siginfo_t        (80 bytes: sig, errno, code, pid, addr)
-//     -360  restorer VA      (8 bytes)
-//    ────── new user sp (16-byte aligned) ─────────────────────────────
+// Trampoline encoding (RV64 RISC-V, standard 32-bit instructions):
+//   li a7, 139  →  addi a7, x0, 139  →  0x08b00893
+//   ecall       →                    →  0x00000073
 //
-// After frame is pushed:
-//   frame.sepc = handler_va   — CPU jumps here on sret
-//   frame.a0   = signum       — first argument to handler
-//   frame.a1   = &siginfo     — second argument
-//   frame.a2   = 0            — no ucontext_t
-//   frame.sp   = new_user_sp  — user stack pointer
-//   frame.ra   = restorer     — handler returns here; restorer does rt_sigreturn
+// When SA_RESTORER is set, restorer_va = sa_restorer from sigaction and
+// the trampoline slot is left zeroed. When absent, restorer_va points at
+// the trampoline bytes in the frame itself.
 
 #[cfg(target_arch = "riscv64")]
 fn push_sigframe_riscv(
@@ -354,44 +354,34 @@ fn push_sigframe_riscv(
     handler_va: usize,
     restorer:   usize,
     sa_flags:   u32,
+    old_mask:   u64,
 ) {
     use crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
 
-    // ── Choose stack ──────────────────────────────────────────────────
     let pid = scheduler::current_pid() as usize;
     let base_sp = if sa_flags & SA_ONSTACK != 0 {
         let alt = ALTSTACK.lock().get(&pid).copied().unwrap_or(AltStack::default());
         if alt.ss_flags & SS_DISABLE == 0 && alt.ss_sp != 0 {
-            if alt.ss_flags & SS_AUTODISARM != 0 {
-                ALTSTACK.lock().remove(&pid);
-            }
+            if alt.ss_flags & SS_AUTODISARM != 0 { ALTSTACK.lock().remove(&pid); }
             alt.ss_sp + alt.ss_size
-        } else {
-            frame.sp   // current user sp
-        }
-    } else {
-        frame.sp
-    };
+        } else { frame.sp }
+    } else { frame.sp };
 
-    // ── Carve frame ───────────────────────────────────────────────────
-    // Layout (from high to low address):
-    //   [restorer_slot]  8 bytes    ← highest
-    //   [siginfo_t]     80 bytes
-    //   [saved TrapFrame] TRAP_FRAME_SIZE bytes  ← lowest = new sp
-    const SIGINFO_SIZE: usize = 80;
-    const RESTORER_SLOT: usize = 8;
-    const FRAME_TOTAL: usize = TRAP_FRAME_SIZE + SIGINFO_SIZE + RESTORER_SLOT;
+    const SIGINFO_SIZE:    usize = 80;
+    const SIGMASK_SLOT:    usize = 8;
+    const RESTORER_SLOT:   usize = 8;
+    const TRAMPOLINE_SIZE: usize = 16; // 2 × 4-byte insns, padded to 8-byte boundary × 2
+    const FRAME_TOTAL: usize =
+        TRAP_FRAME_SIZE + SIGINFO_SIZE + SIGMASK_SLOT + RESTORER_SLOT + TRAMPOLINE_SIZE;
 
-    // Align down to 16 bytes after subtracting the whole frame.
-    let new_sp = (base_sp - FRAME_TOTAL) & !0xf;
-
-    // Safety: we write into user address space. If the user stack is
-    // unmapped this will page-fault; the fault handler will send SIGSEGV.
+    let new_sp          = (base_sp - FRAME_TOTAL) & !0xf;
     let saved_frame_va  = new_sp;
     let siginfo_va      = new_sp + TRAP_FRAME_SIZE;
-    let restorer_va     = new_sp + TRAP_FRAME_SIZE + SIGINFO_SIZE;
+    let sigmask_va      = new_sp + TRAP_FRAME_SIZE + SIGINFO_SIZE;
+    let restorer_slot_va = new_sp + TRAP_FRAME_SIZE + SIGINFO_SIZE + SIGMASK_SLOT;
+    let trampoline_va   = new_sp + TRAP_FRAME_SIZE + SIGINFO_SIZE + SIGMASK_SLOT + RESTORER_SLOT;
 
-    // 1. Save the full TrapFrame (272 bytes) so sigreturn can restore it.
+    // 1. Save TrapFrame.
     unsafe {
         core::ptr::copy_nonoverlapping(
             frame as *const _ as *const u8,
@@ -401,13 +391,6 @@ fn push_sigframe_riscv(
     }
 
     // 2. Write siginfo_t (80 bytes, Linux layout).
-    //    offset  0: si_signo (i32)
-    //    offset  4: si_errno (i32) = 0
-    //    offset  8: si_code  (i32)
-    //    offset 12: _pad
-    //    offset 16: si_addr  (u64)   for SIGSEGV/SIGBUS/SIGFPE/SIGILL
-    //    offset 24: si_pid   (u32)   for SIGCHLD / kill()
-    //    offset 28: si_uid   (u32)
     unsafe {
         let si = siginfo_va as *mut u8;
         core::ptr::write_bytes(si, 0, SIGINFO_SIZE);
@@ -418,35 +401,55 @@ fn push_sigframe_riscv(
         (si.add(28) as *mut u32).write(info.uid);
     }
 
-    // 3. Write restorer VA.
-    unsafe {
-        (restorer_va as *mut usize).write(restorer);
-    }
+    // 3. Save the pre-delivery sigmask so sigreturn can restore it exactly.
+    unsafe { (sigmask_va as *mut u64).write(old_mask); }
 
-    // 4. Redirect the TrapFrame so sret enters the handler.
+    // 4. Restorer: use SA_RESTORER value if provided, otherwise synthesize
+    //    a `li a7, 139; ecall` trampoline in the frame and point ra there.
+    let effective_restorer = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
+        unsafe { (restorer_slot_va as *mut usize).write(restorer); }
+        restorer
+    } else {
+        // RV64: li a7, 139 = addi a7, x0, 139 = 0x08b00893
+        //       ecall                          = 0x00000073
+        unsafe {
+            core::ptr::write_bytes(trampoline_va as *mut u8, 0, TRAMPOLINE_SIZE);
+            (trampoline_va as *mut u32).write(0x08b00893u32); // li a7, 139
+            (trampoline_va as *mut u32).add(1).write(0x00000073u32); // ecall
+            (restorer_slot_va as *mut usize).write(trampoline_va);
+        }
+        trampoline_va
+    };
+
+    // 5. Redirect TrapFrame.
     frame.sepc = handler_va;
-    frame.a0   = info.sig as usize;    // signum
-    frame.a1   = siginfo_va;           // &siginfo_t
-    frame.a2   = 0;                    // no ucontext_t
-    frame.sp   = new_sp;               // new user sp
-    frame.ra   = restorer;             // return address out of handler
+    frame.a0   = info.sig as usize;
+    frame.a1   = siginfo_va;
+    frame.a2   = 0;
+    frame.sp   = new_sp;
+    frame.ra   = effective_restorer;
 }
 
 // ── push_sigframe_x86 ─────────────────────────────────────────────────
 //
-// Carves an x86_64 signal frame from the user RSP and redirects RIP.
+// ucontext_t layout (320 bytes total):
 //
-// Frame layout on user stack (grows down):
-//   [user rsp before signal]
-//     -8    retaddr (restorer VA)
-//     -88   siginfo_t (80 bytes)
-//     -344  ucontext_t (256 bytes)  ← new user rsp
+//   +0    uc_flags      (8)
+//   +8    uc_link       (8)
+//   +16   uc_stack      (24: ss_sp u64, ss_flags i32, _pad i32, ss_size u64)
+//   +40   uc_mcontext:
+//           gregs[23]   (184 bytes = 23 × 8)
+//             [0]  r8   [1]  r9   [2] r10  [3] r11  [4] r12
+//             [5]  r13  [6]  r14  [7] r15  [8] rdi  [9] rsi
+//             [10] rbp  [11] rbx  [12] rdx [13] rax [14] rcx
+//             [15] rsp  [16] rip  [17] efl [18..22] 0
+//           fpregs ptr  (8 bytes, zeroed)
+//   +232  (pad)
+//   +296  uc_sigmask    (8 bytes — old sigmask before delivery)
+//   +304  (pad to 320)
 //
-// On entry to handler:
-//   rdi = signum
-//   rsi = &siginfo_t  (frame + 256)
-//   rdx = &ucontext_t (frame + 0)
-//   rip = handler_va
+// siginfo_t at frame+320 (80 bytes).
+// retaddr  at frame+400  (8 bytes — restorer VA).
 
 #[cfg(target_arch = "x86_64")]
 fn push_sigframe_x86(
@@ -455,6 +458,7 @@ fn push_sigframe_x86(
     handler_va: usize,
     restorer:   usize,
     sa_flags:   u32,
+    old_mask:   u64,
 ) {
     let pid = scheduler::current_pid() as usize;
     let base_rsp = if sa_flags & SA_ONSTACK != 0 {
@@ -465,41 +469,51 @@ fn push_sigframe_x86(
         } else { frame.rsp }
     } else { frame.rsp };
 
-    // Frame: 256 (ucontext) + 80 (siginfo) + 8 (retaddr) = 344 bytes.
-    const UCTX_SIZE:    usize = 256;
+    const UCTX_SIZE:    usize = 320;  // covers uc_sigmask at +296
     const SIGINFO_SIZE: usize = 80;
     const RETADDR_SIZE: usize = 8;
     const FRAME_TOTAL:  usize = UCTX_SIZE + SIGINFO_SIZE + RETADDR_SIZE;
 
-    let new_rsp     = (base_rsp - FRAME_TOTAL) & !0xf;
-    let uctx_va     = new_rsp;
-    let siginfo_va  = new_rsp + UCTX_SIZE;
-    let retaddr_va  = new_rsp + UCTX_SIZE + SIGINFO_SIZE;
+    let new_rsp    = (base_rsp - FRAME_TOTAL) & !0xf;
+    let uctx_va    = new_rsp;
+    let siginfo_va = new_rsp + UCTX_SIZE;
+    let retaddr_va = new_rsp + UCTX_SIZE + SIGINFO_SIZE;
 
-    // 1. Write ucontext_t (256 bytes, simplified — saves rip, rsp, rflags,
-    //    and all GP regs so rt_sigreturn can restore them).
-    //    Linux ucontext_t layout (offsets we care about):
-    //      +0   uc_flags
-    //      +8   uc_link
-    //      +16  uc_stack (ss_sp, ss_flags, ss_size)
-    //      +40  uc_mcontext (gregs[23] starting at +56):
-    //             gregs[0..15] = r8-r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp
-    //             gregs[16]    = rip
-    //             gregs[17]    = eflags
-    //    We use a simplified layout: zero everything, then store the
-    //    registers we need for sigreturn at well-known offsets.
+    // 1. Zero the whole ucontext, then fill known fields.
     unsafe {
         core::ptr::write_bytes(uctx_va as *mut u8, 0, UCTX_SIZE);
-        // Store rip at uc_mcontext.rip  (offset 160 = 40 + 15*8)
-        // Store rsp at uc_mcontext.rsp  (offset 152 = 40 + 14*8)
-        // Store rflags at uc_mcontext.eflags (offset 168 = 40 + 16*8 + 8)
-        let base = uctx_va as *mut usize;
-        base.add(20).write(frame.rip);    // offset 160: rip
-        base.add(19).write(frame.rsp);    // offset 152: rsp
-        base.add(21).write(frame.rflags); // offset 168: rflags
+
+        // gregs base = uctx_va + 40.  Each greg is 8 bytes.
+        // Index mapping:
+        //   0=r8  1=r9  2=r10 3=r11 4=r12 5=r13 6=r14 7=r15
+        //   8=rdi 9=rsi 10=rbp 11=rbx 12=rdx 13=rax 14=rcx
+        //   15=rsp 16=rip 17=efl
+        let gregs = (uctx_va + 40) as *mut usize;
+        gregs.add(0).write(frame.r8);
+        gregs.add(1).write(frame.r9);
+        gregs.add(2).write(frame.r10);
+        gregs.add(3).write(frame.rflags); // r11 = rflags on syscall; best effort for async sigs
+        gregs.add(4).write(frame.r12);
+        gregs.add(5).write(frame.r13);
+        gregs.add(6).write(frame.r14);
+        gregs.add(7).write(frame.r15);
+        gregs.add(8).write(frame.rdi);
+        gregs.add(9).write(frame.rsi);
+        gregs.add(10).write(frame.rbp);
+        gregs.add(11).write(frame.rbx);
+        gregs.add(12).write(frame.rdx);
+        gregs.add(13).write(frame.rax);
+        gregs.add(14).write(frame.rip);  // rcx = user rip on syscall
+        gregs.add(15).write(frame.rsp);
+        gregs.add(16).write(frame.rip);
+        gregs.add(17).write(frame.rflags);
+
+        // uc_sigmask at +296.
+        let sigmask_ptr = (uctx_va + 296) as *mut u64;
+        sigmask_ptr.write(old_mask);
     }
 
-    // 2. Write siginfo_t.
+    // 2. siginfo_t.
     unsafe {
         let si = siginfo_va as *mut u8;
         core::ptr::write_bytes(si, 0, SIGINFO_SIZE);
@@ -510,38 +524,34 @@ fn push_sigframe_x86(
         (si.add(28) as *mut u32).write(info.uid);
     }
 
-    // 3. Write restorer at retaddr slot (below siginfo).
+    // 3. Restorer.
     unsafe { (retaddr_va as *mut usize).write(restorer); }
 
-    // 4. Redirect the SyscallFrame.
+    // 4. Redirect SyscallFrame.
     frame.rip    = handler_va;
-    frame.rdi    = info.sig as usize;   // arg0: signum
-    frame.rsi    = siginfo_va;          // arg1: &siginfo_t
-    frame.rdx    = uctx_va;             // arg2: &ucontext_t
+    frame.rdi    = info.sig as usize;
+    frame.rsi    = siginfo_va;
+    frame.rdx    = uctx_va;
     frame.rsp    = new_rsp;
-    frame.rflags = 0x202;
+    frame.rflags = 0x202; // IF set, everything else clear
 }
 
-// ── sys_rt_sigreturn ─────────────────────────────────────────────────────
+// ── sys_rt_sigreturn ──────────────────────────────────────────────────
 //
 // NR 15 on x86_64, NR 139 on RISC-V.
-// Restores the saved register state from the SignalFrame at the current
-// user stack pointer, undoing what push_sigframe_* set up.
+// Restores the pre-signal register state and sigmask from the SignalFrame.
 
 #[cfg(target_arch = "riscv64")]
 pub fn sys_rt_sigreturn(frame: &mut crate::arch::riscv64::trap::TrapFrame) -> isize {
     use crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
 
-    // The saved TrapFrame is at frame.sp (which is the new_sp we set in
-    // push_sigframe_riscv — the lowest address of the signal frame).
+    // Saved TrapFrame is at frame.sp (= new_sp set in push_sigframe_riscv).
     let saved_va = frame.sp;
-
-    // Basic sanity: must be in user space and 8-byte aligned.
     if saved_va == 0 || saved_va >= USER_SPACE_END || saved_va & 7 != 0 {
         return -14;
     }
 
-    // Restore the saved TrapFrame over the current one.
+    // Restore the full TrapFrame.
     unsafe {
         core::ptr::copy_nonoverlapping(
             saved_va as *const u8,
@@ -550,57 +560,51 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::riscv64::trap::TrapFrame) -> is
         );
     }
 
-    // Restore the sigmask that was active before the signal.
-    // We unblock the signal that was being handled. We use the
-    // saved sstatus to identify which signal; for simplicity we
-    // just clear the lowest set bit of the current per-signal block
-    // added by SA_NODEFER logic — the real implementation would
-    // save the pre-delivery mask in the sigframe.
-    // For now, clear the whole per-handler addition by reading the
-    // restorer VA slot to find which signal we were in.
-    // Simplified: restore the old mask stored just after the TrapFrame.
+    // Restore the exact pre-delivery sigmask from the saved slot.
+    const SIGINFO_SIZE: usize = 80;
+    let sigmask_va = saved_va + TRAP_FRAME_SIZE + SIGINFO_SIZE;
+    let old_mask = unsafe { core::ptr::read_unaligned(sigmask_va as *const u64) };
     let pid = scheduler::current_pid() as usize;
-    // The siginfo is at saved_va + TRAP_FRAME_SIZE.
-    // si_signo is the first i32 there.
-    let signo = unsafe {
-        core::ptr::read_unaligned((saved_va + TRAP_FRAME_SIZE) as *const i32)
-    } as usize;
-    if signo >= 1 && signo <= 64 {
-        let old = get_sigmask(pid);
-        set_sigmask(pid, old & !(1u64 << signo));
-    }
+    set_sigmask(pid, old_mask);
 
-    // Return value is taken from the restored frame's a0 — the frame
-    // restore happens above so the trap handler will reload a0 from
-    // the frame.  Return 0 here (the TrapFrame.a0 already has the
-    // correct value from when the signal was delivered).
+    // Return value comes from the restored frame.a0.
     0
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_rt_sigreturn(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) -> isize {
-    // The ucontext_t is at frame.rsp (new_rsp set in push_sigframe_x86).
+    // ucontext_t is at frame.rsp (= new_rsp set in push_sigframe_x86).
     let uctx_va = frame.rsp;
     if uctx_va == 0 || uctx_va >= USER_SPACE_END { return -14; }
 
-    // Restore rip, rsp, rflags from the ucontext layout we wrote.
     unsafe {
-        let base = uctx_va as *const usize;
-        frame.rip    = base.add(20).read(); // offset 160
-        frame.rsp    = base.add(19).read(); // offset 152
-        frame.rflags = base.add(21).read(); // offset 168
+        let gregs = (uctx_va + 40) as *const usize;
+        frame.r8     = gregs.add(0).read();
+        frame.r9     = gregs.add(1).read();
+        frame.r10    = gregs.add(2).read();
+        // gregs[3] = r11; on SYSCALL path r11 is rflags — restore as rflags.
+        frame.rflags = gregs.add(3).read();
+        frame.r12    = gregs.add(4).read();
+        frame.r13    = gregs.add(5).read();
+        frame.r14    = gregs.add(6).read();
+        frame.r15    = gregs.add(7).read();
+        frame.rdi    = gregs.add(8).read();
+        frame.rsi    = gregs.add(9).read();
+        frame.rbp    = gregs.add(10).read();
+        frame.rbx    = gregs.add(11).read();
+        frame.rdx    = gregs.add(12).read();
+        frame.rax    = gregs.add(13).read();
+        // gregs[14]=rcx (=rip on SYSCALL); gregs[16]=rip — use gregs[16]
+        frame.rsp    = gregs.add(15).read();
+        frame.rip    = gregs.add(16).read();
+        frame.rflags = gregs.add(17).read();
+
+        // Restore pre-delivery sigmask from uc_sigmask at +296.
+        let old_mask = core::ptr::read_unaligned((uctx_va + 296) as *const u64);
+        let pid = scheduler::current_pid() as usize;
+        set_sigmask(pid, old_mask);
     }
 
-    // Unblock the signal we were handling.
-    let siginfo_va = uctx_va + 256;
-    let signo = unsafe {
-        core::ptr::read_unaligned(siginfo_va as *const i32)
-    } as usize;
-    let pid = scheduler::current_pid() as usize;
-    if signo >= 1 && signo <= 64 {
-        let old = get_sigmask(pid);
-        set_sigmask(pid, old & !(1u64 << signo));
-    }
     0
 }
 
@@ -809,7 +813,7 @@ pub fn sys_rt_sigaction(
     0
 }
 
-// ── sys_sigprocmask [NR 14 / NR 135] ─────────────────────────────────
+// ── sys_sigprocmask [NR 14] ───────────────────────────────────────────
 
 pub fn sys_rt_sigprocmask(
     how: u32, set_va: usize, oldset_va: usize, sigsetsize: usize,
@@ -833,4 +837,12 @@ pub fn sys_rt_sigprocmask(
         set_sigmask(pid, new_mask);
     }
     0
+}
+
+// ── altstack_clear_pid (called from do_exit) ──────────────────────────
+
+pub fn altstack_clear_pid(pid: usize) {
+    ALTSTACK.lock().remove(&pid);
+    SIGMASK.lock().remove(&pid);
+    PENDING.lock().remove(&pid);
 }
