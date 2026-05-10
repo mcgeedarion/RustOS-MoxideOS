@@ -1,10 +1,7 @@
-//! Ethernet frame layer — stub.
+//! This module has been merged into `eth.rs`.
+//!
+//! `MacAddr` and all Ethernet framing logic now live in `crate::net::eth`.
+//! This file is kept as a one-line re-export so any out-of-tree code that
+//! still references `crate::net::ethernet` compiles without changes.
 
-/// 6-byte MAC address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MacAddr(pub [u8; 6]);
-
-impl MacAddr {
-    pub const ZERO: Self = MacAddr([0u8; 6]);
-    pub const BROADCAST: Self = MacAddr([0xFF; 6]);
-}
+pub use crate::net::eth::MacAddr;
