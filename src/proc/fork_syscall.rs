@@ -1,14 +1,16 @@
 //! sys_fork (NR 57) — implemented using clone_for_fork (CoW + VMA clone).
 //!
-//! ## Bug fix
+//! ## Arch-specific first-entry paths
 //!
-//! ### push_syscall_frame: CS and RSP slots were wrong
-//!   The 17-slot iretq frame: [13]=rip, [14]=cs, [15]=rflags, [16]=rsp.
-//!   Old code: slot 14 = rflags (should be USER_CS=0x23),
-//!             slot 15 = user_rsp (should be rflags),
-//!             slot 16 = rip again (should be user_rsp).
-//!   On first user return the CPU loads 0x202 as CS, causing #GP before
-//!   the fork child ran a single user instruction.
+//! Identical to clone.rs:
+//!   - x86_64: `push_syscall_frame` + `rip = sysret_trampoline`
+//!   - RISC-V: `push_trap_frame_riscv` + `ra = task_entry_trampoline`
+//!
+//! ## Bug fixes (carried forward)
+//!
+//! ### push_syscall_frame: CS and RSP slots were wrong (x86_64)
+//!   [14]=cs (USER_CS=0x23), [15]=rflags, [16]=rsp.
+//!   Old: [14]=rflags, [15]=rsp, [16]=rip — caused #GP on first user return.
 
 extern crate alloc;
 use crate::mm::kstack::alloc_kstack;
@@ -25,7 +27,6 @@ use crate::arch::x86_64::syscall::sysret_trampoline;
 #[allow(dead_code)]
 fn sysret_trampoline() {}
 
-// Ring-3 selectors.
 const USER_CS: usize = 0x23;
 
 /// sys_fork() -> child_pid (parent) / 0 (child)  [NR 57]
@@ -65,17 +66,36 @@ pub fn sys_fork() -> isize {
         None => return -1,
     };
 
-    push_syscall_frame(kstack_top, child_pcb.pc, 0x202, child_pcb.sp);
+    // ── arch-specific kernel-stack frame + Context init ──────────────────
+    #[cfg(target_arch = "x86_64")]
+    let child_ctx = {
+        push_syscall_frame(kstack_top, child_pcb.pc, 0x202, child_pcb.sp);
+        Context {
+            rip: sysret_trampoline as usize,
+            rsp: kstack_top - 17 * 8,
+            ..Context::zero()
+        }
+    };
 
-    let child_ctx = Context {
-        rip: sysret_trampoline as usize,
-        rsp: kstack_top - 17 * 8,
-        ..Context::zero()
+    #[cfg(target_arch = "riscv64")]
+    let child_ctx = {
+        // For fork the child resumes at the same PC/SP as the parent
+        // (CoW address space copy ensures they have independent pages).
+        push_trap_frame_riscv(kstack_top, child_pcb.pc, child_pcb.sp, child_pcb.tls_base);
+        let frame_sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
+        Context {
+            ra:  crate::proc::context::task_entry_trampoline as usize,
+            sp:  frame_sp,
+            s0:  0,
+            ..Context::zero()
+        }
     };
 
     child_pcb.pid              = child_pid;
     child_pcb.ppid             = parent_pid;
     child_pcb.tgid             = child_pid;
+    child_pcb.pgid             = scheduler::with_proc(parent_pid, |p| p.pgid)
+                                     .unwrap_or(child_pid);
     child_pcb.state            = State::Ready;
     child_pcb.exit_code        = 0;
     child_pcb.user_satp        = child_cr3;
@@ -93,19 +113,23 @@ pub fn sys_fork() -> isize {
     child_pcb.cpu_time_ns        = 0;
     child_pcb.rt_cpu_time_us     = 0;
 
+    // Enqueue PCB into global table first, then enqueue the Task on the
+    // least-loaded CPU runqueue.  Fork children always go through
+    // enqueue_task (load-balanced) since they have a private address space
+    // and there's no TLB-warmth reason to pin them to the parent's CPU.
     scheduler::enqueue(child_pcb);
+    let task_ptr = scheduler::task_ptr_for_pid(child_pid);
+    if !task_ptr.is_null() {
+        scheduler::enqueue_task(task_ptr);
+    }
+
     crate::fs::process_fd::proc_fd_fork(parent_pid, child_pid);
     child_pid as isize
 }
 
-/// Build the 17-slot iretq frame at the top of the kernel stack.
-///
-/// Frame layout (slot index, 8 bytes each):
-///   [0..12]  zeroed (saved GPRs)
-///   [13]     rip    — userspace resume address
-///   [14]     cs     — USER_CS (0x23)
-///   [15]     rflags — 0x202 (IF=1)
-///   [16]     rsp    — user stack pointer
+// ── x86_64: 17-slot iretq frame ────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
     let base = kstack_top - FRAME_SZ;
@@ -113,8 +137,31 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
     unsafe {
         for i in 0..17 { p.add(i).write(0); }
         p.add(13).write(rip);      // RIP
-        p.add(14).write(USER_CS);  // CS  — FIX: was rflags (0x202)
-        p.add(15).write(rflags);   // RFLAGS — FIX: was user_rsp
-        p.add(16).write(user_rsp); // RSP — FIX: was rip again
+        p.add(14).write(USER_CS);  // CS
+        p.add(15).write(rflags);   // RFLAGS
+        p.add(16).write(user_rsp); // RSP
+    }
+}
+
+// ── RISC-V: full TrapFrame ───────────────────────────────────────────────────────
+
+/// RISC-V: build a `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE`.
+///
+/// For fork the child resumes at the parent's PC (CoW pages are independent
+/// so the same virtual address is safe in both address spaces).  `a0 = 0`
+/// so the child sees a return value of 0 from the `ecall`, matching Linux
+/// semantics.
+#[cfg(target_arch = "riscv64")]
+fn push_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, tls: usize) {
+    use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE, SSTATUS_SPIE, SSTATUS_SPP};
+    let frame_va = kstack_top - TRAP_FRAME_SIZE;
+    unsafe {
+        core::ptr::write_bytes(frame_va as *mut u8, 0, TRAP_FRAME_SIZE);
+        let f = frame_va as *mut TrapFrame;
+        (*f).sp      = user_sp;
+        (*f).tp      = tls;
+        (*f).a0      = 0;                          // child return value = 0
+        (*f).sepc    = entry_pc;
+        (*f).sstatus = SSTATUS_SPIE & !SSTATUS_SPP;
     }
 }

@@ -23,18 +23,8 @@
 //! ## `schedule_on(task, cpu)` — pinned cross-CPU enqueue
 //!
 //! Forces `task` onto `cpu`'s runqueue regardless of load.  Used by:
-//!   - `clone(CLONE_VM)` thread creation: the new thread lands on a specific
-//!     CPU chosen by the caller, bypassing the load-balancer.
-//!   - `sched_setaffinity`: after restricting a task's cpumask to a single CPU,
-//!     the kernel re-enqueues via `schedule_on` so it migrates immediately.
-//!   - The test harness in CI: `smp_sched_smoke` creates a task, pins it to
-//!     CPU 1, and verifies the log line `sched: task <pid> assigned to cpu 1`.
-//!
-//! Protocol:
-//!   1. Remove the task from its current runqueue (if any).
-//!   2. Update `task.sched.cpumask` to pin to `cpu`.
-//!   3. Enqueue onto `PERCPU_BLOCKS[cpu].runqueue`.
-//!   4. If `cpu != current_cpu`, send a `Reschedule` IPI.
+//!   - `clone(CLONE_VM)`: pin new thread to parent CPU for warm TLB.
+//!   - `sched_setaffinity`: immediate migration after cpumask update.
 //!
 //! ## CPU affinity
 //!
@@ -54,13 +44,9 @@ use crate::sync::spinlock::SpinLock;
 
 // ── Constants ─────────────────────────────────────────────────────────────────────────
 
-/// Scheduler tick period in nanoseconds (1 ms).
 pub const TICK_NS: u64 = 1_000_000;
-/// Nice-0 CFS weight (matches Linux table entry 120).
 pub const NICE0_WEIGHT: u64 = 1024;
-/// Load balance every N ticks.
 pub const BALANCE_TICKS: u64 = 10;
-/// All CPUs allowed (default affinity mask for a 64-CPU system).
 pub const CPUMASK_ALL: u64 = u64::MAX;
 
 // ── Scheduling policy ─────────────────────────────────────────────────────────────────
@@ -157,13 +143,13 @@ pub(crate) fn nice_to_weight(nice: i8) -> u64 {
     }
 }
 
-// ── CFS run-queue entry ─────────────────────────────────────────────────────────────────
+// ── CFS entry ────────────────────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct CfsEntry {
     vruntime: u64,
     pid: u32,
-    task_ptr: *mut crate::proc::task::Task,
+    task_ptr: *mut crate::proc::task_types::Task,
 }
 impl Ord for CfsEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
@@ -175,13 +161,13 @@ impl PartialOrd for CfsEntry {
 }
 unsafe impl Send for CfsEntry {}
 
-// ── Deadline run-queue entry ──────────────────────────────────────────────────────────────
+// ── Deadline entry ───────────────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct DlEntry {
     abs_deadline: u64,
     pid: u32,
-    task_ptr: *mut crate::proc::task::Task,
+    task_ptr: *mut crate::proc::task_types::Task,
 }
 impl Ord for DlEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
@@ -198,7 +184,7 @@ unsafe impl Send for DlEntry {}
 pub struct RunQueue {
     pub cfs_heap:  BinaryHeap<CfsEntry>,
     pub min_vruntime: u64,
-    pub rt_queue:  VecDeque<*mut crate::proc::task::Task>,
+    pub rt_queue:  VecDeque<*mut crate::proc::task_types::Task>,
     pub dl_heap:   BinaryHeap<DlEntry>,
     pub nr_running: u32,
     pub load_weight: u64,
@@ -222,7 +208,7 @@ impl RunQueue {
         }
     }
 
-    pub fn enqueue(&mut self, task: *mut crate::proc::task::Task) {
+    pub fn enqueue(&mut self, task: *mut crate::proc::task_types::Task) {
         let t = unsafe { &mut *task };
         self.nr_running += 1;
         self.load_weight += t.sched.weight;
@@ -251,7 +237,7 @@ impl RunQueue {
         }
     }
 
-    fn dequeue_cfs(&mut self) -> Option<*mut crate::proc::task::Task> {
+    fn dequeue_cfs(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         self.cfs_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
@@ -261,7 +247,7 @@ impl RunQueue {
         })
     }
 
-    fn dequeue_rt(&mut self) -> Option<*mut crate::proc::task::Task> {
+    fn dequeue_rt(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         if self.rt_queue.is_empty() { return None; }
         let best_idx = self.rt_queue.iter().enumerate()
             .max_by_key(|(_, &tp)| unsafe { (*tp).sched.rt_priority })
@@ -274,7 +260,7 @@ impl RunQueue {
         Some(task)
     }
 
-    fn dequeue_dl(&mut self) -> Option<*mut crate::proc::task::Task> {
+    fn dequeue_dl(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         self.dl_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
@@ -284,7 +270,7 @@ impl RunQueue {
         })
     }
 
-    pub fn dequeue_next(&mut self) -> Option<*mut crate::proc::task::Task> {
+    pub fn dequeue_next(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         if !self.dl_heap.is_empty() { return self.dequeue_dl(); }
         if !self.rt_queue.is_empty() { return self.dequeue_rt(); }
         self.dequeue_cfs()
@@ -340,7 +326,7 @@ impl RunQueue {
 // ── Global process table ────────────────────────────────────────────────────────────────
 
 use crate::proc::process::Pcb;
-use crate::proc::task::Task;
+use crate::proc::task_types::Task;
 
 static PROCS: SpinLock<Vec<Pcb>> = SpinLock::new(Vec::new());
 
@@ -351,6 +337,12 @@ static NEXT_PID: core::sync::atomic::AtomicU32 =
 
 pub fn next_pid() -> u32 {
     NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Total number of live processes in the global process table.
+/// Used by RLIMIT_NPROC checks in `sys_fork` and `sys_clone3`.
+pub fn proc_count() -> usize {
+    PROCS.lock().len()
 }
 
 #[inline]
@@ -366,7 +358,13 @@ pub fn current_pid() -> u32 {
     unsafe { (*task).pid }
 }
 
-// ── mm_lock helpers for uaccess TOCTOU mitigation ─────────────────────────────────────────
+/// Return the tgid for `pid`, or 0 if not found.
+/// Used by thread.rs and signal.rs.
+pub fn tgid_of(pid: usize) -> usize {
+    with_proc(pid, |p| p.tgid).unwrap_or(0)
+}
+
+// ── mm_lock helpers ──────────────────────────────────────────────────────────────────
 
 pub struct MmReadGuard<'a> {
     _guard: crate::sync::spinlock::SpinLockGuard<'a, Vec<Pcb>>,
@@ -387,11 +385,11 @@ pub fn has_current_user_proc() -> bool {
 
 pub fn enqueue(pcb: Pcb) { PROCS.lock().push(pcb); }
 
-pub fn with_proc<T, F: FnOnce(&Pcb) -> T>(pid: u32, f: F) -> Option<T> {
+pub fn with_proc<T, F: FnOnce(&Pcb) -> T>(pid: usize, f: F) -> Option<T> {
     let procs = PROCS.lock();
     procs.iter().find(|p| p.pid == pid).map(f)
 }
-pub fn with_proc_mut<T, F: FnOnce(&mut Pcb) -> T>(pid: u32, f: F) -> Option<T> {
+pub fn with_proc_mut<T, F: FnOnce(&mut Pcb) -> T>(pid: usize, f: F) -> Option<T> {
     let mut procs = PROCS.lock();
     procs.iter_mut().find(|p| p.pid == pid).map(f)
 }
@@ -399,14 +397,18 @@ pub fn with_procs<T, F: FnOnce(&Vec<Pcb>) -> T>(f: F) -> T { f(&PROCS.lock()) }
 pub fn with_procs_mut<T, F: FnOnce(&mut Vec<Pcb>) -> T>(f: F) -> T { f(&mut PROCS.lock()) }
 pub use with_procs as with_procs_ro;
 
-fn task_ptr_for(pid: u32) -> *mut Task {
+/// Return a raw `*mut Task` for `pid` by reading `Pcb::task`.
+///
+/// Used by `clone.rs` and `fork_syscall.rs` to get a task pointer after
+/// `enqueue(child_pcb)` so they can call `enqueue_task` / `schedule_on`.
+///
+/// Returns null if the pid is not found or the task pointer is null.
+pub fn task_ptr_for_pid(pid: usize) -> *mut Task {
     with_proc(pid, |p| p.task as *mut Task).unwrap_or(core::ptr::null_mut())
 }
 
 // ── Enqueue helpers ────────────────────────────────────────────────────────────────────
 
-/// Load-balanced enqueue.  Picks the least-loaded CPU whose affinity mask
-/// permits `task`, then sends a reschedule IPI if the target is remote.
 pub fn enqueue_task(task: *mut Task) {
     if task.is_null() { return; }
     let t = unsafe { &mut *task };
@@ -431,23 +433,9 @@ pub fn enqueue_task(task: *mut Task) {
         crate::smp::percpu::PERCPU_BLOCKS[best_cpu as usize]
             .runqueue.enqueue(task);
     }
-
     crate::smp::ipi::send_reschedule(best_cpu);
 }
 
-/// Pinned cross-CPU enqueue — bypass the load balancer and place `task`
-/// directly on `cpu`'s runqueue.
-///
-/// Steps:
-///   1. Remove from current runqueue if already enqueued (prevents
-///      duplicate entries across two CPUs' heaps).
-///   2. Pin `task.sched.cpumask` to `cpu` so load_balance won't migrate it
-///      away until the caller widens the mask again.
-///   3. Enqueue onto `PERCPU_BLOCKS[cpu].runqueue`.
-///   4. Send a `Reschedule` IPI if `cpu` is remote so it wakes from `wfi`.
-///
-/// The log line `sched: task <pid> assigned to cpu <cpu>` is emitted so CI
-/// can grep for it to verify the cross-CPU path was exercised.
 pub fn schedule_on(task: *mut Task, cpu: u32) {
     if task.is_null() { return; }
     let ncpus = crate::smp::percpu::cpu_count();
@@ -456,7 +444,6 @@ pub fn schedule_on(task: *mut Task, cpu: u32) {
     let t = unsafe { &mut *task };
     let pid = t.pid;
 
-    // Step 1: remove from previous runqueue.
     if t.sched.on_rq {
         let prev_cpu = t.sched.last_cpu;
         if prev_cpu < ncpus {
@@ -467,19 +454,15 @@ pub fn schedule_on(task: *mut Task, cpu: u32) {
         }
     }
 
-    // Step 2: pin to target cpu.
     t.sched.cpumask  = 1u64 << cpu;
     t.sched.last_cpu = cpu;
 
-    // Step 3: enqueue on target.
     unsafe {
         crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
             .runqueue.enqueue(task);
     }
 
     crate::println!("sched: task {} assigned to cpu {}", pid, cpu);
-
-    // Step 4: wake the target CPU.
     crate::smp::ipi::send_reschedule(cpu);
 }
 
@@ -505,8 +488,8 @@ pub fn block_current() {
     schedule();
 }
 
-pub fn wake_pid(pid: u32) {
-    let task = task_ptr_for(pid);
+pub fn wake_pid(pid: usize) {
+    let task = task_ptr_for_pid(pid);
     if task.is_null() { return; }
 
     let was_blocked = with_proc_mut(pid, |p| {
@@ -521,7 +504,7 @@ pub fn wake_pid(pid: u32) {
     if !already_on_rq { enqueue_task(task); }
 }
 
-pub fn suspend_current_until_child_exec(_child_pid: u32) { block_current(); }
+pub fn suspend_current_until_child_exec(_child_pid: usize) { block_current(); }
 
 // ── schedule() ───────────────────────────────────────────────────────────────────────
 
@@ -546,12 +529,12 @@ pub fn schedule() {
                 prev.sched.dl_remaining.saturating_sub(elapsed);
         }
         let prev_pid   = prev.pid;
-        let prev_state = with_proc(prev_pid, |p| p.state)
+        let prev_state = with_proc(prev_pid as usize, |p| p.state)
             .unwrap_or(crate::proc::process::State::Zombie);
         if prev_state == crate::proc::process::State::Running
             || prev_state == crate::proc::process::State::Ready
         {
-            with_proc_mut(prev_pid, |p| p.state = crate::proc::process::State::Ready);
+            with_proc_mut(prev_pid as usize, |p| p.state = crate::proc::process::State::Ready);
             blk.runqueue.enqueue(prev_task);
         }
     }
@@ -568,7 +551,7 @@ pub fn schedule() {
     };
 
     let next = unsafe { &mut *next_task };
-    with_proc_mut(next.pid, |p| p.state = crate::proc::process::State::Running);
+    with_proc_mut(next.pid as usize, |p| p.state = crate::proc::process::State::Running);
     blk.runqueue.curr_vruntime_start = now;
     blk.current_task  = next_task;
     blk.ctx_switches += 1;
@@ -590,7 +573,7 @@ fn schedule_early() {
         .find(|p| p.state == crate::proc::process::State::Ready)
         .map(|p| p.pid);
     let Some(npid) = next_pid_val else { return; };
-    CURRENT_PID.store(npid, core::sync::atomic::Ordering::Relaxed);
+    CURRENT_PID.store(npid as u32, core::sync::atomic::Ordering::Relaxed);
     if let Some(p) = procs.iter_mut().find(|p| p.pid == npid) {
         p.state = crate::proc::process::State::Running;
     }
@@ -628,7 +611,7 @@ pub fn tick(cpu: u32) {
             let elapsed = now.saturating_sub(blk.runqueue.curr_vruntime_start);
             if elapsed >= TICK_NS {
                 let pid = t.pid;
-                with_proc_mut(pid, |p| p.state = crate::proc::process::State::Ready);
+                with_proc_mut(pid as usize, |p| p.state = crate::proc::process::State::Ready);
                 blk.current_task = core::ptr::null_mut();
                 blk.runqueue.enqueue(curr);
                 drop(blk);
@@ -668,7 +651,6 @@ fn load_balance(this_cpu: u32) {
 
     if let Some(task) = busy_blk.runqueue.dequeue_next() {
         let t = unsafe { &mut *task };
-        // Never migrate DEADLINE tasks or tasks pinned to a single CPU.
         if t.sched.policy == SchedPolicy::Deadline
             || t.sched.cpumask.count_ones() == 1
             || !t.sched.cpu_allowed(this_cpu)
@@ -681,13 +663,10 @@ fn load_balance(this_cpu: u32) {
             crate::smp::percpu::PERCPU_BLOCKS[this_cpu as usize]
                 .runqueue.enqueue(task);
         }
-        // Notify the receiving CPU it has new work.
         crate::smp::ipi::send_reschedule(this_cpu);
     }
 }
 
-/// AP idle loop — run on each secondary CPU after bringup.
-/// Sits in `wfi` and relies on reschedule IPIs + timer ticks to `schedule()`.
 pub fn ap_idle() -> ! {
     loop {
         schedule();
