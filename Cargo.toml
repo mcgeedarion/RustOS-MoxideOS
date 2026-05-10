@@ -36,12 +36,12 @@ cc = "1"
 # cargo build --features sysv_ipc       → + SysV IPC + POSIX mq
 # cargo build --features namespaces     → + PID/Mount/Net/UTS/User ns
 # cargo build --features cgroups        → + cgroups v1 controllers
-# cargo build --features gdbstub        → + GDB RSP stub (WIP)
+# cargo build --features gdbstub        → + GDB RSP stub
 # cargo build --features input_events   → + /dev/input evdev layer (WIP)
 # cargo build --features wayland        → + Wayland compositor scaffold (WIP)
 default = ["uefi_boot"]
 
-# ── Boot path ─────────────────────────────────────────────────────────────────
+# ── Boot path ────────────────────────────────────────────────────────────────────
 # RISC-V UEFI boot (EDK2 RiscVVirt / PE-COFF via lld-link).
 # Disable to use SBI direct boot: cargo xtask build --arch riscv64 --boot sbi
 uefi_boot = []
@@ -51,7 +51,19 @@ uefi_boot = []
 # independently; they carry no inter-dependencies unless noted.
 
 # GDB remote serial protocol stub.
-# Status: placeholder module only — no GDB RSP framing or packet handling yet.
+#
+# Status: fully implemented (serial.rs + rsp.rs).
+#   - Packet engine: ?, g/G, p/P, m/M, s, c, Z0/z0, H, qSupported,
+#     qAttached, qC, qfThreadInfo, qsThreadInfo, qOffsets, vCont?,
+#     vCont;s, vCont;c, vKill, D, k.
+#   - SW breakpoints: up to 16 simultaneous INT3 slots.
+#   - Serial I/O: polling COM1 (x86_64) / SBI console_getchar (RISC-V).
+#
+# Integration: call `crate::gdbstub::gdb_trap(regs)` from your INT3 / #DB
+#   exception handler, where `regs: *mut gdbstub::SavedRegs` points at the
+#   live register save frame.  SavedRegs layout must match the trap-entry
+#   push order (rax, rbx, rcx, rdx, rsi, rdi, rbp, r8–r15, rip, rflags).
+#
 # Enable: cargo build --features gdbstub
 gdbstub = []
 
