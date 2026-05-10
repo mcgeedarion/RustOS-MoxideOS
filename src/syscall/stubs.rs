@@ -21,6 +21,8 @@ fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isi
 
 // ── NR 19  readv ────────────────────────────────────────────────────────────────
 
+// Intentionally private to this include!() scope.
+#[allow(dead_code)]
 const IOV_STACK_BUF: usize = 4096;
 
 fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
@@ -394,7 +396,8 @@ fn sys_uname_impl(buf_va: usize) -> isize {
 }
 
 // ── NR 74/75  fsync / fdatasync ──────────────────────────────────────────────
-
+// Intentional no-op: rustos has no write-back cache to flush.
+#[allow(dead_code)]
 fn sys_fsync_impl(_fd: usize) -> isize { 0 }
 
 // ── NR 76/77  truncate / ftruncate ────────────────────────────────────────────
@@ -562,7 +565,10 @@ fn sys_getrusage_impl(who: i32, buf_va: usize) -> isize {
 
 // ── NR 99  sysinfo ─────────────────────────────────────────────────────────────
 
+// Private to this include!() scope; fields are written via unsafe transmute
+// into the user buffer, so rustc sees them as "never read" even though they are.
 #[repr(C)]
+#[allow(dead_code)]
 struct SysInfo {
     uptime:    i64,
     loads:     [u64; 3],
@@ -658,7 +664,10 @@ fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
 
 // ── NR 137/138  statfs / fstatfs ───────────────────────────────────────────────
 
+// Same as SysInfo: fields are written out via pointer cast; rustc cannot see
+// that they are "read" and would warn without this suppression.
 #[repr(C)]
+#[allow(dead_code)]
 struct StatFs {
     f_type:    i64, f_bsize:   i64,
     f_blocks:  u64, f_bfree:   u64, f_bavail:  u64,
@@ -692,7 +701,8 @@ fn sys_statfs_impl(_path_va: usize, buf_va: usize) -> isize { fill_statfs(buf_va
 fn sys_fstatfs_impl(_fd: usize,    buf_va: usize) -> isize { fill_statfs(buf_va) }
 
 // ── NR 162  sync ─────────────────────────────────────────────────────────────
-
+// Intentional no-op: no write-back cache to flush.
+#[allow(dead_code)]
 fn sys_sync_impl() -> isize { 0 }
 
 // ── NR 185  prctl ─────────────────────────────────────────────────────────────
@@ -893,12 +903,16 @@ fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
 }
 
 // ── Misc stubs ────────────────────────────────────────────────────────────────
+// All stubs below are intentional no-ops for the single-user root kernel.
+// Permission bits, ownership, locking, mounting, and syslog are unenforceable
+// until multi-user support lands. Each is suppressed individually so that a
+// NEW no-op added here still needs an explicit #[allow(dead_code)].
 
-fn sys_chmod_impl(_path_va: usize, _mode: u32) -> isize { 0 }
-fn sys_fchmod_impl(_fd: usize, _mode: u32) -> isize { 0 }
-fn sys_chown_impl(_path_va: usize, _uid: u32, _gid: u32) -> isize { 0 }
-fn sys_fchown_impl(_fd: usize, _uid: u32, _gid: u32) -> isize { 0 }
-fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-fn sys_mount_impl(_src: usize, _tgt: usize, _fs: usize, _flags: u64, _data: usize) -> isize { 0 }
-fn sys_syslog_impl(_t: i32, _buf: usize, _len: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_chmod_impl(_path_va: usize, _mode: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_fchmod_impl(_fd: usize, _mode: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_chown_impl(_path_va: usize, _uid: u32, _gid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_fchown_impl(_fd: usize, _uid: u32, _gid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_mount_impl(_src: usize, _tgt: usize, _fs: usize, _flags: u64, _data: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_syslog_impl(_t: i32, _buf: usize, _len: i32) -> isize { 0 }
