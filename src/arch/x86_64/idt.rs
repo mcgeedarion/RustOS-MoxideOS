@@ -7,26 +7,24 @@
 //! clobber rax/rcx/rdx/rsi/rdi/r8-r11 (caller-saved) without saving them.
 //!
 //! Stack layout on entry to each Rust handler (after the stub macro):
-//!   [rsp+0]  r15 .. rax  (15 × 8 = 120 bytes of saved GPRs)
+//!   [rsp+0]  r15 .. rdi  (15 × 8 = 120 bytes of saved GPRs)
 //!   [rsp+120] error_code  (pushed by CPU for #PF, #DF, etc.)
 //!                         or a dummy 0 pushed by the stub for others
 //!   [rsp+128] RIP / CS / RFLAGS / RSP(user) / SS  — CPU interrupt frame
 //!
 //! ## Exception routing
-//!   vector 14 (#PF) — page_fault_handler
-//!   vector 32 (timer IRQ) — timer_irq_handler
-//!   vectors 0-31 (other) — generic_exception_handler
+//!   vector 1  (#DB debug)  — db_handler  → gdbstub::gdb_trap (feature-gated)
+//!   vector 3  (#BP INT3)   — bp_handler  → gdbstub::gdb_trap (feature-gated)
+//!   vector 14 (#PF)        — page_fault_handler
+//!   vector 32 (timer IRQ)  — timer_irq_handler
+//!   vectors 0-31 (other)   — generic_exception_handler
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // ── Macro: full GPR save/restore frame ─────────────────────────────────────
 //
-// PUSH_ALL / POP_ALL bracket every ISR that calls a Rust function.
-// We use the `push` sequence that Linux uses for 64-bit entry.
-//
-// After PUSH_ALL the layout is:
-//   [rsp+0..112]  r15,r14,r13,r12,rbp,rbx,r11,r10,r9,r8,rax,rcx,rdx,rsi,rdi
-// The error code (or dummy 0) lives at [rsp+120] after the pushes.
+// Push order: rdi, rsi, rdx, rcx, rax, r8, r9, r10, r11, rbx, rbp, r12, r13, r14, r15
+// This order is what SavedRegs in gdbstub/rsp.rs expects.
 
 macro_rules! push_all {
     () => { concat!(
@@ -109,10 +107,14 @@ static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 pub fn idt_init() {
     if IDT_LOADED.swap(true, Ordering::SeqCst) { return; }
     unsafe {
+        IDT[1].set(db_asm  as usize, 0x8E); // #DB  debug exception
+        IDT[3].set(bp_asm  as usize, 0x8E); // #BP  INT3 breakpoint
         IDT[14].set(page_fault_asm as usize, 0x8E);
         IDT[32].set(timer_irq_asm  as usize, 0x8E);
         for i in 0usize..32 {
-            if i != 14 { IDT[i].set(generic_exc_asm as usize, 0x8E); }
+            if i != 1 && i != 3 && i != 14 {
+                IDT[i].set(generic_exc_asm as usize, 0x8E);
+            }
         }
         let ptr = IdtPointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
@@ -120,6 +122,71 @@ pub fn idt_init() {
         };
         core::arch::asm!("lidt [{p}]", p = in(reg) &ptr, options(nostack));
     }
+}
+
+// ── #DB debug-exception handler ───────────────────────────────────────────────
+
+/// Called from db_asm with rsp pointing at the base of the SavedRegs frame.
+/// When gdbstub is enabled, hands control to the GDB RSP stub.
+/// Otherwise falls through to the generic halt path.
+#[no_mangle]
+pub unsafe extern "C" fn db_handler(regs: *mut crate::gdbstub::rsp::SavedRegs) {
+    #[cfg(feature = "gdbstub")]
+    {
+        crate::gdbstub::gdb_trap(regs);
+        return;
+    }
+    #[cfg(not(feature = "gdbstub"))]
+    generic_exception_handler(0);
+}
+
+/// Called from bp_asm with rsp pointing at the base of the SavedRegs frame.
+#[no_mangle]
+pub unsafe extern "C" fn bp_handler(regs: *mut crate::gdbstub::rsp::SavedRegs) {
+    #[cfg(feature = "gdbstub")]
+    {
+        crate::gdbstub::gdb_trap(regs);
+        return;
+    }
+    #[cfg(not(feature = "gdbstub"))]
+    generic_exception_handler(0);
+}
+
+// ── #DB ASM stub (vector 1) ───────────────────────────────────────────────────
+//
+// #DB does not push an error code.  We push a dummy 0 to keep the stack
+// layout uniform, save all GPRs, then pass rsp (= &SavedRegs) to db_handler.
+
+#[naked]
+unsafe extern "C" fn db_asm() {
+    core::arch::asm!(
+        "push 0",      // dummy error code
+        push_all!(),
+        "mov rdi, rsp", // rdi = *mut SavedRegs
+        "call db_handler",
+        pop_all!(),
+        "add rsp, 8",   // discard dummy error code
+        "iretq",
+        options(noreturn)
+    );
+}
+
+// ── #BP ASM stub (vector 3) ───────────────────────────────────────────────────
+//
+// #BP (INT3) does not push an error code.  Same layout as #DB.
+
+#[naked]
+unsafe extern "C" fn bp_asm() {
+    core::arch::asm!(
+        "push 0",      // dummy error code
+        push_all!(),
+        "mov rdi, rsp", // rdi = *mut SavedRegs
+        "call bp_handler",
+        pop_all!(),
+        "add rsp, 8",   // discard dummy error code
+        "iretq",
+        options(noreturn)
+    );
 }
 
 // ── Page-fault handler ─────────────────────────────────────────────────────
@@ -149,42 +216,22 @@ pub extern "C" fn page_fault_handler(faulting_va: usize, error_code: u64) {
         crate::proc::scheduler::schedule();
         return;
     }
-    // Use the arch-neutral HAL halt so this path compiles correctly on
-    // RISC-V as well as x86_64.  A raw `hlt` here would cause an
-    // illegal-instruction fault on any non-x86 target.
     loop { crate::arch::api::Cpu::halt(); }
 }
 
 // ── ASM stubs ──────────────────────────────────────────────────────────────
-//
-// Each stub saves all GPRs, calls the Rust handler, restores GPRs, discards
-// the error code (or dummy), and executes IRETQ.
 
 /// Page-fault entry stub.
-/// The CPU pushes: error_code, RIP, CS, RFLAGS, RSP(user), SS.
-/// We read CR2 (faulting VA), save all GPRs, then call page_fault_handler.
 #[naked]
 unsafe extern "C" fn page_fault_asm() {
     core::arch::asm!(
-        // CR2 = faulting VA; it's clobbered by nested faults so save early.
         "push rax",
         "mov rax, cr2",
-        // At this point: [rsp+0]=saved rax, [rsp+8]=error_code (from CPU)
-        // Swap: put CR2 into [rsp+8] and error_code into rax.
         "xchg rax, [rsp+8]",
-        // Now: [rsp+0]=faulting_va (was rax slot), [rsp+8]=error_code
-        // Save the remaining GPRs (push_all! saves rdi first, but rax already
-        // saved; we need a custom sequence here).
-        // Build the standard GPR frame on the stack:
-        "push rdi",    // save rdi — we'll fill it with faulting_va
-        "push rsi",    // save rsi — we'll fill it with error_code
+        "push rdi",
+        "push rsi",
         "push rdx",
         "push rcx",
-        // rax already pushed at [rsp + 4*8 + 8] (after rdi/rsi/rdx/rcx)
-        // Actually restructure: save all regs *except* rax which is already
-        // on the stack as [rsp+original_offset].  Use a full standard frame:
-        //
-        // Simplest correct approach: push dummy rax slot, then fill args.
         "push r8",
         "push r9",
         "push r10",
@@ -195,17 +242,9 @@ unsafe extern "C" fn page_fault_asm() {
         "push r13",
         "push r14",
         "push r15",
-        // Now load handler arguments from the slots we set up above.
-        // The stack (from top = rsp) is:
-        //   rsp+0..112  r15..rdi (15 regs)
-        //   rsp+120     faulting_va  (the rax slot we swapped CR2 into)
-        //   rsp+128     error_code   (the slot we swapped old rax into)
-        //   rsp+136     RIP (CPU frame)
-        // Load args: rdi = faulting_va, rsi = error_code
         "mov rdi, [rsp + 120]",
         "mov rsi, [rsp + 128]",
         "call page_fault_handler",
-        // Restore all GPRs
         "pop r15",
         "pop r14",
         "pop r13",
@@ -220,7 +259,6 @@ unsafe extern "C" fn page_fault_asm() {
         "pop rdx",
         "pop rsi",
         "pop rdi",
-        // Discard the two slots (faulting_va / error_code) we set up.
         "add rsp, 16",
         "iretq",
         options(noreturn)
@@ -231,36 +269,21 @@ unsafe extern "C" fn page_fault_asm() {
 #[naked]
 unsafe extern "C" fn timer_irq_asm() {
     core::arch::asm!(
-        // Push dummy error code so the stack layout is uniform.
         "push 0",
         push_all!(),
-        // rdi = dummy 0 (no meaningful arg to timer handler)
         "xor rdi, rdi",
         "call timer_irq_handler",
         pop_all!(),
-        "add rsp, 8",   // discard dummy error code
+        "add rsp, 8",
         "iretq",
         options(noreturn)
     );
 }
 
-/// Generic exception stub (for vectors 0-31 except #PF, including those
-/// that push an error code and those that don't).
-/// For simplicity we use this for non-error-code exceptions too by pushing
-/// a dummy 0.  For exceptions that DO push an error code the CPU has already
-/// pushed it; the stub handles both cases by always pushing a dummy first
-/// and then doing the full save.
-///
-/// NOTE: For vectors 8, 10, 11, 12, 13, 17, 21, 29, 30 the CPU pushes an
-/// error code automatically. For those vectors a separate stub should be
-/// registered that does NOT push the dummy 0.  As a conservative fallback
-/// this stub is registered for all non-#PF vectors and the double-push
-/// for error-code exceptions is acceptable since generic_exception_handler
-/// currently just halts the kernel anyway.
+/// Generic exception stub.
 #[naked]
 unsafe extern "C" fn generic_exc_asm() {
     core::arch::asm!(
-        // Push a dummy error code for non-error-code exceptions.
         "push 0",
         push_all!(),
         "xor rdi, rdi",
