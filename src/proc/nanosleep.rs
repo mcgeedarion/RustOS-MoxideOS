@@ -1,21 +1,26 @@
 //! nanosleep + clock_gettime + clock_nanosleep syscall implementations.
 //!
-//! ## Bug fixes in this revision
+//! ## Bug fixes
 //!
 //! ### sleep_ns_internal: double schedule() call
 //!   `block_current()` already ends with `schedule()` internally.
 //!   The extra `scheduler::schedule()` after it caused the sleeping task
-//!   to yield a second time after the timer woke it, delaying the return
-//!   from nanosleep by one extra scheduling round trip.
+//!   to yield a second time after the timer woke it.
 //!
-//! ### sys_clock_gettime: copy_to_user return type mismatch
-//!   `copy_to_user` returns `bool`. `.is_err()` is not valid on `bool`.
-//!   Fixed to `if !copy_to_user(...)`.
+//! ### sys_clock_gettime: copy_to_user return type
+//!   `copy_to_user` returns `bool`. Fixed to `if !copy_to_user(...)`.
+//!
+//! ### with_proc_mut closures (post-S2)
+//!   All with_proc_mut closures now take (pcb, pl) and use pl.set_state
+//!   when changing state.
 
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::proc::scheduler;
+use crate::proc::process::State;
 use crate::time::{Timespec, read_monotonic_ns};
 use crate::time::timer::{add_oneshot, cancel_timer};
+
+pub fn now_ns() -> u64 { read_monotonic_ns() }
 
 /// sys_nanosleep(req_va, rem_va)  [NR 35]
 pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
@@ -44,9 +49,7 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
         return -4;
     }
 
-    if rem_va != 0 {
-        let _ = copy_to_user(rem_va, &[0u8; 16]);
-    }
+    if rem_va != 0 { let _ = copy_to_user(rem_va, &[0u8; 16]); }
     ret
 }
 
@@ -69,10 +72,9 @@ pub fn sys_clock_nanosleep(
     } else {
         req_ns
     };
-
     if delta_ns == 0 { return 0; }
-    let ret = sleep_ns_internal(delta_ns);
 
+    let ret = sleep_ns_internal(delta_ns);
     if ret == -4 && rem_va != 0 && flags & 1 == 0 {
         let rem = scheduler::with_proc(scheduler::current_pid(), |p| {
             p.sleep_deadline_ns.saturating_sub(read_monotonic_ns())
@@ -94,7 +96,6 @@ pub fn sys_clock_gettime(_clockid: u32, timespec_va: usize) -> isize {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
     buf[8..16].copy_from_slice(&nsec.to_le_bytes());
-    // FIX: copy_to_user returns bool, not Result. .is_err() is invalid on bool.
     if !copy_to_user(timespec_va, &buf) { return -14; }
     0
 }
@@ -102,47 +103,43 @@ pub fn sys_clock_gettime(_clockid: u32, timespec_va: usize) -> isize {
 // ── Internal: common blocking sleep path ────────────────────────────────────────────
 
 /// Block the current task for `delta_ns` nanoseconds.
-///
 /// Returns 0 on normal completion, -4 (EINTR) if woken early by a signal.
 pub fn sleep_ns_internal(delta_ns: u64) -> isize {
     let pid      = scheduler::current_pid();
     let deadline = read_monotonic_ns() + delta_ns;
 
-    scheduler::with_proc_mut(pid, |p| {
+    // Record deadline before arming timer.
+    scheduler::with_proc_mut(pid, |p, _pl| {
         p.sleep_deadline_ns = deadline;
     });
 
     let timer_id = add_oneshot(deadline, move |_| {
-        scheduler::with_proc_mut(pid, |p| {
+        scheduler::with_proc_mut(pid, |p, pl| {
             p.sleep_deadline_ns = 0;
             p.sleep_timer_id    = 0;
-            if p.state == crate::proc::process::State::Blocked {
-                p.state = crate::proc::process::State::Ready;
+            // Transition Blocked → Ready; if already Ready/Running leave it.
+            if p.state == State::Blocked {
+                pl.set_state(p, State::Ready);
             }
         });
         scheduler::wake_pid(pid);
     });
 
-    scheduler::with_proc_mut(pid, |p| {
+    scheduler::with_proc_mut(pid, |p, _pl| {
         p.sleep_timer_id = timer_id;
     });
 
-    // FIX: block_current() already calls schedule() internally.
-    // The old code called schedule() again after it, causing the task to
-    // yield a second time after the timer woke it.
+    // block_current() calls schedule() internally; do NOT call schedule() again.
     scheduler::block_current();
-    // Returns here when the timer callback calls wake_pid() on us.
 
-    let interrupted = scheduler::with_proc(pid, |p| {
-        p.sleep_deadline_ns != 0
-    }).unwrap_or(false);
+    let interrupted = scheduler::with_proc(pid, |p| p.sleep_deadline_ns != 0)
+        .unwrap_or(false);
 
     if interrupted {
         let tid = scheduler::with_proc(pid, |p| p.sleep_timer_id).unwrap_or(0);
         if tid != 0 { cancel_timer(tid); }
-        scheduler::with_proc_mut(pid, |p| p.sleep_timer_id = 0);
+        scheduler::with_proc_mut(pid, |p, _pl| p.sleep_timer_id = 0);
         return -4;
     }
-
     0
 }

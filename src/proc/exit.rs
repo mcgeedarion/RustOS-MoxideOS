@@ -31,9 +31,10 @@ use crate::uaccess::copy_to_user;
 // ── clear_child_tid ─────────────────────────────────────────────────────────
 
 fn clear_child_tid(pid: usize) {
-    let va = scheduler::with_proc_mut(pid, |p| {
+    let va = scheduler::with_proc_mut(pid, |p, pl| {
         let va = p.clear_child_tid_va;
         p.clear_child_tid_va = 0;
+        let _ = pl; // state unchanged
         va
     }).unwrap_or(0);
     if va == 0 { return; }
@@ -44,9 +45,13 @@ fn clear_child_tid(pid: usize) {
 // ── is_last_live_thread ───────────────────────────────────────────────────
 
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
-    scheduler::with_procs_ro(|procs| {
-        !procs.iter().any(|p| {
-            p.pid != pid && p.tgid == tgid && p.state != State::Zombie
+    // with_procs_ro gives us a snapshot Vec<Arc<ProcLock>>.
+    // ProcLock exposes .pid and .tgid directly; state via load_state().
+    scheduler::with_procs_ro(|pl_vec| {
+        !pl_vec.iter().any(|pl| {
+            pl.pid as usize != pid
+                && pl.tgid as usize == tgid
+                && pl.load_state() != State::Zombie
         })
     })
 }
@@ -54,11 +59,11 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
 // ── zombify ────────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
-    let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p| {
+    let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p, pl| {
         let ks = p.kstack_top;
         p.kstack_top = 0;
-        p.state      = State::Zombie;
         p.exit_code  = encode_exit(code);
+        pl.set_state(p, State::Zombie);
         (ks, p.vfork_parent)
     }).unwrap_or((0, 0));
 
@@ -75,7 +80,6 @@ pub fn do_exit(pid: usize, code: i32) {
     clear_child_tid(pid);
     thread::unregister_thread(pid);
 
-    // Clean up per-pid signal state (PENDING queue, SIGMASK, ALTSTACK).
     crate::proc::signal::altstack_clear_pid(pid);
     crate::syscall::proc_name_clear(pid);
     crate::proc::futex::futex_clear_pid(pid);
@@ -108,10 +112,11 @@ pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
-    let siblings: alloc::vec::Vec<usize> = scheduler::with_procs_ro(|procs| {
-        procs.iter()
-            .filter(|p| p.pid != pid && p.tgid == tgid)
-            .map(|p| p.pid)
+    // Collect sibling pids — only .pid/.tgid are needed, no inner lock.
+    let siblings: alloc::vec::Vec<usize> = scheduler::with_procs_ro(|pl_vec| {
+        pl_vec.iter()
+            .filter(|pl| pl.pid as usize != pid && pl.tgid as usize == tgid)
+            .map(|pl| pl.pid as usize)
             .collect()
     });
 

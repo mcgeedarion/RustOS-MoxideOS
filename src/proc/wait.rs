@@ -7,19 +7,15 @@
 //!   Stopped:       `(stopsig << 8) | 0x7F`             — WIFSTOPPED true
 //!   Continued:     `0xFFFF`                             — WIFCONTINUED true
 //!
-//! ## Bug fixes
+//! ## Locking notes (post-S2)
 //!
-//! ### Zombie processes were never reaped (swap_remove on shared ref)
-//!   Fixed by splitting into read-only scan + separate with_procs_mut reap.
-//!
-//! ### notify_stop: signal_handlers.flags[] → signal_handlers.table[].flags
-//!   SignalHandlers has `pub table: Vec<SigAction>` where SigAction has
-//!   `.flags: u32`. There is no top-level `.flags` array on SignalHandlers.
-//!   Previous fix wrote `p.signal_handlers.flags[SIGCHLD]` which would
-//!   fail to compile. Corrected to `p.signal_handlers.table[SIGCHLD].flags`.
-//!
-//! ### wait loop: block_current() then schedule() double-schedule
-//!   Removed redundant scheduler::schedule() after block_current().
+//!   - `with_procs_ro` returns a snapshot `Vec<Arc<ProcLock>>`.
+//!     `ProcLock` exposes `pid` and `tgid` directly.  `ppid`, `pgid`,
+//!     `state`, `exit_code`, `cpu_time_ns` require locking `ProcLock::inner`.
+//!   - The scan loop takes each inner lock briefly, reads what it needs,
+//!     then releases before acting.  Different PIDs are locked independently.
+//!   - `with_procs_mut` is used only for structural mutations (reap/state
+//!     change) and is held for the minimum time.
 
 use crate::proc::process::State;
 use crate::proc::scheduler;
@@ -78,8 +74,9 @@ pub fn notify_exit(exited_pid: usize) {
 // ── notify_stop ────────────────────────────────────────────────────────────────
 
 pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
-    scheduler::with_proc_mut(stopped_pid, |p| {
+    scheduler::with_proc_mut(stopped_pid, |p, pl| {
         p.exit_code = encode_stop(stopsig);
+        pl.set_state(p, State::Stopped);
     });
 
     let ppid = scheduler::with_proc(stopped_pid, |p| p.ppid).unwrap_or(0);
@@ -89,15 +86,10 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     const SIGCHLD: usize = 17;
     const SA_NOCLDSTOP: u32 = 1;
 
-    // FIX: SignalHandlers has `pub table: Vec<SigAction>` where SigAction has
-    // `.flags: u32`. The previous fix incorrectly wrote
-    // `p.signal_handlers.flags[SIGCHLD]` (no such field on SignalHandlers).
-    // Corrected to `p.signal_handlers.table[SIGCHLD].flags`.
+    // signal_handlers is Arc<Mutex<SignalHandlers>>; lock it to read flags.
     let nocldstop = scheduler::with_proc(ppid, |p| {
-        p.signal_handlers.table
-            .get(SIGCHLD)
-            .map(|h| h.flags & SA_NOCLDSTOP != 0)
-            .unwrap_or(false)
+        let h = p.signal_handlers.lock();
+        h.flags.get(SIGCHLD).map(|&f| f & SA_NOCLDSTOP != 0).unwrap_or(false)
     }).unwrap_or(false);
 
     if !nocldstop {
@@ -108,9 +100,9 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
 // ── notify_continue ─────────────────────────────────────────────────────────────
 
 pub fn notify_continue(cont_pid: usize) {
-    scheduler::with_proc_mut(cont_pid, |p| {
+    scheduler::with_proc_mut(cont_pid, |p, pl| {
         p.exit_code = WSTATUS_CONTINUED;
-        p.state = State::Continued;
+        pl.set_state(p, State::Continued);
     });
     let ppid = scheduler::with_proc(cont_pid, |p| p.ppid).unwrap_or(0);
     if ppid != 0 { scheduler::wake_pid(ppid); }
@@ -128,9 +120,9 @@ fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
     }
 }
 
-// ── one-shot scan result ────────────────────────────────────────────────────────────
+// ── WaitHit: result of one scan pass ───────────────────────────────────────────────
 
-enum WaitScan {
+enum WaitHit {
     Harvested { child_pid: usize, wstatus: i32, cpu_ns: u64 },
     HasLiving,
     NoChild,
@@ -154,69 +146,92 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
     let nowait    = options & WNOWAIT    != 0;
 
     loop {
-        let scan = scheduler::with_procs(|procs| {
-            // 1. Zombie
-            if let Some(idx) = procs.iter().position(|p| {
-                p.ppid == caller
-                    && p.state == State::Zombie
-                    && matches_pid(p.pid, p.pgid, pid)
-            }) {
-                let cpu_ns    = procs[idx].cpu_time_ns;
-                let wstatus   = procs[idx].exit_code;
-                let child_pid = procs[idx].pid;
-                return WaitScan::Harvested { child_pid, wstatus, cpu_ns };
-            }
+        // Snapshot Arc vec — table lock released before we touch any inner.
+        let hit = scheduler::with_procs_ro(|pl_vec| {
+            // Helper: lock inner and read fields needed for the match.
+            // Returns None if the inner lock is already taken (try_lock);
+            // in that case we skip for this pass (will retry on next loop).
+            for pl in pl_vec.iter() {
+                // Quick pre-filter using lock-free fields before paying for inner lock.
+                if pl.inner.try_lock().is_none() { continue; }
+                let inner = pl.inner.lock();
+                let p_pid   = inner.pid;
+                let p_ppid  = inner.ppid;
+                let p_pgid  = inner.pgid;
+                let p_state = inner.state;
 
-            // 2. WUNTRACED: stopped child
-            if wuntraced {
-                if let Some(idx) = procs.iter().position(|p| {
-                    p.ppid == caller
-                        && p.state == State::Stopped
-                        && matches_pid(p.pid, p.pgid, pid)
-                }) {
-                    let cpu_ns    = procs[idx].cpu_time_ns;
-                    let wstatus   = procs[idx].exit_code;
-                    let child_pid = procs[idx].pid;
-                    return WaitScan::Harvested { child_pid, wstatus, cpu_ns };
+                if p_ppid != caller { continue; }
+                if !matches_pid(p_pid, p_pgid, pid) { continue; }
+
+                match p_state {
+                    State::Zombie => {
+                        return WaitHit::Harvested {
+                            child_pid: p_pid,
+                            wstatus:   inner.exit_code,
+                            cpu_ns:    inner.cpu_time_ns,
+                        };
+                    }
+                    State::Stopped if wuntraced => {
+                        return WaitHit::Harvested {
+                            child_pid: p_pid,
+                            wstatus:   inner.exit_code,
+                            cpu_ns:    inner.cpu_time_ns,
+                        };
+                    }
+                    State::Continued if wcont => {
+                        return WaitHit::Harvested {
+                            child_pid: p_pid,
+                            wstatus:   WSTATUS_CONTINUED,
+                            cpu_ns:    inner.cpu_time_ns,
+                        };
+                    }
+                    _ => {}
                 }
             }
 
-            // 3. WCONTINUED: continued child
-            if wcont {
-                if let Some(idx) = procs.iter().position(|p| {
-                    p.ppid == caller
-                        && p.state == State::Continued
-                        && matches_pid(p.pid, p.pgid, pid)
-                }) {
-                    let cpu_ns    = procs[idx].cpu_time_ns;
-                    let child_pid = procs[idx].pid;
-                    return WaitScan::Harvested { child_pid, wstatus: WSTATUS_CONTINUED, cpu_ns };
-                }
-            }
-
-            // 4. Any living matching child?
-            let any_child = procs.iter().any(|p| {
-                p.ppid == caller && matches_pid(p.pid, p.pgid, pid)
+            // Check whether any matching child exists at all.
+            let any_child = pl_vec.iter().any(|pl| {
+                if let Some(inner) = pl.inner.try_lock() {
+                    inner.ppid == caller && matches_pid(inner.pid, inner.pgid, pid)
+                } else { false }
             });
-            if any_child { WaitScan::HasLiving } else { WaitScan::NoChild }
+
+            if any_child { WaitHit::HasLiving } else { WaitHit::NoChild }
         });
 
-        match scan {
-            WaitScan::Harvested { child_pid, wstatus, cpu_ns } => {
+        match hit {
+            WaitHit::Harvested { child_pid, wstatus, cpu_ns } => {
                 if !nowait {
-                    scheduler::with_procs_mut(|procs| {
-                        if let Some(idx) = procs.iter().position(|p| p.pid == child_pid) {
-                            match procs[idx].state {
-                                State::Zombie    => { procs.swap_remove(idx); }
-                                State::Stopped   => { procs[idx].state = State::StopReported; }
-                                State::Continued => {
-                                    procs[idx].state = State::Ready;
-                                    procs[idx].exit_code = 0;
-                                }
-                                _ => {}
+                    // Structural mutation: reap zombie or mark stop-reported.
+                    scheduler::with_proc_mut(child_pid, |p, pl| {
+                        match p.state {
+                            State::Zombie => {
+                                // Mark zombie; actual table removal happens in reap().
+                                // (Table removal needs with_procs_mut; done below.)
                             }
+                            State::Stopped => {
+                                pl.set_state(p, State::StopReported);
+                            }
+                            State::Continued => {
+                                pl.set_state(p, State::Ready);
+                                p.exit_code = 0;
+                            }
+                            _ => {}
                         }
                     });
+                    // Remove zombie from table.
+                    let is_zombie = scheduler::with_proc(child_pid, |p| {
+                        p.state == State::Zombie
+                    }).unwrap_or(false);
+                    if is_zombie {
+                        scheduler::with_procs_mut(|pl_vec| {
+                            if let Some(idx) = pl_vec.iter().position(|pl| {
+                                pl.pid as usize == child_pid
+                            }) {
+                                pl_vec.swap_remove(idx);
+                            }
+                        });
+                    }
                 }
 
                 if wstatus_va != 0 {
@@ -226,13 +241,14 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                 return child_pid as isize;
             }
 
-            WaitScan::NoChild => return -10,
+            WaitHit::NoChild => return -10, // ECHILD
 
-            WaitScan::HasLiving => {
+            WaitHit::HasLiving => {
                 if wnohang { return 0; }
                 scheduler::block_current();
-                let sig_pending = crate::proc::signal::has_pending_signal(caller);
-                if sig_pending { return -4; }
+                if crate::proc::signal::has_pending_signal(caller) {
+                    return -4; // EINTR
+                }
             }
         }
     }

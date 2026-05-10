@@ -7,39 +7,18 @@
 //!      `check_and_deliver(frame)` is called.
 //!   3. For a registered SA_SIGACTION handler the kernel:
 //!      a. Optionally switches sp to the alternate stack (SA_ONSTACK).
-//!      b. Carves an arch-specific SignalFrame from the top of the
-//!         chosen user stack — see `push_sigframe_riscv` / `push_sigframe_x86`.
+//!      b. Carves an arch-specific SignalFrame from the top of the user stack.
 //!      c. Sets up registers so userspace jumps to the handler.
 //!   4. SA_RESTORER / sig_return_trampoline does `rt_sigreturn` ecall/syscall.
 //!   5. sys_rt_sigreturn restores the saved frame from the SignalFrame.
 //!
-//! ## RISC-V SignalFrame layout (grows down, all 8-byte aligned)
+//! ## Post-S2 locking notes
 //!
-//!   user_sp before delivery
-//!    │
-//!    ▼  [0..272)    saved TrapFrame  (34 × 8 bytes)
-//!       [272..352)  siginfo_t        (80 bytes)
-//!       [352..360)  saved sigmask    (8 bytes — old mask before delivery)
-//!       [360..368)  restorer VA      (8 bytes; or synthesized trampoline if 0)
-//!       [368..376)  trampoline[0]    li a7, 139
-//!       [376..384)  trampoline[1]    ecall
-//!    ── new user sp (16-byte aligned) ──────────────────────────────────
-//!
-//! ## x86_64 SignalFrame layout
-//!
-//!   user rsp before delivery
-//!    │
-//!    ▼  [0..320)    ucontext_t  (rip, rsp, rflags, all GP regs, uc_sigmask)
-//!       [320..400)  siginfo_t   (80 bytes)
-//!       [400..408)  retaddr     (8 bytes: restorer VA)
-//!    ── new user rsp (16-byte aligned) ─────────────────────────────────
-//!
-//! ## Default actions (no registered handler)
-//!
-//!   SIGTERM (15), SIGKILL (9) — terminate the process.
-//!   SIGSTOP (19)              — block the task.
-//!   SIGCHLD (17), SIGURG (23), SIGWINCH (28) — ignored.
-//!   All others                — terminate.
+//!   - `send_signal_info` calls `scheduler::wake_pid(pid: usize)` (usize, not u32).
+//!   - `check_and_deliver` uses `with_proc_mut(pid, |p, pl| pl.set_state(…))` for
+//!     SIGSTOP, instead of `with_procs_mut`.
+//!   - `sys_rt_sigsuspend` / `sys_rt_sigtimedwait` use `with_proc_mut` for
+//!     Blocked transitions instead of the old `with_procs_mut` linear scan.
 
 extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -68,11 +47,10 @@ const SEGV_MAPERR: i32 = 1;
 const SI_USER:     i32 = 0;
 
 const SIG_IGN_DEFAULT: u64 =
-    (1u64 << 17) |
-    (1u64 << 23) |
-    (1u64 << 28);
+    (1u64 << 17) | (1u64 << 23) | (1u64 << 28);
 
-const SIG_STOP_DEFAULT: u64 = (1u64 << 19) | (1u64 << 20) | (1u64 << 21) | (1u64 << 22);
+const SIG_STOP_DEFAULT: u64 =
+    (1u64 << 19) | (1u64 << 20) | (1u64 << 21) | (1u64 << 22);
 
 // ── Signal storage ────────────────────────────────────────────────────
 
@@ -140,7 +118,8 @@ pub fn send_signal_user(pid: usize, sig: i32) -> isize {
 pub fn send_signal_info(pid: usize, info: SigInfo) {
     if info.sig == 0 || info.sig > 64 { return; }
     PENDING.lock().entry(pid).or_default().push_back(info);
-    scheduler::wake_pid(pid as u32);
+    // wake_pid takes usize (post-S2).
+    scheduler::wake_pid(pid);
 }
 
 pub fn send_sigchld(parent_pid: usize, child_pid: usize, exit_code: i32, killed: bool) {
@@ -186,8 +165,7 @@ pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
                 None    => return,
             };
             let pos = queue.iter().position(|s| {
-                s.sig >= 1 && s.sig <= 64
-                    && (mask >> s.sig) & 1 == 0
+                s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0
             });
             match pos {
                 Some(i) => queue.remove(i).unwrap(),
@@ -197,17 +175,23 @@ pub fn check_and_deliver(frame: &mut crate::arch::riscv64::trap::TrapFrame) {
 
         let sig = info.sig as usize;
 
-        // Read from the shared handler table under its lock.
         let (handler, sa_flags, restorer) = scheduler::with_proc(pid, |p| {
             let h = p.signal_handlers.lock();
-            (h.handlers[sig], h.flags[sig], h.restorer)
+            (
+                h.handlers.get(sig).copied().unwrap_or(0),
+                h.flags.get(sig).copied().unwrap_or(0),
+                h.restorer,
+            )
         }).unwrap_or((0, 0, 0));
 
         match handler {
             0 => {
                 if (SIG_IGN_DEFAULT >> sig) & 1 != 0 { continue; }
                 if (SIG_STOP_DEFAULT >> sig) & 1 != 0 {
-                    scheduler::with_proc_mut(pid, |p| p.state = State::Blocked);
+                    // Use per-process lock, not global table scan.
+                    scheduler::with_proc_mut(pid, |p, pl| {
+                        pl.set_state(p, State::Blocked);
+                    });
                     scheduler::schedule();
                     continue;
                 }
@@ -240,8 +224,7 @@ pub fn check_and_deliver(frame: &mut crate::arch::x86_64::syscall::SyscallFrame)
                 None    => return,
             };
             let pos = queue.iter().position(|s| {
-                s.sig >= 1 && s.sig <= 64
-                    && (mask >> s.sig) & 1 == 0
+                s.sig >= 1 && s.sig <= 64 && (mask >> s.sig) & 1 == 0
             });
             match pos {
                 Some(i) => queue.remove(i).unwrap(),
@@ -253,14 +236,20 @@ pub fn check_and_deliver(frame: &mut crate::arch::x86_64::syscall::SyscallFrame)
 
         let (handler, sa_flags, restorer) = scheduler::with_proc(pid, |p| {
             let h = p.signal_handlers.lock();
-            (h.handlers[sig], h.flags[sig], h.restorer)
+            (
+                h.handlers.get(sig).copied().unwrap_or(0),
+                h.flags.get(sig).copied().unwrap_or(0),
+                h.restorer,
+            )
         }).unwrap_or((0, 0, 0));
 
         match handler {
             0 => {
                 if (SIG_IGN_DEFAULT >> sig) & 1 != 0 { continue; }
                 if (SIG_STOP_DEFAULT >> sig) & 1 != 0 {
-                    scheduler::with_proc_mut(pid, |p| p.state = State::Blocked);
+                    scheduler::with_proc_mut(pid, |p, pl| {
+                        pl.set_state(p, State::Blocked);
+                    });
                     scheduler::schedule();
                     continue;
                 }
@@ -323,7 +312,6 @@ fn push_sigframe_riscv(
             TRAP_FRAME_SIZE,
         );
     }
-
     unsafe {
         let si = siginfo_va as *mut u8;
         core::ptr::write_bytes(si, 0, SIGINFO_SIZE);
@@ -333,7 +321,6 @@ fn push_sigframe_riscv(
         (si.add(24) as *mut u32).write(info.pid);
         (si.add(28) as *mut u32).write(info.uid);
     }
-
     unsafe { (sigmask_va as *mut u64).write(old_mask); }
 
     let effective_restorer = if sa_flags & SA_RESTORER != 0 && restorer != 0 {
@@ -389,31 +376,19 @@ fn push_sigframe_x86(
 
     unsafe {
         core::ptr::write_bytes(uctx_va as *mut u8, 0, UCTX_SIZE);
-
         let gregs = (uctx_va + 40) as *mut usize;
-        gregs.add(0).write(frame.r8);
-        gregs.add(1).write(frame.r9);
-        gregs.add(2).write(frame.r10);
-        gregs.add(3).write(frame.rflags);
-        gregs.add(4).write(frame.r12);
-        gregs.add(5).write(frame.r13);
-        gregs.add(6).write(frame.r14);
-        gregs.add(7).write(frame.r15);
-        gregs.add(8).write(frame.rdi);
-        gregs.add(9).write(frame.rsi);
-        gregs.add(10).write(frame.rbp);
-        gregs.add(11).write(frame.rbx);
-        gregs.add(12).write(frame.rdx);
-        gregs.add(13).write(frame.rax);
-        gregs.add(14).write(frame.rip);
-        gregs.add(15).write(frame.rsp);
-        gregs.add(16).write(frame.rip);
-        gregs.add(17).write(frame.rflags);
-
+        gregs.add(0).write(frame.r8);     gregs.add(1).write(frame.r9);
+        gregs.add(2).write(frame.r10);    gregs.add(3).write(frame.rflags);
+        gregs.add(4).write(frame.r12);    gregs.add(5).write(frame.r13);
+        gregs.add(6).write(frame.r14);    gregs.add(7).write(frame.r15);
+        gregs.add(8).write(frame.rdi);    gregs.add(9).write(frame.rsi);
+        gregs.add(10).write(frame.rbp);   gregs.add(11).write(frame.rbx);
+        gregs.add(12).write(frame.rdx);   gregs.add(13).write(frame.rax);
+        gregs.add(14).write(frame.rip);   gregs.add(15).write(frame.rsp);
+        gregs.add(16).write(frame.rip);   gregs.add(17).write(frame.rflags);
         let sigmask_ptr = (uctx_va + 296) as *mut u64;
         sigmask_ptr.write(old_mask);
     }
-
     unsafe {
         let si = siginfo_va as *mut u8;
         core::ptr::write_bytes(si, 0, SIGINFO_SIZE);
@@ -423,7 +398,6 @@ fn push_sigframe_x86(
         (si.add(24) as *mut u32).write(info.pid);
         (si.add(28) as *mut u32).write(info.uid);
     }
-
     unsafe { (retaddr_va as *mut usize).write(restorer); }
 
     frame.rip    = handler_va;
@@ -439,12 +413,8 @@ fn push_sigframe_x86(
 #[cfg(target_arch = "riscv64")]
 pub fn sys_rt_sigreturn(frame: &mut crate::arch::riscv64::trap::TrapFrame) -> isize {
     use crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
-
     let saved_va = frame.sp;
-    if saved_va == 0 || saved_va >= USER_SPACE_END || saved_va & 7 != 0 {
-        return -14;
-    }
-
+    if saved_va == 0 || saved_va >= USER_SPACE_END || saved_va & 7 != 0 { return -14; }
     unsafe {
         core::ptr::copy_nonoverlapping(
             saved_va as *const u8,
@@ -452,13 +422,11 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::riscv64::trap::TrapFrame) -> is
             TRAP_FRAME_SIZE,
         );
     }
-
     const SIGINFO_SIZE: usize = 80;
     let sigmask_va = saved_va + TRAP_FRAME_SIZE + SIGINFO_SIZE;
     let old_mask = unsafe { core::ptr::read_unaligned(sigmask_va as *const u64) };
     let pid = scheduler::current_pid() as usize;
     set_sigmask(pid, old_mask);
-
     0
 }
 
@@ -466,32 +434,21 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::riscv64::trap::TrapFrame) -> is
 pub fn sys_rt_sigreturn(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) -> isize {
     let uctx_va = frame.rsp;
     if uctx_va == 0 || uctx_va >= USER_SPACE_END { return -14; }
-
     unsafe {
         let gregs = (uctx_va + 40) as *const usize;
-        frame.r8     = gregs.add(0).read();
-        frame.r9     = gregs.add(1).read();
-        frame.r10    = gregs.add(2).read();
-        frame.rflags = gregs.add(3).read();
-        frame.r12    = gregs.add(4).read();
-        frame.r13    = gregs.add(5).read();
-        frame.r14    = gregs.add(6).read();
-        frame.r15    = gregs.add(7).read();
-        frame.rdi    = gregs.add(8).read();
-        frame.rsi    = gregs.add(9).read();
-        frame.rbp    = gregs.add(10).read();
-        frame.rbx    = gregs.add(11).read();
-        frame.rdx    = gregs.add(12).read();
-        frame.rax    = gregs.add(13).read();
-        frame.rsp    = gregs.add(15).read();
-        frame.rip    = gregs.add(16).read();
+        frame.r8     = gregs.add(0).read();  frame.r9     = gregs.add(1).read();
+        frame.r10    = gregs.add(2).read();  frame.rflags = gregs.add(3).read();
+        frame.r12    = gregs.add(4).read();  frame.r13    = gregs.add(5).read();
+        frame.r14    = gregs.add(6).read();  frame.r15    = gregs.add(7).read();
+        frame.rdi    = gregs.add(8).read();  frame.rsi    = gregs.add(9).read();
+        frame.rbp    = gregs.add(10).read(); frame.rbx    = gregs.add(11).read();
+        frame.rdx    = gregs.add(12).read(); frame.rax    = gregs.add(13).read();
+        frame.rsp    = gregs.add(15).read(); frame.rip    = gregs.add(16).read();
         frame.rflags = gregs.add(17).read();
-
         let old_mask = core::ptr::read_unaligned((uctx_va + 296) as *const u64);
         let pid = scheduler::current_pid() as usize;
         set_sigmask(pid, old_mask);
     }
-
     0
 }
 
@@ -500,11 +457,11 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) 
 pub fn sys_rt_sigpending(set_va: usize, sigsetsize: usize) -> isize {
     if sigsetsize != 8 { return -22; }
     if set_va == 0 || set_va >= USER_SPACE_END { return -14; }
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_pid() as usize;
     let mut pending_set: u64 = 0;
     {
         let map = PENDING.lock();
-        if let Some(queue) = map.get(&(pid as usize)) {
+        if let Some(queue) = map.get(&pid) {
             for info in queue.iter() {
                 if info.sig >= 1 && info.sig <= 64 {
                     pending_set |= 1u64 << info.sig;
@@ -521,31 +478,30 @@ pub fn sys_rt_sigpending(set_va: usize, sigsetsize: usize) -> isize {
 pub fn sys_rt_sigsuspend(mask_va: usize, sigsetsize: usize) -> isize {
     if sigsetsize != 8 { return -22; }
     if mask_va == 0 || mask_va >= USER_SPACE_END { return -14; }
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_pid() as usize;
     let mut mask_bytes = [0u8; 8];
     if copy_from_user(&mut mask_bytes, mask_va).is_err() { return -14; }
     let new_mask = u64::from_ne_bytes(mask_bytes) & !((1u64 << 9) | (1u64 << 19));
-    let old_mask = get_sigmask(pid as usize);
-    set_sigmask(pid as usize, new_mask);
+    let old_mask = get_sigmask(pid);
+    set_sigmask(pid, new_mask);
     loop {
         {
             let map = PENDING.lock();
-            if let Some(queue) = map.get(&(pid as usize)) {
+            if let Some(queue) = map.get(&pid) {
                 for info in queue.iter() {
-                    if info.sig >= 1 && info.sig <= 64 {
-                        if (new_mask >> info.sig) & 1 == 0 {
-                            drop(map);
-                            set_sigmask(pid as usize, old_mask);
-                            return -4;
-                        }
+                    if info.sig >= 1 && info.sig <= 64
+                        && (new_mask >> info.sig) & 1 == 0
+                    {
+                        drop(map);
+                        set_sigmask(pid, old_mask);
+                        return -4; // EINTR
                     }
                 }
             }
         }
-        scheduler::with_procs_mut(|procs| {
-            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                p.state = State::Blocked;
-            }
+        // Use per-process lock — not global table scan.
+        scheduler::with_proc_mut(pid, |p, pl| {
+            pl.set_state(p, State::Blocked);
         });
         scheduler::schedule();
     }
@@ -565,6 +521,7 @@ pub fn sys_rt_sigtimedwait(
     if copy_from_user(&mut set_bytes, uset_va).is_err() { return -14; }
     let wait_set = u64::from_ne_bytes(set_bytes);
     if wait_set == 0 { return -22; }
+
     let deadline_ns: Option<u64> = if timeout_va != 0 && timeout_va < USER_SPACE_END {
         let mut ts = [0u8; 16];
         if copy_from_user(&mut ts, timeout_va).is_err() { return -14; }
@@ -577,11 +534,12 @@ pub fn sys_rt_sigtimedwait(
     } else {
         None
     };
-    let pid = scheduler::current_pid();
+
+    let pid = scheduler::current_pid() as usize;
     loop {
         let found: Option<SigInfo> = {
             let mut map = PENDING.lock();
-            if let Some(queue) = map.get_mut(&(pid as usize)) {
+            if let Some(queue) = map.get_mut(&pid) {
                 let pos = queue.iter().position(|s| {
                     s.sig >= 1 && s.sig <= 64 && (wait_set >> s.sig) & 1 != 0
                 });
@@ -594,9 +552,9 @@ pub fn sys_rt_sigtimedwait(
                 si[0..4].copy_from_slice(&(info.sig as i32).to_ne_bytes());
                 si[4..8].copy_from_slice(&info.code.to_ne_bytes());
                 match info.sig {
-                    17 => si[24..28].copy_from_slice(&info.status.to_ne_bytes()),
-                    11 | 7 | 8 => si[16..24].copy_from_slice(&info.addr.to_ne_bytes()),
-                    _ => {}
+                    17       => si[24..28].copy_from_slice(&info.status.to_ne_bytes()),
+                    11|7|8   => si[16..24].copy_from_slice(&info.addr.to_ne_bytes()),
+                    _        => {}
                 }
                 let _ = copy_to_user(uinfo_va, &si);
             }
@@ -606,23 +564,22 @@ pub fn sys_rt_sigtimedwait(
             if crate::proc::nanosleep::now_ns() >= dl { return -11; }
         }
         {
-            let mask = get_sigmask(pid as usize);
+            let mask = get_sigmask(pid);
             let map = PENDING.lock();
-            if let Some(queue) = map.get(&(pid as usize)) {
+            if let Some(queue) = map.get(&pid) {
                 for info in queue.iter() {
                     if info.sig >= 1 && info.sig <= 64
                         && (wait_set >> info.sig) & 1 == 0
                         && (mask     >> info.sig) & 1 == 0
                     {
-                        return -4;
+                        return -4; // EINTR
                     }
                 }
             }
         }
-        scheduler::with_procs_mut(|procs| {
-            if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
-                p.state = State::Blocked;
-            }
+        // Block via per-process lock only.
+        scheduler::with_proc_mut(pid, |p, pl| {
+            pl.set_state(p, State::Blocked);
         });
         scheduler::schedule();
     }
@@ -631,9 +588,9 @@ pub fn sys_rt_sigtimedwait(
 // ── sys_sigaltstack [NR 131] ──────────────────────────────────────────
 
 pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_pid() as usize;
     if old_ss_va != 0 && old_ss_va < USER_SPACE_END {
-        let alt = ALTSTACK.lock().get(&(pid as usize)).copied().unwrap_or(AltStack {
+        let alt = ALTSTACK.lock().get(&pid).copied().unwrap_or(AltStack {
             ss_sp: 0, ss_flags: SS_DISABLE, ss_size: 0,
         });
         if !copy_to_user(old_ss_va,      &alt.ss_sp.to_ne_bytes())    { return -14; }
@@ -654,28 +611,24 @@ pub fn sys_sigaltstack(ss_va: usize, old_ss_va: usize) -> isize {
         let ss_flags = i32::from_ne_bytes(flags_bytes);
         let ss_size  = usize::from_ne_bytes(size_bytes);
         if ss_flags & SS_DISABLE != 0 {
-            ALTSTACK.lock().remove(&(pid as usize));
+            ALTSTACK.lock().remove(&pid);
         } else {
             if ss_size < 2048 { return -22; }
-            ALTSTACK.lock().insert(pid as usize, AltStack { ss_sp, ss_flags, ss_size });
+            ALTSTACK.lock().insert(pid, AltStack { ss_sp, ss_flags, ss_size });
         }
     }
     0
 }
 
 // ── sys_rt_sigaction [NR 13] ──────────────────────────────────────────
-//
-// Writes through the Arc<Mutex<SignalHandlers>> so CLONE_SIGHAND threads
-// automatically see the updated disposition.
 
 pub fn sys_rt_sigaction(
     sig: u32, new_act_va: usize, old_act_va: usize, _sigsetsize: usize,
 ) -> isize {
     if sig == 0 || sig > 64 { return -22; }
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_pid() as usize;
     let idx = sig as usize;
 
-    // Grab a clone of the Arc so we can lock it outside with_proc_mut.
     let handlers_arc = match scheduler::with_proc(pid, |p| p.signal_handlers.clone()) {
         Some(a) => a,
         None    => return -3,
@@ -683,8 +636,8 @@ pub fn sys_rt_sigaction(
 
     let mut h = handlers_arc.lock();
 
-    let old_handler  = h.handlers[idx];
-    let old_flags    = h.flags[idx];
+    let old_handler  = h.handlers.get(idx).copied().unwrap_or(0);
+    let old_flags    = h.flags.get(idx).copied().unwrap_or(0);
     let old_restorer = h.restorer;
 
     if new_act_va != 0 && new_act_va < USER_SPACE_END {
@@ -695,6 +648,9 @@ pub fn sys_rt_sigaction(
             && copy_from_user(&mut f_bytes, new_act_va + 8).is_ok()
             && copy_from_user(&mut r_bytes, new_act_va + 16).is_ok()
         {
+            // Grow handler/flags vecs if needed.
+            if h.handlers.len() <= idx { h.handlers.resize(idx + 1, 0); }
+            if h.flags.len()    <= idx { h.flags.resize(idx + 1, 0); }
             h.handlers[idx] = usize::from_ne_bytes(h_bytes);
             h.flags[idx]    = u64::from_ne_bytes(f_bytes) as u32;
             h.restorer      = usize::from_ne_bytes(r_bytes);
@@ -703,9 +659,9 @@ pub fn sys_rt_sigaction(
     drop(h);
 
     if old_act_va != 0 && old_act_va < USER_SPACE_END {
-        if !copy_to_user(old_act_va,      &old_handler.to_ne_bytes())         { return -14; }
-        if !copy_to_user(old_act_va + 8,  &(old_flags as u64).to_ne_bytes())  { return -14; }
-        if !copy_to_user(old_act_va + 16, &old_restorer.to_ne_bytes())        { return -14; }
+        if !copy_to_user(old_act_va,      &old_handler.to_ne_bytes())        { return -14; }
+        if !copy_to_user(old_act_va + 8,  &(old_flags as u64).to_ne_bytes()) { return -14; }
+        if !copy_to_user(old_act_va + 16, &old_restorer.to_ne_bytes())       { return -14; }
     }
     0
 }
@@ -737,10 +693,6 @@ pub fn sys_rt_sigprocmask(
 }
 
 // ── altstack_clear_pid ─────────────────────────────────────────────────────
-//
-// Called from do_exit and do_execve to clean up per-pid signal state.
-// On exit: frees PENDING queue, SIGMASK, and ALTSTACK for the exiting pid.
-// On exec: also frees these (pending signals don't survive exec).
 
 pub fn altstack_clear_pid(pid: usize) {
     ALTSTACK.lock().remove(&pid);
