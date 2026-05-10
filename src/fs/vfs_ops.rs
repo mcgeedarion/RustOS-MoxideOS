@@ -58,6 +58,15 @@ pub struct KStatfs {
     pub f_namelen: u64,
 }
 
+// Well-known f_type magic numbers (matches Linux)
+const FSTYPE_EXT2:    u64 = 0xEF53;
+const FSTYPE_FAT32:   u64 = 0x4d44;   // MSDOS_SUPER_MAGIC
+const FSTYPE_TMPFS:   u64 = 0x0102_1994;
+const FSTYPE_OVERLAY: u64 = 0x794c_7630;
+const FSTYPE_DEVTMPFS:u64 = 0x1373;
+const FSTYPE_PROC:    u64 = 0x9fa0;
+const FSTYPE_SYSFS:   u64 = 0x6265_6572;
+
 // ── read_all / write_all ─────────────────────────────────────────────────────
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
@@ -129,24 +138,23 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
 }
 
 // ── pread / pwrite — offset-based I/O ────────────────────────────────────────
+//
+// FIX: previously returned ENOSYS for Overlayfs, Devfs, Procfs, Sysfs.
+// Now falls through to read_all + slice for all backends that support reading.
+// pwrite similarly gains an Overlayfs arm.
 
 pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_pread(path, offset, len),
-        FsType::Ext2 => {
+        _ => {
+            // Generic fallback: read the whole file and slice.
+            // Works for Ext2, Fat32, Overlayfs, Devfs, Procfs, Sysfs.
             let data = read_all(path)?;
             if offset >= data.len() { return Ok(Vec::new()); }
             let end = (offset + len).min(data.len());
             Ok(data[offset..end].to_vec())
         }
-        FsType::Fat32 => {
-            let data = read_all(path)?;
-            if offset >= data.len() { return Ok(Vec::new()); }
-            let end = (offset + len).min(data.len());
-            Ok(data[offset..end].to_vec())
-        }
-        _ => Err(-38),
     }
 }
 
@@ -155,7 +163,7 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     if h.is_readonly() { return Err(-30); }
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_pwrite(path, offset, data),
-        FsType::Ext2 | FsType::Fat32 => {
+        FsType::Ext2 | FsType::Fat32 | FsType::Overlayfs => {
             let mut full = read_all(path).unwrap_or_default();
             let end = offset + data.len();
             if end > full.len() { full.resize(end, 0); }
@@ -170,6 +178,8 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
 }
 
 // ── truncate ────────────────────────────────────────────────────────────────────
+//
+// FIX: added Overlayfs arm (previously fell through to ENOSYS).
 
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -185,6 +195,12 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
             let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
             let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
             fs.truncate(&mut f, len as u64)
+        }
+        FsType::Overlayfs => {
+            // overlayfs::truncate handles copy-up of the lower file before
+            // truncating the upper copy.
+            let om = overlay_mount(&h)?;
+            crate::fs::overlayfs::truncate(&om, &h.subpath, len as u64)
         }
         _ => Err(-38),
     };
@@ -219,6 +235,8 @@ pub fn create(path: &str) -> Result<(), isize> {
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────
+//
+// FIX: Overlayfs previously returned EXDEV; now dispatches to overlayfs::link.
 
 pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let h_e = mount::resolve(existing)?;
@@ -228,6 +246,10 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let result = match h_e.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_link(existing, new),
         FsType::Ext2  => crate::fs::ext2::sys_link(existing, new).map(|_| ()),
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h_e)?;
+            crate::fs::overlayfs::link(&om, &h_e.subpath, &h_n.subpath)
+        }
         _             => Err(-38),
     };
     if result.is_ok() {
@@ -306,6 +328,8 @@ pub fn unlink(path: &str) -> Result<(), isize> {
 }
 
 // ── rename ────────────────────────────────────────────────────────────────────
+//
+// FIX: added Overlayfs arm (previously fell through to ENOSYS).
 
 pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_o = mount::resolve(old)?;
@@ -315,6 +339,10 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let result = match h_o.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_rename(old, new),
         FsType::Ext2  => crate::fs::ext2::sys_rename(old, new).map(|_| ()),
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h_o)?;
+            crate::fs::overlayfs::rename(&om, &h_o.subpath, &h_n.subpath)
+        }
         _             => Err(-38),
     };
     if result.is_ok() {
@@ -330,9 +358,6 @@ pub fn stat(path: &str) -> Result<KStat, isize> { stat_impl(path, false) }
 pub fn lstat(path: &str) -> Result<KStat, isize> { stat_impl(path, true) }
 
 fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
-    // lstat skips symlink resolution — don't serve a cached stat for it
-    // if the cache entry was populated via a regular stat (which may have
-    // followed a symlink).  For simplicity, bypass the cache for lstat.
     if !lstat {
         if let Some(entry) = dcache::lookup(path) {
             return Ok(entry.stat);
@@ -385,7 +410,6 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
         FsType::Sysfs  => crate::fs::sysfs::stat(&h.subpath),
     };
 
-    // Populate cache on successful non-lstat lookup.
     if !lstat {
         if let Ok(ref s) = result {
             dcache::insert(path, h.fstype, s.ino, s.clone());
@@ -395,13 +419,64 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
 }
 
 // ── statfs ────────────────────────────────────────────────────────────────────
+//
+// FIX: previously returned zeroed KStatfs for every non-Tmpfs filesystem.
+// Now dispatches to each backend where a statfs call exists, and fills in
+// correct f_type magic numbers and reasonable defaults for the rest.
 
-/// Return filesystem statistics (sys_statfs / sys_fstatfs).
 pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
-        FsType::Tmpfs  => crate::fs::tmpfs::tmpfs_statfs(path),
-        _ => Ok(KStatfs::default()),
+        FsType::Tmpfs => crate::fs::tmpfs::tmpfs_statfs(path),
+        FsType::Ext2  => {
+            let s = crate::fs::ext2::sys_statfs(path).map_err(|e| e as isize)?;
+            Ok(KStatfs {
+                f_type:    FSTYPE_EXT2,
+                f_bsize:   s.f_bsize as u64,
+                f_blocks:  s.f_blocks,
+                f_bfree:   s.f_bfree,
+                f_bavail:  s.f_bavail,
+                f_namelen: s.f_namelen as u64,
+            })
+        }
+        FsType::Fat32 => {
+            let mp = mount_point_for(&h.subpath, path);
+            let fs_map = crate::fs::fat32::FAT_MOUNTS.lock();
+            let fs = fs_map.get(&mp).ok_or(-2isize)?;
+            let s = fs.statfs()?;
+            Ok(KStatfs {
+                f_type:    FSTYPE_FAT32,
+                f_bsize:   s.cluster_size as u64,
+                f_blocks:  s.total_clusters,
+                f_bfree:   s.free_clusters,
+                f_bavail:  s.free_clusters,
+                f_namelen: 255,
+            })
+        }
+        FsType::Overlayfs => Ok(KStatfs {
+            f_type:    FSTYPE_OVERLAY,
+            f_bsize:   4096,
+            f_namelen: 255,
+            ..KStatfs::default()
+        }),
+        FsType::Devfs => Ok(KStatfs {
+            f_type:    FSTYPE_DEVTMPFS,
+            f_bsize:   4096,
+            f_namelen: 255,
+            ..KStatfs::default()
+        }),
+        FsType::Procfs => Ok(KStatfs {
+            f_type:    FSTYPE_PROC,
+            f_bsize:   4096,
+            f_namelen: 255,
+            ..KStatfs::default()
+        }),
+        FsType::Sysfs => Ok(KStatfs {
+            f_type:    FSTYPE_SYSFS,
+            f_bsize:   4096,
+            f_namelen: 255,
+            ..KStatfs::default()
+        }),
     }
 }
 
