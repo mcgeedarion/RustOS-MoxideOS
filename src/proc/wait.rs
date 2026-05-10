@@ -12,8 +12,8 @@
 //!   - `with_procs_ro` returns a snapshot `Vec<Arc<ProcLock>>`.
 //!     `ProcLock` exposes `pid` and `tgid` directly.  `ppid`, `pgid`,
 //!     `state`, `exit_code`, `cpu_time_ns` require locking `ProcLock::inner`.
-//!   - The scan loop takes each inner lock briefly, reads what it needs,
-//!     then releases before acting.  Different PIDs are locked independently.
+//!   - The scan loop takes each inner lock once per iteration.  There is no
+//!     try_lock pre-filter (that pattern caused TOCTOU double-lock on SMP).
 //!   - `with_procs_mut` is used only for structural mutations (reap/state
 //!     change) and is held for the minimum time.
 
@@ -21,7 +21,7 @@ use crate::proc::process::State;
 use crate::proc::scheduler;
 use crate::uaccess::copy_to_user;
 
-// ── wstatus encoding ──────────────────────────────────────────────────────────────
+// ── wstatus encoding ──────────────────────────────────────────────────
 
 #[inline]
 pub fn encode_exit(code: i32) -> i32 { (code & 0xFF) << 8 }
@@ -38,14 +38,14 @@ pub fn encode_stop(stopsig: u32) -> i32 {
 
 pub const WSTATUS_CONTINUED: i32 = 0xFFFF;
 
-// ── option flags ───────────────────────────────────────────────────────────────
+// ── option flags ─────────────────────────────────────────────────────
 
 pub const WNOHANG:    u32 = 1;
 pub const WUNTRACED:  u32 = 2;
 pub const WCONTINUED: u32 = 8;
 pub const WNOWAIT:    u32 = 0x01000000;
 
-// ── rusage ───────────────────────────────────────────────────────────────────
+// ── rusage ────────────────────────────────────────────────────────────
 
 const RUSAGE_SIZE: usize = 144;
 
@@ -59,19 +59,28 @@ fn write_rusage(va: usize, cpu_ns: u64) {
     let _ = copy_to_user(va, &buf);
 }
 
-// ── notify_exit ────────────────────────────────────────────────────────────────
+// ── notify_exit ────────────────────────────────────────────────────────
 
 pub fn notify_exit(exited_pid: usize) {
     let (ppid, exit_signal) = scheduler::with_proc(exited_pid, |p| (p.ppid, p.exit_signal))
         .unwrap_or((0, 17));
     if ppid == 0 { return; }
+
+    // Wake the parent's thread group — any thread can collect the child.
     scheduler::wake_pid(ppid);
+
     if exit_signal != 0 {
-        crate::proc::signal::send_signal(ppid, exit_signal as i32);
+        // SIGCHLD (or custom exit_signal) is group-directed: deliver to the
+        // parent's process group, not just the ppid TID.
+        let parent_tgid = {
+            let t = crate::proc::thread::tgid_of(ppid);
+            if t != 0 { t } else { ppid }
+        };
+        crate::proc::signal::send_signal_group(parent_tgid, exit_signal as i32);
     }
 }
 
-// ── notify_stop ────────────────────────────────────────────────────────────────
+// ── notify_stop ────────────────────────────────────────────────────────
 
 pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     scheduler::with_proc_mut(stopped_pid, |p, pl| {
@@ -86,18 +95,22 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     const SIGCHLD: usize = 17;
     const SA_NOCLDSTOP: u32 = 1;
 
-    // signal_handlers is Arc<Mutex<SignalHandlers>>; lock it to read flags.
     let nocldstop = scheduler::with_proc(ppid, |p| {
         let h = p.signal_handlers.lock();
         h.flags.get(SIGCHLD).map(|&f| f & SA_NOCLDSTOP != 0).unwrap_or(false)
     }).unwrap_or(false);
 
     if !nocldstop {
-        crate::proc::signal::send_signal(ppid, SIGCHLD as i32);
+        // Group-directed: any unblocked thread in the parent may handle it.
+        let parent_tgid = {
+            let t = crate::proc::thread::tgid_of(ppid);
+            if t != 0 { t } else { ppid }
+        };
+        crate::proc::signal::send_signal_group(parent_tgid, SIGCHLD as i32);
     }
 }
 
-// ── notify_continue ─────────────────────────────────────────────────────────────
+// ── notify_continue ─────────────────────────────────────────────────────
 
 pub fn notify_continue(cont_pid: usize) {
     scheduler::with_proc_mut(cont_pid, |p, pl| {
@@ -108,7 +121,7 @@ pub fn notify_continue(cont_pid: usize) {
     if ppid != 0 { scheduler::wake_pid(ppid); }
 }
 
-// ── pid / pgid match predicate ──────────────────────────────────────────────────────
+// ── pid / pgid match predicate ──────────────────────────────────────────
 
 #[inline]
 fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
@@ -120,15 +133,17 @@ fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
     }
 }
 
-// ── WaitHit: result of one scan pass ───────────────────────────────────────────────
+// ── WaitHit: result of one scan pass ──────────────────────────────────────
 
 enum WaitHit {
     Harvested { child_pid: usize, wstatus: i32, cpu_ns: u64 },
+    /// Matching children exist but none are in a waitable state yet.
     HasLiving,
+    /// No child matches the requested pid/pgid at all.
     NoChild,
 }
 
-// ── sys_waitpid / sys_wait4 ──────────────────────────────────────────────────────────
+// ── sys_waitpid / sys_wait4 ───────────────────────────────────────────
 
 pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
     sys_wait4_impl(pid, wstatus_va, options, 0)
@@ -146,14 +161,12 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
     let nowait    = options & WNOWAIT    != 0;
 
     loop {
-        // Snapshot Arc vec — table lock released before we touch any inner.
+        // Snapshot Arc vec; table lock released before we touch any inner lock.
         let hit = scheduler::with_procs_ro(|pl_vec| {
-            // Helper: lock inner and read fields needed for the match.
-            // Returns None if the inner lock is already taken (try_lock);
-            // in that case we skip for this pass (will retry on next loop).
+            let mut any_child = false;
+
             for pl in pl_vec.iter() {
-                // Quick pre-filter using lock-free fields before paying for inner lock.
-                if pl.inner.try_lock().is_none() { continue; }
+                // Single lock call — no try_lock pre-filter (TOCTOU / deadlock risk).
                 let inner = pl.inner.lock();
                 let p_pid   = inner.pid;
                 let p_ppid  = inner.ppid;
@@ -162,6 +175,9 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
 
                 if p_ppid != caller { continue; }
                 if !matches_pid(p_pid, p_pgid, pid) { continue; }
+
+                // At least one matching child found.
+                any_child = true;
 
                 match p_state {
                     State::Zombie => {
@@ -187,14 +203,9 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                     }
                     _ => {}
                 }
+                // Drop inner lock before moving to the next entry.
+                drop(inner);
             }
-
-            // Check whether any matching child exists at all.
-            let any_child = pl_vec.iter().any(|pl| {
-                if let Some(inner) = pl.inner.try_lock() {
-                    inner.ppid == caller && matches_pid(inner.pid, inner.pgid, pid)
-                } else { false }
-            });
 
             if any_child { WaitHit::HasLiving } else { WaitHit::NoChild }
         });
@@ -202,13 +213,9 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
         match hit {
             WaitHit::Harvested { child_pid, wstatus, cpu_ns } => {
                 if !nowait {
-                    // Structural mutation: reap zombie or mark stop-reported.
                     scheduler::with_proc_mut(child_pid, |p, pl| {
                         match p.state {
-                            State::Zombie => {
-                                // Mark zombie; actual table removal happens in reap().
-                                // (Table removal needs with_procs_mut; done below.)
-                            }
+                            State::Zombie => { /* reap below */ }
                             State::Stopped => {
                                 pl.set_state(p, State::StopReported);
                             }
@@ -241,8 +248,7 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                 return child_pid as isize;
             }
 
-            WaitHit::NoChild => return -10, // ECHILD
-
+            // POSIX: WNOHANG + matching children exist but none waitable -> 0.
             WaitHit::HasLiving => {
                 if wnohang { return 0; }
                 scheduler::block_current();
@@ -250,11 +256,13 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                     return -4; // EINTR
                 }
             }
+
+            WaitHit::NoChild => return -10, // ECHILD
         }
     }
 }
 
-// ── wstatus decode helpers ───────────────────────────────────────────────────────────
+// ── wstatus decode helpers ─────────────────────────────────────────────────
 
 #[inline] pub fn wifexited(ws: i32)    -> bool { (ws & 0x7F) == 0 }
 #[inline] pub fn wexitstatus(ws: i32)  -> i32  { (ws >> 8) & 0xFF }

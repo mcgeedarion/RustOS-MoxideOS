@@ -11,10 +11,11 @@
 //!   4. altstack_clear_pid + proc_name_clear + futex_clear_pid
 //!   5. proc_fd_free         — close all open fds
 //!   6. free_address_space (last thread in group only)
-//!   7. free_kstack + State → Zombie + exit_code = encode_exit(code)
-//!   8. wake vfork_parent
-//!   9. notify_exit (wakes parent waitpid)
-//!  10. schedule()   — never returns
+//!   7. group_pending_clear (last thread in group only) — drain GROUP_PENDING[tgid]
+//!   8. free_kstack + State -> Zombie + exit_code = encode_exit(code)
+//!   9. wake vfork_parent
+//!  10. notify_exit (wakes parent waitpid, sends group-directed SIGCHLD)
+//!  11. schedule()   — never returns
 
 extern crate alloc;
 
@@ -28,13 +29,13 @@ use crate::proc::{scheduler, thread, wait};
 use crate::proc::wait::encode_exit;
 use crate::uaccess::copy_to_user;
 
-// ── clear_child_tid ─────────────────────────────────────────────────────────
+// ── clear_child_tid ──────────────────────────────────────────────────
 
 fn clear_child_tid(pid: usize) {
     let va = scheduler::with_proc_mut(pid, |p, pl| {
         let va = p.clear_child_tid_va;
         p.clear_child_tid_va = 0;
-        let _ = pl; // state unchanged
+        let _ = pl;
         va
     }).unwrap_or(0);
     if va == 0 { return; }
@@ -42,11 +43,9 @@ fn clear_child_tid(pid: usize) {
     futex_wake_addr(va, 1);
 }
 
-// ── is_last_live_thread ───────────────────────────────────────────────────
+// ── is_last_live_thread ──────────────────────────────────────────────
 
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
-    // with_procs_ro gives us a snapshot Vec<Arc<ProcLock>>.
-    // ProcLock exposes .pid and .tgid directly; state via load_state().
     scheduler::with_procs_ro(|pl_vec| {
         !pl_vec.iter().any(|pl| {
             pl.pid as usize != pid
@@ -56,7 +55,7 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     })
 }
 
-// ── zombify ────────────────────────────────────────────────────────────
+// ── zombify ───────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
     let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p, pl| {
@@ -71,7 +70,7 @@ fn zombify(pid: usize, code: i32) -> usize {
     vfork_parent
 }
 
-// ── do_exit ────────────────────────────────────────────────────────────
+// ── do_exit ───────────────────────────────────────────────────────────
 
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
@@ -86,9 +85,12 @@ pub fn do_exit(pid: usize, code: i32) {
 
     crate::fs::process_fd::proc_fd_free(pid);
 
-    if is_last_live_thread(pid, tgid) {
+    let last = is_last_live_thread(pid, tgid);
+    if last {
         let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
         free_address_space(pid, user_satp);
+        // Drain group-directed pending signals so the TGID entry doesn't leak.
+        crate::proc::signal::group_pending_clear(tgid);
     }
 
     let vfork_parent = zombify(pid, code);
@@ -99,20 +101,20 @@ pub fn do_exit(pid: usize, code: i32) {
     loop { <Arch as Cpu>::halt(); }
 }
 
-// ── sys_exit [NR 60] ────────────────────────────────────────────────────────
+// ── sys_exit [NR 60] ────────────────────────────────────────────────────
 
 pub fn sys_exit(status: i32) -> isize {
     do_exit(scheduler::current_pid(), status);
     0
 }
 
-// ── sys_exit_group [NR 231] ─────────────────────────────────────────────────
+// ── sys_exit_group [NR 231] ───────────────────────────────────────────────
 
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
-    // Collect sibling pids — only .pid/.tgid are needed, no inner lock.
+    // Collect sibling pids — only .pid/.tgid needed, no inner lock.
     let siblings: alloc::vec::Vec<usize> = scheduler::with_procs_ro(|pl_vec| {
         pl_vec.iter()
             .filter(|pl| pl.pid as usize != pid && pl.tgid as usize == tgid)
@@ -128,11 +130,13 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::syscall::proc_name_clear(sibling);
         crate::proc::futex::futex_clear_pid(sibling);
         crate::fs::process_fd::proc_fd_free(sibling);
+        // zombify sets exit_code = encode_exit(status) before notify_exit reads it.
         let vfork_parent = zombify(sibling, status);
         if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
         wait::notify_exit(sibling);
     }
 
+    // do_exit handles group_pending_clear for the tgid (last live thread path).
     do_exit(pid, status);
     0
 }
