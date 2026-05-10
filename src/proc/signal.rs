@@ -27,6 +27,7 @@
 
 extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::proc::{scheduler, process::State};
@@ -93,6 +94,19 @@ const SA_NODEFER:  u32 = 0x40000000;
 const SIG_BLOCK:   u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
+
+// ── Process-group helpers ─────────────────────────────────────────────
+
+/// Return the TGIDs of all process-group leaders (pid == tgid) whose
+/// Pcb::pgid matches `pgid`.  Each TGID appears exactly once.
+fn pids_in_pgrp(pgid: usize) -> Vec<usize> {
+    scheduler::with_procs_ro(|procs| {
+        procs.iter()
+            .filter(|p| p.pgid == pgid && p.pid == p.tgid)
+            .map(|p| p.tgid)
+            .collect()
+    })
+}
 
 // ── Thread-directed send API ───────────────────────────────────────────
 
@@ -808,25 +822,77 @@ pub fn sys_rt_sigprocmask(
 
 // ── sys_kill [NR 62] ─────────────────────────────────────────────────────────
 //
-// kill(pid, sig) is group-directed: the signal goes to all threads that
-// constitute the target process, and any unblocked one may deliver it.
+// kill(pid, sig) routing:
+//
+//   pid > 0   -> group-directed to process with TGID == pid
+//   pid == 0  -> group-directed to every process in caller's process group
+//   pid == -1 -> broadcast to every process except pid 1 and caller
+//   pid < -1  -> group-directed to process group |pid|
+//
+// POSIX permission checks (caller uid == target euid) are deferred to the
+// capabilities audit; for now all sends are permitted (same as pid > 0 arm).
 
 pub fn sys_kill(pid: i32, sig: i32) -> isize {
     if sig != 0 && (sig < 1 || sig > 64) { return -22; }
+
     match pid {
+        // ── pid > 0: target a specific process group ──────────────────────
         p if p > 0 => {
             let tgid = p as usize;
-            // Verify target exists.
             let exists = crate::proc::thread::threads_of(tgid).len() > 0
                 || scheduler::with_proc(tgid, |_| ()).is_some();
-            if !exists { return -3; } // ESRCH
-            if sig == 0 { return 0; } // existence check only
+            if !exists { return -3; }
+            if sig == 0 { return 0; }
             send_signal_group(tgid, sig)
         }
-        // pid==0: send to caller's process group. pid==-1: broadcast.
-        // pid < -1: send to |pid| process group.
-        // Not yet implemented; return ESRCH for safety.
-        _ => -3,
+
+        // ── pid == 0: send to caller's process group ──────────────────────
+        0 => {
+            let caller = scheduler::current_pid();
+            let caller_pgid = scheduler::with_proc(caller, |p| p.pgid)
+                .unwrap_or(0);
+            if caller_pgid == 0 { return -3; }
+            let targets = pids_in_pgrp(caller_pgid);
+            if targets.is_empty() { return -3; }
+            if sig == 0 { return 0; }
+            for tgid in targets {
+                send_signal_group(tgid, sig);
+            }
+            0
+        }
+
+        // ── pid == -1: broadcast (skip init and caller) ────────────────────
+        -1 => {
+            let caller_tgid = {
+                let t = crate::proc::thread::tgid_of(scheduler::current_pid());
+                if t != 0 { t } else { scheduler::current_pid() }
+            };
+            // Collect all TGIDs (process leaders only) in one pass.
+            let all_tgids: Vec<usize> = scheduler::with_procs_ro(|procs| {
+                procs.iter()
+                    .filter(|p| p.pid == p.tgid && p.pid != 1 && p.pid != caller_tgid)
+                    .map(|p| p.tgid)
+                    .collect()
+            });
+            if all_tgids.is_empty() { return -3; }
+            if sig == 0 { return 0; }
+            for tgid in all_tgids {
+                send_signal_group(tgid, sig);
+            }
+            0
+        }
+
+        // ── pid < -1: send to process group |pid| ────────────────────────
+        p => {
+            let pgid = (-p) as usize;
+            let targets = pids_in_pgrp(pgid);
+            if targets.is_empty() { return -3; }
+            if sig == 0 { return 0; }
+            for tgid in targets {
+                send_signal_group(tgid, sig);
+            }
+            0
+        }
     }
 }
 
