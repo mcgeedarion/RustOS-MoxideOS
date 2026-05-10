@@ -138,18 +138,12 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
 }
 
 // ── pread / pwrite — offset-based I/O ────────────────────────────────────────
-//
-// FIX: previously returned ENOSYS for Overlayfs, Devfs, Procfs, Sysfs.
-// Now falls through to read_all + slice for all backends that support reading.
-// pwrite similarly gains an Overlayfs arm.
 
 pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_pread(path, offset, len),
         _ => {
-            // Generic fallback: read the whole file and slice.
-            // Works for Ext2, Fat32, Overlayfs, Devfs, Procfs, Sysfs.
             let data = read_all(path)?;
             if offset >= data.len() { return Ok(Vec::new()); }
             let end = (offset + len).min(data.len());
@@ -178,8 +172,6 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
 }
 
 // ── truncate ────────────────────────────────────────────────────────────────────
-//
-// FIX: added Overlayfs arm (previously fell through to ENOSYS).
 
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -197,8 +189,6 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
             fs.truncate(&mut f, len as u64)
         }
         FsType::Overlayfs => {
-            // overlayfs::truncate handles copy-up of the lower file before
-            // truncating the upper copy.
             let om = overlay_mount(&h)?;
             crate::fs::overlayfs::truncate(&om, &h.subpath, len as u64)
         }
@@ -206,6 +196,17 @@ pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     };
     if result.is_ok() { dcache::invalidate(path); }
     result
+}
+
+// ── truncate_fd ──────────────────────────────────────────────────────────────────
+//
+// fd-based truncate used by sys_ftruncate.  Reverse-maps the kernel backing
+// fd to its registered VFS path, then delegates to the path-based truncate().
+// Returns -EBADF if the fd has no associated path (pipe, socket, anon fd).
+
+pub fn truncate_fd(bfd: usize, len: usize) -> Result<(), isize> {
+    let path = crate::fs::fcntl::fd_get_path(bfd).ok_or(-9isize)?;
+    truncate(&path, len)
 }
 
 // ── create ────────────────────────────────────────────────────────────────────
@@ -235,8 +236,6 @@ pub fn create(path: &str) -> Result<(), isize> {
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────
-//
-// FIX: Overlayfs previously returned EXDEV; now dispatches to overlayfs::link.
 
 pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let h_e = mount::resolve(existing)?;
@@ -328,8 +327,6 @@ pub fn unlink(path: &str) -> Result<(), isize> {
 }
 
 // ── rename ────────────────────────────────────────────────────────────────────
-//
-// FIX: added Overlayfs arm (previously fell through to ENOSYS).
 
 pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_o = mount::resolve(old)?;
@@ -419,10 +416,6 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
 }
 
 // ── statfs ────────────────────────────────────────────────────────────────────
-//
-// FIX: previously returned zeroed KStatfs for every non-Tmpfs filesystem.
-// Now dispatches to each backend where a statfs call exists, and fills in
-// correct f_type magic numbers and reasonable defaults for the rest.
 
 pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     let h = mount::resolve(path)?;
@@ -527,6 +520,10 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
 }
 
 // ── symlink / readlink ────────────────────────────────────────────────────────
+//
+// Fat32 has no symlink support in VFAT — return -EPERM (-1) for both.
+// Overlayfs: symlink creates the link in the upper layer (no copy-up needed
+// for a new name). readlink checks upper first, then falls back to lower.
 
 pub fn symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let h = mount::resolve(link_path)?;
@@ -534,6 +531,11 @@ pub fn symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_symlink(target, link_path),
         FsType::Ext2  => crate::fs::ext2::sys_symlink(target, link_path).map(|_| ()),
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h)?;
+            crate::fs::overlayfs::symlink(&om, target, &h.subpath)
+        }
+        FsType::Fat32 => Err(-1),  // EPERM: VFAT has no symlink support
         _             => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(link_path); }
@@ -545,11 +547,20 @@ pub fn readlink(path: &str) -> Result<String, isize> {
     match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_readlink(path),
         FsType::Ext2  => crate::fs::ext2::sys_readlink(path).map_err(|e| e as isize),
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h)?;
+            crate::fs::overlayfs::readlink(&om, &h.subpath)
+        }
+        FsType::Fat32 => Err(-22), // EINVAL: not a symlink (VFAT can't have them)
         _             => Err(-22),
     }
 }
 
 // ── chmod / chown ─────────────────────────────────────────────────────────────
+//
+// Fat32 has no permission bits — return -EPERM for both chmod and chown.
+// Overlayfs: copy up the inode to the upper layer if needed, then update
+// the mode/uid/gid on the upper copy.
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -557,6 +568,12 @@ pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_chmod(path, mode),
         FsType::Ext2  => crate::fs::ext2::sys_chmod(path, mode).map(|_| ()),
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h)?;
+            crate::fs::overlayfs::copy_up_if_needed(&om, &h.subpath)?;
+            crate::fs::overlayfs::chmod(&om, &h.subpath, mode)
+        }
+        FsType::Fat32 => Err(-1),  // EPERM: VFAT has no permission bits
         _             => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(path); }
@@ -569,6 +586,12 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     let result = match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_chown(path, uid, gid),
         FsType::Ext2  => crate::fs::ext2::sys_chown(path, uid, gid).map(|_| ()),
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h)?;
+            crate::fs::overlayfs::copy_up_if_needed(&om, &h.subpath)?;
+            crate::fs::overlayfs::chown(&om, &h.subpath, uid, gid)
+        }
+        FsType::Fat32 => Err(-1),  // EPERM: VFAT has no ownership model
         _             => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(path); }
