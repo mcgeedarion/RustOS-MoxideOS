@@ -19,48 +19,39 @@
 //!     15 Store page fault
 //!
 //!   Interrupts (scause MSB = 1):
-//!     1  Supervisor software interrupt
-//!     5  Supervisor timer interrupt
+//!     1  Supervisor software interrupt → IPI dispatch
+//!     5  Supervisor timer interrupt    → tick + schedule + re-arm
 //!     9  Supervisor external interrupt → PLIC claim/complete loop
 //!
-//! ## Syscall ABI (RISC-V Linux)
-//!   a7 = syscall number
-//!   a0..a5 = arguments
-//!   a0 = return value
+//! ## IPI flow (scause code 1)
+//!   1. Clear SIP.SSIP to acknowledge (write-0 via csrc).
+//!   2. Read logical cpu_id from PercpuBlock (tp-relative).
+//!   3. Call `ipi::dispatch(cpu_id)` which reads & clears `ipi_pending`
+//!      atomically and dispatches each kind:
+//!        bit 0 = TlbShootdown  → ipi::handle_tlb_shootdown()
+//!        bit 1 = Reschedule    → proc::scheduler::schedule()
+//!        bit 2 = FuncCall      → (future deferred-work queue)
+//!        bit 3 = PanicHalt     → halt this hart
 //!
 //! ## Timer tick (scause = 0x8000_0000_0000_0005)
 //!
 //!   Every supervisor timer interrupt:
 //!     1. `time::tick_advance(TICK_NS)` — advance the monotonic clock.
-//!     2. `time::timer::expire_timers()` — fire due wheel entries (nanosleep
-//!        wakeups, ITIMER_REAL, timerfd callbacks, …).
+//!     2. `time::timer::expire_timers()` — fire due wheel entries.
 //!     3. `proc::scheduler::schedule()` — context switch if needed.
-//!     4. `clint::set_next_event(hart, TICK_NS)` — re-arm mtimecmp so the
-//!        next tick fires TICK_NS nanoseconds from now.
+//!     4. `clint::set_next_event(hart, TICK_NS)` — re-arm mtimecmp.
 //!     5. Re-enable STIE in `sie`.
 //!
 //! ## Anonymous mmap page-fault flow (demand paging)
 //!
 //! When user-space touches a page inside a VmaKind::Anonymous (or Heap/Stack)
 //! region that has no PTE yet, scause = 13 (load) or 15 (store).
-//!
-//!   1. stval = faulting VA (not necessarily page-aligned).
-//!   2. `find_vma` looks up the VMA containing that address.
-//!   3. Allocate a fresh zeroed page from PMM.
-//!   4. Map it into the current Sv39 address space with PTE bits derived
-//!      from the VMA’s `prot` field (R/W/X + U, never more than prot allows).
-//!   5. Issue `sfence.vma` to flush the TLB for that VA.
-//!   6. Return — `sret` replays the faulting instruction.
-//!
-//! File-backed VMAs (VmaKind::FileBacked) are not yet demand-paged from disk;
-//! they zero-fill for now (TODO: call vfs::pread into the new page).
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
 use crate::mm::mmap::{VmaKind, PROT_READ, PROT_WRITE, PROT_EXEC};
 
 /// Trap frame saved by `riscv_trap_entry`.
-/// Layout must exactly match the store order in the entry asm.
 #[repr(C)]
 pub struct TrapFrame {
     pub ra: usize,  pub sp:  usize, pub gp:  usize, pub tp:  usize,
@@ -175,6 +166,24 @@ pub extern "C" fn riscv_trap_handler(frame: &mut TrapFrame) {
 fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
     match code {
         // ────────────────────────────────────────────────────────────────
+        // Supervisor software interrupt (code 1) — IPI.
+        //
+        // Protocol:
+        //   1. Clear SIP.SSIP (write-0) to acknowledge.  This must happen
+        //      *before* dispatch so the CPU can receive the next IPI.
+        //   2. Read logical cpu_id from PercpuBlock (tp-relative, set by
+        //      percpu::init on both BSP and APs).
+        //   3. Atomically drain ipi_pending and dispatch each bit.
+        // ────────────────────────────────────────────────────────────────
+        1 => {
+            // Clear SSIP to allow the next IPI to raise SSIP again.
+            // Using csrc (atomic clear bits): csrc sip, 0x2
+            unsafe { asm!("csrci sip, 2", options(nostack, nomem)); }
+            let cpu_id = crate::smp::percpu::current_cpu_id();
+            crate::smp::ipi::dispatch(cpu_id);
+        }
+
+        // ────────────────────────────────────────────────────────────────
         // Supervisor timer interrupt (code 5).
         // ────────────────────────────────────────────────────────────────
         5 => {
@@ -192,13 +201,6 @@ fn handle_interrupt(_frame: &mut TrapFrame, code: usize) {
 
         // ────────────────────────────────────────────────────────────────
         // Supervisor external interrupt (code 9) — PLIC.
-        //
-        // The PLIC's claim/complete loop in plic::handle_irq():
-        //   1. Reads the claim register — gets the highest-priority pending IRQ.
-        //   2. Looks up and calls the registered handler (e.g.
-        //      virtio_net_mmio::virtio_net_mmio_irq).
-        //   3. Writes the IRQ back to the complete register.
-        //   4. Loops until claim returns 0 (no more pending).
         // ────────────────────────────────────────────────────────────────
         9 => { crate::drivers::plic::handle_irq(); }
 
@@ -259,15 +261,13 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
 
 pub fn trap_init() {
     set_stvec(riscv_trap_entry as usize);
-    // Enable SSIE (software), STIE (timer), SEIE (external/PLIC).
+    // Enable SSIE (software/IPI=1), STIE (timer=5), SEIE (external/PLIC=9).
     let sie = csrr!("sie");
     csrw!("sie", sie | (1 << 1) | (1 << 5) | (1 << 9));
     // Enable supervisor-mode interrupts globally (sstatus.SIE = 1).
     let sstatus = csrr!("sstatus");
     csrw!("sstatus", sstatus | (1 << 1));
 }
-
-// ── sret trampoline ──────────────────────────────────────────────────────────────────
 
 #[naked]
 #[no_mangle]
@@ -283,8 +283,6 @@ pub unsafe extern "C" fn sret_trampoline() -> ! {
         options(noreturn)
     );
 }
-
-// ── Sv39 page-mapping helper ───────────────────────────────────────────────────────────
 
 fn riscv_map_page(va: usize, pa: usize, pte_bits: u64) {
     let satp  = get_satp();

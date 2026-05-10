@@ -6,9 +6,27 @@
 //!   0xF2 — function call (deferred work)
 //!   0xFE — panic halt (NMI preferred but vector fallback)
 //!
-//! RISC-V: uses CLINT software-interrupt (SIP.SSIP).
+//! RISC-V: uses SBI SEND_IPI (EID 0x735049) to set SIP.SSIP on the target
+//! hart.  The target takes a supervisor software interrupt (scause = 1) and
+//! calls `ipi::dispatch(cpu_id)` from the trap handler.
+//!
+//! ## IPI pending bits  (`PercpuBlock::ipi_pending`, AtomicU32)
+//!   bit 0 = TlbShootdown  → handle_tlb_shootdown(cpu_id)
+//!   bit 1 = Reschedule    → proc::scheduler::schedule()
+//!   bit 2 = FuncCall      → (future deferred-work queue)
+//!   bit 3 = PanicHalt     → halt this hart / CPU
+//!
+//! ## Send protocol
+//!   1. Set target's `ipi_pending` bit(s) with `fetch_or(..., Release)`.
+//!   2. Call `send(target_cpu, kind)` which invokes the arch-specific
+//!      mechanism (x86: APIC ICR write; RISC-V: SBI SEND_IPI ecall).
+//!
+//! ## Receive protocol (RISC-V, trap handler scause code 1)
+//!   1. Clear SIP.SSIP to acknowledge the interrupt.
+//!   2. Call `ipi::dispatch(cpu_id)` — reads & clears `ipi_pending` atomically
+//!      then dispatches each set bit.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::smp::{MAX_CPUS, num_online_cpus, cpu_info};
 
 /// IPI vector base (x86_64).
@@ -27,14 +45,12 @@ pub enum IpiKind {
     PanicHalt    = 3,
 }
 
-/// Per-CPU TLB shootdown request: the VA range to flush.
-/// Using a global array indexed by cpu_id — only one outstanding shootdown
-/// per CPU at a time (BSP serialises them via `SHOOTDOWN_LOCK`).
+/// Per-CPU TLB shootdown request.
 #[derive(Clone, Copy, Default)]
 pub struct ShootdownReq {
     pub start: u64,
     pub end:   u64,
-    pub asid:  u16,   // 0 = all address spaces
+    pub asid:  u16,
     pub done:  bool,
 }
 
@@ -42,10 +58,14 @@ static mut SHOOTDOWN_REQS: [ShootdownReq; MAX_CPUS] = [ShootdownReq {
     start: 0, end: 0, asid: 0, done: false,
 }; MAX_CPUS];
 
-/// Bitmask of CPUs that still haven't acknowledged the current shootdown.
 static SHOOTDOWN_ACK: AtomicU64 = AtomicU64::new(0);
 
+// ── Send ──────────────────────────────────────────────────────────────────────────
+
 /// Send an IPI to a single target CPU.
+///
+/// Caller must have already set the target's `ipi_pending` bits *before*
+/// calling this, so the handler is guaranteed to see them.
 #[inline]
 pub fn send(target_cpu: u32, kind: IpiKind) {
     #[cfg(target_arch = "x86_64")]
@@ -62,11 +82,10 @@ pub fn send(target_cpu: u32, kind: IpiKind) {
     }
     #[cfg(target_arch = "riscv64")]
     {
+        let _ = kind; // kind encoded in ipi_pending bits, not in the IPI itself
         if let Some(info) = cpu_info(target_cpu) {
-            crate::arch::riscv64::smp::send_ipi(info.hw_id);
-            // The kind is communicated via `ipi_pending` bits already set.
+            crate::arch::riscv64::smp::send_ipi(info.hw_id as usize);
         }
-        let _ = kind;
     }
 }
 
@@ -75,26 +94,64 @@ pub fn broadcast_except_self(kind: IpiKind) {
     let me = crate::smp::percpu::current_cpu_id();
     for cpu in 0..num_online_cpus() {
         if cpu != me {
-            // Mark pending bit so the handler knows what to do.
-            if let Some(info) = cpu_info(cpu) {
-                unsafe {
-                    let blk_ptr = &crate::smp::percpu::PERCPU_BLOCKS[cpu as usize];
-                    blk_ptr.ipi_pending.fetch_or(1 << (kind as u8), Ordering::Release);
-                }
+            // Write pending bits first, then send.
+            unsafe {
+                let blk_ptr = &crate::smp::percpu::PERCPU_BLOCKS[cpu as usize];
+                blk_ptr.ipi_pending.fetch_or(1 << (kind as u8), Ordering::Release);
             }
             send(cpu, kind);
         }
     }
 }
 
-/// Flush `[start, end)` on all CPUs that have `asid` mapped.
-/// Blocks until all CPUs acknowledge.
+// ── Receive dispatch ────────────────────────────────────────────────────────────────
+
+/// Called from the supervisor software interrupt handler (RISC-V scause = 1)
+/// after SIP.SSIP has been cleared.  Atomically drains all pending IPI bits
+/// and dispatches each one.
+///
+/// This is also called on x86_64 from the APIC IPI vector handlers (which
+/// have already decoded the kind from the vector number and set the bit
+/// before calling here), but on x86_64 the vectors fire directly so this
+/// function is a fallback path not normally used.
+pub fn dispatch(cpu_id: u32) {
+    let blk = unsafe { &crate::smp::percpu::PERCPU_BLOCKS[cpu_id as usize] };
+    // Atomically read and clear all pending bits.
+    let pending = blk.ipi_pending.swap(0, Ordering::AcqRel);
+    if pending == 0 {
+        // Spurious SSIP (can happen if SBI raises it for other reasons).
+        return;
+    }
+
+    if pending & (1 << IpiKind::TlbShootdown as u8) != 0 {
+        handle_tlb_shootdown(cpu_id);
+    }
+    if pending & (1 << IpiKind::Reschedule as u8) != 0 {
+        crate::proc::scheduler::schedule();
+    }
+    if pending & (1 << IpiKind::FuncCall as u8) != 0 {
+        // Future: drain deferred work queue.
+    }
+    if pending & (1 << IpiKind::PanicHalt as u8) != 0 {
+        // Another hart panicked; halt this one.
+        crate::println!("smp: cpu {} halted by IPI_PANIC_HALT", cpu_id);
+        loop {
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("wfi", options(nostack, nomem)); }
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+        }
+    }
+}
+
+// ── TLB shootdown ─────────────────────────────────────────────────────────────────
+
+/// Flush `[start, end)` on all CPUs.  Blocks until all CPUs acknowledge.
 pub fn tlb_shootdown(start: u64, end: u64, asid: u16) {
     let me = crate::smp::percpu::current_cpu_id();
     let n = num_online_cpus();
     if n <= 1 { return; }
 
-    // Build ack mask (all CPUs except self).
     let mut ack_mask: u64 = 0;
     for cpu in 0..n {
         if cpu != me {
@@ -107,24 +164,18 @@ pub fn tlb_shootdown(start: u64, end: u64, asid: u16) {
         }
     }
     SHOOTDOWN_ACK.store(ack_mask, Ordering::Release);
-
     broadcast_except_self(IpiKind::TlbShootdown);
-
-    // Flush our own TLB range first.
     local_tlb_flush(start, end);
-
-    // Spin until all remote CPUs acknowledge.
     while SHOOTDOWN_ACK.load(Ordering::Acquire) != 0 {
         core::hint::spin_loop();
     }
 }
 
-/// Called from the TLB-shootdown IPI handler on each AP.
+/// Called from `dispatch` on the recipient CPU.
 pub fn handle_tlb_shootdown(cpu_id: u32) {
     let req = unsafe { &mut SHOOTDOWN_REQS[cpu_id as usize] };
     local_tlb_flush(req.start, req.end);
     req.done = true;
-    // Clear our bit in the ack mask.
     SHOOTDOWN_ACK.fetch_and(!(1u64 << cpu_id), Ordering::Release);
 }
 
@@ -140,7 +191,6 @@ fn local_tlb_flush(start: u64, end: u64) {
     }
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        // sfence.vma flushes the entire TLB; range flush is optional.
         core::arch::asm!("sfence.vma", options(nostack));
     }
 }
@@ -150,6 +200,10 @@ fn local_tlb_flush(start: u64, end: u64) {
 pub fn reschedule(target_cpu: u32) {
     let me = crate::smp::percpu::current_cpu_id();
     if target_cpu != me {
+        unsafe {
+            crate::smp::percpu::PERCPU_BLOCKS[target_cpu as usize]
+                .ipi_pending.fetch_or(1 << IpiKind::Reschedule as u8, Ordering::Release);
+        }
         send(target_cpu, IpiKind::Reschedule);
     }
 }
