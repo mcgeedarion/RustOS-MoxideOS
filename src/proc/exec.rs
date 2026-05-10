@@ -12,6 +12,8 @@
 //!   8.  clear_vmas / free_old_address_space / load_cr3(new_cr3)
 //!   9.  build_initial_stack → initial_rsp
 //!  10.  PCB update: user_satp/pc/sp/signal_handlers/vfork_parent/exe_path
+//!       signal_handlers: SIG_IGN dispositions survive; user VAs reset to SIG_DFL.
+//!       pending signals and sigmask are cleared (they don't survive exec).
 //!  11.  wake_pid(vfork_parent) if set
 //!  12.  Patch SyscallFrame (x86_64) OR rebuild TrapFrame on kstack (riscv64)
 //!
@@ -22,21 +24,7 @@
 //!   at `kstack_top - TRAP_FRAME_SIZE`. We overwrite it in-place via
 //!   `rebuild_trap_frame_riscv`, then update the Context so that the next
 //!   context switch (or the eventual trap_return at the end of this trap
-//!   handler invocation) enters the new program correctly:
-//!
-//!     ctx.ra  = task_entry_trampoline   — schedule() → switch_riscv → ret here
-//!     ctx.sp  = kstack_top - TRAP_FRAME_SIZE  — kernel sp for trap_return
-//!     ctx.s0  = 0                       — clean fp chain
-//!
-//!   This keeps the same PID, TID, kstack, and FD table, matching Linux
-//!   execve semantics. FDs with O_CLOEXEC are already closed by
-//!   proc_fd_close_on_exec before this point.
-//!
-//! ## Bug fixes (carried forward)
-//!
-//! ### copy_from_user argument order was swapped
-//! ### build_initial_stack NULL sentinel was before pointer arrays
-//! ### do_execve re-read vfork_parent after zeroing it
+//!   handler invocation) enters the new program correctly.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -84,7 +72,7 @@ const PRESENT:       u64   = 1;
 const MAX_CSTR_LEN:   usize = 4096;
 const MAX_CSTR_ARRAY: usize = 1024;
 
-// ── stack size helper ──────────────────────────────────────────────────────────────────────
+// ── stack size helper ─────────────────────────────────────────────────────────
 
 fn stack_bytes_for_pid(pid: usize) -> usize {
     let soft = scheduler::with_proc(pid, |p| p.rlimits.stack_soft())
@@ -99,7 +87,7 @@ fn stack_bytes_for_pid(pid: usize) -> usize {
 
 fn stack_bytes_default() -> usize { DEFAULT_STACK_BYTES }
 
-// ── free_old_address_space ────────────────────────────────────────────────────────────────
+// ── free_old_address_space ────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn free_old_address_space(cr3: usize) {
@@ -145,7 +133,7 @@ pub unsafe fn free_child_address_space(_cr3: usize) {}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn free_old_address_space(_cr3: usize) {}
 
-// ── new_user_address_space ────────────────────────────────────────────────────────────────
+// ── new_user_address_space ────────────────────────────────────────────────────
 
 fn new_user_address_space() -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
@@ -182,7 +170,7 @@ fn load_cr3(cr3: usize) {
     }
 }
 
-// ── spawn_user_process (boot-time, no running task) ─────────────────────────────────
+// ── spawn_user_process (boot-time, no running task) ──────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
@@ -268,8 +256,6 @@ pub fn spawn_user_process_from_bytes(
     let ppid = scheduler::current_pid();
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    // For spawn (boot-time) on RISC-V: build the initial TrapFrame so the
-    // task can enter user mode via task_entry_trampoline → trap_return.
     #[cfg(target_arch = "riscv64")]
     rebuild_trap_frame_riscv(kstack_top, entry_va, initial_rsp, 0);
 
@@ -320,7 +306,7 @@ pub fn spawn_process(path: &str) -> bool {
     spawn_user_process(path, &[path], &[])
 }
 
-// ── sys_execve [NR 59] ───────────────────────────────────────────────────────────────────
+// ── sys_execve [NR 59] ────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(
@@ -346,12 +332,6 @@ pub fn sys_execve(
     }
 }
 
-/// RISC-V execve entry point (called from trap handler, no SyscallFrame).
-///
-/// Performs a full in-place exec: replaces the current task's address space,
-/// rewrites the TrapFrame at kstack_top - TRAP_FRAME_SIZE, and updates the
-/// Context so that the scheduler enters user mode correctly on next dispatch.
-/// Returns 0 on success or a negative errno on failure.
 #[cfg(target_arch = "riscv64")]
 pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
     let mut path_buf = alloc::vec![0u8; MAX_CSTR_LEN];
@@ -371,7 +351,7 @@ pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isi
     }
 }
 
-// ── do_execve (x86_64) ───────────────────────────────────────────────────────────────────
+// ── do_execve (x86_64) ───────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(
@@ -436,11 +416,16 @@ pub fn do_execve(
 
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
+    // Snapshot old signal_handlers before mutating PCB so we can exec_reset.
+    let old_handlers = scheduler::with_proc(pid as usize, |p| p.signal_handlers.clone())
+        .unwrap_or_default();
+
     let vfork_parent = scheduler::with_proc_mut(pid as usize, |p| {
         p.user_satp       = new_cr3;
         p.pc              = entry_va;
         p.sp              = initial_rsp;
-        p.signal_handlers = SignalHandlers::default();
+        // SIG_IGN dispositions survive exec; user handler VAs are reset.
+        p.signal_handlers = old_handlers.exec_reset();
         p.exe_path        = Some(String::from(path));
         p.brk_base        = heap_base;
         p.brk             = heap_base;
@@ -448,6 +433,9 @@ pub fn do_execve(
         p.vfork_parent    = 0;
         vp
     }).unwrap_or(0);
+
+    // Pending signals and sigmask do not survive exec.
+    crate::proc::signal::altstack_clear_pid(pid as usize);
 
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
@@ -457,25 +445,8 @@ pub fn do_execve(
     Ok(())
 }
 
-// ── do_execve_riscv (in-place exec for RISC-V) ───────────────────────────────────────
+// ── do_execve_riscv ───────────────────────────────────────────────────────────
 
-/// Replace the current task's address space in-place.
-///
-/// Steps:
-///   1.  Load and map the new ELF into a fresh page table root.
-///   2.  Allocate a new user stack in the new address space.
-///   3.  Close O_CLOEXEC file descriptors.
-///   4.  Tear down the old address space and switch to the new one.
-///   5.  Build the initial argv/envp/auxv stack.
-///   6.  Write a new `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE`.
-///   7.  Update `pcb.ctx` so `schedule()` → `switch_riscv` → `ret` lands at
-///       `task_entry_trampoline`, which jumps to `trap_return` and `sret`s.
-///   8.  Update PCB metadata (satp, pc, sp, exe_path, brk, signals).
-///   9.  Wake vfork parent if applicable.
-///
-/// The function returns `Ok(())`. Because the TrapFrame has already been
-/// overwritten on the kstack, the trap handler's normal restore path will
-/// `sret` into the new program when this ecall returns.
 #[cfg(target_arch = "riscv64")]
 fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize> {
     use crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
@@ -484,7 +455,6 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
     let pid = scheduler::current_pid();
     crate::fs::process_fd::proc_fd_close_on_exec(pid);
 
-    // ── 1–2. Load ELF into fresh address space ─────────────────────────────
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|_| -8isize)?;
     let file_size = vfs::fstat(fd).unwrap_or(0);
     const MAX_ELF: usize = 64 * 1024 * 1024;
@@ -530,32 +500,19 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
         &hdr, &phdrs, phdr_va, entry_va, interp_base_val,
     ).map_err(|e| { unsafe { free_old_address_space(new_satp); } e })?;
 
-    // ── 3–4. Tear down old address space, activate new one ─────────────────
     let old_satp = scheduler::with_proc(pid as usize, |p| p.user_satp).unwrap_or(0);
     mmap::clear_vmas_pub(pid as usize);
     if old_satp != 0 { unsafe { free_old_address_space(old_satp); } }
-    load_cr3(new_satp);   // load_cr3 handles RISC-V satp + sfence.vma
+    load_cr3(new_satp);
 
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    // ── 5. Retrieve kstack_top before mutating PCB ─────────────────────────
     let kstack_top = scheduler::with_proc(pid as usize, |p| p.kstack_top)
         .unwrap_or(0);
     if kstack_top == 0 { return Err(-1); }
 
-    // ── 6. Rebuild TrapFrame in place on the kstack ────────────────────────
-    //
-    // The TrapFrame slot is always at kstack_top - TRAP_FRAME_SIZE.
-    // We zero the old frame and populate the new program's entry state.
-    // TLS (tp) starts as 0; the runtime will set it via set_thread_area
-    // or clone(CLONE_SETTLS) in userspace.
-    rebuild_trap_frame_riscv(kstack_top, entry_va, initial_sp, 0 /* tls */);
+    rebuild_trap_frame_riscv(kstack_top, entry_va, initial_sp, 0);
 
-    // ── 7. Update Context ───────────────────────────────────────────────────────────────
-    //
-    // Whether this task is scheduled next via switch_riscv (preempted before
-    // the ecall handler returns) or resumes through the normal trap exit path,
-    // both paths end at trap_return which restores the TrapFrame we just wrote.
     let new_ctx = crate::proc::context::Context {
         ra:  task_entry_trampoline as usize,
         sp:  kstack_top - TRAP_FRAME_SIZE,
@@ -563,13 +520,16 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
         ..crate::proc::context::Context::zero()
     };
 
-    // ── 8. Update PCB metadata ───────────────────────────────────────────────────────────
+    // Snapshot old handlers before mutating PCB.
+    let old_handlers = scheduler::with_proc(pid as usize, |p| p.signal_handlers.clone())
+        .unwrap_or_default();
+
     let vfork_parent = scheduler::with_proc_mut(pid as usize, |p| {
         p.user_satp       = new_satp;
         p.pc              = entry_va;
         p.sp              = initial_sp;
         p.ctx             = new_ctx;
-        p.signal_handlers = SignalHandlers::default();
+        p.signal_handlers = old_handlers.exec_reset();
         p.exe_path        = Some(String::from(path));
         p.brk_base        = heap_base;
         p.brk             = heap_base;
@@ -579,23 +539,16 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
         vp
     }).unwrap_or(0);
 
-    // ── 9. Wake vfork parent ─────────────────────────────────────────────────────────────
+    // Pending signals and sigmask do not survive exec.
+    crate::proc::signal::altstack_clear_pid(pid as usize);
+
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
     Ok(())
 }
 
-// ── rebuild_trap_frame_riscv ──────────────────────────────────────────────────────────
+// ── rebuild_trap_frame_riscv ──────────────────────────────────────────────────
 
-/// Overwrite the `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE` with a fresh
-/// frame for the new program.
-///
-/// Used by both `do_execve_riscv` (in-place exec) and `spawn_user_process`
-/// (boot-time first task) on RISC-V.
-///
-/// `sstatus` is set with SPIE=1 (interrupts enabled after sret) and SPP=0
-/// (return to U-mode).  All registers except `sp`, `tp`, `a0`, and `sepc`
-/// are zeroed so the new program starts with a clean register state.
 #[cfg(target_arch = "riscv64")]
 fn rebuild_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, tls: usize) {
     use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE, SSTATUS_SPIE, SSTATUS_SPP};
@@ -611,7 +564,7 @@ fn rebuild_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, 
     }
 }
 
-// ── read_cstr_array ───────────────────────────────────────────────────────────────────────
+// ── read_cstr_array ───────────────────────────────────────────────────────────
 
 fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     if ptr_array_va == 0 { return Vec::new(); }
@@ -637,7 +590,7 @@ fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
     result
 }
 
-// ── build_initial_stack ──────────────────────────────────────────────────────────────────────
+// ── build_initial_stack ───────────────────────────────────────────────────────
 
 fn build_initial_stack(
     stack_top: usize,
@@ -727,7 +680,7 @@ fn build_initial_stack(
     Ok(sp)
 }
 
-// ── load_interpreter ────────────────────────────────────────────────────────────────────────
+// ── load_interpreter ─────────────────────────────────────────────────────────
 
 fn load_interpreter(cr3: usize, path: &str) -> Result<usize, isize> {
     let fd = vfs::open(path, vfs::O_RDONLY).map_err(|_| -8isize)?;
@@ -747,7 +700,7 @@ fn load_interpreter(cr3: usize, path: &str) -> Result<usize, isize> {
     elf::load_elf_into(cr3, idata, &ihdr, &iphdrs)
 }
 
-// ── clear_vmas wrapper ──────────────────────────────────────────────────────────────────────
+// ── clear_vmas wrapper ────────────────────────────────────────────────────────
 
 pub fn clear_vmas(pid_key: u32) {
     mmap::clear_vmas_pub(pid_key as usize);
