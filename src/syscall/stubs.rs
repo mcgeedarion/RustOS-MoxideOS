@@ -250,7 +250,7 @@ fn mremap_move(
         crate::mm::mmap::sys_munmap(hint, new_len);
         hint
     } else {
-        crate::proc::scheduler::with_proc_mut(pid, |p| {
+        crate::proc::scheduler::with_proc_mut(pid, |p, _pl| {
             let v = p.next_va;
             p.next_va = (v + new_len + PAGE * 2 + PAGE - 1) & !(PAGE - 1);
             v

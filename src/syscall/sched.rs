@@ -121,7 +121,7 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
 
     let now_ns = crate::time::monotonic_ns();
 
-    crate::proc::scheduler::with_proc_mut(pid, |pcb| {
+    crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         let was_rt    = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
         let becomes_rt = matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr);
 
@@ -192,7 +192,7 @@ pub fn sys_sched_setparam(pid: usize, param_uptr: usize) -> isize {
     if copy_from_user(param_uptr as *const SchedParam, &mut param).is_err() {
         return -14;
     }
-    crate::proc::scheduler::with_proc_mut(pid, |pcb| {
+    crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         if pcb.sched.policy == SchedPolicy::Normal {
             // No-op for CFS tasks.
         } else {
@@ -227,7 +227,7 @@ pub fn sys_setpriority(which: i32, who: usize, prio: i32) -> isize {
     let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
     let floor = nice_floor(pid);
     let clamped = prio.clamp(floor as i32, 19) as i8;
-    crate::proc::scheduler::with_proc_mut(pid, |p| {
+    crate::proc::scheduler::with_proc_mut(pid, |p, _pl| {
         p.sched.nice   = clamped;
         p.sched.weight = crate::proc::scheduler::nice_to_weight_pub(clamped);
     }).map(|_| 0isize).unwrap_or(-3)
@@ -263,7 +263,7 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     let online_mask: u64 = if ncpus >= 64 { u64::MAX } else { (1u64 << ncpus) - 1 };
     let effective = mask & online_mask;
     if effective == 0 { return -22; }
-    crate::proc::scheduler::with_proc_mut(pid, |pcb| {
+    crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         pcb.sched.cpumask = effective;
     }).map(|_| 0isize).unwrap_or(-3)
 }
