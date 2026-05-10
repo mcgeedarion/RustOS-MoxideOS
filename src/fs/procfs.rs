@@ -8,11 +8,12 @@
 //!   /proc/self/maps    → VMA map in Linux /proc/maps format
 //!   /proc/<pid>/maps   → same for any pid
 //!   /proc/self/status  → minimal status fields (incl. RtCpuTime)
-//!   /proc/self/stat    → full 52-field stat line (Linux 3.5+ format)
+//!   /proc/<pid>/stat   → full 52-field stat line (Linux 3.5+ format)
 //!   /proc/<pid>/limits → per-process resource limits (ulimit -a format)
 //!   /proc/uptime       → uptime in seconds
 //!   /proc/meminfo      → basic memory figures
 //!   /proc/cpuinfo      → single-CPU stub
+//!   /proc/slabinfo     → slab allocator cache statistics
 //!
 //! ## readlink support
 //!   readlink("/proc/self/exe")  → exe path string (no NUL)
@@ -143,9 +144,20 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     if p == "/proc/meminfo" {
         let total = crate::mm::pmm::total_pages() as u64 * 4;
         let free  = crate::mm::pmm::free_pages()  as u64 * 4;
+        // Pull slab usage from the slab allocator.
+        let slab  = crate::mm::slab::slab_stats();
+        let slab_kb = (slab.total_slabs * 4) as u64; // each slab = 1 page = 4 KiB
         return Some(format!(
-            "MemTotal:  {:8} kB\nMemFree:   {:8} kB\nMemAvailable: {:8} kB\n",
-            total, free, free
+            "MemTotal:      {:8} kB\n\
+             MemFree:       {:8} kB\n\
+             MemAvailable:  {:8} kB\n\
+             Slab:          {:8} kB\n\
+             SReclaimable:  {:8} kB\n\
+             SUnreclaim:    {:8} kB\n",
+            total, free, free,
+            slab_kb,
+            slab_kb, // all slabs are reclaimable via slab_shrink()
+            0u64,
         ).into_bytes());
     }
     if p == "/proc/cpuinfo" {
@@ -177,7 +189,61 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     if p == "/proc/mounts" || p == "/proc/self/mounts" || p.ends_with("/mounts") {
         return Some(b"tmpfs /dev/shm tmpfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n".to_vec());
     }
+    // ── /proc/slabinfo ────────────────────────────────────────────────────────
+    //
+    // Format matches Linux 2.6+ /proc/slabinfo v2.1:
+    //
+    //   slabinfo - version: 2.1
+    //   # name          <active_objs> <num_objs> <objsize> <objperslab> \
+    //         <pagesperslab> : tunables <limit> <batchcount> <sharedfactor> \
+    //         : slabdata <active_slabs> <num_slabs> <sharedavail>
+    //
+    // tunables / sharedavail are 0 (no per-CPU magazines yet).
+    if p == "/proc/slabinfo" {
+        return Some(gen_slabinfo().into_bytes());
+    }
     None
+}
+
+// ─── /proc/slabinfo generator ─────────────────────────────────────────────────
+
+fn gen_slabinfo() -> String {
+    use crate::mm::slab::slab_stats;
+
+    let stats = slab_stats();
+    let mut out = String::from(
+        "slabinfo - version: 2.1\n\
+         # name                  <active_objs> <num_objs> <objsize> \
+<objperslab> <pagesperslab> \
+: tunables <limit> <batchcount> <sharedfactor> \
+: slabdata <active_slabs> <num_slabs> <sharedavail>\n"
+    );
+
+    for cs in &stats.per_cache {
+        if cs.obj_size == 0 { continue; }
+        // slots_per_page = (4096 - hdr_offset(obj_size)) / obj_size
+        // Re-derive here to avoid pulling slab internals into procfs.
+        let hdr_raw   = 40usize; // size_of::<SlabHdr>() — kept in sync with slab.rs
+        let hdr_off   = (hdr_raw + cs.obj_size - 1) & !(cs.obj_size - 1);
+        let obj_per_slab = (4096 - hdr_off) / cs.obj_size;
+
+        let total_objs    = cs.total_slabs * obj_per_slab;
+        let active_slabs  = cs.partial_slabs + cs.full_slabs;
+
+        out.push_str(&format!(
+            "{:<22} {:6} {:6} {:6} {:6} {:6} : tunables      0      0      0 \
+: slabdata {:6} {:6}      0\n",
+            format!("kmalloc-{}", cs.obj_size),
+            cs.active_objs,
+            total_objs,
+            cs.obj_size,
+            obj_per_slab,
+            1,              // pages_per_slab is always 1
+            active_slabs,
+            cs.total_slabs,
+        ));
+    }
+    out
 }
 
 // ─── /proc/<pid>/limits generator ────────────────────────────────────────────
@@ -476,15 +542,16 @@ fn gen_maps(pid: usize) -> String {
         let r = if vma.prot & 1 != 0 { 'r' } else { '-' };
         let w = if vma.prot & 2 != 0 { 'w' } else { '-' };
         let x = if vma.prot & 4 != 0 { 'x' } else { '-' };
-        let s = match vma.kind {
-            crate::mm::mmap::VmaKind::Anonymous      => 'p',
-            crate::mm::mmap::VmaKind::FileBacked(..) => 'p',
-            crate::mm::mmap::VmaKind::Fixed          => 'p',
-            crate::mm::mmap::VmaKind::PhysMap(..)    => 'p',
-        };
+        // All non-shared VMA kinds are 'p' (private copy-on-write).
+        // MAP_SHARED is not yet tracked at the VmaKind level, so every
+        // entry is 'p' for now — identical to Linux for anonymous/file-
+        // private maps, and consistent with our COW implementation.
+        let s = 'p';
         let label = match &vma.kind {
             crate::mm::mmap::VmaKind::FileBacked(fd, _) =>
                 crate::fs::vfs::fd_to_path(*fd).unwrap_or_default(),
+            crate::mm::mmap::VmaKind::Heap    => String::from("[heap]"),
+            crate::mm::mmap::VmaKind::Stack   => String::from("[stack]"),
             _ => String::new(),
         };
         out.push_str(&format!(

@@ -5,36 +5,38 @@
 //!   - `kernel_main_riscv64`  — called from the RISC-V SBI stub (boot.rs)
 //!
 //! x86_64 boot sequence:
-//!   1. serial::init()          — UART output
-//!   2. pmm::init()             — physical memory manager
-//!   3. heap::init()            — slab allocator over PMM
-//!   4. initramfs::mount()      — populate VFS from CPIO
-//!   5. gdt::init()             — GDT + TSS
-//!   6. idt::init()             — IDT / exception vectors
-//!   7. apic::init()            — local + IO APIC, timer IRQ
-//!   8. time::init()            — clocksource calibration (TSC/HPET), timerfd, itimers
-//!   9. smp::init()             — enumerate MADT CPUs, bring up APs
-//!  10. tty::init()             — PTY registry + /dev/pts
-//!  11. drivers::nic::init()    — NIC driver (e1000e/virtio-net)
-//!  12. dhcp::init()            — DORA handshake; sets ip/gw/mask in ip layer
-//!  13. spawn pid 1 from /init  — scheduler takes over
+//!   1.  serial::init()         — UART output
+//!   2.  pmm::init()            — physical memory manager
+//!   3.  heap::init()           — linked-list allocator over PMM
+//!   3a. mm::init()             — slab cache pre-warm (8 size classes)
+//!   4.  initramfs::mount()     — populate VFS from CPIO
+//!   5.  gdt::init()            — GDT + TSS
+//!   6.  idt::init()            — IDT / exception vectors
+//!   7.  apic::init()           — local + IO APIC, timer IRQ
+//!   8.  time::init()           — clocksource calibration (TSC/HPET), timerfd, itimers
+//!   9.  smp::init()            — enumerate MADT CPUs, bring up APs
+//!   10. tty::init()            — PTY registry + /dev/pts
+//!   11. drivers::nic::init()   — NIC driver (e1000e/virtio-net)
+//!   12. dhcp::init()           — DORA handshake; sets ip/gw/mask in ip layer
+//!   13. spawn pid 1 from /init — scheduler takes over
 //!
 //! RISC-V boot sequence:
-//!   1. trap_init()             — install stvec, enable SSIE/STIE/SEIE (must be first)
-//!   2. init_from_fdt()         — parse FDT: /memory → PMM, /chosen → initramfs,
+//!   1.  trap_init()            — install stvec, enable SSIE/STIE/SEIE (must be first)
+//!   2.  init_from_fdt()        — parse FDT: /memory → PMM, /chosen → initramfs,
 //!                                            /soc/plic → plic::set_base(),
 //!                                            virtio_mmio@ → virtio_net_mmio::probe()
-//!   3. heap::init()            — slab/linked-list allocator over PMM
-//!   4. initramfs::mount()      — populate VFS from CPIO
-//!   5. plic::init()            — set S-mode context threshold=0, PLIC ready to deliver
-//!   6. virtio_net_mmio::enable_plic_irq()
+//!   3.  heap::init()           — linked-list allocator over PMM
+//!   3a. mm::init()             — slab cache pre-warm (8 size classes)
+//!   4.  initramfs::mount()     — populate VFS from CPIO
+//!   5.  plic::init()           — set S-mode context threshold=0, PLIC ready to deliver
+//!   6.  virtio_net_mmio::enable_plic_irq()
 //!                              — register NIC IRQ with PLIC; enables interrupt-driven RX
-//!   7. time::init()            — calibrate CLINT mtime clocksource, timerfd, itimers
-//!   8. smp::init()             — SBI HSM hart bringup
-//!   9. tty::init()             — PTY registry + /dev/pts
-//!  10. drivers::nic::init()    — NIC abstraction layer init (rx_poll fallback path)
-//!  11. dhcp::init()            — DORA handshake
-//!  12. spawn pid 1 from /init  — scheduler takes over
+//!   7.  time::init()           — calibrate CLINT mtime clocksource, timerfd, itimers
+//!   8.  smp::init()            — SBI HSM hart bringup
+//!   9.  tty::init()            — PTY registry + /dev/pts
+//!   10. drivers::nic::init()   — NIC abstraction layer init (rx_poll fallback path)
+//!   11. dhcp::init()           — DORA handshake
+//!   12. spawn pid 1 from /init — scheduler takes over
 
 #![allow(unused_imports)]
 
@@ -50,8 +52,19 @@ pub fn kernel_main_x86_64() {
     serial::init();
     crate::println!("rustos: x86_64 kernel starting");
 
+    // 2. Physical memory manager — must come first so heap and slab have frames.
     pmm::init();
+
+    // 3. Kernel heap (linked-list allocator) — enables Box / Vec / String.
     heap::init();
+
+    // 3a. Slab allocator — pre-warms 8 fixed-size caches over PMM.
+    //     Must follow heap::init() so that slab::init()'s pmm::alloc_page
+    //     calls (inside Cache::grow) have the PMM ready and so that any
+    //     Box allocations inside init() itself work correctly.
+    crate::mm::init();
+    crate::println!("rustos: slab allocator ready");
+
     crate::fs::initramfs::mount_initramfs();
     gdt::init();
     idt::init();
@@ -112,6 +125,10 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
 
     // 3. Heap must come up before any Box/Vec/String allocations.
     heap::init();
+
+    // 3a. Slab allocator — pre-warms 8 fixed-size caches over PMM.
+    crate::mm::init();
+    crate::println!("rustos: slab allocator ready");
 
     // 4. VFS from CPIO.
     crate::fs::initramfs::mount_initramfs();
