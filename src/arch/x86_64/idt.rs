@@ -124,45 +124,44 @@ pub fn idt_init() {
     }
 }
 
-// ── #DB debug-exception handler ───────────────────────────────────────────────
+// ── #DB / #BP handlers ────────────────────────────────────────────────────────
+//
+// The ASM stubs pass `rsp` (pointing at the SavedRegs frame) as a raw *mut u64.
+// When the gdbstub feature is active we cast to *mut SavedRegs before calling
+// gdb_trap.  When it is absent we ignore the pointer and fall back to the
+// generic halt path.  Using *mut u64 here avoids an unconditional reference to
+// the SavedRegs type which only exists behind #[cfg(feature = "gdbstub")].
 
-/// Called from db_asm with rsp pointing at the base of the SavedRegs frame.
-/// When gdbstub is enabled, hands control to the GDB RSP stub.
-/// Otherwise falls through to the generic halt path.
 #[no_mangle]
-pub unsafe extern "C" fn db_handler(regs: *mut crate::gdbstub::rsp::SavedRegs) {
+pub unsafe extern "C" fn db_handler(frame: *mut u64) {
     #[cfg(feature = "gdbstub")]
     {
-        crate::gdbstub::gdb_trap(regs);
+        crate::gdbstub::gdb_trap(frame as *mut crate::gdbstub::SavedRegs);
         return;
     }
-    #[cfg(not(feature = "gdbstub"))]
+    #[allow(unreachable_code)]
     generic_exception_handler(0);
 }
 
-/// Called from bp_asm with rsp pointing at the base of the SavedRegs frame.
 #[no_mangle]
-pub unsafe extern "C" fn bp_handler(regs: *mut crate::gdbstub::rsp::SavedRegs) {
+pub unsafe extern "C" fn bp_handler(frame: *mut u64) {
     #[cfg(feature = "gdbstub")]
     {
-        crate::gdbstub::gdb_trap(regs);
+        crate::gdbstub::gdb_trap(frame as *mut crate::gdbstub::SavedRegs);
         return;
     }
-    #[cfg(not(feature = "gdbstub"))]
+    #[allow(unreachable_code)]
     generic_exception_handler(0);
 }
 
 // ── #DB ASM stub (vector 1) ───────────────────────────────────────────────────
-//
-// #DB does not push an error code.  We push a dummy 0 to keep the stack
-// layout uniform, save all GPRs, then pass rsp (= &SavedRegs) to db_handler.
 
 #[naked]
 unsafe extern "C" fn db_asm() {
     core::arch::asm!(
-        "push 0",      // dummy error code
+        "push 0",       // dummy error code — #DB has no CPU-pushed error code
         push_all!(),
-        "mov rdi, rsp", // rdi = *mut SavedRegs
+        "mov rdi, rsp", // rdi = *mut u64 frame pointer
         "call db_handler",
         pop_all!(),
         "add rsp, 8",   // discard dummy error code
@@ -172,15 +171,13 @@ unsafe extern "C" fn db_asm() {
 }
 
 // ── #BP ASM stub (vector 3) ───────────────────────────────────────────────────
-//
-// #BP (INT3) does not push an error code.  Same layout as #DB.
 
 #[naked]
 unsafe extern "C" fn bp_asm() {
     core::arch::asm!(
-        "push 0",      // dummy error code
+        "push 0",       // dummy error code — #BP has no CPU-pushed error code
         push_all!(),
-        "mov rdi, rsp", // rdi = *mut SavedRegs
+        "mov rdi, rsp", // rdi = *mut u64 frame pointer
         "call bp_handler",
         pop_all!(),
         "add rsp, 8",   // discard dummy error code
@@ -193,19 +190,11 @@ unsafe extern "C" fn bp_asm() {
 
 #[no_mangle]
 pub extern "C" fn page_fault_handler(faulting_va: usize, error_code: u64) {
-    // ── 1. Demand-zero / demand-fill (P=0, U=1) ───────────────────────────
     if error_code & 0x1 == 0 && error_code & 0x4 != 0 {
-        if crate::mm::page_fault::handle_demand_fault(faulting_va) {
-            return;
-        }
+        if crate::mm::page_fault::handle_demand_fault(faulting_va) { return; }
     }
+    if crate::proc::cow_fault::handle_cow_fault(faulting_va, error_code) { return; }
 
-    // ── 2. CoW write fault (P=1, W=1, U=1) ───────────────────────────────
-    if crate::proc::cow_fault::handle_cow_fault(faulting_va, error_code) {
-        return;
-    }
-
-    // ── 3. Genuine access violation ───────────────────────────────────────
     let pid = crate::proc::scheduler::current_pid();
     crate::console::println!(
         "SIGSEGV pid={} va={:#x} err={:#x}",
@@ -221,7 +210,6 @@ pub extern "C" fn page_fault_handler(faulting_va: usize, error_code: u64) {
 
 // ── ASM stubs ──────────────────────────────────────────────────────────────
 
-/// Page-fault entry stub.
 #[naked]
 unsafe extern "C" fn page_fault_asm() {
     core::arch::asm!(
@@ -265,7 +253,6 @@ unsafe extern "C" fn page_fault_asm() {
     );
 }
 
-/// Timer IRQ entry stub (no error code pushed by CPU).
 #[naked]
 unsafe extern "C" fn timer_irq_asm() {
     core::arch::asm!(
@@ -280,7 +267,6 @@ unsafe extern "C" fn timer_irq_asm() {
     );
 }
 
-/// Generic exception stub.
 #[naked]
 unsafe extern "C" fn generic_exc_asm() {
     core::arch::asm!(

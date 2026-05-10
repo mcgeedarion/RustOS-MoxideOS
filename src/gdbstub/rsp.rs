@@ -68,17 +68,16 @@ pub struct SavedRegs {
 }
 
 impl SavedRegs {
-    /// Read the RIP from the CPU interrupt frame sitting above the saved GPRs.
-    /// Layout: SavedRegs (15×8=120 bytes) + error_code (8) + RIP.
+    /// RIP: 15 GPR slots + 1 error_code slot above the frame base.
     pub unsafe fn rip(ptr: *const Self) -> u64 {
-        *((ptr as *const u64).add(15 + 1)) // skip 15 GPR slots + 1 error_code slot
+        *((ptr as *const u64).add(16))
     }
     pub unsafe fn set_rip(ptr: *mut Self, v: u64) {
         *((ptr as *mut u64).add(16)) = v;
     }
-    /// RFLAGS is 2 slots above RIP in the CPU frame.
+    /// RFLAGS: 15 GPRs + error_code + RIP + CS = offset 18.
     pub unsafe fn rflags(ptr: *const Self) -> u64 {
-        *((ptr as *const u64).add(18)) // 15 GPRs + error_code + RIP + CS + RFLAGS
+        *((ptr as *const u64).add(18))
     }
     pub unsafe fn set_rflags(ptr: *mut Self, v: u64) {
         *((ptr as *mut u64).add(18)) = v;
@@ -117,20 +116,12 @@ fn parse_hex_u64(s: &[u8]) -> Option<u64> {
     }
     Some(v)
 }
+/// Decode a hex string of exactly `dst.len() * 2` bytes into `dst`.
 fn hex_decode(src: &[u8], dst: &mut [u8]) -> bool {
     if src.len() != dst.len() * 2 { return false; }
     for i in 0..dst.len() {
-        let hi = from_hex_nibble(src[i*2])?;
-        let lo = from_hex_nibble(src[i*2+1])?;
-        dst[i] = (hi << 4) | lo;
-    }
-    true
-}
-fn hex_decode(src: &[u8], dst: &mut [u8]) -> bool {
-    if src.len() != dst.len() * 2 { return false; }
-    for i in 0..dst.len() {
-        let hi = match from_hex_nibble(src[i*2])   { Some(v) => v, None => return false };
-        let lo = match from_hex_nibble(src[i*2+1]) { Some(v) => v, None => return false };
+        let hi = match from_hex_nibble(src[i * 2])     { Some(v) => v, None => return false };
+        let lo = match from_hex_nibble(src[i * 2 + 1]) { Some(v) => v, None => return false };
         dst[i] = (hi << 4) | lo;
     }
     true
@@ -157,7 +148,7 @@ unsafe fn reg_get(regs: *const SavedRegs, n: usize) -> Option<u64> {
         1  => r.rcx,
         2  => r.rdx,
         3  => r.rbx,
-        4  => 0,            // rsp: not in our pushed frame; return 0
+        4  => 0,            // rsp: not in pushed frame; return 0
         5  => r.rbp,
         6  => r.rsi,
         7  => r.rdi,
@@ -361,7 +352,7 @@ pub unsafe fn run_session(regs: *mut SavedRegs) {
                         let mut out = Vec::with_capacity(len as usize * 2);
                         for i in 0..len as usize {
                             let mut h = [0u8; 2];
-                            byte_to_hex(ptr.add(i).read_volatile(), &mut h);
+                            byte_to_hex(unsafe { ptr.add(i).read_volatile() }, &mut h);
                             out.extend_from_slice(&h);
                         }
                         send_packet(&out);
@@ -384,7 +375,7 @@ pub unsafe fn run_session(regs: *mut SavedRegs) {
                                 if let (Some(h), Some(l)) =
                                     (from_hex_nibble(hex[i*2]), from_hex_nibble(hex[i*2+1]))
                                 {
-                                    ptr.add(i).write_volatile((h << 4) | l);
+                                    unsafe { ptr.add(i).write_volatile((h << 4) | l); }
                                 }
                             }
                             send_ok();
@@ -394,15 +385,15 @@ pub unsafe fn run_session(regs: *mut SavedRegs) {
             }
 
             b's' => {
-                let rf = SavedRegs::rflags(regs);
-                SavedRegs::set_rflags(regs, rf | RFLAGS_TF);
+                let rf = unsafe { SavedRegs::rflags(regs) };
+                unsafe { SavedRegs::set_rflags(regs, rf | RFLAGS_TF); }
                 send_packet(b"S05");
                 break 'session;
             }
 
             b'c' => {
-                let rf = SavedRegs::rflags(regs);
-                SavedRegs::set_rflags(regs, rf & !RFLAGS_TF);
+                let rf = unsafe { SavedRegs::rflags(regs) };
+                unsafe { SavedRegs::set_rflags(regs, rf & !RFLAGS_TF); }
                 send_packet(b"S05");
                 break 'session;
             }
@@ -455,13 +446,13 @@ pub unsafe fn run_session(regs: *mut SavedRegs) {
                 } else if buf.starts_with(b"vCont;") {
                     match buf.get(6).copied().unwrap_or(0) {
                         b's' => {
-                            let rf = SavedRegs::rflags(regs);
-                            SavedRegs::set_rflags(regs, rf | RFLAGS_TF);
+                            let rf = unsafe { SavedRegs::rflags(regs) };
+                            unsafe { SavedRegs::set_rflags(regs, rf | RFLAGS_TF); }
                             send_packet(b"S05"); break 'session;
                         }
                         b'c' => {
-                            let rf = SavedRegs::rflags(regs);
-                            SavedRegs::set_rflags(regs, rf & !RFLAGS_TF);
+                            let rf = unsafe { SavedRegs::rflags(regs) };
+                            unsafe { SavedRegs::set_rflags(regs, rf & !RFLAGS_TF); }
                             send_packet(b"S05"); break 'session;
                         }
                         _ => send_empty(),
@@ -476,7 +467,7 @@ pub unsafe fn run_session(regs: *mut SavedRegs) {
             }
 
             b'D' => { bp_clear_all(&mut bps); send_ok(); break 'session; }
-            b'k' => { bp_clear_all(&mut bps); break 'session; } // no reply for 'k'
+            b'k' => { bp_clear_all(&mut bps); break 'session; }
 
             _ => send_empty(),
         }
