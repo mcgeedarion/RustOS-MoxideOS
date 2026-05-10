@@ -3,8 +3,8 @@
 //! Reads the FDT blob passed by OpenSBI in `a1` to:
 //!   1. Register physical RAM regions with the PMM (`pmm::add_region`).
 //!   2. Record the initramfs location (`initramfs::set_initramfs_range`).
-//!   3. Discover VirtIO-MMIO devices and call their probe functions.
-//!      Currently handled: DeviceID 1 (net) → `virtio_net_mmio::probe(base, irq)`.
+//!   3. Discover VirtIO-MMIO devices → `virtio_net_mmio::probe(base, irq)`.
+//!   4. Discover the PLIC → `plic::set_base(base)`.
 //!
 //! Only the subset of the FDT spec needed for QEMU `virt` machine is
 //! implemented — big-endian u32 token stream, no dynamic allocation required.
@@ -56,18 +56,16 @@ impl FdtHeader {
     fn off_dt_strings(&self) -> u32 { u32::from_be(self.off_dt_strings) }
 }
 
-// ── Helper: read big-endian integers from a byte slice ─────────────────────────
+// ── Big-endian integer helpers ──────────────────────────────────────────────────────────
 
 #[inline]
 fn be32(b: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([b[off], b[off+1], b[off+2], b[off+3]])
 }
-
 fn cstr(bytes: &[u8], off: usize) -> &str {
     let end = bytes[off..].iter().position(|&c| c == 0).unwrap_or(0);
     core::str::from_utf8(&bytes[off..off + end]).unwrap_or("")
 }
-
 #[inline]
 fn be64(b: &[u8], off: usize) -> u64 {
     u64::from_be_bytes([
@@ -76,27 +74,26 @@ fn be64(b: &[u8], off: usize) -> u64 {
     ])
 }
 
-// ── Kernel page base + size (keep initramfs pages out of the PMM) ─────────────
+// ── Kernel end symbol ───────────────────────────────────────────────────────────────────
 
-extern "C" {
-    static _kernel_end: u8;
-}
+extern "C" { static _kernel_end: u8; }
 
-// ── Node state during walk ────────────────────────────────────────────────────────
+// ── Node tracking state ───────────────────────────────────────────────────────────────
 
-/// State tracked for a single virtio_mmio node as we collect its properties.
 #[derive(Default)]
 struct VirtioMmioNode {
-    base: usize,  // from `reg`
-    irq:  u32,    // from `interrupts`
-    /// true once we have confirmed the `compatible` property says virtio,mmio
+    base:      usize,
+    irq:       u32,
     is_virtio: bool,
 }
 
+/// Which kind of node we are currently inside (depth==2 for /soc/* children).
+#[derive(PartialEq)]
+enum SocChild { None, Plic, Other }
+
 // ── Main walker ───────────────────────────────────────────────────────────────────
 
-/// Walk the FDT blob and initialise the PMM, initramfs range, and VirtIO
-/// MMIO devices.
+/// Walk the FDT blob and initialise PMM, initramfs, PLIC, and VirtIO-MMIO devices.
 ///
 /// # Safety
 /// `fdt_ptr` must be the physical address of a valid DTB blob as passed by
@@ -117,22 +114,23 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
 
     crate::println!("fdt: blob at {:#x}, {} bytes", fdt_ptr, total);
 
-    let mut pos:         usize = 0;
-    let mut depth:       usize = 0;
-    let mut in_memory:   bool  = false;
-    let mut in_chosen:   bool  = false;
-    let mut in_virtio:   bool  = false;  // inside a virtio_mmio node
-    let mut vmmio:       VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
-    let mut initrd_start: u64  = 0;
-    let mut initrd_end:   u64  = 0;
+    let mut pos:           usize = 0;
+    let mut depth:         usize = 0;
+    let mut in_memory:     bool  = false;
+    let mut in_chosen:     bool  = false;
+    let mut in_virtio:     bool  = false;
+    let mut in_soc:        bool  = false;   // inside /soc node (depth 1)
+    let mut soc_child:     SocChild = SocChild::None;  // which /soc/* we are in
+    let mut vmmio:         VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
+    let mut plic_base:     usize = 0;       // /soc/plic reg base
+    let mut initrd_start:  u64   = 0;
+    let mut initrd_end:    u64   = 0;
 
-    let kernel_end_pa = &_kernel_end as *const u8 as usize;
-    let kernel_end_pa = (kernel_end_pa + 0xFFF) & !0xFFF;
+    let kernel_end_pa = (&_kernel_end as *const u8 as usize + 0xFFF) & !0xFFF;
 
     loop {
         if pos + 4 > structs.len() { break; }
-        let token = be32(structs, pos);
-        pos += 4;
+        let token = be32(structs, pos); pos += 4;
 
         match token {
             FDT_BEGIN_NODE => {
@@ -144,53 +142,70 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                                      .unwrap_or("");
                 pos = padded;
 
-                if depth == 1 {
-                    in_memory = node_name == "memory" || node_name.starts_with("memory@");
-                    in_chosen = node_name == "chosen";
-                    // Detect virtio_mmio@<addr> nodes at depth 1.
-                    in_virtio = node_name.starts_with("virtio_mmio@");
-                    if in_virtio {
-                        // Parse base address from node name (e.g. "virtio_mmio@10001000").
-                        let addr_str = &node_name["virtio_mmio@".len()..];
-                        vmmio = VirtioMmioNode {
-                            base: usize::from_str_radix(addr_str, 16).unwrap_or(0),
-                            irq:  0,
-                            is_virtio: false,
+                match depth {
+                    1 => {
+                        // Top-level nodes.
+                        in_memory = node_name == "memory" || node_name.starts_with("memory@");
+                        in_chosen = node_name == "chosen";
+                        in_soc    = node_name == "soc";
+                        in_virtio = node_name.starts_with("virtio_mmio@");
+                        if in_virtio {
+                            let addr_str = &node_name["virtio_mmio@".len()..];
+                            vmmio = VirtioMmioNode {
+                                base: usize::from_str_radix(addr_str, 16).unwrap_or(0),
+                                irq: 0, is_virtio: false,
+                            };
+                        }
+                    }
+                    2 if in_soc => {
+                        // /soc/* children.
+                        soc_child = if node_name == "plic"
+                                      || node_name.starts_with("plic@") {
+                            SocChild::Plic
+                        } else {
+                            SocChild::Other
                         };
                     }
-                } else {
-                    in_memory = false;
-                    in_virtio = false;
+                    _ => {}
                 }
                 depth += 1;
             }
 
             FDT_END_NODE => {
                 if depth > 0 { depth -= 1; }
-                if depth == 1 {
-                    // Leaving a top-level node.
-                    if in_virtio && vmmio.is_virtio && vmmio.base != 0 {
-                        // Probe the device; virtio_net_mmio::probe() checks
-                        // DeviceID internally and returns false for non-net devices.
-                        crate::drivers::virtio_net_mmio::probe(vmmio.base, vmmio.irq);
+                match depth {
+                    1 => {
+                        // Leaving a top-level node.
+                        if in_virtio && vmmio.is_virtio && vmmio.base != 0 {
+                            crate::drivers::virtio_net_mmio::probe(vmmio.base, vmmio.irq);
+                        }
+                        in_memory = false;
+                        in_chosen = false;
+                        in_virtio = false;
+                        in_soc    = false;
                     }
-                    in_memory = false;
-                    in_chosen = false;
-                    in_virtio = false;
+                    2 if in_soc => {
+                        // Leaving a /soc/* child.
+                        if soc_child == SocChild::Plic && plic_base != 0 {
+                            crate::drivers::plic::set_base(plic_base);
+                        }
+                        soc_child = SocChild::None;
+                    }
+                    _ => {}
                 }
             }
 
             FDT_PROP => {
                 if pos + 8 > structs.len() { break; }
-                let prop_len    = be32(structs, pos) as usize; pos += 4;
-                let name_off    = be32(structs, pos) as usize; pos += 4;
-                let prop_name   = cstr(strings, name_off);
-                let prop_data   = if pos + prop_len <= structs.len() {
+                let prop_len  = be32(structs, pos) as usize; pos += 4;
+                let name_off  = be32(structs, pos) as usize; pos += 4;
+                let prop_name = cstr(strings, name_off);
+                let prop_data = if pos + prop_len <= structs.len() {
                     &structs[pos..pos + prop_len]
                 } else { &[] };
                 pos = (pos + prop_len + 3) & !3;
 
-                // ── /memory reg ──────────────────────────────────────────────────────
+                // ── /memory reg ────────────────────────────────────────────────────
                 if in_memory && prop_name == "reg" {
                     let mut i = 0usize;
                     while i + 16 <= prop_data.len() {
@@ -222,7 +237,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── /chosen ────────────────────────────────────────────────────────────
+                // ── /chosen ─────────────────────────────────────────────────────────
                 if in_chosen {
                     match prop_name {
                         "linux,initrd-start" => {
@@ -239,30 +254,48 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── virtio_mmio@ node properties ────────────────────────────────────
+                // ── virtio_mmio@ node ──────────────────────────────────────────────────
                 if in_virtio {
                     match prop_name {
                         "compatible" => {
-                            // Expect "virtio,mmio" as a NUL-terminated string.
                             let s = core::str::from_utf8(
                                 prop_data.split(|&c| c == 0).next().unwrap_or(&[])
                             ).unwrap_or("");
                             vmmio.is_virtio = s == "virtio,mmio";
                         }
                         "reg" => {
-                            // reg: (addr, size) pair, each 8 bytes on RISC-V.
                             if prop_data.len() >= 8 {
                                 let addr = be64(prop_data, 0) as usize;
                                 if addr != 0 { vmmio.base = addr; }
                             }
                         }
                         "interrupts" => {
-                            // PLIC interrupt number: 4-byte big-endian cell.
-                            if prop_data.len() >= 4 {
-                                vmmio.irq = be32(prop_data, 0);
-                            }
+                            if prop_data.len() >= 4 { vmmio.irq = be32(prop_data, 0); }
                         }
                         _ => {}
+                    }
+                }
+
+                // ── /soc/plic node ─────────────────────────────────────────────────────
+                // QEMU virt DTB has /soc { plic@c000000 { reg = <0 0xc000000 0 0x600000>; } }
+                // `reg` for the PLIC is a (addr-hi, addr-lo, size-hi, size-lo) tuple
+                // with 32-bit cells (each FDT cell is a big-endian u32).
+                // Two address cells + two size cells = 4 u32s = 16 bytes.
+                if soc_child == SocChild::Plic && prop_name == "reg" {
+                    if prop_data.len() >= 16 {
+                        // #address-cells = 2 on QEMU virt /soc: high u32 then low u32.
+                        let addr_hi = be32(prop_data, 0) as usize;
+                        let addr_lo = be32(prop_data, 4) as usize;
+                        let addr    = (addr_hi << 32) | addr_lo;
+                        if addr != 0 { plic_base = addr; }
+                    } else if prop_data.len() >= 8 {
+                        // Some firmware emits a single-cell 64-bit address.
+                        let addr = be64(prop_data, 0) as usize;
+                        if addr != 0 { plic_base = addr; }
+                    } else if prop_data.len() >= 4 {
+                        // Fallback: 32-bit address cell.
+                        let addr = be32(prop_data, 0) as usize;
+                        if addr != 0 { plic_base = addr; }
                     }
                 }
             }
@@ -272,7 +305,6 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
         }
     }
 
-    // Register the initramfs found in /chosen.
     if initrd_start != 0 && initrd_end > initrd_start {
         let len = (initrd_end - initrd_start) as usize;
         crate::println!("initramfs: found at {:#x}, {} bytes", initrd_start as usize, len);

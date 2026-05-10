@@ -10,6 +10,7 @@
 //!   pcie              — PCIe ECAM enumeration
 //!   e1000e            — Intel e1000e Gigabit Ethernet
 //!   nic               — NIC abstraction layer (send_frame / rx_poll_all)
+//!   plic              — RISC-V PLIC interrupt controller
 //!   virtio_blk        — VirtIO block device
 //!   virtio_net        — VirtIO network device (PCIe, x86_64)
 //!   virtio_net_mmio   — VirtIO network device (MMIO, RISC-V virt machine)
@@ -42,6 +43,7 @@ pub mod mouse;
 pub mod nic;
 pub mod nvme;
 pub mod pcie;
+pub mod plic;
 pub mod tty;
 pub mod usb;
 pub mod virtio_blk;
