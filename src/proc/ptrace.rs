@@ -10,6 +10,10 @@
 //! ### ptrace_syscall_stop: send_signal(tracer, sig) type mismatch
 //!   sig is u32 but send_signal expects i32. Won't compile. Fixed with
 //!   explicit `sig as i32` cast.
+//!
+//! ### with_proc_mut closures (post-S2)
+//!   All with_proc_mut closures updated to take (p, _pl). None of these
+//!   sites change p.state so the pl handle is unused.
 
 extern crate alloc;
 
@@ -52,8 +56,6 @@ const FRAME_SZ:  usize = 17 * 8;
 const RFLAGS_TF: usize = 1 << 8;
 
 // FIX: 64-bit ring-3 CS is 0x33 (RPL=3, TI=0, index=6).
-// 0x1b is the 32-bit compat user CS — using it caused gdb to treat the
-// inferior as a 32-bit process and misparse all register values.
 const USER_CS64: u64 = 0x33;
 const USER_SS:   u64 = 0x2b;
 
@@ -78,7 +80,7 @@ impl Default for PtraceState {
     fn default() -> Self { PtraceState::None }
 }
 
-// ── SyscallFrame field offsets ──────────────────────────────────────────────────────
+// ── SyscallFrame field offsets ─────────────────────────────────────────────────
 
 const F_R15: usize = 0;
 const F_R14: usize = 1;
@@ -93,12 +95,12 @@ const F_RDX: usize = 9;
 const F_R10: usize = 10;
 const F_R8:  usize = 11;
 const F_R9:  usize = 12;
-const F_RCX: usize = 13; // user RIP
-const F_R11: usize = 14; // user RFLAGS
+const F_RCX: usize = 13;
+const F_R11: usize = 14;
 const F_RSP: usize = 15;
 const F_RIP: usize = 16;
 
-// ── Linux user_regs_struct offsets ────────────────────────────────────────────────────
+// ── Linux user_regs_struct offsets ────────────────────────────────────────────
 
 const UREG_R15:      usize = 0;
 const UREG_R14:      usize = 1;
@@ -129,13 +131,13 @@ const UREG_FS:       usize = 25;
 const UREG_GS:       usize = 26;
 const UREG_COUNT:    usize = 27;
 
-// ── Frame accessor ────────────────────────────────────────────────────────────────
+// ── Frame accessor ─────────────────────────────────────────────────────────────
 
 unsafe fn frame_ptr(kstack_top: usize) -> *mut usize {
     (kstack_top - FRAME_SZ) as *mut usize
 }
 
-// ── Build a Linux user_regs_struct ────────────────────────────────────────────────────
+// ── Build a Linux user_regs_struct ────────────────────────────────────────────
 
 fn build_user_regs(kstack_top: usize, fs_base: usize) -> [u64; UREG_COUNT] {
     let f = unsafe { core::slice::from_raw_parts(frame_ptr(kstack_top), 17) };
@@ -146,20 +148,19 @@ fn build_user_regs(kstack_top: usize, fs_base: usize) -> [u64; UREG_COUNT] {
     regs[UREG_R12]      = f[F_R12]  as u64;
     regs[UREG_RBP]      = f[F_RBP]  as u64;
     regs[UREG_RBX]      = f[F_RBX]  as u64;
-    regs[UREG_R11]      = f[F_R11]  as u64; // RFLAGS
+    regs[UREG_R11]      = f[F_R11]  as u64;
     regs[UREG_R10]      = f[F_R10]  as u64;
     regs[UREG_R9]       = f[F_R9]   as u64;
     regs[UREG_R8]       = f[F_R8]   as u64;
     regs[UREG_RAX]      = f[F_RAX]  as u64;
-    regs[UREG_RCX]      = f[F_RCX]  as u64; // user RIP (saved in rcx by SYSCALL)
+    regs[UREG_RCX]      = f[F_RCX]  as u64;
     regs[UREG_RDX]      = f[F_RDX]  as u64;
     regs[UREG_RSI]      = f[F_RSI]  as u64;
     regs[UREG_RDI]      = f[F_RDI]  as u64;
     regs[UREG_ORIG_RAX] = f[F_RAX]  as u64;
     regs[UREG_RIP]      = f[F_RIP]  as u64;
-    // FIX: 64-bit user CS is 0x33, not 0x1b (32-bit compat).
     regs[UREG_CS]       = USER_CS64;
-    regs[UREG_EFLAGS]   = f[F_R11]  as u64; // r11 = rflags saved by SYSCALL
+    regs[UREG_EFLAGS]   = f[F_R11]  as u64;
     regs[UREG_RSP]      = f[F_RSP]  as u64;
     regs[UREG_SS]       = USER_SS;
     regs[UREG_FS_BASE]  = fs_base   as u64;
@@ -171,30 +172,30 @@ fn build_user_regs(kstack_top: usize, fs_base: usize) -> [u64; UREG_COUNT] {
     regs
 }
 
-// ── Apply user_regs_struct back to the frame ─────────────────────────────────────────
+// ── Apply user_regs_struct back to the frame ──────────────────────────────────
 
 fn apply_user_regs(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
     let f = unsafe { core::slice::from_raw_parts_mut(frame_ptr(kstack_top), 17) };
-    f[F_R15] = regs[UREG_R15]     as usize;
-    f[F_R14] = regs[UREG_R14]     as usize;
-    f[F_R13] = regs[UREG_R13]     as usize;
-    f[F_R12] = regs[UREG_R12]     as usize;
-    f[F_RBP] = regs[UREG_RBP]     as usize;
-    f[F_RBX] = regs[UREG_RBX]     as usize;
-    f[F_RAX] = regs[UREG_RAX]     as usize;
-    f[F_RDI] = regs[UREG_RDI]     as usize;
-    f[F_RSI] = regs[UREG_RSI]     as usize;
-    f[F_RDX] = regs[UREG_RDX]     as usize;
-    f[F_R10] = regs[UREG_R10]     as usize;
-    f[F_R8]  = regs[UREG_R8]      as usize;
-    f[F_R9]  = regs[UREG_R9]      as usize;
-    f[F_RCX] = regs[UREG_RIP]     as usize; // RIP lives in rcx slot
-    f[F_R11] = regs[UREG_EFLAGS]  as usize; // RFLAGS lives in r11 slot
-    f[F_RSP] = regs[UREG_RSP]     as usize;
-    f[F_RIP] = regs[UREG_RIP]     as usize;
+    f[F_R15] = regs[UREG_R15]    as usize;
+    f[F_R14] = regs[UREG_R14]    as usize;
+    f[F_R13] = regs[UREG_R13]    as usize;
+    f[F_R12] = regs[UREG_R12]    as usize;
+    f[F_RBP] = regs[UREG_RBP]    as usize;
+    f[F_RBX] = regs[UREG_RBX]    as usize;
+    f[F_RAX] = regs[UREG_RAX]    as usize;
+    f[F_RDI] = regs[UREG_RDI]    as usize;
+    f[F_RSI] = regs[UREG_RSI]    as usize;
+    f[F_RDX] = regs[UREG_RDX]    as usize;
+    f[F_R10] = regs[UREG_R10]    as usize;
+    f[F_R8]  = regs[UREG_R8]     as usize;
+    f[F_R9]  = regs[UREG_R9]     as usize;
+    f[F_RCX] = regs[UREG_RIP]    as usize;
+    f[F_R11] = regs[UREG_EFLAGS] as usize;
+    f[F_RSP] = regs[UREG_RSP]    as usize;
+    f[F_RIP] = regs[UREG_RIP]    as usize;
 }
 
-// ── PEEKUSER / POKEUSER ────────────────────────────────────────────────────────────────
+// ── PEEKUSER / POKEUSER ───────────────────────────────────────────────────────
 
 fn peekuser_word(kstack_top: usize, fs_base: usize, byte_off: usize) -> u64 {
     let word_idx = byte_off / 8;
@@ -211,30 +212,30 @@ fn pokeuser_word(kstack_top: usize, byte_off: usize, val: u64) -> isize {
     if word_idx >= UREG_COUNT { return 0; }
     let f = unsafe { core::slice::from_raw_parts_mut(frame_ptr(kstack_top), 17) };
     match word_idx {
-        UREG_R15     => f[F_R15]  = val as usize,
-        UREG_R14     => f[F_R14]  = val as usize,
-        UREG_R13     => f[F_R13]  = val as usize,
-        UREG_R12     => f[F_R12]  = val as usize,
-        UREG_RBP     => f[F_RBP]  = val as usize,
-        UREG_RBX     => f[F_RBX]  = val as usize,
-        UREG_R11     => f[F_R11]  = val as usize,
-        UREG_R10     => f[F_R10]  = val as usize,
-        UREG_R9      => f[F_R9]   = val as usize,
-        UREG_R8      => f[F_R8]   = val as usize,
-        UREG_RAX | UREG_ORIG_RAX => f[F_RAX] = val as usize,
-        UREG_RCX     => f[F_RCX]  = val as usize,
-        UREG_RDX     => f[F_RDX]  = val as usize,
-        UREG_RSI     => f[F_RSI]  = val as usize,
-        UREG_RDI     => f[F_RDI]  = val as usize,
-        UREG_RIP     => { f[F_RCX] = val as usize; f[F_RIP] = val as usize; }
-        UREG_EFLAGS  => f[F_R11]  = val as usize,
-        UREG_RSP     => f[F_RSP]  = val as usize,
+        UREG_R15                  => f[F_R15] = val as usize,
+        UREG_R14                  => f[F_R14] = val as usize,
+        UREG_R13                  => f[F_R13] = val as usize,
+        UREG_R12                  => f[F_R12] = val as usize,
+        UREG_RBP                  => f[F_RBP] = val as usize,
+        UREG_RBX                  => f[F_RBX] = val as usize,
+        UREG_R11                  => f[F_R11] = val as usize,
+        UREG_R10                  => f[F_R10] = val as usize,
+        UREG_R9                   => f[F_R9]  = val as usize,
+        UREG_R8                   => f[F_R8]  = val as usize,
+        UREG_RAX | UREG_ORIG_RAX  => f[F_RAX] = val as usize,
+        UREG_RCX                  => f[F_RCX] = val as usize,
+        UREG_RDX                  => f[F_RDX] = val as usize,
+        UREG_RSI                  => f[F_RSI] = val as usize,
+        UREG_RDI                  => f[F_RDI] = val as usize,
+        UREG_RIP => { f[F_RCX] = val as usize; f[F_RIP] = val as usize; }
+        UREG_EFLAGS               => f[F_R11] = val as usize,
+        UREG_RSP                  => f[F_RSP] = val as usize,
         _ => {}
     }
     0
 }
 
-// ── PEEKDATA / POKEDATA ────────────────────────────────────────────────────────────────
+// ── PEEKDATA / POKEDATA ───────────────────────────────────────────────────────
 
 fn peek_tracee_word(cr3: usize, addr: usize) -> Option<u64> {
     let pa = <Arch as Paging>::virt_to_phys(cr3, addr)?;
@@ -250,7 +251,7 @@ fn poke_tracee_word(cr3: usize, addr: usize, val: u64) -> bool {
     true
 }
 
-// ── Permission check ────────────────────────────────────────────────────────────────
+// ── Permission check ──────────────────────────────────────────────────────────
 
 fn may_trace(tracer_pid: usize, target_pid: usize) -> bool {
     scheduler::with_proc(target_pid, |p| p.ppid == tracer_pid).unwrap_or(false)
@@ -259,7 +260,7 @@ fn may_trace(tracer_pid: usize, target_pid: usize) -> bool {
     }).unwrap_or(false)
 }
 
-// ── sys_ptrace ────────────────────────────────────────────────────────────────────
+// ── sys_ptrace ────────────────────────────────────────────────────────────────
 
 pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
     let caller = scheduler::current_pid();
@@ -267,8 +268,8 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
 
     match req {
         PTRACE_TRACEME => {
-            scheduler::with_proc_mut(caller, |p| {
-                if p.ptrace_state != crate::proc::ptrace::PtraceState::None {
+            scheduler::with_proc_mut(caller, |p, _pl| {
+                if p.ptrace_state != PtraceState::None {
                     return -16isize;
                 }
                 p.ptrace_state = PtraceState::Tracee {
@@ -283,7 +284,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
         PTRACE_ATTACH => {
             if target == caller { return -1; }
             if !may_trace(caller, target) { return -1; }
-            let ok = scheduler::with_proc_mut(target, |p| {
+            let ok = scheduler::with_proc_mut(target, |p, _pl| {
                 if p.ptrace_state != PtraceState::None { return false; }
                 p.ptrace_state = PtraceState::Tracee {
                     tracer: caller,
@@ -298,7 +299,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
         }
 
         PTRACE_DETACH => {
-            let found = scheduler::with_proc_mut(target, |p| {
+            let found = scheduler::with_proc_mut(target, |p, _pl| {
                 match p.ptrace_state {
                     PtraceState::Tracee { tracer, .. } |
                     PtraceState::Stopped { tracer, .. } if tracer == caller => {
@@ -321,7 +322,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
         }
 
         PTRACE_CONT => {
-            let found = scheduler::with_proc_mut(target, |p| {
+            let found = scheduler::with_proc_mut(target, |p, _pl| {
                 match p.ptrace_state {
                     PtraceState::Stopped { tracer, options, .. } if tracer == caller => {
                         p.ptrace_state = PtraceState::Tracee {
@@ -347,7 +348,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
         }
 
         PTRACE_SINGLESTEP => {
-            let found = scheduler::with_proc_mut(target, |p| {
+            let found = scheduler::with_proc_mut(target, |p, _pl| {
                 match p.ptrace_state {
                     PtraceState::Stopped { tracer, options, .. } if tracer == caller => {
                         p.ptrace_state = PtraceState::Tracee {
@@ -373,7 +374,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
         }
 
         PTRACE_SYSCALL => {
-            let found = scheduler::with_proc_mut(target, |p| {
+            let found = scheduler::with_proc_mut(target, |p, _pl| {
                 match p.ptrace_state {
                     PtraceState::Stopped { tracer, options, .. } if tracer == caller => {
                         p.ptrace_state = PtraceState::Tracee {
@@ -472,7 +473,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
 
         PTRACE_SETOPTIONS => {
             let opts = (data as u64) & PTRACE_O_MASK;
-            scheduler::with_proc_mut(target, |p| {
+            scheduler::with_proc_mut(target, |p, _pl| {
                 match &mut p.ptrace_state {
                     PtraceState::Tracee  { options, .. } => { *options = opts; }
                     PtraceState::Stopped { options, .. } => { *options = opts; }
@@ -495,7 +496,7 @@ pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
     }
 }
 
-// ── Called by the syscall entry path ───────────────────────────────────────────────────
+// ── Called by the syscall entry path ──────────────────────────────────────────
 
 pub fn ptrace_syscall_stop() {
     let pid = scheduler::current_pid();
@@ -505,9 +506,8 @@ pub fn ptrace_syscall_stop() {
                 => (tracer, options),
             _ => return,
         };
-    // FIX: sig was u32, send_signal expects i32. Added explicit cast.
     let sig: u32 = if options & PTRACE_O_TRACESYSGOOD != 0 { 5 | 0x80 } else { 5 };
-    scheduler::with_proc_mut(pid, |p| {
+    scheduler::with_proc_mut(pid, |p, _pl| {
         p.ptrace_state = PtraceState::Stopped { tracer, options, sig };
     });
     send_signal(tracer, sig as i32);

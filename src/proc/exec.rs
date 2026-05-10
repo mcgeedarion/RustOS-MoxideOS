@@ -25,6 +25,12 @@
 //!   `rebuild_trap_frame_riscv`, then update the Context so that the next
 //!   context switch (or the eventual trap_return at the end of this trap
 //!   handler invocation) enters the new program correctly.
+//!
+//! ## Post-S2 locking
+//!
+//!   Both `do_execve` and `do_execve_riscv` update the PCB through
+//!   `with_proc_mut(pid, |p, _pl| { … })`. Neither changes `p.state`
+//!   so `_pl` is unused.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -48,9 +54,8 @@ use crate::arch::x86_64::gdt::update_rsp0;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::paging;
 
-const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
-const INTERP_BASE: usize = 0x0060_0000;
-
+const STACK_TOP:          usize = 0x0000_7FFF_FF00_0000;
+const INTERP_BASE:        usize = 0x0060_0000;
 const STACK_MAX:          usize = 64 * 1024 * 1024;
 const STACK_MIN:          usize = PAGE;
 const DEFAULT_STACK_BYTES:usize = 8  * 1024 * 1024;
@@ -170,7 +175,7 @@ fn load_cr3(cr3: usize) {
     }
 }
 
-// ── spawn_user_process (boot-time, no running task) ──────────────────────────
+// ── spawn_user_process (boot-time, no running task) ───────────────────────────
 
 pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
     let fd = match vfs::open(path, vfs::O_RDONLY) {
@@ -268,28 +273,27 @@ pub fn spawn_user_process_from_bytes(
     #[cfg(target_arch = "riscv64")]
     {
         ctx.ra = crate::proc::context::task_entry_trampoline as usize;
-        ctx.sp = kstack_top
-            - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
+        ctx.sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
     }
 
     let mut pcb = crate::proc::process::Pcb {
         pid,
         ppid,
-        tgid:                pid,
-        pgid:                pid,
-        state:               crate::proc::process::State::Ready,
-        exit_code:           0,
-        caps:                CapSet::empty(),
-        pc:                  entry_va,
-        sp:                  initial_rsp,
-        user_satp:           new_cr3,
+        tgid:            pid,
+        pgid:            pid,
+        state:           crate::proc::process::State::Ready,
+        exit_code:       0,
+        caps:            CapSet::empty(),
+        pc:              entry_va,
+        sp:              initial_rsp,
+        user_satp:       new_cr3,
         kstack_top,
         ctx,
-        vmas:                alloc::vec![],
-        next_va:             crate::proc::process::Pcb::INITIAL_NEXT_VA,
-        brk_base:            heap_base,
-        brk:                 heap_base,
-        signal_handlers:     SignalHandlers::default(),
+        vmas:            alloc::vec![],
+        next_va:         crate::proc::process::Pcb::INITIAL_NEXT_VA,
+        brk_base:        heap_base,
+        brk:             heap_base,
+        signal_handlers: SignalHandlers::default(),
         ..crate::proc::process::Pcb::zeroed()
     };
     pcb.exe_path = Some(String::from(path));
@@ -310,16 +314,16 @@ pub fn spawn_process(path: &str) -> bool {
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_execve(
-    path_va:  usize,
-    argv_va:  usize,
-    envp_va:  usize,
-    frame:    &mut SyscallFrame,
+    path_va: usize,
+    argv_va: usize,
+    envp_va: usize,
+    frame:   &mut SyscallFrame,
 ) -> isize {
     let mut path_buf = alloc::vec![0u8; MAX_CSTR_LEN];
     if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
     let nul = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
     let path = match core::str::from_utf8(&path_buf[..nul]) {
-        Ok(s) => s.to_string(),
+        Ok(s)  => s.to_string(),
         Err(_) => return -14,
     };
     let argv = read_cstr_array(argv_va);
@@ -338,7 +342,7 @@ pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isi
     if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
     let nul = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
     let path = match core::str::from_utf8(&path_buf[..nul]) {
-        Ok(s) => s.to_string(),
+        Ok(s)  => s.to_string(),
         Err(_) => return -14,
     };
     let argv = read_cstr_array(argv_va);
@@ -351,13 +355,13 @@ pub fn sys_execve_noframe(path_va: usize, argv_va: usize, envp_va: usize) -> isi
     }
 }
 
-// ── do_execve (x86_64) ───────────────────────────────────────────────────────
+// ── do_execve (x86_64) ────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(
-    path: &str,
-    argv: &[&str],
-    envp: &[&str],
+    path:  &str,
+    argv:  &[&str],
+    envp:  &[&str],
     frame: &mut SyscallFrame,
 ) -> Result<(), isize> {
     let pid = scheduler::current_pid();
@@ -416,15 +420,13 @@ pub fn do_execve(
 
     let heap_base = mmap::set_brk_base_compute(bss_end);
 
-    // Snapshot old signal_handlers before mutating PCB so we can exec_reset.
     let old_handlers = scheduler::with_proc(pid as usize, |p| p.signal_handlers.clone())
         .unwrap_or_default();
 
-    let vfork_parent = scheduler::with_proc_mut(pid as usize, |p| {
+    let vfork_parent = scheduler::with_proc_mut(pid as usize, |p, _pl| {
         p.user_satp       = new_cr3;
         p.pc              = entry_va;
         p.sp              = initial_rsp;
-        // SIG_IGN dispositions survive exec; user handler VAs are reset.
         p.signal_handlers = old_handlers.exec_reset();
         p.exe_path        = Some(String::from(path));
         p.brk_base        = heap_base;
@@ -434,7 +436,6 @@ pub fn do_execve(
         vp
     }).unwrap_or(0);
 
-    // Pending signals and sigmask do not survive exec.
     crate::proc::signal::altstack_clear_pid(pid as usize);
 
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
@@ -520,11 +521,10 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
         ..crate::proc::context::Context::zero()
     };
 
-    // Snapshot old handlers before mutating PCB.
     let old_handlers = scheduler::with_proc(pid as usize, |p| p.signal_handlers.clone())
         .unwrap_or_default();
 
-    let vfork_parent = scheduler::with_proc_mut(pid as usize, |p| {
+    let vfork_parent = scheduler::with_proc_mut(pid as usize, |p, _pl| {
         p.user_satp       = new_satp;
         p.pc              = entry_va;
         p.sp              = initial_sp;
@@ -539,7 +539,6 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
         vp
     }).unwrap_or(0);
 
-    // Pending signals and sigmask do not survive exec.
     crate::proc::signal::altstack_clear_pid(pid as usize);
 
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
@@ -581,7 +580,7 @@ fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
         if copy_from_user(&mut buf, ptr).is_err() { break; }
         let nul = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         let s = match core::str::from_utf8(&buf[..nul]) {
-            Ok(s) => s,
+            Ok(s)  => s,
             Err(_) => break,
         };
         result.push(String::from(s));
@@ -593,13 +592,13 @@ fn read_cstr_array(ptr_array_va: usize) -> Vec<String> {
 // ── build_initial_stack ───────────────────────────────────────────────────────
 
 fn build_initial_stack(
-    stack_top: usize,
-    argv: &[String],
-    envp: &[String],
-    hdr: &elf::ElfHeader,
-    phdrs: &[elf::Elf64Phdr],
-    phdr_va: usize,
-    entry_va: usize,
+    stack_top:   usize,
+    argv:        &[String],
+    envp:        &[String],
+    hdr:         &elf::ElfHeader,
+    phdrs:       &[elf::Elf64Phdr],
+    phdr_va:     usize,
+    entry_va:    usize,
     interp_base: usize,
 ) -> Result<usize, isize> {
     use core::ptr;
@@ -655,13 +654,13 @@ fn build_initial_stack(
     let phdr_count = phdrs.len();
     let phdr_size  = core::mem::size_of::<elf::Elf64Phdr>();
     let auxv: &[(u64,u64)] = &[
-        (AT_PHDR,   phdr_va      as u64),
-        (AT_PHENT,  phdr_size    as u64),
-        (AT_PHNUM,  phdr_count   as u64),
-        (AT_PAGESZ, PAGE         as u64),
-        (AT_BASE,   interp_base  as u64),
-        (AT_ENTRY,  entry_va     as u64),
-        (AT_RANDOM, random_va    as u64),
+        (AT_PHDR,   phdr_va     as u64),
+        (AT_PHENT,  phdr_size   as u64),
+        (AT_PHNUM,  phdr_count  as u64),
+        (AT_PAGESZ, PAGE        as u64),
+        (AT_BASE,   interp_base as u64),
+        (AT_ENTRY,  entry_va    as u64),
+        (AT_RANDOM, random_va   as u64),
         (AT_NULL,   0),
     ];
     for &(t, v) in auxv.iter().rev() {
