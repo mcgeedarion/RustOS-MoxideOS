@@ -25,11 +25,12 @@
   per-CPU run queues; EDF with CBS admission control
 - **Memory**: 4-level page tables (x86_64) / Sv39+Sv48 (RISC-V), demand paging,
   Copy-on-Write (COW), ASLR, **slab allocator** (8–1024 byte caches, per-cache SMP locks)
-- **Filesystems**: ext2, **ext4**, FAT32/VFAT, tmpfs, devfs, procfs (`/proc/slabinfo`), initramfs (cpio), VFS layer
+- **Filesystems**: ext2, **ext4**, FAT32/VFAT, tmpfs, devfs, procfs (`/proc/slabinfo`, `/proc/<pid>/ns/`), initramfs (cpio), VFS layer
 - **Drivers**: virtio-blk, virtio-net, virtio-gpu, PS/2 keyboard, UART, PCIe enumeration
 - **Linux syscall compatibility**: ~80 syscalls (see [Syscall Table](#syscall-table-selected))
 - **Resource limits**: `RLIMIT_CPU` and `RLIMIT_RTTIME` with SIGXCPU/SIGKILL enforcement
 - **IPC**: SysV msg/sem/shm (NR 29–31, 64–71), POSIX mq (NR 240–245), futex (WAIT/WAKE/WAKE_BITSET/REQUEUE/CMP_REQUEUE, robust lists), pipes, Unix sockets
+- **Namespaces**: NEWNS (mount), NEWPID, NEWNET, NEWUTS, NEWIPC, NEWUSER — `unshare(2)`, `setns(2)`, `/proc/<pid>/ns/` nsfs inodes
 - **SMP**: AP bringup (APIC trampoline / SBI HSM), per-CPU blocks, IPI dispatch, MM RwLock per address space
 - **Security**: ASLR, stack canaries, PTI, SMEP/SMAP, seccomp-BPF, capability set
 - **Timers**: real `nanosleep` / `clock_nanosleep` — clock-aware absolute sleeps, EINTR/remainder correctness, `CLOCK_PROCESS_CPUTIME_ID` / `CLOCK_THREAD_CPUTIME_ID`
@@ -57,23 +58,23 @@ rustos/
 │   │                   #   namespaces (ns/), cgroups v1 (cgroups/)
 │   ├── sync/           # futex, RwLock, Condvar, WaitQueue
 │   ├── ipc/            # SysV msg/sem/shm + POSIX mq  [default: on]
-│   ├── gdbstub/        # GDB RSP stub — x86_64 (rsp.rs) + RISC-V (rsp_riscv.rs) [feature: gdbstub]
-│   ├── input/          # /dev/input evdev layer         [feature: input_events]
-│   └── wayland/        # Wayland compositor scaffold    [feature: wayland]
+│   ├── gdbstub/        # GDB RSP stub — x86_64 + RISC-V  [feature: gdbstub]
+│   ├── input/          # /dev/input evdev layer           [feature: input_events]
+│   └── wayland/        # Wayland compositor scaffold       [feature: wayland]
 ├── tests/              # C integration tests (run on Linux host or in-kernel)
 ├── userspace/          # Minimal init + shell
 ├── xtask/              # cargo xtask build system
 ├── docs/
 │   ├── musl_port.md
 │   └── musl_pipeline.md
-├── Dockerfile          # Reproducible dev/CI environment (Ubuntu 24.04)
-├── flake.nix           # Nix flake dev shell + nix build
-├── run_qemu.sh         # x86_64 QEMU launcher
-├── run_qemu_riscv.sh   # RISC-V QEMU launcher (UEFI + SBI modes)
+├── Dockerfile
+├── flake.nix
+├── run_qemu.sh
+├── run_qemu_riscv.sh
 ├── Cargo.toml
-├── rust-toolchain.toml # Pinned nightly + targets
-├── x86_64.ld           # x86_64 linker script
-└── linker.ld           # RISC-V linker script
+├── rust-toolchain.toml
+├── x86_64.ld
+└── linker.ld
 ```
 
 ---
@@ -85,47 +86,31 @@ Three ways to get a working build environment. Pick one.
 ### Option A — Docker (recommended for CI / one-shot builds)
 
 ```bash
-# Build the image once (~3 min on first run, cached after)
 docker build -t rustos-dev .
-
-# Drop into an interactive dev shell with the source mounted
 docker run --rm -it -v "$(pwd)":/work rustos-dev
-
-# One-shot build without entering the shell
 docker run --rm -v "$(pwd)":/work rustos-dev cargo build
 ```
 
 The image bundles: `clang`/`lld`, `riscv64-unknown-elf-{as,ar}`, `qemu-system-{riscv64,x86_64}`,
-`ovmf`, and the pinned `nightly-2025-05-15` toolchain. The toolchain version is
-verified at image-build time — a mismatch fails loudly.
+`ovmf`, and the pinned `nightly-2025-05-15` toolchain.
 
 ### Option B — Nix flake (recommended for local development)
 
 ```bash
-# Enter the dev shell (downloads pinned toolchain from binary cache)
 nix develop
-
-# One-shot build without entering
 nix develop --command cargo build
-
-# Reproducible kernel artifact (outputs to result/boot/rustos.efi)
 nix build
 ```
 
 Requires [Nix with flakes enabled](https://nixos.wiki/wiki/Flakes).
-All tools, the pinned nightly, and QEMU are provided by the flake —
-no manual `rustup` or `apt install` needed.
 
 ### Option C — Native (rustup + manual tool install)
 
 ```bash
-# Rust toolchain (rust-toolchain.toml is read automatically by rustup)
-rustup show   # confirms nightly-2025-05-15 is active
-
-# System tools
+rustup show
 sudo apt install clang lld nasm qemu-system-riscv64 qemu-system-x86_64 \
-                 qemu-efi-riscv64 ovmf binutils-riscv64-linux-gnu  # Debian/Ubuntu
-brew install qemu llvm                                              # macOS
+                 qemu-efi-riscv64 ovmf binutils-riscv64-linux-gnu
+brew install qemu llvm
 ```
 
 ---
@@ -135,9 +120,9 @@ brew install qemu llvm                                              # macOS
 ### RISC-V UEFI (default)
 
 ```bash
-cargo build          # debug, riscv64-uefi.json
+cargo build
 cargo build --release
-cargo xtask build    # same as cargo build --release via xtask
+cargo xtask build
 ```
 
 ### RISC-V SBI
@@ -148,8 +133,6 @@ cargo build \
   --no-default-features \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem
-
-cargo xtask build --arch riscv64 --boot sbi   # equivalent via xtask
 ```
 
 ### x86_64
@@ -167,28 +150,21 @@ cargo build \
 ## Running in QEMU
 
 ```bash
-# x86_64 (serial output to terminal)
 ./run_qemu.sh
-./run_qemu.sh --gpu            # with virtio-gpu window
-./run_qemu.sh disk.img         # with a disk image
-./run_qemu.sh --gdb            # halt at entry, wait for GDB on :1234
-
-# RISC-V UEFI (default)
+./run_qemu.sh --gpu
+./run_qemu.sh disk.img
+./run_qemu.sh --gdb            # halt at entry, GDB on :1234
 ./run_qemu_riscv.sh
-
-# RISC-V SBI
 ./run_qemu_riscv.sh --sbi
-
-# RISC-V GDB (QEMU gdbserver on :1235)
-./run_qemu_riscv.sh --gdb
+./run_qemu_riscv.sh --gdb      # QEMU gdbserver on :1235
 gdb-multiarch \
   -ex 'set arch riscv:rv64' \
   -ex 'file target/riscv64-uefi/release/rustos.efi' \
   -ex 'target remote :1235'
 ```
 
-`.gdbinit` in the repo root auto-connects to QEMU's gdbserver and loads
-the correct architecture. For RISC-V use port `:1235`; for x86_64 use `:1234`.
+`.gdbinit` auto-connects and loads the correct architecture.
+RISC-V uses port `:1235`; x86_64 uses `:1234`.
 
 ---
 
@@ -199,66 +175,24 @@ the kernel itself. Both architectures are supported — no QEMU gdbserver requir
 
 ### x86_64
 
-The stub runs over COM1 (raw UART, I/O ports `0x3F8`–`0x3FD`). Enable it and
-attach GDB directly to the running kernel:
-
 ```bash
-# Build
 cargo build --target x86_64-unknown-none \
   --no-default-features --features gdbstub \
   -Z build-std=core,alloc,compiler_builtins
-
-# Launch QEMU (no -s/-S flags needed)
 ./run_qemu.sh
-
-# Attach
 gdb target/x86_64-unknown-none/debug/rustos \
-  -ex 'target remote /dev/ttyS0'   # or tcp::1234 via socat
-```
-
-Wire the stub from your `#DB`/`#BP` exception handler:
-
-```rust
-#[cfg(feature = "gdbstub")]
-crate::gdbstub::gdb_trap(regs, scheduler::current_pid());
+  -ex 'target remote /dev/ttyS0'
 ```
 
 ### RISC-V
 
-The stub runs over the SBI legacy console (`EID=1`/`EID=2` ecalls), which maps
-to the QEMU serial port — no separate UART driver needed.
-
 ```bash
-# Build (UEFI)
-cargo build \
-  --no-default-features --features gdbstub \
+cargo build --no-default-features --features gdbstub \
   -Z build-std=core,alloc,compiler_builtins
-
-# Build (SBI)
-cargo build \
-  --target riscv64gc-unknown-none-elf \
-  --no-default-features --features gdbstub \
-  -Z build-std=core,alloc,compiler_builtins
-
-# Launch QEMU
 ./run_qemu_riscv.sh
-
-# Attach — gdb-multiarch understands riscv:rv64 and fetches target.xml
 gdb-multiarch target/riscv64-uefi/debug/rustos.efi \
   -ex 'set arch riscv:rv64' \
-  -ex 'target remote /dev/ttyS1'   # or tcp::1235 via socat
-```
-
-The stub is wired into `handle_exception` (scause = 3, Breakpoint) in
-`src/arch/riscv64/trap.rs`. It activates on any `ebreak` instruction.
-To call it explicitly from Rust:
-
-```rust
-#[cfg(feature = "gdbstub")]
-crate::gdbstub::gdb_trap_rv(
-    frame as *mut crate::gdbstub::RvSavedRegs,
-    scheduler::current_pid() as u32,
-);
+  -ex 'target remote /dev/ttyS1'
 ```
 
 ### RSP Packet Support (both architectures)
@@ -272,59 +206,86 @@ crate::gdbstub::gdb_trap_rv(
 | `X` | Write memory (binary, RSP-escaped) |
 | `s`/`c` | Single-step / continue (optional address) |
 | `Z0`/`z0` | Insert/remove SW breakpoint (up to 16) |
-| `Z1`–`Z4` | HW breakpoints — returns `E01`, GDB falls back to SW |
 | `H`/`T` | Thread select / thread alive |
 | `vCont` | `s` and `c` actions |
 | `vKill`/`D`/`k` | Kill / detach |
 | `qSupported` | Advertises `swbreak+`, `vContSupported+`, `qXfer:features:read+` |
-| `qfThreadInfo`/`qsThreadInfo` | Thread enumeration (all live kernel PIDs) |
-| `qC`/`qOffsets`/`qAttached` | Session metadata |
-| `qXfer:features:read:target.xml` | Architecture XML (`i386:x86-64` or `riscv:rv64`) |
+| `qfThreadInfo`/`qsThreadInfo` | Thread enumeration |
+| `qXfer:features:read:target.xml` | Architecture XML |
 
 ### Register Files
 
-| Arch | Registers | `g`/`G` size | Single-step mechanism |
-|------|-----------|-------------|----------------------|
-| x86_64 | 24 (rax–r15, rip, eflags, cs/ss/ds/es/fs/gs) | 192 hex bytes | `RFLAGS.TF` |
-| RISC-V | 33 (zero–t6, pc) | 528 hex bytes | `sstatus.SSTEP` (bit 1) |
+| Arch | Registers | `g`/`G` size | Single-step |
+|------|-----------|-------------|-------------|
+| x86_64 | 24 (rax–r15, rip, eflags, cs/ss/ds/es/fs/gs) | 192 bytes | `RFLAGS.TF` |
+| RISC-V | 33 (zero–t6, pc) | 528 bytes | `sstatus.SSTEP` |
+
+---
+
+## Namespaces
+
+`unshare(2)` (NR 272) and `setns(2)` (NR 308) are fully wired. Each supported
+namespace type and its isolation semantics:
+
+| Type | Flag | Isolation |
+|------|------|-----------|
+| Mount | `CLONE_NEWNS` | Private mount table cloned from parent; `resolve_for_ns` routes all VFS path lookups |
+| PID | `CLONE_NEWPID` | Children get local PIDs starting from 2; `getpid()` translates via `pid_ns::local_pid()` |
+| Network | `CLONE_NEWNET` | Per-ns interface registry; new ns starts with `lo` only; socket isolation via `check_socket_ns()` |
+| UTS | `CLONE_NEWUTS` | NsId tracked; per-ns hostname/domainname (future) |
+| IPC | `CLONE_NEWIPC` | NsId tracked; per-ns SysV/POSIX IPC (future) |
+| User | `CLONE_NEWUSER` | NsId tracked; uid/gid mapping (future); `CAP_SYS_ADMIN` check for root |
+
+### /proc/<pid>/ns/
+
+Each process exposes 7 namespace symlinks. Tools like `nsenter(1)` use them:
+
+```
+/proc/self/ns/mnt  → mnt:[4026531840]
+/proc/self/ns/pid  → pid:[4026531836]
+/proc/self/ns/net  → net:[4026531992]
+/proc/self/ns/uts  → uts:[4026531838]
+/proc/self/ns/ipc  → ipc:[4026531839]
+/proc/self/ns/user → user:[4026531837]
+/proc/self/ns/time → time:[4026531834]
+```
+
+Openng a `/proc/<pid>/ns/<name>` path returns a fd that can be passed directly
+to `setns(2)` — the fd carries both the symlink content (for `read()`) and the
+ns identity (for `setns()`) via the same synthetic fd number.
 
 ---
 
 ## Feature Flags
 
-The **default build** includes the base kernel plus SysV IPC.
-All WIP or incomplete subsystems are behind opt-in feature flags.
+The **default build** includes the base kernel, SysV IPC, and namespaces.
+WIP subsystems are behind opt-in flags.
 
 | Feature | Default | Status | Enable with |
 |---------|---------|--------|-------------|
 | `uefi_boot` | ✅ on | Stable | (always on by default) |
 | `sysv_ipc` | ✅ on | **Stable** — SysV msg/sem/shm + POSIX mq; NR 29–31, 64–71, 240–245 | (on by default) |
-| `gdbstub` | ❌ off | **Complete** — x86_64 (UART) + RISC-V (SBI); SW breakpoints, single-step, thread enum, `target.xml` | `--features gdbstub` |
-| `namespaces` | ❌ off | 5 NS types done; `setns`/nsfs missing | `--features namespaces` |
+| `namespaces` | ✅ on | **Stable** — 6 NS types; `unshare`/`setns` wired; `/proc/<pid>/ns/` inodes | (on by default) |
+| `gdbstub` | ❌ off | **Complete** — x86_64 (UART) + RISC-V (SBI); SW breakpoints, single-step, `target.xml` | `--features gdbstub` |
 | `cgroups` | ❌ off | Knob API done; cgroupfs mount missing | `--features cgroups` |
 | `input_events` | ❌ off | Stub no-ops; evdev routing missing | `--features input_events` |
 | `wayland` | ❌ off | Scaffold only | `--features wayland` |
 
 ```bash
 # Full WIP build (all optional features)
-cargo build --features namespaces,cgroups,gdbstub,input_events,wayland
+cargo build --features cgroups,gdbstub,input_events,wayland
 ```
 
-To graduate a feature into `default`: replace all capability stubs with real
-enforcement, wire syscall dispatch entries, implement any missing VFS mounts,
-then move the feature from the gated table to `default = [...]` in `Cargo.toml`.
+To graduate a feature: wire all syscall dispatch entries, implement missing VFS
+mounts, replace capability stubs, then add to `default = [...]` in `Cargo.toml`.
 
 ---
 
 ## Integration Tests
 
 ```bash
-# Build and run on the Linux host (validates logic against the host kernel)
 chmod +x tests/run_tests.sh && ./tests/run_tests.sh
-
-# Run inside the kernel (copy tests into initramfs)
 for t in build_tests/*; do cp "$t" initramfs/bin/; done
-# then in your init script: /bin/futex_* /bin/sched_* /bin/pipe_* ...
 ```
 
 Test suite covers: futex thundering-herd, `cmp_requeue`, robust-list death,
@@ -343,11 +304,9 @@ VFS concurrent `creat`, and `poll()` vs close-race.
 | `SCHED_DEADLINE` | 6 | DL | EDF with CBS admission control |
 
 **`RLIMIT_RTTIME`** — RT tasks accumulate `rt_cpu_time_us`. Resets to 0 on any
-voluntary block (`futex_wait`, `nanosleep`, `waitpid`, `block_current()`).
-Soft limit → `SIGXCPU`; hard limit → `SIGKILL`.
+voluntary block. Soft limit → `SIGXCPU`; hard limit → `SIGKILL`.
 
-**`RLIMIT_CPU`** — Charged every tick regardless of policy.
-Soft crossing → `SIGXCPU` (repeated each second); hard → `SIGKILL`.
+**`RLIMIT_CPU`** — Charged every tick. Soft crossing → `SIGXCPU`; hard → `SIGKILL`.
 
 ---
 
@@ -380,7 +339,9 @@ Soft crossing → `SIGXCPU` (repeated each second); hard → `SIGKILL`.
 | 228 | `clock_gettime` | ✅ all clock IDs including CPUTIME |
 | 230 | `clock_nanosleep` | ✅ TIMER_ABSTIME, clock-aware |
 | 240–245 | `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/`mq_notify`/`mq_getsetattr` | ✅ |
+| 272 | `unshare` | ✅ all 6 NS types |
 | 302 | `prlimit64` | ✅ |
+| 308 | `setns` | ✅ |
 | 314 | `sched_setattr` | ✅ |
 | 315 | `sched_getattr` | ✅ |
 
@@ -389,20 +350,12 @@ Soft crossing → `SIGXCPU` (repeated each second); hard → `SIGKILL`.
 ## Development
 
 ```bash
-# Fast type-check without linking
-cargo check --target x86_64-unknown-none \
-  -Z build-std=core,alloc,compiler_builtins
-
-# Format check (enforced by fmt.yml CI)
+cargo check --target x86_64-unknown-none -Z build-std=core,alloc,compiler_builtins
 cargo fmt --check
-
-# Clippy (bare-metal; no_std)
 cargo clippy --target x86_64-unknown-none \
   -Z build-std=core,alloc,compiler_builtins -- -D warnings
-
-# xtask helpers
-cargo xtask build           # RISC-V UEFI release
-cargo xtask build --debug   # RISC-V UEFI debug
+cargo xtask build
+cargo xtask build --debug
 cargo xtask clean
 ```
 
@@ -418,14 +371,12 @@ Three files must always agree on the nightly date:
 | `Dockerfile` | `ARG NIGHTLY_DATE=YYYY-MM-DD` |
 | `flake.nix` | `pkgs.rust-bin.nightly."YYYY-MM-DD"` |
 
-Steps:
-1. Update the date in all three files in a single commit.
-2. `cargo build` for each of the three targets (RISC-V UEFI, RISC-V SBI, x86_64).
-3. Fix any API churn (check the nightly release notes for breaking changes to
-   `naked_functions`, `alloc_error_handler`, or `-Z build-std`).
+1. Update all three in a single commit.
+2. `cargo build` for each of the three targets.
+3. Fix any API churn from nightly release notes.
 4. `docker build -t rustos-dev .` to verify the image.
 5. `nix develop --command cargo build` to verify the flake.
-6. Add a CHANGELOG entry documenting the bump and reason.
+6. Add a CHANGELOG entry.
 
 ---
 
@@ -436,7 +387,7 @@ Steps:
 - [ ] AMD/Intel GPU DRM/KMS driver
 - [ ] `io_uring` support
 - [ ] Expanded musl libc syscall coverage
-- [ ] Graduate `namespaces` + `cgroups` features into default
+- [ ] Graduate `cgroups` feature into default
 - [ ] `/dev/input` evdev routing (`input_events`)
 
 ---
