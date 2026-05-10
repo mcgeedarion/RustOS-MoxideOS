@@ -35,7 +35,7 @@ use crate::arch::{Arch, api::Paging};
 pub const USER_SPACE_END: usize = 0x0000_8000_0000_0000;
 const PAGE_SIZE: usize = 4096;
 
-// ── Address range check ───────────────────────────────────────────────────────
+// ── Address range check ─────────────────────────────────────────────────────────────
 
 #[inline]
 fn user_range_valid(va: usize, len: usize) -> bool {
@@ -46,7 +46,20 @@ fn user_range_valid(va: usize, len: usize) -> bool {
     }
 }
 
-// ── Page-table walk ───────────────────────────────────────────────────────────
+// ── mm_lock guard helper ─────────────────────────────────────────────────────────
+
+/// Acquire mm_lock for reading if a user process is currently running,
+/// otherwise return None (safe in single-CPU / early-boot contexts).
+#[inline]
+fn mm_read_guard() -> Option<crate::proc::scheduler::MmReadGuard> {
+    if crate::proc::scheduler::has_current_user_proc() {
+        Some(crate::proc::scheduler::with_current_mm_read())
+    } else {
+        None
+    }
+}
+
+// ── Page-table walk ────────────────────────────────────────────────────────────────
 
 /// Walk the current process's page table under the mm_lock (read) and confirm
 /// every page in [va, va+len) is mapped.  Returns false if any page is absent.
@@ -58,7 +71,8 @@ fn pages_mapped_locked(va: usize, len: usize) -> bool {
     let _guard = crate::proc::scheduler::with_current_mm_read();
 
     let cr3 = crate::proc::scheduler::with_proc(
-        crate::proc::scheduler::current_pid(), |p| p.user_satp
+        crate::proc::scheduler::current_pid(),
+        |p| p.user_satp,
     ).unwrap_or(0);
     if cr3 == 0 { return false; }
 
@@ -82,7 +96,8 @@ fn pages_mapped_locked(va: usize, len: usize) -> bool {
 /// threads where no concurrent munmap can occur.
 fn pages_mapped_unlocked(va: usize, len: usize) -> bool {
     let cr3 = crate::proc::scheduler::with_proc(
-        crate::proc::scheduler::current_pid(), |p| p.user_satp
+        crate::proc::scheduler::current_pid(),
+        |p| p.user_satp,
     ).unwrap_or(0);
     if cr3 == 0 { return false; }
 
@@ -112,7 +127,7 @@ fn pages_mapped(va: usize, len: usize) -> bool {
     }
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Public API ───────────────────────────────────────────────────────────────────
 
 /// Return `true` iff [va, va+len) is entirely within user space **and**
 /// every page is currently mapped.
@@ -135,11 +150,7 @@ pub fn validate_user_ptr(va: usize, len: usize) -> bool {
 pub fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
     if !user_range_valid(src_va, dst.len()) { return Err(()); }
     // Acquire mm_lock for read; hold it across the walk AND the copy below.
-    let _guard = if crate::proc::scheduler::has_current_user_proc() {
-        Some(crate::proc::scheduler::with_current_mm_read())
-    } else {
-        None
-    };
+    let _guard = mm_read_guard();
     // Walk under the lock.
     if !pages_mapped_unlocked(src_va, dst.len()) { return Err(()); }
     // Copy under the lock — munmap cannot proceed until _guard drops.
@@ -158,11 +169,7 @@ pub fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
 /// Holds mm_lock for read across walk+copy to prevent TOCTOU.
 pub fn copy_to_user(dst_va: usize, src: &[u8]) -> bool {
     if !user_range_valid(dst_va, src.len()) { return false; }
-    let _guard = if crate::proc::scheduler::has_current_user_proc() {
-        Some(crate::proc::scheduler::with_current_mm_read())
-    } else {
-        None
-    };
+    let _guard = mm_read_guard();
     if !pages_mapped_unlocked(dst_va, src.len()) { return false; }
     // SAFETY: same as copy_from_user above.
     let dst = unsafe { slice::from_raw_parts_mut(dst_va as *mut u8, src.len()) };
@@ -188,15 +195,17 @@ pub fn read_path(ptr: *const u8) -> Option<alloc::string::String> {
     if !user_range_valid(base, 1) { return None; }
 
     // Acquire mm_lock once for the entire scan.
-    let _guard = if crate::proc::scheduler::has_current_user_proc() {
-        Some(crate::proc::scheduler::with_current_mm_read())
-    } else {
-        None
-    };
+    let _guard = mm_read_guard();
+
+    let pid = crate::proc::scheduler::current_pid();
+    let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp)
+        .unwrap_or(0);
+    if cr3 == 0 { return None; }
 
     const PATH_MAX: usize = 4095;
     let mut len = 0usize;
-    let mut next_page_check = 0usize; // byte offset of the next page boundary to validate
+    // Byte offset of the next page boundary that needs validating.
+    let mut next_page_check = 0usize;
 
     loop {
         if len > PATH_MAX { return None; }
@@ -204,15 +213,12 @@ pub fn read_path(ptr: *const u8) -> Option<alloc::string::String> {
         // Validate the current page before reading from it.
         if len >= next_page_check {
             if !user_range_valid(base + len, 1) { return None; }
-            // pages_mapped_unlocked is safe here because we hold _guard.
             let page_start = (base + len) & !(PAGE_SIZE - 1);
             let page_end   = page_start + PAGE_SIZE;
-            if crate::arch::Arch::as_paging().virt_to_phys(
-                crate::proc::scheduler::with_proc(
-                    crate::proc::scheduler::current_pid(), |p| p.user_satp
-                ).unwrap_or(0),
-                page_start
-            ).is_none() { return None; }
+            // pages_mapped_unlocked is safe here because we hold _guard.
+            if <Arch as Paging>::virt_to_phys(cr3, page_start).is_none() {
+                return None;
+            }
             // Next check at the start of the following page.
             next_page_check = page_end - base;
         }
