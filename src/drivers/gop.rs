@@ -11,33 +11,6 @@
 //!
 //! ## EFI_GRAPHICS_OUTPUT_PROTOCOL layout (UEFI 2.10 §12.9)
 //!
-//! ```text
-//!  EFI_GRAPHICS_OUTPUT_PROTOCOL {
-//!    QueryMode  fn ptr
-//!    SetMode    fn ptr
-//!    Blt        fn ptr
-//!    Mode       *EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE
-//!  }
-//!
-//!  EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE {
-//!    MaxMode              u32
-//!    Mode                 u32
-//!    Info                 *EFI_GRAPHICS_OUTPUT_MODE_INFORMATION
-//!    SizeOfInfo           usize
-//!    FrameBufferBase      u64     ← physical address
-//!    FrameBufferSize      usize
-//!  }
-//!
-//!  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION {
-//!    Version              u32
-//!    HorizontalResolution u32
-//!    VerticalResolution   u32
-//!    PixelFormat          u32  (0=RGBX, 1=BGRX, 2=BitMask, 3=BltOnly)
-//!    PixelInformation     [u32; 4]
-//!    PixelsPerScanLine    u32
-//!  }
-//! ```
-//!
 //! ## LocateProtocol offset
 //! LocateProtocol is function #43 (0-indexed) in EFI_BOOT_SERVICES:
 //!   offset = 24 (header) + 43 * 8 = 368 = 0x170
@@ -45,7 +18,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-// ── GOP GUID: {9042a9de-23dc-4a38-96fb-7aded080516a} ────────────────────────────
+// ── GOP GUID: {9042a9de-23dc-4a38-96fb-7aded080516a} ─────────────────────────
 const GOP_GUID: [u64; 2] = [
     0x4a38_dc23_de9a_4290_u64.to_le(),
     0x6a51_80ed_adad_fb96_u64.to_le(),
@@ -54,10 +27,10 @@ const GOP_GUID: [u64; 2] = [
 /// Pixel encoding reported by GOP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
-    Rgbx,   // R at byte 0
-    Bgrx,   // B at byte 0 (most common on real hardware)
+    Rgbx,
+    Bgrx,
     BitMask,
-    BltOnly, // no linear framebuffer
+    BltOnly,
 }
 
 /// Everything the kernel needs from GOP, captured before ExitBootServices.
@@ -81,7 +54,7 @@ static GOP_INFO:  Mutex<GopInfo> = Mutex::new(GopInfo {
     pixel_format:    PixelFormat::Bgrx,
 });
 
-/// Returns the captured GOP info, or None if GOP was not found.
+/// Returns the captured GOP info, or None if GOP was not found / not available.
 pub fn get() -> Option<GopInfo> {
     if GOP_VALID.load(Ordering::Acquire) {
         Some(*GOP_INFO.lock())
@@ -90,15 +63,24 @@ pub fn get() -> Option<GopInfo> {
     }
 }
 
-/// Returns the framebuffer byte size (width * height * 4).
+/// Returns true when a linear framebuffer was successfully captured.
+///
+/// Callers that only need a framebuffer-present flag (e.g. the console
+/// driver deciding whether to attempt pixel output) use this instead of
+/// calling `get()` and matching on the Option.
+#[inline]
+pub fn is_available() -> bool {
+    GOP_VALID.load(Ordering::Acquire)
+}
+
+/// Returns the framebuffer byte size (pixels_per_line * height * 4).
 pub fn fb_byte_size(info: &GopInfo) -> usize {
     info.pixels_per_line as usize * info.height as usize * 4
 }
 
-// ── Raw EFI types for GOP query ──────────────────────────────────────────────────
+// ── Raw EFI types for GOP query ───────────────────────────────────────────────
 
 type EfiStatus = usize;
-type EfiHandle = *mut core::ffi::c_void;
 const EFI_SUCCESS: EfiStatus = 0;
 
 /// Offset of LocateProtocol in EFI_BOOT_SERVICES: header(24) + 43*8 = 0x170.
@@ -119,12 +101,12 @@ struct GopProtocol {
 
 #[repr(C)]
 struct GopMode {
-    max_mode:        u32,
-    mode:            u32,
-    info:            *mut GopModeInfo,
-    size_of_info:    usize,
-    fb_base:         u64,
-    fb_size:         usize,
+    max_mode:     u32,
+    mode:         u32,
+    info:         *mut GopModeInfo,
+    size_of_info: usize,
+    fb_base:      u64,
+    fb_size:      usize,
 }
 
 #[repr(C)]
@@ -139,12 +121,15 @@ struct GopModeInfo {
 
 /// Query GOP via LocateProtocol and store the result in `GOP_INFO`.
 ///
+/// Returns `true` if a usable linear framebuffer was found and stored,
+/// `false` otherwise (headless, BltOnly mode, or firmware has no GOP).
+///
 /// Must be called before ExitBootServices while boot services are live.
 /// Safe to call on both x86_64 and RISC-V UEFI paths.
 ///
 /// # Safety
 /// `boot_services_ptr` must be a valid `*EFI_BOOT_SERVICES` pointer.
-pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_void) {
+pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_void) -> bool {
     let bs_base = boot_services_ptr as usize;
     let locate: LocateProtocolFn =
         *((bs_base + LOCATE_PROTOCOL_OFFSET) as *const LocateProtocolFn);
@@ -155,31 +140,29 @@ pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_vo
         core::ptr::null_mut(),
         &mut gop_iface,
     );
-
     if status != EFI_SUCCESS || gop_iface.is_null() {
-        // GOP not available (e.g. headless serial-only QEMU).
-        return;
+        return false;
     }
 
     let gop_ptr = gop_iface as *const GopProtocol;
     if gop_ptr.is_null() || (gop_ptr as usize) % core::mem::align_of::<GopProtocol>() != 0 {
-        return;
+        return false;
     }
     let gop = &*gop_ptr;
 
     let mode_ptr = gop.mode as *const GopMode;
     if mode_ptr.is_null() || (mode_ptr as usize) % core::mem::align_of::<GopMode>() != 0 {
-        return;
+        return false;
     }
     let mode = &*mode_ptr;
 
     let info_ptr = mode.info as *const GopModeInfo;
     if info_ptr.is_null() || (info_ptr as usize) % core::mem::align_of::<GopModeInfo>() != 0 {
-        return;
+        return false;
     }
     let info = &*info_ptr;
 
-    if mode.fb_base == 0 { return; } // BltOnly — no linear FB
+    if mode.fb_base == 0 { return false; }
 
     let pixel_format = match info.pixel_format {
         0 => PixelFormat::Rgbx,
@@ -187,8 +170,7 @@ pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_vo
         2 => PixelFormat::BitMask,
         _ => PixelFormat::BltOnly,
     };
-
-    if pixel_format == PixelFormat::BltOnly { return; }
+    if pixel_format == PixelFormat::BltOnly { return false; }
 
     *GOP_INFO.lock() = GopInfo {
         fb_phys:         mode.fb_base,
@@ -199,4 +181,5 @@ pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_vo
         pixel_format,
     };
     GOP_VALID.store(true, Ordering::Release);
+    true
 }
