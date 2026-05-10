@@ -13,7 +13,8 @@
 //! ## Supported filesystem types
 //! | FsType     | Backend module       | Typical mount point(s)    |
 //! |------------|----------------------|---------------------------|
-//! | Ext2       | fs::ext2             | /                         |
+//! | Ext2       | fs::ext2             | /  (rw, plain ext2/ext3)  |
+//! | Ext4       | fs::ext4             | /  (ro, ext4 with extents)|
 //! | Fat32      | fs::fat32            | /boot/efi, /mnt/usb       |
 //! | Tmpfs      | fs::ramfs            | /tmp, /run, /dev/shm      |
 //! | Overlayfs  | fs::overlayfs        | /overlay, container roots |
@@ -28,11 +29,12 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Filesystem type discriminant ────────────────────────────────────────────
+// ── Filesystem type discriminant ─────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FsType {
     Ext2,
+    Ext4,
     Fat32,
     Tmpfs,
     Overlayfs,
@@ -45,7 +47,8 @@ impl FsType {
     /// Parse the kernel-facing filesystem name string (as passed to mount(2)).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "ext2" | "ext3" | "ext4" => Some(FsType::Ext2),
+            "ext2" | "ext3" => Some(FsType::Ext2),
+            "ext4"          => Some(FsType::Ext4),
             "vfat" | "fat32" | "fat" => Some(FsType::Fat32),
             "tmpfs"                  => Some(FsType::Tmpfs),
             "overlay" | "overlayfs"  => Some(FsType::Overlayfs),
@@ -59,6 +62,7 @@ impl FsType {
     pub fn as_str(&self) -> &'static str {
         match self {
             FsType::Ext2      => "ext2",
+            FsType::Ext4      => "ext4",
             FsType::Fat32     => "vfat",
             FsType::Tmpfs     => "tmpfs",
             FsType::Overlayfs => "overlay",
@@ -85,7 +89,7 @@ pub const MNT_FORCE:      u32 = 1;
 pub const MNT_DETACH:     u32 = 2;
 pub const MNT_EXPIRE:     u32 = 4;
 
-// ── Per-entry overlay options ────────────────────────────────────────────────
+// ── Per-entry overlay options ──────────────────────────────────────────────
 
 /// Extra parameters carried for overlayfs mounts.
 #[derive(Clone, Debug)]
@@ -95,7 +99,7 @@ pub struct OverlayOpts {
     pub work:    String,   // work directory (must be on same fs as upper)
 }
 
-// ── MountEntry ───────────────────────────────────────────────────────────────
+// ── MountEntry ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct MountEntry {
@@ -106,15 +110,16 @@ pub struct MountEntry {
     pub overlay:    Option<OverlayOpts>,
 }
 
-// ── FsHandle — returned to vfs_ops callers ───────────────────────────────────
+// ── FsHandle — returned to vfs_ops callers ────────────────────────────────────
 
 /// Identifies which filesystem owns a path and the mount-relative sub-path.
 #[derive(Clone, Debug)]
 pub struct FsHandle {
-    pub fstype:   FsType,
-    pub subpath:  String,   // path relative to the mount point
-    pub flags:    u64,
-    pub overlay:  Option<OverlayOpts>,
+    pub fstype:      FsType,
+    pub subpath:     String,   // path relative to the mount point
+    pub flags:       u64,
+    pub overlay:     Option<OverlayOpts>,
+    pub mount_point: String,   // the mount-point itself (for overlay lookup)
 }
 
 impl FsHandle {
@@ -123,7 +128,7 @@ impl FsHandle {
     }
 }
 
-// ── Global mount table ───────────────────────────────────────────────────────
+// ── Global mount table ──────────────────────────────────────────────────────────
 
 pub struct MountTable {
     entries: Vec<MountEntry>,
@@ -134,9 +139,6 @@ impl MountTable {
         MountTable { entries: Vec::new() }
     }
 
-    // ── Internal helpers ────────────────────────────────────────────────────
-
-    /// Re-sort entries: longest mount-point first (most specific wins).
     fn sort(&mut self) {
         self.entries.sort_by(|a, b| b.mountpoint.len().cmp(&a.mountpoint.len()));
     }
@@ -146,9 +148,6 @@ impl MountTable {
         if p.is_empty() { "/".to_string() } else { p.to_string() }
     }
 
-    // ── Public API ──────────────────────────────────────────────────────────
-
-    /// Add a mount entry (called from sys_mount and kernel init).
     pub fn mount(
         &mut self,
         source:     &str,
@@ -159,7 +158,6 @@ impl MountTable {
     ) -> Result<(), isize> {
         let mp = Self::normalize(target);
 
-        // MS_REMOUNT — update flags on existing entry.
         if flags & MS_REMOUNT != 0 {
             for e in &mut self.entries {
                 if e.mountpoint == mp {
@@ -167,12 +165,11 @@ impl MountTable {
                     return Ok(());
                 }
             }
-            return Err(-22); // EINVAL — nothing mounted here
+            return Err(-22);
         }
 
-        // Reject duplicate mount points (use MS_REMOUNT to update).
         if self.entries.iter().any(|e| e.mountpoint == mp) {
-            return Err(-16); // EBUSY
+            return Err(-16);
         }
 
         self.entries.push(MountEntry {
@@ -186,24 +183,17 @@ impl MountTable {
         Ok(())
     }
 
-    /// Remove a mount entry.
     pub fn umount(&mut self, target: &str, flags: u32) -> Result<(), isize> {
         let mp = Self::normalize(target);
-        // MNT_DETACH: mark busy mounts for lazy removal — we just remove immediately.
         let _ = flags;
         let before = self.entries.len();
         self.entries.retain(|e| e.mountpoint != mp);
-        if self.entries.len() == before { Err(-22) } else { Ok(()) } // EINVAL
+        if self.entries.len() == before { Err(-22) } else { Ok(()) }
     }
 
-    /// Resolve an absolute path to an `FsHandle` carrying the responsible
-    /// filesystem type and the mount-relative sub-path.
-    ///
-    /// Returns `Err(-2)` (ENOENT) if no mount covers the path (should not
-    /// happen once `/` is mounted).
     pub fn resolve(&self, path: &str) -> Result<FsHandle, isize> {
         let path = if path.starts_with('/') { path.to_string() }
-                   else { alloc::format!("/\0") }; // relative path — treat as ENOENT
+                   else { alloc::format!("/\0") };
         for entry in &self.entries {
             let mp = &entry.mountpoint;
             let matches = if mp == "/" {
@@ -222,27 +212,26 @@ impl MountTable {
                 let subpath = if rel.is_empty() { "/".to_string() }
                               else { alloc::format!("/{}", rel) };
                 return Ok(FsHandle {
-                    fstype:  entry.fstype.clone(),
+                    fstype:      entry.fstype.clone(),
                     subpath,
-                    flags:   entry.flags,
-                    overlay: entry.overlay.clone(),
+                    flags:       entry.flags,
+                    overlay:     entry.overlay.clone(),
+                    mount_point: mp.clone(),
                 });
             }
         }
-        Err(-2) // ENOENT
+        Err(-2)
     }
 
-    /// Return a snapshot of all current mount entries (for /proc/mounts).
     pub fn list(&self) -> Vec<MountEntry> {
         self.entries.clone()
     }
 }
 
-// ── Global instance ──────────────────────────────────────────────────────────
+// ── Global instance ────────────────────────────────────────────────────────────────
 
 static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable::new());
 
-/// Kernel-internal mount helper (called from arch init, not via syscall).
 pub fn kernel_mount(
     source:  &str,
     target:  &str,
@@ -253,43 +242,56 @@ pub fn kernel_mount(
     MOUNT_TABLE.lock().mount(source, target, fstype, flags, overlay)
 }
 
-/// Resolve a path to its owning filesystem handle.  Called by vfs_ops.
 pub fn resolve(path: &str) -> Result<FsHandle, isize> {
     MOUNT_TABLE.lock().resolve(path)
 }
 
-/// Return the full mount list (for /proc/mounts rendering).
 pub fn list_mounts() -> Vec<MountEntry> {
     MOUNT_TABLE.lock().list()
 }
 
-// ── Kernel boot mounts ───────────────────────────────────────────────────────
+// ── Kernel boot mounts ────────────────────────────────────────────────────────
 
 /// Called once from the kernel main entry point after the PMM is ready.
-/// Registers the canonical set of virtual/pseudo filesystems so that path
-/// resolution works before any userspace mount(2) is processed.
+/// Registers canonical virtual/pseudo filesystems and detects the root
+/// block-device filesystem type automatically.
 pub fn init_mounts() {
     let mut tbl = MOUNT_TABLE.lock();
-    // Root ext2 (block device wired separately in ext2.rs)
-    let _ = tbl.mount("sda",  "/",     FsType::Ext2,   0,            None);
-    // EFI System Partition — FAT32 read-only by default; efi_rw() remounts rw
-    let _ = tbl.mount("sda1", "/boot/efi", FsType::Fat32, MS_RDONLY,  None);
-    // tmpfs mounts
-    let _ = tbl.mount("tmpfs", "/tmp",     FsType::Tmpfs,  MS_NOSUID | MS_NODEV, None);
-    let _ = tbl.mount("tmpfs", "/run",     FsType::Tmpfs,  MS_NOSUID | MS_NODEV, None);
-    let _ = tbl.mount("tmpfs", "/dev/shm", FsType::Tmpfs,  MS_NOSUID | MS_NODEV, None);
-    // Pseudo-filesystems
-    let _ = tbl.mount("devtmpfs", "/dev",  FsType::Devfs,  MS_NOSUID,  None);
+
+    // Root filesystem: try ext2 (read-write) first; if the image uses ext4
+    // features that ext2.rs refuses, fall back to ext4 (read-only).
+    let root_fstype = if crate::fs::ext2::mount() {
+        log::info!("mount: root filesystem: ext2/ext3 (rw)");
+        FsType::Ext2
+    } else if crate::fs::ext4::mount() {
+        log::info!("mount: root filesystem: ext4 (ro)");
+        FsType::Ext4
+    } else {
+        log::warn!("mount: no recognised filesystem on virtio-blk; root will be unavailable");
+        // Still register a placeholder so path resolution doesn't panic.
+        FsType::Ext2
+    };
+    let root_flags = if root_fstype == FsType::Ext4 { MS_RDONLY } else { 0 };
+    let _ = tbl.mount("sda", "/", root_fstype, root_flags, None);
+
+    // EFI System Partition (FAT32, read-only by default).
+    let _ = tbl.mount("sda1", "/boot/efi", FsType::Fat32, MS_RDONLY, None);
+
+    // tmpfs mounts.
+    let _ = tbl.mount("tmpfs", "/tmp",     FsType::Tmpfs, MS_NOSUID | MS_NODEV, None);
+    let _ = tbl.mount("tmpfs", "/run",     FsType::Tmpfs, MS_NOSUID | MS_NODEV, None);
+    let _ = tbl.mount("tmpfs", "/dev/shm", FsType::Tmpfs, MS_NOSUID | MS_NODEV, None);
+
+    // Pseudo-filesystems.
+    let _ = tbl.mount("devtmpfs", "/dev",  FsType::Devfs,  MS_NOSUID, None);
     let _ = tbl.mount("proc",     "/proc", FsType::Procfs, MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
     let _ = tbl.mount("sysfs",    "/sys",  FsType::Sysfs,  MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
+
     tbl.sort();
 }
 
-// ── sys_mount / sys_umount2 syscall handlers ─────────────────────────────────
+// ── sys_mount / sys_umount2 ───────────────────────────────────────────────────────
 
-/// sys_mount(source, target, fstype_str, flags, data_ptr)
-/// `data_ptr` is ignored for all types except overlayfs, where it is expected
-/// to be a comma-separated option string: `lowerdir=X,upperdir=Y,workdir=Z`.
 pub fn sys_mount(
     source:   &str,
     target:   &str,
@@ -299,10 +301,9 @@ pub fn sys_mount(
 ) -> isize {
     let fstype = match FsType::from_str(fstype_s) {
         Some(t) => t,
-        None    => return -22, // EINVAL
+        None    => return -22,
     };
 
-    // Parse overlayfs options from `data`.
     let overlay = if fstype == FsType::Overlayfs {
         let mut lower = String::new();
         let mut upper = String::new();
@@ -312,7 +313,7 @@ pub fn sys_mount(
             if let Some(v) = kv.strip_prefix("upperdir=")  { upper = v.to_string(); }
             if let Some(v) = kv.strip_prefix("workdir=")   { work  = v.to_string(); }
         }
-        if lower.is_empty() { return -22; } // lowerdir is mandatory
+        if lower.is_empty() { return -22; }
         Some(OverlayOpts { lower, upper, work })
     } else {
         None
@@ -324,7 +325,6 @@ pub fn sys_mount(
     }
 }
 
-/// sys_umount2(target, flags)
 pub fn sys_umount2(target: &str, flags: u32) -> isize {
     match MOUNT_TABLE.lock().umount(target, flags) {
         Ok(())  => 0,
