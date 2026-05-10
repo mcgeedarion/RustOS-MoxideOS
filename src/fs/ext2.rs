@@ -3,11 +3,19 @@
 //! Revision 0 and revision 1 (dynamic inode sizes) are supported.
 //! Block sizes of 1024, 2048, and 4096 bytes are supported.
 //!
+//! ## Addressing
+//!
+//! inode.block[0..11]  direct
+//! inode.block[12]     single-indirect  (ptrs_per_block data blocks)
+//! inode.block[13]     double-indirect  (ptrs_per_block^2 data blocks)
+//! inode.block[14]     triple-indirect  (ptrs_per_block^3 data blocks)
+//!
+//! With bs=4096, ptrs_per_block=1024, max addressable ≈ 4 TiB.
+//! This driver caps at MAX_FILE_SIZE = 256 MiB.
+//!
 //! ## Write path
-//! Mutations (create, unlink, write, truncate, mkdir, rmdir, rename,
-//! link, symlink, chmod, chown) are applied directly to the in-memory
-//! image Vec<u8> and immediately flushed to the backing block device
-//! via virtio_blk::write_sectors on the affected 512-byte sectors.
+//! Mutations are applied to the in-memory image Vec<u8> and immediately
+//! flushed to the backing block device via virtio_blk::write_sectors.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -15,7 +23,6 @@ use alloc::string::String;
 use spin::Mutex;
 
 const MAX_FILE_SIZE: usize = 256 * 1024 * 1024;
-// EXT2 file-type constants for DirEntry2.file_type
 const FT_REG:  u8 = 1;
 const FT_DIR:  u8 = 2;
 const FT_SYML: u8 = 7;
@@ -87,7 +94,7 @@ struct Inode {
     dtime:         u32,
     gid:           u16,
     links_count:   u16,
-    blocks:        u32,   // 512-byte units
+    blocks:        u32,
     flags:         u32,
     osd1:          u32,
     block:         [u32; 15],
@@ -204,7 +211,21 @@ pub fn mount() -> bool {
     true
 }
 
-// ── Ext2Fs read helpers ───────────────────────────────────────────────────
+// ── Low-level pointer helpers (no self borrow) ────────────────────────────
+
+#[inline]
+fn read_ptr(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
+}
+
+#[inline]
+fn write_ptr(buf: &mut [u8], off: usize, v: u32) {
+    let b = v.to_le_bytes();
+    buf[off]   = b[0]; buf[off+1] = b[1];
+    buf[off+2] = b[2]; buf[off+3] = b[3];
+}
+
+// ── Ext2Fs impl ───────────────────────────────────────────────────────────
 
 impl Ext2Fs {
     fn gd_offset(&self, g: usize) -> usize {
@@ -230,9 +251,7 @@ impl Ext2Fs {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 gd as *const GroupDesc as *const u8,
-                self.data.as_mut_ptr().add(off),
-                32,
-            );
+                self.data.as_mut_ptr().add(off), 32);
         }
         self.flush_range(off, 32);
     }
@@ -259,8 +278,7 @@ impl Ext2Fs {
                 core::ptr::copy_nonoverlapping(
                     inode as *const Inode as *const u8,
                     self.data.as_mut_ptr().add(off),
-                    core::mem::size_of::<Inode>(),
-                );
+                    core::mem::size_of::<Inode>());
             }
             self.flush_range(off, core::mem::size_of::<Inode>());
         }
@@ -280,13 +298,13 @@ impl Ext2Fs {
         Some(&mut self.data[off..off + self.block_size])
     }
 
-    // ── Sector flush ──────────────────────────────────────────────────────
+    // ── Flush ─────────────────────────────────────────────────────────────
 
     fn flush_range(&self, byte_off: usize, len: usize) {
         if len == 0 { return; }
-        let first_sector = byte_off / 512;
-        let last_sector  = (byte_off + len - 1) / 512;
-        for s in first_sector..=last_sector {
+        let first = byte_off / 512;
+        let last  = (byte_off + len - 1) / 512;
+        for s in first..=last {
             let start = s * 512;
             let end   = (start + 512).min(self.data.len());
             if end > start {
@@ -304,8 +322,6 @@ impl Ext2Fs {
 
     // ── Block allocator ───────────────────────────────────────────────────
 
-    /// Allocate one free block, preferring `preferred_group`.
-    /// Returns the block number or 0 on failure.
     fn alloc_block(&mut self, preferred_group: usize) -> u32 {
         let total = self.total_groups;
         for delta in 0..total {
@@ -319,20 +335,15 @@ impl Ext2Fs {
                 let bit  = i % 8;
                 if byte >= self.data.len() { break; }
                 if self.data[byte] & (1 << bit) == 0 {
-                    // Found a free bit — mark it used.
                     self.data[byte] |= 1 << bit;
                     self.flush_range(byte, 1);
-                    // Update group descriptor.
                     let mut gd2 = self.group_desc(g);
                     gd2.free_blocks = gd2.free_blocks.saturating_sub(1);
                     self.write_group_desc(g, &gd2);
                     let blkno = (g * bpg + i + self.first_data_blk) as u32;
-                    // Zero the new block.
                     let blk_off = blkno as usize * self.block_size;
                     if blk_off + self.block_size <= self.data.len() {
-                        for b in &mut self.data[blk_off..blk_off + self.block_size] {
-                            *b = 0;
-                        }
+                        for b in &mut self.data[blk_off..blk_off + self.block_size] { *b = 0; }
                         self.flush_block(blkno);
                     }
                     return blkno;
@@ -402,190 +413,455 @@ impl Ext2Fs {
         self.write_group_desc(g, &gd2);
     }
 
-    // ── Block scan helpers ────────────────────────────────────────────────
+    // ── Indirect pointer block I/O ────────────────────────────────────────
+
+    /// Read all u32 pointers from one block into a Vec.
+    fn read_ptrs(&self, blkno: u32) -> Vec<u32> {
+        let ppb = self.block_size / 4;
+        match self.block_data(blkno) {
+            None    => alloc::vec![0u32; ppb],
+            Some(d) => (0..ppb).map(|i| read_ptr(d, i * 4)).collect(),
+        }
+    }
+
+    /// Write a pointer Vec back to `blkno` and flush.
+    fn write_ptrs(&mut self, blkno: u32, ptrs: &[u32]) {
+        let off = blkno as usize * self.block_size;
+        let bs  = self.block_size;
+        if off + bs > self.data.len() { return; }
+        for (i, &p) in ptrs.iter().enumerate() {
+            if i * 4 + 4 > bs { break; }
+            write_ptr(&mut self.data[off..], i * 4, p);
+        }
+        self.flush_block(blkno);
+    }
+
+    /// Ensure `*slot != 0`, allocating a block in `grp` if needed.
+    /// Updates `*slot` and returns the block number, or Err(-28) on ENOSPC.
+    fn alloc_if_zero(&mut self, slot: &mut u32, grp: usize) -> Result<u32, i32> {
+        if *slot == 0 {
+            let b = self.alloc_block(grp);
+            if b == 0 { return Err(-28); }
+            *slot = b;
+        }
+        Ok(*slot)
+    }
+
+    // ── scan_inode_data_blocks ────────────────────────────────────────────
+    //
+    // Walks every data block reachable from `ino` in logical order.
+    // Calls `f(block_slice) -> bool`; returning false stops the walk early.
 
     fn scan_inode_data_blocks<F>(&self, ino: &Inode, mut f: F)
     where F: FnMut(&[u8]) -> bool
     {
+        let ppb = self.block_size / 4;
+
+        // Direct
         for i in 0..12usize {
             if let Some(blk) = self.block_data(ino.block[i]) {
                 if !f(blk) { return; }
             }
         }
-        if let Some(iblk) = self.block_data(ino.block[12]) {
-            let ptrs = self.block_size / 4;
-            for i in 0..ptrs {
-                let blkno = u32::from_le_bytes([
-                    iblk[i*4], iblk[i*4+1], iblk[i*4+2], iblk[i*4+3]
-                ]);
-                if let Some(blk) = self.block_data(blkno) {
+
+        // Single-indirect
+        if ino.block[12] != 0 {
+            let l1 = self.read_ptrs(ino.block[12]);
+            for &b in &l1 {
+                if b == 0 { continue; }
+                if let Some(blk) = self.block_data(b) {
                     if !f(blk) { return; }
                 }
             }
         }
-    }
 
-    fn read_inode_data(&self, ino: &Inode) -> Vec<u8> {
-        let size = (ino.size_lo as usize).min(MAX_FILE_SIZE);
-        let mut out = alloc::vec![0u8; size];
-        let mut written = 0usize;
-        for i in 0..12usize {
-            if written >= size { break; }
-            if let Some(d) = self.block_data(ino.block[i]) {
-                let n = (size - written).min(d.len());
-                out[written..written + n].copy_from_slice(&d[..n]);
-                written += n;
-            }
-        }
-        if written < size {
-            if let Some(iblk) = self.block_data(ino.block[12]) {
-                let ptrs = self.block_size / 4;
-                for i in 0..ptrs {
-                    if written >= size { break; }
-                    let blk = u32::from_le_bytes([iblk[i*4], iblk[i*4+1], iblk[i*4+2], iblk[i*4+3]]);
-                    if let Some(d) = self.block_data(blk) {
-                        let n = (size - written).min(d.len());
-                        out[written..written + n].copy_from_slice(&d[..n]);
-                        written += n;
+        // Double-indirect
+        if ino.block[13] != 0 {
+            let l1 = self.read_ptrs(ino.block[13]);
+            'di: for &b1 in &l1 {
+                if b1 == 0 { continue; }
+                let l2 = self.read_ptrs(b1);
+                for &b2 in &l2 {
+                    if b2 == 0 { continue; }
+                    if let Some(blk) = self.block_data(b2) {
+                        if !f(blk) { break 'di; }
                     }
                 }
             }
         }
+
+        // Triple-indirect
+        if ino.block[14] != 0 {
+            let l1 = self.read_ptrs(ino.block[14]);
+            'ti: for &b1 in &l1 {
+                if b1 == 0 { continue; }
+                let l2 = self.read_ptrs(b1);
+                for &b2 in &l2 {
+                    if b2 == 0 { continue; }
+                    let l3 = self.read_ptrs(b2);
+                    for &b3 in &l3 {
+                        if b3 == 0 { continue; }
+                        if let Some(blk) = self.block_data(b3) {
+                            if !f(blk) { break 'ti; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── read_inode_data ───────────────────────────────────────────────────
+
+    fn read_inode_data(&self, ino: &Inode) -> Vec<u8> {
+        let size = (ino.size_lo as usize).min(MAX_FILE_SIZE);
+        let mut out     = alloc::vec![0u8; size];
+        let mut written = 0usize;
+        let bs          = self.block_size;
+        let ppb         = bs / 4;
+
+        macro_rules! copy_blk {
+            ($blkno:expr) => {{
+                if written >= size { break; }
+                if let Some(d) = self.block_data($blkno) {
+                    let n = (size - written).min(d.len());
+                    out[written..written + n].copy_from_slice(&d[..n]);
+                    written += n;
+                }
+            }};
+        }
+
+        // Direct
+        for i in 0..12usize {
+            if written >= size { break; }
+            if ino.block[i] != 0 { copy_blk!(ino.block[i]); }
+        }
+
+        // Single-indirect
+        if written < size && ino.block[12] != 0 {
+            let l1 = self.read_ptrs(ino.block[12]);
+            for &b in &l1 { copy_blk!(b); }
+        }
+
+        // Double-indirect
+        if written < size && ino.block[13] != 0 {
+            let l1 = self.read_ptrs(ino.block[13]);
+            'di_r: for &b1 in &l1 {
+                if b1 == 0 { continue; }
+                let l2 = self.read_ptrs(b1);
+                for &b2 in &l2 {
+                    if written >= size { break 'di_r; }
+                    copy_blk!(b2);
+                }
+            }
+        }
+
+        // Triple-indirect
+        if written < size && ino.block[14] != 0 {
+            let l1 = self.read_ptrs(ino.block[14]);
+            'ti_r: for &b1 in &l1 {
+                if b1 == 0 { continue; }
+                let l2 = self.read_ptrs(b1);
+                for &b2 in &l2 {
+                    if b2 == 0 { continue; }
+                    let l3 = self.read_ptrs(b2);
+                    for &b3 in &l3 {
+                        if written >= size { break 'ti_r; }
+                        copy_blk!(b3);
+                    }
+                }
+            }
+        }
+
         out.truncate(size);
         out
     }
 
-    // ── Write inode data ──────────────────────────────────────────────────
+    // ── write_inode_data ──────────────────────────────────────────────────
+    //
+    // Writes `data` into inode `ino_num`, allocating / freeing blocks
+    // across all four indirection levels as needed.
+    //
+    // Logical block index `blk_idx` is a flat 0-based counter:
+    //
+    //   [0..11]           direct
+    //   [12..12+ppb)      single-indirect
+    //   [12+ppb..12+ppb+ppb^2)  double-indirect
+    //   [...]             triple-indirect
+    //
+    // For each logical block:
+    //   needed  => ensure data block exists, write content, flush
+    //   excess  => free data block, zero pointer
+    // Pointer blocks are freed when all their entries are zero.
 
-    /// Write `data` into `ino`, allocating / freeing blocks as needed.
-    /// Handles direct blocks (0..11) and single-indirect (block[12]).
     fn write_inode_data(&mut self, ino_num: u32, data: &[u8]) -> Result<(), i32> {
-        let size = data.len().min(MAX_FILE_SIZE);
-        let bs   = self.block_size;
-        let needed_direct   = size.div_ceil(bs).min(12);
-        let needed_indirect = if size > 12 * bs {
-            (size - 12 * bs).div_ceil(bs)
-        } else { 0 };
-        let ptrs_per_block  = bs / 4;
-        if needed_indirect > ptrs_per_block {
-            return Err(-27); // EFBIG — double indirect not implemented
-        }
+        let size         = data.len().min(MAX_FILE_SIZE);
+        let bs           = self.block_size;
+        let ppb          = bs / 4;          // pointers per block
+        let needed_blks  = size.div_ceil(bs);
+        let grp          = ((ino_num - 1) as usize) / self.inodes_per_grp;
 
         let mut inode = self.inode(ino_num).ok_or(-2i32)?;
-        let grp = ((ino_num - 1) as usize) / self.inodes_per_grp;
+        // Running count of overhead (pointer) blocks for inode.blocks.
+        let mut ptr_blocks: usize = 0;
+        // Flat block index counter.
+        let mut blk_idx: usize = 0;
 
-        // ---- Direct blocks ----
+        // Helper closure: write one data slice into blkno.
+        // Returns Err if blkno is out of range.
+        // (defined inline below via macro to avoid borrow issues)
+
+        // ── Phase 0: direct blocks (inode.block[0..11]) ───────────────────
         for i in 0..12usize {
-            if i < needed_direct {
-                if inode.block[i] == 0 {
-                    let b = self.alloc_block(grp);
-                    if b == 0 { return Err(-28); } // ENOSPC
-                    inode.block[i] = b;
-                }
-                let start = i * bs;
+            let start = blk_idx * bs;
+            if blk_idx < needed_blks {
+                let b = self.alloc_if_zero(&mut inode.block[i], grp)?;
                 let end   = (start + bs).min(size);
                 let slice = &data[start..end];
-                let blkno = inode.block[i];
-                let off   = blkno as usize * bs;
+                let off   = b as usize * bs;
                 if off + bs <= self.data.len() {
                     self.data[off..off + slice.len()].copy_from_slice(slice);
                     if slice.len() < bs {
-                        for b in &mut self.data[off + slice.len()..off + bs] { *b = 0; }
+                        for x in &mut self.data[off + slice.len()..off + bs] { *x = 0; }
                     }
-                    self.flush_block(blkno);
+                    self.flush_block(b);
                 }
-            } else {
-                // Free excess direct block.
-                if inode.block[i] != 0 {
-                    self.free_block(inode.block[i]);
-                    inode.block[i] = 0;
-                }
+            } else if inode.block[i] != 0 {
+                self.free_block(inode.block[i]);
+                inode.block[i] = 0;
             }
+            blk_idx += 1;
         }
 
-        // ---- Single-indirect block ----
-        if needed_indirect > 0 {
-            if inode.block[12] == 0 {
-                let ib = self.alloc_block(grp);
-                if ib == 0 { return Err(-28); }
-                inode.block[12] = ib;
-            }
-            // Build the pointer table.
-            let iblkno = inode.block[12];
-            let iblk_off = iblkno as usize * bs;
+        // ── Phase 1: single-indirect (inode.block[12]) ────────────────────
+        {
+            let si_start   = blk_idx;            // = 12
+            let si_end     = si_start + ppb;
+            let si_needed  = needed_blks.saturating_sub(si_start).min(ppb);
 
-            // Collect existing pointers so we can free unused ones.
-            let mut ptrs = alloc::vec![0u32; ptrs_per_block];
-            if iblk_off + bs <= self.data.len() {
-                for i in 0..ptrs_per_block {
-                    ptrs[i] = u32::from_le_bytes([
-                        self.data[iblk_off + i*4],
-                        self.data[iblk_off + i*4 + 1],
-                        self.data[iblk_off + i*4 + 2],
-                        self.data[iblk_off + i*4 + 3],
-                    ]);
-                }
-            }
+            if si_needed > 0 {
+                let ib = self.alloc_if_zero(&mut inode.block[12], grp)?;
+                ptr_blocks += 1;
+                let mut ptrs = self.read_ptrs(ib);
 
-            for i in 0..ptrs_per_block {
-                if i < needed_indirect {
-                    if ptrs[i] == 0 {
-                        let b = self.alloc_block(grp);
-                        if b == 0 { return Err(-28); }
-                        ptrs[i] = b;
-                    }
-                    let start = 12 * bs + i * bs;
-                    let end   = (start + bs).min(size);
-                    let slice = &data[start..end];
-                    let blkno = ptrs[i];
-                    let off   = blkno as usize * bs;
-                    if off + bs <= self.data.len() {
-                        self.data[off..off + slice.len()].copy_from_slice(slice);
-                        if slice.len() < bs {
-                            for b in &mut self.data[off + slice.len()..off + bs] { *b = 0; }
+                for i in 0..ppb {
+                    let logical = si_start + i;
+                    let start   = logical * bs;
+                    if i < si_needed {
+                        if ptrs[i] == 0 {
+                            let b = self.alloc_block(grp);
+                            if b == 0 { return Err(-28); }
+                            ptrs[i] = b;
                         }
-                        self.flush_block(blkno);
-                    }
-                } else if ptrs[i] != 0 {
-                    self.free_block(ptrs[i]);
-                    ptrs[i] = 0;
-                }
-            }
-
-            // Write pointer table back.
-            if iblk_off + bs <= self.data.len() {
-                for i in 0..ptrs_per_block {
-                    let bytes = ptrs[i].to_le_bytes();
-                    self.data[iblk_off + i*4..iblk_off + i*4 + 4].copy_from_slice(&bytes);
-                }
-                self.flush_block(iblkno);
-            }
-        } else {
-            // Free the indirect block if it was previously used.
-            if inode.block[12] != 0 {
-                // Free all pointers first.
-                let iblkno  = inode.block[12];
-                let iblk_off = iblkno as usize * bs;
-                if iblk_off + bs <= self.data.len() {
-                    let ptrs_per = bs / 4;
-                    for i in 0..ptrs_per {
-                        let p = u32::from_le_bytes([
-                            self.data[iblk_off + i*4],
-                            self.data[iblk_off + i*4 + 1],
-                            self.data[iblk_off + i*4 + 2],
-                            self.data[iblk_off + i*4 + 3],
-                        ]);
-                        self.free_block(p);
+                        let end   = (start + bs).min(size);
+                        let slice = &data[start..end];
+                        let off   = ptrs[i] as usize * bs;
+                        if off + bs <= self.data.len() {
+                            self.data[off..off + slice.len()].copy_from_slice(slice);
+                            if slice.len() < bs {
+                                for x in &mut self.data[off + slice.len()..off + bs] { *x = 0; }
+                            }
+                            self.flush_block(ptrs[i]);
+                        }
+                    } else if ptrs[i] != 0 {
+                        self.free_block(ptrs[i]);
+                        ptrs[i] = 0;
                     }
                 }
-                self.free_block(iblkno);
+                self.write_ptrs(ib, &ptrs);
+            } else if inode.block[12] != 0 {
+                // Free all data blocks and the indirect block itself.
+                let ib   = inode.block[12];
+                let ptrs = self.read_ptrs(ib);
+                for &p in &ptrs { self.free_block(p); }
+                self.free_block(ib);
                 inode.block[12] = 0;
             }
+            blk_idx = si_end;
         }
 
+        // ── Phase 2: double-indirect (inode.block[13]) ────────────────────
+        {
+            let di_start  = blk_idx;             // = 12 + ppb
+            let di_end    = di_start + ppb * ppb;
+            let di_needed = needed_blks.saturating_sub(di_start).min(ppb * ppb);
+
+            if di_needed > 0 {
+                let l1b = self.alloc_if_zero(&mut inode.block[13], grp)?;
+                ptr_blocks += 1;
+                let mut l1 = self.read_ptrs(l1b);
+
+                let mut remaining = di_needed;
+                for i in 0..ppb {
+                    if remaining == 0 {
+                        // Free excess L2 chain.
+                        if l1[i] != 0 {
+                            let l2 = self.read_ptrs(l1[i]);
+                            for &p in &l2 { self.free_block(p); }
+                            self.free_block(l1[i]);
+                            l1[i] = 0;
+                        }
+                        continue;
+                    }
+                    let chunk = remaining.min(ppb);
+                    let l2b   = if l1[i] == 0 {
+                        let b = self.alloc_block(grp);
+                        if b == 0 { return Err(-28); }
+                        l1[i] = b; ptr_blocks += 1; b
+                    } else {
+                        ptr_blocks += 1; l1[i]
+                    };
+                    let mut l2 = self.read_ptrs(l2b);
+                    for j in 0..ppb {
+                        let logical = di_start + i * ppb + j;
+                        let start   = logical * bs;
+                        if j < chunk {
+                            if l2[j] == 0 {
+                                let b = self.alloc_block(grp);
+                                if b == 0 { return Err(-28); }
+                                l2[j] = b;
+                            }
+                            let end   = (start + bs).min(size);
+                            let slice = &data[start..end];
+                            let off   = l2[j] as usize * bs;
+                            if off + bs <= self.data.len() {
+                                self.data[off..off + slice.len()].copy_from_slice(slice);
+                                if slice.len() < bs {
+                                    for x in &mut self.data[off + slice.len()..off + bs] { *x = 0; }
+                                }
+                                self.flush_block(l2[j]);
+                            }
+                        } else if l2[j] != 0 {
+                            self.free_block(l2[j]);
+                            l2[j] = 0;
+                        }
+                    }
+                    self.write_ptrs(l2b, &l2);
+                    remaining = remaining.saturating_sub(chunk);
+                }
+                self.write_ptrs(l1b, &l1);
+            } else if inode.block[13] != 0 {
+                let l1b = inode.block[13];
+                let l1  = self.read_ptrs(l1b);
+                for &b1 in &l1 {
+                    if b1 == 0 { continue; }
+                    let l2 = self.read_ptrs(b1);
+                    for &p in &l2 { self.free_block(p); }
+                    self.free_block(b1);
+                }
+                self.free_block(l1b);
+                inode.block[13] = 0;
+            }
+            blk_idx = di_end;
+        }
+
+        // ── Phase 3: triple-indirect (inode.block[14]) ────────────────────
+        {
+            let ti_start  = blk_idx;
+            let ti_needed = needed_blks.saturating_sub(ti_start).min(ppb * ppb * ppb);
+
+            if ti_needed > 0 {
+                let l1b = self.alloc_if_zero(&mut inode.block[14], grp)?;
+                ptr_blocks += 1;
+                let mut l1 = self.read_ptrs(l1b);
+
+                let mut remaining = ti_needed;
+                for i in 0..ppb {
+                    if remaining == 0 {
+                        if l1[i] != 0 {
+                            let l2 = self.read_ptrs(l1[i]);
+                            for &b2 in &l2 {
+                                if b2 == 0 { continue; }
+                                let l3 = self.read_ptrs(b2);
+                                for &p in &l3 { self.free_block(p); }
+                                self.free_block(b2);
+                            }
+                            self.free_block(l1[i]);
+                            l1[i] = 0;
+                        }
+                        continue;
+                    }
+                    let l1_chunk = remaining.min(ppb * ppb);
+                    let l2b = if l1[i] == 0 {
+                        let b = self.alloc_block(grp);
+                        if b == 0 { return Err(-28); }
+                        l1[i] = b; ptr_blocks += 1; b
+                    } else {
+                        ptr_blocks += 1; l1[i]
+                    };
+                    let mut l2 = self.read_ptrs(l2b);
+                    let mut rem2 = l1_chunk;
+                    for j in 0..ppb {
+                        if rem2 == 0 {
+                            if l2[j] != 0 {
+                                let l3 = self.read_ptrs(l2[j]);
+                                for &p in &l3 { self.free_block(p); }
+                                self.free_block(l2[j]);
+                                l2[j] = 0;
+                            }
+                            continue;
+                        }
+                        let l2_chunk = rem2.min(ppb);
+                        let l3b = if l2[j] == 0 {
+                            let b = self.alloc_block(grp);
+                            if b == 0 { return Err(-28); }
+                            l2[j] = b; ptr_blocks += 1; b
+                        } else {
+                            ptr_blocks += 1; l2[j]
+                        };
+                        let mut l3 = self.read_ptrs(l3b);
+                        for k in 0..ppb {
+                            let logical = ti_start + i * ppb * ppb + j * ppb + k;
+                            let start   = logical * bs;
+                            if k < l2_chunk {
+                                if l3[k] == 0 {
+                                    let b = self.alloc_block(grp);
+                                    if b == 0 { return Err(-28); }
+                                    l3[k] = b;
+                                }
+                                let end   = (start + bs).min(size);
+                                let slice = &data[start..end];
+                                let off   = l3[k] as usize * bs;
+                                if off + bs <= self.data.len() {
+                                    self.data[off..off + slice.len()].copy_from_slice(slice);
+                                    if slice.len() < bs {
+                                        for x in &mut self.data[off + slice.len()..off + bs] { *x = 0; }
+                                    }
+                                    self.flush_block(l3[k]);
+                                }
+                            } else if l3[k] != 0 {
+                                self.free_block(l3[k]);
+                                l3[k] = 0;
+                            }
+                        }
+                        self.write_ptrs(l3b, &l3);
+                        rem2 = rem2.saturating_sub(l2_chunk);
+                    }
+                    self.write_ptrs(l2b, &l2);
+                    remaining = remaining.saturating_sub(l1_chunk);
+                }
+                self.write_ptrs(l1b, &l1);
+            } else if inode.block[14] != 0 {
+                let l1b = inode.block[14];
+                let l1  = self.read_ptrs(l1b);
+                for &b1 in &l1 {
+                    if b1 == 0 { continue; }
+                    let l2 = self.read_ptrs(b1);
+                    for &b2 in &l2 {
+                        if b2 == 0 { continue; }
+                        let l3 = self.read_ptrs(b2);
+                        for &p in &l3 { self.free_block(p); }
+                        self.free_block(b2);
+                    }
+                    self.free_block(b1);
+                }
+                self.free_block(l1b);
+                inode.block[14] = 0;
+            }
+        }
+
+        // ── Update inode size + block count ───────────────────────────────
         inode.size_lo = size as u32;
-        inode.blocks  = ((needed_direct + if needed_indirect > 0 { 1 + needed_indirect } else { 0 })
-                          * bs / 512) as u32;
+        inode.blocks  = ((needed_blks + ptr_blocks) * bs / 512) as u32;
         self.write_inode(ino_num, &inode);
         Ok(())
     }
@@ -627,8 +903,6 @@ impl Ext2Fs {
         result
     }
 
-    /// Split a path into (parent_ino, filename).  Returns Err(-2) if
-    /// parent doesn't exist, Err(-20) if parent is not a directory.
     fn dir_lookup_parent(&self, path: &str) -> Result<(u32, &str), i32> {
         let path = path.trim_start_matches('/');
         let (parent_path, name) = match path.rfind('/') {
@@ -641,30 +915,31 @@ impl Ext2Fs {
             self.lookup_path(parent_path).ok_or(-2i32)?
         };
         let parent_inode = self.inode(parent_ino).ok_or(-2i32)?;
-        if parent_inode.mode & 0xF000 != 0x4000 { return Err(-20); } // ENOTDIR
+        if parent_inode.mode & 0xF000 != 0x4000 { return Err(-20); }
         Ok((parent_ino, name))
     }
 
-    /// Append a directory entry to `dir_ino`.
     fn add_dirent(&mut self, dir_ino: u32, child_ino: u32,
                   name: &str, file_type: u8) -> Result<(), i32> {
         let name_len  = name.len() as u8;
-        let rec_need  = (8 + name.len() + 3) & !3; // 4-byte aligned
+        let rec_need  = (8 + name.len() + 3) & !3;
         let bs        = self.block_size;
         let dir_inode = self.inode(dir_ino).ok_or(-2i32)?;
 
-        // Try to fit into an existing block by splitting a padded entry.
         let mut blocks_to_scan: Vec<u32> = Vec::new();
         for i in 0..12 { if dir_inode.block[i] != 0 { blocks_to_scan.push(dir_inode.block[i]); } }
+        // Single-indirect
         if dir_inode.block[12] != 0 {
-            let ib_off = dir_inode.block[12] as usize * bs;
-            let ptrs   = bs / 4;
-            for i in 0..ptrs {
-                let p = u32::from_le_bytes([
-                    self.data[ib_off + i*4], self.data[ib_off + i*4+1],
-                    self.data[ib_off + i*4+2], self.data[ib_off + i*4+3],
-                ]);
-                if p != 0 { blocks_to_scan.push(p); }
+            let ptrs = self.read_ptrs(dir_inode.block[12]);
+            for &p in &ptrs { if p != 0 { blocks_to_scan.push(p); } }
+        }
+        // Double-indirect (directories rarely reach this)
+        if dir_inode.block[13] != 0 {
+            let l1 = self.read_ptrs(dir_inode.block[13]);
+            for &b1 in &l1 {
+                if b1 == 0 { continue; }
+                let l2 = self.read_ptrs(b1);
+                for &p in &l2 { if p != 0 { blocks_to_scan.push(p); } }
             }
         }
 
@@ -682,16 +957,12 @@ impl Ext2Fs {
                 let actual = (8 + de.name_len as usize + 3) & !3;
                 let slack  = rec.saturating_sub(actual);
                 if slack >= rec_need {
-                    // Shrink the existing entry and write the new one after it.
                     let new_rec = (rec - slack) as u16;
                     self.data[off + cursor + 4] = (new_rec & 0xFF) as u8;
                     self.data[off + cursor + 5] = (new_rec >> 8)   as u8;
-                    let new_off = off + cursor + actual;
+                    let new_off  = off + cursor + actual;
                     let tail_rec = slack as u16;
-                    let new_de = DirEntry2 {
-                        inode: child_ino, rec_len: tail_rec,
-                        name_len, file_type,
-                    };
+                    let new_de = DirEntry2 { inode: child_ino, rec_len: tail_rec, name_len, file_type };
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             &new_de as *const DirEntry2 as *const u8,
@@ -699,9 +970,7 @@ impl Ext2Fs {
                     }
                     let nb = new_off + 8;
                     let ne = nb + name.len();
-                    if ne <= self.data.len() {
-                        self.data[nb..ne].copy_from_slice(name.as_bytes());
-                    }
+                    if ne <= self.data.len() { self.data[nb..ne].copy_from_slice(name.as_bytes()); }
                     self.flush_block(blkno);
                     return Ok(());
                 }
@@ -709,31 +978,32 @@ impl Ext2Fs {
             }
         }
 
-        // No space in existing blocks — allocate a new directory block.
-        let grp   = ((dir_ino - 1) as usize) / self.inodes_per_grp;
+        let grp    = ((dir_ino - 1) as usize) / self.inodes_per_grp;
         let newblk = self.alloc_block(grp);
         if newblk == 0 { return Err(-28); }
 
-        // Attach it to the inode.
         let mut dir_inode = self.inode(dir_ino).ok_or(-2i32)?;
         let mut attached = false;
         for i in 0..12 {
             if dir_inode.block[i] == 0 {
-                dir_inode.block[i] = newblk;
-                attached = true;
-                break;
+                dir_inode.block[i] = newblk; attached = true; break;
             }
         }
         if !attached {
-            // Need indirect block — simplified: fail if not already allocated.
-            return Err(-28);
+            // Fall back to single-indirect for large directories.
+            let ib = self.alloc_if_zero(&mut dir_inode.block[12], grp)?;
+            let mut ptrs = self.read_ptrs(ib);
+            let slot = ptrs.iter_mut().find(|p| **p == 0).ok_or(-28i32)?;
+            *slot = newblk;
+            self.write_ptrs(ib, &ptrs);
+            attached = true;
         }
+        if !attached { return Err(-28); }
         dir_inode.size_lo += bs as u32;
         self.write_inode(dir_ino, &dir_inode);
 
-        // Write the single entry into the new block.
-        let off   = newblk as usize * bs;
-        let de    = DirEntry2 { inode: child_ino, rec_len: bs as u16, name_len, file_type };
+        let off = newblk as usize * bs;
+        let de  = DirEntry2 { inode: child_ino, rec_len: bs as u16, name_len, file_type };
         unsafe {
             core::ptr::copy_nonoverlapping(
                 &de as *const DirEntry2 as *const u8,
@@ -741,14 +1011,11 @@ impl Ext2Fs {
         }
         let nb = off + 8;
         let ne = nb + name.len();
-        if ne <= self.data.len() {
-            self.data[nb..ne].copy_from_slice(name.as_bytes());
-        }
+        if ne <= self.data.len() { self.data[nb..ne].copy_from_slice(name.as_bytes()); }
         self.flush_block(newblk);
         Ok(())
     }
 
-    /// Remove the directory entry for `name` from `dir_ino`.
     fn remove_dirent(&mut self, dir_ino: u32, name: &str) -> Result<(), i32> {
         let name_bytes = name.as_bytes();
         let bs         = self.block_size;
@@ -760,7 +1027,6 @@ impl Ext2Fs {
             let off = blkno as usize * bs;
             if off + bs > self.data.len() { continue; }
             let mut cursor = 0usize;
-            let mut prev_rec_end = 0usize;
             while cursor + 8 <= bs {
                 let de = unsafe {
                     *((self.data.as_ptr().add(off + cursor)) as *const DirEntry2)
@@ -770,17 +1036,6 @@ impl Ext2Fs {
                 if de.inode != 0 {
                     let ne = cursor + 8 + de.name_len as usize;
                     if ne <= bs && &self.data[off + cursor + 8..off + ne] == name_bytes {
-                        if prev_rec_end > 0 {
-                            // Merge into previous entry's rec_len.
-                            let prev_rec = unsafe {
-                                *((self.data.as_ptr().add(off + prev_rec_end - 
-                                    // find prev de.rec_len: it ends at cursor
-                                    rec)) as *const u16)
-                            };
-                            let _ = prev_rec; // unused
-                            // Simpler: just zero this entry's inode field.
-                        }
-                        // Zero the inode field — entry is now free.
                         self.data[off + cursor]     = 0;
                         self.data[off + cursor + 1] = 0;
                         self.data[off + cursor + 2] = 0;
@@ -789,11 +1044,10 @@ impl Ext2Fs {
                         return Ok(());
                     }
                 }
-                prev_rec_end = cursor + rec;
                 cursor += rec;
             }
         }
-        Err(-2) // ENOENT
+        Err(-2)
     }
 
     fn list_dir_ino(&self, dir_ino: u32) -> Vec<(u32, String, bool)> {
@@ -827,21 +1081,11 @@ impl Ext2Fs {
         if ino == 0 { return Err(-28); }
         let now = crate::drivers::rtc::read_unix_time().unwrap_or(0) as u32;
         let new_inode = Inode {
-            mode,
-            uid,
-            size_lo: 0,
+            mode, uid, size_lo: 0,
             atime: now, ctime: now, mtime: now, dtime: 0,
-            gid,
-            links_count: 1,
-            blocks: 0,
-            flags: 0,
-            osd1: 0,
-            block: [0u32; 15],
-            generation: 0,
-            file_acl: 0,
-            size_hi: 0,
-            faddr: 0,
-            osd2: [0u8; 12],
+            gid, links_count: 1, blocks: 0, flags: 0, osd1: 0,
+            block: [0u32; 15], generation: 0, file_acl: 0,
+            size_hi: 0, faddr: 0, osd2: [0u8; 12],
         };
         self.write_inode(ino, &new_inode);
         Ok(ino)
@@ -906,12 +1150,9 @@ pub fn sys_stat(path: &str) -> Result<Ext2Stat, i32> {
 }
 
 pub fn sys_lstat(path: &str) -> Result<Ext2Stat, i32> {
-    // For symlinks, lstat returns the symlink inode rather than following.
-    // Our lookup_path already doesn't follow symlinks, so lstat == stat here.
     sys_stat(path)
 }
 
-/// Readdir returning rich Ext2DirEntry structs (used by vfs_ops::readdir).
 pub fn readdir(path: &str) -> Result<Vec<Ext2DirEntry>, i32> {
     let fs = FS.lock();
     let fs = fs.as_ref().ok_or(-5i32)?;
@@ -951,7 +1192,6 @@ pub fn sys_truncate(path: &str, size: u64) -> Result<(), i32> {
 pub fn sys_create(path: &str) -> Result<u32, i32> {
     let mut fs_lock = FS.lock();
     let fs = fs_lock.as_mut().ok_or(-5i32)?;
-    // Return EEXIST if path already exists.
     if fs.lookup_path(path).is_some() { return Err(-17); }
     let (parent_ino, name) = fs.dir_lookup_parent(path)?;
     let grp = ((parent_ino - 1) as usize) / fs.inodes_per_grp;
@@ -968,15 +1208,12 @@ pub fn sys_mkdir(path: &str, mode: u16) -> Result<u32, i32> {
     let grp = ((parent_ino - 1) as usize) / fs.inodes_per_grp;
     let dir_mode = 0o040000 | (mode & 0o7777);
     let ino = fs.make_inode(dir_mode, 0, 0, grp)?;
-    // Add . and .. entries.
     fs.add_dirent(ino, ino, ".", FT_DIR)?;
     fs.add_dirent(ino, parent_ino, "..", FT_DIR)?;
     fs.add_dirent(parent_ino, ino, name, FT_DIR)?;
-    // Increment parent's links_count (for the .. entry).
     let mut parent_inode = fs.inode(parent_ino).ok_or(-2i32)?;
     parent_inode.links_count += 1;
     fs.write_inode(parent_ino, &parent_inode);
-    // Update used_dirs in group descriptor.
     let mut gd = fs.group_desc(grp);
     gd.used_dirs += 1;
     fs.write_group_desc(grp, &gd);
@@ -988,16 +1225,13 @@ pub fn sys_unlink(path: &str) -> Result<(), i32> {
     let fs = fs_lock.as_mut().ok_or(-5i32)?;
     let ino = fs.lookup_path(path).ok_or(-2i32)?;
     let inode = fs.inode(ino).ok_or(-2i32)?;
-    if inode.mode & 0xF000 == 0x4000 { return Err(-21); } // EISDIR
+    if inode.mode & 0xF000 == 0x4000 { return Err(-21); }
     let (parent_ino, name) = fs.dir_lookup_parent(path)?;
     fs.remove_dirent(parent_ino, name)?;
-    // Decrement link count; free inode+blocks if zero.
     let mut inode = fs.inode(ino).ok_or(-2i32)?;
     inode.links_count = inode.links_count.saturating_sub(1);
     if inode.links_count == 0 {
-        // Free data blocks.
-        let empty: &[u8] = &[];
-        let _ = fs.write_inode_data(ino, empty);
+        let _ = fs.write_inode_data(ino, &[]);
         inode = fs.inode(ino).ok_or(-2i32)?;
         inode.dtime = crate::drivers::rtc::read_unix_time().unwrap_or(0) as u32;
         fs.write_inode(ino, &inode);
@@ -1013,18 +1247,15 @@ pub fn sys_rmdir(path: &str) -> Result<(), i32> {
     let fs = fs_lock.as_mut().ok_or(-5i32)?;
     let ino = fs.lookup_path(path).ok_or(-2i32)?;
     let inode = fs.inode(ino).ok_or(-2i32)?;
-    if inode.mode & 0xF000 != 0x4000 { return Err(-20); } // ENOTDIR
-    // Must be empty (only . and ..).
+    if inode.mode & 0xF000 != 0x4000 { return Err(-20); }
     let entries = fs.list_dir_ino(ino);
     let non_dot = entries.iter().filter(|(_, n, _)| n != "." && n != "..").count();
-    if non_dot > 0 { return Err(-39); } // ENOTEMPTY
+    if non_dot > 0 { return Err(-39); }
     let (parent_ino, name) = fs.dir_lookup_parent(path)?;
     fs.remove_dirent(parent_ino, name)?;
-    // Decrement parent link count (for the .. we're removing).
     let mut parent_inode = fs.inode(parent_ino).ok_or(-2i32)?;
     parent_inode.links_count = parent_inode.links_count.saturating_sub(1);
     fs.write_inode(parent_ino, &parent_inode);
-    // Free the directory inode.
     let mut inode = fs.inode(ino).ok_or(-2i32)?;
     inode.links_count = 0;
     inode.dtime = crate::drivers::rtc::read_unix_time().unwrap_or(0) as u32;
@@ -1041,7 +1272,6 @@ pub fn sys_rename(old: &str, new: &str) -> Result<(), i32> {
     let mut fs_lock = FS.lock();
     let fs = fs_lock.as_mut().ok_or(-5i32)?;
     let ino = fs.lookup_path(old).ok_or(-2i32)?;
-    // If new already exists, unlink it first (POSIX atomic rename).
     if let Some(existing) = fs.lookup_path(new) {
         let ex_inode = fs.inode(existing).ok_or(-2i32)?;
         let (new_parent, new_name) = fs.dir_lookup_parent(new)?;
@@ -1049,9 +1279,7 @@ pub fn sys_rename(old: &str, new: &str) -> Result<(), i32> {
         let mut ex = fs.inode(existing).ok_or(-2i32)?;
         ex.links_count = ex.links_count.saturating_sub(1);
         if ex.links_count == 0 {
-            if ex_inode.mode & 0xF000 != 0x4000 {
-                let _ = fs.write_inode_data(existing, &[]);
-            }
+            if ex_inode.mode & 0xF000 != 0x4000 { let _ = fs.write_inode_data(existing, &[]); }
             fs.free_inode(existing);
         } else {
             fs.write_inode(existing, &ex);
@@ -1071,7 +1299,7 @@ pub fn sys_link(old: &str, new: &str) -> Result<(), i32> {
     let fs = fs_lock.as_mut().ok_or(-5i32)?;
     let ino = fs.lookup_path(old).ok_or(-2i32)?;
     let inode = fs.inode(ino).ok_or(-2i32)?;
-    if inode.mode & 0xF000 == 0x4000 { return Err(-21); } // EISDIR
+    if inode.mode & 0xF000 == 0x4000 { return Err(-21); }
     if fs.lookup_path(new).is_some() { return Err(-17); }
     let (new_parent, new_name) = fs.dir_lookup_parent(new)?;
     fs.add_dirent(new_parent, ino, new_name, FT_REG)?;
@@ -1098,7 +1326,7 @@ pub fn sys_readlink(path: &str) -> Result<String, i32> {
     let fs = fs.as_ref().ok_or(-5i32)?;
     let ino = fs.lookup_path(path).ok_or(-2i32)?;
     let inode = fs.inode(ino).ok_or(-2i32)?;
-    if inode.mode & 0xF000 != 0xA000 { return Err(-22); } // EINVAL — not a symlink
+    if inode.mode & 0xF000 != 0xA000 { return Err(-22); }
     let data = fs.read_inode_data(&inode);
     String::from_utf8(data).map_err(|_| -22i32)
 }
