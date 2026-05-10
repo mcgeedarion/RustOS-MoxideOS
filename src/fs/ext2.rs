@@ -27,7 +27,7 @@ const FT_REG:  u8 = 1;
 const FT_DIR:  u8 = 2;
 const FT_SYML: u8 = 7;
 
-// ── On-disk structures ────────────────────────────────────────────────────
+// ── On-disk structures ────────────────────────────────────────────────
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -156,7 +156,7 @@ struct Ext2Fs {
 
 static FS: Mutex<Option<Ext2Fs>> = Mutex::new(None);
 
-// ── mount ─────────────────────────────────────────────────────────────────
+// ── mount ────────────────────────────────────────────────────────────────────
 
 pub fn mount() -> bool {
     if !crate::drivers::virtio_blk::is_present() { return false; }
@@ -225,7 +225,7 @@ fn write_ptr(buf: &mut [u8], off: usize, v: u32) {
     buf[off+2] = b[2]; buf[off+3] = b[3];
 }
 
-// ── Ext2Fs impl ───────────────────────────────────────────────────────────
+// ── Ext2Fs impl ────────────────────────────────────────────────────────────────
 
 impl Ext2Fs {
     fn gd_offset(&self, g: usize) -> usize {
@@ -298,7 +298,7 @@ impl Ext2Fs {
         Some(&mut self.data[off..off + self.block_size])
     }
 
-    // ── Flush ─────────────────────────────────────────────────────────────
+    // ── Flush ─────────────────────────────────────────────────────────────────
 
     fn flush_range(&self, byte_off: usize, len: usize) {
         if len == 0 { return; }
@@ -320,7 +320,7 @@ impl Ext2Fs {
         self.flush_range(off, self.block_size);
     }
 
-    // ── Block allocator ───────────────────────────────────────────────────
+    // ── Block allocator ─────────────────────────────────────────────────────────
 
     fn alloc_block(&mut self, preferred_group: usize) -> u32 {
         let total = self.total_groups;
@@ -370,7 +370,7 @@ impl Ext2Fs {
         self.write_group_desc(g, &gd2);
     }
 
-    // ── Inode allocator ───────────────────────────────────────────────────
+    // ── Inode allocator ─────────────────────────────────────────────────────────
 
     fn alloc_inode(&mut self, preferred_group: usize) -> u32 {
         let total = self.total_groups;
@@ -413,7 +413,7 @@ impl Ext2Fs {
         self.write_group_desc(g, &gd2);
     }
 
-    // ── Indirect pointer block I/O ────────────────────────────────────────
+    // ── Indirect pointer block I/O ────────────────────────────────────────────
 
     /// Read all u32 pointers from one block into a Vec.
     fn read_ptrs(&self, blkno: u32) -> Vec<u32> {
@@ -447,7 +447,7 @@ impl Ext2Fs {
         Ok(*slot)
     }
 
-    // ── scan_inode_data_blocks ────────────────────────────────────────────
+    // ── scan_inode_data_blocks ──────────────────────────────────────────────────
     //
     // Walks every data block reachable from `ino` in logical order.
     // Calls `f(block_slice) -> bool`; returning false stops the walk early.
@@ -510,7 +510,7 @@ impl Ext2Fs {
         }
     }
 
-    // ── read_inode_data ───────────────────────────────────────────────────
+    // ── read_inode_data ────────────────────────────────────────────────────────
 
     fn read_inode_data(&self, ino: &Inode) -> Vec<u8> {
         let size = (ino.size_lo as usize).min(MAX_FILE_SIZE);
@@ -576,41 +576,23 @@ impl Ext2Fs {
         out
     }
 
-    // ── write_inode_data ──────────────────────────────────────────────────
+    // ── write_inode_data ────────────────────────────────────────────────────────
     //
     // Writes `data` into inode `ino_num`, allocating / freeing blocks
     // across all four indirection levels as needed.
-    //
-    // Logical block index `blk_idx` is a flat 0-based counter:
-    //
-    //   [0..11]           direct
-    //   [12..12+ppb)      single-indirect
-    //   [12+ppb..12+ppb+ppb^2)  double-indirect
-    //   [...]             triple-indirect
-    //
-    // For each logical block:
-    //   needed  => ensure data block exists, write content, flush
-    //   excess  => free data block, zero pointer
-    // Pointer blocks are freed when all their entries are zero.
 
     fn write_inode_data(&mut self, ino_num: u32, data: &[u8]) -> Result<(), i32> {
         let size         = data.len().min(MAX_FILE_SIZE);
         let bs           = self.block_size;
-        let ppb          = bs / 4;          // pointers per block
+        let ppb          = bs / 4;
         let needed_blks  = size.div_ceil(bs);
         let grp          = ((ino_num - 1) as usize) / self.inodes_per_grp;
 
         let mut inode = self.inode(ino_num).ok_or(-2i32)?;
-        // Running count of overhead (pointer) blocks for inode.blocks.
         let mut ptr_blocks: usize = 0;
-        // Flat block index counter.
         let mut blk_idx: usize = 0;
 
-        // Helper closure: write one data slice into blkno.
-        // Returns Err if blkno is out of range.
-        // (defined inline below via macro to avoid borrow issues)
-
-        // ── Phase 0: direct blocks (inode.block[0..11]) ───────────────────
+        // ── Phase 0: direct blocks (inode.block[0..11]) ─────────────────────
         for i in 0..12usize {
             let start = blk_idx * bs;
             if blk_idx < needed_blks {
@@ -632,9 +614,9 @@ impl Ext2Fs {
             blk_idx += 1;
         }
 
-        // ── Phase 1: single-indirect (inode.block[12]) ────────────────────
+        // ── Phase 1: single-indirect (inode.block[12]) ─────────────────────
         {
-            let si_start   = blk_idx;            // = 12
+            let si_start   = blk_idx;
             let si_end     = si_start + ppb;
             let si_needed  = needed_blks.saturating_sub(si_start).min(ppb);
 
@@ -669,7 +651,6 @@ impl Ext2Fs {
                 }
                 self.write_ptrs(ib, &ptrs);
             } else if inode.block[12] != 0 {
-                // Free all data blocks and the indirect block itself.
                 let ib   = inode.block[12];
                 let ptrs = self.read_ptrs(ib);
                 for &p in &ptrs { self.free_block(p); }
@@ -679,9 +660,9 @@ impl Ext2Fs {
             blk_idx = si_end;
         }
 
-        // ── Phase 2: double-indirect (inode.block[13]) ────────────────────
+        // ── Phase 2: double-indirect (inode.block[13]) ─────────────────────
         {
-            let di_start  = blk_idx;             // = 12 + ppb
+            let di_start  = blk_idx;
             let di_end    = di_start + ppb * ppb;
             let di_needed = needed_blks.saturating_sub(di_start).min(ppb * ppb);
 
@@ -693,7 +674,6 @@ impl Ext2Fs {
                 let mut remaining = di_needed;
                 for i in 0..ppb {
                     if remaining == 0 {
-                        // Free excess L2 chain.
                         if l1[i] != 0 {
                             let l2 = self.read_ptrs(l1[i]);
                             for &p in &l2 { self.free_block(p); }
@@ -754,7 +734,7 @@ impl Ext2Fs {
             blk_idx = di_end;
         }
 
-        // ── Phase 3: triple-indirect (inode.block[14]) ────────────────────
+        // ── Phase 3: triple-indirect (inode.block[14]) ─────────────────────
         {
             let ti_start  = blk_idx;
             let ti_needed = needed_blks.saturating_sub(ti_start).min(ppb * ppb * ppb);
@@ -859,14 +839,13 @@ impl Ext2Fs {
             }
         }
 
-        // ── Update inode size + block count ───────────────────────────────
         inode.size_lo = size as u32;
         inode.blocks  = ((needed_blks + ptr_blocks) * bs / 512) as u32;
         self.write_inode(ino_num, &inode);
         Ok(())
     }
 
-    // ── Directory helpers ─────────────────────────────────────────────────
+    // ── Directory helpers ────────────────────────────────────────────────────────
 
     fn lookup_path(&self, path: &str) -> Option<u32> {
         let mut ino = 2u32;
@@ -928,12 +907,10 @@ impl Ext2Fs {
 
         let mut blocks_to_scan: Vec<u32> = Vec::new();
         for i in 0..12 { if dir_inode.block[i] != 0 { blocks_to_scan.push(dir_inode.block[i]); } }
-        // Single-indirect
         if dir_inode.block[12] != 0 {
             let ptrs = self.read_ptrs(dir_inode.block[12]);
             for &p in &ptrs { if p != 0 { blocks_to_scan.push(p); } }
         }
-        // Double-indirect (directories rarely reach this)
         if dir_inode.block[13] != 0 {
             let l1 = self.read_ptrs(dir_inode.block[13]);
             for &b1 in &l1 {
@@ -990,7 +967,6 @@ impl Ext2Fs {
             }
         }
         if !attached {
-            // Fall back to single-indirect for large directories.
             let ib = self.alloc_if_zero(&mut dir_inode.block[12], grp)?;
             let mut ptrs = self.read_ptrs(ib);
             let slot = ptrs.iter_mut().find(|p| **p == 0).ok_or(-28i32)?;
@@ -1016,14 +992,33 @@ impl Ext2Fs {
         Ok(())
     }
 
+    // FIX: remove_dirent now scans single-indirect and double-indirect blocks
+    // in addition to direct blocks, matching the coverage of add_dirent.
+    // Previously only inode.block[0..11] were scanned, causing ENOENT for
+    // entries in directories larger than 12 * block_size bytes.
     fn remove_dirent(&mut self, dir_ino: u32, name: &str) -> Result<(), i32> {
         let name_bytes = name.as_bytes();
         let bs         = self.block_size;
         let dir_inode  = self.inode(dir_ino).ok_or(-2i32)?;
 
+        let mut blocks_to_scan: Vec<u32> = Vec::new();
         for i in 0..12 {
-            let blkno = dir_inode.block[i];
-            if blkno == 0 { continue; }
+            if dir_inode.block[i] != 0 { blocks_to_scan.push(dir_inode.block[i]); }
+        }
+        if dir_inode.block[12] != 0 {
+            let ptrs = self.read_ptrs(dir_inode.block[12]);
+            for &p in &ptrs { if p != 0 { blocks_to_scan.push(p); } }
+        }
+        if dir_inode.block[13] != 0 {
+            let l1 = self.read_ptrs(dir_inode.block[13]);
+            for &b1 in &l1 {
+                if b1 == 0 { continue; }
+                let l2 = self.read_ptrs(b1);
+                for &p in &l2 { if p != 0 { blocks_to_scan.push(p); } }
+            }
+        }
+
+        for blkno in blocks_to_scan {
             let off = blkno as usize * bs;
             if off + bs > self.data.len() { continue; }
             let mut cursor = 0usize;
@@ -1092,7 +1087,7 @@ impl Ext2Fs {
     }
 }
 
-// ── Public read-only API ──────────────────────────────────────────────────
+// ── Public read-only API ────────────────────────────────────────────────────
 
 pub fn stat(path: &str) -> Option<u32> {
     FS.lock().as_ref()?.lookup_path(path)
@@ -1127,7 +1122,7 @@ pub fn readdir_raw(dir_ino: u32) -> Option<Vec<(u32, String, bool)>> {
     Some(fs.list_dir_ino(dir_ino))
 }
 
-// ── Public stat (vfs_ops-facing) ──────────────────────────────────────────
+// ── Public stat (vfs_ops-facing) ──────────────────────────────────────────────
 
 pub fn sys_stat(path: &str) -> Result<Ext2Stat, i32> {
     let fs = FS.lock();
@@ -1149,8 +1144,50 @@ pub fn sys_stat(path: &str) -> Result<Ext2Stat, i32> {
     })
 }
 
+// FIX: sys_lstat must return the symlink inode itself without following the
+// final path component. The old implementation was a direct alias to sys_stat
+// which always resolved symlinks via lookup_path.
+//
+// New approach: resolve all but the last component normally, then call
+// lookup_dir on the final name to get the raw inode number from the parent
+// directory entry, and return that inode's fields without any mode check.
 pub fn sys_lstat(path: &str) -> Result<Ext2Stat, i32> {
-    sys_stat(path)
+    let fs = FS.lock();
+    let fs = fs.as_ref().ok_or(-5i32)?;
+
+    let path_trimmed = path.trim_start_matches('/');
+    let (parent_path, last) = match path_trimmed.rfind('/') {
+        Some(i) => (&path_trimmed[..i], &path_trimmed[i+1..]),
+        None    => ("", path_trimmed),
+    };
+
+    // Resolve the parent directory (all but last component) using the
+    // symlink-following lookup_path — only the final component must not
+    // be followed.
+    let parent_ino = if parent_path.is_empty() {
+        2u32
+    } else {
+        // Reconstruct with leading slash for lookup_path.
+        let full_parent = alloc::format!("/{}", parent_path);
+        fs.lookup_path(&full_parent).ok_or(-2i32)?
+    };
+
+    // Look up the final name as a raw dir-entry (does not follow symlinks).
+    let ino = fs.lookup_dir(parent_ino, last).ok_or(-2i32)?;
+    let inode = fs.inode(ino).ok_or(-2i32)?;
+    Ok(Ext2Stat {
+        ino,
+        mode:    inode.mode,
+        nlink:   inode.links_count as u32,
+        uid:     inode.uid as u32,
+        gid:     inode.gid as u32,
+        size:    inode.size_lo as u64,
+        atime:   inode.atime as u64,
+        mtime:   inode.mtime as u64,
+        ctime:   inode.ctime as u64,
+        blksize: fs.block_size as u32,
+        blocks:  inode.blocks as u64,
+    })
 }
 
 pub fn readdir(path: &str) -> Result<Vec<Ext2DirEntry>, i32> {
@@ -1168,7 +1205,7 @@ pub fn readdir(path: &str) -> Result<Vec<Ext2DirEntry>, i32> {
     Ok(out)
 }
 
-// ── Public write API ──────────────────────────────────────────────────────
+// ── Public write API ─────────────────────────────────────────────────────
 
 pub fn sys_write_file(path: &str, data: &[u8]) -> Result<(), i32> {
     let mut fs_lock = FS.lock();
@@ -1268,18 +1305,24 @@ pub fn sys_rmdir(path: &str) -> Result<(), i32> {
     Ok(())
 }
 
+// FIX: when rename clobbers an existing destination and links_count reaches 0,
+// call write_inode_data(existing, &[]) unconditionally (both files and dirs).
+// The old code skipped this for directories, leaving their data blocks leaked.
 pub fn sys_rename(old: &str, new: &str) -> Result<(), i32> {
     let mut fs_lock = FS.lock();
     let fs = fs_lock.as_mut().ok_or(-5i32)?;
     let ino = fs.lookup_path(old).ok_or(-2i32)?;
     if let Some(existing) = fs.lookup_path(new) {
-        let ex_inode = fs.inode(existing).ok_or(-2i32)?;
         let (new_parent, new_name) = fs.dir_lookup_parent(new)?;
         fs.remove_dirent(new_parent, new_name)?;
         let mut ex = fs.inode(existing).ok_or(-2i32)?;
         ex.links_count = ex.links_count.saturating_sub(1);
         if ex.links_count == 0 {
-            if ex_inode.mode & 0xF000 != 0x4000 { let _ = fs.write_inode_data(existing, &[]); }
+            // Free data blocks for both regular files and directories.
+            let _ = fs.write_inode_data(existing, &[]);
+            let mut ex2 = fs.inode(existing).ok_or(-2i32)?;
+            ex2.dtime = crate::drivers::rtc::read_unix_time().unwrap_or(0) as u32;
+            fs.write_inode(existing, &ex2);
             fs.free_inode(existing);
         } else {
             fs.write_inode(existing, &ex);
@@ -1350,4 +1393,33 @@ pub fn sys_chown(path: &str, uid: u32, gid: u32) -> Result<(), i32> {
     inode.gid = gid as u16;
     fs.write_inode(ino, &inode);
     Ok(())
+}
+
+pub fn sys_statfs(path: &str) -> Result<Ext2Statfs, i32> {
+    let fs = FS.lock();
+    let fs = fs.as_ref().ok_or(-5i32)?;
+    // Ensure the path exists (returns ENOENT if not).
+    let _ = fs.lookup_path(path).ok_or(-2i32)?;
+    // Re-read the superblock fields from the in-memory image.
+    let sb = if fs.data.len() >= 1024 + core::mem::size_of::<Superblock>() {
+        unsafe { *((fs.data.as_ptr().add(1024)) as *const Superblock) }
+    } else {
+        return Err(-5);
+    };
+    Ok(Ext2Statfs {
+        f_bsize:   fs.block_size as u32,
+        f_blocks:  sb.blocks_count as u64,
+        f_bfree:   sb.free_blocks_count as u64,
+        f_bavail:  sb.free_blocks_count.saturating_sub(sb.r_blocks_count) as u64,
+        f_namelen: 255,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Ext2Statfs {
+    pub f_bsize:   u32,
+    pub f_blocks:  u64,
+    pub f_bfree:   u64,
+    pub f_bavail:  u64,
+    pub f_namelen: u32,
 }
