@@ -117,7 +117,13 @@ impl SchedEntity {
         }
     }
 
-    pub fn set_deadline(&mut self, runtime_ns: u64, deadline_ns: u64, period_ns: u64, now_ns: u64) {
+    pub fn set_deadline(
+        &mut self,
+        runtime_ns:  u64,
+        deadline_ns: u64,
+        period_ns:   u64,
+        now_ns:      u64,
+    ) {
         self.dl_runtime          = runtime_ns;
         self.dl_deadline         = deadline_ns;
         self.dl_period           = period_ns.max(1);
@@ -164,7 +170,9 @@ impl Ord for CfsEntry {
     }
 }
 impl PartialOrd for CfsEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 unsafe impl Send for CfsEntry {}
 
@@ -182,7 +190,9 @@ impl Ord for DlEntry {
     }
 }
 impl PartialOrd for DlEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 unsafe impl Send for DlEntry {}
 
@@ -660,7 +670,9 @@ pub fn wake_pid(pid: usize) {
     if !already { enqueue_task(task); }
 }
 
-pub fn suspend_current_until_child_exec(_child_pid: usize) { block_current(); }
+pub fn suspend_current_until_child_exec(_child_pid: usize) {
+    block_current();
+}
 
 // ── current_pid ───────────────────────────────────────────────────────────────
 
@@ -693,7 +705,10 @@ pub fn current_pid() -> u32 {
 /// Convenience wrappers — delegate to proc_table so callers don't need
 /// to import two modules.
 #[inline]
-pub fn with_proc<T, F: FnOnce(&crate::proc::process::Pcb) -> T>(pid: usize, f: F) -> Option<T> {
+pub fn with_proc<T, F>(pid: usize, f: F) -> Option<T>
+where
+    F: FnOnce(&crate::proc::process::Pcb) -> T,
+{
     proc_table::with_proc(pid, f)
 }
 #[inline]
@@ -703,11 +718,17 @@ pub fn with_proc_mut<T, F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> 
     proc_table::with_proc_mut(pid, f)
 }
 #[inline]
-pub fn with_procs_ro<T, F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T>(f: F) -> T {
+pub fn with_procs_ro<T, F>(f: F) -> T
+where
+    F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
+{
     proc_table::with_procs_ro(f)
 }
 #[inline]
-pub fn with_procs_mut<T, F: FnOnce(&mut alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T>(f: F) -> T {
+pub fn with_procs_mut<T, F>(f: F) -> T
+where
+    F: FnOnce(&mut alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
+{
     proc_table::with_procs_mut(f)
 }
 #[inline]
