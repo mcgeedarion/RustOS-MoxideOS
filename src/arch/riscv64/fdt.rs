@@ -5,6 +5,7 @@
 //!   2. Record the initramfs location (`initramfs::set_initramfs_range`).
 //!   3. Discover VirtIO-MMIO devices → `virtio_net_mmio::probe(base, irq)`.
 //!   4. Discover the PLIC → `plic::set_base(base)`.
+//!   5. Enumerate /cpus/cpu@ nodes → `smp::register_cpu(hw_id, node, is_bsp)`.
 //!
 //! Only the subset of the FDT spec needed for QEMU `virt` machine is
 //! implemented — big-endian u32 token stream, no dynamic allocation required.
@@ -30,7 +31,7 @@ const FDT_PROP:        u32 = 3;
 const FDT_NOP:         u32 = 4;
 const FDT_END:         u32 = 9;
 
-// ── Header ────────────────────────────────────────────────────────────────────────
+// ── Header ──────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 struct FdtHeader {
@@ -56,7 +57,7 @@ impl FdtHeader {
     fn off_dt_strings(&self) -> u32 { u32::from_be(self.off_dt_strings) }
 }
 
-// ── Big-endian integer helpers ──────────────────────────────────────────────────────────
+// ── Big-endian integer helpers ───────────────────────────────────────────────
 
 #[inline]
 fn be32(b: &[u8], off: usize) -> u32 {
@@ -74,11 +75,11 @@ fn be64(b: &[u8], off: usize) -> u64 {
     ])
 }
 
-// ── Kernel end symbol ───────────────────────────────────────────────────────────────────
+// ── Kernel end symbol ────────────────────────────────────────────────────────
 
 extern "C" { static _kernel_end: u8; }
 
-// ── Node tracking state ───────────────────────────────────────────────────────────────
+// ── Node tracking state ──────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct VirtioMmioNode {
@@ -87,13 +88,17 @@ struct VirtioMmioNode {
     is_virtio: bool,
 }
 
-/// Which kind of node we are currently inside (depth==2 for /soc/* children).
+/// Current child type under /soc (depth 2 when in_soc is true).
 #[derive(PartialEq)]
 enum SocChild { None, Plic, Other }
 
-// ── Main walker ───────────────────────────────────────────────────────────────────
+/// Current child type under /cpus (depth 2 when in_cpus is true).
+#[derive(PartialEq)]
+enum CpusChild { None, Cpu }
 
-/// Walk the FDT blob and initialise PMM, initramfs, PLIC, and VirtIO-MMIO devices.
+// ── Main walker ──────────────────────────────────────────────────────────────
+
+/// Walk the FDT blob and initialise PMM, initramfs, PLIC, VirtIO-MMIO, and SMP.
 ///
 /// # Safety
 /// `fdt_ptr` must be the physical address of a valid DTB blob as passed by
@@ -116,17 +121,35 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
 
     let mut pos:           usize = 0;
     let mut depth:         usize = 0;
+
+    // /memory node
     let mut in_memory:     bool  = false;
+    // /chosen node
     let mut in_chosen:     bool  = false;
+    // /virtio_mmio@ top-level node
     let mut in_virtio:     bool  = false;
-    let mut in_soc:        bool  = false;   // inside /soc node (depth 1)
-    let mut soc_child:     SocChild = SocChild::None;  // which /soc/* we are in
     let mut vmmio:         VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
-    let mut plic_base:     usize = 0;       // /soc/plic reg base
+    // /soc node and its children
+    let mut in_soc:        bool  = false;
+    let mut soc_child:     SocChild = SocChild::None;
+    let mut plic_base:     usize = 0;
+    // /cpus node and its children
+    let mut in_cpus:       bool  = false;
+    let mut cpus_child:    CpusChild = CpusChild::None;
+    let mut cpu_reg:       u32   = u32::MAX;  // hart-id from `reg` property
+    let mut cpu_status_ok: bool  = false;     // `status` is "okay" or absent
+    let mut cpu_count:     u32   = 0;         // total CPU nodes seen
+    // /chosen
     let mut initrd_start:  u64   = 0;
     let mut initrd_end:    u64   = 0;
 
     let kernel_end_pa = (&_kernel_end as *const u8 as usize + 0xFFF) & !0xFFF;
+
+    // Register BSP (hart 0) first so logical id 0 is always the boot hart.
+    // We will re-register APs as we find their nodes in /cpus.
+    // Actually we enumerate all /cpus/cpu@ nodes and use the `reg` property
+    // as hw_id; the first one with reg==BOOT_HART_ID becomes the BSP.
+    let boot_hart = crate::arch::riscv64::boot::BOOT_HART_ID;
 
     loop {
         if pos + 4 > structs.len() { break; }
@@ -144,10 +167,10 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
 
                 match depth {
                     1 => {
-                        // Top-level nodes.
                         in_memory = node_name == "memory" || node_name.starts_with("memory@");
                         in_chosen = node_name == "chosen";
                         in_soc    = node_name == "soc";
+                        in_cpus   = node_name == "cpus";
                         in_virtio = node_name.starts_with("virtio_mmio@");
                         if in_virtio {
                             let addr_str = &node_name["virtio_mmio@".len()..];
@@ -158,13 +181,22 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                         }
                     }
                     2 if in_soc => {
-                        // /soc/* children.
                         soc_child = if node_name == "plic"
                                       || node_name.starts_with("plic@") {
                             SocChild::Plic
                         } else {
                             SocChild::Other
                         };
+                    }
+                    2 if in_cpus => {
+                        // /cpus/cpu@ or /cpus/cpu-map etc.
+                        if node_name == "cpu" || node_name.starts_with("cpu@") {
+                            cpus_child    = CpusChild::Cpu;
+                            cpu_reg       = u32::MAX;
+                            cpu_status_ok = true; // assume okay unless disabled
+                        } else {
+                            cpus_child = CpusChild::None;
+                        }
                     }
                     _ => {}
                 }
@@ -183,13 +215,28 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                         in_chosen = false;
                         in_virtio = false;
                         in_soc    = false;
+                        in_cpus   = false;
                     }
                     2 if in_soc => {
-                        // Leaving a /soc/* child.
                         if soc_child == SocChild::Plic && plic_base != 0 {
                             crate::drivers::plic::set_base(plic_base);
                         }
                         soc_child = SocChild::None;
+                    }
+                    2 if in_cpus => {
+                        if cpus_child == CpusChild::Cpu && cpu_reg != u32::MAX && cpu_status_ok {
+                            let is_bsp = cpu_reg == boot_hart as u32;
+                            crate::smp::register_cpu(cpu_reg, 0 /*node*/, is_bsp);
+                            cpu_count += 1;
+                            crate::println!(
+                                "fdt: cpu hart {} logical {} {}",
+                                cpu_reg, cpu_count - 1,
+                                if is_bsp { "(BSP)" } else { "(AP)" }
+                            );
+                        }
+                        cpus_child    = CpusChild::None;
+                        cpu_reg       = u32::MAX;
+                        cpu_status_ok = true;
                     }
                     _ => {}
                 }
@@ -205,7 +252,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                 } else { &[] };
                 pos = (pos + prop_len + 3) & !3;
 
-                // ── /memory reg ────────────────────────────────────────────────────
+                // ── /memory reg ──────────────────────────────────────────────
                 if in_memory && prop_name == "reg" {
                     let mut i = 0usize;
                     while i + 16 <= prop_data.len() {
@@ -237,7 +284,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── /chosen ─────────────────────────────────────────────────────────
+                // ── /chosen ──────────────────────────────────────────────────
                 if in_chosen {
                     match prop_name {
                         "linux,initrd-start" => {
@@ -254,7 +301,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── virtio_mmio@ node ──────────────────────────────────────────────────
+                // ── virtio_mmio@ node ─────────────────────────────────────────
                 if in_virtio {
                     match prop_name {
                         "compatible" => {
@@ -276,26 +323,39 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── /soc/plic node ─────────────────────────────────────────────────────
-                // QEMU virt DTB has /soc { plic@c000000 { reg = <0 0xc000000 0 0x600000>; } }
-                // `reg` for the PLIC is a (addr-hi, addr-lo, size-hi, size-lo) tuple
-                // with 32-bit cells (each FDT cell is a big-endian u32).
-                // Two address cells + two size cells = 4 u32s = 16 bytes.
+                // ── /soc/plic node ────────────────────────────────────────────
                 if soc_child == SocChild::Plic && prop_name == "reg" {
                     if prop_data.len() >= 16 {
-                        // #address-cells = 2 on QEMU virt /soc: high u32 then low u32.
                         let addr_hi = be32(prop_data, 0) as usize;
                         let addr_lo = be32(prop_data, 4) as usize;
                         let addr    = (addr_hi << 32) | addr_lo;
                         if addr != 0 { plic_base = addr; }
                     } else if prop_data.len() >= 8 {
-                        // Some firmware emits a single-cell 64-bit address.
                         let addr = be64(prop_data, 0) as usize;
                         if addr != 0 { plic_base = addr; }
                     } else if prop_data.len() >= 4 {
-                        // Fallback: 32-bit address cell.
                         let addr = be32(prop_data, 0) as usize;
                         if addr != 0 { plic_base = addr; }
+                    }
+                }
+
+                // ── /cpus/cpu@ node ───────────────────────────────────────────
+                // `reg` = hart id (u32 big-endian cell).
+                // `status` = "okay" | "disabled".
+                if cpus_child == CpusChild::Cpu {
+                    match prop_name {
+                        "reg" => {
+                            if prop_data.len() >= 4 {
+                                cpu_reg = be32(prop_data, 0);
+                            }
+                        }
+                        "status" => {
+                            let s = core::str::from_utf8(
+                                prop_data.split(|&c| c == 0).next().unwrap_or(&[])
+                            ).unwrap_or("");
+                            cpu_status_ok = s == "okay" || s == "ok";
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -303,6 +363,12 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
             FDT_NOP => {}
             FDT_END | _ => { break; }
         }
+    }
+
+    // If no /cpus nodes were found (e.g. FDT omits them), register hart 0 as BSP.
+    if cpu_count == 0 {
+        crate::smp::register_cpu(boot_hart as u32, 0, true);
+        crate::println!("fdt: no /cpus nodes found — registering boot hart {} only", boot_hart);
     }
 
     if initrd_start != 0 && initrd_end > initrd_start {

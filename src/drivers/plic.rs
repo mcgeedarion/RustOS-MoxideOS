@@ -11,44 +11,42 @@
 //!   0x200000 + ctx*0x1000 + 0x00 : priority threshold (per context)
 //!   0x200000 + ctx*0x1000 + 0x04 : claim/complete register (per context)
 //!
-//! ## Contexts (QEMU virt, 1 hart)
+//! ## Contexts (QEMU virt)
 //!   Context 0: hart 0 M-mode  (used by OpenSBI, do not touch)
-//!   Context 1: hart 0 S-mode  ← this is us
-//!   Context 2: hart 1 M-mode  (not present in single-hart QEMU)
-//!   ...
+//!   Context 1: hart 0 S-mode  ← this is us (BSP)
+//!   Context 2: hart 1 M-mode  (OpenSBI)
+//!   Context 3: hart 1 S-mode  ← AP hart 1
 //!   General formula: ctx = hart * 2 + 1  (S-mode)
 //!
 //! ## Usage
 //!   1. FDT walker calls `set_base(plic_pa)` when it finds the PLIC node.
 //!   2. `kernel_main` calls `plic::init()` after fdt::init_from_fdt().
 //!   3. Each driver registers its IRQ with `plic::enable_irq(irq, handler)`.
-//!      virtio_net_mmio stores its IRQ number and calls this after probe().
-//!   4. The trap handler calls `plic::handle_irq()` on every supervisor
-//!      external interrupt (scause code 9).
+//!   4. APs call `plic::init_context(ctx)` during their own bringup.
+//!   5. The trap handler calls `plic::handle_irq()` on every supervisor
+//!      external interrupt (scause code 9) on any hart.
 
 use spin::Mutex;
 
-// ── PLIC register layout constants ─────────────────────────────────────────────────
+// ── PLIC register layout constants ──────────────────────────────────────────
 
 const PLIC_PRIORITY_BASE:  usize = 0x0000_0000;
 const PLIC_ENABLE_BASE:    usize = 0x0000_2000;
 const PLIC_ENABLE_STRIDE:  usize = 0x0000_0080; // per context
 const PLIC_CTX_BASE:       usize = 0x0020_0000;
 const PLIC_CTX_STRIDE:     usize = 0x0000_1000; // per context
-const PLIC_CTX_THRESHOLD:  usize = 0x0000;      // offset within context
-const PLIC_CTX_CLAIM:      usize = 0x0004;      // offset within context (claim/complete)
+const PLIC_CTX_THRESHOLD:  usize = 0x0000;
+const PLIC_CTX_CLAIM:      usize = 0x0004;
 
-// Number of IRQ sources the PLIC supports (spec allows up to 1023).
-// QEMU virt uses 96 sources.  We allocate a handler table for 128.
 const MAX_IRQ: usize = 128;
 
-// ── State ───────────────────────────────────────────────────────────────────────────
+// ── State ────────────────────────────────────────────────────────────────────
 
 type IrqHandler = fn();
 
 struct PlicState {
     base:     usize,
-    /// S-mode hart 0 context number.  For a 1-hart system this is 1.
+    /// S-mode hart 0 context number (BSP). APs use hart*2+1.
     ctx:      usize,
     handlers: [Option<IrqHandler>; MAX_IRQ],
 }
@@ -58,11 +56,11 @@ unsafe impl Sync for PlicState {}
 
 static PLIC: Mutex<PlicState> = Mutex::new(PlicState {
     base:     0,
-    ctx:      1,   // hart 0 S-mode
+    ctx:      1,
     handlers: [None; MAX_IRQ],
 });
 
-// ── MMIO helpers ─────────────────────────────────────────────────────────────────────
+// ── MMIO helpers ─────────────────────────────────────────────────────────────
 
 #[inline]
 unsafe fn r32(addr: usize) -> u32 {
@@ -73,36 +71,28 @@ unsafe fn w32(addr: usize, val: u32) {
     core::ptr::write_volatile(addr as *mut u32, val);
 }
 
-// ── FDT callback ───────────────────────────────────────────────────────────────────
+// ── FDT callback ─────────────────────────────────────────────────────────────
 
 /// Called by `fdt::init_from_fdt` when it encounters the `/soc/plic` node.
-/// `base` is the identity-mapped physical address from the `reg` property.
 pub fn set_base(base: usize) {
     PLIC.lock().base = base;
     crate::println!("plic: MMIO base {:#x}", base);
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────────────
+// ── BSP init ─────────────────────────────────────────────────────────────────
 
-/// Initialise the PLIC for the S-mode context on hart 0.
-///
-/// Sets the priority threshold to 0 (accept all non-zero priorities).
-/// Call this after `fdt::init_from_fdt` so `set_base` has been called.
+/// Initialise the PLIC for the S-mode context on hart 0 (BSP).
 /// Returns `false` if no PLIC base was found in the FDT.
 pub fn init() -> bool {
     let state = PLIC.lock();
-    let base = state.base;
-    let ctx  = state.ctx;
+    let base  = state.base;
+    let ctx   = state.ctx;
     drop(state);
-
     if base == 0 {
         crate::println!("plic: WARNING: base not set — PLIC not initialised");
         return false;
     }
-
     unsafe {
-        // Set priority threshold = 0 for our S-mode context.
-        // This means any IRQ with priority ≥ 1 will be delivered.
         let threshold_addr = base + PLIC_CTX_BASE + ctx * PLIC_CTX_STRIDE + PLIC_CTX_THRESHOLD;
         w32(threshold_addr, 0);
     }
@@ -110,15 +100,39 @@ pub fn init() -> bool {
     true
 }
 
-// ── IRQ registration ─────────────────────────────────────────────────────────────────
+/// Initialise the PLIC for an AP's S-mode context.
+///
+/// Sets threshold = 0 and copies enable bits from the BSP context so the
+/// AP can receive the same set of IRQs (e.g. virtio-net).
+/// Called from `arch::riscv64::smp::ap_init_plic()`.
+pub fn init_context(ctx: usize) {
+    let state = PLIC.lock();
+    let base  = state.base;
+    let bsp_ctx = state.ctx;
+    drop(state);
+    if base == 0 { return; }
 
-/// Register a handler for `irq` and enable it in the PLIC.
-///
-/// - Sets source priority to 1 (lowest non-zero).
-/// - Sets the enable bit in the S-mode context enable bank.
-/// - Records `handler` in the dispatch table.
-///
-/// Safe to call multiple times for the same IRQ (updates handler).
+    unsafe {
+        // Set threshold = 0 for this AP's context.
+        let thr_addr = base + PLIC_CTX_BASE + ctx * PLIC_CTX_STRIDE + PLIC_CTX_THRESHOLD;
+        w32(thr_addr, 0);
+
+        // Copy enable words from BSP context to this AP's context.
+        // Each context has MAX_IRQ/32 = 4 enable words (for MAX_IRQ=128).
+        let words = MAX_IRQ / 32;
+        for w in 0..words {
+            let bsp_en  = base + PLIC_ENABLE_BASE + bsp_ctx * PLIC_ENABLE_STRIDE + w * 4;
+            let ap_en   = base + PLIC_ENABLE_BASE + ctx     * PLIC_ENABLE_STRIDE + w * 4;
+            let bits    = r32(bsp_en);
+            w32(ap_en, bits);
+        }
+    }
+    crate::println!("plic: AP context {} initialised", ctx);
+}
+
+// ── IRQ registration ─────────────────────────────────────────────────────────
+
+/// Register a handler for `irq` and enable it in the BSP PLIC context.
 pub fn enable_irq(irq: u32, handler: IrqHandler) {
     if irq == 0 || irq as usize >= MAX_IRQ {
         crate::println!("plic: enable_irq: invalid IRQ {}", irq);
@@ -133,22 +147,18 @@ pub fn enable_irq(irq: u32, handler: IrqHandler) {
     drop(state);
 
     unsafe {
-        // Set source priority = 1.
         let prio_addr = base + PLIC_PRIORITY_BASE + irq as usize * 4;
         w32(prio_addr, 1);
-
-        // Set enable bit in the context's enable bank.
-        // Each context has 128 bits (4 bytes per 32 IRQs).
-        let word     = irq as usize / 32;
-        let bit      = irq as usize % 32;
-        let en_addr  = base + PLIC_ENABLE_BASE + ctx * PLIC_ENABLE_STRIDE + word * 4;
-        let prev     = r32(en_addr);
+        let word    = irq as usize / 32;
+        let bit     = irq as usize % 32;
+        let en_addr = base + PLIC_ENABLE_BASE + ctx * PLIC_ENABLE_STRIDE + word * 4;
+        let prev    = r32(en_addr);
         w32(en_addr, prev | (1 << bit));
     }
     crate::println!("plic: enabled IRQ {} (ctx {})", irq, ctx);
 }
 
-/// Disable an IRQ source in the PLIC (clears enable bit, removes handler).
+/// Disable an IRQ source in the PLIC BSP context.
 pub fn disable_irq(irq: u32) {
     if irq == 0 || irq as usize >= MAX_IRQ { return; }
     let mut state = PLIC.lock();
@@ -166,32 +176,29 @@ pub fn disable_irq(irq: u32) {
     }
 }
 
-// ── IRQ dispatch ───────────────────────────────────────────────────────────────────────
+// ── IRQ dispatch ─────────────────────────────────────────────────────────────
 
-/// Called from the supervisor external interrupt handler in `trap.rs`
-/// (scause code 9, MSB set = interrupt).
-///
-/// Loops claiming IRQs until the PLIC returns 0 (no more pending).
-/// For each claimed IRQ:
-///   1. Calls the registered handler (e.g. `virtio_net_mmio::virtio_net_mmio_irq`).
-///   2. Writes the IRQ back to the complete register.
-///
-/// This must NOT hold the PLIC mutex across the handler call, because the
-/// handler (e.g. virtio_net_mmio_irq) may itself try to lock other mutexes.
+/// Called from the supervisor external interrupt handler (scause code 9).
+/// Works for any hart — reads the claim register for the calling hart's
+/// S-mode context (hart_id * 2 + 1).
 pub fn handle_irq() {
-    let (base, ctx) = {
+    let (base, _bsp_ctx) = {
         let state = PLIC.lock();
         (state.base, state.ctx)
     };
     if base == 0 { return; }
 
+    // Determine calling hart's S-mode context from tp (set to hart_id at boot).
+    let hart_id: usize;
+    unsafe { core::arch::asm!("mv {}, tp", out(reg) hart_id, options(nostack, nomem)); }
+    let ctx = hart_id * 2 + 1;
+
     let claim_addr = base + PLIC_CTX_BASE + ctx * PLIC_CTX_STRIDE + PLIC_CTX_CLAIM;
 
     loop {
         let irq = unsafe { r32(claim_addr) };
-        if irq == 0 { break; } // no more pending
+        if irq == 0 { break; }
 
-        // Look up handler without holding the lock during dispatch.
         let handler: Option<IrqHandler> = {
             let state = PLIC.lock();
             if irq as usize < MAX_IRQ { state.handlers[irq as usize] } else { None }
@@ -200,10 +207,9 @@ pub fn handle_irq() {
         if let Some(h) = handler {
             h();
         } else {
-            crate::println!("plic: spurious IRQ {}", irq);
+            crate::println!("plic: spurious IRQ {} on hart {}", irq, hart_id);
         }
 
-        // Write IRQ back to claim/complete to signal completion.
         unsafe { w32(claim_addr, irq); }
     }
 }
