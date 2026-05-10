@@ -4,8 +4,23 @@
 //!   a0 = hart ID
 //!   a1 = pointer to FDT (device tree blob)
 //!
-//! We stash both registers in globals, set up a temporary boot stack,
-//! then call kernel_main(hart_id, fdt_ptr).
+//! We stash both registers in globals, set up the boot stack (sp = BOOT_STACK_TOP,
+//! the highest address of the 32 KiB .bss boot stack region), then call
+//! kernel_main_riscv64(hart_id, fdt_ptr).
+//!
+//! ## Stack layout
+//!
+//! RISC-V stacks grow **downward**: sp must point to the *highest* address of
+//! the reserved region on entry.  The linker places symbols in the order they
+//! appear in the object file, so we must declare the stack array **before**
+//! BOOT_STACK_TOP so that the top symbol ends up at `base + size`:
+//!
+//!   [BOOT_STACK  .................. BOOT_STACK_TOP]
+//!    ^low                                    ^high
+//!    .bss                                sp on entry
+//!
+//! The repr(align(16)) satisfies the RISC-V ABI 16-byte stack-alignment
+//! invariant that the hardware enforces at `call` instructions.
 
 use core::arch::asm;
 
@@ -16,17 +31,27 @@ pub static mut BOOT_HART_ID: usize = 0;
 /// 0 = not available.
 pub static mut FDT_PHYS: usize = 0;
 
-/// 16 KiB boot stack (BSS, zero-initialised by OpenSBI).
-#[link_section = ".bss"]
-static mut BOOT_STACK: [u8; 16384] = [0u8; 16384];
+/// 32 KiB boot stack (BSS, zero-initialised by OpenSBI / firmware).
+///
+/// `repr(align(16))` ensures the region starts on a 16-byte boundary so
+/// that the initial `sp = BOOT_STACK_TOP` value is also 16-byte aligned
+/// (BOOT_STACK_TOP is placed at `base + 32768` by the linker).
+#[repr(align(16))]
+struct BootStackStorage([u8; 32768]);
 
-/// Symbol at the top of the boot stack.
+/// The stack storage itself.  MUST be declared **before** BOOT_STACK_TOP so
+/// the linker places BOOT_STACK_TOP immediately above it (higher address).
+#[link_section = ".bss"]
+static mut BOOT_STACK: BootStackStorage = BootStackStorage([0u8; 32768]);
+
+/// Zero-size symbol immediately above BOOT_STACK.  `sp` is set to this
+/// address on entry — it is the valid first push address (stack is empty).
 #[no_mangle]
 #[link_section = ".bss"]
 pub static BOOT_STACK_TOP: [u8; 0] = [];
 
 /// Naked SBI entry stub.  Entered with MMU off, interrupts off.
-/// Saves a0/a1, sets sp, then calls kernel_main(hart_id, fdt_ptr).
+/// Saves a0/a1, sets sp = BOOT_STACK_TOP, then calls kernel_main_riscv64.
 #[no_mangle]
 #[naked]
 #[link_section = ".text.boot"]
@@ -42,10 +67,10 @@ pub unsafe extern "C" fn _start() -> ! {
         "la   t0, {fdt_phys}",
         "sd   a1, 0(t0)",
 
-        // Load boot stack pointer.
+        // Load boot stack pointer (top = highest address of BOOT_STACK).
         "la   sp, {stack_top}",
 
-        // Call kernel_main(hart_id=a0, fdt_ptr=a1) — args already in a0/a1.
+        // Call kernel_main_riscv64(hart_id=a0, fdt_ptr=a1) — args already in a0/a1.
         "call {kmain}",
 
         // kernel_main returned — should never happen.

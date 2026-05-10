@@ -11,18 +11,27 @@
 //!   2. Capture GOP framebuffer (graceful fallback if unavailable).
 //!   3. Scan EFI configuration table for ACPI 2.0 RSDP and OVMF initrd.
 //!   4. LoadFile2 initramfs protocol (real hardware / systemd-boot).
-//!   5. Dynamic EFI memory map + ExitBootServices.
-//!   6. Switch to kernel boot stack and tail-call kernel_main().
+//!   5. Dynamic EFI memory map + ExitBootServices (with mandatory retry).
+//!   6. Save EFI map metadata for pmm_add_efi_map().
+//!   7. Switch to kernel boot stack (BOOT_STACK_TOP) and tail-call kernel_main.
+//!
+//! ## ExitBootServices retry
+//!   SiFive HiFive Premier P550 and StarFive VisionFive 2 firmware both
+//!   observed to invalidate the map key between GetMemoryMap and
+//!   ExitBootServices.  UEFI spec §7.4.6 requires callers to handle this by
+//!   refreshing the key and retrying once.  If the second attempt fails we
+//!   halt in a wfi loop rather than continuing with boot services active.
 
 use core::arch::asm;
 
-// ─── EFI types ─────────────────────────────────────────────────────────────────
+// ─── EFI types ────────────────────────────────────────────────────────────────
 
 type EfiStatus = usize;
 type EfiHandle = *mut core::ffi::c_void;
 
-const EFI_SUCCESS:          EfiStatus = 0;
-const EFI_BUFFER_TOO_SMALL: EfiStatus = 0x8000_0000_0000_0005;
+const EFI_SUCCESS:           EfiStatus = 0;
+const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
+const EFI_BUFFER_TOO_SMALL:  EfiStatus = 0x8000_0000_0000_0005;
 
 #[repr(C)]
 struct EfiTableHeader {
@@ -83,13 +92,13 @@ struct EfiBootServices {
 const EFI_LOADER_DATA: u32 = 2;
 
 #[repr(C)]
-struct EfiMemDescriptor {
-    type_:          u32,
-    _pad:           u32,
-    physical_start: u64,
-    virtual_start:  u64,
-    num_pages:      u64,
-    attribute:      u64,
+pub struct EfiMemDescriptor {
+    pub type_:          u32,
+    pub _pad:           u32,
+    pub physical_start: u64,
+    pub virtual_start:  u64,
+    pub num_pages:      u64,
+    pub attribute:      u64,
 }
 
 #[repr(C)]
@@ -132,7 +141,7 @@ const BY_PROTOCOL: u32 = 2;
 const EXIT_BOOT_SERVICES_OFFSET: usize = 0x190;
 type ExitBootServicesFn = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 
-// ─── GUIDs ───────────────────────────────────────────────────────────────────
+// ─── GUIDs ────────────────────────────────────────────────────────────────────
 
 const ACPI2_GUID: [u64; 2] = [
     0x11d3_f1e4_71e8_6888,
@@ -144,9 +153,16 @@ const INITRD_MEDIA_GUID: [u64; 2] = [
     0x68cc_3152_55ca_74ac,
 ];
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
+// ─── Globals set before kernel_main ───────────────────────────────────────────
 
+/// Physical address of the ACPI 2.0 RSDP. 0 = not found.
 pub static mut RSDP_PHYS: u64 = 0;
+
+/// Saved EFI memory map metadata — consumed by pmm_add_efi_map() in
+/// memmap_init().  Set before ExitBootServices; read-only thereafter.
+pub static mut EFI_MAP_PTR:   usize = 0;
+pub static mut EFI_MAP_SIZE:  usize = 0;
+pub static mut EFI_DESC_SIZE: usize = 0;
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
@@ -190,7 +206,7 @@ pub unsafe extern "efiapi" fn uefi_start(
         load_initrd_via_loadfile2(st.boot_services as *mut core::ffi::c_void, bs_base);
     }
 
-    // 5. Dynamic EFI memory map.
+    // 5. Dynamic EFI memory map — allocate buffer with headroom.
     let mut map_size:  usize = 0;
     let mut map_key:   usize = 0;
     let mut desc_size: usize = 0;
@@ -204,12 +220,11 @@ pub unsafe extern "efiapi" fn uefi_start(
         &mut desc_size,
         &mut desc_ver,
     );
-    map_size += 2048;
+    map_size += 2048; // headroom for AllocatePool descriptor
 
     let mut map_buf: *mut u8 = core::ptr::null_mut();
     let alloc_status = (bs.allocate_pool)(EFI_LOADER_DATA, map_size, &mut map_buf);
     if alloc_status != EFI_SUCCESS || map_buf.is_null() {
-        // Non-recoverable — halt.
         loop { asm!("wfi", options(nostack, nomem)); }
     }
 
@@ -224,28 +239,69 @@ pub unsafe extern "efiapi" fn uefi_start(
         loop { asm!("wfi", options(nostack, nomem)); }
     }
 
-    // 6. ExitBootServices.
-    let exit_fn = *((bs_base + EXIT_BOOT_SERVICES_OFFSET) as *const ExitBootServicesFn);
-    let _ = exit_fn(image_handle, map_key);
+    // 6. Save map metadata for pmm_add_efi_map() (must happen before
+    //    ExitBootServices because the EFI pool stays mapped afterwards).
+    EFI_MAP_PTR   = map_buf as usize;
+    EFI_MAP_SIZE  = map_size;
+    EFI_DESC_SIZE = desc_size;
 
-    // 7. Switch to kernel boot stack and call kernel_main.
+    // 7. ExitBootServices — with mandatory retry on EFI_INVALID_PARAMETER.
+    //
+    // UEFI spec §7.4.6: firmware may modify the memory map between
+    // GetMemoryMap and ExitBootServices, invalidating map_key.  Observed
+    // on SiFive P550 and StarFive VisionFive 2 firmware.
+    let exit_fn = *((bs_base + EXIT_BOOT_SERVICES_OFFSET) as *const ExitBootServicesFn);
+
+    let mut exit_status = exit_fn(image_handle, map_key);
+
+    if exit_status == EFI_INVALID_PARAMETER {
+        // Refresh the map key using the existing buffer.
+        let mut retry_map_size  = map_size;
+        let mut retry_map_key:  usize = 0;
+        let mut retry_desc_size: usize = desc_size;
+        let mut retry_desc_ver:  u32   = desc_ver;
+
+        let remap_status = (bs.get_memory_map)(
+            &mut retry_map_size,
+            map_buf as *mut EfiMemDescriptor,
+            &mut retry_map_key,
+            &mut retry_desc_size,
+            &mut retry_desc_ver,
+        );
+
+        if remap_status == EFI_SUCCESS {
+            EFI_MAP_SIZE  = retry_map_size;
+            EFI_DESC_SIZE = retry_desc_size;
+            exit_status   = exit_fn(image_handle, retry_map_key);
+        }
+    }
+
+    if exit_status != EFI_SUCCESS {
+        // Boot services still live — cannot continue safely.  Halt.
+        loop { asm!("wfi", options(nostack, nomem)); }
+    }
+
+    // 8. Switch to the kernel boot stack and tail-call kernel_main.
+    //
+    // BOOT_STACK_TOP is immediately above BOOT_STACK in .bss (see boot.rs).
+    // sp = BOOT_STACK_TOP is the correct initial stack pointer value for a
+    // downward-growing RISC-V stack.
     extern "C" {
         fn kernel_main() -> !;
-        static BOOT_STACK_TOP: [u8; 0];
     }
     asm!(
         "la   sp, {stack_top}",
-        "mv   s0, zero",
+        "mv   s0, zero",   // clear frame pointer
         "call {km}",
         "1:  wfi",
         "j   1b",
-        stack_top = sym BOOT_STACK_TOP,
+        stack_top = sym crate::arch::riscv64::boot::BOOT_STACK_TOP,
         km        = sym kernel_main,
         options(noreturn),
     );
 }
 
-// ─── LoadFile2 initramfs ──────────────────────────────────────────────────────────
+// ─── LoadFile2 initramfs ───────────────────────────────────────────────────────
 
 unsafe fn load_initrd_via_loadfile2(
     boot_services: *mut core::ffi::c_void,
