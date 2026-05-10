@@ -127,16 +127,20 @@ pub fn idt_init() {
 // ── #DB / #BP handlers ────────────────────────────────────────────────────────
 //
 // The ASM stubs pass `rsp` (pointing at the SavedRegs frame) as a raw *mut u64.
-// When the gdbstub feature is active we cast to *mut SavedRegs before calling
-// gdb_trap.  When it is absent we ignore the pointer and fall back to the
-// generic halt path.  Using *mut u64 here avoids an unconditional reference to
-// the SavedRegs type which only exists behind #[cfg(feature = "gdbstub")].
+// When the gdbstub feature is active we cast to *mut SavedRegs and pass the
+// current PID so the stub can report the correct stopped thread in '?', 'qC',
+// and thread-stop-reply packets.
+// When the feature is absent we fall through to the generic halt path.
 
 #[no_mangle]
 pub unsafe extern "C" fn db_handler(frame: *mut u64) {
     #[cfg(feature = "gdbstub")]
     {
-        crate::gdbstub::gdb_trap(frame as *mut crate::gdbstub::SavedRegs);
+        let pid = crate::proc::scheduler::current_pid();
+        crate::gdbstub::gdb_trap(
+            frame as *mut crate::gdbstub::SavedRegs,
+            pid,
+        );
         return;
     }
     #[allow(unreachable_code)]
@@ -147,7 +151,11 @@ pub unsafe extern "C" fn db_handler(frame: *mut u64) {
 pub unsafe extern "C" fn bp_handler(frame: *mut u64) {
     #[cfg(feature = "gdbstub")]
     {
-        crate::gdbstub::gdb_trap(frame as *mut crate::gdbstub::SavedRegs);
+        let pid = crate::proc::scheduler::current_pid();
+        crate::gdbstub::gdb_trap(
+            frame as *mut crate::gdbstub::SavedRegs,
+            pid,
+        );
         return;
     }
     #[allow(unreachable_code)]
