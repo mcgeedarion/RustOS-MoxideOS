@@ -9,6 +9,7 @@ pub mod page_fault;
 pub mod pmm;
 pub mod rss;
 pub mod slab;
+pub mod swap;
 
 /// Initialise memory subsystems that require explicit boot-time setup.
 ///
@@ -16,11 +17,13 @@ pub mod slab;
 ///   1. pmm::init() / pmm::pmm_add_efi_map() / memmap::memmap_init()
 ///      — physical frames must be available before slab can grow.
 ///   2. heap::init_heap_tracking()  — linked_list_allocator bootstrap.
-///   3. mm::init()                  — THIS function; pre-warms slab caches.
+///   3. mm::init()                  — THIS function; pre-warms slab caches
+///                                    and initialises the swap subsystem.
 ///
 /// After this returns, `slab::slab_alloc`, `slab::slab_free`,
-/// `slab::slab_shrink`, and `slab::slab_stats` are all safe to call
-/// from any kernel context.
+/// `slab::slab_shrink`, `slab::slab_stats`, and all `swap::` functions
+/// are safe to call from any kernel context.
 pub fn init() {
     slab::init();
+    swap::init();
 }
