@@ -9,6 +9,7 @@
 //!   2.  pmm::init()            — physical memory manager
 //!   3.  heap::init()           — linked-list allocator over PMM
 //!   3a. mm::init()             — slab cache pre-warm (8 size classes)
+//!   3b. io_uring::init()       — ring table init (requires alloc)
 //!   4.  initramfs::mount()     — populate VFS from CPIO
 //!   5.  gdt::init()            — GDT + TSS
 //!   6.  idt::init()            — IDT / exception vectors
@@ -27,6 +28,7 @@
 //!                                            virtio_mmio@ → virtio_net_mmio::probe()
 //!   3.  heap::init()           — linked-list allocator over PMM
 //!   3a. mm::init()             — slab cache pre-warm (8 size classes)
+//!   3b. io_uring::init()       — ring table init (requires alloc)
 //!   4.  initramfs::mount()     — populate VFS from CPIO
 //!   5.  plic::init()           — set S-mode context threshold=0, PLIC ready to deliver
 //!   6.  virtio_net_mmio::enable_plic_irq()
@@ -64,6 +66,10 @@ pub fn kernel_main_x86_64() {
     //     Box allocations inside init() itself work correctly.
     crate::mm::init();
     crate::println!("rustos: slab allocator ready");
+
+    // 3b. io_uring ring table — requires alloc, must precede any io_uring syscall.
+    crate::io_uring::init();
+    crate::println!("rustos: io_uring ready");
 
     crate::fs::initramfs::mount_initramfs();
     gdt::init();
@@ -129,6 +135,10 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     // 3a. Slab allocator — pre-warms 8 fixed-size caches over PMM.
     crate::mm::init();
     crate::println!("rustos: slab allocator ready");
+
+    // 3b. io_uring ring table — requires alloc, must precede any io_uring syscall.
+    crate::io_uring::init();
+    crate::println!("rustos: io_uring ready");
 
     // 4. VFS from CPIO.
     crate::fs::initramfs::mount_initramfs();
