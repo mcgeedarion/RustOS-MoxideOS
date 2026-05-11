@@ -17,6 +17,20 @@ pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 
 /// The per-CPU block.  Must be `repr(C)` so the assembly trampoline can
 /// access `self_ptr` at a fixed offset (offset 0).
+///
+/// ## Field ordering note
+///
+/// `self_ptr` and `cpu_id` are at offsets 0 and 8 respectively; the
+/// x86_64 `current_cpu_id()` fast path reads `gs:[4]` (offset 4 inside
+/// the pointer-sized slot that starts at 0 on LP64 — actually the u32
+/// `cpu_id` is at offset 8 due to the pointer being 8 bytes).  Do NOT
+/// reorder the first two fields without updating the inline asm.
+///
+/// `current_pid` is written by `scheduler::schedule()` on every CPU every
+/// time a new task is selected.  `scheduler::current_pid()` reads it
+/// directly without going through `current_task`, so it is accurate even
+/// during the brief window when `current_task` is null between context
+/// switches.  Initialised to 0 (idle / no process).
 #[repr(C, align(64))]
 pub struct PercpuBlock {
     /// Pointer to self — must stay at offset 0.
@@ -35,6 +49,15 @@ pub struct PercpuBlock {
     pub syscall_stack: [u8; SYSCALL_STACK_SIZE],
     /// Pointer to the currently running `Task` on this CPU.
     pub current_task: *mut crate::proc::task::Task,
+    /// PID of the currently running process on this CPU.
+    ///
+    /// Written by `scheduler::schedule()` unconditionally on every CPU
+    /// whenever a new task is selected (or set to 0 when the runqueue
+    /// drains).  Read by `scheduler::current_pid()` as the authoritative
+    /// source; the global `CURRENT_PID` AtomicU32 in scheduler.rs is only
+    /// a fallback for early-boot code that runs before percpu blocks are
+    /// initialised.
+    pub current_pid: u32,
     /// Runqueue for this CPU's CFS scheduler.
     pub runqueue: crate::proc::scheduler::RunQueue,
     /// Count of context switches on this CPU.
@@ -50,12 +73,20 @@ impl PercpuBlock {
 }
 
 /// Static storage for up to MAX_CPUS per-CPU blocks.
-static mut PERCPU_BLOCKS: [PercpuBlock; crate::smp::MAX_CPUS] = {
-    // const-init each element.
+pub static mut PERCPU_BLOCKS: [PercpuBlock; crate::smp::MAX_CPUS] = {
     let mut arr: [PercpuBlock; crate::smp::MAX_CPUS] =
         unsafe { core::mem::zeroed() };
     arr
 };
+
+/// Number of CPUs that have been initialised via `init()`.
+static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Returns the number of CPUs that have called `init()`.
+#[inline]
+pub fn cpu_count() -> u32 {
+    CPU_COUNT.load(Ordering::Acquire)
+}
 
 /// Initialise per-CPU storage for `cpu_id` and install the block pointer
 /// into the architecture-specific CPU register.
@@ -70,11 +101,14 @@ pub unsafe fn init(cpu_id: u32) {
         blk.node = info.node;
     }
     blk.intr_disable_depth = 0;
-    blk.intr_was_enabled = false;
-    blk.current_task = core::ptr::null_mut();
-    blk.ctx_switches = 0;
-    blk.ipi_pending = AtomicU32::new(0);
-    blk.runqueue = crate::proc::scheduler::RunQueue::new();
+    blk.intr_was_enabled   = false;
+    blk.current_task       = core::ptr::null_mut();
+    blk.current_pid        = 0;
+    blk.ctx_switches       = 0;
+    blk.ipi_pending        = AtomicU32::new(0);
+    blk.runqueue           = crate::proc::scheduler::RunQueue::new();
+
+    CPU_COUNT.fetch_max(cpu_id + 1, Ordering::Release);
 
     #[cfg(target_arch = "x86_64")]
     {
