@@ -1,6 +1,9 @@
 //! x86-64 Linux syscall dispatch table for rustos.
 //!
 //! ## Recently wired
+//!   NR 425  io_uring_setup(entries, params)    => io_uring::syscall::sys_io_uring_setup
+//!   NR 426  io_uring_enter(fd, …)              => io_uring::syscall::sys_io_uring_enter
+//!   NR 427  io_uring_register(fd, op, arg, n)  => io_uring::syscall::sys_io_uring_register
 //!   NR 41-55 socket syscalls (all 15)
 //!   NR 288   accept4 (was wrongly aliased to timerfd_gettime64)
 //!   NR 318  getrandom(buf, count, flags)     => stubs::sys_getrandom_impl
@@ -26,7 +29,7 @@
 //!   The dispatch() arm for NR 15 below is therefore unreachable in normal
 //!   operation and exists only as a safe fallback.
 //!
-//! ## Socket NRs (NR 41-55)
+//! ## Socket NRs (NR 41-55, 288)
 //!   41  socket       42  connect     43  accept      44  sendto
 //!   45  recvfrom     46  sendmsg     47  recvmsg     48  shutdown
 //!   49  bind         50  listen      51  getsockname 52  getpeername
@@ -246,6 +249,10 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        crate::fs::close_range::sys_close_range(first, last, flags),
                    _ => -22,
                },
+        // ── io_uring ─────────────────────────────────────────────────────────────────────────
+        425 => crate::io_uring::syscall::sys_io_uring_setup(a as u32, b),
+        426 => crate::io_uring::syscall::sys_io_uring_enter(a, b as u32, c as u32, d as u32, e, f),
+        427 => crate::io_uring::syscall::sys_io_uring_register(a, b as u32, c, d as u32),
         // ── socket syscalls (NR 41-55, 288) ─────────────────────────────────────────────
         41  => crate::net::socket::sys_socket(a as i32, b as i32, c as i32),
         42  => crate::net::socket::sys_connect(a, b, c as u32),
