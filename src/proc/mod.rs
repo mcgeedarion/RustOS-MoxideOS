@@ -15,6 +15,7 @@ pub mod pid_ns;
 pub mod proc_table;
 pub mod process;
 pub mod ptrace;
+pub mod restart;
 pub mod rlimit;
 pub mod sched_helpers;
 pub mod scheduler;
