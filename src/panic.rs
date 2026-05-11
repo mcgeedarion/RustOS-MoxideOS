@@ -15,7 +15,16 @@
 use core::fmt::Write;
 use crate::arch::{Arch, api::{Interrupts, Cpu, Serial}};
 
+/// Permanent CPU halt used by panic and OOM handlers.
+/// `#[cold]` keeps this out of the hot-path instruction cache.
+#[cold]
+#[inline(never)]
+fn halt_loop() -> ! {
+    loop { Arch::halt(); }
+}
+
 #[panic_handler]
+#[cold]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // 1. Disable local interrupts first so no timer fires mid-panic.
     Arch::disable();
@@ -41,6 +50,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 #[alloc_error_handler]
+#[cold]
 fn alloc_error(layout: core::alloc::Layout) -> ! {
     Arch::disable();
     Arch::serial_write(b"\r\n*** OOM: alloc_error ***\r\n");
@@ -52,14 +62,7 @@ fn alloc_error(layout: core::alloc::Layout) -> ! {
     halt_loop()
 }
 
-fn halt_loop() -> ! {
-    // Interrupts are already disabled; loop on the arch halt primitive.
-    // x86: `hlt` sleeps until NMI/SMI (benign, loops back).
-    // RISC-V: `wfi` sleeps until interrupt (interrupts disabled so never wakes).
-    loop { Arch::halt(); }
-}
-
-// ── Serial writer ───────────────────────────────────────────────────────────
+// ── Serial writer ────────────────────────────────────────────────────────────
 
 /// Zero-size type that implements `fmt::Write` by writing bytes directly
 /// to the arch serial port.  No allocator, no locks — safe in panic context.

@@ -17,22 +17,56 @@
 //!
 //! ## RDRAND retry optimisation
 //!
-//! The original code retried RDRAND via a Rust `for` loop that re-entered
-//! the `asm!` block on each failed attempt.  Every `asm!` entry point is
-//! an opaque scheduling barrier for LLVM, so each retry incurred the full
-//! block overhead.  Moving the retry loop *inside* the `asm!` block with a
-//! local label (`2: rdrand / jnc 2b`) eliminates that overhead and keeps
-//! the entire retry sequence in a single micro-op dispatch window.
+//! The retry loop lives *inside* the `asm!` block using a local numeric
+//! label (`2: rdrand / jnc 2b`) so that every retry stays within a single
+//! micro-op dispatch window and LLVM never sees a branch back into a new
+//! `asm!` barrier.  The `rdrand_asm!` macro below encapsulates this block
+//! so `arch_entropy` and `rdrand64` share one definition.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Xorshift-64 PRNG state.  Initialised to 0; seeded by `seed_from_hw()`.
 static STATE: AtomicU64 = AtomicU64::new(0);
 
-// ── Hardware seeding ─────────────────────────────────────────────────────
+// ── RDRAND macro (x86_64 only) ────────────────────────────────────────────
+//
+// Evaluates to `(result: u64, ok: bool)` without duplicating the asm block.
+// Previously `arch_entropy` and `rdrand64` each contained identical 20-line
+// asm! blocks; this macro eliminates that duplication entirely.
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! rdrand_asm {
+    () => {{
+        let result: u64;
+        let ok: u8;
+        unsafe {
+            core::arch::asm!(
+                "xor {cnt:e}, {cnt:e}",
+                "2:",
+                "rdrand {v}",
+                "jc 3f",
+                "inc {cnt:e}",
+                "cmp {cnt:e}, 10",
+                "jl 2b",
+                "xor {ok}, {ok}",
+                "jmp 4f",
+                "3:",
+                "mov {ok}, 1",
+                "4:",
+                v   = out(reg)      result,
+                ok  = out(reg_byte) ok,
+                cnt = out(reg)      _,
+                options(nostack, nomem)
+            );
+        }
+        (result, ok != 0)
+    }};
+}
+
+// ── Hardware seeding ──────────────────────────────────────────────────────
 
 pub fn seed_from_hw() {
-    let raw = hw_seed_raw();
+    let raw  = hw_seed_raw();
     let seed = raw ^ 0xDEAD_BEEF_CAFE_BABE_u64;
     let seed = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE_u64 } else { seed };
     STATE.store(seed, Ordering::Relaxed);
@@ -74,39 +108,13 @@ fn hw_seed_raw() -> u64 {
     compile_error!("rand::hw_seed_raw: unsupported architecture — add a case here");
 }
 
-// ── arch_entropy — security-critical entropy ─────────────────────────────
+// ── arch_entropy — security-critical entropy ──────────────────────────────
 
 pub fn arch_entropy() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        // Retry loop is entirely inside the asm! block using a local numeric
-        // label so that every retry stays within a single dispatch window and
-        // LLVM never sees a branch back into a new asm! barrier.
-        // The outer Rust counter limits total retries to 10 (Intel guidance)
-        // before falling back to xorshift.
-        let result: u64;
-        let ok: u8;
-        unsafe {
-            core::arch::asm!(
-                "xor {cnt:e}, {cnt:e}",       // cnt = 0
-                "2:",
-                "rdrand {v}",
-                "jc 3f",                       // CF=1 → success, jump to exit
-                "inc {cnt:e}",
-                "cmp {cnt:e}, 10",
-                "jl 2b",                       // retry up to 10 times
-                "xor {ok}, {ok}",             // all retries failed: ok=0
-                "jmp 4f",
-                "3:",
-                "mov {ok}, 1",
-                "4:",
-                v   = out(reg)      result,
-                ok  = out(reg_byte) ok,
-                cnt = out(reg)      _,
-                options(nostack, nomem)
-            );
-        }
-        if ok != 0 { return result; }
+        let (result, ok) = rdrand_asm!();
+        if ok { return result; }
         crate::println!("WARN: rand: RDRAND failed 10× — falling back to xorshift entropy");
         next_u64()
     }
@@ -122,8 +130,8 @@ pub fn arch_entropy() -> u64 {
             i = out(reg) instret,
             options(nostack, nomem)
         );
-        let hw = cycle ^ instret;
-        let xs = next_u64();
+        let hw    = cycle ^ instret;
+        let xs    = next_u64();
         let mixed = hw.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(xs);
         mixed ^ (mixed >> 30)
     }
@@ -136,7 +144,7 @@ pub fn arch_entropy() -> u64 {
 
 pub fn next_u64() -> u64 {
     loop {
-        let s = STATE.load(Ordering::Relaxed);
+        let s  = STATE.load(Ordering::Relaxed);
         let s1 = s ^ (s << 13);
         let s1 = s1 ^ (s1 >> 7);
         let s1 = s1 ^ (s1 << 17);
@@ -150,32 +158,10 @@ pub fn next_u64() -> u64 {
 // ── x86_64-only helpers ───────────────────────────────────────────────────
 
 /// Raw RDRAND — x86_64 only.  Prefer `arch_entropy()` at call sites.
-/// The retry loop lives inside the `asm!` block (see module doc).
 #[cfg(target_arch = "x86_64")]
 pub fn rdrand64() -> u64 {
-    let result: u64;
-    let ok: u8;
-    unsafe {
-        core::arch::asm!(
-            "xor {cnt:e}, {cnt:e}",
-            "2:",
-            "rdrand {v}",
-            "jc 3f",
-            "inc {cnt:e}",
-            "cmp {cnt:e}, 10",
-            "jl 2b",
-            "xor {ok}, {ok}",
-            "jmp 4f",
-            "3:",
-            "mov {ok}, 1",
-            "4:",
-            v   = out(reg)      result,
-            ok  = out(reg_byte) ok,
-            cnt = out(reg)      _,
-            options(nostack, nomem)
-        );
-    }
-    if ok != 0 { result } else { next_u64() }
+    let (result, ok) = rdrand_asm!();
+    if ok { result } else { next_u64() }
 }
 
 /// RDRAND with xorshift fallback — kept for call-site compatibility.

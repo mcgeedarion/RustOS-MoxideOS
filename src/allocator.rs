@@ -20,8 +20,7 @@
 //! virtually, via the identity/physmap) contiguous.  A compact 16-byte
 //! `AllocHeader` is stored in the first 16 bytes of the allocation so that
 //! `dealloc` can recover the exact page count without being given it
-//! externally — fixing the previous bug where `free_bytes(ptr, size)` could
-//! free the wrong number of pages if the caller passed a rounded-up size.
+//! externally.
 //!
 //! Header layout (stored at allocation base, invisible to the caller):
 //! ```text
@@ -47,16 +46,16 @@ use core::{
 use spin::Mutex;
 use crate::mm::pmm;
 
-// ── Constants ─────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────
 
-const PAGE_SIZE:    usize = 4096;
-const MIN_ALIGN:    usize = 16;
+const PAGE_SIZE:   usize = 4096;
+const MIN_ALIGN:   usize = 16;
 /// Header stored at the base of every multi-page allocation.
-const HEADER_SIZE:  usize = 16;
+const HEADER_SIZE: usize = 16;
 /// Magic sentinel used to detect header corruption in dealloc.
-const ALLOC_MAGIC:  u64   = 0xDEAD_C0DE_CAFE_F00D;
+const ALLOC_MAGIC: u64   = 0xDEAD_C0DE_CAFE_F00D;
 
-// ── Multi-page header ─────────────────────────────────────────────────────
+// ── Multi-page header ──────────────────────────────────────────────────────
 
 #[repr(C)]
 struct AllocHeader {
@@ -89,7 +88,7 @@ impl AllocHeader {
     }
 }
 
-// ── Slab free-list node ───────────────────────────────────────────────────
+// ── Slab free-list node ────────────────────────────────────────────────────
 
 /// Intrusive free-list node embedded in each free slab slot.
 /// The `next` pointer is stored in the first 8 bytes of the free object.
@@ -97,7 +96,7 @@ struct SlabNode {
     next: *mut SlabNode,
 }
 
-// ── Slab class table ──────────────────────────────────────────────────────
+// ── Slab class table ───────────────────────────────────────────────────────
 
 /// Number of slab size classes (powers-of-two from 16 to 4096).
 const SLAB_CLASSES: usize = 9;
@@ -105,7 +104,6 @@ const SLAB_CLASSES: usize = 9;
 const fn slab_size(class: usize) -> usize { MIN_ALIGN << class }
 
 /// Global slab free lists, one per size class.
-/// Each entry is the head of an intrusive singly-linked list of free slots.
 struct SlabLayer {
     heads: [*mut SlabNode; SLAB_CLASSES],
 }
@@ -118,15 +116,23 @@ static SLAB: Mutex<SlabLayer> = Mutex::new(SlabLayer {
     heads: [core::ptr::null_mut(); SLAB_CLASSES],
 });
 
-/// Return the slab class index for `size`, or `None` if size > PAGE_SIZE.
+/// Return the slab class index for `layout`, or `None` if the request is
+/// too large or has an alignment that exceeds the slot size.
+///
+/// Centralises the class-selection logic used by both `alloc` and `dealloc`
+/// so the two paths can never disagree on which class owns a pointer.
 #[inline]
-fn slab_class(size: usize) -> Option<usize> {
+fn slab_class_for_layout(layout: &Layout) -> Option<usize> {
+    let size  = layout.size().max(MIN_ALIGN);
+    let align = layout.align().max(MIN_ALIGN);
     if size == 0 || size > PAGE_SIZE { return None; }
-    // Round up to the next power-of-two >= MIN_ALIGN.
     let rounded = size.next_power_of_two().max(MIN_ALIGN);
-    // class = log2(rounded / MIN_ALIGN).
-    let class = (rounded / MIN_ALIGN).trailing_zeros() as usize;
-    if class < SLAB_CLASSES { Some(class) } else { None }
+    let class   = (rounded / MIN_ALIGN).trailing_zeros() as usize;
+    if class < SLAB_CLASSES && align <= slab_size(class) {
+        Some(class)
+    } else {
+        None
+    }
 }
 
 /// Allocate one slot from slab class `class`.
@@ -145,11 +151,10 @@ unsafe fn slab_alloc(slab: &mut SlabLayer, class: usize) -> Option<NonNull<u8>> 
     }
 
     // Free list empty — fetch a fresh page and slice it into slots.
-    let pa = pmm::alloc_page()?;
+    let pa   = pmm::alloc_page()?;
     let base = pa as *mut u8;
     let slots_per_page = PAGE_SIZE / slot_size;
 
-    // Link all slots into the free list, then pop the first one to return.
     // Build the list from the last slot backwards so the first slot is head.
     let mut list_head: *mut SlabNode = core::ptr::null_mut();
     for i in (0..slots_per_page).rev() {
@@ -174,15 +179,13 @@ unsafe fn slab_free(slab: &mut SlabLayer, class: usize, ptr: *mut u8) {
     slab.heads[class] = node;
 }
 
-// ── Multi-page allocation ─────────────────────────────────────────────────
+// ── Multi-page allocation ──────────────────────────────────────────────────
 
 /// Allocate `pages` physically contiguous pages and return a pointer to
 /// the usable region (immediately after the embedded `AllocHeader`).
+/// Marked `#[cold]` — large allocations are uncommon; keeps the slab path tight.
+#[cold]
 unsafe fn large_alloc(pages: usize) -> Option<NonNull<u8>> {
-    // We need one extra page worth of space for the header if the header
-    // fits within the first page (HEADER_SIZE = 16, PAGE_SIZE = 4096, so
-    // the header always fits in the first page alongside the caller data).
-    // We simply reduce the usable area of the first page by HEADER_SIZE.
     let base_pa = pmm::alloc_pages_contig(pages)?;
     let base    = base_pa as *mut u8;
     AllocHeader::write(base, pages as u32);
@@ -191,13 +194,15 @@ unsafe fn large_alloc(pages: usize) -> Option<NonNull<u8>> {
 
 /// Free a multi-page allocation whose user pointer is `user_ptr`.
 /// Reads the page count from the embedded header.
+/// Marked `#[cold]` to match `large_alloc`.
+#[cold]
 unsafe fn large_free(user_ptr: *mut u8) {
-    let pages = AllocHeader::read_pages(user_ptr) as usize;
+    let pages   = AllocHeader::read_pages(user_ptr) as usize;
     let base_pa = user_ptr.sub(HEADER_SIZE) as usize;
     pmm::free_pages_contig(base_pa, pages);
 }
 
-// ── GlobalAlloc impl ──────────────────────────────────────────────────────
+// ── GlobalAlloc impl ───────────────────────────────────────────────────────
 
 pub struct KernelAllocator;
 
@@ -206,26 +211,21 @@ pub static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size  = layout.size().max(MIN_ALIGN);
-        let align = layout.align().max(MIN_ALIGN);
-
-        // Slab path: fits in one page and alignment ≤ slot size.
-        if let Some(class) = slab_class(size) {
-            if align <= slab_size(class) {
-                return match slab_alloc(&mut SLAB.lock(), class) {
-                    Some(p) => p.as_ptr(),
-                    None    => core::ptr::null_mut(),
-                };
-            }
+        // Slab path: fits in one page with compatible alignment.
+        if let Some(class) = slab_class_for_layout(&layout) {
+            return match slab_alloc(&mut SLAB.lock(), class) {
+                Some(p) => p.as_ptr(),
+                None    => core::ptr::null_mut(),
+            };
         }
 
         // Multi-page path.
-        // Account for the header that lives in the first HEADER_SIZE bytes.
-        let usable_first_page = PAGE_SIZE - HEADER_SIZE;
+        // The header eats HEADER_SIZE bytes from the first page.
+        let size               = layout.size().max(MIN_ALIGN);
+        let usable_first_page  = PAGE_SIZE - HEADER_SIZE;
         let total_bytes = if size <= usable_first_page {
             PAGE_SIZE
         } else {
-            // Round up: header eats HEADER_SIZE bytes from the first page.
             HEADER_SIZE + ((size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
         };
         let pages = (total_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -238,14 +238,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() { return; }
-        let size  = layout.size().max(MIN_ALIGN);
-        let align = layout.align().max(MIN_ALIGN);
 
-        if let Some(class) = slab_class(size) {
-            if align <= slab_size(class) {
-                slab_free(&mut SLAB.lock(), class, ptr);
-                return;
-            }
+        if let Some(class) = slab_class_for_layout(&layout) {
+            slab_free(&mut SLAB.lock(), class, ptr);
+            return;
         }
 
         large_free(ptr);
@@ -258,7 +254,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
         };
         let new_ptr = self.alloc(new_layout);
         if !new_ptr.is_null() {
-            // Copy only the bytes that exist in both old and new buffers.
             let copy_len = layout.size().min(new_size);
             core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len);
             self.dealloc(ptr, layout);
@@ -267,11 +262,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
-// ── alloc_bytes / free_bytes public helpers ───────────────────────────────
+// ── alloc_bytes / free_bytes public helpers ────────────────────────────────
 // Used by mm::heap::grow() and other kernel subsystems.
 
 /// Allocate `size` bytes with at least `align` alignment.
-/// Delegates to the same slab/large-page logic as `GlobalAlloc::alloc`.
 pub fn alloc_bytes(size: usize, align: usize) -> Option<NonNull<u8>> {
     let layout = Layout::from_size_align(size.max(1), align.max(MIN_ALIGN)).ok()?;
     NonNull::new(unsafe { ALLOCATOR.alloc(layout) })
