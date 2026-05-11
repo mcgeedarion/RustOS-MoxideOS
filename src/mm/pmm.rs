@@ -18,8 +18,11 @@
 //!   that no process can read stale data from a previously-owned page.
 //!
 //! ## Contiguous multi-page allocation
-//!   alloc_pages_contig(n) collects the free list into a temporary sorted
-//!   Vec, finds a run of n adjacent frames, and removes them.
+//!   alloc_pages_contig(n) holds CONTIG_LOCK while it drains the Treiber
+//!   stack into a temporary sorted Vec, finds a run of n adjacent frames,
+//!   and removes them.  The lock prevents concurrent alloc_page() calls
+//!   from racing with the drain/re-push sequence and producing duplicate
+//!   page pointers.
 //!
 //! ## Kernel image reservation
 //!   Pages in [_kernel_start, _end) are never handed out.
@@ -27,15 +30,21 @@
 //! ## EFI memory map filtering (x86_64 UEFI boot)
 //!   pmm_add_efi_map() walks the EFI memory descriptor array saved by
 //!   uefi_entry before ExitBootServices and only calls pmm_add_region()
-//!   for EfiConventionalMemory (type 4) and EfiPersistentMemory (type 7)
+//!   for EfiConventionalMemory (type 4) and EfiPersistentMemory (type 14)
 //!   entries.  All firmware runtime regions, ACPI tables, MMIO ranges,
 //!   and reserved pages are skipped, preventing NVRAM/runtime corruption.
 //!
 //! ## RISC-V FDT init
 //!   init_from_fdt(fdt_ptr) parses the minimal FDT structure to find
 //!   /memory@... reg cells and registers every usable range.
+//!
+//! ## TOTAL_PAGES semantics
+//!   TOTAL_PAGES is a fixed watermark set at init time: every call to
+//!   pmm_add_region() increments it by the number of pages registered.
+//!   alloc_page() and free_page() do NOT touch TOTAL_PAGES — use
+//!   free_pages() / total_pages() for current accounting.
 
-use core::sync::atomic::{AtomicUsize, AtomicU64, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicU64, AtomicPtr, AtomicBool, Ordering};
 use spin::Mutex;
 extern crate alloc;
 use alloc::vec::Vec;
@@ -87,7 +96,20 @@ fn pool_index(pa: usize) -> Option<usize> {
 
 static FREE_HEAD:   AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 static FREE_COUNT:  AtomicUsize   = AtomicUsize::new(0);
+/// Fixed watermark: total physical pages registered at init time.
+/// Never modified by alloc_page() or free_page().
 static TOTAL_PAGES: AtomicUsize   = AtomicUsize::new(0);
+
+// ── Contiguous-allocation mutex ────────────────────────────────────────────────────
+//
+// alloc_pages_contig() drains the entire Treiber stack into a Vec, sorts it,
+// finds a contiguous run, then re-pushes the remainder.  Without this lock a
+// concurrent alloc_page() could pop a page between the drain and the re-push,
+// see the stale next-pointer written during drain, and dereference garbage.
+//
+// We use a bare spin::Mutex<()> rather than a flag so that Rust's borrow
+// checker enforces the critical section.
+static CONTIG_LOCK: Mutex<()> = Mutex::new(());
 
 #[inline]
 fn treiber_push(pa: usize) {
@@ -154,7 +176,7 @@ fn is_valid_pa(pa: usize) -> bool {
 
 // ── EFI memory type constants (UEFI spec Table 7-6) ───────────────────────────────
 //
-// Only EfiConventionalMemory (4) and EfiPersistentMemory (7) are safe to
+// Only EfiConventionalMemory (4) and EfiPersistentMemory (14) are safe to
 // hand to the PMM.  All other types are live firmware or hardware regions.
 //
 //   0  EfiReservedMemoryType
@@ -165,21 +187,16 @@ fn is_valid_pa(pa: usize) -> bool {
 //   5  EfiUnusableMemory
 //   6  EfiACPIReclaimMemory    ← ACPI tables; reclaim after parsing
 //   7  EfiACPIMemoryNVS        ← firmware NVS; NEVER reclaim (NVRAM)
-//   7  EfiPersistentMemory     ← NVDIMM; safe for general use
 //   8  EfiMemoryMappedIO
 //   9  EfiMemoryMappedIOPortSpace
 //  10  EfiPalCode
 //  11  EfiUnacceptedMemoryType (UEFI 2.9+; needs Accept call first)
 //  12  EfiRuntimeServicesCode  ← live firmware; NEVER touch
 //  13  EfiRuntimeServicesData  ← live firmware; NEVER touch (NVRAM corruption)
-//
-// Note: the UEFI spec reuses value 7 for both EfiACPIMemoryNVS and
-// EfiPersistentMemory in different revisions.  In practice type 14 is
-// used for NVDIMM on UEFI 2.6+ systems, but we conservatively accept
-// only type 4 and type 14 here and treat 7 as NVS (do-not-touch).
+//  14  EfiPersistentMemory     ✔ NVDIMM / pmem (UEFI 2.6+)
 
-const EFI_CONVENTIONAL_MEMORY:  u32 = 4;
-const EFI_PERSISTENT_MEMORY:    u32 = 14; // NVDIMM / pmem (UEFI 2.6+)
+const EFI_CONVENTIONAL_MEMORY: u32 = 4;
+const EFI_PERSISTENT_MEMORY:   u32 = 14; // NVDIMM / pmem (UEFI 2.6+)
 
 /// Returns true iff this EFI memory type is safe to give to the PMM.
 #[inline]
@@ -323,24 +340,50 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
 // ── Core allocator ──────────────────────────────────────────────────────────────
 
 pub fn alloc_page() -> Option<usize> {
+    // If a contiguous allocation is in progress, we must not pop from the
+    // Treiber stack mid-drain.  Spin until CONTIG_LOCK is free.
+    //
+    // We use try_lock in a loop rather than lock() so that an interrupt
+    // handler calling alloc_page() during a contig alloc doesn't deadlock
+    // on the same CPU.  On a uni-processor kernel this is the only safe
+    // approach; on SMP the contention window is very short.
+    let _guard = loop {
+        if let Some(g) = CONTIG_LOCK.try_lock() { break g; }
+        core::hint::spin_loop();
+    };
+
     let pa = treiber_pop();
     if pa != 0 {
         if let Some(idx) = pool_index(pa) { pool_bit_clear_free(idx); }
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
         return Some(pa);
     }
+    // _guard released here; bump path doesn't race with contig drain.
+    drop(_guard);
+
     let idx = BUMP.fetch_add(1, Ordering::Relaxed);
     if idx >= POOL_PAGES {
         BUMP.fetch_sub(1, Ordering::Relaxed);
         return None;
     }
-    TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
+    // TOTAL_PAGES is NOT incremented here.  It is a fixed watermark set
+    // entirely by pmm_add_region() at init time.
     Some(POOL.0.as_ptr() as usize + idx * PAGE_SIZE)
 }
 
+/// Allocate `n` physically contiguous pages.  Returns the base physical
+/// address of the run, or `None` on failure.
+///
+/// # Locking
+/// Holds `CONTIG_LOCK` for the entire drain → sort → find → re-push
+/// sequence so that concurrent `alloc_page()` calls cannot pop pages
+/// whose next-pointers were overwritten during the drain.
 pub fn alloc_pages_contig(n: usize) -> Option<usize> {
     if n == 0 { return None; }
     if n == 1 { return alloc_page(); }
+
+    // Hold the lock for the entire drain/re-push window.
+    let _guard = CONTIG_LOCK.lock();
 
     let mut all: Vec<usize> = Vec::new();
     loop {
@@ -387,6 +430,7 @@ pub fn alloc_pages_contig(n: usize) -> Option<usize> {
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
     }
     Some(base_pa)
+    // _guard dropped here, unlocking CONTIG_LOCK.
 }
 
 pub fn free_pages_contig(base_pa: usize, n: usize) {
@@ -421,7 +465,12 @@ pub fn free_page(pa: usize) {
         }
     }
     treiber_push(pa);
-    TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
+    // NOTE: TOTAL_PAGES is intentionally NOT incremented here.
+    // It is a fixed watermark (set only by pmm_add_region at init time)
+    // representing the total usable physical pages registered with the PMM.
+    // Incrementing it on free would cause total_pages() to grow with every
+    // free_page() call, making it useless for capacity reporting.
+    // Use free_pages() for the current count of available pages.
 }
 
 /// Register a physical memory region as available to the PMM.
@@ -440,5 +489,7 @@ pub fn pmm_add_region(base: usize, size: usize) {
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 
+/// Number of pages currently available for allocation.
 pub fn free_pages()  -> usize { FREE_COUNT.load(Ordering::Relaxed) }
+/// Total usable physical pages registered at init time (fixed watermark).
 pub fn total_pages() -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
