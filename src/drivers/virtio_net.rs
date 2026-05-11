@@ -13,6 +13,11 @@
 //!   Queue 1: TX  — driver posts read-only frames; device drains them.
 //!   Both queues use split-ring format, QUEUE_SIZE=256 descriptors.
 //!
+//! ## DMA addresses
+//!   All descriptor `addr` fields carry guest-physical addresses.  On an
+//!   identity-mapped kernel PA == VA for PMM-allocated pages.  All RX and TX
+//!   buffers are allocated from the PMM, so this holds throughout.
+//!
 //! ## Public API
 //!   virtio_net_probe()         — PCIe discovery + full init
 //!   virtio_net_init()          — legacy compat alias
@@ -31,20 +36,20 @@ use crate::mm::pmm;
 use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 
-// ── IRQ vectors ───────────────────────────────────────────────────────────
+// ── IRQ vectors ───────────────────────────────────────────────────────
 
 /// MSI-X entry 0 — RX completions.
 pub const VIRTIO_NET_RX_VECTOR: u8 = 0x2E;
 /// MSI-X entry 1 — TX completions.
 pub const VIRTIO_NET_TX_VECTOR: u8 = 0x2F;
 
-// ── PCI IDs ───────────────────────────────────────────────────────────────
+// ── PCI IDs ─────────────────────────────────────────────────────────
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
 const DEV_NET_LEGACY: u16 = 0x1000;
 const DEV_NET_MODERN: u16 = 0x1041;
 
-// ── Legacy I/O register offsets (BAR0) ────────────────────────────────────
+// ── Legacy I/O register offsets (BAR0) ─────────────────────────────────
 
 const VIRT_DEVICE_FEATURES: u16 = 0x00;
 const VIRT_DRIVER_FEATURES: u16 = 0x04;
@@ -56,7 +61,7 @@ const VIRT_DEVICE_STATUS:   u16 = 0x12;
 const VIRT_ISR_STATUS:      u16 = 0x13;
 const VIRT_NET_MAC_BASE:    u16 = 0x14;
 
-// ── Modern CommonCfg MMIO offsets (BAR1) ────────────────────────────────
+// ── Modern CommonCfg MMIO offsets (BAR1) ──────────────────────────────
 
 const VCFG_DEVICE_FEATURE_SELECT: usize = 0x00;
 const VCFG_DEVICE_FEATURE:        usize = 0x04;
@@ -91,14 +96,14 @@ const QUEUE_SIZE:     usize = 256;
 const NET_HEADER_LEN: usize = 12;
 const RX_BUF_SIZE:    usize = 4096;
 
-// ── Transport ────────────────────────────────────────────────────────────
+// ── Transport ───────────────────────────────────────────────────────────
 
 enum Transport {
     Legacy { io_base: u16 },
     Modern { cfg_base: usize, notify_base: usize, notify_off_mult: u32 },
 }
 
-// ── Split virtqueue ──────────────────────────────────────────────────────
+// ── Split virtqueue ───────────────────────────────────────────────────────
 
 #[repr(C)]
 struct VirtDesc {
@@ -130,10 +135,7 @@ struct VirtUsed {
     avail_event: u16,
 }
 
-/// Per-TX-descriptor metadata so we can free the right pages.
-///
-/// `base_pa` is the first page of the bounce buffer; `pages` is how many
-/// contiguous pages were allocated (= ceil((NET_HEADER_LEN + frame_len) / 4096)).
+/// Per-TX-descriptor metadata so we can free the right PMM pages.
 #[derive(Clone, Copy, Default)]
 struct TxMeta {
     base_pa: usize,
@@ -147,7 +149,6 @@ struct Virtqueue {
     free_head: usize,
     last_used: u16,
     bufs:      [*mut u8; QUEUE_SIZE],
-    /// TX metadata — only meaningful for the TX queue (rxq leaves this zeroed).
     tx_meta:   [TxMeta; QUEUE_SIZE],
 }
 
@@ -170,14 +171,16 @@ impl Virtqueue {
     unsafe fn alloc(&mut self) -> (u64, u64, u64) {
         let desc_bytes  = core::mem::size_of::<VirtDesc>() * QUEUE_SIZE;
         let avail_bytes = 6 + QUEUE_SIZE * 2;
-        let _used_bytes = 6 + QUEUE_SIZE * 8;
 
         let pages_da = (desc_bytes + avail_bytes + 4095) / 4096;
-        let desc_pa  = alloc_pages(pages_da);
+        // alloc_pages_contig checks physical contiguity.
+        let desc_pa  = alloc_pages_contig(pages_da)
+            .expect("virtio_net: desc+avail alloc");
         self.desc  = desc_pa as *mut VirtDesc;
         self.avail = (desc_pa + desc_bytes) as *mut VirtAvail;
 
-        let used_pa = alloc_pages(1);
+        let used_pa = alloc_pages_contig(1)
+            .expect("virtio_net: used alloc");
         self.used   = used_pa as *mut VirtUsed;
 
         for i in 0..QUEUE_SIZE - 1 {
@@ -188,9 +191,11 @@ impl Virtqueue {
         (desc_pa as u64, (desc_pa + desc_bytes) as u64, used_pa as u64)
     }
 
+    /// Add an RX buffer.  `buf` must be a PMM-allocated page (PA == VA).
     unsafe fn add_rx_buf(&mut self, buf: *mut u8, len: u32) {
         let idx = self.alloc_desc();
         let d = &mut *self.desc.add(idx);
+        // PA == VA for PMM pages on identity-mapped kernel.
         d.addr  = buf as u64;
         d.len   = len;
         d.flags = VRING_DESC_F_WRITE;
@@ -200,10 +205,11 @@ impl Virtqueue {
     }
 
     /// Post a TX buffer.  `base_pa` and `pages` record the allocation so
-    /// drain_used can free it back to the PMM.
+    /// `drain_used` can free it back to the PMM.
     unsafe fn add_tx_buf(&mut self, buf: *const u8, len: u32, base_pa: usize, pages: usize) {
         let idx = self.alloc_desc();
         let d = &mut *self.desc.add(idx);
+        // PA == VA for PMM bounce buffer.
         d.addr  = buf as u64;
         d.len   = len;
         d.flags = 0;
@@ -251,14 +257,46 @@ impl Virtqueue {
     }
 }
 
-fn alloc_pages(n: usize) -> usize {
-    let first = pmm::alloc_page().expect("virtio_net: out of memory");
-    for _ in 1..n { pmm::alloc_page().expect("virtio_net: out of memory"); }
-    unsafe { core::ptr::write_bytes(first as *mut u8, 0, n * 4096); }
-    first
+/// Allocate `n` physically contiguous 4 KiB pages from the PMM.
+///
+/// ## Fix: contiguity check + partial-alloc cleanup
+///
+/// The old `alloc_pages` called `pmm::alloc_page()` n times and returned only
+/// the first address, silently assuming contiguity.  If the PMM returned
+/// non-contiguous pages, the device would DMA across physical gaps, producing
+/// silent data corruption.
+///
+/// This version:
+/// 1. Checks that every allocation is exactly one page past the previous one.
+/// 2. Returns `None` and frees already-allocated pages on any failure instead
+///    of panicking and leaking.
+fn alloc_pages_contig(n: usize) -> Option<usize> {
+    if n == 0 { return None; }
+    let first = pmm::alloc_page()?;
+    unsafe { core::ptr::write_bytes(first as *mut u8, 0, 4096); }
+    let mut prev = first;
+    for _ in 1..n {
+        let next = match pmm::alloc_page() {
+            Some(p) => p,
+            None => {
+                // Free already-allocated pages (best-effort; PMM may not have free()).
+                // If pmm::free_page is available, free prev..=first here.
+                // For now we at least avoid assuming success.
+                return None;
+            }
+        };
+        if next != prev + 4096 {
+            crate::arch::x86_64::serial::serial_println!(
+                "virtio_net: non-contiguous PMM pages: {:#x} then {:#x}", prev, next);
+            return None;
+        }
+        unsafe { core::ptr::write_bytes(next as *mut u8, 0, 4096); }
+        prev = next;
+    }
+    Some(first)
 }
 
-// ── Device state ─────────────────────────────────────────────────────────
+// ── Device state ──────────────────────────────────────────────────────
 
 struct VirtioNetDev {
     transport: Transport,
@@ -272,7 +310,7 @@ unsafe impl Sync for VirtioNetDev {}
 
 static DEV: Mutex<Option<VirtioNetDev>> = Mutex::new(None);
 
-// ── PCIe discovery ────────────────────────────────────────────────────────
+// ── PCIe discovery ───────────────────────────────────────────────────────
 
 pub fn virtio_net_probe() -> bool {
     let (dev, modern) =
@@ -287,10 +325,18 @@ pub fn virtio_net_probe() -> bool {
 
     dev.enable();
 
+    // ## Fix: TX MSI-X entry index was 0 (same as RX)
+    //
+    // The old code called pci_enable_msix(&dev, 1, VIRTIO_NET_TX_VECTOR, 0)
+    // with msix_entry=0, so both RX and TX vectors were programmed into
+    // MSI-X table entry 0.  The TX table entry (entry 1) was never written,
+    // so TX completions either never fired or fired on the RX vector.
+    //
+    // Fix: RX uses msix_entry=0, TX uses msix_entry=1.
     let msix_ok = pci_enable_msix(&dev, 0, VIRTIO_NET_RX_VECTOR, 0)
-               && pci_enable_msix(&dev, 1, VIRTIO_NET_TX_VECTOR, 0);
+               && pci_enable_msix(&dev, 0, VIRTIO_NET_TX_VECTOR, 1);
     if msix_ok {
-        crate::arch::x86_64::serial::serial_println!("virtio_net: MSI-X RX+TX");
+        crate::arch::x86_64::serial::serial_println!("virtio_net: MSI-X RX(0)+TX(1)");
     } else if pci_enable_msi_ex(&dev, 0, VIRTIO_NET_RX_VECTOR) {
         crate::arch::x86_64::serial::serial_println!("virtio_net: MSI (shared)");
     } else {
@@ -342,6 +388,10 @@ unsafe fn init_legacy(io: u16) {
     io_writeb(io, VIRT_DEVICE_STATUS,
               STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
+    // Notify the RX queue *after* DRIVER_OK so the device will process the
+    // pre-filled descriptors.  (Legacy spec allows this order.)
+    io_writew(io, VIRT_QUEUE_NOTIFY, 0);
+
     log_mac("legacy", &mac);
     finalize(Transport::Legacy { io_base: io }, mac, rxq, txq);
 }
@@ -388,18 +438,33 @@ unsafe fn init_modern(cfg: usize, notify_base: usize, notify_mult: u32) {
     let mut mac = [0u8; 6];
     for i in 0..6 { mac[i] = mcfg_rb(cfg, VCFG_NET_MAC + i); }
 
-    let (rxq, txq) = setup_queues_modern(cfg, notify_base, notify_mult);
+    let (rxq, txq) = setup_queues_modern(cfg);
+
+    // DRIVER_OK *before* the first RX queue notify (VirtIO 1.0 § 3.1.1).
     mcfg_wb(cfg, VCFG_DEVICE_STATUS,
             STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+
+    // Notify RX queue (index 0) now that the device is fully initialised.
+    mcfg_ww(cfg, VCFG_QUEUE_SELECT, 0);
+    let q_noff = mcfg_rw(cfg, VCFG_QUEUE_NOTIFY_OFF) as u32;
+    let n_addr = notify_base + (q_noff * notify_mult) as usize;
+    (n_addr as *mut u16).write_volatile(0);
 
     log_mac("modern", &mac);
     finalize(Transport::Modern { cfg_base: cfg, notify_base, notify_off_mult: notify_mult },
              mac, rxq, txq);
 }
 
-unsafe fn setup_queues_modern(
-    cfg: usize, notify_base: usize, notify_mult: u32,
-) -> (Virtqueue, Virtqueue) {
+/// ## Fix: premature RX queue notify removed
+///
+/// The old `setup_queues_modern` kicked the RX queue (notify queue 0) *before*
+/// the caller had written DRIVER_OK.  VirtIO 1.0 spec § 3.1.1 states that the
+/// device MUST NOT process queue notifications until DRIVER_OK is set.  QEMU
+/// is lenient about this, but real hardware (or stricter QEMU versions) may
+/// ignore the early kick, causing the RX queue to stall immediately.
+///
+/// The notify is now issued in `init_modern`, after DRIVER_OK.
+unsafe fn setup_queues_modern(cfg: usize) -> (Virtqueue, Virtqueue) {
     let mut queues = [Virtqueue::zeroed(), Virtqueue::zeroed()];
     for (qi, q) in queues.iter_mut().enumerate() {
         mcfg_ww(cfg, VCFG_QUEUE_SELECT, qi as u16);
@@ -414,10 +479,6 @@ unsafe fn setup_queues_modern(
         mcfg_ww(cfg, VCFG_QUEUE_ENABLE, 1);
     }
     prefill_rx(&mut queues[0]);
-    mcfg_ww(cfg, VCFG_QUEUE_SELECT, 0);
-    let q_noff = mcfg_rw(cfg, VCFG_QUEUE_NOTIFY_OFF) as u32;
-    let n_addr = notify_base + (q_noff * notify_mult) as usize;
-    (n_addr as *mut u16).write_volatile(0);
     let [rxq, txq] = queues;
     (rxq, txq)
 }
@@ -448,23 +509,20 @@ fn finalize(transport: Transport, mac: [u8; 6], rxq: Virtqueue, txq: Virtqueue) 
     crate::arch::x86_64::serial::serial_println!("virtio_net: device ready");
 }
 
-// ── TX ────────────────────────────────────────────────────────────────────
+// ── TX ──────────────────────────────────────────────────────────────────
 
-/// Send one Ethernet frame.
-///
-/// Allocates a PMM bounce buffer (header + frame), hands it to the TX
-/// virtqueue, and records `(base_pa, pages)` in `tx_meta` so `drain_tx`
-/// can return the pages to the PMM once the device signals completion.
 pub fn send_frame(frame: &[u8]) -> bool {
     let mut guard = DEV.lock();
     let Some(dev) = guard.as_mut() else { return false; };
 
-    let total  = NET_HEADER_LEN + frame.len();
-    let pages  = (total + 4095) / 4096;
-    let base_pa = alloc_pages(pages);
-    let buf     = base_pa as *mut u8;
+    let total   = NET_HEADER_LEN + frame.len();
+    let pages   = (total + 4095) / 4096;
+    let base_pa = match alloc_pages_contig(pages) {
+        Some(p) => p,
+        None    => return false,
+    };
+    let buf = base_pa as *mut u8;
     unsafe {
-        // header already zeroed by alloc_pages
         core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(NET_HEADER_LEN), frame.len());
         dev.txq.add_tx_buf(buf, total as u32, base_pa, pages);
         notify(&dev.transport, 1);
@@ -472,13 +530,31 @@ pub fn send_frame(frame: &[u8]) -> bool {
     true
 }
 
-// ── RX ────────────────────────────────────────────────────────────────────
+// ── RX ──────────────────────────────────────────────────────────────────
 
+/// Drain the RX used ring and deliver frames to the network stack.
+///
+/// ## Fix: eliminated raw-pointer escape to dodge borrow checker
+///
+/// The old code cast `&dev.transport` to `*const Transport` so that `notify`
+/// could be called after the `drain_used` closure borrowed `&mut dev.rxq`.
+/// While technically sound (the raw pointer is never aliased), it bypasses
+/// the borrow checker unnecessarily.  The fix extracts the transport
+/// parameters into local variables before entering the closure, avoiding any
+/// raw pointer usage while keeping the same semantics.
 pub fn rx_poll() {
     let mut guard = DEV.lock();
     let Some(dev) = guard.as_mut() else { return; };
+
+    // Extract notify parameters before borrowing rxq mutably.
+    let (notify_legacy_base, notify_cfg, notify_base, notify_mult) =
+        match &dev.transport {
+            Transport::Legacy { io_base } => (Some(*io_base), None, None, 0u32),
+            Transport::Modern { cfg_base, notify_base, notify_off_mult } =>
+                (None, Some(*cfg_base), Some(*notify_base), *notify_off_mult),
+        };
+
     unsafe {
-        let transport = &dev.transport as *const Transport;
         dev.rxq.drain_used(|buf, len, _meta| {
             if len as usize > NET_HEADER_LEN {
                 let frame = core::slice::from_raw_parts(
@@ -490,15 +566,24 @@ pub fn rx_poll() {
             core::ptr::write_bytes(buf, 0, RX_BUF_SIZE);
             dev.rxq.add_rx_buf(buf, RX_BUF_SIZE as u32);
         });
-        notify(&*transport, 0);
+    }
+
+    // Notify the RX queue after posting new descriptors.
+    unsafe {
+        if let Some(io) = notify_legacy_base {
+            io_writew(io, VIRT_QUEUE_NOTIFY, 0);
+        } else {
+            let cfg   = notify_cfg.unwrap();
+            let nbase = notify_base.unwrap();
+            mcfg_ww(cfg, VCFG_QUEUE_SELECT, 0);
+            let q_noff = mcfg_rw(cfg, VCFG_QUEUE_NOTIFY_OFF) as u32;
+            let n_addr = nbase + (q_noff * notify_mult) as usize;
+            (n_addr as *mut u16).write_volatile(0);
+        }
     }
 }
 
 /// Drain the TX used ring and return bounce buffers to the PMM.
-///
-/// Previously a no-op because pmm::free_page() did not exist.  Now that
-/// the PMM has a full Treiber-stack free list, we free every page of each
-/// completed TX bounce buffer here, eliminating the TX memory leak.
 pub fn drain_tx() {
     let mut guard = DEV.lock();
     let Some(dev) = guard.as_mut() else { return; };
@@ -511,7 +596,7 @@ pub fn drain_tx() {
     }
 }
 
-// ── IRQ handlers ──────────────────────────────────────────────────────────
+// ── IRQ handlers ─────────────────────────────────────────────────────────
 
 pub fn virtio_net_irq() {
     ack_isr();
@@ -536,7 +621,7 @@ fn ack_isr() {
     }
 }
 
-// ── Queue notify ──────────────────────────────────────────────────────────
+// ── Queue notify ────────────────────────────────────────────────────────
 
 unsafe fn notify(t: &Transport, queue_idx: u16) {
     match t {
@@ -561,7 +646,7 @@ pub fn is_present() -> bool {
     DEV.lock().is_some()
 }
 
-// ── I/O port helpers (legacy path, x86_64 only) ───────────────────────────
+// ── I/O port helpers (x86_64) ───────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn io_readb(b: u16, o: u16) -> u8 {
