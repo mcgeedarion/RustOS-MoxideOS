@@ -37,6 +37,13 @@ pub const IPPROTO_IPV6: i32 = 41;
 // IPV6 socket options
 pub const IPV6_V6ONLY: i32 = 26;
 
+// SOL_SOCKET level
+pub const SOL_SOCKET:   i32 = 1;
+pub const SO_REUSEADDR: i32 = 2;
+
+// IPPROTO_TCP level
+pub const TCP_NODELAY: i32 = 1;
+
 // ── Unified address type ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -128,7 +135,9 @@ pub struct Socket {
     pub local:       SockAddr,
     pub peer:        SockAddr,
     pub nonblocking: bool,
-    pub v6only:      bool,   // IPV6_V6ONLY — don't accept mapped IPv4
+    pub v6only:      bool,
+    pub reuseaddr:   bool,
+    pub nodelay:     bool,
 }
 
 impl Socket {
@@ -140,9 +149,10 @@ impl Socket {
             peer:        SockAddr::Unbound,
             nonblocking: false,
             v6only:      false,
+            reuseaddr:   false,
+            nodelay:     false,
         }
     }
-    // Compatibility shims used in legacy code paths.
     pub fn local_port(&self) -> u16  { self.local.port() }
     pub fn peer_ip4(&self) -> u32    { if let SockAddr::V4 { ip, .. } = self.peer { ip } else { 0 } }
     pub fn peer_port(&self) -> u16   { self.peer.port() }
@@ -150,9 +160,7 @@ impl Socket {
 
 // ── Global tables ─────────────────────────────────────────────────────────────
 
-/// Combined socket table (AF_INET, AF_INET6, AF_UNIX all share one table).
 pub static SOCKETS: Mutex<Vec<Option<Socket>>> = Mutex::new(Vec::new());
-/// Back-compat alias used by legacy udp demux code.
 pub use SOCKETS as UDP_SOCKETS;
 
 static UNIX_LISTENERS: Mutex<BTreeMap<String, UnixListener>> = Mutex::new(BTreeMap::new());
@@ -167,7 +175,6 @@ fn next_ephemeral() -> u16 {
 
 // ── sockaddr readers ──────────────────────────────────────────────────────────
 
-/// Read a `sockaddr_in` (16 bytes) from userspace.  Returns (port, ip).
 fn read_sockaddr_in(va: usize) -> Option<(u16, u32)> {
     let mut buf = [0u8; 16];
     crate::uaccess::copy_from_user(va, &mut buf).ok()?;
@@ -176,8 +183,6 @@ fn read_sockaddr_in(va: usize) -> Option<(u16, u32)> {
     Some((port, ip))
 }
 
-/// Read a `sockaddr_in6` (28 bytes) from userspace.
-/// Layout: sin6_family(2) + sin6_port(2) + sin6_flowinfo(4) + sin6_addr(16) + sin6_scope_id(4)
 fn read_sockaddr_in6(va: usize) -> Option<(u16, ipv6::Addr6, u32, u32)> {
     let mut buf = [0u8; 28];
     crate::uaccess::copy_from_user(va, &mut buf).ok()?;
@@ -188,7 +193,6 @@ fn read_sockaddr_in6(va: usize) -> Option<(u16, ipv6::Addr6, u32, u32)> {
     Some((port, ip, flowinfo, scope_id))
 }
 
-/// Write a `sockaddr_in` to userspace.
 fn write_sockaddr_in(va: usize, ip: u32, port: u16) {
     let mut addr = [0u8; 16];
     addr[1] = AF_INET as u8;
@@ -198,7 +202,6 @@ fn write_sockaddr_in(va: usize, ip: u32, port: u16) {
     let _ = crate::uaccess::copy_to_user(va, &addr);
 }
 
-/// Write a `sockaddr_in6` to userspace.
 fn write_sockaddr_in6(va: usize, ip: &ipv6::Addr6, port: u16, flowinfo: u32, scope_id: u32) {
     let mut buf = [0u8; 28];
     buf[1] = AF_INET6 as u8;
@@ -212,7 +215,6 @@ fn write_sockaddr_in6(va: usize, ip: &ipv6::Addr6, port: u16, flowinfo: u32, sco
 
 // ── UDP demultiplexers ────────────────────────────────────────────────────────
 
-/// Route an incoming IPv4 UDP datagram.
 pub fn demux_udp(src_ip: u32, src_port: u16, dst_port: u16, data: &[u8]) {
     if dst_port == crate::net::dhcp::DHCP_CLIENT_PORT {
         crate::net::dhcp::receive(src_ip, data);
@@ -233,7 +235,6 @@ pub fn demux_udp(src_ip: u32, src_port: u16, dst_port: u16, data: &[u8]) {
     }
 }
 
-/// Route an incoming IPv6 UDP datagram.
 pub fn demux_udp6(src_ip: &ipv6::Addr6, src_port: u16, dst_port: u16, data: &[u8]) {
     let mut table = SOCKETS.lock();
     for slot in table.iter_mut() {
@@ -265,14 +266,14 @@ fn alloc_slot(table: &mut Vec<Option<Socket>>, s: Socket) -> usize {
 pub fn sys_socket(domain: i32, kind: i32, proto: i32) -> isize {
     match domain {
         d if d == AF_INET || d == AF_INET6 || d == AF_UNIX => {}
-        _ => return -97, // EAFNOSUPPORT
+        _ => return -97,
     }
     match kind & 0xF {
         k if k == SOCK_STREAM || k == SOCK_DGRAM => {}
-        _ => return -22, // EINVAL
+        _ => return -22,
     }
     let mut sock = Socket::new(domain, kind & 0xF, proto);
-    sock.nonblocking = (kind & 0x800) != 0; // SOCK_NONBLOCK
+    sock.nonblocking = (kind & 0x800) != 0;
     let mut table = SOCKETS.lock();
     alloc_slot(&mut table, sock) as isize
 }
@@ -310,6 +311,18 @@ pub fn sys_bind(sock_idx: usize, addr_va: usize, addrlen: u32) -> isize {
             let (port, ip) = match read_sockaddr_in(addr_va) {
                 Some(v) => v, None => return -14,
             };
+            // Reject duplicate binds unless SO_REUSEADDR is set on this socket.
+            let reuseaddr = sock.reuseaddr;
+            if port != 0 && !reuseaddr {
+                for (i, slot) in table.iter().enumerate() {
+                    if i == sock_idx { continue; }
+                    if let Some(other) = slot {
+                        if other.local.port() == port && other.domain == AF_INET {
+                            return -98; // EADDRINUSE
+                        }
+                    }
+                }
+            }
             sock.local = SockAddr::V4 { ip, port };
             if sock.kind == SOCK_DGRAM {
                 sock.state = SocketState::Udp4 { local_port: port, rx_queue: VecDeque::new() };
@@ -321,6 +334,17 @@ pub fn sys_bind(sock_idx: usize, addr_va: usize, addrlen: u32) -> isize {
             let (port, ip, flowinfo, scope_id) = match read_sockaddr_in6(addr_va) {
                 Some(v) => v, None => return -14,
             };
+            let reuseaddr = sock.reuseaddr;
+            if port != 0 && !reuseaddr {
+                for (i, slot) in table.iter().enumerate() {
+                    if i == sock_idx { continue; }
+                    if let Some(other) = slot {
+                        if other.local.port() == port && other.domain == AF_INET6 {
+                            return -98;
+                        }
+                    }
+                }
+            }
             sock.local = SockAddr::V6 { ip, port, flowinfo, scope_id };
             if sock.kind == SOCK_DGRAM {
                 sock.state = SocketState::Udp6 { local_port: port, rx_queue: VecDeque::new() };
@@ -383,6 +407,7 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
                             state: SocketState::UnixConn(server_conn),
                             local: SockAddr::Unbound, peer: SockAddr::Unbound,
                             nonblocking: false, v6only: false,
+                            reuseaddr: false, nodelay: false,
                         };
                         let new_idx = alloc_slot(&mut SOCKETS.lock(), new_sock);
                         if addr_va != 0 {
@@ -418,6 +443,7 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
                 local: SockAddr::Unbound,
                 peer:  SockAddr::V4 { ip: peer_ip, port: peer_port },
                 nonblocking: false, v6only: false,
+                reuseaddr: false, nodelay: false,
             };
             let new_idx = alloc_slot(&mut SOCKETS.lock(), new_sock);
             if addr_va != 0 {
@@ -469,12 +495,35 @@ pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
             let (port, dst_ip) = match read_sockaddr_in(addr_va) {
                 Some(v) => v, None => return -14,
             };
-            let kind = SOCKETS.lock().get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.kind).unwrap_or(-1);
+            let (kind, nb) = {
+                let t = SOCKETS.lock();
+                let s = t.get(sock_idx).and_then(|s| s.as_ref());
+                (s.map(|s| s.kind).unwrap_or(-1), s.map(|s| s.nonblocking).unwrap_or(false))
+            };
             if kind == SOCK_STREAM {
                 let src_port = next_ephemeral();
                 let conn_idx = match crate::net::tcp::connect(dst_ip, port, src_port) {
                     Ok(i) => i, Err(e) => return e,
                 };
+                if nb {
+                    // Nonblocking: stash state and return EINPROGRESS.
+                    let mut table = SOCKETS.lock();
+                    if let Some(Some(sock)) = table.get_mut(sock_idx) {
+                        sock.state = SocketState::TcpActive { conn_idx };
+                        sock.local = SockAddr::V4 { ip: ip::our_ip(), port: src_port };
+                        sock.peer  = SockAddr::V4 { ip: dst_ip, port };
+                    }
+                    return -115; // EINPROGRESS
+                }
+                // Blocking: spin until handshake completes.
+                loop {
+                    match crate::net::tcp::conn_state(conn_idx) {
+                        Some(crate::net::tcp::TcpState::Established) => break,
+                        Some(crate::net::tcp::TcpState::Closed)      => return -111, // ECONNREFUSED
+                        _ => {}
+                    }
+                    crate::proc::scheduler::yield_now();
+                }
                 let mut table = SOCKETS.lock();
                 if let Some(Some(sock)) = table.get_mut(sock_idx) {
                     sock.state = SocketState::TcpActive { conn_idx };
@@ -504,7 +553,6 @@ pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
             };
             let kind = SOCKETS.lock().get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.kind).unwrap_or(-1);
             if kind == SOCK_STREAM {
-                // TCP over IPv6 — stub until tcp6 module is added.
                 return -38; // ENOSYS
             }
             if kind == SOCK_DGRAM {
@@ -588,7 +636,7 @@ pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, _flags: i32,
             len as isize
         }
 
-        _ => -107, // ENOTCONN
+        _ => -107,
     }
 }
 
@@ -741,30 +789,67 @@ pub fn sys_getpeername(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> i
 
 pub fn sys_setsockopt(sock_idx: usize, level: i32, opt: i32,
                       optval_va: usize, optlen: u32) -> isize {
+    let mut v32 = [0u8; 4];
+    let val = if optlen >= 4 && crate::uaccess::copy_from_user(optval_va, &mut v32).is_ok() {
+        Some(u32::from_ne_bytes(v32))
+    } else {
+        None
+    };
+
     let mut table = SOCKETS.lock();
     let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) { Some(s) => s, None => return -9 };
+
     match (level, opt) {
-        (_, 0x8004) if optlen >= 4 => {
-            let mut v = [0u8; 4];
-            if crate::uaccess::copy_from_user(optval_va, &mut v).is_ok() {
-                sock.nonblocking = u32::from_ne_bytes(v) != 0;
+        // FIONBIO / nonblocking flag
+        (_, 0x8004) => {
+            if let Some(v) = val { sock.nonblocking = v != 0; }
+        }
+        // SOL_SOCKET
+        (l, o) if l == SOL_SOCKET && o == SO_REUSEADDR => {
+            if let Some(v) = val { sock.reuseaddr = v != 0; }
+        }
+        // IPPROTO_TCP — TCP_NODELAY
+        (l, o) if l == IPPROTO_TCP && o == TCP_NODELAY => {
+            if let Some(v) = val { sock.nodelay = v != 0; }
+            // Propagate to live connection immediately.
+            if let SocketState::TcpActive { conn_idx } = sock.state {
+                let idx = conn_idx;
+                let nd  = sock.nodelay;
+                drop(table);
+                crate::net::tcp::set_nodelay(idx, nd);
+                return 0;
             }
         }
+        // IPPROTO_IPV6
         (l, o) if l == IPPROTO_IPV6 && o == IPV6_V6ONLY => {
-            if optlen >= 4 {
-                let mut v = [0u8; 4];
-                if crate::uaccess::copy_from_user(optval_va, &mut v).is_ok() {
-                    sock.v6only = u32::from_ne_bytes(v) != 0;
-                }
-            }
+            if let Some(v) = val { sock.v6only = v != 0; }
         }
         _ => {}
     }
     0
 }
 
-pub fn sys_getsockopt(_sock_idx: usize, _level: i32, _opt: i32,
-                      _optval_va: usize, _optlen_va: usize) -> isize { 0 }
+pub fn sys_getsockopt(sock_idx: usize, level: i32, opt: i32,
+                      optval_va: usize, optlen_va: usize) -> isize {
+    let table = SOCKETS.lock();
+    let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) { Some(s) => s, None => return -9 };
+
+    let value: u32 = match (level, opt) {
+        (_, 0x8004)                                     => sock.nonblocking as u32,
+        (l, o) if l == SOL_SOCKET   && o == SO_REUSEADDR => sock.reuseaddr as u32,
+        (l, o) if l == IPPROTO_TCP  && o == TCP_NODELAY  => sock.nodelay   as u32,
+        (l, o) if l == IPPROTO_IPV6 && o == IPV6_V6ONLY  => sock.v6only   as u32,
+        _ => return 0,
+    };
+    drop(table);
+    if optval_va != 0 {
+        let _ = crate::uaccess::copy_to_user(optval_va, &value.to_ne_bytes());
+    }
+    if optlen_va != 0 {
+        let _ = crate::uaccess::copy_to_user(optlen_va, &4u32.to_ne_bytes());
+    }
+    0
+}
 
 // ── sys_close_socket ─────────────────────────────────────────────────────────
 
@@ -846,6 +931,7 @@ pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isiz
             state: SocketState::UnixConn(conn),
             local: SockAddr::Unbound, peer: SockAddr::Unbound,
             nonblocking: (kind & 0x800) != 0, v6only: false,
+            reuseaddr: false, nodelay: false,
         }
     };
     let mut table = SOCKETS.lock();
@@ -929,4 +1015,10 @@ pub fn sys_recvmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
     let mut raw = [0u8; core::mem::size_of::<UserMsghdr>()];
     if crate::uaccess::copy_from_user(msg_va, &mut raw).is_err() { return -14; }
     let hdr: UserMsghdr = unsafe { core::mem::transmute(raw) };
-  
+    let mut kbuf = alloc::vec![0u8; 65536];
+    let n = sys_recvfrom(sock_idx, kbuf.as_mut_ptr() as usize, kbuf.len(), flags,
+                         hdr.msg_name, hdr.msg_namelen as usize);
+    if n <= 0 { return n; }
+    let written = scatter_iovec(hdr.msg_iov, hdr.msg_iovlen, &kbuf[..n as usize]);
+    written as isize
+}

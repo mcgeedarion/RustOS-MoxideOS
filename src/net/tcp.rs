@@ -6,6 +6,7 @@
 //!   Retransmit timeout (simple fixed 200 ms)
 //!   FIN / RST teardown
 //!   Listen backlog queue
+//!   TCP_NODELAY: skip Nagle coalescing when set
 
 extern crate alloc;
 
@@ -64,6 +65,9 @@ pub struct TcpConn {
     pub unacked: Vec<(u32, Vec<u8>)>,
 
     pub backlog: VecDeque<TcpConn>,
+
+    /// When true, bypass Nagle: send immediately regardless of segment size.
+    pub nodelay: bool,
 }
 
 impl TcpConn {
@@ -78,6 +82,7 @@ impl TcpConn {
             tx_buf:  VecDeque::new(),
             unacked: Vec::new(),
             backlog: VecDeque::new(),
+            nodelay: false,
         }
     }
 }
@@ -281,15 +286,9 @@ fn is_between(lo: u32, x: u32, hi: u32) -> bool {
     else        { lo <= x || x < hi }
 }
 
-// ── Public API (used by socket layer) ─────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
-/// Open an active TCP connection.
-///
-/// **Argument order**: `connect(dst_ip, dst_port, src_port)` — matches
-/// how `socket.rs` calls it.  The old signature had `(local_port, remote_ip,
-/// remote_port)` which was inconsistent; fixed here.
-///
-/// Returns `Ok(conn_idx)` or `Err(negative_errno)` on failure.
+/// Start an active TCP connection; returns connection index.
 pub fn connect(dst_ip: u32, dst_port: u16, src_port: u16) -> Result<usize, isize> {
     let our_ip = ip::our_ip();
     let isn    = crate::rand::rand32();
@@ -308,7 +307,19 @@ pub fn connect(dst_ip: u32, dst_port: u16, src_port: u16) -> Result<usize, isize
     Ok(conns.len() - 1)
 }
 
-/// Bind a listening socket and return its connection-table index.
+/// Return the current TCP state for `idx` (used by blocking connect).
+pub fn conn_state(idx: usize) -> Option<TcpState> {
+    TCP_CONNS.lock().get(idx).map(|c| c.state)
+}
+
+/// Enable or disable TCP_NODELAY on an existing connection.
+pub fn set_nodelay(idx: usize, enabled: bool) {
+    if let Some(c) = TCP_CONNS.lock().get_mut(idx) {
+        c.nodelay = enabled;
+    }
+}
+
+/// Create a passive listening entry; returns its index.
 pub fn listen(local_port: u16) -> usize {
     let mut c = TcpConn::new();
     c.state      = TcpState::Listen;
@@ -319,68 +330,69 @@ pub fn listen(local_port: u16) -> usize {
     conns.len() - 1
 }
 
-/// Accept the next fully-established connection from a listen socket's backlog.
+/// Pop the next fully-established connection from a listener's backlog.
 pub fn accept(listen_idx: usize) -> Option<usize> {
     let mut conns = TCP_CONNS.lock();
-    if let Some(conn) = conns.get_mut(listen_idx) {
-        let pos = conn.backlog.iter().position(|c| c.state == TcpState::Established);
-        if let Some(p) = pos {
-            let accepted = conn.backlog.remove(p).unwrap();
-            conns.push(accepted);
-            return Some(conns.len() - 1);
-        }
-    }
-    None
+    let pos = conns.get(listen_idx)?.backlog
+        .iter().position(|c| c.state == TcpState::Established)?;
+    let accepted = conns[listen_idx].backlog.remove(pos).unwrap();
+    conns.push(accepted);
+    Some(conns.len() - 1)
 }
 
-/// Return `(remote_ip, remote_port)` for a connection — used by `sys_accept`.
+/// Return `(remote_ip, remote_port)` for a connection.
 pub fn peer_addr(idx: usize) -> (u32, u16) {
-    TCP_CONNS.lock()
-        .get(idx)
+    TCP_CONNS.lock().get(idx)
         .map(|c| (c.remote_ip, c.remote_port))
         .unwrap_or((0, 0))
 }
 
-/// Send data on an established connection (write + flush).
-/// Matches the `tcp::send(idx, &buf) -> isize` call in `socket.rs`.
+/// Write data to the TX buffer and immediately flush.
 pub fn send(idx: usize, data: &[u8]) -> isize {
     let n = write(idx, data);
     if n > 0 { flush(idx); }
     n
 }
 
-/// Read up to `buf.len()` bytes from the RX buffer.
-/// Matches the `tcp::recv(idx, &mut buf) -> isize` call in `socket.rs`.
+/// Drain up to `buf.len()` bytes from the RX buffer.
 pub fn recv(idx: usize, buf: &mut [u8]) -> isize {
     read(idx, buf)
 }
 
-/// Return true if received data is available (alias used by `socket::socket_poll`).
-/// `socket.rs` calls `tcp::rx_available(conn_idx)`.
+/// True if there is data in the RX buffer.
 pub fn rx_available(idx: usize) -> bool {
-    rx_ready(idx)
+    TCP_CONNS.lock().get(idx).map(|c| !c.rx_buf.is_empty()).unwrap_or(false)
 }
 
-/// Write data to a connection's TX buffer (does not flush).
+/// Append to TX buffer without flushing.
 pub fn write(idx: usize, data: &[u8]) -> isize {
     let mut conns = TCP_CONNS.lock();
-    if let Some(c) = conns.get_mut(idx) {
-        if c.state != TcpState::Established { return -104; }
-        c.tx_buf.extend(data.iter().copied());
-        return data.len() as isize;
+    match conns.get_mut(idx) {
+        Some(c) if c.state == TcpState::Established => {
+            c.tx_buf.extend(data.iter().copied());
+            data.len() as isize
+        }
+        Some(_) => -104, // ECONNRESET
+        None    => -9,   // EBADF
     }
-    -9
 }
 
-/// Flush all pending TX data as MSS-sized segments.
+/// Transmit all pending TX data.
+/// With TCP_NODELAY each write is flushed immediately regardless of size.
+/// Without it, data is coalesced into MSS-sized (1460 B) segments.
 pub fn flush(idx: usize) {
     let our_ip = ip::our_ip();
     let mut conns = TCP_CONNS.lock();
     if let Some(c) = conns.get_mut(idx) {
         if c.state != TcpState::Established { return; }
-        let mss = 1460usize;
+        const MSS: usize = 1460;
         while !c.tx_buf.is_empty() {
-            let n = c.tx_buf.len().min(mss).min(c.snd_wnd as usize);
+            let limit = if c.nodelay {
+                c.tx_buf.len()              // send everything at once
+            } else {
+                MSS                          // coalesce up to one MSS
+            };
+            let n = limit.min(c.snd_wnd as usize);
             if n == 0 { break; }
             let chunk: Vec<u8> = c.tx_buf.drain(..n).collect();
             send_segment(our_ip, c.local_port, c.remote_ip, c.remote_port,
@@ -391,18 +403,20 @@ pub fn flush(idx: usize) {
     }
 }
 
-/// Read up to `buf.len()` bytes from the RX ring buffer.
+/// Drain up to `buf.len()` bytes from the RX ring buffer.
 pub fn read(idx: usize, buf: &mut [u8]) -> isize {
     let mut conns = TCP_CONNS.lock();
-    if let Some(c) = conns.get_mut(idx) {
-        let n = c.rx_buf.len().min(buf.len());
-        for (i, b) in c.rx_buf.drain(..n).enumerate() { buf[i] = b; }
-        return n as isize;
+    match conns.get_mut(idx) {
+        Some(c) => {
+            let n = c.rx_buf.len().min(buf.len());
+            for (i, b) in c.rx_buf.drain(..n).enumerate() { buf[i] = b; }
+            n as isize
+        }
+        None => -9,
     }
-    -9
 }
 
-/// Initiate graceful TCP close (send FIN).
+/// Initiate graceful close (FIN).
 pub fn close(idx: usize) {
     let our_ip = ip::our_ip();
     let mut conns = TCP_CONNS.lock();
@@ -425,14 +439,16 @@ pub fn close(idx: usize) {
     }
 }
 
-/// True if RX data is available on `idx`.
-pub fn rx_ready(idx: usize) -> bool {
-    TCP_CONNS.lock().get(idx).map(|c| !c.rx_buf.is_empty()).unwrap_or(false)
-}
-
-/// True if the connection is writable and the remote window is open.
-pub fn tx_ready(idx: usize) -> bool {
-    TCP_CONNS.lock().get(idx)
-        .map(|c| c.state == TcpState::Established && c.snd_wnd > 0)
-        .unwrap_or(false)
+/// Retransmit all unacknowledged segments.
+/// Call from a periodic timer interrupt (e.g. every 200 ms).
+pub fn tick_retransmit() {
+    let our_ip = ip::our_ip();
+    let conns = TCP_CONNS.lock();
+    for c in conns.iter() {
+        if c.state != TcpState::Established { continue; }
+        for (seq, data) in &c.unacked {
+            send_segment(our_ip, c.local_port, c.remote_ip, c.remote_port,
+                *seq, c.rcv_nxt, PSH | ACK, c.rcv_wnd, data);
+        }
+    }
 }
