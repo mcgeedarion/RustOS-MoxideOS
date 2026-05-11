@@ -18,29 +18,35 @@
 //!  10. Create IO Completion Queue (Admin cmd 0x05)
 //!  11. Create IO Submission Queue (Admin cmd 0x01)
 //!
-//! ## Register map (BAR0 offsets)
-//!   0x000  CAP    (u64)  Controller Capabilities
-//!   0x008  VS     (u32)  Version
-//!   0x014  INTMS  (u32)  Interrupt Mask Set
-//!   0x018  INTMC  (u32)  Interrupt Mask Clear
-//!   0x01C  CC     (u32)  Controller Configuration
-//!   0x01C  CSTS   (u32)  Controller Status  (offset 0x01C + 4 = 0x020)
-//!   0x024  AQA    (u32)  Admin Queue Attributes
-//!   0x028  ASQ    (u64)  Admin Submission Queue Base Address
-//!   0x030  ACQ    (u64)  Admin Completion Queue Base Address
-//!   0x1000 SQ0TDB (u32)  Admin SQ tail doorbell  (stride = 4 << CAP.DSTRD)
-//!   0x1004 CQ0HDB (u32)  Admin CQ head doorbell
-//!   0x1008 SQ1TDB (u32)  IO SQ tail doorbell
-//!   0x100C CQ1HDB (u32)  IO CQ head doorbell
+//! ## PRP physical addresses
+//!
+//! NVMe PRPs are *physical* addresses — the controller performs DMA using the
+//! host physical address space.  All buffers passed to nvme_read/nvme_write
+//! must be described by their physical address, not their virtual address.
+//!
+//! For kernel-mode callers with identity-mapped memory the two are the same,
+//! but for any future higher-half or non-identity mapping the distinction
+//! matters.  The public API therefore takes a `u64 buf_pa` (physical address)
+//! rather than a raw pointer, forcing the caller to perform the VA→PA
+//! translation (typically via `virt_to_phys()`).
+//!
+//! Internal DMA scratch buffers (alloc_page) come from the PMM which returns
+//! physical addresses directly, so those paths are always correct.
 //!
 //! ## sfence vs mfence in the submit path
 //!
 //! The NVMe spec requires that all SQE stores are visible to the device
-//! before the doorbell write.  This ordering only involves *stores* — there
-//! is no requirement to order loads before the doorbell.  `mfence` (a full
-//! store+load barrier, ~100 cycles on modern Intel) is therefore stronger
-//! than necessary.  `sfence` (store-only barrier, ~1 cycle) is sufficient
-//! and is what Linux and other production NVMe drivers use.
+//! before the doorbell write.  Only *store* ordering is required.
+//! `sfence` (store-only barrier, ~1 cycle) is sufficient and is what Linux
+//! and other production NVMe drivers use.  `mfence` (~100 cycles) is
+//! unnecessarily expensive.
+//!
+//! ## poll() load ordering
+//!
+//! `poll()` uses `read_volatile` for the CQE, which includes a compiler
+//! barrier.  On x86_64 loads are strongly ordered (TSO) so no `lfence` is
+//! required.  On RISC-V (weak ordering) a `fence r,r` is emitted before
+//! reading each CQE to prevent speculative hoisting of the load.
 
 extern crate alloc;
 use alloc::string::String;
@@ -81,13 +87,10 @@ const CC_CQS_16:   u32 = 4 << 20;
 const CSTS_RDY:   u32 = 1 << 0;
 const CSTS_CFS:   u32 = 1 << 1;
 
-const ADMIN_DELETE_IO_SQ:  u8 = 0x00;
 const ADMIN_CREATE_IO_SQ:  u8 = 0x01;
-const ADMIN_DELETE_IO_CQ:  u8 = 0x04;
 const ADMIN_CREATE_IO_CQ:  u8 = 0x05;
 const ADMIN_IDENTIFY:      u8 = 0x06;
 
-const NVM_FLUSH:  u8 = 0x00;
 const NVM_WRITE:  u8 = 0x01;
 const NVM_READ:   u8 = 0x02;
 
@@ -128,22 +131,22 @@ struct Cqe {
 }
 
 impl Cqe {
-    #[inline] fn phase(&self) -> bool  { self.dw3 & (1 << 16) != 0 }
-    #[inline] fn status(&self) -> u16  { ((self.dw3 >> 17) & 0x7FFF) as u16 }
-    #[inline] fn cid(&self)   -> u16  { (self.dw3 & 0xFFFF) as u16 }
+    #[inline] fn phase(&self) -> bool { self.dw3 & (1 << 16) != 0 }
+    #[inline] fn status(&self) -> u16 { ((self.dw3 >> 17) & 0x7FFF) as u16 }
+    #[inline] fn cid(&self)   -> u16 { (self.dw3 & 0xFFFF) as u16 }
 }
 
 // ── Queue pair ────────────────────────────────────────────────────────────
 
 struct Queue {
-    sq_base: u64,
-    cq_base: u64,
-    sq_tail: u32,
-    cq_head: u32,
+    sq_base:  u64,
+    cq_base:  u64,
+    sq_tail:  u32,
+    cq_head:  u32,
     cq_phase: bool,
     next_cid: u16,
-    sq_db: *mut u32,
-    cq_db: *mut u32,
+    sq_db:    *mut u32,
+    cq_db:    *mut u32,
 }
 
 unsafe impl Send for Queue {}
@@ -160,11 +163,11 @@ impl Queue {
         }
     }
 
-    /// Submit a pre-filled SQE, ring the tail doorbell.
+    /// Submit a pre-filled SQE and ring the tail doorbell.
     ///
     /// Uses `sfence` (not `mfence`) to order the SQE stores before the
     /// doorbell write.  Only store ordering is required by the NVMe spec;
-    /// `mfence` (~100 cycles) is unnecessarily expensive here.
+    /// `sfence` (~1 cycle) vs `mfence` (~100 cycles).
     unsafe fn submit(&mut self, mut sqe: Sqe) -> u16 {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1).max(1);
@@ -173,11 +176,10 @@ impl Queue {
         let slot = (self.sq_base as *mut Sqe).add(self.sq_tail as usize);
         core::ptr::write_volatile(slot, sqe);
 
-        // sfence: ensure all SQE stores are globally visible before the
-        // doorbell write.  Store-only barrier; ~1 cycle on modern Intel.
+        // sfence: all SQE stores must be globally visible before doorbell.
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("sfence", options(nostack, preserves_flags));
-        // On RISC-V use a store fence (fence w,w).
+        // RISC-V: store fence (fence w,w).
         #[cfg(target_arch = "riscv64")]
         core::arch::asm!("fence w,w", options(nostack));
 
@@ -186,8 +188,21 @@ impl Queue {
         cid
     }
 
+    /// Poll for a specific CQE by `cid`.  Returns the NVMe status field
+    /// (0 = success, 0xFFFF = timeout).
+    ///
+    /// ## Load ordering
+    ///
+    /// x86_64: TSO guarantees load ordering; no lfence needed.
+    /// RISC-V: emit `fence r,r` before each CQE read to prevent the CPU
+    /// from speculating the load above a prior store (e.g. the doorbell
+    /// write that produced this completion).
     unsafe fn poll(&mut self, cid: u16, retries: usize) -> u16 {
         for _ in 0..retries {
+            // RISC-V: acquire load ordering before reading CQE.
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!("fence r,r", options(nostack));
+
             let slot = (self.cq_base as *mut Cqe).add(self.cq_head as usize);
             let cqe = core::ptr::read_volatile(slot);
             if cqe.phase() == self.cq_phase && cqe.cid() == cid {
@@ -197,13 +212,19 @@ impl Queue {
                 core::ptr::write_volatile(self.cq_db, self.cq_head);
                 return status;
             }
+            #[cfg(target_arch = "x86_64")]
             core::arch::asm!("pause", options(nomem, nostack));
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!("wfi", options(nomem, nostack));
         }
         0xFFFF
     }
 
     unsafe fn drain(&mut self) {
         loop {
+            #[cfg(target_arch = "riscv64")]
+            core::arch::asm!("fence r,r", options(nostack));
+
             let slot = (self.cq_base as *mut Cqe).add(self.cq_head as usize);
             let cqe = core::ptr::read_volatile(slot);
             if cqe.phase() != self.cq_phase { break; }
@@ -217,13 +238,13 @@ impl Queue {
 // ── Controller state ──────────────────────────────────────────────────────
 
 struct NvmeCtrl {
-    bar0:       u64,
-    db_stride:  u64,
-    admin:      Queue,
-    io:         Queue,
-    ns_size:    u64,
-    lba_shift:  u32,
-    ready:      bool,
+    bar0:      u64,
+    db_stride: u64,
+    admin:     Queue,
+    io:        Queue,
+    ns_size:   u64,
+    lba_shift: u32,
+    ready:     bool,
 }
 
 unsafe impl Send for NvmeCtrl {}
@@ -256,11 +277,17 @@ impl NvmeCtrl {
         (self.bar0 + NVME_DOORBELL_BASE + idx as u64 * self.db_stride) as *mut u32
     }
 
+    /// Allocate and zero a 4 KiB page.  Returns the **physical** address.
+    ///
+    /// # Panics
+    /// Panics if the PMM is out of memory.  All internal NVMe DMA buffers
+    /// are allocated at init time, so OOM here is a fatal boot error.
     fn alloc_page() -> u64 {
-        let pa = pmm::alloc_page();
-        assert!(pa != 0, "nvme: PMM out of memory");
+        let pa = pmm::alloc_page()
+            .expect("nvme: PMM out of memory during init");
+        // Zero the page through the physical alias (identity-mapped kernel).
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
-        pa
+        pa as u64
     }
 
     unsafe fn reset(&mut self) -> bool {
@@ -323,7 +350,7 @@ impl NvmeCtrl {
         let sqe = Sqe {
             cdw0:  ADMIN_IDENTIFY as u32,
             nsid:  0,
-            prp1:  buf_pa,
+            prp1:  buf_pa,  // physical address — correct for DMA
             prp2:  0,
             cdw10: CNS_CONTROLLER as u32,
             ..Default::default()
@@ -331,6 +358,7 @@ impl NvmeCtrl {
         let status = self.admin_cmd(sqe);
         let mut model = String::new();
         if status == 0 {
+            // Read response through the physical alias (identity-mapped).
             let ptr = buf_pa as *const u8;
             for i in 24..64usize {
                 let b = core::ptr::read_volatile(ptr.add(i));
@@ -338,7 +366,7 @@ impl NvmeCtrl {
                 model.push(b as char);
             }
         }
-        pmm::free_page(buf_pa);
+        pmm::free_page(buf_pa as usize);
         model
     }
 
@@ -347,27 +375,34 @@ impl NvmeCtrl {
         let sqe = Sqe {
             cdw0:  ADMIN_IDENTIFY as u32,
             nsid:  1,
-            prp1:  buf_pa,
+            prp1:  buf_pa,  // physical address — correct for DMA
             prp2:  0,
             cdw10: CNS_NAMESPACE as u32,
             ..Default::default()
         };
         let status = self.admin_cmd(sqe);
         if status == 0 {
-            let ptr = buf_pa as *const u64;
-            self.ns_size = core::ptr::read_volatile(ptr);
-            let flbas = core::ptr::read_volatile((buf_pa + 26) as *const u8) & 0xF;
-            let lbaf_off = 128 + flbas as u64 * 4;
-            let lbaf = core::ptr::read_volatile((buf_pa + lbaf_off) as *const u32);
+            // NSZE: bytes 0-7 of Identify Namespace data (physical alias).
+            let ptr = buf_pa as *const u8;
+            self.ns_size = core::ptr::read_volatile(ptr as *const u64);
+
+            // FLBAS: byte 26, lower 4 bits = active LBA format index.
+            let flbas = core::ptr::read_volatile(ptr.add(26)) & 0xF;
+
+            // LBAFn: at offset 128 + n*4.  Each entry is 4 bytes; bits[23:16]
+            // hold the LBADS (log2 of sector size).
+            let lbaf_off = 128usize + flbas as usize * 4;
+            // Guard: lbaf_off max = 128 + 15*4 = 188; well within 4096 bytes.
+            let lbaf = core::ptr::read_volatile(ptr.add(lbaf_off) as *const u32);
             self.lba_shift = (lbaf >> 16) & 0xFF;
             if self.lba_shift == 0 { self.lba_shift = 9; }
         }
-        pmm::free_page(buf_pa);
+        pmm::free_page(buf_pa as usize);
     }
 
     unsafe fn create_io_cq(&mut self, cq_pa: u64) -> bool {
         let cdw10: u32 = 1 | (((QUEUE_DEPTH - 1) as u32) << 16);
-        let cdw11: u32 = 1 | (1 << 1);
+        let cdw11: u32 = 1 | (1 << 1); // PC=1, IEN=1
         let sqe = Sqe {
             cdw0:  ADMIN_CREATE_IO_CQ as u32,
             prp1:  cq_pa,
@@ -379,7 +414,7 @@ impl NvmeCtrl {
 
     unsafe fn create_io_sq(&mut self, sq_pa: u64) -> bool {
         let cdw10: u32 = 1 | (((QUEUE_DEPTH - 1) as u32) << 16);
-        let cdw11: u32 = 1 | (1 << 16);
+        let cdw11: u32 = 1 | (1 << 16); // CQID=1
         let sqe = Sqe {
             cdw0:  ADMIN_CREATE_IO_SQ as u32,
             prp1:  sq_pa,
@@ -441,7 +476,7 @@ pub fn nvme_probe() {
     };
 
     let mut ctrl = CTRL.lock();
-    ctrl.bar0      = bar0;
+    ctrl.bar0 = bar0;
 
     let cap = unsafe { ctrl.read64(NVME_REG_CAP) };
     let dstrd = ((cap >> 32) & 0xF) as u64;
@@ -493,15 +528,22 @@ pub fn nvme_lba_size() -> u32 {
     1u32 << CTRL.lock().lba_shift
 }
 
-pub fn nvme_read(lba: u64, count: u16, buf: *mut u8) -> bool {
+/// Read `count` LBAs starting at `lba` into the buffer at physical address
+/// `buf_pa`.
+///
+/// # Safety
+/// `buf_pa` must be a valid physical address for a buffer of at least
+/// `count * lba_size` bytes.  For identity-mapped kernel buffers, pass
+/// `buf_ptr as u64` (virtual == physical).  For heap buffers use
+/// `virt_to_phys(buf_ptr)`.
+pub fn nvme_read(lba: u64, count: u16, buf_pa: u64) -> bool {
     let mut ctrl = CTRL.lock();
     if !ctrl.ready { return false; }
-    let buf_pa = buf as u64;
 
     let sqe = Sqe {
         cdw0:  NVM_READ as u32,
         nsid:  1,
-        prp1:  buf_pa,
+        prp1:  buf_pa,   // physical address — required by NVMe spec
         prp2:  0,
         cdw10: (lba & 0xFFFF_FFFF) as u32,
         cdw11: (lba >> 32) as u32,
@@ -513,15 +555,18 @@ pub fn nvme_read(lba: u64, count: u16, buf: *mut u8) -> bool {
     status == 0
 }
 
-pub fn nvme_write(lba: u64, count: u16, buf: *const u8) -> bool {
+/// Write `count` LBAs from the buffer at physical address `buf_pa` to `lba`.
+///
+/// # Safety
+/// `buf_pa` must be a valid physical address.  See `nvme_read` for details.
+pub fn nvme_write(lba: u64, count: u16, buf_pa: u64) -> bool {
     let mut ctrl = CTRL.lock();
     if !ctrl.ready { return false; }
-    let buf_pa = buf as u64;
 
     let sqe = Sqe {
         cdw0:  NVM_WRITE as u32,
         nsid:  1,
-        prp1:  buf_pa,
+        prp1:  buf_pa,   // physical address — required by NVMe spec
         prp2:  0,
         cdw10: (lba & 0xFFFF_FFFF) as u32,
         cdw11: (lba >> 32) as u32,
@@ -533,12 +578,15 @@ pub fn nvme_write(lba: u64, count: u16, buf: *const u8) -> bool {
     status == 0
 }
 
+/// Convenience wrapper: read one 512-byte sector into a stack buffer.
+/// The buffer must be identity-mapped (stack = kernel = PA == VA).
 pub fn nvme_read_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
-    nvme_read(lba, 1, buf.as_mut_ptr())
+    nvme_read(lba, 1, crate::mm::vmm::virt_to_phys(buf.as_mut_ptr() as usize) as u64)
 }
 
+/// Convenience wrapper: write one 512-byte sector from a stack buffer.
 pub fn nvme_write_sector(lba: u64, buf: &[u8; 512]) -> bool {
-    nvme_write(lba, 1, buf.as_ptr())
+    nvme_write(lba, 1, crate::mm::vmm::virt_to_phys(buf.as_ptr() as usize) as u64)
 }
 
 pub fn nvme_irq() {
