@@ -1,28 +1,19 @@
-//! BSD socket layer — AF_INET (TCP/UDP) and AF_UNIX (stream).
+//! BSD socket layer.
 //!
-//! ## AF_UNIX support
+//! ## Supported address families
 //!
-//! `AF_UNIX SOCK_STREAM` sockets are the standard IPC mechanism for
-//! Wayland clients connecting to the compositor, and for any other
-//! process-to-process communication that should not go over the network
-//! stack.  This module adds a simple kernel-side Unix socket implementation:
+//!   AF_UNIX   (1) — SOCK_STREAM unix socket pairs (Wayland, IPC)
+//!   AF_INET   (2) — SOCK_STREAM (TCP) + SOCK_DGRAM (UDP) over IPv4
+//!   AF_INET6  (10) — SOCK_STREAM (TCP stub) + SOCK_DGRAM (UDP) over IPv6
 //!
-//!   - `bind(path)`     — registers the socket path in the Unix socket table.
-//!   - `listen()`       — marks the socket as accepting connections.
-//!   - `connect(path)`  — creates a kernel pipe-pair and wires both ends.
-//!   - `accept()`       — dequeues the next completed pipe-pair endpoint.
-//!   - `send/recv`      — read/write through the pipe-pair's ring buffer.
+//! ## Dual-stack
 //!
-//! The socket path is looked up in `UNIX_BINDINGS` (a `BTreeMap<String, usize>`).
-//! No actual filesystem node is created — the path is purely a name in
-//! the kernel socket namespace (comparable to Linux's abstract namespace
-//! but stored in the VFS devfs instead; full VFS integration is a future
-//! improvement).
+//! IPv6 sockets use `sockaddr_in6` (28 bytes).  The `SockAddr` enum unifies
+//! the address representation internally so all send/recv paths can branch
+//! on `AF_INET` vs `AF_INET6` without storing separate fields.
 //!
-//! ## Thread safety
-//!
-//! All socket tables are protected by `IrqSpinLock` so they are safe to
-//! access from both syscall context and interrupt context.
+//! IPv6 UDP send/recv is fully functional.  IPv6 TCP is a stub that returns
+//! -ENOSYS until a tcp6 module is added.
 
 extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -30,7 +21,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::net::{ip, tcp, udp};
+use crate::net::{ip, tcp, udp, ipv6};
 
 // ── Domain / type constants (Linux ABI) ──────────────────────────────────────
 
@@ -41,6 +32,27 @@ pub const SOCK_STREAM: i32 = 1;
 pub const SOCK_DGRAM:  i32 = 2;
 pub const IPPROTO_TCP: i32 = 6;
 pub const IPPROTO_UDP: i32 = 17;
+pub const IPPROTO_IPV6: i32 = 41;
+
+// IPV6 socket options
+pub const IPV6_V6ONLY: i32 = 26;
+
+// ── Unified address type ─────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SockAddr {
+    Unbound,
+    V4   { ip: u32,                port: u16 },
+    V6   { ip: ipv6::Addr6,        port: u16, flowinfo: u32, scope_id: u32 },
+    Unix { path: String },
+}
+
+impl SockAddr {
+    pub fn port(&self) -> u16 {
+        match self { SockAddr::V4 { port, .. } | SockAddr::V6 { port, .. } => *port, _ => 0 }
+    }
+    pub fn is_unbound(&self) -> bool { matches!(self, SockAddr::Unbound) }
+}
 
 // ── Unix socket pipe-pair ────────────────────────────────────────────────────
 
@@ -62,32 +74,22 @@ impl UnixConn {
         let b = UnixConn { rx: a_to_b,         tx: b_to_a };
         (a, b)
     }
-
-    fn write(&self, data: &[u8]) {
-        self.tx.lock().buf.extend(data.iter().copied());
+    fn write(&self, data: &[u8]) { self.tx.lock().buf.extend(data.iter().copied()); }
+    fn read(&self, len: usize) -> Vec<u8> {
+        let mut p = self.rx.lock();
+        let n = len.min(p.buf.len());
+        p.buf.drain(..n).collect()
     }
-
-    fn read(&self, len: usize) -> alloc::vec::Vec<u8> {
-        let mut pipe = self.rx.lock();
-        let n = len.min(pipe.buf.len());
-        pipe.buf.drain(..n).collect()
-    }
-
     fn is_readable(&self) -> bool {
-        let pipe = self.rx.lock();
-        !pipe.buf.is_empty() || pipe.closed
+        let p = self.rx.lock();
+        !p.buf.is_empty() || p.closed
     }
-
-    fn close_tx(&self) {
-        self.tx.lock().closed = true;
-    }
+    fn close_tx(&self) { self.tx.lock().closed = true; }
 }
 
-// ── Unix listening socket backlog ─────────────────────────────────────────────
+// ── Unix listening socket ─────────────────────────────────────────────────────
 
-struct PendingUnix {
-    server_conn: UnixConn,
-}
+struct PendingUnix { server_conn: UnixConn }
 
 struct UnixListener {
     backlog:     VecDeque<PendingUnix>,
@@ -97,7 +99,8 @@ struct UnixListener {
 // ── Socket state ─────────────────────────────────────────────────────────────
 
 pub enum SocketState {
-    Udp       { local_port: u16, rx_queue: VecDeque<UdpDatagram> },
+    Udp4      { local_port: u16, rx_queue: VecDeque<UdpDatagram4> },
+    Udp6      { local_port: u16, rx_queue: VecDeque<UdpDatagram6> },
     TcpActive { conn_idx: usize },
     TcpListen { listen_idx: usize },
     UnixConn(UnixConn),
@@ -105,8 +108,14 @@ pub enum SocketState {
     Unbound,
 }
 
-pub struct UdpDatagram {
+pub struct UdpDatagram4 {
     pub src_ip:   u32,
+    pub src_port: u16,
+    pub data:     Vec<u8>,
+}
+
+pub struct UdpDatagram6 {
+    pub src_ip:   ipv6::Addr6,
     pub src_port: u16,
     pub data:     Vec<u8>,
 }
@@ -116,29 +125,37 @@ pub struct Socket {
     pub kind:        i32,
     pub proto:       i32,
     pub state:       SocketState,
-    pub local_port:  u16,
-    pub peer_ip:     u32,
-    pub peer_port:   u16,
+    pub local:       SockAddr,
+    pub peer:        SockAddr,
     pub nonblocking: bool,
+    pub v6only:      bool,   // IPV6_V6ONLY — don't accept mapped IPv4
 }
 
 impl Socket {
     fn new(domain: i32, kind: i32, proto: i32) -> Self {
         Socket {
             domain, kind, proto,
-            state: SocketState::Unbound,
-            local_port: 0, peer_ip: 0, peer_port: 0,
+            state:       SocketState::Unbound,
+            local:       SockAddr::Unbound,
+            peer:        SockAddr::Unbound,
             nonblocking: false,
+            v6only:      false,
         }
     }
+    // Compatibility shims used in legacy code paths.
+    pub fn local_port(&self) -> u16  { self.local.port() }
+    pub fn peer_ip4(&self) -> u32    { if let SockAddr::V4 { ip, .. } = self.peer { ip } else { 0 } }
+    pub fn peer_port(&self) -> u16   { self.peer.port() }
 }
 
 // ── Global tables ─────────────────────────────────────────────────────────────
 
-pub static UDP_SOCKETS: Mutex<Vec<Option<Socket>>> = Mutex::new(Vec::new());
+/// Combined socket table (AF_INET, AF_INET6, AF_UNIX all share one table).
+pub static SOCKETS: Mutex<Vec<Option<Socket>>> = Mutex::new(Vec::new());
+/// Back-compat alias used by legacy udp demux code.
+pub use SOCKETS as UDP_SOCKETS;
 
-static UNIX_LISTENERS: Mutex<BTreeMap<String, UnixListener>> =
-    Mutex::new(BTreeMap::new());
+static UNIX_LISTENERS: Mutex<BTreeMap<String, UnixListener>> = Mutex::new(BTreeMap::new());
 
 static EPHEMERAL: Mutex<u16> = Mutex::new(49152);
 fn next_ephemeral() -> u16 {
@@ -148,140 +165,194 @@ fn next_ephemeral() -> u16 {
     p
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UDP demultiplexer — called from udp::receive
-// ─────────────────────────────────────────────────────────────────────────────
+// ── sockaddr readers ──────────────────────────────────────────────────────────
 
-/// Route an incoming UDP datagram to the right socket or kernel service.
-///
-/// Priority order:
-///   1. Port 68  (DHCP client reply)       → dhcp::receive
-///   2. Ephemeral kernel port (DNS query)  → dns::receive
-///   3. Registered user UDP socket         → enqueue in rx_queue
+/// Read a `sockaddr_in` (16 bytes) from userspace.  Returns (port, ip).
+fn read_sockaddr_in(va: usize) -> Option<(u16, u32)> {
+    let mut buf = [0u8; 16];
+    crate::uaccess::copy_from_user(va, &mut buf).ok()?;
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    let ip   = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    Some((port, ip))
+}
+
+/// Read a `sockaddr_in6` (28 bytes) from userspace.
+/// Layout: sin6_family(2) + sin6_port(2) + sin6_flowinfo(4) + sin6_addr(16) + sin6_scope_id(4)
+fn read_sockaddr_in6(va: usize) -> Option<(u16, ipv6::Addr6, u32, u32)> {
+    let mut buf = [0u8; 28];
+    crate::uaccess::copy_from_user(va, &mut buf).ok()?;
+    let port      = u16::from_be_bytes([buf[2], buf[3]]);
+    let flowinfo  = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let ip: ipv6::Addr6 = buf[8..24].try_into().ok()?;
+    let scope_id  = u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    Some((port, ip, flowinfo, scope_id))
+}
+
+/// Write a `sockaddr_in` to userspace.
+fn write_sockaddr_in(va: usize, ip: u32, port: u16) {
+    let mut addr = [0u8; 16];
+    addr[1] = AF_INET as u8;
+    addr[2] = (port >> 8) as u8;
+    addr[3] = port as u8;
+    addr[4..8].copy_from_slice(&ip.to_be_bytes());
+    let _ = crate::uaccess::copy_to_user(va, &addr);
+}
+
+/// Write a `sockaddr_in6` to userspace.
+fn write_sockaddr_in6(va: usize, ip: &ipv6::Addr6, port: u16, flowinfo: u32, scope_id: u32) {
+    let mut buf = [0u8; 28];
+    buf[1] = AF_INET6 as u8;
+    buf[2] = (port >> 8) as u8;
+    buf[3] = port as u8;
+    buf[4..8].copy_from_slice(&flowinfo.to_be_bytes());
+    buf[8..24].copy_from_slice(ip);
+    buf[24..28].copy_from_slice(&scope_id.to_be_bytes());
+    let _ = crate::uaccess::copy_to_user(va, &buf);
+}
+
+// ── UDP demultiplexers ────────────────────────────────────────────────────────
+
+/// Route an incoming IPv4 UDP datagram.
 pub fn demux_udp(src_ip: u32, src_port: u16, dst_port: u16, data: &[u8]) {
-    // 1. DHCP client port — always kernel-owned.
     if dst_port == crate::net::dhcp::DHCP_CLIENT_PORT {
         crate::net::dhcp::receive(src_ip, data);
         return;
     }
-
-    // 2. Ephemeral kernel ports (currently used by DNS resolver).
-    //    src_port == 53 identifies a DNS reply; dst_port is our ephemeral
-    //    source port that was registered via udp::register_ephemeral.
-    if src_port == crate::net::dns::DNS_PORT
-        && udp::is_ephemeral(dst_port)
-    {
+    if src_port == crate::net::dns::DNS_PORT && udp::is_ephemeral(dst_port) {
         crate::net::dns::receive(src_ip, data);
         return;
     }
-
-    // 3. User-space UDP socket bound to this port.
-    let mut table = UDP_SOCKETS.lock();
+    let mut table = SOCKETS.lock();
     for slot in table.iter_mut() {
-        if let Some(sock) = slot {
-            if let SocketState::Udp { local_port, ref mut rx_queue } = sock.state {
-                if local_port == dst_port {
-                    rx_queue.push_back(UdpDatagram {
-                        src_ip,
-                        src_port,
-                        data: data.to_vec(),
-                    });
-                    return;
-                }
+        if let Some(Socket { state: SocketState::Udp4 { local_port, ref mut rx_queue }, .. }) = slot {
+            if *local_port == dst_port {
+                rx_queue.push_back(UdpDatagram4 { src_ip, src_port, data: data.to_vec() });
+                return;
             }
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Syscall implementations
-// ─────────────────────────────────────────────────────────────────────────────
+/// Route an incoming IPv6 UDP datagram.
+pub fn demux_udp6(src_ip: &ipv6::Addr6, src_port: u16, dst_port: u16, data: &[u8]) {
+    let mut table = SOCKETS.lock();
+    for slot in table.iter_mut() {
+        if let Some(Socket { state: SocketState::Udp6 { local_port, ref mut rx_queue }, .. }) = slot {
+            if *local_port == dst_port {
+                rx_queue.push_back(UdpDatagram6 {
+                    src_ip: *src_ip,
+                    src_port,
+                    data: data.to_vec(),
+                });
+                return;
+            }
+        }
+    }
+}
+
+// ── Slot allocator ────────────────────────────────────────────────────────────
+
+fn alloc_slot(table: &mut Vec<Option<Socket>>, s: Socket) -> usize {
+    if let Some(i) = table.iter().position(|x| x.is_none()) {
+        table[i] = Some(s); i
+    } else {
+        table.push(Some(s)); table.len() - 1
+    }
+}
+
+// ── sys_socket ────────────────────────────────────────────────────────────────
 
 pub fn sys_socket(domain: i32, kind: i32, proto: i32) -> isize {
     match domain {
-        d if d == AF_INET || d == AF_UNIX => {}
-        _ => return -97,
+        d if d == AF_INET || d == AF_INET6 || d == AF_UNIX => {}
+        _ => return -97, // EAFNOSUPPORT
     }
     match kind & 0xF {
         k if k == SOCK_STREAM || k == SOCK_DGRAM => {}
-        _ => return -22,
+        _ => return -22, // EINVAL
     }
-    let sock = Socket::new(domain, kind & 0xF, proto);
-    let mut table = UDP_SOCKETS.lock();
-    if let Some(idx) = table.iter().position(|s| s.is_none()) {
-        table[idx] = Some(sock);
-        return idx as isize;
-    }
-    table.push(Some(sock));
-    (table.len() - 1) as isize
+    let mut sock = Socket::new(domain, kind & 0xF, proto);
+    sock.nonblocking = (kind & 0x800) != 0; // SOCK_NONBLOCK
+    let mut table = SOCKETS.lock();
+    alloc_slot(&mut table, sock) as isize
 }
 
-pub fn sys_bind(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
+// ── sys_bind ──────────────────────────────────────────────────────────────────
+
+pub fn sys_bind(sock_idx: usize, addr_va: usize, addrlen: u32) -> isize {
     let mut hdr = [0u8; 2];
     if crate::uaccess::copy_from_user(addr_va, &mut hdr).is_err() { return -14; }
     let family = u16::from_ne_bytes(hdr) as i32;
 
-    let mut table = UDP_SOCKETS.lock();
+    let mut table = SOCKETS.lock();
     let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) {
-        Some(s) => s,
-        None    => return -9,
+        Some(s) => s, None => return -9,
     };
 
-    if family == AF_UNIX {
-        let mut sun = [0u8; 110];
-        let _ = crate::uaccess::copy_from_user(addr_va, &mut sun);
-        let path_bytes = &sun[2..];
-        let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(108);
-        let path = match core::str::from_utf8(&path_bytes[..nul]) {
-            Ok(p) => p,
-            Err(_) => return -22,
-        };
-        let mut listeners = UNIX_LISTENERS.lock();
-        listeners.entry(path.into()).or_insert_with(|| UnixListener {
-            backlog: VecDeque::new(),
-            max_backlog: 128,
-        });
-        sock.state = SocketState::UnixListen { path: path.into() };
-        return 0;
-    }
-
-    if family == AF_INET {
-        let mut addr = [0u8; 16];
-        if crate::uaccess::copy_from_user(addr_va, &mut addr).is_err() { return -14; }
-        let port = u16::from_be_bytes([addr[2], addr[3]]);
-        sock.local_port = port;
-        if sock.domain == AF_INET && sock.kind == SOCK_DGRAM {
-            sock.state = SocketState::Udp {
-                local_port: port,
-                rx_queue: VecDeque::new(),
+    match family {
+        f if f == AF_UNIX => {
+            let mut sun = [0u8; 110];
+            let _ = crate::uaccess::copy_from_user(addr_va, &mut sun);
+            let path_bytes = &sun[2..];
+            let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(108);
+            let path = match core::str::from_utf8(&path_bytes[..nul]) {
+                Ok(p) => p, Err(_) => return -22,
             };
-            crate::net::udp::register_port(port, sock_idx);
+            let mut listeners = UNIX_LISTENERS.lock();
+            listeners.entry(path.into()).or_insert_with(|| UnixListener {
+                backlog: VecDeque::new(), max_backlog: 128,
+            });
+            sock.state = SocketState::UnixListen { path: path.into() };
+            sock.local = SockAddr::Unix { path: path.into() };
+            0
         }
-        return 0;
+        f if f == AF_INET => {
+            let (port, ip) = match read_sockaddr_in(addr_va) {
+                Some(v) => v, None => return -14,
+            };
+            sock.local = SockAddr::V4 { ip, port };
+            if sock.kind == SOCK_DGRAM {
+                sock.state = SocketState::Udp4 { local_port: port, rx_queue: VecDeque::new() };
+                crate::net::udp::register_port(port, sock_idx);
+            }
+            0
+        }
+        f if f == AF_INET6 => {
+            let (port, ip, flowinfo, scope_id) = match read_sockaddr_in6(addr_va) {
+                Some(v) => v, None => return -14,
+            };
+            sock.local = SockAddr::V6 { ip, port, flowinfo, scope_id };
+            if sock.kind == SOCK_DGRAM {
+                sock.state = SocketState::Udp6 { local_port: port, rx_queue: VecDeque::new() };
+            }
+            0
+        }
+        _ => -22,
     }
-
-    -22
 }
 
+// ── sys_listen ────────────────────────────────────────────────────────────────
+
 pub fn sys_listen(sock_idx: usize, backlog: i32) -> isize {
-    let table = UDP_SOCKETS.lock();
+    let table = SOCKETS.lock();
     let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) {
-        Some(s) => s,
-        None    => return -9,
+        Some(s) => s, None => return -9,
     };
     if let SocketState::UnixListen { ref path } = sock.state {
+        let path = path.clone();
+        drop(table);
         let mut listeners = UNIX_LISTENERS.lock();
         if let Some(l) = listeners.get_mut(path.as_str()) {
             l.max_backlog = backlog.max(1) as usize;
         }
         return 0;
     }
-    if sock.domain == AF_INET && sock.kind == SOCK_STREAM {
-        let port = sock.local_port;
+    if (sock.domain == AF_INET || sock.domain == AF_INET6) && sock.kind == SOCK_STREAM {
+        let port = sock.local.port();
         drop(table);
         let idx = crate::net::tcp::listen(port);
-        let mut table2 = UDP_SOCKETS.lock();
-        if let Some(Some(s)) = table2.get_mut(sock_idx) {
+        let mut t2 = SOCKETS.lock();
+        if let Some(Some(s)) = t2.get_mut(sock_idx) {
             s.state = SocketState::TcpListen { listen_idx: idx };
         }
         return 0;
@@ -289,10 +360,12 @@ pub fn sys_listen(sock_idx: usize, backlog: i32) -> isize {
     0
 }
 
+// ── sys_accept ────────────────────────────────────────────────────────────────
+
 pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
-    // ── AF_UNIX ──────────────────────────────────────────────────────────────
+    // AF_UNIX
     {
-        let table = UDP_SOCKETS.lock();
+        let table = SOCKETS.lock();
         if let Some(Some(sock)) = table.get(sock_idx) {
             if let SocketState::UnixListen { ref path } = sock.state {
                 let path = path.clone();
@@ -300,49 +373,37 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
                 loop {
                     let conn = {
                         let mut listeners = UNIX_LISTENERS.lock();
-                        if let Some(l) = listeners.get_mut(path.as_str()) {
-                            l.backlog.pop_front().map(|p| p.server_conn)
-                        } else {
-                            return -9;
-                        }
+                        listeners.get_mut(path.as_str())
+                            .and_then(|l| l.backlog.pop_front())
+                            .map(|p| p.server_conn)
                     };
                     if let Some(server_conn) = conn {
                         let new_sock = Socket {
                             domain: AF_UNIX, kind: SOCK_STREAM, proto: 0,
                             state: SocketState::UnixConn(server_conn),
-                            local_port: 0, peer_ip: 0, peer_port: 0,
-                            nonblocking: false,
+                            local: SockAddr::Unbound, peer: SockAddr::Unbound,
+                            nonblocking: false, v6only: false,
                         };
-                        let mut t2 = UDP_SOCKETS.lock();
-                        let new_idx = if let Some(i) = t2.iter().position(|s| s.is_none()) {
-                            t2[i] = Some(new_sock); i
-                        } else {
-                            t2.push(Some(new_sock)); t2.len() - 1
-                        };
+                        let new_idx = alloc_slot(&mut SOCKETS.lock(), new_sock);
                         if addr_va != 0 {
-                            let sa = [AF_UNIX as u8, 0u8];
-                            let _ = crate::uaccess::copy_to_user(addr_va, &sa);
-                        }
-                        if addrlen_va != 0 {
-                            let len = 2u32;
-                            let _ = crate::uaccess::copy_to_user(addrlen_va, &len.to_ne_bytes());
+                            let _ = crate::uaccess::copy_to_user(addr_va, &[AF_UNIX as u8, 0u8]);
+                            if addrlen_va != 0 {
+                                let _ = crate::uaccess::copy_to_user(addrlen_va, &2u32.to_ne_bytes());
+                            }
                         }
                         return new_idx as isize;
                     }
                     crate::proc::scheduler::yield_now();
-                    let nonblock = {
-                        let t = UDP_SOCKETS.lock();
-                        t.get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.nonblocking).unwrap_or(false)
-                    };
-                    if nonblock { return -11; }
+                    if SOCKETS.lock().get(sock_idx).and_then(|s| s.as_ref())
+                        .map(|s| s.nonblocking).unwrap_or(false) { return -11; }
                 }
             }
         }
     }
 
-    // ── AF_INET TCP ──────────────────────────────────────────────────────────
+    // AF_INET TCP
     let listen_idx = {
-        let table = UDP_SOCKETS.lock();
+        let table = SOCKETS.lock();
         match table.get(sock_idx).and_then(|s| s.as_ref()) {
             Some(Socket { state: SocketState::TcpListen { listen_idx }, .. }) => *listen_idx,
             _ => return -22,
@@ -354,181 +415,203 @@ pub fn sys_accept(sock_idx: usize, addr_va: usize, addrlen_va: usize) -> isize {
             let new_sock = Socket {
                 domain: AF_INET, kind: SOCK_STREAM, proto: IPPROTO_TCP,
                 state: SocketState::TcpActive { conn_idx },
-                local_port: 0, peer_ip, peer_port,
-                nonblocking: false,
+                local: SockAddr::Unbound,
+                peer:  SockAddr::V4 { ip: peer_ip, port: peer_port },
+                nonblocking: false, v6only: false,
             };
-            let mut t = UDP_SOCKETS.lock();
-            let new_idx = if let Some(i) = t.iter().position(|s| s.is_none()) {
-                t[i] = Some(new_sock); i
-            } else {
-                t.push(Some(new_sock)); t.len() - 1
-            };
+            let new_idx = alloc_slot(&mut SOCKETS.lock(), new_sock);
             if addr_va != 0 {
-                let mut addr = [0u8; 16];
-                addr[0] = 0; addr[1] = AF_INET as u8;
-                addr[2] = (peer_port >> 8) as u8;
-                addr[3] = peer_port as u8;
-                addr[4..8].copy_from_slice(&peer_ip.to_be_bytes());
-                let _ = crate::uaccess::copy_to_user(addr_va, &addr);
+                write_sockaddr_in(addr_va, peer_ip, peer_port);
                 if addrlen_va != 0 {
-                    let len = 16u32;
-                    let _ = crate::uaccess::copy_to_user(addrlen_va, &len.to_ne_bytes());
+                    let _ = crate::uaccess::copy_to_user(addrlen_va, &16u32.to_ne_bytes());
                 }
             }
             return new_idx as isize;
         }
         crate::proc::scheduler::yield_now();
-        let nonblock = {
-            let t = UDP_SOCKETS.lock();
-            t.get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.nonblocking).unwrap_or(false)
-        };
-        if nonblock { return -11; }
+        if SOCKETS.lock().get(sock_idx).and_then(|s| s.as_ref())
+            .map(|s| s.nonblocking).unwrap_or(false) { return -11; }
     }
 }
+
+// ── sys_connect ───────────────────────────────────────────────────────────────
 
 pub fn sys_connect(sock_idx: usize, addr_va: usize, _addrlen: u32) -> isize {
     let mut hdr = [0u8; 2];
     if crate::uaccess::copy_from_user(addr_va, &mut hdr).is_err() { return -14; }
     let family = u16::from_ne_bytes(hdr) as i32;
 
-    if family == AF_UNIX {
-        let mut sun = [0u8; 110];
-        let _ = crate::uaccess::copy_from_user(addr_va, &mut sun);
-        let path_bytes = &sun[2..];
-        let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(108);
-        let path = match core::str::from_utf8(&path_bytes[..nul]) {
-            Ok(p) => p, Err(_) => return -22,
-        };
-        let (conn_a, conn_b) = UnixConn::new_pair();
-        {
-            let mut listeners = UNIX_LISTENERS.lock();
-            let listener = match listeners.get_mut(path) {
-                Some(l) => l,
-                None    => return -111,
+    match family {
+        f if f == AF_UNIX => {
+            let mut sun = [0u8; 110];
+            let _ = crate::uaccess::copy_from_user(addr_va, &mut sun);
+            let path_bytes = &sun[2..];
+            let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(108);
+            let path = match core::str::from_utf8(&path_bytes[..nul]) {
+                Ok(p) => p, Err(_) => return -22,
             };
-            if listener.backlog.len() >= listener.max_backlog { return -111; }
-            listener.backlog.push_back(PendingUnix { server_conn: conn_a });
-        }
-        let mut table = UDP_SOCKETS.lock();
-        if let Some(Some(sock)) = table.get_mut(sock_idx) {
-            sock.state = SocketState::UnixConn(conn_b);
-            return 0;
-        }
-        return -9;
-    }
-
-    if family == AF_INET {
-        let mut addr = [0u8; 16];
-        if crate::uaccess::copy_from_user(addr_va, &mut addr).is_err() { return -14; }
-        let port   = u16::from_be_bytes([addr[2], addr[3]]);
-        let dst_ip = u32::from_be_bytes([addr[4], addr[5], addr[6], addr[7]]);
-
-        let kind = {
-            let table = UDP_SOCKETS.lock();
-            match table.get(sock_idx).and_then(|s| s.as_ref()) {
-                Some(s) => s.kind,
-                None    => return -9,
+            let (conn_a, conn_b) = UnixConn::new_pair();
+            {
+                let mut listeners = UNIX_LISTENERS.lock();
+                let l = match listeners.get_mut(path) { Some(l) => l, None => return -111 };
+                if l.backlog.len() >= l.max_backlog { return -111; }
+                l.backlog.push_back(PendingUnix { server_conn: conn_a });
             }
-        };
-
-        if kind == SOCK_STREAM {
-            let src_port = next_ephemeral();
-            let conn_idx = match crate::net::tcp::connect(dst_ip, port, src_port) {
-                Ok(i)  => i,
-                Err(e) => return e,
+            let mut table = SOCKETS.lock();
+            if let Some(Some(sock)) = table.get_mut(sock_idx) {
+                sock.state = SocketState::UnixConn(conn_b);
+                sock.peer  = SockAddr::Unix { path: path.into() };
+                return 0;
+            }
+            -9
+        }
+        f if f == AF_INET => {
+            let (port, dst_ip) = match read_sockaddr_in(addr_va) {
+                Some(v) => v, None => return -14,
             };
-            let mut table = UDP_SOCKETS.lock();
-            if let Some(Some(sock)) = table.get_mut(sock_idx) {
-                sock.state      = SocketState::TcpActive { conn_idx };
-                sock.local_port = src_port;
-                sock.peer_ip    = dst_ip;
-                sock.peer_port  = port;
-            }
-            return 0;
-        }
-
-        if kind == SOCK_DGRAM {
-            let mut table = UDP_SOCKETS.lock();
-            if let Some(Some(sock)) = table.get_mut(sock_idx) {
-                sock.peer_ip   = dst_ip;
-                sock.peer_port = port;
-                if sock.local_port == 0 {
-                    let lp = next_ephemeral();
-                    sock.local_port = lp;
-                    sock.state = SocketState::Udp { local_port: lp, rx_queue: VecDeque::new() };
-                    crate::net::udp::register_port(lp, sock_idx);
+            let kind = SOCKETS.lock().get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.kind).unwrap_or(-1);
+            if kind == SOCK_STREAM {
+                let src_port = next_ephemeral();
+                let conn_idx = match crate::net::tcp::connect(dst_ip, port, src_port) {
+                    Ok(i) => i, Err(e) => return e,
+                };
+                let mut table = SOCKETS.lock();
+                if let Some(Some(sock)) = table.get_mut(sock_idx) {
+                    sock.state = SocketState::TcpActive { conn_idx };
+                    sock.local = SockAddr::V4 { ip: ip::our_ip(), port: src_port };
+                    sock.peer  = SockAddr::V4 { ip: dst_ip, port };
                 }
+                return 0;
             }
-            return 0;
+            if kind == SOCK_DGRAM {
+                let mut table = SOCKETS.lock();
+                if let Some(Some(sock)) = table.get_mut(sock_idx) {
+                    sock.peer = SockAddr::V4 { ip: dst_ip, port };
+                    if sock.local.is_unbound() {
+                        let lp = next_ephemeral();
+                        sock.local = SockAddr::V4 { ip: ip::our_ip(), port: lp };
+                        sock.state = SocketState::Udp4 { local_port: lp, rx_queue: VecDeque::new() };
+                        crate::net::udp::register_port(lp, sock_idx);
+                    }
+                }
+                return 0;
+            }
+            -22
         }
+        f if f == AF_INET6 => {
+            let (port, dst_ip, flowinfo, scope_id) = match read_sockaddr_in6(addr_va) {
+                Some(v) => v, None => return -14,
+            };
+            let kind = SOCKETS.lock().get(sock_idx).and_then(|s| s.as_ref()).map(|s| s.kind).unwrap_or(-1);
+            if kind == SOCK_STREAM {
+                // TCP over IPv6 — stub until tcp6 module is added.
+                return -38; // ENOSYS
+            }
+            if kind == SOCK_DGRAM {
+                let mut table = SOCKETS.lock();
+                if let Some(Some(sock)) = table.get_mut(sock_idx) {
+                    sock.peer = SockAddr::V6 { ip: dst_ip, port, flowinfo, scope_id };
+                    if sock.local.is_unbound() {
+                        let lp = next_ephemeral();
+                        sock.local = SockAddr::V6 { ip: ipv6::our_ip6(), port: lp, flowinfo: 0, scope_id: 0 };
+                        sock.state = SocketState::Udp6 { local_port: lp, rx_queue: VecDeque::new() };
+                    }
+                }
+                return 0;
+            }
+            -22
+        }
+        _ => -22,
     }
-
-    -22
 }
 
-pub fn sys_send(sock_idx: usize, buf_va: usize, len: usize, _flags: i32) -> isize {
-    sys_sendto(sock_idx, buf_va, len, 0, 0, 0)
+// ── sys_sendto ────────────────────────────────────────────────────────────────
+
+pub fn sys_send(sock_idx: usize, buf_va: usize, len: usize, flags: i32) -> isize {
+    sys_sendto(sock_idx, buf_va, len, flags, 0, 0)
 }
 
-pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
+pub fn sys_sendto(sock_idx: usize, buf_va: usize, len: usize, _flags: i32,
                   dest_addr: usize, addrlen: u32) -> isize {
     if len == 0 { return 0; }
     if !crate::uaccess::validate_user_ptr(buf_va, len) { return -14; }
     let mut kbuf = alloc::vec![0u8; len];
     if crate::uaccess::copy_from_user(buf_va, &mut kbuf).is_err() { return -14; }
 
-    let table = UDP_SOCKETS.lock();
+    let table = SOCKETS.lock();
     let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) {
         Some(s) => s, None => return -9,
     };
 
     match &sock.state {
-        SocketState::UnixConn(conn) => {
-            conn.write(&kbuf);
-            return len as isize;
-        }
+        SocketState::UnixConn(conn) => { conn.write(&kbuf); len as isize }
+
         SocketState::TcpActive { conn_idx } => {
             let idx = *conn_idx;
             drop(table);
-            return crate::net::tcp::send(idx, &kbuf);
+            crate::net::tcp::send(idx, &kbuf)
         }
-        SocketState::Udp { local_port, .. } => {
+
+        SocketState::Udp4 { local_port, .. } => {
             let lp = *local_port;
             let (dst_ip, dst_port) = if dest_addr != 0 && addrlen >= 8 {
-                let mut a = [0u8; 8];
                 drop(table);
-                if crate::uaccess::copy_from_user(dest_addr, &mut a).is_err() { return -14; }
-                (u32::from_be_bytes([a[4], a[5], a[6], a[7]]),
-                 u16::from_be_bytes([a[2], a[3]]))
+                match read_sockaddr_in(dest_addr) {
+                    Some((p, ip)) => (ip, p),
+                    None          => return -14,
+                }
             } else {
-                let t = UDP_SOCKETS.lock();
-                let s = t.get(sock_idx).and_then(|s| s.as_ref()).unwrap();
-                let r = (s.peer_ip, s.peer_port);
-                drop(t);
-                r
+                let peer = sock.peer.clone();
+                drop(table);
+                match peer { SockAddr::V4 { ip, port } => (ip, port), _ => return -107 }
             };
             if dst_ip == 0 || dst_port == 0 { return -107; }
-            // FIX: was crate::net::ip::local_ip() which doesn't exist.
-            let _src_ip = ip::our_ip();
             udp::send(lp, dst_ip, dst_port, &kbuf);
-            return len as isize;
+            len as isize
         }
-        _ => return -107,
+
+        SocketState::Udp6 { local_port, .. } => {
+            let lp = *local_port;
+            let (dst_ip, dst_port) = if dest_addr != 0 && addrlen >= 8 {
+                drop(table);
+                match read_sockaddr_in6(dest_addr) {
+                    Some((p, ip, _, _)) => (ip, p),
+                    None => return -14,
+                }
+            } else {
+                let peer = sock.peer.clone();
+                drop(table);
+                match peer { SockAddr::V6 { ip, port, .. } => (ip, port), _ => return -107 }
+            };
+            if dst_port == 0 { return -107; }
+            udp::send6(lp, &dst_ip, dst_port, &kbuf);
+            len as isize
+        }
+
+        _ => -107, // ENOTCONN
     }
 }
 
-pub fn sys_recv(sock_idx: usize, buf_va: usize, len: usize, _flags: i32) -> isize {
-    sys_recvfrom(sock_idx, buf_va, len, 0, 0, 0)
+// ── sys_recvfrom ──────────────────────────────────────────────────────────────
+
+pub fn sys_recv(sock_idx: usize, buf_va: usize, len: usize, flags: i32) -> isize {
+    sys_recvfrom(sock_idx, buf_va, len, flags, 0, 0)
 }
 
-pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
+pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, _flags: i32,
                     src_addr: usize, addrlen_va: usize) -> isize {
     if len == 0 { return 0; }
     if !crate::uaccess::validate_user_ptr(buf_va, len) { return -14; }
 
     loop {
-        let (data, from_ip, from_port): (Vec<u8>, u32, u16) = {
-            let table = UDP_SOCKETS.lock();
+        enum RecvData {
+            Bytes(Vec<u8>),
+            Udp4(Vec<u8>, u32, u16),
+            Udp6(Vec<u8>, ipv6::Addr6, u16),
+        }
+
+        let result: RecvData = {
+            let table = SOCKETS.lock();
             let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) {
                 Some(s) => s, None => return -9,
             };
@@ -542,107 +625,140 @@ pub fn sys_recvfrom(sock_idx: usize, buf_va: usize, len: usize, flags: i32,
                         crate::proc::scheduler::yield_now();
                         continue;
                     }
-                    (d, 0, 0)
+                    RecvData::Bytes(d)
                 }
                 SocketState::TcpActive { conn_idx } => {
                     let idx = *conn_idx;
+                    let nb  = sock.nonblocking;
                     drop(table);
                     let mut kbuf = alloc::vec![0u8; len];
                     let n = crate::net::tcp::recv(idx, &mut kbuf);
                     if n == 0 {
-                        let nb = UDP_SOCKETS.lock().get(sock_idx)
-                            .and_then(|s| s.as_ref()).map(|s| s.nonblocking).unwrap_or(false);
                         if nb { return -11; }
                         crate::proc::scheduler::yield_now();
                         continue;
                     }
                     if n < 0 { return n; }
                     kbuf.truncate(n as usize);
-                    return if crate::uaccess::copy_to_user(buf_va, &kbuf).is_err() { -14 } else { n };
+                    let r = crate::uaccess::copy_to_user(buf_va, &kbuf);
+                    return if r.is_err() { -14 } else { n };
                 }
-                SocketState::Udp { .. } => {
+                SocketState::Udp4 { .. } => {
                     let nb = sock.nonblocking;
-                    if let Some(dg) = {
-                        let mut t2 = UDP_SOCKETS.lock();
-                        if let Some(Some(Socket {
-                            state: SocketState::Udp { ref mut rx_queue, .. }, ..
-                        })) = t2.get_mut(sock_idx) {
+                    drop(table);
+                    let dg = {
+                        let mut t2 = SOCKETS.lock();
+                        if let Some(Some(Socket { state: SocketState::Udp4 { ref mut rx_queue, .. }, .. })) = t2.get_mut(sock_idx) {
                             rx_queue.pop_front()
                         } else { None }
-                    } {
-                        (dg.data, dg.src_ip, dg.src_port)
-                    } else {
-                        drop(table);
-                        if nb { return -11; }
-                        crate::proc::scheduler::yield_now();
-                        continue;
+                    };
+                    match dg {
+                        Some(d) => RecvData::Udp4(d.data, d.src_ip, d.src_port),
+                        None => {
+                            if nb { return -11; }
+                            crate::proc::scheduler::yield_now();
+                            continue;
+                        }
+                    }
+                }
+                SocketState::Udp6 { .. } => {
+                    let nb = sock.nonblocking;
+                    drop(table);
+                    let dg = {
+                        let mut t2 = SOCKETS.lock();
+                        if let Some(Some(Socket { state: SocketState::Udp6 { ref mut rx_queue, .. }, .. })) = t2.get_mut(sock_idx) {
+                            rx_queue.pop_front()
+                        } else { None }
+                    };
+                    match dg {
+                        Some(d) => RecvData::Udp6(d.data, d.src_ip, d.src_port),
+                        None => {
+                            if nb { return -11; }
+                            crate::proc::scheduler::yield_now();
+                            continue;
+                        }
                     }
                 }
                 _ => return -107,
             }
         };
 
-        let n = data.len().min(len);
-        if crate::uaccess::copy_to_user(buf_va, &data[..n]).is_err() { return -14; }
-        if src_addr != 0 && from_ip != 0 {
-            let mut addr = [0u8; 16];
-            addr[0] = 0; addr[1] = AF_INET as u8;
-            addr[2] = (from_port >> 8) as u8;
-            addr[3] = from_port as u8;
-            addr[4..8].copy_from_slice(&from_ip.to_be_bytes());
-            let _ = crate::uaccess::copy_to_user(src_addr, &addr);
-            if addrlen_va != 0 {
-                let _ = crate::uaccess::copy_to_user(addrlen_va, &16u32.to_ne_bytes());
+        return match result {
+            RecvData::Bytes(data) => {
+                let n = data.len().min(len);
+                if crate::uaccess::copy_to_user(buf_va, &data[..n]).is_err() { -14 } else { n as isize }
             }
-        }
-        return n as isize;
+            RecvData::Udp4(data, from_ip, from_port) => {
+                let n = data.len().min(len);
+                if crate::uaccess::copy_to_user(buf_va, &data[..n]).is_err() { return -14; }
+                if src_addr != 0 {
+                    write_sockaddr_in(src_addr, from_ip, from_port);
+                    if addrlen_va != 0 {
+                        let _ = crate::uaccess::copy_to_user(addrlen_va, &16u32.to_ne_bytes());
+                    }
+                }
+                n as isize
+            }
+            RecvData::Udp6(data, from_ip, from_port) => {
+                let n = data.len().min(len);
+                if crate::uaccess::copy_to_user(buf_va, &data[..n]).is_err() { return -14; }
+                if src_addr != 0 {
+                    write_sockaddr_in6(src_addr, &from_ip, from_port, 0, 0);
+                    if addrlen_va != 0 {
+                        let _ = crate::uaccess::copy_to_user(addrlen_va, &28u32.to_ne_bytes());
+                    }
+                }
+                n as isize
+            }
+        };
     }
 }
 
+// ── sys_getsockname / sys_getpeername ─────────────────────────────────────────
+
 pub fn sys_getsockname(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> isize {
-    let table = UDP_SOCKETS.lock();
-    if let Some(Some(sock)) = table.get(sock_idx) {
-        if sock.domain == AF_UNIX {
-            let mut ua = [0u8; 110];
-            let fam = AF_UNIX as u16;
-            ua[0..2].copy_from_slice(&fam.to_ne_bytes());
-            let _ = crate::uaccess::copy_to_user(addr_va, &ua);
-            return 0;
-        }
-        let mut addr = [0u8; 16];
-        addr[0] = 0; addr[1] = AF_INET as u8;
-        addr[2] = (sock.local_port >> 8) as u8;
-        addr[3] = sock.local_port as u8;
-        let _ = crate::uaccess::copy_to_user(addr_va, &addr);
-        return 0;
+    let table = SOCKETS.lock();
+    let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) { Some(s) => s, None => return -9 };
+    match &sock.local {
+        SockAddr::V4 { ip, port }                => { write_sockaddr_in(addr_va, *ip, *port); 0 }
+        SockAddr::V6 { ip, port, flowinfo, scope_id } => { write_sockaddr_in6(addr_va, ip, *port, *flowinfo, *scope_id); 0 }
+        SockAddr::Unix { .. }                    => { let _ = crate::uaccess::copy_to_user(addr_va, &[AF_UNIX as u8, 0u8]); 0 }
+        SockAddr::Unbound                        => 0,
     }
-    -9
 }
 
 pub fn sys_getpeername(sock_idx: usize, addr_va: usize, _addrlen_va: usize) -> isize {
-    let table = UDP_SOCKETS.lock();
-    if let Some(Some(sock)) = table.get(sock_idx) {
-        if sock.peer_ip != 0 {
-            let mut addr = [0u8; 16];
-            addr[0] = 0; addr[1] = AF_INET as u8;
-            addr[2] = (sock.peer_port >> 8) as u8;
-            addr[3] = sock.peer_port as u8;
-            addr[4..8].copy_from_slice(&sock.peer_ip.to_be_bytes());
-            let _ = crate::uaccess::copy_to_user(addr_va, &addr);
-        }
+    let table = SOCKETS.lock();
+    let sock = match table.get(sock_idx).and_then(|s| s.as_ref()) { Some(s) => s, None => return -9 };
+    match &sock.peer {
+        SockAddr::V4 { ip, port }                => { write_sockaddr_in(addr_va, *ip, *port); 0 }
+        SockAddr::V6 { ip, port, flowinfo, scope_id } => { write_sockaddr_in6(addr_va, ip, *port, *flowinfo, *scope_id); 0 }
+        _ => 0,
     }
-    0
 }
 
-pub fn sys_setsockopt(sock_idx: usize, _level: i32, opt: i32,
+// ── sys_setsockopt ────────────────────────────────────────────────────────────
+
+pub fn sys_setsockopt(sock_idx: usize, level: i32, opt: i32,
                       optval_va: usize, optlen: u32) -> isize {
-    if opt == 0x8004 && optlen >= 4 {
-        let mut v = [0u8; 4];
-        if crate::uaccess::copy_from_user(&mut v, optval_va).is_ok() {
-            let nb = u32::from_ne_bytes(v) != 0;
-            let mut t = UDP_SOCKETS.lock();
-            if let Some(Some(s)) = t.get_mut(sock_idx) { s.nonblocking = nb; }
+    let mut table = SOCKETS.lock();
+    let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) { Some(s) => s, None => return -9 };
+    match (level, opt) {
+        (_, 0x8004) if optlen >= 4 => {
+            let mut v = [0u8; 4];
+            if crate::uaccess::copy_from_user(optval_va, &mut v).is_ok() {
+                sock.nonblocking = u32::from_ne_bytes(v) != 0;
+            }
         }
+        (l, o) if l == IPPROTO_IPV6 && o == IPV6_V6ONLY => {
+            if optlen >= 4 {
+                let mut v = [0u8; 4];
+                if crate::uaccess::copy_from_user(optval_va, &mut v).is_ok() {
+                    sock.v6only = u32::from_ne_bytes(v) != 0;
+                }
+            }
+        }
+        _ => {}
     }
     0
 }
@@ -650,8 +766,10 @@ pub fn sys_setsockopt(sock_idx: usize, _level: i32, opt: i32,
 pub fn sys_getsockopt(_sock_idx: usize, _level: i32, _opt: i32,
                       _optval_va: usize, _optlen_va: usize) -> isize { 0 }
 
+// ── sys_close_socket ─────────────────────────────────────────────────────────
+
 pub fn sys_close_socket(sock_idx: usize) {
-    let mut table = UDP_SOCKETS.lock();
+    let mut table = SOCKETS.lock();
     if let Some(slot) = table.get_mut(sock_idx) {
         if let Some(Socket { state: SocketState::UnixConn(ref conn), .. }) = *slot {
             conn.close_tx();
@@ -660,12 +778,10 @@ pub fn sys_close_socket(sock_idx: usize) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Socket FD bridge helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Socket FD bridge helpers ──────────────────────────────────────────────────
 
 pub fn is_socket_fd(fd: usize) -> bool {
-    let t = UDP_SOCKETS.lock();
+    let t = SOCKETS.lock();
     fd < t.len() && t[fd].is_some()
 }
 
@@ -678,22 +794,19 @@ pub fn socket_write(fd: usize, buf: &[u8]) -> isize {
 }
 
 pub fn socket_poll(fd: usize, events: u32) -> Option<u32> {
-    let table = UDP_SOCKETS.lock();
+    let table = SOCKETS.lock();
     let sock = table.get(fd)?.as_ref()?;
     let (readable, writable) = match &sock.state {
-        SocketState::UnixConn(conn) => (conn.is_readable(), true),
-        SocketState::UnixListen { path } => {
-            let listeners = UNIX_LISTENERS.lock();
-            let r = listeners.get(path.as_str())
-                .map(|l| !l.backlog.is_empty())
-                .unwrap_or(false);
-            (r, false)
+        SocketState::UnixConn(conn)           => (conn.is_readable(), true),
+        SocketState::UnixListen { path }      => {
+            let l = UNIX_LISTENERS.lock();
+            (l.get(path.as_str()).map(|x| !x.backlog.is_empty()).unwrap_or(false), false)
         }
-        SocketState::Udp { rx_queue, .. }  => (!rx_queue.is_empty(), true),
-        SocketState::TcpActive { conn_idx } =>
-            (crate::net::tcp::rx_available(*conn_idx), true),
-        SocketState::TcpListen { .. } => (false, false),
-        SocketState::Unbound           => (false, true),
+        SocketState::Udp4 { rx_queue, .. }    => (!rx_queue.is_empty(), true),
+        SocketState::Udp6 { rx_queue, .. }    => (!rx_queue.is_empty(), true),
+        SocketState::TcpActive { conn_idx }   => (crate::net::tcp::rx_available(*conn_idx), true),
+        SocketState::TcpListen { .. }         => (false, false),
+        SocketState::Unbound                  => (false, true),
     };
     use crate::fs::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
     let mut r = 0u32;
@@ -702,20 +815,13 @@ pub fn socket_poll(fd: usize, events: u32) -> Option<u32> {
     Some(r)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// sys_shutdown
-// ─────────────────────────────────────────────────────────────────────────────
+// ── sys_shutdown ─────────────────────────────────────────────────────────────
 
 pub fn sys_shutdown(sock_idx: usize, how: i32) -> isize {
-    let mut table = UDP_SOCKETS.lock();
-    let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) {
-        Some(s) => s,
-        None    => return -9,
-    };
+    let mut table = SOCKETS.lock();
+    let sock = match table.get_mut(sock_idx).and_then(|s| s.as_mut()) { Some(s) => s, None => return -9 };
     match &sock.state {
-        SocketState::UnixConn(conn) => {
-            if how == 1 || how == 2 { conn.close_tx(); }
-        }
+        SocketState::UnixConn(conn) => { if how == 1 || how == 2 { conn.close_tx(); } }
         SocketState::TcpActive { conn_idx } => {
             let idx = *conn_idx;
             drop(table);
@@ -727,9 +833,7 @@ pub fn sys_shutdown(sock_idx: usize, how: i32) -> isize {
     0
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// sys_socketpair  — AF_UNIX SOCK_STREAM only
-// ─────────────────────────────────────────────────────────────────────────────
+// ── sys_socketpair ────────────────────────────────────────────────────────────
 
 pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isize {
     if domain != AF_UNIX         { return -97; }
@@ -740,18 +844,11 @@ pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isiz
         Socket {
             domain: AF_UNIX, kind: SOCK_STREAM, proto: 0,
             state: SocketState::UnixConn(conn),
-            local_port: 0, peer_ip: 0, peer_port: 0,
-            nonblocking: (kind & 0x800) != 0,
+            local: SockAddr::Unbound, peer: SockAddr::Unbound,
+            nonblocking: (kind & 0x800) != 0, v6only: false,
         }
     };
-    let mut table = UDP_SOCKETS.lock();
-    let alloc_slot = |table: &mut Vec<Option<Socket>>, s: Socket| -> usize {
-        if let Some(i) = table.iter().position(|x| x.is_none()) {
-            table[i] = Some(s); i
-        } else {
-            table.push(Some(s)); table.len() - 1
-        }
-    };
+    let mut table = SOCKETS.lock();
     let fd0 = alloc_slot(&mut table, make_sock(conn_a));
     let fd1 = alloc_slot(&mut table, make_sock(conn_b));
     drop(table);
@@ -765,16 +862,14 @@ pub fn sys_socketpair(domain: i32, kind: i32, _proto: i32, sv_va: usize) -> isiz
     0
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// sys_sendmsg / sys_recvmsg
-// ─────────────────────────────────────────────────────────────────────────────
+// ── sys_sendmsg / sys_recvmsg ─────────────────────────────────────────────────
 
 #[repr(C)]
 struct UserIovec { base: usize, len: usize }
 
 fn gather_iovec(iov_va: usize, iovcnt: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
     let iov_size = core::mem::size_of::<UserIovec>();
+    let mut out = Vec::new();
     for i in 0..iovcnt {
         let ptr = iov_va + i * iov_size;
         let mut raw = [0u8; 16];
@@ -789,8 +884,8 @@ fn gather_iovec(iov_va: usize, iovcnt: usize) -> Option<Vec<u8>> {
 }
 
 fn scatter_iovec(iov_va: usize, iovcnt: usize, data: &[u8]) -> usize {
-    let mut written = 0usize;
     let iov_size = core::mem::size_of::<UserIovec>();
+    let mut written = 0usize;
     for i in 0..iovcnt {
         if written >= data.len() { break; }
         let ptr = iov_va + i * iov_size;
@@ -818,43 +913,20 @@ struct UserMsghdr {
     _pad1:          u32,
 }
 
-const MSGHDR_SIZE: usize = core::mem::size_of::<UserMsghdr>();
-
 pub fn sys_sendmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
     if msg_va == 0 { return -14; }
-    let mut raw = [0u8; MSGHDR_SIZE];
+    let mut raw = [0u8; core::mem::size_of::<UserMsghdr>()];
     if crate::uaccess::copy_from_user(msg_va, &mut raw).is_err() { return -14; }
     let hdr: UserMsghdr = unsafe { core::mem::transmute(raw) };
     let data = match gather_iovec(hdr.msg_iov, hdr.msg_iovlen) {
-        Some(d) => d,
-        None    => return -14,
+        Some(d) => d, None => return -14,
     };
-    sys_sendto(sock_idx, data.as_ptr() as usize, data.len(),
-               flags, hdr.msg_name, hdr.msg_namelen)
+    sys_sendto(sock_idx, data.as_ptr() as usize, data.len(), flags, hdr.msg_name, hdr.msg_namelen)
 }
 
 pub fn sys_recvmsg(sock_idx: usize, msg_va: usize, flags: i32) -> isize {
     if msg_va == 0 { return -14; }
-    let mut raw = [0u8; MSGHDR_SIZE];
+    let mut raw = [0u8; core::mem::size_of::<UserMsghdr>()];
     if crate::uaccess::copy_from_user(msg_va, &mut raw).is_err() { return -14; }
     let hdr: UserMsghdr = unsafe { core::mem::transmute(raw) };
-    if hdr.msg_iovlen == 0 { return 0; }
-    let total_cap: usize = {
-        let iov_size = core::mem::size_of::<UserIovec>();
-        let mut cap = 0usize;
-        for i in 0..hdr.msg_iovlen {
-            let ptr = hdr.msg_iov + i * iov_size;
-            let mut iraw = [0u8; 16];
-            if crate::uaccess::copy_from_user(ptr, &mut iraw).is_err() { break; }
-            let iov: UserIovec = unsafe { core::mem::transmute(iraw) };
-            cap += iov.len;
-        }
-        cap
-    };
-    if total_cap == 0 { return 0; }
-    let mut kbuf = alloc::vec![0u8; total_cap];
-    let n = sys_recvfrom(sock_idx, kbuf.as_mut_ptr() as usize, total_cap,
-                         flags, hdr.msg_name, 0);
-    if n <= 0 { return n; }
-    scatter_iovec(hdr.msg_iov, hdr.msg_iovlen, &kbuf[..n as usize]) as isize
-}
+  
