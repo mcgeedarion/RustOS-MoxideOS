@@ -69,7 +69,6 @@ unsafe fn outl(port: u16, val: u32) {
 const PCI_ADDR: u16 = 0xCF8;
 const PCI_DATA: u16 = 0xCFC;
 
-/// Read a 32-bit dword from PCI legacy CAM config space.
 pub unsafe fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let addr: u32 = 0x8000_0000
         | ((bus  as u32) << 16)
@@ -80,7 +79,6 @@ pub unsafe fn pci_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     inl(PCI_DATA)
 }
 
-/// Write a 32-bit dword to PCI legacy CAM config space.
 pub unsafe fn pci_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     let addr: u32 = 0x8000_0000
         | ((bus  as u32) << 16)
@@ -91,33 +89,24 @@ pub unsafe fn pci_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     outl(PCI_DATA, val);
 }
 
-/// Read a 16-bit word via CAM.
 pub unsafe fn pci_read16(bus: u8, dev: u8, func: u8, offset: u8) -> u16 {
     let dw = pci_read32(bus, dev, func, offset & 0xFC);
     ((dw >> ((offset & 2) * 8)) & 0xFFFF) as u16
 }
 
-/// Read a byte via CAM.
 pub unsafe fn pci_read8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
     let dw = pci_read32(bus, dev, func, offset & 0xFC);
     ((dw >> ((offset & 3) * 8)) & 0xFF) as u8
 }
 
-// ── ECAM — Enhanced Configuration Access Mechanism ────────────────────────
-//
-// Physical base address of the ECAM MMIO window (PCI segment 0, bus 0 base).
-// 0 means ECAM unavailable; all config_* functions fall back to CAM.
-// Set by ecam_set_base() after parsing the ACPI MCFG table.
+// ── ECAM ──────────────────────────────────────────────────────────────────
 
 static ECAM_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Store the ECAM MMIO base from MCFG.  Call before pcie_init().
-/// Typical value on QEMU/OVMF: 0xB000_0000.
 pub fn ecam_set_base(base: u64) {
     ECAM_BASE.store(base, Ordering::Release);
 }
 
-/// Raw pointer to the start of a function's 4 KiB ECAM config space.
 #[inline]
 fn ecam_ptr(bus: u8, dev: u8, func: u8) -> *mut u8 {
     let base   = ECAM_BASE.load(Ordering::Acquire);
@@ -125,8 +114,6 @@ fn ecam_ptr(bus: u8, dev: u8, func: u8) -> *mut u8 {
     (base + offset) as *mut u8
 }
 
-/// Read a 32-bit dword — ECAM if available, CAM otherwise.
-/// ECAM supports the full 12-bit (0x000–0xFFC) PCIe config space.
 pub unsafe fn config_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     if ECAM_BASE.load(Ordering::Relaxed) != 0 {
         core::ptr::read_volatile(ecam_ptr(bus, dev, func).add(offset as usize) as *mut u32)
@@ -135,7 +122,6 @@ pub unsafe fn config_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     }
 }
 
-/// Write a 32-bit dword — ECAM if available, CAM otherwise.
 pub unsafe fn config_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
     if ECAM_BASE.load(Ordering::Relaxed) != 0 {
         core::ptr::write_volatile(ecam_ptr(bus, dev, func).add(offset as usize) as *mut u32, val);
@@ -144,13 +130,11 @@ pub unsafe fn config_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) 
     }
 }
 
-/// Read a 16-bit word via ECAM/CAM.
 pub unsafe fn config_read16(bus: u8, dev: u8, func: u8, offset: u16) -> u16 {
     let dw = config_read32(bus, dev, func, offset & !3);
     ((dw >> ((offset & 2) * 8)) & 0xFFFF) as u16
 }
 
-/// Read a byte via ECAM/CAM.
 pub unsafe fn config_read8(bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
     let dw = config_read32(bus, dev, func, offset & !3);
     ((dw >> ((offset & 3) * 8)) & 0xFF) as u8
@@ -161,23 +145,22 @@ pub unsafe fn config_read8(bus: u8, dev: u8, func: u8, offset: u16) -> u8 {
 pub const PCI_VENDOR_ID:     u8 = 0x00;
 pub const PCI_DEVICE_ID:     u8 = 0x02;
 pub const PCI_COMMAND:       u8 = 0x04;
-pub const PCI_CLASS_REV:     u8 = 0x08; // [31:24]=class [23:16]=sub [15:8]=prog-if [7:0]=rev
+pub const PCI_CLASS_REV:     u8 = 0x08;
 pub const PCI_HEADER_TYPE:   u8 = 0x0E;
 pub const PCI_BAR0:          u8 = 0x10;
 pub const PCI_CAP_PTR:       u8 = 0x34;
-pub const PCI_SECONDARY_BUS: u8 = 0x19; // only valid for type-1 headers
+pub const PCI_SECONDARY_BUS: u8 = 0x19;
 
-pub const PCI_CMD_MMIO:      u16 = 1 << 1; // memory space enable
-pub const PCI_CMD_BUSMASTER: u16 = 1 << 2; // DMA enable
+pub const PCI_CMD_MMIO:      u16 = 1 << 1;
+pub const PCI_CMD_BUSMASTER: u16 = 1 << 2;
+pub const PCI_CMD_IOSPACE:   u16 = 1 << 0; // I/O space enable
 
-// PCI class codes (class.subclass)
 pub const PCI_CLASS_STORAGE_IDE:  u32 = 0x0101;
 pub const PCI_CLASS_STORAGE_AHCI: u32 = 0x0106;
 pub const PCI_CLASS_STORAGE_NVME: u32 = 0x0108;
 pub const PCI_CLASS_NETWORK_ETH:  u32 = 0x0200;
 pub const PCI_CLASS_DISPLAY_VGA:  u32 = 0x0300;
 
-// Capability IDs
 const CAP_MSI:  u8 = 0x05;
 const CAP_MSIX: u8 = 0x11;
 
@@ -234,19 +217,30 @@ impl PciDevice {
         ((self.class as u32) << 8) | self.subclass as u32
     }
 
-    /// Enable MMIO + bus-master in the command register.
+    /// Enable MMIO + bus-master + I/O space in the command register.
     pub fn enable(&self) {
         unsafe {
             let cmd = config_read16(self.bus, self.dev, self.func, PCI_COMMAND as u16);
-            config_write32(self.bus, self.dev, self.func, PCI_COMMAND as u16,
-                (cmd | PCI_CMD_MMIO | PCI_CMD_BUSMASTER) as u32);
+            config_write32(
+                self.bus, self.dev, self.func, PCI_COMMAND as u16,
+                (cmd | PCI_CMD_MMIO | PCI_CMD_BUSMASTER | PCI_CMD_IOSPACE) as u32,
+            );
         }
     }
 
-    /// Return the MMIO base address of BARn, or None.
+    /// Return the MMIO base address of BARn, or None if it is an I/O BAR or unset.
     pub fn bar_mmio(&self, n: usize) -> Option<u64> {
         self.bars.get(n).and_then(|b| b.as_ref()).and_then(|b| {
             if !b.is_io { Some(b.base) } else { None }
+        })
+    }
+
+    /// Return the I/O port base of BARn, or None if it is an MMIO BAR or unset.
+    ///
+    /// Used by legacy virtio drivers (BAR0 = I/O port space).
+    pub fn bar_io(&self, n: usize) -> Option<u64> {
+        self.bars.get(n).and_then(|b| b.as_ref()).and_then(|b| {
+            if b.is_io { Some(b.base) } else { None }
         })
     }
 }
@@ -255,8 +249,6 @@ impl PciDevice {
 
 static DEVICES: Mutex<Vec<PciDevice>> = Mutex::new(Vec::new());
 
-/// Walk the entire PCI bus tree and populate the device list.
-/// Call once during early boot, after PMM + heap are up and ECAM is mapped.
 pub fn pcie_init() {
     let mut devs = DEVICES.lock();
     devs.clear();
@@ -305,7 +297,7 @@ fn probe(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
     let device_id = (vd >> 16) as u16;
 
     let cr = unsafe { config_read32(bus, dev, func, PCI_CLASS_REV as u16) };
-    let class   = (cr >> 24) as u8;
+    let class    = (cr >> 24) as u8;
     let subclass = (cr >> 16) as u8;
     let prog_if  = (cr >>  8) as u8;
 
@@ -320,11 +312,7 @@ fn probe(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
     Some(PciDevice { bus, dev, func, vendor_id, device_id, class, subclass, prog_if, bars })
 }
 
-// ── BAR decoding (with firmware preservation) ─────────────────────────────
-//
-// If firmware already assigned a non-zero base address to a BAR, we keep it.
-// Only allocate from our windows when the firmware left the base at zero.
-// This prevents collisions with HPET, LAPIC, IOAPIC, and other firmware MMIO.
+// ── BAR decoding ──────────────────────────────────────────────────────────
 
 fn decode_bars(bus: u8, dev: u8, func: u8) -> [Option<PciBar>; 6] {
     let mut bars: [Option<PciBar>; 6] = Default::default();
@@ -401,9 +389,20 @@ fn decode_bars(bus: u8, dev: u8, func: u8) -> [Option<PciBar>; 6] {
 
 // ── MSI programming ───────────────────────────────────────────────────────
 
-/// Enable MSI (cap 0x05) for a device, routing `vector` to `apic_id`.
-/// Pass apic_id=0 for BSP-only interrupt routing.
-/// Returns true if MSI capability was found and configured.
+/// Enable MSI (cap 0x05) for a device.
+///
+/// ## Fix: MSI Multi Message Enable field
+///
+/// The MSI Message Control register bits [6:4] select how many vectors the
+/// device is granted (MME).  The old code wrote `(mc & !0) | 1`, where
+/// `!0u16 == 0xFFFF` is an identity mask, so it left the MME field unchanged
+/// at whatever firmware had set.  If firmware set MME > 0 (multiple vectors)
+/// and the device had also set the corresponding MMC bits, the device might
+/// use a different vector than `vector` for some interrupts.
+///
+/// The fix clears MME (bits [6:4]) to `000` before setting the MSI Enable
+/// bit, requesting exactly 1 vector.  This matches what Linux does:
+///   mc = (mc & ~PCI_MSI_FLAGS_QSIZE) | PCI_MSI_FLAGS_ENABLE;
 pub fn pci_enable_msi_ex(d: &PciDevice, apic_id: u8, vector: u8) -> bool {
     let mut cap_off = unsafe {
         config_read8(d.bus, d.dev, d.func, PCI_CAP_PTR as u16) & 0xFC
@@ -417,7 +416,7 @@ pub fn pci_enable_msi_ex(d: &PciDevice, apic_id: u8, vector: u8) -> bool {
         if cap_id == CAP_MSI {
             let msg_addr: u32 = 0xFEE0_0000 | ((apic_id as u32) << 12);
             let msg_data: u16 = vector as u16;
-            let mc           = (cap_dw >> 16) as u16;
+            let mc            = (cap_dw >> 16) as u16;
             let is_64bit      = mc & (1 << 7) != 0;
             unsafe {
                 config_write32(d.bus, d.dev, d.func, cap_off + 4, msg_addr);
@@ -425,10 +424,15 @@ pub fn pci_enable_msi_ex(d: &PciDevice, apic_id: u8, vector: u8) -> bool {
                     config_write32(d.bus, d.dev, d.func, cap_off + 8,  0);
                     config_write32(d.bus, d.dev, d.func, cap_off + 12, msg_data as u32);
                 } else {
-                    config_write32(d.bus, d.dev, d.func, cap_off + 8, msg_data as u32);
+                    config_write32(d.bus, d.dev, d.func, cap_off + 8,  msg_data as u32);
                 }
-                config_write32(d.bus, d.dev, d.func, cap_off,
-                    (cap_dw & 0x0000_FFFF) | ((((mc & !0) | 1) as u32) << 16));
+                // Clear MME (bits [6:4]) to request 1 vector; set Enable (bit 0).
+                // Old code: `(mc & !0) | 1` left MME bits unchanged (identity mask).
+                let mc_new = (mc & !0x0070u16) | 1u16;
+                config_write32(
+                    d.bus, d.dev, d.func, cap_off,
+                    (cap_dw & 0x0000_FFFF) | ((mc_new as u32) << 16),
+                );
             }
             return true;
         }
@@ -443,32 +447,7 @@ pub fn pci_enable_msi(d: &PciDevice, vector: u8) -> bool {
 }
 
 // ── MSI-X programming (cap 0x11) ─────────────────────────────────────────
-//
-// MSI-X uses an MMIO table (pointed to by a BAR + offset) instead of a single
-// config-space register.  Each 16-byte entry in the table:
-//   [0x00] msg_addr_lo  (u32)
-//   [0x04] msg_addr_hi  (u32)
-//   [0x08] msg_data     (u32)
-//   [0x0C] vector_ctrl  (u32)  bit 0 = per-vector mask
-//
-// The MSI-X capability structure (at cap_off in config space):
-//   [+0x00] cap_id (0x11), next_cap, message_control
-//       mc bits[10:0] = table_size - 1; bit[14] = function mask; bit[15] = enable
-//   [+0x04] table_offset_and_bir
-//       bits[2:0] = BIR (which BAR holds the table)
-//       bits[31:3] = table offset (8-byte aligned)
-//   [+0x08] pba_offset_and_bir (Pending Bit Array — not used here)
-//
-// Prerequisites before calling:
-//   - dev.enable() must have been called (MMIO + bus-master bits set).
-//   - The BAR that holds the MSI-X table must be mapped as UC in the kernel
-//     page tables.  Map bar_base..bar_base+bar_size as UC before calling.
-//
-// For multi-vector devices, call in a loop:
-//   for (entry, vec) in (0..).zip(MY_VECTORS) { pci_enable_msix(&dev, apic_id, vec, entry); }
 
-/// Enable MSI-X, programming table entry `msix_entry` to fire `vector` on `apic_id`.
-/// Returns true if the MSI-X capability was found and the entry was programmed.
 pub fn pci_enable_msix(d: &PciDevice, apic_id: u8, vector: u8, msix_entry: u16) -> bool {
     let mut cap_off = unsafe {
         config_read8(d.bus, d.dev, d.func, PCI_CAP_PTR as u16) & 0xFC
@@ -489,24 +468,22 @@ pub fn pci_enable_msix(d: &PciDevice, apic_id: u8, vector: u8, msix_entry: u16) 
                 None    => return false,
             };
 
-            // Pointer to the 16-byte MSI-X table entry.
-            // Assumes the BAR's MMIO is mapped (identity or at bar_base).
             let entry_va = (bar_base + tbl_offset + msix_entry as u64 * 16) as *mut u32;
 
             let msg_addr_lo: u32 = 0xFEE0_0000 | ((apic_id as u32) << 12);
-            let msg_data: u32    = vector as u32; // fixed delivery, edge trigger
+            let msg_data: u32    = vector as u32;
 
             unsafe {
-                // Mask before writing (vector_ctrl bit 0 = 1).
+                // Mask the entry before modifying it.
                 let ctrl_ptr = entry_va.add(3);
                 core::ptr::write_volatile(ctrl_ptr,
                     core::ptr::read_volatile(ctrl_ptr) | 1);
 
                 core::ptr::write_volatile(entry_va.add(0), msg_addr_lo);
-                core::ptr::write_volatile(entry_va.add(1), 0u32); // addr hi = 0
+                core::ptr::write_volatile(entry_va.add(1), 0u32);
                 core::ptr::write_volatile(entry_va.add(2), msg_data);
 
-                // Unmask (clear bit 0 of vector_ctrl).
+                // Unmask.
                 core::ptr::write_volatile(entry_va.add(3),
                     core::ptr::read_volatile(entry_va.add(3)) & !1);
             }
@@ -528,38 +505,22 @@ pub fn pci_enable_msix(d: &PciDevice, apic_id: u8, vector: u8, msix_entry: u16) 
 
 // ── Public accessors ──────────────────────────────────────────────────────
 
-/// Iterate over all discovered PCI devices, calling `f` for each.
 pub fn with_devices<F: FnMut(&PciDevice)>(mut f: F) {
     for d in DEVICES.lock().iter() { f(d); }
 }
 
-/// Find the first device matching a class/subclass pair.
-/// Common values: PCI_CLASS_STORAGE_NVME (0x0108), PCI_CLASS_NETWORK_ETH (0x0200).
 pub fn find_device_by_class(class_sub: u32) -> Option<PciDevice> {
     DEVICES.lock().iter()
         .find(|d| d.class_sub() == class_sub)
         .cloned()
 }
 
-/// Find the first device matching a specific vendor + device ID.
-///
-/// Common IDs:
-///   Intel NVMe:         (0x8086, 0x0953)
-///   Intel e1000e NIC:   (0x8086, 0x10D3)
-///   Intel igb NIC:      (0x8086, 0x10C9)
-///   Realtek r8169 NIC:  (0x10EC, 0x8169)
-///   AMD NVMe (FCH):     (0x1022, 0x7901)
-///   AMD GPU (Navi):     (0x1002, 0x731F)
-///   virtio-net:         (0x1AF4, 0x1000)
-///   virtio-blk:         (0x1AF4, 0x1001)
 pub fn find_device_by_id(vendor: u16, device: u16) -> Option<PciDevice> {
     DEVICES.lock().iter()
         .find(|d| d.vendor_id == vendor && d.device_id == device)
         .cloned()
 }
 
-/// Find all devices matching a vendor + device ID.
-/// Use for multi-port NICs, multiple NVMe controllers, etc.
 pub fn find_all_devices_by_id(vendor: u16, device: u16) -> Vec<PciDevice> {
     DEVICES.lock().iter()
         .filter(|d| d.vendor_id == vendor && d.device_id == device)
