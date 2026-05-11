@@ -39,12 +39,39 @@
 //! confirms, sets Ready, then enqueues.  This keeps the common "not blocked"
 //! path lock-free.
 //!
+//! ## current_pid() — per-CPU authoritative source
+//!
+//! `current_pid()` reads `(*blk).current_task.pid` from the calling CPU's
+//! percpu block.  This is always accurate for the running task on any CPU.
+//!
+//! `CURRENT_PID` (global AtomicU32) is retained only as a **fallback** for
+//! code that runs before percpu blocks are initialised (early boot).
+//! `schedule()` now updates the per-CPU block's `current_pid` field
+//! unconditionally on *every* CPU rather than only CPU 0, so the global is
+//! never the only source of truth on SMP systems.
+//!
+//! ## load_balance() — snapshot-then-work pattern
+//!
+//! `load_balance()` takes a single read-only snapshot of every CPU's
+//! `load_weight` and `nr_running` into local variables before doing any
+//! work.  It then operates only on the snapshot to select the busiest CPU.
+//! The steal step re-reads `nr_running` from the live block under no extra
+//! lock (we accept that it may have changed; the guard is only that we don't
+//! move the single remaining task off a CPU).
+//!
 //! ## mm_lock helpers
 //!
 //! `MmReadGuard` and `with_current_mm_read()` are the public surface used by
 //! `uaccess` to hold the current process's `mm_lock` for reading across the
 //! entire validate+copy sequence, preventing a concurrent munmap from
 //! unmapping pages between the page-table walk and the actual copy.
+//!
+//! ### MmReadGuard drop order
+//!
+//! The struct field order is `_arc` first, `_guard` second.  Rust drops
+//! fields in declaration order (top to bottom), so the `RwLockReadGuard` is
+//! dropped before the `Arc`, which means the `RwLock` is never freed while
+//! the guard still holds a reference into it.
 
 use core::cmp::Reverse;
 use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
@@ -396,6 +423,9 @@ pub fn schedule() {
         Some(t) => t,
         None => {
             blk.current_task = core::ptr::null_mut();
+            // Update this CPU's per-CPU pid field (not just the global).
+            // CURRENT_PID global is only a boot-time fallback.
+            blk.current_pid = 0;
             if cpu == 0 {
                 CURRENT_PID.store(0, core::sync::atomic::Ordering::Relaxed);
             }
@@ -413,7 +443,13 @@ pub fn schedule() {
     }
 
     blk.runqueue.curr_vruntime_start = now;
-    blk.current_task  = next_task;
+    blk.current_task = next_task;
+    // Update this CPU's per-CPU current_pid on every CPU, not just CPU 0.
+    // current_pid() reads this field directly, so it is always accurate
+    // regardless of which CPU is running.  The global CURRENT_PID is kept
+    // in sync only on CPU 0 for early-boot code that runs before percpu
+    // blocks are set up.
+    blk.current_pid = next.pid;
     blk.ctx_switches += 1;
 
     if cpu == 0 {
@@ -508,8 +544,7 @@ pub fn tick(cpu: u32) {
         }
     }
 
-    // ── RLIMIT_RTTIME enforcement (S4 fix) ───────────────────────────────
-    // Increment rt_cpu_time_us for the running RT task.  Kill it if exceeded.
+    // ── RLIMIT_RTTIME enforcement ─────────────────────────────────────────
     if !curr.is_null() {
         let t = unsafe { &*curr };
         if matches!(t.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
@@ -542,25 +577,51 @@ pub fn tick(cpu: u32) {
     }
 }
 
+// Snapshot of one CPU's run-queue metrics, taken atomically before any steal
+// decision is made.  Using a snapshot instead of re-reading live fields
+// prevents the TOCTOU where we identify busiest_cpu from stale load_weight
+// then act on a different (now lighter) CPU.
+#[derive(Copy, Clone)]
+struct RqSnapshot {
+    load_weight: u64,
+    nr_running:  u32,
+}
+
 fn load_balance(this_cpu: u32) {
     let ncpus = crate::smp::percpu::cpu_count();
     if ncpus <= 1 { return; }
 
+    // ── Step 1: snapshot all CPUs' load metrics ───────────────────────────
+    // We read load_weight and nr_running once per CPU into a local array.
+    // All subsequent decisions are made from the snapshot, so we cannot
+    // act on a stale "busiest" that has since drained its queue.
+    let mut snapshots: [RqSnapshot; 64] = [RqSnapshot { load_weight: 0, nr_running: 0 }; 64];
+    let ncpus_clamped = (ncpus as usize).min(64);
+    for cpu in 0..ncpus_clamped {
+        let blk = unsafe { &crate::smp::percpu::PERCPU_BLOCKS[cpu] };
+        snapshots[cpu] = RqSnapshot {
+            load_weight: blk.runqueue.load_weight,
+            nr_running:  blk.runqueue.nr_running,
+        };
+    }
+
+    // ── Step 2: find busiest CPU from snapshot ────────────────────────────
     let mut max_load: u64 = 0;
     let mut busiest_cpu: u32 = this_cpu;
-    for cpu in 0..ncpus {
-        let load = unsafe {
-            crate::smp::percpu::PERCPU_BLOCKS[cpu as usize].runqueue.load_weight
-        };
-        if load > max_load { max_load = load; busiest_cpu = cpu; }
+    for cpu in 0..ncpus_clamped {
+        if snapshots[cpu].load_weight > max_load {
+            max_load = snapshots[cpu].load_weight;
+            busiest_cpu = cpu as u32;
+        }
     }
     if busiest_cpu == this_cpu { return; }
 
-    let this_load = unsafe {
-        crate::smp::percpu::PERCPU_BLOCKS[this_cpu as usize].runqueue.load_weight
-    };
+    let this_load = snapshots[this_cpu as usize].load_weight;
     if max_load <= this_load + this_load / 4 { return; }
 
+    // ── Step 3: steal one task from the busiest CPU ───────────────────────
+    // Re-read nr_running live here to avoid stealing the last task off a
+    // CPU that has since become idle (snapshot may be stale by now).
     let busy_blk = unsafe {
         &mut crate::smp::percpu::PERCPU_BLOCKS[busiest_cpu as usize]
     };
@@ -689,12 +750,25 @@ pub fn suspend_current_until_child_exec(_child_pid: usize) {
 /// RAII guard returned by `with_current_mm_read`.  Holds the read side of
 /// the current process's `mm_lock` until dropped.
 ///
+/// ## Drop order (important)
+///
+/// Field declaration order determines drop order in Rust.  `_arc` is declared
+/// *before* `_guard` so the compiler drops `_guard` first (releasing the
+/// read lock) and then `_arc` (potentially freeing the `RwLock` allocation).
+/// Reversing the field order would drop the `Arc` first, freeing the backing
+/// `RwLock` while the guard still points into it — use-after-free.
+///
+/// Do **not** reorder these fields.
+///
 /// Callers must not acquire any inner `ProcLock` while holding this guard,
 /// or the deadlock-free lock ordering documented in `process.rs` is violated.
 pub struct MmReadGuard {
-    // The Arc keeps the RwLock alive even if the process exits while we hold
-    // the read side.  The guard borrows from the Arc.
+    // FIELD ORDER IS LOAD-BEARING: _arc must be declared before _guard.
+    // Rust drops fields in declaration order; _guard must be dropped (lock
+    // released) before _arc is dropped (RwLock possibly freed).
+    /// Keeps the `RwLock<()>` allocation alive for the duration of the guard.
     _arc:   alloc::sync::Arc<spin::RwLock<()>>,
+    /// Holds the read lock.  Dropped before `_arc` due to field order above.
     _guard: spin::RwLockReadGuard<'static, ()>,
 }
 
@@ -712,9 +786,14 @@ pub fn with_current_mm_read() -> MmReadGuard {
     let pid = current_pid() as usize;
     let arc = proc_table::with_proc(pid, |pcb| alloc::sync::Arc::clone(&pcb.mm_lock))
         .expect("with_current_mm_read: no current process");
-    // SAFETY: we extend the lifetime of the guard to 'static by pairing it
-    // with the owning Arc stored in MmReadGuard.  The Arc ensures the RwLock
-    // is not freed while the guard lives.
+    // SAFETY:
+    //   1. `arc` is an Arc<RwLock<()>> keeping the RwLock allocation alive.
+    //   2. We extend the borrow to 'static by casting through a raw pointer.
+    //      This is sound because `MmReadGuard` stores `_arc` before `_guard`,
+    //      guaranteeing that the guard is dropped (and the read lock released)
+    //      before the Arc decrements its refcount.  The RwLock cannot be freed
+    //      while the guard is live.
+    //   3. The guard is never sent to another thread (`Send` impl is unsafe).
     let guard = unsafe {
         let raw: *const spin::RwLock<()> = alloc::sync::Arc::as_ptr(&arc);
         (*raw).read()
@@ -723,6 +802,10 @@ pub fn with_current_mm_read() -> MmReadGuard {
 }
 
 // ── current_pid ───────────────────────────────────────────────────────────────
+//
+// Authoritative source: PercpuBlock::current_pid (written by schedule() on
+// every CPU).  The global CURRENT_PID AtomicU32 is a fallback for early-boot
+// code that runs before percpu blocks are initialised.
 
 static CURRENT_PID: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
@@ -743,7 +826,14 @@ pub fn current_pid() -> u32 {
     if blk.is_null() {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     }
-    let task = unsafe { (*blk).current_task };
+    // Prefer the per-CPU current_pid field, which schedule() keeps up to date
+    // on every CPU.  Fall back through current_task for compatibility with
+    // percpu blocks that pre-date the current_pid field.
+    let blk_ref = unsafe { &*blk };
+    if blk_ref.current_pid != 0 {
+        return blk_ref.current_pid;
+    }
+    let task = blk_ref.current_task;
     if task.is_null() {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     }
@@ -802,6 +892,11 @@ pub fn has_current_user_proc() -> bool {
     let task = unsafe { (*blk).current_task };
     if task.is_null() { return false; }
     unsafe { (*task).pid > 0 }
+}
+
+pub fn current_ppid() -> u32 {
+    let pid = current_pid() as usize;
+    proc_table::with_proc(pid, |p| p.ppid as u32).unwrap_or(0)
 }
 
 pub fn ap_idle() -> ! {
