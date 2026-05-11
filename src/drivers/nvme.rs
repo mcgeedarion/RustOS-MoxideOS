@@ -33,13 +33,14 @@
 //!   0x1008 SQ1TDB (u32)  IO SQ tail doorbell
 //!   0x100C CQ1HDB (u32)  IO CQ head doorbell
 //!
-//! ## Wiring in kernel_main
-//!   ```
-//!   // After pcie_init():
-//!   nvme::nvme_probe();
-//!   idt.set_handler(nvme::NVME_IRQ_VECTOR, nvme_irq_stub);
-//!   // naked extern fn nvme_irq_stub calls nvme::nvme_irq()
-//!   ```
+//! ## sfence vs mfence in the submit path
+//!
+//! The NVMe spec requires that all SQE stores are visible to the device
+//! before the doorbell write.  This ordering only involves *stores* — there
+//! is no requirement to order loads before the doorbell.  `mfence` (a full
+//! store+load barrier, ~100 cycles on modern Intel) is therefore stronger
+//! than necessary.  `sfence` (store-only barrier, ~1 cycle) is sufficient
+//! and is what Linux and other production NVMe drivers use.
 
 extern crate alloc;
 use alloc::string::String;
@@ -54,7 +55,6 @@ use crate::mm::pmm;
 
 // ── IRQ vector ────────────────────────────────────────────────────────────
 
-/// IDT vector reserved for the NVMe MSI-X interrupt.
 pub const NVME_IRQ_VECTOR: u8 = 0x32;
 
 // ── NVMe register offsets (BAR0) ──────────────────────────────────────────
@@ -69,38 +69,31 @@ const NVME_REG_AQA:    u64 = 0x024;
 const NVME_REG_ASQ:    u64 = 0x028;
 const NVME_REG_ACQ:    u64 = 0x030;
 
-// Doorbell base offset and stride (4 << CAP.DSTRD, DSTRD usually 0 → stride = 4)
 const NVME_DOORBELL_BASE: u64 = 0x1000;
 
-// CC bits
 const CC_EN:       u32 = 1 << 0;
-const CC_CSS_NVM:  u32 = 0 << 4;  // NVM command set
-const CC_MPS_4K:   u32 = 0 << 7;  // 4 KiB memory page size (2^(12+MPS))
-const CC_AMS_RR:   u32 = 0 << 11; // Round-robin arbitration
-const CC_SQS_64:   u32 = 6 << 16; // IO SQ entry size = 2^6 = 64 bytes
-const CC_CQS_16:   u32 = 4 << 20; // IO CQ entry size = 2^4 = 16 bytes
+const CC_CSS_NVM:  u32 = 0 << 4;
+const CC_MPS_4K:   u32 = 0 << 7;
+const CC_AMS_RR:   u32 = 0 << 11;
+const CC_SQS_64:   u32 = 6 << 16;
+const CC_CQS_16:   u32 = 4 << 20;
 
-// CSTS bits
 const CSTS_RDY:   u32 = 1 << 0;
 const CSTS_CFS:   u32 = 1 << 1;
 
-// Admin command opcodes
 const ADMIN_DELETE_IO_SQ:  u8 = 0x00;
 const ADMIN_CREATE_IO_SQ:  u8 = 0x01;
 const ADMIN_DELETE_IO_CQ:  u8 = 0x04;
 const ADMIN_CREATE_IO_CQ:  u8 = 0x05;
 const ADMIN_IDENTIFY:      u8 = 0x06;
 
-// NVM command opcodes
 const NVM_FLUSH:  u8 = 0x00;
 const NVM_WRITE:  u8 = 0x01;
 const NVM_READ:   u8 = 0x02;
 
-// Identify CNS values
 const CNS_NAMESPACE:  u8 = 0x00;
 const CNS_CONTROLLER: u8 = 0x01;
 
-// Queue depth (number of entries)
 const QUEUE_DEPTH: usize = 64;
 
 // ── Submission Queue Entry (SQE) — 64 bytes ───────────────────────────────
@@ -108,13 +101,13 @@ const QUEUE_DEPTH: usize = 64;
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Default)]
 struct Sqe {
-    cdw0:    u32, // [7:0]=opcode [9:8]=fuse [15:14]=psdt [31:16]=CID
+    cdw0:    u32,
     nsid:    u32,
     cdw2:    u32,
     cdw3:    u32,
-    mptr:    u64, // metadata pointer
-    prp1:    u64, // first PRP entry (or SGL descriptor)
-    prp2:    u64, // second PRP entry (or PRP list pointer)
+    mptr:    u64,
+    prp1:    u64,
+    prp2:    u64,
     cdw10:   u32,
     cdw11:   u32,
     cdw12:   u32,
@@ -128,10 +121,10 @@ struct Sqe {
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
 struct Cqe {
-    dw0:  u32, // command-specific result
-    dw1:  u32, // reserved
-    dw2:  u32, // [15:0]=SQ head ptr [31:16]=SQ identifier
-    dw3:  u32, // [15:0]=CID  [16]=phase  [31:17]=status field
+    dw0:  u32,
+    dw1:  u32,
+    dw2:  u32,
+    dw3:  u32,
 }
 
 impl Cqe {
@@ -143,17 +136,13 @@ impl Cqe {
 // ── Queue pair ────────────────────────────────────────────────────────────
 
 struct Queue {
-    /// Physical/virtual base of the SQ (64 × 64-byte SQEs = 4 KiB)
     sq_base: u64,
-    /// Physical/virtual base of the CQ (64 × 16-byte CQEs = 1 KiB, padded to 4 KiB)
     cq_base: u64,
     sq_tail: u32,
     cq_head: u32,
-    cq_phase: bool, // expected phase bit for next CQE
+    cq_phase: bool,
     next_cid: u16,
-    /// Doorbell MMIO pointer for SQ tail
     sq_db: *mut u32,
-    /// Doorbell MMIO pointer for CQ head
     cq_db: *mut u32,
 }
 
@@ -172,7 +161,10 @@ impl Queue {
     }
 
     /// Submit a pre-filled SQE, ring the tail doorbell.
-    /// Returns the CID assigned to this command.
+    ///
+    /// Uses `sfence` (not `mfence`) to order the SQE stores before the
+    /// doorbell write.  Only store ordering is required by the NVMe spec;
+    /// `mfence` (~100 cycles) is unnecessarily expensive here.
     unsafe fn submit(&mut self, mut sqe: Sqe) -> u16 {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1).max(1);
@@ -181,13 +173,19 @@ impl Queue {
         let slot = (self.sq_base as *mut Sqe).add(self.sq_tail as usize);
         core::ptr::write_volatile(slot, sqe);
 
+        // sfence: ensure all SQE stores are globally visible before the
+        // doorbell write.  Store-only barrier; ~1 cycle on modern Intel.
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("sfence", options(nostack, preserves_flags));
+        // On RISC-V use a store fence (fence w,w).
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!("fence w,w", options(nostack));
+
         self.sq_tail = (self.sq_tail + 1) % QUEUE_DEPTH as u32;
         core::ptr::write_volatile(self.sq_db, self.sq_tail);
         cid
     }
 
-    /// Poll the CQ until a CQE with `cid` appears or `retries` spins elapse.
-    /// Returns the status field (0 = success).
     unsafe fn poll(&mut self, cid: u16, retries: usize) -> u16 {
         for _ in 0..retries {
             let slot = (self.cq_base as *mut Cqe).add(self.cq_head as usize);
@@ -196,16 +194,14 @@ impl Queue {
                 let status = cqe.status();
                 self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u32;
                 if self.cq_head == 0 { self.cq_phase = !self.cq_phase; }
-                // Ack CQ head to controller
                 core::ptr::write_volatile(self.cq_db, self.cq_head);
                 return status;
             }
             core::arch::asm!("pause", options(nomem, nostack));
         }
-        0xFFFF // timeout
+        0xFFFF
     }
 
-    /// Drain all newly-completed CQEs (IRQ path — no specific CID).
     unsafe fn drain(&mut self) {
         loop {
             let slot = (self.cq_base as *mut Cqe).add(self.cq_head as usize);
@@ -221,12 +217,12 @@ impl Queue {
 // ── Controller state ──────────────────────────────────────────────────────
 
 struct NvmeCtrl {
-    bar0:       u64,   // BAR0 MMIO virtual base
-    db_stride:  u64,   // doorbell register stride in bytes (4 << DSTRD)
+    bar0:       u64,
+    db_stride:  u64,
     admin:      Queue,
     io:         Queue,
-    ns_size:    u64,   // total LBA count (from Identify NS NSZE)
-    lba_shift:  u32,   // log2 of LBA size (from LBAF[FLBAS].LBADS); usually 9 (512B) or 12 (4KiB)
+    ns_size:    u64,
+    lba_shift:  u32,
     ready:      bool,
 }
 
@@ -243,8 +239,6 @@ impl NvmeCtrl {
         }
     }
 
-    // ── Register accessors ────────────────────────────────────────────
-
     #[inline] unsafe fn read32(&self, off: u64) -> u32 {
         core::ptr::read_volatile((self.bar0 + off) as *const u32)
     }
@@ -258,40 +252,25 @@ impl NvmeCtrl {
         core::ptr::write_volatile((self.bar0 + off) as *mut u64, v);
     }
 
-    // ── Doorbell helpers ──────────────────────────────────────────────
-
-    /// Return a *mut u32 doorbell pointer given its index in the doorbell array.
-    /// Doorbells start at BAR0+0x1000, spaced db_stride bytes apart.
-    /// Index layout: SQ0TDB=0, CQ0HDB=1, SQ1TDB=2, CQ1HDB=3, ...
     fn db_ptr(&self, idx: usize) -> *mut u32 {
         (self.bar0 + NVME_DOORBELL_BASE + idx as u64 * self.db_stride) as *mut u32
     }
 
-    // ── Allocate one 4 KiB physically-contiguous page from PMM ───────
-
     fn alloc_page() -> u64 {
         let pa = pmm::alloc_page();
         assert!(pa != 0, "nvme: PMM out of memory");
-        // Zero the page so SQEs/CQEs start in a known state.
         unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
         pa
     }
 
-    // ── Controller reset ──────────────────────────────────────────────
-
-    /// Disable the controller and wait for CSTS.RDY to clear.
-    /// Returns false on timeout.
     unsafe fn reset(&mut self) -> bool {
         let cap = self.read64(NVME_REG_CAP);
-        // CAP.TO [31:24] — timeout in 500 ms units
         let to_500ms = ((cap >> 24) & 0xFF) as u64;
-        let spin_limit: u64 = (to_500ms + 1) * 500_000; // rough loop count
+        let spin_limit: u64 = (to_500ms + 1) * 500_000;
 
-        // Clear CC.EN
         let cc = self.read32(NVME_REG_CC);
         self.write32(NVME_REG_CC, cc & !CC_EN);
 
-        // Wait for CSTS.RDY=0
         for _ in 0..spin_limit {
             if self.read32(NVME_REG_CSTS) & CSTS_RDY == 0 { return true; }
             core::arch::asm!("pause", options(nomem, nostack));
@@ -299,13 +278,10 @@ impl NvmeCtrl {
         false
     }
 
-    // ── Admin queue setup ─────────────────────────────────────────────
-
     unsafe fn setup_admin_queues(&mut self) {
         let sq_pa = Self::alloc_page();
         let cq_pa = Self::alloc_page();
 
-        // AQA: admin CQ size [27:16] and admin SQ size [11:0], 0-based
         let aqa: u32 = (((QUEUE_DEPTH - 1) as u32) << 16) | (QUEUE_DEPTH - 1) as u32;
         self.write32(NVME_REG_AQA, aqa);
         self.write64(NVME_REG_ASQ, sq_pa);
@@ -316,13 +292,10 @@ impl NvmeCtrl {
         self.admin.sq_tail  = 0;
         self.admin.cq_head  = 0;
         self.admin.cq_phase = true;
-        self.admin.sq_db    = self.db_ptr(0); // SQ0TDB
-        self.admin.cq_db    = self.db_ptr(1); // CQ0HDB
+        self.admin.sq_db    = self.db_ptr(0);
+        self.admin.cq_db    = self.db_ptr(1);
     }
 
-    // ── Enable controller ─────────────────────────────────────────────
-
-    /// Set CC fields and raise CC.EN. Spin until CSTS.RDY=1.
     unsafe fn enable(&mut self) -> bool {
         let cap = self.read64(NVME_REG_CAP);
         let to_500ms = ((cap >> 24) & 0xFF) as u64;
@@ -333,25 +306,20 @@ impl NvmeCtrl {
 
         for _ in 0..spin_limit {
             let csts = self.read32(NVME_REG_CSTS);
-            if csts & CSTS_CFS != 0 { return false; } // fatal status
+            if csts & CSTS_CFS != 0 { return false; }
             if csts & CSTS_RDY != 0 { return true;  }
             core::arch::asm!("pause", options(nomem, nostack));
         }
         false
     }
 
-    // ── Admin command helpers ─────────────────────────────────────────
-
-    /// Send one admin command and poll for completion. Returns status (0=OK).
     unsafe fn admin_cmd(&mut self, sqe: Sqe) -> u16 {
         let cid = self.admin.submit(sqe);
         self.admin.poll(cid, 4_000_000)
     }
 
-    // ── Identify Controller (CNS=1) ───────────────────────────────────
-
     unsafe fn identify_controller(&mut self) -> String {
-        let buf_pa = Self::alloc_page(); // 4 KiB Identify data structure
+        let buf_pa = Self::alloc_page();
         let sqe = Sqe {
             cdw0:  ADMIN_IDENTIFY as u32,
             nsid:  0,
@@ -363,7 +331,6 @@ impl NvmeCtrl {
         let status = self.admin_cmd(sqe);
         let mut model = String::new();
         if status == 0 {
-            // Identify Controller bytes [24..63] = Model Number (ASCII, space-padded)
             let ptr = buf_pa as *const u8;
             for i in 24..64usize {
                 let b = core::ptr::read_volatile(ptr.add(i));
@@ -371,12 +338,9 @@ impl NvmeCtrl {
                 model.push(b as char);
             }
         }
-        // Return page to PMM
         pmm::free_page(buf_pa);
         model
     }
-
-    // ── Identify Namespace 1 (CNS=0) ─────────────────────────────────
 
     unsafe fn identify_namespace(&mut self) {
         let buf_pa = Self::alloc_page();
@@ -391,26 +355,19 @@ impl NvmeCtrl {
         let status = self.admin_cmd(sqe);
         if status == 0 {
             let ptr = buf_pa as *const u64;
-            // NSZE at offset 0 (bytes 0–7)
             self.ns_size = core::ptr::read_volatile(ptr);
-            // FLBAS at byte 26: bits [3:0] = index into LBAF array
             let flbas = core::ptr::read_volatile((buf_pa + 26) as *const u8) & 0xF;
-            // LBAF[i] at offset 128 + i*4; bits [23:16] = LBADS
             let lbaf_off = 128 + flbas as u64 * 4;
             let lbaf = core::ptr::read_volatile((buf_pa + lbaf_off) as *const u32);
             self.lba_shift = (lbaf >> 16) & 0xFF;
-            if self.lba_shift == 0 { self.lba_shift = 9; } // default 512B
+            if self.lba_shift == 0 { self.lba_shift = 9; }
         }
         pmm::free_page(buf_pa);
     }
 
-    // ── Create IO Completion Queue (Admin cmd 0x05) ───────────────────
-
     unsafe fn create_io_cq(&mut self, cq_pa: u64) -> bool {
-        // CDW10: [15:0]=QID=1, [31:16]=QSIZE-1
-        // CDW11: [0]=PC (physically contiguous), [1]=IEN (IRQ enable), [31:16]=IV=0
         let cdw10: u32 = 1 | (((QUEUE_DEPTH - 1) as u32) << 16);
-        let cdw11: u32 = 1 | (1 << 1); // PC=1, IEN=1, IV=0
+        let cdw11: u32 = 1 | (1 << 1);
         let sqe = Sqe {
             cdw0:  ADMIN_CREATE_IO_CQ as u32,
             prp1:  cq_pa,
@@ -420,13 +377,9 @@ impl NvmeCtrl {
         self.admin_cmd(sqe) == 0
     }
 
-    // ── Create IO Submission Queue (Admin cmd 0x01) ───────────────────
-
     unsafe fn create_io_sq(&mut self, sq_pa: u64) -> bool {
-        // CDW10: [15:0]=QID=1, [31:16]=QSIZE-1
-        // CDW11: [0]=PC, [15:1]=reserved, [31:16]=CQID=1 (associated CQ)
         let cdw10: u32 = 1 | (((QUEUE_DEPTH - 1) as u32) << 16);
-        let cdw11: u32 = 1 | (1 << 16); // PC=1, CQID=1
+        let cdw11: u32 = 1 | (1 << 16);
         let sqe = Sqe {
             cdw0:  ADMIN_CREATE_IO_SQ as u32,
             prp1:  sq_pa,
@@ -435,8 +388,6 @@ impl NvmeCtrl {
         };
         self.admin_cmd(sqe) == 0
     }
-
-    // ── IO queue setup ────────────────────────────────────────────────
 
     unsafe fn setup_io_queues(&mut self) -> bool {
         let cq_pa = Self::alloc_page();
@@ -450,8 +401,8 @@ impl NvmeCtrl {
         self.io.sq_tail  = 0;
         self.io.cq_head  = 0;
         self.io.cq_phase = true;
-        self.io.sq_db    = self.db_ptr(2); // SQ1TDB
-        self.io.cq_db    = self.db_ptr(3); // CQ1HDB
+        self.io.sq_db    = self.db_ptr(2);
+        self.io.cq_db    = self.db_ptr(3);
         true
     }
 }
@@ -462,8 +413,6 @@ static CTRL: Mutex<NvmeCtrl> = Mutex::new(NvmeCtrl::uninit());
 
 // ── Public API ────────────────────────────────────────────────────────────
 
-/// Probe, reset, identify, and set up the NVMe controller.
-/// Call after pcie_init() and before any storage I/O.
 pub fn nvme_probe() {
     let dev = match find_device_by_class(PCI_CLASS_STORAGE_NVME) {
         Some(d) => d,
@@ -483,7 +432,6 @@ pub fn nvme_probe() {
 
     dev.enable();
 
-    // Enable MSI-X (entry 0), fall back to MSI, then run polled.
     let irq_mode = if pci_enable_msix(&dev, 0, NVME_IRQ_VECTOR, 0) {
         "MSI-X"
     } else if pci_enable_msi_ex(&dev, 0, NVME_IRQ_VECTOR) {
@@ -495,12 +443,10 @@ pub fn nvme_probe() {
     let mut ctrl = CTRL.lock();
     ctrl.bar0      = bar0;
 
-    // Read doorbell stride from CAP.DSTRD [35:32]
     let cap = unsafe { ctrl.read64(NVME_REG_CAP) };
     let dstrd = ((cap >> 32) & 0xF) as u64;
     ctrl.db_stride = 4u64 << dstrd;
 
-    // Log version
     let vs = unsafe { ctrl.read32(NVME_REG_VS) };
     crate::arch::x86_64::serial::serial_println!(
         "nvme: BAR0={:#x} vs={}.{} irq={}",
@@ -509,33 +455,27 @@ pub fn nvme_probe() {
         irq_mode
     );
 
-    // 1. Reset
     if !unsafe { ctrl.reset() } {
         crate::arch::x86_64::serial::serial_println!("nvme: reset timeout");
         return;
     }
 
-    // 2. Admin queues (must be before CC.EN)
     unsafe { ctrl.setup_admin_queues(); }
 
-    // 3. Enable
     if !unsafe { ctrl.enable() } {
         crate::arch::x86_64::serial::serial_println!("nvme: enable timeout / CFS");
         return;
     }
 
-    // 4. Identify Controller
     let model = unsafe { ctrl.identify_controller() };
     crate::arch::x86_64::serial::serial_println!("nvme: model: {}", model);
 
-    // 5. Identify Namespace 1
     unsafe { ctrl.identify_namespace(); }
     crate::arch::x86_64::serial::serial_println!(
         "nvme: ns1 size={} LBAs  lba_shift={}",
         ctrl.ns_size, ctrl.lba_shift
     );
 
-    // 6. IO queues
     if !unsafe { ctrl.setup_io_queues() } {
         crate::arch::x86_64::serial::serial_println!("nvme: IO queue creation failed");
         return;
@@ -545,32 +485,24 @@ pub fn nvme_probe() {
     crate::arch::x86_64::serial::serial_println!("nvme: ready");
 }
 
-/// Return the total number of logical blocks on namespace 1.
-/// Returns 0 if the controller has not been successfully probed.
 pub fn nvme_capacity() -> u64 {
     CTRL.lock().ns_size
 }
 
-/// Return the LBA size in bytes (typically 512 or 4096).
 pub fn nvme_lba_size() -> u32 {
     1u32 << CTRL.lock().lba_shift
 }
 
-/// Read `count` contiguous LBAs starting at `lba` into `buf`.
-/// `buf` must be physically contiguous and at least `count * lba_size` bytes.
-/// Returns true on success.
 pub fn nvme_read(lba: u64, count: u16, buf: *mut u8) -> bool {
     let mut ctrl = CTRL.lock();
     if !ctrl.ready { return false; }
     let buf_pa = buf as u64;
 
-    // CDW10: SLBA low 32 bits  CDW11: SLBA high 32 bits
-    // CDW12: [15:0]=NLB-1 (0-based number of logical blocks)
     let sqe = Sqe {
         cdw0:  NVM_READ as u32,
         nsid:  1,
         prp1:  buf_pa,
-        prp2:  0, // single-page transfer ≤ 4 KiB; for larger use PRP list
+        prp2:  0,
         cdw10: (lba & 0xFFFF_FFFF) as u32,
         cdw11: (lba >> 32) as u32,
         cdw12: (count as u32).saturating_sub(1),
@@ -581,9 +513,6 @@ pub fn nvme_read(lba: u64, count: u16, buf: *mut u8) -> bool {
     status == 0
 }
 
-/// Write `count` contiguous LBAs starting at `lba` from `buf`.
-/// `buf` must be physically contiguous and at least `count * lba_size` bytes.
-/// Returns true on success.
 pub fn nvme_write(lba: u64, count: u16, buf: *const u8) -> bool {
     let mut ctrl = CTRL.lock();
     if !ctrl.ready { return false; }
@@ -604,23 +533,18 @@ pub fn nvme_write(lba: u64, count: u16, buf: *const u8) -> bool {
     status == 0
 }
 
-/// Convenience wrapper: read a single 512-byte sector.
 pub fn nvme_read_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
     nvme_read(lba, 1, buf.as_mut_ptr())
 }
 
-/// Convenience wrapper: write a single 512-byte sector.
 pub fn nvme_write_sector(lba: u64, buf: &[u8; 512]) -> bool {
     nvme_write(lba, 1, buf.as_ptr())
 }
 
-/// IRQ handler — call from the naked IDT stub at NVME_IRQ_VECTOR.
-/// Drains the IO CQ and clears the MSI-X interrupt.
 pub fn nvme_irq() {
     let mut ctrl = CTRL.lock();
     if !ctrl.ready { return; }
     unsafe {
-        // Clear interrupt mask (INTMC) so the device de-asserts the line
         ctrl.write32(NVME_REG_INTMC, 1);
         ctrl.io.drain();
     }
