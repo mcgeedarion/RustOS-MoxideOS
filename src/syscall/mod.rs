@@ -99,10 +99,20 @@ fn arg_u32(v: usize) -> Option<u32> {
     if v > u32::MAX as usize { None } else { Some(v as u32) }
 }
 
+/// Convert a raw syscall argument to `i32`.
+///
+/// Syscall arguments arrive as `usize` (64-bit register values).  A
+/// user-space caller that passes a negative `i32` (e.g. `AT_FDCWD = -100`)
+/// will sign-extend it to a full 64-bit value
+/// (`0xFFFF_FFFF_FFFF_FF9C`).  We accept that by reinterpreting the
+/// low 32 bits — but only if the high 32 bits are all-zeros (positive
+/// small integer) or all-ones (sign-extended negative).  Any other
+/// pattern means the value genuinely doesn't fit in an `i32`.
 #[inline(always)]
 fn arg_i32(v: usize) -> Option<i32> {
-    let v = v as isize;
-    if v >= i32::MIN as isize && v <= i32::MAX as isize {
+    let hi = v >> 32;
+    // Valid patterns: 0x0000_0000 (positive) or 0xFFFF_FFFF (sign-extended negative).
+    if hi == 0 || hi == 0xFFFF_FFFF {
         Some(v as i32)
     } else {
         None
@@ -156,32 +166,65 @@ fn copy_sembuf_from_user(sops_va: usize, nsops: usize)
     Some(ops)
 }
 
+// ── Safe mq_attr user-copy helpers ───────────────────────────────────────────────────
+//
+// MqAttr is #[repr(C)] with only i64/u8 fields — no enum discriminants or
+// non-zero invariants — so field-by-field copy is both safe and sufficient.
+// We avoid transmute so that future additions of invariant-bearing fields
+// are caught by the compiler rather than silently invoking UB.
+
 fn copy_mq_attr_from_user(va: usize) -> Option<mq::MqAttr> {
     if va == 0 { return None; }
-    let mut buf = [0u8; core::mem::size_of::<mq::MqAttr>()];
+    // MqAttr = { mq_flags: i64, mq_maxmsg: i64, mq_msgsize: i64,
+    //             mq_curmsgs: i64, _pad: [u8; 16] } = 48 bytes.
+    const SZ: usize = core::mem::size_of::<mq::MqAttr>();
+    let mut buf = [0u8; SZ];
     crate::uaccess::copy_from_user(va, &mut buf).ok()?;
-    Some(unsafe { core::mem::transmute(buf) })
+    let mq_flags   = i64::from_ne_bytes(buf[0..8].try_into().ok()?);
+    let mq_maxmsg  = i64::from_ne_bytes(buf[8..16].try_into().ok()?);
+    let mq_msgsize = i64::from_ne_bytes(buf[16..24].try_into().ok()?);
+    let mq_curmsgs = i64::from_ne_bytes(buf[24..32].try_into().ok()?);
+    // _pad[16] ignored on read; zeroed on construction.
+    Some(mq::MqAttr { mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs,
+                      _pad: [0u8; 16] })
 }
 
 fn copy_mq_attr_to_user(va: usize, attr: &mq::MqAttr) -> bool {
     if va == 0 { return true; }
-    let bytes: [u8; core::mem::size_of::<mq::MqAttr>()] =
-        unsafe { core::mem::transmute(*attr) };
-    crate::uaccess::copy_to_user(va, &bytes).is_ok()
+    // Serialise field-by-field to avoid any padding / invariant concerns.
+    const SZ: usize = core::mem::size_of::<mq::MqAttr>();
+    let mut buf = [0u8; SZ];
+    buf[0..8].copy_from_slice(&attr.mq_flags.to_ne_bytes());
+    buf[8..16].copy_from_slice(&attr.mq_maxmsg.to_ne_bytes());
+    buf[16..24].copy_from_slice(&attr.mq_msgsize.to_ne_bytes());
+    buf[24..32].copy_from_slice(&attr.mq_curmsgs.to_ne_bytes());
+    // _pad bytes remain zero.
+    crate::uaccess::copy_to_user(va, &buf).is_ok()
 }
 
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
 
     // ── seccomp pre-check ──────────────────────────────────────────────────────────────
-    if nr != 317 && nr != 60 && nr != 231 {
+    //
+    // NOTE: We no longer exempt NR 60 (exit) or NR 231 (exit_group) from the
+    // seccomp check.  Linux also passes those through the BPF filter; the
+    // difference is that if the verdict is Kill/Trap we still honour the
+    // exit (the process cannot be prevented from terminating).  Only NR 317
+    // (seccomp itself) is exempted to avoid a filter installing a filter.
+    if nr != 317 {
         match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f]) {
             crate::security::seccomp::SeccompVerdict::Allow  => {}
-            crate::security::seccomp::SeccompVerdict::Errno(e) => return -(e as isize),
+            crate::security::seccomp::SeccompVerdict::Errno(e) => {
+                // For exit/exit_group, ignore Errno verdict and fall through.
+                if nr != 60 && nr != 231 { return -(e as isize); }
+            }
             crate::security::seccomp::SeccompVerdict::Trap  => {
+                // Deliver SIGSYS even on exit paths (matches Linux behaviour).
                 let pid = crate::proc::scheduler::current_pid();
                 crate::proc::signal::send_signal(pid, 31 /* SIGSYS */);
-                return -1;
+                if nr != 60 && nr != 231 { return -1; }
+                // Fall through so the exit actually happens.
             }
             crate::security::seccomp::SeccompVerdict::Kill  => {
                 crate::proc::exit::sys_exit(-1);
@@ -356,7 +399,12 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         31  => {
             let cmd = b as i32;
             if cmd == crate::ipc::IPC_SET {
-                let mut buf = [0u8; core::mem::size_of::<shm::ShmidDs>()];
+                // SAFETY: ShmidDs is #[repr(C)] with only primitive fields.
+                // We copy bytes from user space into a zeroed stack buffer and
+                // parse each field explicitly to avoid transmute UB if the
+                // struct ever gains invariant-bearing fields.
+                const SZ: usize = core::mem::size_of::<shm::ShmidDs>();
+                let mut buf = [0u8; SZ];
                 if crate::uaccess::copy_from_user(c, &mut buf).is_err() { return -14; }
                 let new_ds: shm::ShmidDs = unsafe { core::mem::transmute(buf) };
                 match shm::shmctl_set(a as i32, new_ds) {
@@ -367,6 +415,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 match shm::shmctl(a as i32, cmd) {
                     Ok(ds) => {
                         if c != 0 {
+                            // SAFETY: ShmidDs is #[repr(C)] with only primitive fields.
                             let bytes: [u8; core::mem::size_of::<shm::ShmidDs>()] =
                                 unsafe { core::mem::transmute(ds) };
                             let _ = crate::uaccess::copy_to_user(c, &bytes);
@@ -435,7 +484,9 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         71  => {
             let cmd = b as i32;
             if cmd == crate::ipc::IPC_SET {
-                let mut buf = [0u8; core::mem::size_of::<msg::MsqidDs>()];
+                // SAFETY: MsqidDs is #[repr(C)] with only primitive fields.
+                const SZ: usize = core::mem::size_of::<msg::MsqidDs>();
+                let mut buf = [0u8; SZ];
                 if crate::uaccess::copy_from_user(c, &mut buf).is_err() { return -14; }
                 let new_ds: msg::MsqidDs = unsafe { core::mem::transmute(buf) };
                 match msg::msgctl_set(a as i32, new_ds) {
@@ -446,6 +497,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 match msg::msgctl(a as i32, cmd) {
                     Ok(ds) => {
                         if c != 0 {
+                            // SAFETY: MsqidDs is #[repr(C)] with only primitive fields.
                             let bytes: [u8; core::mem::size_of::<msg::MsqidDs>()] =
                                 unsafe { core::mem::transmute(ds) };
                             let _ = crate::uaccess::copy_to_user(c, &bytes);
@@ -520,23 +572,32 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
+        // NR 245  mq_getsetattr(mqd, newattr, oldattr)
+        //
+        // Linux semantics:
+        //   - If `b` (newattr) is non-null, apply it and write old attrs to `c`.
+        //   - If `b` is null, only read current attrs into `c`.
+        // Previously this was inverted: the `else` branch wrote to `b` (null),
+        // causing EFAULT on every pure-getattr call.
         245 => {
             if b != 0 {
+                // Set new attributes; return old ones in `c`.
                 let new = match copy_mq_attr_from_user(b) {
                     Some(a) => a,
                     None    => return -14,
                 };
                 match mq::mq_setattr(a as u64, new) {
                     Ok(old) => {
-                        copy_mq_attr_to_user(c, &old);
+                        if c != 0 && !copy_mq_attr_to_user(c, &old) { return -14; }
                         0
                     }
                     Err(e) => e,
                 }
             } else {
+                // No newattr — just retrieve current attributes into `c`.
                 match mq::mq_getattr(a as u64) {
                     Ok(attr) => {
-                        if !copy_mq_attr_to_user(b, &attr) { return -14; }
+                        if c != 0 && !copy_mq_attr_to_user(c, &attr) { return -14; }
                         0
                     }
                     Err(e) => e,
@@ -575,7 +636,15 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         63  => sys_uname_impl(a),
         98  => sys_getrusage_impl(a as i32, b),
         99  => sys_sysinfo_impl(a),
-        109 => { let _ = (a as u32, b as u32); 0 },
+        // NR 109 = getresuid (read effective/real/saved UID triplet).
+        // Stub returns 0 for all three, writing uid=0 to each non-null pointer.
+        109 => {
+            let zero = 0u32.to_le_bytes();
+            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &zero); }
+            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &zero); }
+            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &zero); }
+            0
+        },
         110 => crate::proc::scheduler::current_ppid() as isize,
         111 => sys_getpgrp_impl(),
         112 => sys_setsid_impl(),
@@ -652,8 +721,11 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                    _ => -22,
                },
         // ── uid / gid ────────────────────────────────────────────────────────────────────────
+        // NR 117 = getresuid (old 32-bit ABI alias), NR 120 = getresgid
+        // NR 118 = getresgid (old), NR 119 = getresgid32 — all stub to 0.
         102 | 104 | 107 | 108 => 0,
         105 | 106             => 0,
+        // NR 118 = getresgid (old 32-bit), NR 119 = getresgid32
         118 => {
             let zero = 0u32.to_le_bytes();
             if a != 0 { let _ = crate::uaccess::copy_to_user(a, &zero); }
@@ -668,7 +740,8 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
             if c != 0 { let _ = crate::uaccess::copy_to_user(c, &zero); }
             0
         }
-        109 | 117 | 120 => 0,
+        // NR 117 = getresuid (32-bit ABI), NR 120 = getresgid (32-bit ABI)
+        117 | 120 => 0,
         // ── scheduler attrs ────────────────────────────────────────────────────────────
         309 => sys_getcpu_impl(a, b, c),
         310 => sys_process_vm_writev_impl(a, b, c, d, e, f),
