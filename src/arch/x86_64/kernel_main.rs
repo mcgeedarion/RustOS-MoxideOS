@@ -1,15 +1,17 @@
-//! Kernel entry point — called from multiboot2_entry() or uefi_start() after
-//! the CPU is in 64-bit long mode with interrupts disabled.
+//! Kernel entry point — called from uefi_start() (primary) or
+//! multiboot2_entry() (legacy, feature = "multiboot2_boot") after the CPU is
+//! in 64-bit long mode with interrupts disabled.
 //!
 //! ## Boot sequence
 //!   0a. serial::early_init()         — 16550 TX-only, no alloc, no heap
-//!   0b. vga::init()                  — VGA text mode (x86 only, no-op if GOP)
+//!   0b. vga::init()                  — VGA text mode (no-op when GOP active)
 //!   0c. heap_init()                  — global allocator (panics now visible)
 //!   1.  gdt_init()                   — GDT + TSS + GSBASE
 //!   2.  idt_init()                   — IDT exception/IRQ vectors
 //!   3.  syscall_setup()              — SYSCALL/SYSRET MSRs
 //!   4.  serial::init()               — full 16550 reinit (IRQ-driven, FIFOs)
-//!   5.  memmap_init() + parse_mbi()  — Phase 2: feed real RAM to PMM; walk MBI
+//!   5.  memmap_init()                — Phase 2: feed EFI memory map to PMM
+//!       parse_mbi() [multiboot only] — walk multiboot2 info block
 //!   6.  xsave_init()                 — XSAVE/FXSAVE feature detection
 //!   7.  acpi_init()                  — RSDP → MADT: CPU list, I/O APIC
 //!   8.  pcie_init()                  — Phase 1: PCIe bus enumeration + BAR
@@ -26,11 +28,20 @@
 //!   Without serial::early_init() that panic is completely invisible on real
 //!   hardware.  early_init() uses only I/O port instructions and no heap.
 //!
+//! ## UEFI boot (primary path)
+//!   uefi_start() in uefi_entry.rs:
+//!     1. Prints banner via EFI SimpleTextOutput.
+//!     2. Captures GOP framebuffer (graceful fallback to serial-only).
+//!     3. Locates ACPI 2.0 RSDP from EFI configuration table.
+//!     4. Loads initrd via EFI_INITRD_MEDIA_GUID LoadFile2 protocol
+//!        (systemd-boot / GRUB2) or OVMF vendor table fallback.
+//!     5. Obtains EFI memory map + calls ExitBootServices (with AMI/Insyde
+//!        firmware retry per UEFI spec §7.4.6).
+//!     6. Switches to kernel boot stack, tail-calls kernel_main().
+//!
 //! ## VGA text mode
-//!   vga::init() probes the BIOS Data Area (0x0449) to see if the firmware
-//!   left the display in a text mode.  If UEFI/GOP took over it returns false
-//!   and the GOP framebuffer driver stays in control.  Either way the call
-//!   is safe unconditionally.
+//!   vga::init() probes BDA 0x0449.  When UEFI/GOP took over it returns false
+//!   and the GOP framebuffer driver stays in control.  Safe unconditionally.
 
 use core::arch::asm;
 use crate::arch::x86_64::{
@@ -45,8 +56,12 @@ use crate::proc::exec::spawn_user_process;
 
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
+// ── Legacy multiboot2 entry (only compiled when feature = "multiboot2_boot") ──
+
+#[cfg(feature = "multiboot2_boot")]
 pub static mut MBI_PTR: usize = 0;
 
+#[cfg(feature = "multiboot2_boot")]
 #[no_mangle]
 pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
     if magic == 0x36d7_6289 {
@@ -55,21 +70,20 @@ pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
     kernel_main()
 }
 
+// ── Primary kernel entry ──────────────────────────────────────────────────────
+
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     // 0a. Serial UART before anything that can panic.
-    //     Programs COM1 (0x3F8) divisor for 115200 baud, enables 16-byte FIFO.
-    //     Uses only IN/OUT instructions — no heap, no globals, no allocation.
     serial::early_init();
 
-    // 0b. VGA text mode — before heap_init so panics appear on screen too.
-    //     Returns false (silent no-op) when GOP/UEFI owns the display.
+    // 0b. VGA text mode probe — safe no-op when GOP owns the display.
     #[cfg(target_arch = "x86_64")]
     let vga_active = crate::drivers::vga::init();
     #[cfg(not(target_arch = "x86_64"))]
     let vga_active = false;
 
-    // 0c. Heap — any panic from here is visible on the UART (and VGA if active).
+    // 0c. Heap.
     crate::allocator::heap_init();
 
     // 1–3. CPU structures.
@@ -77,7 +91,7 @@ pub extern "C" fn kernel_main() -> ! {
     idt_init();
     syscall_setup();
 
-    // 4. Full serial reinit (IRQ-driven, FIFO thresholds, line discipline).
+    // 4. Full serial reinit.
     serial::init();
 
     if vga_active {
@@ -87,7 +101,7 @@ pub extern "C" fn kernel_main() -> ! {
         serial_println!("vga: GOP/framebuffer mode (VGA text mode inactive)");
     }
 
-    // ── CI sentinels ─────────────────────────────────────────────────────────────
+    // ── CI sentinels ──────────────────────────────────────────────────────────
     serial_println!("rustos: kernel_main reached");
     serial_println!("TEST PASS: uart_smoke");
     {
@@ -99,22 +113,28 @@ pub extern "C" fn kernel_main() -> ! {
     }
     serial_println!("TEST PASS: alloc_smoke");
     serial_println!("TEST PASS: trap_smoke");
-    // ──────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
 
     serial_println!("rustos: booting");
 
     // 5. Phase 2: feed real memory map to PMM.
     crate::mm::memmap::memmap_init();
-    let mbi = unsafe { MBI_PTR };
-    if mbi != 0 {
-        unsafe { crate::arch::x86_64::multiboot2::parse_mbi(mbi); }
-        serial_println!("mb2: MBI at {:#x} parsed", mbi);
+
+    // Multiboot2 only: walk MBI tags for additional memory map entries.
+    #[cfg(feature = "multiboot2_boot")]
+    {
+        let mbi = unsafe { MBI_PTR };
+        if mbi != 0 {
+            unsafe { crate::arch::x86_64::multiboot2::parse_mbi(mbi); }
+            serial_println!("mb2: MBI at {:#x} parsed", mbi);
+        }
     }
 
     // 6. FP state.
     xsave_init();
 
-    // 7. ACPI.
+    // 7. ACPI — RSDP comes from uefi_entry::RSDP_PHYS (UEFI) or from
+    //    multiboot2 ACPI tag (legacy).  Either way it is in RSDP_PHYS.
     let rsdp_pa = unsafe { crate::arch::x86_64::uefi_entry::RSDP_PHYS };
     crate::acpi::acpi_init(rsdp_pa);
     serial_println!("acpi: {} CPU(s)", crate::acpi::cpu_count());

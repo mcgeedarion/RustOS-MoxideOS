@@ -5,6 +5,7 @@ pub mod hal;
 pub mod idt;
 pub mod interrupts;
 pub mod kernel_main;
+#[cfg(feature = "multiboot2_boot")]
 pub mod multiboot2;
 pub mod paging;
 pub mod serial;
