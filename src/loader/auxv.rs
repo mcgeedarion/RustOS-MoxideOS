@@ -10,9 +10,16 @@
 //!   [envp pointers, NULL terminator]
 //!   [auxv key/value pairs, AT_NULL terminator]
 //!   <- initial RSP (16-byte aligned)
+//!
+//! ## Error handling
+//!
+//! Returns `Some(initial_rsp)` on success.  Returns `None` if the combined
+//! argv/envp/auxv data does not fit within `stack_buf`.  The caller must
+//! not launch the process on `None`; it should report ENOMEM / SIGKILL
+//! instead.  Silent truncation is not acceptable — a partial stack causes
+//! undefined behaviour in the C runtime.
 
 extern crate alloc;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 // AT_* tags needed by musl/glibc startup.
@@ -39,7 +46,8 @@ const PAGE: usize = 4096;
 /// - `phdr_count`:  number of program headers (AT_PHNUM).
 /// - `phdr_size`:   size of one phdr in bytes (AT_PHENT).
 ///
-/// Returns the initial RSP value (user VA, 16-byte aligned).
+/// Returns `Some(initial_rsp)` (user VA, 16-byte aligned) on success,
+/// or `None` if argv/envp/auxv do not fit within `stack_buf`.
 pub fn build_stack(
     stack_buf:   &mut [u8],
     stack_top:   usize,
@@ -49,7 +57,7 @@ pub fn build_stack(
     phdr_va:     usize,
     phdr_count:  usize,
     phdr_size:   usize,
-) -> usize {
+) -> Option<usize> {
     // --- pack strings + AT_RANDOM into stack_buf from the top down ----------
     let buf_va_base = stack_top - stack_buf.len(); // user VA of stack_buf[0]
 
@@ -75,16 +83,19 @@ pub fn build_stack(
     string_bytes.extend_from_slice(&rand_b);
 
     // Align string block to 16 bytes.
-    let str_total      = (string_bytes.len() + 15) & !15;
-    let string_va_base = stack_top - str_total;
+    let str_total = (string_bytes.len() + 15) & !15;
+
+    // Overflow check: string block must fit below stack_top.
+    let string_va_base = stack_top.checked_sub(str_total)?;
     let random_va      = string_va_base + random_offset;
 
-    // Copy string block into stack_buf (relative offset from buf base).
-    let buf_string_off = string_va_base - buf_va_base;
-    if buf_string_off + string_bytes.len() <= stack_buf.len() {
-        stack_buf[buf_string_off..buf_string_off + string_bytes.len()]
-            .copy_from_slice(&string_bytes);
+    // String block must lie within stack_buf.
+    let buf_string_off = string_va_base.checked_sub(buf_va_base)?;
+    if buf_string_off + string_bytes.len() > stack_buf.len() {
+        return None;
     }
+    stack_buf[buf_string_off..buf_string_off + string_bytes.len()]
+        .copy_from_slice(&string_bytes);
 
     // --- build pointer table below string block ------------------------------
     let auxv: &[(u64, u64)] = &[
@@ -102,28 +113,37 @@ pub fn build_stack(
     let argc           = argv.len();
     let ptrtable_words = 1 + (argc + 1) + (envp.len() + 1) + auxv.len() * 2;
     let ptrtable_bytes = ptrtable_words * 8;
-    let rsp_raw        = string_va_base - ptrtable_bytes;
-    let initial_rsp    = rsp_raw & !0xF_usize;
+
+    // Overflow check: pointer table must fit below the string block.
+    let rsp_raw     = string_va_base.checked_sub(ptrtable_bytes)?;
+    let initial_rsp = rsp_raw & !0xF_usize;
+
+    // Pointer table must lie within stack_buf.
+    let table_buf_off = initial_rsp.checked_sub(buf_va_base)?;
+    if table_buf_off + ptrtable_bytes > stack_buf.len() {
+        return None;
+    }
 
     // Write pointer table into stack_buf.
-    let table_buf_off = initial_rsp - buf_va_base;
     let mut off = table_buf_off;
 
     macro_rules! write64 {
-        ($val:expr) => {
-            if off + 8 <= stack_buf.len() {
-                stack_buf[off..off + 8].copy_from_slice(&($val as u64).to_ne_bytes());
-                off += 8;
-            }
-        };
+        ($val:expr) => {{
+            let end = off + 8;
+            // Bounds guard: each write64! checked independently so that
+            // a miscalculation in ptrtable_bytes does not go undetected.
+            if end > stack_buf.len() { return None; }
+            stack_buf[off..end].copy_from_slice(&($val as u64).to_ne_bytes());
+            off = end;
+        }};
     }
 
     write64!(argc);
     for ao in &argv_offsets { write64!(string_va_base + ao); }
-    write64!(0u64); // argv null
+    write64!(0u64); // argv null terminator
     for eo in &envp_offsets { write64!(string_va_base + eo); }
-    write64!(0u64); // envp null
+    write64!(0u64); // envp null terminator
     for (atype, aval) in auxv { write64!(atype); write64!(aval); }
 
-    initial_rsp
+    Some(initial_rsp)
 }
