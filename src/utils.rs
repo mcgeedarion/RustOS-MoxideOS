@@ -1,7 +1,4 @@
-//! Miscellaneous kernel utilities.
-pub fn align_up(val: usize, align: usize) -> usize {
-    (val + align - 1) & !(align - 1)
-}
-pub fn align_down(val: usize, align: usize) -> usize {
-    val & !(align - 1)
-}
+// Legacy shim — code has moved to src/kernel/utils.rs
+// This file is retained so that `crate::utils` continues to compile.
+// Update callers to use `crate::kernel::utils` and remove this file.
+pub use crate::kernel::utils::*;
