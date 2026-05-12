@@ -1,6 +1,4 @@
-//! Devicetree blob parser stub.
-//!
-//! TODO: implement full FDT/DTB parsing for RISC-V boot.
-//! This function is intentionally a no-op until the parser is written.
-#[allow(dead_code)]
-pub fn parse(_dtb: *const u8) {}
+// Legacy shim — code has moved to src/firmware/dt.rs
+// This file is retained so that `crate::dt` continues to compile.
+// Update callers to use `crate::firmware::dt` and remove this file.
+pub use crate::firmware::dt::*;
