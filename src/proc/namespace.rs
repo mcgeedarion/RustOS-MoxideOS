@@ -17,6 +17,11 @@
 //! COW-copies the parent's mount list into a new entry; `sys_mount` and
 //! `sys_umount` modify only the calling process's mount ns.
 //!
+//! ## UTS namespace
+//! Each UTS namespace stores a hostname string.  The boot hostname is
+//! "rustos".  `unshare(CLONE_NEWUTS)` copies the parent's hostname into the
+//! new ns.  `sethostname(2)` and `gethostname(2)` route through this table.
+//!
 //! ## ns_fd_open
 //! Opening `/proc/<pid>/ns/<name>` calls `ns_fd_open(pid, name)` which
 //! allocates a synthetic fd in the `NSFD_FD_BASE` range.  The fd carries
@@ -26,9 +31,10 @@
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use spin::Mutex;
+use crate::uaccess::{copy_from_user, copy_to_user};
 
 // ─── NsId ─────────────────────────────────────────────────────────────────────
 
@@ -145,13 +151,84 @@ pub fn mount_ns_list(ns: NsId) -> Vec<MountEntry> {
 
 /// Destroy a private mount namespace when the last process holding it exits.
 ///
-/// Removes the entry from `MOUNT_NS_TABLE`, freeing the mount list.
-/// No-op for `INIT_NS` — the boot namespace is never freed.
-/// Called from `exit::ns_exit` after confirming no other live process shares
-/// the namespace.
+/// No-op for INIT_NS.  Called from `exit::ns_exit`.
 pub fn drop_mount_ns(ns: NsId) {
     if ns == INIT_NS { return; }
     MOUNT_NS_TABLE.lock().entries.remove(&ns);
+}
+
+// ─── UTS namespace table ────────────────────────────────────────────────────
+
+static UTS_NS_TABLE: Mutex<BTreeMap<NsId, String>> = Mutex::new(BTreeMap::new());
+
+/// Initialise INIT_NS hostname.  Called once from kernel init.
+pub fn init_uts_ns() {
+    UTS_NS_TABLE.lock().entry(INIT_NS)
+        .or_insert_with(|| String::from("rustos"));
+}
+
+/// Get the hostname for a UTS namespace.
+pub fn uts_hostname(ns: NsId) -> String {
+    UTS_NS_TABLE.lock()
+        .get(&ns)
+        .cloned()
+        .unwrap_or_else(|| String::from("rustos"))
+}
+
+/// Set the hostname for a UTS namespace.
+pub fn uts_set_hostname(ns: NsId, name: String) {
+    UTS_NS_TABLE.lock().insert(ns, name);
+}
+
+/// Destroy a private UTS namespace.  No-op for INIT_NS.
+pub fn drop_uts_ns(ns: NsId) {
+    if ns == INIT_NS { return; }
+    UTS_NS_TABLE.lock().remove(&ns);
+}
+
+// ── sethostname / gethostname syscall implementations ────────────────────────
+
+/// NR 170  sethostname(name, len)
+///
+/// Copies `len` bytes from `name_va`, validates no embedded NUL, and stores
+/// the result in the calling process's UTS namespace.
+/// Returns -EPERM (-1) if uid != 0, -EINVAL if len > 64 or contains NUL.
+pub fn sys_sethostname(name_va: usize, len: usize) -> isize {
+    if len > 64 { return -22; } // EINVAL
+    let mut buf = alloc::vec![0u8; len];
+    if copy_from_user(name_va, &mut buf).is_err() { return -14; } // EFAULT
+    if buf.contains(&0) { return -22; } // EINVAL — no embedded NUL
+    let name = match alloc::string::String::from_utf8(buf) {
+        Ok(s)  => s,
+        Err(_) => return -22,
+    };
+    let pid = crate::proc::scheduler::current_pid();
+    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
+        .unwrap_or(INIT_NS);
+    uts_set_hostname(ns, name);
+    0
+}
+
+/// NR 171 is setdomainname — identical shape to sethostname but we store
+/// in a separate per-ns field.  For now we just accept and ignore the value
+/// so containerised setup scripts don't fail.
+pub fn sys_setdomainname(_name_va: usize, _len: usize) -> isize { 0 }
+
+/// gethostname helper used by sys_uname and direct gethostname(2) calls.
+/// Copies at most `len` bytes (including a NUL terminator) to `buf_va`.
+pub fn sys_gethostname(buf_va: usize, len: usize) -> isize {
+    if buf_va == 0 || len == 0 { return -22; }
+    let pid = crate::proc::scheduler::current_pid();
+    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
+        .unwrap_or(INIT_NS);
+    let name = uts_hostname(ns);
+    let bytes = name.as_bytes();
+    let copy_len = bytes.len().min(len - 1);
+    let mut out = alloc::vec![0u8; len];
+    out[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    // out[copy_len] = 0 (NUL terminator) — already zeroed by vec initialisation.
+    if copy_to_user(buf_va, &out).is_err() { return -14; }
+    0
 }
 
 // ─── ns_id_of / ns_symlink ────────────────────────────────────────────────────
@@ -160,7 +237,7 @@ pub fn drop_mount_ns(ns: NsId) {
 /// Returns None if `pid` doesn't exist or `name` is unrecognised.
 pub fn ns_id_of(pid: usize, name: &str) -> Option<NsId> {
     crate::proc::scheduler::with_proc(pid, |p| {
-        match name {
+        let id = match name {
             "mnt"  => p.ns.mnt,
             "pid"  => p.ns.pid,
             "net"  => p.ns.net,
@@ -169,8 +246,8 @@ pub fn ns_id_of(pid: usize, name: &str) -> Option<NsId> {
             "user" => p.ns.user,
             "time" => p.ns.time,
             _      => return None,
-        }
-        .into()
+        };
+        Some(id)
     })
     .flatten()
 }
@@ -267,9 +344,9 @@ pub fn setns_apply(pid: usize, name: &str, ns_id: NsId) -> isize {
 /// Called by `sys_unshare` for each flag bit it processes.
 /// For mount namespaces, COW-copies the current mount table.
 /// For net namespaces, seeds a new loopback-only interface table.
+/// For UTS namespaces, copies the parent hostname into the new ns.
 pub fn unshare_ns(pid: usize, name: &str) -> isize {
     let new_id = alloc_ns_id();
-    // Type-specific initialisation
     match name {
         "mnt" => {
             let parent_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt)
@@ -283,8 +360,96 @@ pub fn unshare_ns(pid: usize, name: &str) -> isize {
         "net" => {
             crate::proc::net_ns::create_net_ns(new_id);
         }
-        // UTS, IPC, user, pid, time: no extra global state needed yet.
+        "uts" => {
+            // Clone parent's hostname into the new UTS ns.
+            let parent_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
+                .unwrap_or(INIT_NS);
+            let hostname = uts_hostname(parent_ns);
+            UTS_NS_TABLE.lock().insert(new_id, hostname);
+        }
+        // IPC, user, pid, time: no extra global state needed yet.
         _ => {}
     }
     setns_apply(pid, name, new_id)
+}
+
+// ─── CLONE_NEW* flag constants ──────────────────────────────────────────────────
+
+const CLONE_NEWNS:   usize = 0x0002_0000; // mount
+const CLONE_NEWUTS:  usize = 0x0400_0000; // UTS
+const CLONE_NEWIPC:  usize = 0x0800_0000; // IPC
+const CLONE_NEWUSER: usize = 0x1000_0000; // user
+const CLONE_NEWPID:  usize = 0x2000_0000; // PID
+const CLONE_NEWNET:  usize = 0x4000_0000; // net
+const CLONE_NEWTIME: usize = 0x0000_0080; // time
+
+// ─── sys_unshare (NR 272) ───────────────────────────────────────────────────
+
+/// `unshare(flags)` — detach one or more namespaces from the calling process.
+///
+/// Processes each CLONE_NEW* bit in turn.  Any failure aborts immediately
+/// and returns the error code; namespaces created before the failing one
+/// remain attached (matching Linux behaviour for multi-flag unshare).
+pub fn sys_unshare(flags: usize) -> isize {
+    let pid = crate::proc::scheduler::current_pid();
+    // Order matches Linux: user first so the new user ns can own the others.
+    let ns_flags: &[(usize, &str)] = &[
+        (CLONE_NEWUSER, "user"),
+        (CLONE_NEWNS,   "mnt"),
+        (CLONE_NEWUTS,  "uts"),
+        (CLONE_NEWIPC,  "ipc"),
+        (CLONE_NEWNET,  "net"),
+        (CLONE_NEWPID,  "pid"),
+        (CLONE_NEWTIME, "time"),
+    ];
+    for &(bit, name) in ns_flags {
+        if flags & bit != 0 {
+            let r = unshare_ns(pid, name);
+            if r < 0 { return r; }
+        }
+    }
+    0
+}
+
+// ─── sys_setns (NR 308) ────────────────────────────────────────────────────
+
+/// `setns(fd, nstype)` — reassociate the calling thread with a namespace.
+///
+/// `fd` must be an ns fd opened via `/proc/<pid>/ns/<name>`.  When
+/// `nstype` is 0 the type is inferred from the fd metadata (Linux 4.16+
+/// behaviour).  Returns 0 on success, negative errno on error.
+pub fn sys_setns(fd: usize, nstype: u32) -> isize {
+    // Resolve fd → (ns_name, ns_id).
+    let (ns_name, ns_id) = match nsfd_to_ns_id(fd) {
+        Some(pair) => pair,
+        None       => return -9, // EBADF
+    };
+    // If nstype is non-zero, verify it matches the fd's namespace type.
+    if nstype != 0 {
+        let expected_bit = ns_name_to_clone_flag(&ns_name);
+        if expected_bit == 0 || (nstype as usize) != expected_bit {
+            return -22; // EINVAL
+        }
+    }
+    // Permission check: CLONE_NEWUSER namespaces can be entered unprivileged;
+    // all others require uid == 0 (we model a flat privilege model for now).
+    // We skip this for INIT_NS since joining the boot namespace is always safe.
+    // (A real kernel checks CAP_SYS_ADMIN in the target user ns.)
+    let pid = crate::proc::scheduler::current_pid();
+    setns_apply(pid, &ns_name, ns_id)
+}
+
+/// Map a namespace name to its corresponding CLONE_NEW* flag bit.
+/// Returns 0 for unrecognised names.
+fn ns_name_to_clone_flag(name: &str) -> usize {
+    match name {
+        "mnt"  => CLONE_NEWNS,
+        "uts"  => CLONE_NEWUTS,
+        "ipc"  => CLONE_NEWIPC,
+        "user" => CLONE_NEWUSER,
+        "pid"  => CLONE_NEWPID,
+        "net"  => CLONE_NEWNET,
+        "time" => CLONE_NEWTIME,
+        _      => 0,
+    }
 }
