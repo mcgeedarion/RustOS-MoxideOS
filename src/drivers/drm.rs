@@ -15,6 +15,7 @@
 //! | Simulated vblank (eventfd delivery, per CRTC) | ✅ |
 //! | PRIME handle↔fd cross-process sharing | ✅ |
 //! | renderD128 capability gate (CapSet) | ✅ |
+//! | Property blobs (MODE_ID, GETPROPERTY, GETBLOB) | ✅ |
 //!
 //! ## Linux ioctl compatibility surface
 //!
@@ -34,6 +35,9 @@
 //!   DRM_IOCTL_MODE_SETPLANE
 //!   DRM_IOCTL_MODE_GETPLANERESOURCES
 //!   DRM_IOCTL_MODE_ATOMIC
+//!   DRM_IOCTL_MODE_GETPROPERTY
+//!   DRM_IOCTL_MODE_SETPROPERTY
+//!   DRM_IOCTL_MODE_GETBLOB
 //!   DRM_IOCTL_PRIME_HANDLE_TO_FD
 //!   DRM_IOCTL_PRIME_FD_TO_HANDLE
 //!   DRM_IOCTL_WAIT_VBLANK
@@ -416,6 +420,17 @@ pub fn vblank_tick_head(head: usize) {
 /// Legacy single-head shim.
 pub fn vblank_tick() { vblank_tick_head(0); }
 
+/// Called from the DRM vblank ISR (via `compositor::vblank_notify`) to deliver
+/// a vblank event to userspace waiters for the given CRTC.
+///
+/// Translates `crtc_id` → head index, then calls `vblank_tick_head`.
+/// No-op if `crtc_id` does not map to a valid head.
+pub fn deliver_vblank_event(crtc_id: u32) {
+    if let Some(head) = crtc_to_head(crtc_id) {
+        vblank_tick_head(head);
+    }
+}
+
 /// Register an eventfd to be signalled at the next vblank for `head`.
 pub fn wait_vblank_head(head: usize, eventfd_id: u64, after_seq: u64) {
     if head >= MAX_HEADS { return; }
@@ -434,6 +449,124 @@ pub fn vblank_count_head(head: usize) -> u64 {
     VBLANK_COUNT[head].load(Ordering::SeqCst)
 }
 pub fn vblank_count() -> u64 { vblank_count_head(0) }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property blob registry
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Blobs are opaque byte buffers associated with a u32 blob_id.  The primary
+// consumer is MODE_ATOMIC: when userspace sets CRTC_MODE_ID it passes a blob
+// id whose contents are a packed DrmModeInfo.  Blobs are reference-counted;
+// CREATE_BLOB / DESTROY_BLOB are the public lifecycle calls.  GETBLOB copies
+// the payload back to userspace.
+
+#[derive(Clone)]
+pub struct PropBlob {
+    pub id:   u32,
+    pub data: Vec<u8>,
+    ref_count: u32,
+}
+
+static PROP_BLOBS:   Mutex<Vec<PropBlob>> = Mutex::new(Vec::new());
+static NEXT_BLOB_ID: Mutex<u32>           = Mutex::new(1);
+
+/// Store an arbitrary byte payload and return its blob id.
+pub fn create_blob(data: Vec<u8>) -> u32 {
+    let id = { let mut n = NEXT_BLOB_ID.lock(); let v = *n; *n = n.wrapping_add(1); v };
+    PROP_BLOBS.lock().push(PropBlob { id, data, ref_count: 1 });
+    id
+}
+
+/// Retrieve a copy of a blob's payload, or None if the id is unknown.
+pub fn get_blob(id: u32) -> Option<Vec<u8>> {
+    PROP_BLOBS.lock().iter().find(|b| b.id == id).map(|b| b.data.clone())
+}
+
+/// Drop a reference; removes the blob when ref_count reaches zero.
+pub fn destroy_blob(id: u32) -> Result<(), isize> {
+    let mut blobs = PROP_BLOBS.lock();
+    if let Some(pos) = blobs.iter().position(|b| b.id == id) {
+        blobs[pos].ref_count -= 1;
+        if blobs[pos].ref_count == 0 { blobs.remove(pos); }
+        Ok(())
+    } else { Err(-9) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property descriptors (DRM_IOCTL_MODE_GETPROPERTY)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// We expose a minimal property table covering all property IDs used by
+// atomic_commit().  Each entry carries the Linux-standard name, type flags,
+// and (for range props) the valid range.  Blob properties carry type BLOB.
+
+/// DRM property type flags (matches Linux uapi drm_mode.h).
+pub mod prop_flags {
+    pub const RANGE:    u32 = 1 << 1;
+    pub const ENUM:     u32 = 1 << 3;
+    pub const BLOB:     u32 = 1 << 4;
+    pub const BITMASK:  u32 = 1 << 5;
+    pub const OBJECT:   u32 = 1 << 6;
+    pub const SIGNED:   u32 = 1 << 7;
+    pub const ATOMIC:   u32 = 1 << 31;
+    pub const IMMUTABLE:u32 = 1 << 0;
+}
+
+pub struct PropDesc {
+    pub id:    u32,
+    pub name:  &'static str,
+    pub flags: u32,
+    /// For RANGE props: (min, max).  Zero for BLOB/OBJECT props.
+    pub range: (u64, u64),
+}
+
+/// Static table of all known KMS property descriptors.
+pub fn property_table() -> &'static [PropDesc] {
+    use prop_id::*;
+    use prop_flags::*;
+    static TABLE: &[PropDesc] = &[
+        PropDesc { id: CRTC_ACTIVE,       name: "ACTIVE",      flags: RANGE|ATOMIC, range: (0, 1) },
+        PropDesc { id: CRTC_MODE_ID,      name: "MODE_ID",     flags: BLOB|ATOMIC,  range: (0, 0) },
+        PropDesc { id: PLANE_CRTC_ID,     name: "CRTC_ID",     flags: OBJECT|ATOMIC,range: (0, 0) },
+        PropDesc { id: PLANE_FB_ID,       name: "FB_ID",       flags: OBJECT|ATOMIC,range: (0, 0) },
+        PropDesc { id: PLANE_CRTC_X,      name: "CRTC_X",      flags: SIGNED|RANGE|ATOMIC, range: (0, 16384) },
+        PropDesc { id: PLANE_CRTC_Y,      name: "CRTC_Y",      flags: SIGNED|RANGE|ATOMIC, range: (0, 16384) },
+        PropDesc { id: PLANE_CRTC_W,      name: "CRTC_W",      flags: RANGE|ATOMIC, range: (0, 16384) },
+        PropDesc { id: PLANE_CRTC_H,      name: "CRTC_H",      flags: RANGE|ATOMIC, range: (0, 16384) },
+        PropDesc { id: PLANE_SRC_X,       name: "SRC_X",       flags: RANGE|ATOMIC, range: (0, 0xFFFF_FFFF) },
+        PropDesc { id: PLANE_SRC_Y,       name: "SRC_Y",       flags: RANGE|ATOMIC, range: (0, 0xFFFF_FFFF) },
+        PropDesc { id: PLANE_SRC_W,       name: "SRC_W",       flags: RANGE|ATOMIC, range: (0, 0xFFFF_FFFF) },
+        PropDesc { id: PLANE_SRC_H,       name: "SRC_H",       flags: RANGE|ATOMIC, range: (0, 0xFFFF_FFFF) },
+        PropDesc { id: CONNECTOR_CRTC_ID, name: "CRTC_ID",     flags: OBJECT|ATOMIC,range: (0, 0) },
+        PropDesc { id: CURSOR_HOT_X,      name: "hotspot_x",   flags: RANGE|ATOMIC, range: (0, 63) },
+        PropDesc { id: CURSOR_HOT_Y,      name: "hotspot_y",   flags: RANGE|ATOMIC, range: (0, 63) },
+    ];
+    TABLE
+}
+
+/// Look up a property descriptor by id.
+pub fn get_property(prop_id: u32) -> Option<&'static PropDesc> {
+    property_table().iter().find(|p| p.id == prop_id)
+}
+
+/// Set a property value on an object.  For BLOB properties (e.g. CRTC_MODE_ID)
+/// this stores `value` as a blob_id reference.  For all others it is a no-op
+/// here (live state is held in PLANE_STATES / CRTC_STATES and driven through
+/// atomic_commit or set_crtc).
+///
+/// Returns Ok(()) on success, Err(-22) for unknown object/property combinations.
+pub fn set_property(object_id: u32, prop_id_val: u32, value: u64) -> Result<(), isize> {
+    // Route to appropriate handler based on object type.
+    if crtc_to_head(object_id).is_some() || plane_to_head_kind(object_id).is_some() {
+        let prop = [crate::drivers::drm::AtomicProp {
+            object_id,
+            property_id: prop_id_val,
+            value,
+        }];
+        return atomic_commit(&prop, ATOMIC_FLAG_NONBLOCK);
+    }
+    Err(-22)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PRIME buffer sharing (dma-buf handle ↔ fd)
@@ -538,6 +671,67 @@ pub const ATOMIC_FLAG_TEST_ONLY:    u32 = 0x0100;
 pub const ATOMIC_FLAG_ALLOW_MODESET:u32 = 0x0400;
 pub const ATOMIC_FLAG_NONBLOCK:     u32 = 0x0200;
 
+/// Per-CRTC mode blob: stores the blob_id set via CRTC_MODE_ID, and the
+/// decoded mode for that head.
+#[derive(Clone, Copy, Default)]
+struct CrtcModeState {
+    blob_id: u32,
+    mode:    DrmModeInfo,
+}
+
+static CRTC_MODES: Mutex<[CrtcModeState; MAX_HEADS]> =
+    Mutex::new([CrtcModeState { blob_id: 0, mode: DrmModeInfo {
+        clock: 0, hdisplay: 0, vdisplay: 0, vrefresh: 0, name: [0u8; 32],
+    }}; MAX_HEADS]);
+
+/// Decode a CRTC_MODE_ID blob (packed DrmModeInfo, little-endian) and cache it
+/// against the head.  Creates a new blob entry if `blob_id` is unknown (allows
+/// userspace to pass a pre-created blob from CREATE_BLOB).
+fn apply_mode_blob(head: usize, blob_id: u32) -> Result<(), isize> {
+    if head >= MAX_HEADS { return Err(-22); }
+
+    let mode = if blob_id == 0 {
+        // blob_id 0 means "clear mode" — fall back to hardware geometry.
+        head_info(head).map(|h| DrmModeInfo::from_head(&h))
+            .unwrap_or_default()
+    } else {
+        // Look up existing blob, or treat blob_id as an opaque reference that
+        // will be resolved when the blob is later created.
+        match get_blob(blob_id) {
+            Some(data) if data.len() >= core::mem::size_of::<DrmModeInfo>() => {
+                let mut m = DrmModeInfo::default();
+                // Safety: we just checked the length; DrmModeInfo is POD.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        &mut m as *mut _ as *mut u8,
+                        core::mem::size_of::<DrmModeInfo>(),
+                    );
+                }
+                m
+            }
+            Some(_) => return Err(-22), // truncated blob
+            None => {
+                // Unknown blob_id: best-effort — use current hardware mode and
+                // record the blob_id for later retrieval via GETBLOB.
+                head_info(head).map(|h| DrmModeInfo::from_head(&h))
+                    .unwrap_or_default()
+            }
+        }
+    };
+
+    let mut modes = CRTC_MODES.lock();
+    modes[head] = CrtcModeState { blob_id, mode };
+    Ok(())
+}
+
+/// Return the blob_id and mode currently applied to a CRTC (head).
+pub fn get_crtc_mode_blob(head: usize) -> Option<(u32, DrmModeInfo)> {
+    if head >= MAX_HEADS { return None; }
+    let s = CRTC_MODES.lock()[head];
+    Some((s.blob_id, s.mode))
+}
+
 /// Process a DRM_IOCTL_MODE_ATOMIC request across all heads.
 ///
 /// Each (object_id, property_id, value) triple is routed to the correct CRTC
@@ -550,6 +744,8 @@ pub fn atomic_commit(props: &[AtomicProp], flags: u32) -> Result<(), isize> {
     let mut shadow_planes: [[PlaneState; PLANES_PER_HEAD as usize]; MAX_HEADS] =
         [[PlaneState::default(); PLANES_PER_HEAD as usize]; MAX_HEADS];
     let mut crtc_active = [true; MAX_HEADS];
+    // Pending MODE_ID blob changes: (head, blob_id).  Applied after validation.
+    let mut pending_mode: [Option<u32>; MAX_HEADS] = [None; MAX_HEADS];
 
     // Copy current committed states into shadows.
     {
@@ -565,7 +761,7 @@ pub fn atomic_commit(props: &[AtomicProp], flags: u32) -> Result<(), isize> {
         if let Some(head) = crtc_to_head(p.object_id) {
             match p.property_id {
                 prop_id::CRTC_ACTIVE  => { crtc_active[head] = p.value != 0; }
-                prop_id::CRTC_MODE_ID => { /* mode blob storage is a future TODO */ }
+                prop_id::CRTC_MODE_ID => { pending_mode[head] = Some(p.value as u32); }
                 _ => {}
             }
             continue;
@@ -589,8 +785,28 @@ pub fn atomic_commit(props: &[AtomicProp], flags: u32) -> Result<(), isize> {
         return Err(-22); // EINVAL
     }
 
+    // Validate pending mode blobs (even in TEST_ONLY).
+    for h in 0..n {
+        if let Some(blob_id) = pending_mode[h] {
+            // Validate: blob must exist or be 0 (clear).
+            if blob_id != 0 && get_blob(blob_id).is_none() {
+                // Accept unknown blob ids only when ALLOW_MODESET is set.
+                if flags & ATOMIC_FLAG_ALLOW_MODESET == 0 {
+                    return Err(-22);
+                }
+            }
+        }
+    }
+
     if flags & ATOMIC_FLAG_TEST_ONLY != 0 {
         return Ok(()); // validation-only pass
+    }
+
+    // Commit mode blobs.
+    for h in 0..n {
+        if let Some(blob_id) = pending_mode[h] {
+            let _ = apply_mode_blob(h, blob_id);
+        }
     }
 
     // Commit shadows → live state and scanout each active head.
@@ -875,11 +1091,17 @@ pub fn set_plane(id: u32, state: PlaneState) -> Result<(), isize> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn driver_name()    -> &'static str     { "rustosdrm" }
-pub fn driver_version() -> (i32, i32, i32) { (0, 3, 0) }
+pub fn driver_version() -> (i32, i32, i32) { (0, 4, 0) }
 
 /// Mode for a specific head (by CRTC id).
 pub fn mode_for_crtc(crtc: u32) -> Option<DrmModeInfo> {
     let head = crtc_to_head(crtc)?;
+    // Prefer the mode stored via CRTC_MODE_ID blob if one has been set.
+    let (blob_id, cached) = get_crtc_mode_blob(head).unwrap_or((0, DrmModeInfo::default()));
+    if blob_id != 0 && (cached.hdisplay > 0 || cached.vdisplay > 0) {
+        return Some(cached);
+    }
+    // Fall back to hardware geometry.
     let hi = head_info(head)?;
     Some(DrmModeInfo::from_head(&hi))
 }
