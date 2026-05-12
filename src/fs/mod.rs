@@ -1,4 +1,5 @@
 pub mod btrfs;
+pub mod cgroupfs;
 pub mod close_range;
 pub mod dcache;
 pub mod devfs;
