@@ -54,15 +54,35 @@ run_test() {
 echo "=== rustos concurrent stress tests ==="
 echo
 
+# --- Futex ---
 run_test futex_thundering_herd  tests/futex_thundering_herd.c
 run_test futex_cmp_requeue      tests/futex_cmp_requeue.c
 run_test futex_robust_death     tests/futex_robust_death.c
+
+# --- Scheduler ---
 run_test sched_rr_fairness      tests/sched_rr_fairness.c
 run_test sched_cfs_fairness     tests/sched_cfs_fairness.c
 run_test sched_deadline_cbs     tests/sched_deadline_cbs.c
+
+# --- IPC / IO ---
 run_test pipe_stress            tests/pipe_stress.c
-run_test vfs_concurrent_creat   tests/vfs_concurrent_creat.c
 run_test poll_close_race        tests/poll_close_race.c
+run_test epoll_basic            tests/epoll_basic.c
+
+# --- Process / Signal ---
+run_test fork_exec_wait         tests/fork_exec_wait.c
+run_test signal_restart         tests/signal_restart.c
+
+# --- Memory ---
+run_test mmap_cow_fork          tests/mmap_cow_fork.c
+
+# --- Threads ---
+run_test pthread_test           tests/pthread_test.c
+run_test pthread_barrier        tests/pthread_barrier.c
+
+# --- VFS ---
+run_test vfs_concurrent_creat   tests/vfs_concurrent_creat.c
+run_test vfs_rename_unlink      tests/vfs_rename_unlink.c
 
 echo
 echo "Results: $PASS passed  $SKIP skipped  $FAIL failed"
