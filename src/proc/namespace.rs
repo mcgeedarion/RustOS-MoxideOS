@@ -36,6 +36,12 @@
 //! ## /proc/<pid>/ns/ file descriptors
 //! `ns_fd_open(pid, nstype)` produces a synthetic fd ≥ NSFD_FD_BASE.
 //! `setns` resolves the fd → (NsId, nstype) and installs it in the PCB.
+//!
+//! ## setns(2) restrictions enforced
+//! * CAP_SYS_ADMIN (capability 21) is required for all ns types except
+//!   NSTYPE_USER when the caller already owns a user namespace.
+//! * Joining NSTYPE_PID or NSTYPE_USER from a multi-threaded process
+//!   returns EINVAL, matching Linux kernel behaviour.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
@@ -209,6 +215,14 @@ impl MountNsTable {
     /// List all mount entries for ns `id`.
     fn list(&self, ns: NsId) -> alloc::vec::Vec<MountEntry> {
         self.entries.get(&ns).cloned().unwrap_or_default()
+    }
+
+    /// Lazily seed `ns` from the global table if it has no private entry.
+    fn ensure_seeded(&mut self, ns: NsId) {
+        if ns != INIT_NS && !self.entries.contains_key(&ns) {
+            let snapshot = crate::fs::mount::list_mounts();
+            self.entries.insert(ns, snapshot);
+        }
     }
 }
 
@@ -415,7 +429,18 @@ pub fn sys_unshare(flags: usize) -> isize {
 // ─── sys_setns ───────────────────────────────────────────────────────────────
 
 /// setns(fd, nstype)  [NR 308]
+///
+/// Restrictions enforced (matching Linux setns(2)):
+///  1. fd must be a valid namespace fd (EBADF otherwise).
+///  2. nstype, if non-zero, must match the fd's ns type (EINVAL).
+///  3. CAP_SYS_ADMIN is required for every type except NSTYPE_USER when
+///     the caller already lives in a non-initial user namespace (EPERM).
+///  4. Joining NSTYPE_PID or NSTYPE_USER from a multi-threaded process
+///     is rejected with EINVAL.
+///  5. For NSTYPE_MNT, the target ns's mount table is lazily seeded
+///     *before* taking the proc lock to avoid lock-order inversion.
 pub fn sys_setns(fd: usize, nstype: u32) -> isize {
+    // ── 1. Resolve the namespace fd ──────────────────────────────────────
     let entry = {
         let tbl = NSFD_TABLE.lock();
         match tbl.get(&fd) {
@@ -423,37 +448,51 @@ pub fn sys_setns(fd: usize, nstype: u32) -> isize {
             None    => return -9, // EBADF
         }
     };
+
+    // ── 2. nstype consistency check ──────────────────────────────────────
     if nstype != NSTYPE_ANY && nstype != entry.nstype {
-        return -22;
+        return -22; // EINVAL
     }
 
     let pid = crate::proc::scheduler::current_pid();
     if pid == 0 { return -1; }
 
+    // ── 3. CAP_SYS_ADMIN check ───────────────────────────────────────────
+    // NSTYPE_USER is exempt when the caller already owns a user namespace.
+    let in_user_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.is_user_ns())
+        .unwrap_or(false);
+    let needs_cap = entry.nstype != NSTYPE_USER || !in_user_ns;
+    if needs_cap && !crate::security::check_capability(21) {
+        return -1; // EPERM
+    }
+
+    // ── 4. Multi-thread guard for PID and USER namespaces ────────────────
+    if entry.nstype == NSTYPE_PID || entry.nstype == NSTYPE_USER {
+        let nthreads = crate::proc::scheduler::thread_count_of(pid).unwrap_or(1);
+        if nthreads > 1 {
+            return -22; // EINVAL
+        }
+    }
+
+    // ── 5. NSTYPE_MNT: lazy-seed the target mount table *outside* the
+    //       proc lock to prevent lock-order inversion with MOUNT_NS_TABLE.
+    if entry.nstype == NSTYPE_MNT {
+        let target = entry.ns_id;
+        if target != INIT_NS {
+            MOUNT_NS_TABLE.lock().ensure_seeded(target);
+        }
+    }
+    // Similarly, ensure net-ns exists before taking the proc lock.
+    if entry.nstype == NSTYPE_NET {
+        crate::proc::net_ns::create_net_ns(entry.ns_id);
+    }
+
+    // ── 6. Install the new ns id into the PCB ────────────────────────────
     crate::proc::scheduler::with_proc_mut(pid, |p| {
         match entry.nstype {
-            NSTYPE_MNT => {
-                // If the target ns has no private table yet, seed it now
-                // from the global table (lazy fork).
-                let target = entry.ns_id;
-                if target != INIT_NS {
-                    let mut tbl = MOUNT_NS_TABLE.lock();
-                    if !tbl.entries.contains_key(&target) {
-                        let snapshot = crate::fs::mount::list_mounts();
-                        tbl.entries.insert(target, snapshot);
-                    }
-                }
-                p.ns.mnt = entry.ns_id;
-            }
-            NSTYPE_PID  => {
-                // PID ns join: recorded in PCB, takes effect for next fork.
-                p.ns.pid = entry.ns_id;
-            }
-            NSTYPE_NET  => {
-                // Ensure the net-ns exists.
-                crate::proc::net_ns::create_net_ns(entry.ns_id);
-                p.ns.net = entry.ns_id;
-            }
+            NSTYPE_MNT  => p.ns.mnt  = entry.ns_id,
+            NSTYPE_PID  => p.ns.pid  = entry.ns_id,
+            NSTYPE_NET  => p.ns.net  = entry.ns_id,
             NSTYPE_UTS  => p.ns.uts  = entry.ns_id,
             NSTYPE_IPC  => p.ns.ipc  = entry.ns_id,
             NSTYPE_USER => p.ns.user = entry.ns_id,

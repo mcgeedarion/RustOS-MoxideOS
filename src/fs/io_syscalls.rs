@@ -243,10 +243,18 @@ pub fn sys_openat(dirfd: i32, path_va: usize, flags: u32, mode: u32) -> isize {
 /// sys_close(fd)  [NR 3]
 pub fn sys_close(fd: usize) -> isize {
     if fd > 2 {
-        let bfd = proc_fd_backing(cpid(), fd);
-        if bfd >= 0 {
-            let bfd = bfd as usize;
-            if crate::fs::procfs::is_procfs_fd(bfd) || crate::fs::sysfs::is_sysfs_fd(bfd) {
+        let bfd_r = proc_fd_backing(cpid(), fd);
+        if bfd_r >= 0 {
+            let bfd = bfd_r as usize;
+            // Namespace fds (NSFD_FD_BASE range): clean up both the ns-fd
+            // entry (NSFD_TABLE) and the stashed procfs content (PROCFS_FDS).
+            if crate::proc::namespace::is_ns_fd(bfd) {
+                crate::proc::namespace::ns_fd_close(bfd);
+                crate::fs::procfs::procfs_close(bfd);
+                synth_offset_remove(bfd);
+            } else if crate::fs::procfs::is_procfs_fd(bfd)
+                   || crate::fs::sysfs::is_sysfs_fd(bfd)
+            {
                 synth_offset_remove(bfd);
             }
         }
