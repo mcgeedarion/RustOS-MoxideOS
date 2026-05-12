@@ -1,7 +1,14 @@
-//! Display subsystem.
+//! Display subsystem: DRM/KMS object model and Wayland compositor.
 //!
-//! Contains the DRM/KMS kernel-side display stack and the Wayland
-//! compositor protocol server.
+//! ## Layers
+//!
+//!   `drm`     — DRM/KMS objects (CRTC, encoder, connector, plane, GEM).
+//!               This is the kernel-side mode-setting abstraction layer.
+//!               The hardware driver stubs live in `crate::drivers::drm`
+//!               and `crate::drivers::virtio_gpu`.
+//!
+//!   `wayland` — In-kernel Wayland compositor and server.
+//!               Surfaces are presented to the display via the DRM layer.
 
 pub mod drm;
 pub mod wayland;
