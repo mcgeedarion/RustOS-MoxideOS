@@ -41,40 +41,46 @@
 
 ## Repository Layout
 
-```
-rustos/
-├── src/
-│   ├── arch/
-│   │   ├── x86_64/     # IDT, APIC, GDT, paging, SMP trampoline
-│   │   └── riscv64/    # PLIC, trap handler, SBI/UEFI entry
-│   ├── proc/           # scheduler, fork, exec, wait, signals, futex, rlimit
-│   ├── mm/             # VMM, PMM, slab, page tables, COW, mmap
-│   ├── fs/             # VFS, ext2, ext4, FAT32, tmpfs, devfs, procfs, initramfs
-│   ├── drivers/        # virtio-{blk,net,gpu}, PS/2, UART, NVMe, PCIe
-│   ├── syscall/        # syscall dispatch + individual handlers
-│   ├── net/            # TCP/UDP/IP stack
-│   ├── smp/            # per-CPU blocks, AP bring-up, IPI
-│   ├── security/       # ASLR, canaries, PTI, SMEP/SMAP, seccomp, capset,
-│   │                   #   namespaces (ns/), cgroups v1 (cgroups/)
-│   ├── sync/           # futex, RwLock, Condvar, WaitQueue
-│   ├── ipc/            # SysV msg/sem/shm + POSIX mq  [default: on]
-│   ├── gdbstub/        # GDB RSP stub — x86_64 + RISC-V  [feature: gdbstub]
-│   ├── input/          # /dev/input evdev layer           [feature: input_events]
-│   └── wayland/        # Wayland compositor scaffold       [feature: wayland]
-├── tests/              # C integration tests (run on Linux host or in-kernel)
-├── userspace/          # Minimal init + shell
-├── xtask/              # cargo xtask build system
-├── docs/
+```text
+RustOS/
+├── .github/
+│   └── workflows/      # GitHub Actions CI workflows
+├── docs/               # Project documentation
 │   ├── musl_port.md
 │   └── musl_pipeline.md
+├── src/                # Kernel source
+│   ├── arch/
+│   │   ├── x86_64/     # x86_64 CPU, traps, paging, APIC, GDT, boot handoff
+│   │   └── riscv64/    # RISC-V traps, paging, SBI/UEFI handoff, PLIC/CLINT
+│   ├── crt/            # C runtime startup support
+│   ├── drivers/        # Device drivers: virtio, PCIe, UART, VGA/GOP, storage, network
+│   ├── drm/            # Kernel graphics/display manager abstractions
+│   ├── firmware/       # Firmware interfaces such as ACPI/UEFI-facing support
+│   ├── fs/             # VFS and filesystems: ext*, FAT/VFAT, tmpfs, devfs, procfs, initramfs
+│   ├── gdbstub/        # GDB Remote Serial Protocol stub
+│   ├── initramfs/      # Initramfs loading and cpio support
+│   ├── input/          # Input/event device layer
+│   ├── ipc/            # SysV IPC, POSIX message queues, shared memory, semaphores
+│   ├── mm/             # PMM, VMM, paging, slab allocator, COW, mmap
+│   ├── net/            # Ethernet, IP, UDP/TCP, sockets, network namespace hooks
+│   ├── proc/           # Processes, scheduler, fork/exec/wait, signals, PID namespaces
+│   ├── security/       # ASLR, canaries, PTI, seccomp, capabilities, namespaces, cgroups
+│   ├── smp/            # Multi-core bring-up, per-CPU state, IPIs
+│   ├── sync/           # Locks, wait queues, futexes, synchronization primitives
+│   ├── syscall/        # Syscall table, dispatch, Linux ABI compatibility handlers
+│   ├── tty/            # TTY, PTY, terminal handling
+│   └── wayland/        # Wayland compositor/kernel interface scaffold
+├── tests/              # Integration and host-side tests
+├── userspace/          # Minimal userspace programs, init, shell, demos
+├── xtask/              # Cargo xtask build and image tooling
+├── Cargo.toml
 ├── Dockerfile
 ├── flake.nix
-├── run_qemu.sh
-├── run_qemu_riscv.sh
-├── Cargo.toml
+├── linker.ld           # RISC-V/default linker script
+├── run_qemu.sh         # x86_64 QEMU launcher
+├── run_qemu_riscv.sh   # RISC-V QEMU launcher
 ├── rust-toolchain.toml
-├── x86_64.ld
-└── linker.ld
+└── x86_64.ld           # x86_64 linker script
 ```
 
 ---
@@ -216,7 +222,7 @@ gdb-multiarch target/riscv64-uefi/debug/rustos.efi \
 ### Register Files
 
 | Arch | Registers | `g`/`G` size | Single-step |
-|------|-----------|-------------|-------------|
+|------|-----------|-------------|
 | x86_64 | 24 (rax–r15, rip, eflags, cs/ss/ds/es/fs/gs) | 192 bytes | `RFLAGS.TF` |
 | RISC-V | 33 (zero–t6, pc) | 528 bytes | `sstatus.SSTEP` |
 
