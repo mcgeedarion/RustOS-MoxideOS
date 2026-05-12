@@ -14,17 +14,21 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define N       8
 #define RUN_SEC 2
 
 static atomic_long counters[N];
 static atomic_int  go = 0;
+static atomic_int  setparam_failed = 0;
 
 static void *runner(void *arg) {
     int id = (int)(long)arg;
     struct sched_param p = { .sched_priority = 10 };
-    pthread_setschedparam(pthread_self(), SCHED_RR, &p);
+    int rc = pthread_setschedparam(pthread_self(), SCHED_RR, &p);
+    if (rc == EPERM)
+        atomic_store(&setparam_failed, 1);
 
     while (!atomic_load(&go)) sched_yield();
 
@@ -50,6 +54,11 @@ int main(void) {
     atomic_store(&go, 1);
     for (int i = 0; i < N; i++) pthread_join(t[i], NULL);
 
+    if (atomic_load(&setparam_failed)) {
+        puts("SKIP");
+        return 0;
+    }
+
     long mn = atomic_load(&counters[0]);
     long mx = mn;
     for (int i = 1; i < N; i++) {
@@ -57,11 +66,9 @@ int main(void) {
         if (v < mn) mn = v;
         if (v > mx) mx = v;
     }
-    for (int i = 0; i < N; i++)
-        dprintf(2, "  rr thread %d: %ld\n", i, (long)atomic_load(&counters[i]));
 
     if (mn > 0 && (double)mx / (double)mn < 2.0) {
-        write(1, "SCHED_RR PASS\n", 14);
+        puts("PASS");
         return 0;
     }
     dprintf(2, "SCHED_RR FAIL: min=%ld max=%ld ratio=%.2f\n",

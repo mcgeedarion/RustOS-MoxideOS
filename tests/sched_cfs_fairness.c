@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
 
 #define N       8
 #define RUN_SEC 2
@@ -52,14 +53,13 @@ int main(void) {
         total += v;
         if (v < mn) mn = v;
         if (v > mx) mx = v;
-        dprintf(2, "  cfs thread %d: %ld\n", i, v);
     }
     double mean = (double)total / N;
     double lo   = mean * 0.70;
     double hi   = mean * 1.30;
 
     if ((double)mn >= lo && (double)mx <= hi) {
-        write(1, "SCHED_CFS PASS\n", 15);
+        puts("PASS");
         return 0;
     }
     dprintf(2, "SCHED_CFS FAIL: min=%ld max=%ld mean=%.0f window=[%.0f,%.0f]\n",

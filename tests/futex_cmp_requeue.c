@@ -33,27 +33,24 @@ int main(void) {
     for (int i = 0; i < N; i++)
         pthread_create(&t[i], NULL, waiter, NULL);
 
-    while (atomic_load(&staged) < N) sched_yield();
-    usleep(20000);
+    while (atomic_load(&staged) < N)
+        sched_yield();
 
-    /* Wake 1, requeue N-1 onto dst */
     long r = syscall(SYS_futex, &src, FUTEX_CMP_REQUEUE,
                      1, (void*)(long)(N - 1), &dst, 0);
     if (r < 0) {
-        write(2, "FUTEX_CMPREQ FAIL: cmp_requeue syscall error\n", 45);
+        dprintf(2, "FUTEX_CMPREQ FAIL: cmp_requeue syscall error\n");
         return 1;
     }
 
-    usleep(10000);
-
-    /* Release all requeued waiters on dst */
     syscall(SYS_futex, &dst, FUTEX_WAKE, N, NULL, NULL, 0);
 
-    for (int i = 0; i < N; i++) pthread_join(t[i], NULL);
+    for (int i = 0; i < N; i++)
+        pthread_join(t[i], NULL);
 
     int w = atomic_load(&woken);
     if (w == N) {
-        write(1, "FUTEX_CMPREQ PASS\n", 18);
+        puts("PASS");
         return 0;
     }
     dprintf(2, "FUTEX_CMPREQ FAIL: woken=%d expected=%d\n", w, N);

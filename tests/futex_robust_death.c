@@ -21,7 +21,6 @@ static pthread_mutex_t mtx;
 static void *killer(void *arg) {
     (void)arg;
     pthread_mutex_lock(&mtx);
-    /* Exit without unlocking — triggers robust list kernel cleanup */
     return NULL;
 }
 
@@ -34,13 +33,13 @@ int main(void) {
 
     pthread_t t;
     pthread_create(&t, NULL, killer, NULL);
-    pthread_join(t, NULL); /* thread exited holding lock */
+    pthread_join(t, NULL);
 
     int r = pthread_mutex_lock(&mtx);
     if (r == EOWNERDEAD) {
         pthread_mutex_consistent(&mtx);
         pthread_mutex_unlock(&mtx);
-        write(1, "FUTEX_ROBUST PASS\n", 18);
+        puts("PASS");
         return 0;
     }
     dprintf(2, "FUTEX_ROBUST FAIL: lock returned %d (expected EOWNERDEAD=%d)\n",
