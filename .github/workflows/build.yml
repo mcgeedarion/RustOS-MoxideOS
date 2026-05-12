@@ -12,30 +12,24 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Single source of truth for the nightly pin used in all three jobs.
-  # Must match rust-toolchain.toml channel and Dockerfile/flake.nix.
-  NIGHTLY: nightly-2025-05-15
+  # Toolchain is pinned in rust-toolchain.toml — that file is the single
+  # source of truth for the nightly version used by all jobs here and
+  # locally.  Use `toolchain: file` below so CI always reads it directly
+  # rather than duplicating the pin here.
 
 jobs:
-  # ── Primary: RISC-V UEFI (default target + default feature) ─────────────────
+  # ── Primary: RISC-V UEFI (default target + default feature) ───────────────
   build-riscv-uefi:
     name: "RISC-V UEFI (debug + release)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (${{ env.NIGHTLY }})
+      - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.NIGHTLY }}
+          toolchain: file
           components: rust-src, llvm-tools-preview, rustfmt, clippy
-
-      - name: Verify toolchain pin
-        run: |
-          ACTIVE=$(rustup show active-toolchain | awk '{print $1}')
-          echo "Active toolchain: $ACTIVE"
-          echo "$ACTIVE" | grep -q "$NIGHTLY" \
-            || { echo "ERROR: toolchain mismatch!"; exit 1; }
 
       - name: Install clang + lld
         run: |
@@ -49,8 +43,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-riscv-uefi-${{ env.NIGHTLY }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-riscv-uefi-${{ env.NIGHTLY }}-
+          key: ${{ runner.os }}-riscv-uefi-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-riscv-uefi-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: Build (debug)
         run: |
@@ -68,26 +62,19 @@ jobs:
             -Z build-std=core,alloc,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem
 
-  # ── Secondary: RISC-V SBI ───────────────────────────────────────────────────
+  # ── Secondary: RISC-V SBI ──────────────────────────────────────────────────
   build-riscv-sbi:
     name: "RISC-V SBI (debug)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (${{ env.NIGHTLY }})
+      - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.NIGHTLY }}
+          toolchain: file
           components: rust-src
           targets: riscv64gc-unknown-none-elf
-
-      - name: Verify toolchain pin
-        run: |
-          ACTIVE=$(rustup show active-toolchain | awk '{print $1}')
-          echo "Active toolchain: $ACTIVE"
-          echo "$ACTIVE" | grep -q "$NIGHTLY" \
-            || { echo "ERROR: toolchain mismatch!"; exit 1; }
 
       - name: Install clang
         run: |
@@ -101,8 +88,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-riscv-sbi-${{ env.NIGHTLY }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-riscv-sbi-${{ env.NIGHTLY }}-
+          key: ${{ runner.os }}-riscv-sbi-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-riscv-sbi-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: Build (debug)
         run: |
@@ -112,26 +99,19 @@ jobs:
             -Z build-std=core,alloc,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem
 
-  # ── Tertiary: x86_64 ────────────────────────────────────────────────────────
+  # ── Tertiary: x86_64 ───────────────────────────────────────────────────────────
   build-x86_64:
     name: "x86_64 (debug + release)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain (${{ env.NIGHTLY }})
+      - name: Install Rust toolchain (rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.NIGHTLY }}
+          toolchain: file
           components: rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
-
-      - name: Verify toolchain pin
-        run: |
-          ACTIVE=$(rustup show active-toolchain | awk '{print $1}')
-          echo "Active toolchain: $ACTIVE"
-          echo "$ACTIVE" | grep -q "$NIGHTLY" \
-            || { echo "ERROR: toolchain mismatch!"; exit 1; }
 
       - name: Install clang + nasm
         run: |
@@ -145,8 +125,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-x86_64-${{ env.NIGHTLY }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-x86_64-${{ env.NIGHTLY }}-
+          key: ${{ runner.os }}-x86_64-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-x86_64-${{ hashFiles('rust-toolchain.toml') }}-
 
       - name: Build (debug)
         run: |

@@ -37,6 +37,7 @@ jobs:
         run: |
           # virtio_gpu.rs currently contains markdown (not Rust) — exclude it
           # until the real driver is written.
-          find src tests xtask userspace -name '*.rs' \
+          # userspace/ contains only C/Makefile files — no .rs files exist there.
+          find src tests xtask -name '*.rs' \
             ! -path 'src/drivers/virtio_gpu.rs' \
             | xargs rustfmt --edition 2021 --check

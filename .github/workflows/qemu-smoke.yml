@@ -29,15 +29,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      # Pin to the same nightly as rust-toolchain.toml so a nightly
+      # regression cannot break smoke without also breaking the build job.
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: file
           targets: riscv64gc-unknown-none-elf
           components: rust-src, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: riscv64-debug
+          key: riscv64-debug-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Install QEMU (RISC-V)
         run: |
@@ -56,11 +59,6 @@ jobs:
             { echo "ELF not found"; exit 1; }
           file target/riscv64gc-unknown-none-elf/debug/rustos
 
-      # -smp 2 starts a second QEMU vCPU (hart 1).  The BSP uses SBI HSM
-      # HART_START to wake it; it runs through ap_entry_riscv → ap_entry
-      # → init_hart (sets stvec/SEIE on hart 1) → ap_init_plic → ap_idle.
-      # PLIC context 3 (hart 1 S-mode) is initialised with threshold=0 and
-      # inherits the virtio-net enable bits from context 1 (BSP).
       - name: QEMU SMP + NIC smoke test (RISC-V)
         run: |
           timeout 15 qemu-system-riscv64 \
@@ -129,15 +127,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: file
           targets: x86_64-unknown-none
           components: rust-src, llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-debug
+          key: x86_64-debug-${{ hashFiles('rust-toolchain.toml') }}
 
       - name: Install QEMU (x86) + OVMF
         run: |

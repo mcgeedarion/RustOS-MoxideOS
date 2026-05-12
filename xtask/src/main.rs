@@ -22,7 +22,7 @@ use std::{
     process::{Command, exit},
 };
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+// ─── helpers ────────────────────────────────────────────────────────────────────────
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,7 +75,7 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
     }
 }
 
-// ─── CLI parsing ──────────────────────────────────────────────────────────────
+// ─── CLI parsing ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Arch {
@@ -147,7 +147,7 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
     opts
 }
 
-// ─── build actions ────────────────────────────────────────────────────────────
+// ─── build actions ──────────────────────────────────────────────────────────────
 
 fn build_riscv_uefi(root: &PathBuf, debug: bool) {
     let profile = if debug { "debug" } else { "release" };
@@ -218,7 +218,15 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
     }
 }
 
-fn build_x86_64(root: &PathBuf, debug: bool) {
+fn build_x86_64(root: &PathBuf, debug: bool, initrd: bool) {
+    // Warn early if --initrd was passed; it is not supported for x86_64 builds.
+    // The flag is accepted by the parser so it does not error on unknown args,
+    // but we must not silently discard it.
+    if initrd {
+        eprintln!("[xtask] WARNING: --initrd is not supported for x86_64 builds.");
+        eprintln!("[xtask]          Initramfs support is RISC-V SBI only (--arch riscv64 --boot sbi --initrd).");
+    }
+
     let profile = if debug { "debug" } else { "release" };
     eprintln!("[xtask] Building rustos (x86_64, {profile})...");
 
@@ -235,11 +243,18 @@ fn build_x86_64(root: &PathBuf, debug: bool) {
 
     let elf = root.join(format!("target/x86_64-unknown-none/{profile}/rustos"));
     let bin = root.join("kernel.bin");
-    run(Command::new("objcopy").args(["-O", "binary"]).arg(&elf).arg(&bin));
+
+    // Require objcopy / llvm-objcopy with a friendly install hint rather than
+    // panicking with "failed to spawn command" if the tool is absent.
+    let objcopy = require_tool(
+        &["llvm-objcopy", "objcopy"],
+        "apt install llvm binutils",
+    );
+    run(Command::new(&objcopy).args(["-O", "binary"]).arg(&elf).arg(&bin));
     eprintln!("[xtask] Built: {}", bin.display());
 }
 
-// ─── image action ─────────────────────────────────────────────────────────────
+// ─── image action ─────────────────────────────────────────────────────────────────
 
 /// `cargo xtask image [--arch <x86_64|riscv64>] [--debug] [--initrd]`
 ///
@@ -249,7 +264,7 @@ fn build_x86_64(root: &PathBuf, debug: bool) {
 ///
 /// Requires: mtools (mformat, mmd, mcopy) + objcopy / llvm-objcopy.
 fn image(root: &PathBuf, opts: &BuildOpts) {
-    // ── pre-flight tool checks ──────────────────────────────────────────────
+    // ── pre-flight tool checks ───────────────────────────────────────────────
     require_tool(
         &["mformat"],
         "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS",
@@ -261,15 +276,15 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         "apt install llvm binutils",
     );
 
-    // ── build the kernel first ──────────────────────────────────────────────
+    // ── build the kernel first ────────────────────────────────────────────────
     eprintln!("[xtask] image: building kernel...");
     match (opts.arch, opts.boot) {
         (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(root, opts.debug),
         (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(root, opts.debug, opts.initrd),
-        (Arch::X86_64,  _)          => build_x86_64(root, opts.debug),
+        (Arch::X86_64,  _)          => build_x86_64(root, opts.debug, opts.initrd),
     }
 
-    // ── locate the EFI / ELF output ────────────────────────────────────────
+    // ── locate the EFI / ELF output ───────────────────────────────────────────
     let profile = if opts.debug { "debug" } else { "release" };
 
     let (efi_name, img_name) = match opts.arch {
@@ -277,8 +292,6 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         Arch::RiscV64 => ("BOOTRISCV64.EFI",  "boot-riscv64.img"),
     };
 
-    // For x86_64 we need to produce the PE EFI file from the ELF.
-    // For riscv64/uefi the EFI binary is already in esp/EFI/BOOT/.
     let efi_path = root.join("esp/EFI/BOOT").join(efi_name);
 
     if opts.arch == Arch::X86_64 {
@@ -289,11 +302,9 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         }
         let esp_dir = root.join("esp/EFI/BOOT");
         std::fs::create_dir_all(&esp_dir).expect("create esp dir");
-        // Strip to a flat binary then convert to PE EFI.
-        // objcopy can emit PE-COFF directly with --target efi-app-x86-64.
         run(Command::new(&objcopy)
             .args(["--target", "efi-app-x86-64",
-                   "--subsystem", "10"]) // EFI application
+                   "--subsystem", "10"])
             .arg(&elf)
             .arg(&efi_path));
     }
@@ -304,36 +315,29 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         exit(1);
     }
 
-    // ── create the FAT32 disk image ─────────────────────────────────────────
+    // ── create the FAT32 disk image ───────────────────────────────────────────
     let img_path = root.join(img_name);
 
-    // mformat: create a 64 MiB FAT32 image.
-    // -C = create image file, -F = FAT32, -h 64 -s 32 = 64 sectors/track * 32
-    // tracks = 2048 sectors * 512 bytes = 1 MiB clusters; -S 512 = sector size.
-    // Total size: 131072 sectors * 512 = 64 MiB.
     run(Command::new("mformat")
         .args(["-C", "-F",
                "-h", "64",
                "-s", "32",
-               "-t", "64",    // 64 cylinders → 64*64*32*512 = 64 MiB
+               "-t", "64",
                "-i"])
         .arg(&img_path)
         .arg("::"));
 
-    // mmd: create the EFI/BOOT directory tree inside the image.
     run(Command::new("mmd")
         .args(["-i"])
         .arg(&img_path)
         .args(["::/EFI", "::/EFI/BOOT"]));
 
-    // mcopy: copy the EFI binary into the image.
     run(Command::new("mcopy")
         .args(["-i"])
         .arg(&img_path)
         .arg(&efi_path)
         .arg(format!("::/EFI/BOOT/{efi_name}")));
 
-    // Optionally embed the initramfs on the ESP root.
     if opts.initrd {
         let cpio = root.join("initramfs.cpio");
         if cpio.exists() {
@@ -375,7 +379,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     eprintln!();
 }
 
-// ─── entrypoint ───────────────────────────────────────────────────────────────
+// ─── entrypoint ───────────────────────────────────────────────────────────────────
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -390,11 +394,10 @@ fn main() {
             match (opts.arch, opts.boot) {
                 (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(&root, opts.debug),
                 (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(&root, opts.debug, opts.initrd),
-                (Arch::X86_64,  _)          => build_x86_64(&root, opts.debug),
+                (Arch::X86_64,  _)          => build_x86_64(&root, opts.debug, opts.initrd),
             }
         }
         "image" => {
-            // Default arch for `image` is x86_64 (most common real-hardware target).
             let mut opts = parse_build_args(&rest);
             if rest.iter().all(|a| a != "--arch") {
                 opts.arch = Arch::X86_64;
@@ -413,7 +416,7 @@ fn main() {
                 "  --arch <riscv64|x86_64>   Target architecture  (image default: x86_64)\n",
                 "  --boot <uefi|sbi>         Boot mode (riscv64)  (default: uefi)\n",
                 "  --debug                   Debug build          (default: release)\n",
-                "  --initrd                  Build/include initramfs\n",
+                "  --initrd                  Build/include initramfs (RISC-V SBI only)\n",
                 "\n",
                 "image requires:\n",
                 "  mtools   (mformat, mmd, mcopy)  →  apt install mtools\n",

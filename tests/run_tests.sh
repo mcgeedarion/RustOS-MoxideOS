@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # tests/run_tests.sh
 #
 # Build and run the full concurrent stress test suite against rustos.
@@ -11,7 +11,7 @@
 # (on Linux host for build verification) or dropped into the kernel image
 # initramfs and run via exec for full kernel integration testing.
 
-set -e
+set -euo pipefail
 
 CC=${MUSL_GCC:-musl-gcc}
 CFLAGS="-static -O1 -Wall -Wextra -Wno-unused-parameter"
@@ -23,20 +23,21 @@ FAIL=0
 SKIP=0
 
 run_test() {
-    name="$1"
-    src="$2"
-    bin="$BUILD_DIR/$name"
+    local name="$1"
+    local src="$2"
+    local bin="$BUILD_DIR/$name"
 
     printf 'Building %-30s ... ' "$name"
     if ! $CC $CFLAGS -o "$bin" "$src" -lpthread -lrt 2>"$BUILD_DIR/$name.log"; then
         echo 'BUILD FAIL'
-        cat "$BUILD_DIR/$name.log" | sed 's/^/    /'
+        sed 's/^/    /' "$BUILD_DIR/$name.log"
         FAIL=$((FAIL + 1))
         return
     fi
     echo 'ok'
 
     printf 'Running  %-30s ... ' "$name"
+    # Capture stdout for PASS/SKIP/FAIL detection; suppress on first run.
     output=$("$bin" 2>/dev/null)
     exit_code=$?
 
@@ -45,7 +46,9 @@ run_test() {
         *SKIP*) echo "SKIP"; SKIP=$((SKIP + 1)) ;;
         *)
             echo "FAIL (exit=$exit_code)"
-            "$bin" || true  # rerun to capture stderr
+            # Rerun with both stdout+stderr visible so the 'detail:' line
+            # written to stderr by test_helpers.h appears in CI logs.
+            "$bin" 2>&1 || true
             FAIL=$((FAIL + 1))
             ;;
     esac
