@@ -11,6 +11,7 @@
 //!   3a. mm::init()             — slab cache pre-warm (8 size classes)
 //!   3b. io_uring::init()       — ring table init (requires alloc)
 //!   4.  initramfs::mount()     — populate VFS from CPIO
+//!   4a. namespace::init()      — seed INIT_NS in mount + UTS namespace tables
 //!   5.  gdt::init()            — GDT + TSS
 //!   6.  idt::init()            — IDT / exception vectors
 //!   7.  apic::init()           — local + IO APIC, timer IRQ
@@ -30,6 +31,7 @@
 //!   3a. mm::init()             — slab cache pre-warm (8 size classes)
 //!   3b. io_uring::init()       — ring table init (requires alloc)
 //!   4.  initramfs::mount()     — populate VFS from CPIO
+//!   4a. namespace::init()      — seed INIT_NS in mount + UTS namespace tables
 //!   5.  plic::init()           — set S-mode context threshold=0, PLIC ready to deliver
 //!   6.  virtio_net_mmio::enable_plic_irq()
 //!                              — register NIC IRQ with PLIC; enables interrupt-driven RX
@@ -46,8 +48,6 @@ use crate::{drivers, fs, io_uring, mm, net, proc, smp, time, tty};
 // ── Shared helpers ───────────────────────────────────────────────────────────────────────
 
 /// Halt the current CPU permanently. Used only on fatal, unrecoverable errors.
-/// Marked `#[cold]` so LLVM treats call sites as unlikely branches, keeping
-/// the hot boot path's code layout tight.
 #[cold]
 #[inline(never)]
 fn halt_loop() -> ! {
@@ -57,6 +57,20 @@ fn halt_loop() -> ! {
         #[cfg(target_arch = "riscv64")]
         unsafe { core::arch::asm!("wfi"); }
     }
+}
+
+/// Initialise the namespace subsystem. Called in both arch paths immediately
+/// after mount_initramfs() so the VFS is live and alloc is available.
+///
+/// - init_mount_ns() seeds INIT_NS in MOUNT_NS_TABLE (empty BTreeMap → one entry)
+/// - init_uts_ns()   seeds INIT_NS in UTS_NS_TABLE with hostname "rustos"
+///
+/// Both functions are idempotent: calling them a second time is a no-op.
+#[inline]
+fn init_namespaces() {
+    crate::proc::namespace::init_mount_ns();
+    crate::proc::namespace::init_uts_ns();
+    crate::println!("rustos: namespace subsystem initialised");
 }
 
 /// Common tail executed by both arch entry points after all hardware subsystems
@@ -91,25 +105,28 @@ pub fn kernel_main_x86_64() {
     serial::init();
     crate::println!("rustos: x86_64 kernel starting");
 
-    // 2. Physical memory manager — must come before heap and slab have frames.
+    // 2. Physical memory manager.
     pmm::init();
 
-    // 3. Kernel heap (linked-list allocator) — enables Box / Vec / String.
+    // 3. Kernel heap.
     heap::init();
 
-    // 3a. Slab allocator — pre-warms 8 fixed-size caches over PMM.
-    //     Must follow heap::init() so that slab::init()'s pmm::alloc_page
-    //     calls (inside Cache::grow) have the PMM ready and so that any
-    //     Box allocations inside init() itself work correctly.
+    // 3a. Slab allocator.
     mm::init();
     crate::println!("rustos: slab allocator ready");
 
-    // 3b. io_uring ring table — requires alloc, must precede any io_uring syscall.
+    // 3b. io_uring ring table.
     io_uring::init();
     crate::println!("rustos: io_uring ready");
 
-    // 4–12. Remaining subsystems.
+    // 4. VFS from CPIO initramfs.
     fs::initramfs::mount_initramfs();
+
+    // 4a. Namespace subsystem — must follow heap::init() (needs alloc) and
+    //     precede any process creation (PID 1 inherits INIT_NS).
+    init_namespaces();
+
+    // 5–12. Remaining hardware + network subsystems.
     gdt::init();
     idt::init();
     apic::init();
@@ -144,8 +161,7 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
     crate::println!("rustos: riscv64 kernel starting (hart {})", hart_id);
     crate::println!("kernel_main reached");
 
-    // 2. Walk the FDT: registers PMM regions, finds initramfs, sets PLIC base,
-    //    probes virtio_mmio devices (virtio_net_mmio::probe is called here).
+    // 2. Walk the FDT.
     unsafe { crate::arch::riscv64::fdt::init_from_fdt(fdt_ptr); }
     crate::println!(
         "pmm: {} MiB total, {} MiB free",
@@ -153,26 +169,26 @@ pub fn kernel_main_riscv64(hart_id: usize, fdt_ptr: usize) {
         pmm::free_pages() * 4 / 1024,
     );
 
-    // 3. Heap must come up before any Box/Vec/String allocations.
+    // 3. Heap.
     heap::init();
 
-    // 3a. Slab allocator — pre-warms 8 fixed-size caches over PMM.
+    // 3a. Slab allocator.
     mm::init();
     crate::println!("rustos: slab allocator ready");
 
-    // 3b. io_uring ring table — requires alloc, must precede any io_uring syscall.
+    // 3b. io_uring ring table.
     io_uring::init();
     crate::println!("rustos: io_uring ready");
 
     // 4. VFS from CPIO.
     fs::initramfs::mount_initramfs();
 
+    // 4a. Namespace subsystem — same ordering rationale as x86_64 path.
+    init_namespaces();
+
     // 5. PLIC: set threshold=0 so any enabled IRQ with priority ≥1 is delivered.
-    //    Must happen after fdt::init_from_fdt (which calls plic::set_base).
     if drivers::plic::init() {
         // 6. Register the virtio-net MMIO IRQ with the PLIC.
-        //    From now on, RX is interrupt-driven (scause 0x8000…9 → plic::handle_irq
-        //    → virtio_net_mmio_irq → rx_poll + drain_tx).
         drivers::virtio_net_mmio::enable_plic_irq();
     } else {
         crate::println!("plic: not available — NIC will use polled RX");
