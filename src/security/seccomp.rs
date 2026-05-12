@@ -24,8 +24,8 @@
 //!   SECCOMP_RET_KILL_THREAD   0x0000_0000 — kill current thread
 //!   SECCOMP_RET_TRAP          0x0003_0000 — send SIGSYS
 //!   SECCOMP_RET_ERRNO         0x0005_0000 — return -errno (low 16 bits)
-//!   SECCOMP_RET_USER_NOTIF    0x7FC0_0000 — (stub) treated as KILL
-//!   SECCOMP_RET_TRACE         0x7FF0_0000 — (stub) treated as ALLOW
+//!   SECCOMP_RET_USER_NOTIF    0x7FC0_0000 — (stub) no listener → ENOSYS
+//!   SECCOMP_RET_TRACE         0x7FF0_0000 — (stub) no tracer → EPERM
 //!   SECCOMP_RET_LOG           0x7FFC_0000 — log and allow
 //!   SECCOMP_RET_ALLOW         0x7FFF_0000 — allow the syscall
 //!
@@ -71,6 +71,10 @@ pub const SECCOMP_RET_DATA:         u32 = 0x0000_FFFF;
 
 // Architecture constant written into seccomp_data.arch
 pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+// ─── Errno literals (no_std; avoid libc dep) ────────────────────────────────
+const EPERM:  i32 = 1;
+const ENOSYS: i32 = 38;
 
 // ─── seccomp_data (fed to BPF program as packet bytes) ──────────────────────
 
@@ -159,6 +163,8 @@ const BPF_TXA: u16 = BPF_MISC | 0x80;
 
 /// Maximum BPF program length (matching Linux's BPF_MAXINSNS)
 const BPF_MAXINSNS: usize = 4096;
+/// V10 fix: cap evaluation steps to prevent infinite-loop DoS.
+const BPF_MAX_STEPS: usize = 65_536;
 /// Working memory for BPF programs (M[0..16])
 const BPF_MEMWORDS: usize = 16;
 
@@ -196,17 +202,22 @@ pub struct FilterChain {
 
 /// Evaluate a single cBPF program against `data` bytes.
 /// Returns the u32 action code produced by BPF_RET.
-/// On any malformed access, returns SECCOMP_RET_KILL_PROCESS.
+/// On any malformed access or step-limit exceeded, returns SECCOMP_RET_KILL_PROCESS.
 fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
     let mut a: u32 = 0;
     let mut x: u32 = 0;
     let mut m = [0u32; BPF_MEMWORDS];
     let mut pc: usize = 0;
+    // V10 fix: step counter prevents infinite-loop BPF programs from
+    // hanging the kernel evaluation path.
+    let mut steps: usize = 0;
 
     if insns.len() > BPF_MAXINSNS { return SECCOMP_RET_KILL_PROCESS; }
 
     loop {
         if pc >= insns.len() { return SECCOMP_RET_KILL_PROCESS; }
+        steps += 1;
+        if steps > BPF_MAX_STEPS { return SECCOMP_RET_KILL_PROCESS; }
         let ins = insns[pc];
         let code = ins.code;
         let k    = ins.k;
@@ -403,9 +414,15 @@ fn action_to_verdict(ret: u32) -> SeccompVerdict {
             let errno = (ret & SECCOMP_RET_DATA) as i32;
             SeccompVerdict::Errno(if errno == 0 { 1 } else { errno })
         }
-        // TRACE / USER_NOTIF: stub as allow (no ptrace/notif support yet)
-        a if a == SECCOMP_RET_TRACE     => SeccompVerdict::Allow,
-        a if a == SECCOMP_RET_USER_NOTIF => SeccompVerdict::Kill, // no listener → kill
+        // V11 fix: TRACE — no ptrace tracer attached → deny with EPERM.
+        // Linux default: if no tracer is present the syscall is denied.
+        // When ptrace support is added, check for an attached tracer here
+        // and return Allow only if one exists.
+        a if a == SECCOMP_RET_TRACE => SeccompVerdict::Errno(EPERM),
+        // V11 fix: USER_NOTIF — no listener installed → deny with ENOSYS
+        // rather than killing the process outright, giving callers a
+        // recoverable error instead of a hard crash.
+        a if a == SECCOMP_RET_USER_NOTIF => SeccompVerdict::Errno(ENOSYS),
         // LOG / ALLOW
         _ => SeccompVerdict::Allow,
     }

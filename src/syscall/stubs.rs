@@ -922,6 +922,9 @@ fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize)
 fn sys_utimensat_impl(_dirfd: i32, _path_va: usize, _times_va: usize, _flags: i32) -> isize { 0 }
 
 // ── NR 318  getrandom ──────────────────────────────────────────────────────────
+// V8 fix: use arch_entropy() as the primary source so that the hardware RNG
+// (RDRAND on x86_64, mixed cycle counters on RISC-V) is always consulted
+// first, rather than falling through to the bare xorshift LFSR.
 
 const GETRANDOM_MAX: usize = 4096;
 
@@ -930,7 +933,7 @@ fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
     let n = count.min(GETRANDOM_MAX);
     let mut buf = alloc::vec![0u8; n];
     for chunk in buf.chunks_mut(8) {
-        let r     = crate::rand::rdrand_or_lfsr();
+        let r     = crate::rand::arch_entropy();
         let bytes = r.to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
