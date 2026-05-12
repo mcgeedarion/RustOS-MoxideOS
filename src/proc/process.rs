@@ -224,12 +224,21 @@ pub struct Pcb {
     // ── Group scheduling ─────────────────────────────────────────────────
     //
     // `tg_id == 0` means this process is ungrouped (root cgroup).
-    // A non-zero tg_id means the process belongs to the TaskGroup with
-    // that id in the TASK_GROUPS table.  The scheduler checks this field
-    // in enqueue() to decide whether to place the task into the group's
-    // inner heap or directly onto the per-CPU cfs_heap.
     /// Task group id.  0 = ungrouped / root.
     pub tg_id: usize,
+
+    // ── Priority inheritance ──────────────────────────────────────────────
+    //
+    // `base_rt_priority` stores the process's original rt_priority before
+    // any PI boost.  When a PI-mutex owner is boosted by a higher-priority
+    // waiter, `sched.rt_priority` is raised to the waiter's level while
+    // `base_rt_priority` is left untouched.  On FUTEX_UNLOCK_PI the
+    // scheduler restores `sched.rt_priority` to `base_rt_priority` once no
+    // further PI waiters remain.
+    //
+    // Invariant: base_rt_priority <= sched.rt_priority at all times.
+    /// Original (un-boosted) RT priority.  0 for non-RT tasks.
+    pub base_rt_priority: u8,
 }
 
 // SAFETY: Pcb is accessed only under ProcLock::inner (spin::Mutex).
@@ -283,6 +292,7 @@ impl Pcb {
             task:                core::ptr::null_mut(),
             sched:               SchedEntity::new(0),
             tg_id:               0,
+            base_rt_priority:    0,
         }
     }
 
