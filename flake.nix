@@ -1,7 +1,6 @@
 {
   description = "rustos — Rust bare-metal OS (x86_64 + RISC-V)";
 
-  # ── Input pins ──────────────────────────────────────────────────────────────
   # IMPORTANT: keep the nightly date here in sync with:
   #   rust-toolchain.toml  (channel = "nightly-YYYY-MM-DD")
   #   Dockerfile           (ARG NIGHTLY_DATE=YYYY-MM-DD)
@@ -22,8 +21,6 @@
           overlays = [ rust-overlay.overlays.default ];
         };
 
-        # ── Toolchain ────────────────────────────────────────────────────────
-        # Pin matches rust-toolchain.toml and Dockerfile.
         rustToolchain = pkgs.rust-bin.nightly."2025-05-15".default.override {
           extensions = [
             "rust-src"            # required by -Z build-std
@@ -38,22 +35,19 @@
           ];
         };
 
-        # ── Native build tools ───────────────────────────────────────────────
         nativeDeps = with pkgs; [
-          clang_18       # linker for bare-metal targets
-          lld_18         # lld-link for riscv64-uefi.json (PE/COFF)
-          nasm           # x86_64 boot assembly
-          # RISC-V GNU binutils for build.rs uentry.S assembler
+          clang_18
+          lld_18
+          nasm
           pkgsCross.riscv64-embedded.buildPackages.binutils
-          qemu           # QEMU for smoke tests
-          ovmf           # UEFI firmware for QEMU
+          qemu
+          ovmf
           git
           gnumake
           python3
         ];
 
       in {
-        # ── devShell ──────────────────────────────────────────────────────────
         # Usage:
         #   nix develop                        # enter dev shell
         #   nix develop --command cargo build  # build without entering
@@ -62,13 +56,9 @@
 
           buildInputs  = [ rustToolchain ] ++ nativeDeps;
 
-          # Environment variables consumed by cargo / build.rs
           shellHook = ''
             export CARGO_TERM_COLOR=always
             export CARGO_INCREMENTAL=0
-
-            # Make riscv64-unknown-elf-as / riscv64-unknown-elf-ar visible
-            # to build.rs without requiring a PATH change inside cargo.
             export RISCV_AS=$(which riscv64-unknown-elf-as 2>/dev/null || echo "")
             export RISCV_AR=$(which riscv64-unknown-elf-ar 2>/dev/null || echo "")
 
@@ -88,14 +78,12 @@
           '';
         };
 
-        # ── Package: kernel ELF (RISC-V UEFI, release) ───────────────────────
         # Allows: nix build
         packages.default = pkgs.rustPlatform.buildRustPackage {
           pname   = "rustos";
           version = "0.2.0";
           src     = ./.;
 
-          # Cargo.lock must be present for nix build to be reproducible.
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [ rustToolchain ] ++ nativeDeps;
@@ -113,7 +101,6 @@
             cp target/riscv64-uefi/release/rustos.efi $out/boot/
           '';
 
-          # Rust bare-metal crates don't use the standard test harness.
           doCheck = false;
         };
       }

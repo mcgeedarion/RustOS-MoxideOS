@@ -56,7 +56,6 @@ for arg in "$@"; do
   esac
 done
 
-# ── GDB banner helper ────────────────────────────────────────────────────────────────
 gdb_banner() {
   local sym_file
   if [[ "$BOOT" == "uefi" ]]; then
@@ -76,9 +75,8 @@ gdb_banner() {
   echo
 }
 
-# ── Net args helper ────────────────────────────────────────────────────────────────
 add_net_args() {
-  local -n arr=$1   # nameref to the array
+  local -n arr=$1
   if [[ $NET_MODE -eq 1 ]]; then
     echo "[*] Network: virtio-net-device (MMIO, user-mode NAT, guest 10.0.2.15/24)"
     arr+=(

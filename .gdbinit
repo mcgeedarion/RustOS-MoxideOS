@@ -10,28 +10,16 @@ set disassembly-flavor intel
 set print pretty on
 set print array on
 
-# ── Load kernel symbol file ───────────────────────────────────────────────────
-# Debug ELF contains all DWARF info. Adjust path for release builds if needed.
 file target/x86_64-unknown-none/debug/rustos
 
-# ── Architecture ─────────────────────────────────────────────────────────────
 set architecture i386:x86-64
 
-# ── Connect to QEMU gdbserver ────────────────────────────────────────────────
-# QEMU -s opens TCP :1234.  Change port here if you use -gdb tcp::NNNN.
 target remote :1234
 
-# ── Useful breakpoints ───────────────────────────────────────────────────────
 # Uncomment to break at kernel entry and panic handler automatically.
 # break kernel_main
 # break rust_begin_unwind
 
-# ── Kernel-specific commands ─────────────────────────────────────────────────
-
-# procs -- print a summary of every PCB in the run queue
-#
-# Reads SCHED.procs (Vec<Pcb>) directly from kernel memory.
-# Output: index  pid  ppid  tgid  state  pc  sp
 define procs
   printf "%-4s %-6s %-6s %-6s %-8s %-18s %s\n", \
     "idx", "pid", "ppid", "tgid", "state", "pc", "sp"
@@ -87,8 +75,6 @@ pcb N -- print detailed fields of PCB at scheduler run-queue index N.
 Use `procs` first to find the index for a given pid.
 end
 
-# kbt -- kernel backtrace from current rsp
-# Useful when `bt` is confused by the kernel stack layout after a trap.
 define kbt
   set $__rsp = $rsp
   printf "kernel stack backtrace from rsp=0x%lx:\n", $__rsp

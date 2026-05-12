@@ -67,11 +67,6 @@ QEMU_ARGS=(
   -d guest_errors,cpu_reset
 )
 
-# ── virtio-net (user-mode NAT) ────────────────────────────────────────────
-# Adds a virtio-net-pci device the driver discovers during PCI enumeration.
-# QEMU user networking provides SLIRP NAT — no TAP, no root needed.
-# The kernel's virtio_net_probe() will find vendor=0x1AF4 dev=0x1041 (modern)
-# on the q35 bus and register it with nic::register_nic().
 if [[ $NET_MODE -eq 1 ]]; then
   echo "[*] Network: virtio-net-pci (user-mode NAT, guest 10.0.2.15/24)"
   QEMU_ARGS+=(
@@ -82,7 +77,6 @@ else
   echo "[*] Network: disabled (--no-net)"
 fi
 
-# ── GPU ────────────────────────────────────────────────────────────────────
 if [[ $GPU_MODE -eq 1 ]]; then
   echo "[*] GPU mode: adding virtio-gpu-pci + SDL display"
   QEMU_ARGS+=(
@@ -93,7 +87,6 @@ else
   QEMU_ARGS+=(-display none)
 fi
 
-# ── Disk ───────────────────────────────────────────────────────────────────
 if [[ -n "$DISK" ]]; then
   echo "[*] Attaching disk: $DISK"
   QEMU_ARGS+=(
@@ -104,11 +97,10 @@ else
   echo "[*] No disk image — ramfs only"
 fi
 
-# ── GDB ────────────────────────────────────────────────────────────────────
 if [[ $GDB_MODE -eq 1 ]]; then
   QEMU_ARGS+=(
-    -s        # open gdbserver on TCP :1234
-    -S        # halt CPU at startup, wait for GDB `continue`
+    -s
+    -S
   )
   echo
   echo "  ┌─────────────────────────────────────────────┐"
