@@ -1,7 +1,16 @@
-//! Direct Rendering Manager (DRM) subsystem.
+//! DRM/KMS (Direct Rendering Manager / Kernel Mode Setting) subsystem.
 //!
-//! Provides kernel-mode setting (KMS) and GPU buffer management (GEM)
-//! for display hardware.
+//! This module provides the kernel-side DRM/KMS infrastructure:
+//! - Mode setting (CRTC, encoder, connector management)
+//! - Framebuffer allocation and management
+//! - GPU/display driver abstraction
+//! - GEM (Graphics Execution Manager) buffer objects
+//! - Synchronization primitives for GPU work (fences, dma-buf)
+//!
+//! The Wayland compositor (`crate::display::wayland`) interfaces with this
+//! subsystem to perform display output and buffer presentation.
+//!
+//! Hardware driver stubs: `crate::drivers::drm`, `crate::drivers::virtio_gpu`
 
 pub mod connector;
 pub mod crtc;
@@ -10,47 +19,7 @@ pub mod framebuffer;
 pub mod gem;
 pub mod plane;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DisplayMode {
-    pub hdisplay: u16,
-    pub vdisplay: u16,
-    pub refresh: u32,
-    pub clock: u32,
-    pub hsync_start: u16,
-    pub hsync_end: u16,
-    pub htotal: u16,
-    pub vsync_start: u16,
-    pub vsync_end: u16,
-    pub vtotal: u16,
-    pub flags: u32,
-}
-
-pub use connector::Connector;
-pub use crtc::Crtc;
-pub use encoder::Encoder;
-pub use framebuffer::FramebufferDesc;
-pub use gem::GemObject;
-pub use plane::Plane;
-
-/// DRM device handle.
-pub struct DrmDevice {
-    pub connectors: alloc::vec::Vec<Connector>,
-    pub crtcs: alloc::vec::Vec<Crtc>,
-    pub encoders: alloc::vec::Vec<Encoder>,
-    pub planes: alloc::vec::Vec<Plane>,
-    pub framebuffers: alloc::vec::Vec<FramebufferDesc>,
-    pub gem_objects: alloc::vec::Vec<GemObject>,
-}
-
-impl DrmDevice {
-    pub fn new() -> Self {
-        Self {
-            connectors: alloc::vec::Vec::new(),
-            crtcs: alloc::vec::Vec::new(),
-            encoders: alloc::vec::Vec::new(),
-            planes: alloc::vec::Vec::new(),
-            framebuffers: alloc::vec::Vec::new(),
-            gem_objects: alloc::vec::Vec::new(),
-        }
-    }
-}
+pub use crate::drm::{
+    DisplayMode, DrmDriver, DrmError,
+    connector::*, crtc::*, encoder::*, framebuffer::*, gem::*, plane::*,
+};
