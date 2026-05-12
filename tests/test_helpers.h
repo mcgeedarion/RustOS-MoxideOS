@@ -1,11 +1,16 @@
-/* tests/test_helpers.h
+/* tests/test_helpers.h — shared macros for the rustos test suite.
  *
- * Shared macros for the rustos test suite.
+ * Conventions (mirrors userspace/init/init.c):
+ *   - Diagnostic detail  → stderr  (fd 2)
+ *   - Runner token       → stdout  (fd 1)  matched by run_tests.sh *PASS*/*FAIL*/*SKIP*
+ *   - No printf in main paths; test macros use puts() + fprintf(stderr)
+ *   - exit() is acceptable here (tests run in a fully-initialized musl env)
+ *   - _exit() is used in fork() children (consistent with init.c)
  *
- * All tests:
- *   - print "PASS", "FAIL: <reason>", or "SKIP: <reason>" to stdout
- *   - return 0 on PASS or SKIP, 1 on FAIL
- *   - are compiled with musl-gcc -static via tests/run_tests.sh
+ * Syscalls exercised by these macros:
+ *   write(1, ...)   — SYS_write = 1
+ *   write(2, ...)   — SYS_write = 1
+ *   exit(n)         — SYS_exit  = 60
  */
 #ifndef RUSTOS_TEST_HELPERS_H
 #define RUSTOS_TEST_HELPERS_H
@@ -15,24 +20,46 @@
 #include <string.h>
 #include <errno.h>
 
-/* Emit PASS and exit 0. */
-#define TEST_PASS() do { puts("PASS"); exit(0); } while (0)
+/* ── Pass / skip ────────────────────────────────────────────────────────── */
 
-/* Emit SKIP with reason and exit 0. */
-#define TEST_SKIP(reason) do { puts("SKIP: " reason); exit(0); } while (0)
+/* Emit PASS token to stdout and exit 0. */
+#define TEST_PASS() \
+    do { puts("PASS"); exit(0); } while (0)
 
-/* Emit FAIL with reason and exit 1. */
-#define TEST_FAIL(reason) do { puts("FAIL: " reason); exit(1); } while (0)
+/* Emit SKIP token to stdout with reason and exit 0. */
+#define TEST_SKIP(reason) \
+    do { puts("SKIP: " reason); exit(0); } while (0)
 
-/* Emit FAIL with formatted message and exit 1. */
+/* ── Failure ────────────────────────────────────────────────────────────── */
+
+/*
+ * All TEST_FAIL* macros:
+ *   1. Write the diagnostic reason to stderr so run_tests.sh captures it
+ *      on the rerun pass ("$bin || true").
+ *   2. Write the bare FAIL token to stdout so the runner's *FAIL* glob fires.
+ *   3. exit(1).
+ */
+
+/* Emit FAIL with a fixed string reason. */
+#define TEST_FAIL(reason) \
+    do { fprintf(stderr, "  detail: " reason "\n"); \
+         puts("FAIL"); exit(1); } while (0)
+
+/* Emit FAIL with a printf-style formatted reason. */
 #define TEST_FAILF(fmt, ...) \
-    do { fprintf(stdout, "FAIL: " fmt "\n", ##__VA_ARGS__); exit(1); } while (0)
+    do { fprintf(stderr, "  detail: " fmt "\n", ##__VA_ARGS__); \
+         puts("FAIL"); exit(1); } while (0)
 
-/* Check condition; FAIL with message if false. */
+/* ── Assertion helpers ──────────────────────────────────────────────────── */
+
+/* Fail with message if condition is false. */
 #define TEST_ASSERT(cond, reason) \
     do { if (!(cond)) TEST_FAIL(reason); } while (0)
 
-/* Check syscall return; FAIL with perror-style message if rc < 0. */
+/*
+ * Fail with a perror-style message if rc < 0.
+ * Prints:  detail: <name>: <strerror(errno)>
+ */
 #define TEST_SYSCALL(rc, name) \
     do { if ((rc) < 0) TEST_FAILF("%s: %s", name, strerror(errno)); } while (0)
 
