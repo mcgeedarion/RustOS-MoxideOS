@@ -49,8 +49,6 @@
 #include <linux/drm.h>
 #include <linux/dma-buf.h>
 
-/* ── compile-time constants ─────────────────────────────────────────────── */
-
 #define WAYLAND_SOCKET_PATH   "/run/wayland-0"
 #define MAX_CLIENTS           64
 #define MAX_SURFACES          256
@@ -67,8 +65,6 @@
 #define INTF_SEAT         "wl_seat"
 #define INTF_OUTPUT       "wl_output"
 
-/* ── DRM state ──────────────────────────────────────────────────────────── */
-
 static int drm_fd    = -1;
 static int input_fd  = -1;
 static int epoll_fd  = -1;
@@ -81,7 +77,6 @@ static uint32_t primary_fb_id = 0;
 static uint32_t primary_crtc_id = 0;  /* saved from drm_setup(); used by drm_flip() */
 static void    *primary_map   = NULL;  /* mmap of the primary dumb buffer */
 
-/* DRM dumb buffer for the compositor's back-buffer */
 static uint32_t back_buf_handle = 0;
 static uint64_t back_buf_size   = 0;
 static void    *back_buf_map    = NULL;
@@ -97,7 +92,6 @@ static int drm_setup(void) {
     struct drm_mode_card_res res = {0};
     if (ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
 
-    /* Allocate arrays and re-issue to get the actual IDs */
     uint32_t connector_ids[8] = {0};
     uint32_t crtc_ids[8]      = {0};
     res.connector_id_ptr = (uintptr_t)connector_ids;
@@ -107,7 +101,6 @@ static int drm_setup(void) {
     if (ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
     if (res.count_connectors == 0) return -1;
 
-    /* Find the first connected connector and its preferred mode */
     struct drm_mode_get_connector conn = {0};
     conn.connector_id = connector_ids[0];
     if (ioctl(drm_fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) return -1;
@@ -125,7 +118,6 @@ static int drm_setup(void) {
     /* Save the CRTC id so drm_flip() doesn't have to hardcode it */
     primary_crtc_id = crtc_ids[0];
 
-    /* Allocate the primary dumb buffer */
     struct drm_mode_create_dumb cd = {
         .height = screen_height,
         .width  = screen_width,
@@ -136,7 +128,6 @@ static int drm_setup(void) {
     back_buf_size   = cd.size;
     screen_stride   = cd.pitch;
 
-    /* mmap the dumb buffer */
     struct drm_mode_map_dumb md = { .handle = back_buf_handle };
     if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) return -1;
     back_buf_map = mmap(NULL, (size_t)back_buf_size, PROT_READ|PROT_WRITE,
@@ -144,7 +135,6 @@ static int drm_setup(void) {
     if (back_buf_map == MAP_FAILED) return -1;
     memset(back_buf_map, 0x00, (size_t)back_buf_size);
 
-    /* Create a DRM framebuffer object wrapping the dumb buffer */
     struct drm_mode_fb_cmd fb = {
         .width  = screen_width,
         .height = screen_height,
@@ -157,7 +147,6 @@ static int drm_setup(void) {
     primary_fb_id = fb.fb_id;
     primary_map   = back_buf_map;
 
-    /* Program the CRTC */
     struct drm_mode_crtc crtc = {
         .crtc_id      = primary_crtc_id,
         .fb_id        = primary_fb_id,
@@ -182,8 +171,6 @@ static void drm_flip(void) {
     ioctl(drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf);
 }
 
-/* ── Wayland wire protocol helpers ──────────────────────────────────────── */
-
 typedef struct {
     uint32_t object_id;
     uint16_t opcode;
@@ -205,8 +192,6 @@ static void wl_send(int fd, uint32_t obj, uint16_t opcode,
 static uint32_t read_u32(const uint8_t *buf, size_t off) {
     uint32_t v; memcpy(&v, buf + off, 4); return v;
 }
-
-/* ── Surface / client object model ─────────────────────────────────────── */
 
 typedef struct {
     uint32_t  id;             /* wl_surface object id */
@@ -243,8 +228,6 @@ typedef struct {
 
 static Client clients[MAX_CLIENTS];
 static int    n_clients = 0;
-
-/* ── Protocol dispatch ──────────────────────────────────────────────────── */
 
 /*
  * registry_global_send — emit one wl_registry.global event.
@@ -322,7 +305,6 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
     /* wl_shm */
     if (obj == c->shm_id) {
         if (op == 0 /* create_pool */) {
-            /* create_pool(new_id, fd, size) */
             /* fd is passed out-of-band via SCM_RIGHTS in a real impl;
                for rustos shared memory we use the wl_shm_pool fd field
                directly as a kernel shm handle that mmap resolves. */
@@ -344,7 +326,6 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         switch (op) {
         case 0: /* destroy */ s->id = 0; break;
         case 1: /* attach(buffer_id, x, y) */
-            /* buffer_id references a wl_buffer created from the SHM pool */
             s->shm_data = c->shm_pool;
             s->x = (int32_t)read_u32(data, 4);
             s->y = (int32_t)read_u32(data, 8);
@@ -362,7 +343,6 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             break;
         case 6: /* commit */
             s->committed = 1;
-            /* Blit surface into back-buffer */
             if (s->shm_data && back_buf_map) {
                 uint32_t blit_w = s->width  ? s->width  : screen_width;
                 uint32_t blit_h = s->height ? s->height : screen_height;
@@ -382,18 +362,15 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
                 }
                 s->n_damage = 0;
             }
-            /* Page-flip to show the new frame */
             drm_flip();
             break;
         case 8: /* set_buffer_scale */
-            /* accepted but ignored at this resolution */ break;
+            break;
         default: break;
         }
         return;
     }
 }
-
-/* ── Message parser ─────────────────────────────────────────────────────── */
 
 static void process_rx(Client *c) {
     size_t off = 0;
@@ -414,11 +391,7 @@ static void process_rx(Client *c) {
     c->rx_len -= off;
 }
 
-/* ── Input forwarding ───────────────────────────────────────────────────── */
-
-/* Linux input_event structure */
 struct input_event {
-    /* struct timeval (8 bytes on 64-bit) */
     long     tv_sec;
     long     tv_usec;
     uint16_t type;
@@ -475,8 +448,6 @@ static void forward_input(void) {
     }
 }
 
-/* ── seccomp filter ─────────────────────────────────────────────────────── */
-
 /*
  * install_seccomp — whitelist the syscalls this compositor needs.
  *
@@ -501,19 +472,15 @@ static void install_seccomp(void) {
 #ifndef AUDIT_ARCH_X86_64
     return;
 #else
-    /* BPF program: load arch, verify, load syscall number, whitelist */
     struct sock_filter filter[] = {
-        /* Verify architecture */
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
             offsetof(struct seccomp_data, arch)),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, AUDIT_ARCH_X86_64, 1, 0),
         BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
 
-        /* Load syscall number */
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS,
             offsetof(struct seccomp_data, nr)),
 
-        /* Whitelist each allowed syscall */
 #define ALLOW(nr) BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr), 0, 1), \
                   BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)
         ALLOW(0),   /* read         */
@@ -533,7 +500,6 @@ static void install_seccomp(void) {
         ALLOW(60),  /* exit         */
         ALLOW(15),  /* rt_sigreturn */
 #undef ALLOW
-        /* Default: kill the entire process */
         BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
     };
     struct sock_fprog prog = {
@@ -543,8 +509,6 @@ static void install_seccomp(void) {
     syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
 #endif
 }
-
-/* ── Main event loop ────────────────────────────────────────────────────── */
 
 /*
  * log_msg — write a message to stdout.
@@ -558,7 +522,6 @@ static void log_msg(const char *s) {
 }
 
 int main(void) {
-    /* ── Read inherited fds from environment ─────────────────────────── */
     const char *drm_env   = getenv("WAYLAND_DRM_FD");
     const char *input_env = getenv("WAYLAND_INPUT_FD");
     drm_fd   = drm_env   ? atoi(drm_env)   : open("/dev/dri/card0",         O_RDWR);
@@ -566,15 +529,12 @@ int main(void) {
 
     if (drm_fd < 0) { log_msg("[compositor] no DRM device"); _exit(1); }
 
-    /* ── DRM: query display, create dumb buffer, program CRTC ─────────── */
     if (drm_setup() < 0) {
         log_msg("[compositor] DRM setup failed — no display output");
-        /* Continue anyway: we can still serve clients without a display */
     } else {
         log_msg("[compositor] DRM display initialised");
     }
 
-    /* ── Unix socket: bind /run/wayland-0 ───────────────────────────── */
     listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd < 0) { log_msg("[compositor] socket() failed"); _exit(1); }
     unlink(WAYLAND_SOCKET_PATH);
@@ -590,7 +550,6 @@ int main(void) {
     }
     log_msg("[compositor] listening on " WAYLAND_SOCKET_PATH);
 
-    /* ── epoll: watch listen_fd, DRM fd, input fd ───────────────────── */
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     struct epoll_event ev;
     ev.events   = EPOLLIN;
@@ -605,12 +564,10 @@ int main(void) {
         epoll_ctl(epoll_fd, EPOLL_CTL_ADD, input_fd, &ev);
     }
 
-    /* ── Install seccomp filter (after all fds open, before the loop) ── */
     install_seccomp();
 
     log_msg("[compositor] event loop started");
 
-    /* ── Event loop ─────────────────────────────────────────────────── */
     struct epoll_event events[32];
     for (;;) {
         int nev = epoll_wait(epoll_fd, events, 32, 16 /* ms timeout = ~60 Hz */);
@@ -628,7 +585,6 @@ int main(void) {
                     c->fd      = cfd;
                     c->alive   = 1;
                     c->next_id = 2;
-                    /* Add to epoll */
                     ev.events  = EPOLLIN | EPOLLET;
                     ev.data.fd = cfd;
                     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &ev);
@@ -638,10 +594,8 @@ int main(void) {
 
             /* DRM vblank / page-flip event */
             if (efd == drm_fd) {
-                /* Read the DRM event to drain the fd */
                 uint8_t drmev[64];
                 read(drm_fd, drmev, sizeof(drmev));
-                /* Fire all pending frame callbacks */
                 for (int ci = 0; ci < n_clients; ci++) {
                     Client *c = &clients[ci];
                     if (!c->alive) continue;
@@ -671,7 +625,6 @@ int main(void) {
                 ssize_t n = read(c->fd, c->rx + c->rx_len,
                                  RX_BUF_SIZE - c->rx_len);
                 if (n <= 0) {
-                    /* Client disconnected */
                     close(c->fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
                     c->alive = 0;

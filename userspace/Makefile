@@ -61,8 +61,6 @@ wayland: $(BUILD_DIR)
 	      -o $(BUILD_DIR)/rustos-compositor \
 	      wayland/compositor.c
 
-# ── Install ────────────────────────────────────────────────────────────────
-#
 # Copies built binaries into a staging rootfs tree whose layout matches
 # what build_initramfs.sh expects when it packs the CPIO archive:
 #

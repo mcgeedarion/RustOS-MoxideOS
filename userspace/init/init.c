@@ -58,14 +58,10 @@
 #include <sys/wait.h>
 #include <time.h>
 
-/* ── Paths ──────────────────────────────────────────────────────────────── */
-
 #define COMPOSITOR_BIN      "/usr/bin/rustos-compositor"
 #define DRM_DEV             "/dev/dri/card0"
 #define INPUT_DEV           "/dev/input/event0"
 #define RESTART_DELAY_SEC   1
-
-/* ── Tiny helpers (avoid pulling in printf) ─────────────────────────────── */
 
 static void puts_fd(int fd, const char *s)
 {
@@ -75,7 +71,6 @@ static void puts_fd(int fd, const char *s)
     write(fd, "\n", 1);
 }
 
-/* Write a decimal integer to fd without using printf. */
 static void putint_fd(int fd, int n)
 {
     char buf[24];
@@ -102,16 +97,12 @@ static void fmt_env(char *buf, size_t buf_len,
     size_t k = 0;
     while (key[k] && k < buf_len - 1) { buf[k] = key[k]; k++; }
     if (k < buf_len - 1) buf[k++] = '=';
-    /* write decimal digits */
     char digits[16]; int d = 0;
     if (val == 0) { digits[d++] = '0'; }
     else { int v = val; while (v > 0) { digits[d++] = (char)('0' + v % 10); v /= 10; } }
-    /* digits are reversed */
     for (int r = d - 1; r >= 0 && k < buf_len - 1; r--) buf[k++] = digits[r];
     buf[k] = '\0';
 }
-
-/* ── Compositor supervisor ──────────────────────────────────────────────── */
 
 /*
  * spawn_compositor — open device fds, fork, exec the compositor.
@@ -124,7 +115,6 @@ static void fmt_env(char *buf, size_t buf_len,
  */
 static pid_t spawn_compositor(void)
 {
-    /* Open device nodes.  These fds will be inherited by the child. */
     int drm_fd = open(DRM_DEV, O_RDWR);
     if (drm_fd < 0) {
         puts_fd(2, "[init] WARNING: cannot open " DRM_DEV " — compositor not started");
@@ -145,7 +135,6 @@ static pid_t spawn_compositor(void)
     if (pid == 0) {
         /* ── child ────────────────────────────────────────────────────── */
 
-        /* Build env strings for the fd numbers. */
         char drm_env[32];
         char input_env[32];
         fmt_env(drm_env,   sizeof(drm_env),   "WAYLAND_DRM_FD",   drm_fd);
@@ -164,12 +153,10 @@ static pid_t spawn_compositor(void)
 
         execve(COMPOSITOR_BIN, argv, envp);
 
-        /* execve only returns on failure */
         puts_fd(2, "[init] ERROR: execve(" COMPOSITOR_BIN ") failed");
         _exit(1);
     }
 
-    /* ── parent ─────────────────────────────────────────────────────────── */
     /*
      * Close our copies of the device fds — the child has its own.
      * The DRM master fd must be held by exactly one process; keeping a
@@ -184,8 +171,6 @@ static pid_t spawn_compositor(void)
 
     return pid;
 }
-
-/* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(void)
 {
