@@ -61,7 +61,7 @@ use crate::proc::task_types::Task;
 use crate::security::CapSet;
 use crate::security::seccomp::FilterChain;
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── State ──────────────────────────────────────────────────────────────────────────
 
 /// Process lifecycle state.
 ///
@@ -105,7 +105,7 @@ impl State {
     }
 }
 
-// ── ProcLock — per-process locking unit ──────────────────────────────────────
+// ── ProcLock — per-process locking unit ──────────────────────────────────────────
 
 /// The entry stored in the global process table.
 ///
@@ -147,22 +147,9 @@ impl ProcLock {
     }
 }
 
-// ── Pcb — per-process kernel control block ───────────────────────────────────
+// ── Pcb — per-process kernel control block ─────────────────────────────────────────
 
 /// Full process kernel state.  Always accessed through `ProcLock::inner`.
-///
-/// ### S1 fix
-/// Restored fields removed in the previous refactor:
-/// - `task`:  raw pointer to the thin `Task` struct used by the scheduler.
-///            Allocated alongside the Pcb; freed in `do_exit` before zombify.
-/// - `sched`: `SchedEntity` mirrored into `Task::sched` — kept in sync by
-///            the scheduler.  `sched_helpers.rs` and `scheduler.rs` read it
-///            from the Pcb to avoid an extra pointer deref in low-frequency paths.
-///
-/// ### mm_lock
-/// Protects `vmas`, `user_satp`, `brk`, and related VMA state against
-/// concurrent mmap/munmap while uaccess is performing a page walk + copy.
-/// See module-level docs for the lock ordering rules.
 #[derive(Clone)]
 pub struct Pcb {
     // Identity
@@ -182,9 +169,6 @@ pub struct Pcb {
     pub user_satp: usize,
 
     // Virtual memory areas + mm_lock
-    //
-    // Writers (munmap, mmap, brk, exec) must take mm_lock for write.
-    // Readers (uaccess validate+copy) take mm_lock for read.
     pub vmas:     Vec<Vma>,
     pub mm_lock:  Arc<spin::RwLock<()>>,
     pub next_va:  usize,
@@ -233,17 +217,19 @@ pub struct Pcb {
     pub sleep_deadline_ns: u64,
     pub sleep_timer_id:    u64,
 
-    // ── S1: restored scheduler fields ────────────────────────────────────
-    //
-    // `task` points to the thin Task struct held in kernel heap alongside
-    // this Pcb.  The scheduler operates entirely through *mut Task;
-    // `task` lets do_exit/fork reach the scheduler entry to free/clone it.
-    //
-    // `sched` is the authoritative copy of scheduling parameters.  The Task's
-    // embedded SchedEntity is the hot copy — the scheduler keeps them in sync
-    // whenever it mutates vruntime, dl_remaining, etc.
+    // Scheduler fields
     pub task:  *mut Task,
     pub sched: SchedEntity,
+
+    // ── Group scheduling ─────────────────────────────────────────────────
+    //
+    // `tg_id == 0` means this process is ungrouped (root cgroup).
+    // A non-zero tg_id means the process belongs to the TaskGroup with
+    // that id in the TASK_GROUPS table.  The scheduler checks this field
+    // in enqueue() to decide whether to place the task into the group's
+    // inner heap or directly onto the per-CPU cfs_heap.
+    /// Task group id.  0 = ungrouped / root.
+    pub tg_id: usize,
 }
 
 // SAFETY: Pcb is accessed only under ProcLock::inner (spin::Mutex).
@@ -296,6 +282,7 @@ impl Pcb {
             sleep_timer_id:      0,
             task:                core::ptr::null_mut(),
             sched:               SchedEntity::new(0),
+            tg_id:               0,
         }
     }
 
