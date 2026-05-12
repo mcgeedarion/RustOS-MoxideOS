@@ -60,6 +60,8 @@ use crate::proc::scheduler::SchedEntity;
 use crate::proc::task_types::Task;
 use crate::security::CapSet;
 use crate::security::seccomp::FilterChain;
+use crate::proc::cgroup::CgroupId;
+use crate::proc::cgroup::ROOT_CGROUP;
 
 // ── State ──────────────────────────────────────────────────────────────────────────
 
@@ -221,6 +223,13 @@ pub struct Pcb {
     pub task:  *mut Task,
     pub sched: SchedEntity,
 
+    // ── cgroup membership ─────────────────────────────────────────────────
+    //
+    // Which cgroup v2 node this process belongs to.  Inherited on fork;
+    // updated via `cgroup.procs` writes.  Read on the hot scheduler path
+    // without locking (only the PCB lock guards writes).
+    pub cgroup_id: CgroupId,
+
     // ── Group scheduling ─────────────────────────────────────────────────
     //
     // `tg_id == 0` means this process is ungrouped (root cgroup).
@@ -291,6 +300,7 @@ impl Pcb {
             sleep_timer_id:      0,
             task:                core::ptr::null_mut(),
             sched:               SchedEntity::new(0),
+            cgroup_id:           ROOT_CGROUP,
             tg_id:               0,
             base_rt_priority:    0,
         }

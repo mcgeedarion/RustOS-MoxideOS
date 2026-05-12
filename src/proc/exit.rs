@@ -10,13 +10,14 @@
 //!   3. unregister_thread
 //!   4. altstack_clear_pid + proc_name_clear + futex_clear_pid
 //!   5. proc_fd_free         — close all open fds
-//!   6. free_address_space (last thread in group only)
-//!   7. group_pending_clear (last thread in group only) — drain GROUP_PENDING[tgid]
-//!   8. ns_exit (last thread in group only) — tear down private namespaces
-//!   9. free_kstack + State -> Zombie + exit_code = encode_exit(code)
-//!  10. wake vfork_parent
-//!  11. notify_exit (wakes parent waitpid, sends group-directed SIGCHLD)
-//!  12. schedule()   — never returns
+//!   6. cgroup_exit          — remove PID from cgroup, maybe free cgroup
+//!   7. free_address_space (last thread in group only)
+//!   8. group_pending_clear (last thread in group only) — drain GROUP_PENDING[tgid]
+//!   9. ns_exit (last thread in group only) — tear down private namespaces
+//!  10. free_kstack + State -> Zombie + exit_code = encode_exit(code)
+//!  11. wake vfork_parent
+//!  12. notify_exit (wakes parent waitpid, sends group-directed SIGCHLD)
+//!  13. schedule()   — never returns
 
 extern crate alloc;
 
@@ -131,6 +132,9 @@ pub fn do_exit(pid: usize, code: i32) {
 
     crate::fs::process_fd::proc_fd_free(pid);
 
+    // ── cgroup exit hook (every thread) ──────────────────────────────────────
+    crate::proc::cgroup::cgroup_exit(pid);
+
     let last = is_last_live_thread(pid, tgid);
     if last {
         let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
@@ -175,6 +179,7 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::syscall::proc_name_clear(sibling);
         crate::proc::futex::futex_clear_pid(sibling);
         crate::fs::process_fd::proc_fd_free(sibling);
+        crate::proc::cgroup::cgroup_exit(sibling); // ← cgroup hook
         let vfork_parent = zombify(sibling, status);
         if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
         wait::notify_exit(sibling);
