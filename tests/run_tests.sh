@@ -37,7 +37,6 @@ run_test() {
     echo 'ok'
 
     printf 'Running  %-30s ... ' "$name"
-    # Capture stdout for PASS/SKIP/FAIL detection; suppress on first run.
     output=$("$bin" 2>/dev/null)
     exit_code=$?
 
@@ -46,8 +45,6 @@ run_test() {
         *SKIP*) echo "SKIP"; SKIP=$((SKIP + 1)) ;;
         *)
             echo "FAIL (exit=$exit_code)"
-            # Rerun with both stdout+stderr visible so the 'detail:' line
-            # written to stderr by test_helpers.h appears in CI logs.
             "$bin" 2>&1 || true
             FAIL=$((FAIL + 1))
             ;;

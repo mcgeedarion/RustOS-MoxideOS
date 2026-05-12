@@ -65,10 +65,7 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
     match which_first(names) {
         Some(t) => t,
         None => {
-            eprintln!(
-                "[xtask] ERROR: none of {:?} found on PATH.",
-                names
-            );
+            eprintln!("[xtask] ERROR: none of {:?} found on PATH.", names);
             eprintln!("[xtask] Install with: {install_hint}");
             exit(1);
         }
@@ -219,9 +216,6 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
 }
 
 fn build_x86_64(root: &PathBuf, debug: bool, initrd: bool) {
-    // Warn early if --initrd was passed; it is not supported for x86_64 builds.
-    // The flag is accepted by the parser so it does not error on unknown args,
-    // but we must not silently discard it.
     if initrd {
         eprintln!("[xtask] WARNING: --initrd is not supported for x86_64 builds.");
         eprintln!("[xtask]          Initramfs support is RISC-V SBI only (--arch riscv64 --boot sbi --initrd).");
@@ -243,9 +237,6 @@ fn build_x86_64(root: &PathBuf, debug: bool, initrd: bool) {
 
     let elf = root.join(format!("target/x86_64-unknown-none/{profile}/rustos"));
     let bin = root.join("kernel.bin");
-
-    // Require objcopy / llvm-objcopy with a friendly install hint rather than
-    // panicking with "failed to spawn command" if the tool is absent.
     let objcopy = require_tool(
         &["llvm-objcopy", "objcopy"],
         "apt install llvm binutils",
@@ -264,7 +255,6 @@ fn build_x86_64(root: &PathBuf, debug: bool, initrd: bool) {
 ///
 /// Requires: mtools (mformat, mmd, mcopy) + objcopy / llvm-objcopy.
 fn image(root: &PathBuf, opts: &BuildOpts) {
-    // ── pre-flight tool checks ───────────────────────────────────────────────
     require_tool(
         &["mformat"],
         "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS",
@@ -276,7 +266,6 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         "apt install llvm binutils",
     );
 
-    // ── build the kernel first ────────────────────────────────────────────────
     eprintln!("[xtask] image: building kernel...");
     match (opts.arch, opts.boot) {
         (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(root, opts.debug),
@@ -284,7 +273,6 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         (Arch::X86_64,  _)          => build_x86_64(root, opts.debug, opts.initrd),
     }
 
-    // ── locate the EFI / ELF output ───────────────────────────────────────────
     let profile = if opts.debug { "debug" } else { "release" };
 
     let (efi_name, img_name) = match opts.arch {
@@ -303,8 +291,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         let esp_dir = root.join("esp/EFI/BOOT");
         std::fs::create_dir_all(&esp_dir).expect("create esp dir");
         run(Command::new(&objcopy)
-            .args(["--target", "efi-app-x86-64",
-                   "--subsystem", "10"])
+            .args(["--target", "efi-app-x86-64", "--subsystem", "10"])
             .arg(&elf)
             .arg(&efi_path));
     }
@@ -315,15 +302,10 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         exit(1);
     }
 
-    // ── create the FAT32 disk image ───────────────────────────────────────────
     let img_path = root.join(img_name);
 
     run(Command::new("mformat")
-        .args(["-C", "-F",
-               "-h", "64",
-               "-s", "32",
-               "-t", "64",
-               "-i"])
+        .args(["-C", "-F", "-h", "64", "-s", "32", "-t", "64", "-i"])
         .arg(&img_path)
         .arg("::"));
 
@@ -353,11 +335,9 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         }
     }
 
-    // ── success banner ─────────────────────────────────────────────────────
     eprintln!("\n[xtask] ✓ Image ready: {}", img_path.display());
     eprintln!("\n  Flash to USB:");
-    eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync",
-        img_path.display());
+    eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync", img_path.display());
     match opts.arch {
         Arch::X86_64 => {
             eprintln!("\n  Smoke-test in QEMU (before flashing):");

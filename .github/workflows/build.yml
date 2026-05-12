@@ -12,10 +12,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # Toolchain is pinned in rust-toolchain.toml — that file is the single
-  # source of truth for the nightly version used by all jobs here and
-  # locally.  Use `toolchain: file` below so CI always reads it directly
-  # rather than duplicating the pin here.
 
 jobs:
   # ── Primary: RISC-V UEFI (default target + default feature) ───────────────
