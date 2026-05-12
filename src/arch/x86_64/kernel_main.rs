@@ -15,6 +15,10 @@
 //!   6.  xsave_init()                 — XSAVE/FXSAVE feature detection
 //!   7.  acpi_init()                  — RSDP → MADT: CPU list, I/O APIC
 //!   8.  pcie_init()                  — Phase 1: PCIe bus enumeration + BAR
+//!   8a. virtio_gpu::init()           — probe virtio-gpu PCI device, allocate
+//!                                       scanout resources
+//!   8b. drm::init_heads()            — register GOP (head 0) + virtio-gpu
+//!                                       scanouts (heads 1+) in KMS topology
 //!   9.  apic_init()                  — Local APIC + timer (enables interrupts)
 //!  10.  ahci_probe()                 — AHCI via PCI, init
 //!  11.  virtio_blk fallback          — if no AHCI disk found
@@ -70,7 +74,7 @@ pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
     kernel_main()
 }
 
-// ── Primary kernel entry ──────────────────────────────────────────────────────
+// ── Primary kernel entry ────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
@@ -101,7 +105,7 @@ pub extern "C" fn kernel_main() -> ! {
         serial_println!("vga: GOP/framebuffer mode (VGA text mode inactive)");
     }
 
-    // ── CI sentinels ──────────────────────────────────────────────────────────
+    // ── CI sentinels ──────────────────────────────────────────────────────────────
     serial_println!("rustos: kernel_main reached");
     serial_println!("TEST PASS: uart_smoke");
     {
@@ -141,6 +145,19 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 8. PCIe enumeration.
     crate::drivers::pcie::pcie_init();
+
+    // 8a. virtio-gpu: probe PCI device and allocate per-scanout resources.
+    //     Must come after pcie_init() so BARs are mapped, and before
+    //     drm::init_heads() which reads num_scanouts().
+    crate::drivers::virtio_gpu::init();
+    serial_println!("virtio-gpu: {} scanout(s)",
+                    crate::drivers::virtio_gpu::num_scanouts());
+
+    // 8b. DRM head registration: GOP → head 0, virtio-gpu scanouts → heads 1+.
+    //     NUM_HEADS was 0 until this call; KMS ioctls are useless before it.
+    crate::drivers::drm::init_heads();
+    serial_println!("drm: {} head(s) registered",
+                    crate::drivers::drm::num_heads());
 
     // 9. APIC + timer (enables interrupts).
     apic_init();
