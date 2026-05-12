@@ -5,21 +5,38 @@
 //! 1. **`SCHED_DEADLINE`** — Earliest-Deadline-First (EDF) with CBS budget.
 //!    Exhausted tasks sleep until their next replenishment window.
 //!
-//! 2. **`SCHED_FIFO` / `SCHED_RR`** — real-time FIFO queue.  FIFO tasks run
-//!    until they yield/block; RR rotates within their priority band after one
-//!    `TICK_NS` tick.
+//! 2. **`SCHED_FIFO` / `SCHED_RR`** — real-time FIFO queue.  Tasks are
+//!    ordered by `rt_priority` (highest first); equal-priority tasks are
+//!    served in FIFO arrival order via a monotone `enqueue_seq` counter.
+//!    Dequeue is O(log n) via `BinaryHeap<RtEntry>`.
 //!
 //! 3. **`SCHED_NORMAL`** — CFS-inspired vruntime min-heap.
 //!
 //! 4. **`SCHED_BATCH`** — like Normal but deprioritised below all Normal
 //!    tasks.  Uses the same vruntime accounting as Normal so it self-balances
-//!    among batch peers, but the batch_queue is only drained when the CFS
+//!    among batch peers, but the batch_heap is only drained when the CFS
 //!    heap is empty.  Intended for CPU-bound background work (compilation,
 //!    checksumming, etc.) that should not steal latency from interactive tasks.
 //!
 //! 5. **`SCHED_IDLE`** — lowest possible priority.  Weight is fixed at 1
 //!    regardless of nice value.  Only runs when *all* other queues are empty.
 //!    Analogous to Linux `SCHED_IDLE` (not the per-CPU idle thread).
+//!
+//! ## RT queue ordering
+//!
+//! `RtEntry` implements `Ord` such that the `BinaryHeap` max-heap yields the
+//! highest-priority task first.  Tie-breaking on `enqueue_seq` (ascending)
+//! preserves POSIX SCHED_FIFO semantics: among tasks at the same priority
+//! the one that arrived first is picked next.
+//!
+//! ```text
+//! priority(A) > priority(B)  =>  A before B          (POSIX requirement)
+//! priority(A) == priority(B), seq(A) < seq(B)  =>  A before B  (FIFO)
+//! ```
+//!
+//! `rt_seq` is a per-`RunQueue` `u64` that wraps via `wrapping_add`.  Wrap
+//! at 2^64 is harmless: the ordering only needs to be consistent within the
+//! set of tasks *currently* in the heap, not across all time.
 //!
 //! ## Per-CPU run queues
 //!
@@ -89,7 +106,7 @@ use crate::sync::spinlock::SpinLock;
 use crate::proc::process::{State, ProcLock};
 use crate::proc::proc_table;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────────
 
 pub const TICK_NS:        u64 = 1_000_000;
 pub const NICE0_WEIGHT:   u64 = 1_024;
@@ -97,14 +114,10 @@ pub const BALANCE_TICKS:  u64 = 10;
 pub const CPUMASK_ALL:    u64 = u64::MAX;
 
 /// Fixed weight for SCHED_IDLE tasks — always 1, regardless of nice value.
-/// This ensures idle-class tasks never starve non-idle tasks even under
-/// sustained load.
 pub const IDLE_WEIGHT: u64 = 1;
 
-/// Maximum weight cap applied to SCHED_BATCH tasks.  Batch tasks use the
-/// normal nice_to_weight table but are capped here so a nice-(-20) batch
-/// task cannot outweigh a nice-0 normal task.  Value equals nice +4 weight
-/// (~820), keeping batch clearly below the nice-0 baseline of 1024.
+/// Maximum weight cap for SCHED_BATCH tasks so a nice(-20) batch task never
+/// outweighs a nice-0 normal task.
 pub const BATCH_WEIGHT_CAP: u64 = 820;
 
 // ── SchedPolicy ───────────────────────────────────────────────────────────────
@@ -115,11 +128,7 @@ pub enum SchedPolicy {
     Normal   = 0,
     Fifo     = 1,
     Rr       = 2,
-    /// SCHED_BATCH (Linux policy 3): CFS-like accounting, runs below all
-    /// Normal tasks.  Good for CPU-bound background jobs.
     Batch    = 3,
-    /// SCHED_IDLE (Linux policy 5): lowest-priority class, weight fixed at 1.
-    /// Runs only when Deadline, RT, Normal, *and* Batch queues are all empty.
     Idle     = 5,
     Deadline = 6,
 }
@@ -219,12 +228,6 @@ pub(crate) fn nice_to_weight(nice: i8) -> u64 {
     }
 }
 
-/// Compute the effective scheduling weight for a given policy and nice value.
-///
-/// - `SCHED_IDLE`  → always `IDLE_WEIGHT` (1), nice is ignored.
-/// - `SCHED_BATCH` → `nice_to_weight(nice)` capped at `BATCH_WEIGHT_CAP` so
-///   that even a batch task at nice -20 stays below a normal task at nice 0.
-/// - All other policies → `nice_to_weight(nice)` unchanged.
 pub fn effective_weight(policy: SchedPolicy, nice: i8) -> u64 {
     match policy {
         SchedPolicy::Idle  => IDLE_WEIGHT,
@@ -236,13 +239,14 @@ pub fn effective_weight(policy: SchedPolicy, nice: i8) -> u64 {
 // ── CFS entry ─────────────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
-struct CfsEntry {
-    vruntime: u64,
-    pid:      u32,
-    task_ptr: *mut crate::proc::task_types::Task,
+pub struct CfsEntry {
+    pub vruntime: u64,
+    pub pid:      u32,
+    pub task_ptr: *mut crate::proc::task_types::Task,
 }
 impl Ord for CfsEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Min-heap: lower vruntime wins → reverse natural order.
         other.vruntime.cmp(&self.vruntime)
     }
 }
@@ -252,6 +256,45 @@ impl PartialOrd for CfsEntry {
     }
 }
 unsafe impl Send for CfsEntry {}
+
+// ── RT entry ──────────────────────────────────────────────────────────────────
+//
+// Replaces the old VecDeque<*mut Task> + O(n) max_by_key scan.
+//
+// Ordering contract (max-heap, so "greater" = dequeued first):
+//
+//   1. Higher rt_priority → dequeued first  (POSIX requirement)
+//   2. Same rt_priority   → lower enqueue_seq dequeued first  (FIFO within band)
+//
+// This gives O(log n) enqueue and O(log n) dequeue for the RT class.
+
+#[derive(Eq, PartialEq)]
+struct RtEntry {
+    /// POSIX real-time priority: 1 (lowest) … 99 (highest).  We store it as
+    /// u8 (0..=99 fits); values above 99 are implementation-defined extension.
+    rt_priority:  u8,
+    /// Monotone arrival counter.  Lower value = arrived earlier.
+    /// Stored as `Reverse` so that *smaller* seq sorts *greater* in the
+    /// max-heap, breaking priority ties in FIFO order.
+    enqueue_seq:  Reverse<u64>,
+    pid:          u32,
+    task_ptr:     *mut crate::proc::task_types::Task,
+}
+
+impl Ord for RtEntry {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // Primary key: higher rt_priority wins.
+        self.rt_priority.cmp(&other.rt_priority)
+            // Tie-break: earlier arrival (lower seq = Reverse-greater) wins.
+            .then(self.enqueue_seq.cmp(&other.enqueue_seq))
+    }
+}
+impl PartialOrd for RtEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+unsafe impl Send for RtEntry {}
 
 // ── Deadline entry ────────────────────────────────────────────────────────────
 
@@ -278,13 +321,14 @@ unsafe impl Send for DlEntry {}
 pub struct RunQueue {
     pub cfs_heap:            BinaryHeap<CfsEntry>,
     pub min_vruntime:        u64,
-    pub rt_queue:            VecDeque<*mut crate::proc::task_types::Task>,
+    /// O(log n) RT priority queue.  Replaces the old VecDeque + O(n) scan.
+    /// Ordered by (rt_priority DESC, enqueue_seq ASC) — see `RtEntry::Ord`.
+    pub rt_heap:             BinaryHeap<RtEntry>,
+    /// Monotone counter for RT enqueue ordering.  Wraps via wrapping_add;
+    /// wrap is harmless within any realistically sized run queue.
+    rt_seq:                  u64,
     pub dl_heap:             BinaryHeap<DlEntry>,
-    /// SCHED_BATCH tasks: CFS-like vruntime accounting, drained only when
-    /// cfs_heap is empty.  Stored as a min-heap mirroring cfs_heap.
     pub batch_heap:          BinaryHeap<CfsEntry>,
-    /// SCHED_IDLE tasks: drained only when all other queues (including
-    /// batch_heap) are empty.  Simple FIFO within the idle class.
     pub idle_queue:          VecDeque<*mut crate::proc::task_types::Task>,
     pub nr_running:          u32,
     pub load_weight:         u64,
@@ -299,7 +343,8 @@ impl RunQueue {
         RunQueue {
             cfs_heap:            BinaryHeap::new(),
             min_vruntime:        0,
-            rt_queue:            VecDeque::new(),
+            rt_heap:             BinaryHeap::new(),
+            rt_seq:              0,
             dl_heap:             BinaryHeap::new(),
             batch_heap:          BinaryHeap::new(),
             idle_queue:          VecDeque::new(),
@@ -324,7 +369,16 @@ impl RunQueue {
                 });
             }
             SchedPolicy::Fifo | SchedPolicy::Rr => {
-                self.rt_queue.push_back(task);
+                // Allocate a sequence number for FIFO ordering within the
+                // same priority band.  wrapping_add keeps us from panicking.
+                let seq = self.rt_seq;
+                self.rt_seq = self.rt_seq.wrapping_add(1);
+                self.rt_heap.push(RtEntry {
+                    rt_priority: t.sched.rt_priority,
+                    enqueue_seq: Reverse(seq),
+                    pid:         t.pid,
+                    task_ptr:    task,
+                });
             }
             SchedPolicy::Normal => {
                 if t.sched.vruntime < self.min_vruntime {
@@ -337,9 +391,6 @@ impl RunQueue {
                 });
             }
             SchedPolicy::Batch => {
-                // Batch tasks track vruntime exactly like Normal tasks so they
-                // self-balance among each other, but they live in a separate
-                // heap that is only drained when the Normal CFS heap is empty.
                 if t.sched.vruntime < self.min_vruntime {
                     t.sched.vruntime = self.min_vruntime;
                 }
@@ -350,8 +401,6 @@ impl RunQueue {
                 });
             }
             SchedPolicy::Idle => {
-                // SCHED_IDLE tasks are enqueued FIFO; weight is always 1 so
-                // vruntime-based ordering would not improve fairness here.
                 self.idle_queue.push_back(task);
             }
         }
@@ -363,8 +412,6 @@ impl RunQueue {
             t.sched.on_rq = false;
             self.nr_running  = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
-            // Advance the per-CPU min_vruntime to prevent newly-woken Normal
-            // tasks from immediately pre-empting long-sleeping batch peers.
             if t.sched.vruntime > self.min_vruntime {
                 self.min_vruntime = t.sched.vruntime;
             }
@@ -372,17 +419,15 @@ impl RunQueue {
         })
     }
 
+    /// O(log n) RT dequeue — pops the highest (priority, FIFO-order) entry.
     fn dequeue_rt(&mut self) -> Option<*mut crate::proc::task_types::Task> {
-        if self.rt_queue.is_empty() { return None; }
-        let best_idx = self.rt_queue.iter().enumerate()
-            .max_by_key(|(_, &tp)| unsafe { (*tp).sched.rt_priority })
-            .map(|(i, _)| i)?;
-        let task = self.rt_queue.remove(best_idx)?;
-        let t = unsafe { &mut *task };
-        t.sched.on_rq = false;
-        self.nr_running  = self.nr_running.saturating_sub(1);
-        self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
-        Some(task)
+        self.rt_heap.pop().map(|e| {
+            let t = unsafe { &mut *e.task_ptr };
+            t.sched.on_rq = false;
+            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
+            e.task_ptr
+        })
     }
 
     fn dequeue_dl(&mut self) -> Option<*mut crate::proc::task_types::Task> {
@@ -395,8 +440,6 @@ impl RunQueue {
         })
     }
 
-    /// Dequeue the next SCHED_BATCH task (lowest vruntime among batch peers).
-    /// Called only when the Normal CFS heap is empty.
     fn dequeue_batch(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         self.batch_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
@@ -407,8 +450,6 @@ impl RunQueue {
         })
     }
 
-    /// Dequeue the next SCHED_IDLE task (FIFO within the idle class).
-    /// Called only when all higher-priority queues are empty.
     fn dequeue_idle(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         self.idle_queue.pop_front().map(|task| {
             let t = unsafe { &mut *task };
@@ -419,24 +460,21 @@ impl RunQueue {
         })
     }
 
-    /// Select the next task to run in strict priority order:
-    /// Deadline > RT (FIFO/RR) > Normal (CFS) > Batch > Idle
+    /// Strict priority order: Deadline > RT > Normal > Batch > Idle.
     pub fn dequeue_next(&mut self) -> Option<*mut crate::proc::task_types::Task> {
-        if !self.dl_heap.is_empty()    { return self.dequeue_dl(); }
-        if !self.rt_queue.is_empty()   { return self.dequeue_rt(); }
-        if !self.cfs_heap.is_empty()   { return self.dequeue_cfs(); }
-        if !self.batch_heap.is_empty() { return self.dequeue_batch(); }
-        if !self.idle_queue.is_empty() { return self.dequeue_idle(); }
+        if !self.dl_heap.is_empty()   { return self.dequeue_dl(); }
+        if !self.rt_heap.is_empty()   { return self.dequeue_rt(); }
+        if !self.cfs_heap.is_empty()  { return self.dequeue_cfs(); }
+        if !self.batch_heap.is_empty(){ return self.dequeue_batch(); }
+        if !self.idle_queue.is_empty(){ return self.dequeue_idle(); }
         None
     }
 
     pub fn peek_next(&self) -> Option<u32> {
-        if let Some(e) = self.dl_heap.peek()  { return Some(e.pid); }
-        if let Some(&tp) = self.rt_queue.front() {
-            return Some(unsafe { (*tp).pid });
-        }
-        if let Some(e) = self.cfs_heap.peek() { return Some(e.pid); }
-        if let Some(e) = self.batch_heap.peek() { return Some(e.pid); }
+        if let Some(e) = self.dl_heap.peek()   { return Some(e.pid); }
+        if let Some(e) = self.rt_heap.peek()   { return Some(e.pid); }
+        if let Some(e) = self.cfs_heap.peek()  { return Some(e.pid); }
+        if let Some(e) = self.batch_heap.peek(){ return Some(e.pid); }
         if let Some(&tp) = self.idle_queue.front() {
             return Some(unsafe { (*tp).pid });
         }
@@ -444,16 +482,25 @@ impl RunQueue {
     }
 
     pub fn remove_pid(&mut self, pid: u32) -> bool {
-        // ── RT queue ─────────────────────────────────────────────────────
-        if let Some(pos) = self.rt_queue.iter()
-            .position(|&tp| unsafe { (*tp).pid } == pid)
+        // ── RT heap ───────────────────────────────────────────────────────
+        // remove_pid is a cold path (kill, affinity change, etc.) so the
+        // O(n) drain-and-rebuild is acceptable here.  The hot dequeue_rt
+        // path is O(log n).
         {
-            let task = self.rt_queue.remove(pos).unwrap();
-            let t = unsafe { &mut *task };
-            t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
-            self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
-            return true;
+            let old: Vec<RtEntry> = core::mem::take(&mut self.rt_heap).into_vec();
+            let mut found = false;
+            for e in old {
+                if e.pid == pid {
+                    let t = unsafe { &mut *e.task_ptr };
+                    t.sched.on_rq = false;
+                    self.nr_running  = self.nr_running.saturating_sub(1);
+                    self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
+                    found = true;
+                } else {
+                    self.rt_heap.push(e);
+                }
+            }
+            if found { return true; }
         }
 
         // ── Normal CFS heap ───────────────────────────────────────────────
@@ -527,10 +574,6 @@ impl RunQueue {
 }
 
 // ── schedule() ────────────────────────────────────────────────────────────────
-//
-// Hot path.  Never locks PROC_TABLE.
-// State transitions are done via ProcLock::set_state (updates both the
-// Pcb field and the state_atom atomically under ProcLock::inner).
 
 pub fn schedule() {
     let cpu = crate::smp::percpu::current_cpu_id();
@@ -545,9 +588,6 @@ pub fn schedule() {
         let prev    = unsafe { &mut *prev_task };
         let elapsed = now.saturating_sub(blk.runqueue.curr_vruntime_start);
 
-        // vruntime accounting for Normal and Batch (Idle weight=1 so delta
-        // would be huge; we skip it to avoid polluting vruntime for Idle tasks
-        // that happen to run during an otherwise empty period).
         match prev.sched.policy {
             SchedPolicy::Normal | SchedPolicy::Batch => {
                 if prev.sched.weight > 0 {
@@ -624,9 +664,6 @@ fn schedule_early() {
 }
 
 // ── tick() + load balance ─────────────────────────────────────────────────────
-//
-// tick() never locks PROC_TABLE on the hot replenishment path — it reads
-// state_atom.  It takes the inner lock only to set Blocked→Ready.
 
 pub fn tick(cpu: u32) {
     let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu as usize] };
@@ -662,7 +699,7 @@ pub fn tick(cpu: u32) {
         }
     });
 
-    // ── RR time-slice preemption ─────────────────────────────────────
+    // ── RR time-slice preemption ──────────────────────────────────────
     let curr = blk.current_task;
     if !curr.is_null() {
         let t = unsafe { &mut *curr };
@@ -701,10 +738,7 @@ pub fn tick(cpu: u32) {
                         && inner.rt_cpu_time_us >= soft
                 };
                 if kill {
-                    crate::proc::signal::send_signal(
-                        t.pid as usize,
-                        24, // SIGXCPU
-                    );
+                    crate::proc::signal::send_signal(t.pid as usize, 24);
                 }
             }
         }
@@ -717,8 +751,6 @@ pub fn tick(cpu: u32) {
     }
 }
 
-// Snapshot of one CPU's run-queue metrics, taken atomically before any steal
-// decision is made.
 #[derive(Copy, Clone)]
 struct RqSnapshot {
     load_weight: u64,
@@ -729,7 +761,6 @@ fn load_balance(this_cpu: u32) {
     let ncpus = crate::smp::percpu::cpu_count();
     if ncpus <= 1 { return; }
 
-    // ── Step 1: snapshot all CPUs' load metrics ───────────────────────────
     let mut snapshots: [RqSnapshot; 64] = [RqSnapshot { load_weight: 0, nr_running: 0 }; 64];
     let ncpus_clamped = (ncpus as usize).min(64);
     for cpu in 0..ncpus_clamped {
@@ -740,7 +771,6 @@ fn load_balance(this_cpu: u32) {
         };
     }
 
-    // ── Step 2: find busiest CPU from snapshot ────────────────────────────
     let mut max_load: u64 = 0;
     let mut busiest_cpu: u32 = this_cpu;
     for cpu in 0..ncpus_clamped {
@@ -754,7 +784,6 @@ fn load_balance(this_cpu: u32) {
     let this_load = snapshots[this_cpu as usize].load_weight;
     if max_load <= this_load + this_load / 4 { return; }
 
-    // ── Step 3: steal one task from the busiest CPU ───────────────────────
     let busy_blk = unsafe {
         &mut crate::smp::percpu::PERCPU_BLOCKS[busiest_cpu as usize]
     };
@@ -762,8 +791,6 @@ fn load_balance(this_cpu: u32) {
 
     if let Some(task) = busy_blk.runqueue.dequeue_next() {
         let t = unsafe { &mut *task };
-        // Never steal SCHED_IDLE tasks — they should only consume genuinely
-        // idle CPU time on the CPU they were enqueued on.
         if t.sched.policy == SchedPolicy::Idle
             || t.sched.policy == SchedPolicy::Deadline
             || t.sched.cpumask.count_ones() == 1
@@ -854,7 +881,6 @@ pub fn block_current() {
     schedule();
 }
 
-/// Wake a task.  Lock-free fast path: check state_atom before locking inner.
 pub fn wake_pid(pid: usize) {
     let pl = match proc_table::find_proc_lock(pid) {
         Some(p) => p,
@@ -878,25 +904,9 @@ pub fn suspend_current_until_child_exec(_child_pid: usize) {
     block_current();
 }
 
-// ── mm_lock helpers (used by uaccess) ────────────────────────────────────────
+// ── mm_lock helpers ───────────────────────────────────────────────────────────
 
-/// RAII guard returned by `with_current_mm_read`.  Holds the read side of
-/// the current process's `mm_lock` until dropped.
-///
-/// ## Drop order (important)
-///
-/// Field declaration order determines drop order in Rust.  `_arc` is declared
-/// *before* `_guard` so the compiler drops `_guard` first (releasing the
-/// read lock) and then `_arc` (potentially freeing the `RwLock` allocation).
-/// Reversing the field order would drop the `Arc` first, freeing the backing
-/// `RwLock` while the guard still points into it — use-after-free.
-///
-/// Do **not** reorder these fields.
-///
-/// Callers must not acquire any inner `ProcLock` while holding this guard,
-/// or the deadlock-free lock ordering documented in `process.rs` is violated.
 pub struct MmReadGuard {
-    // FIELD ORDER IS LOAD-BEARING: _arc must be declared before _guard.
     _arc:   alloc::sync::Arc<spin::RwLock<()>>,
     _guard: spin::RwLockReadGuard<'static, ()>,
 }
@@ -936,9 +946,7 @@ pub fn current_pid() -> u32 {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     }
     let blk_ref = unsafe { &*blk };
-    if blk_ref.current_pid != 0 {
-        return blk_ref.current_pid;
-    }
+    if blk_ref.current_pid != 0 { return blk_ref.current_pid; }
     let task = blk_ref.current_task;
     if task.is_null() {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -948,39 +956,26 @@ pub fn current_pid() -> u32 {
 
 #[inline]
 pub fn with_proc<T, F>(pid: usize, f: F) -> Option<T>
-where
-    F: FnOnce(&crate::proc::process::Pcb) -> T,
-{
+where F: FnOnce(&crate::proc::process::Pcb) -> T {
     proc_table::with_proc(pid, f)
 }
 #[inline]
-pub fn with_proc_mut<T, F>(
-    pid: usize,
-    f: F,
-) -> Option<T>
-where
-    F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> T,
-{
+pub fn with_proc_mut<T, F>(pid: usize, f: F) -> Option<T>
+where F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> T {
     proc_table::with_proc_mut(pid, f)
 }
 #[inline]
 pub fn with_procs_ro<T, F>(f: F) -> T
-where
-    F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
-{
+where F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T {
     proc_table::with_procs_ro(f)
 }
 #[inline]
 pub fn with_procs_mut<T, F>(f: F) -> T
-where
-    F: FnOnce(&mut alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
-{
+where F: FnOnce(&mut alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T {
     proc_table::with_procs_mut(f)
 }
 #[inline]
-pub fn enqueue(pcb: crate::proc::process::Pcb) {
-    proc_table::enqueue(pcb)
-}
+pub fn enqueue(pcb: crate::proc::process::Pcb) { proc_table::enqueue(pcb) }
 #[inline]
 pub fn task_ptr_for_pid(pid: usize) -> *mut crate::proc::task_types::Task {
     proc_table::task_ptr_for_pid(pid)
@@ -989,12 +984,10 @@ pub fn task_ptr_for_pid(pid: usize) -> *mut crate::proc::task_types::Task {
 pub fn tgid_of(pid: usize) -> usize {
     proc_table::with_proc(pid, |p| p.tgid).unwrap_or(0)
 }
-
 #[inline]
 pub fn thread_count_of(pid: usize) -> Option<usize> {
     proc_table::thread_count_of(pid)
 }
-
 #[inline]
 pub fn has_current_user_proc() -> bool {
     let blk = crate::smp::percpu::current_block();
@@ -1003,12 +996,10 @@ pub fn has_current_user_proc() -> bool {
     if task.is_null() { return false; }
     unsafe { (*task).pid > 0 }
 }
-
 pub fn current_ppid() -> u32 {
     let pid = current_pid() as usize;
     proc_table::with_proc(pid, |p| p.ppid as u32).unwrap_or(0)
 }
-
 pub fn ap_idle() -> ! {
     loop {
         schedule();
