@@ -1,23 +1,20 @@
 /* tests/sched_deadline_cbs.c
  *
- * Stress test: SCHED_DEADLINE CBS budget exhaustion and replenishment.
+ * Stress: SCHED_DEADLINE CBS budget exhaustion and replenishment.
  *
- * Sets up a deadline task with runtime=5ms, deadline=period=10ms.
- * After burning 5ms of budget the thread yields; it must be rescheduled
- * at the next 10ms period boundary. Over 5 periods, at least 4 must show
- * correct replenishment timing. Targets tick() CBS logic in
- * src/proc/scheduler.rs.
- *
- * Falls back to SKIP if sched_setattr (NR 314) is not wired.
+ * Sets runtime=5ms, deadline=period=10ms. After burning 5ms of budget
+ * the thread yields; it must be rescheduled at the next 10ms boundary.
+ * Over 5 periods at least 4 must show correct replenishment timing.
+ * Skips if sched_setattr (NR 314) is not wired.
+ * Targets tick() CBS logic (src/proc/scheduler.rs).
  */
 #define _GNU_SOURCE
 #include <sched.h>
-#include <stdio.h>
 #include <time.h>
-#include <unistd.h>
 #include <stdint.h>
 #include <sys/syscall.h>
-#include <errno.h>
+#include <stdio.h>
+#include "test_helpers.h"
 
 static inline uint64_t now_ns(void) {
     struct timespec ts;
@@ -43,40 +40,30 @@ int main(void) {
     struct sched_attr attr = {
         .size           = sizeof(attr),
         .sched_policy   = SCHED_DEADLINE,
-        .sched_runtime  = 5000000ULL,
-        .sched_deadline = 10000000ULL,
-        .sched_period   = 10000000ULL,
+        .sched_runtime  = 5000000ULL,  /* 5 ms */
+        .sched_deadline = 10000000ULL, /* 10 ms */
+        .sched_period   = 10000000ULL, /* 10 ms */
     };
 
-    if (syscall(314, 0, &attr, 0) != 0) {
-        puts("SKIP");
-        return 0;
-    }
+    if (syscall(314, 0, &attr, 0) != 0)
+        TEST_SKIP("sched_setattr (NR 314) not wired");
 
-    int periods_ok = 0;
+    int      ok    = 0;
     uint64_t start = now_ns();
 
     for (int rep = 0; rep < 5; rep++) {
         uint64_t burst_end = now_ns() + 5000000ULL;
         while (now_ns() < burst_end) {}
-
         sched_yield();
-
-        uint64_t elapsed = now_ns() - start;
-        uint64_t min_expected = (uint64_t)(rep + 1) * 8000000ULL;
-        if (elapsed >= min_expected)
-            periods_ok++;
+        if (now_ns() - start >= (uint64_t)(rep + 1) * 8000000ULL)
+            ok++;
     }
 
-    if (periods_ok >= 4) {
-        puts("PASS");
-        return 0;
-    }
-    dprintf(2, "SCHED_DL FAIL: only %d/5 periods showed correct replenishment\n",
-            periods_ok);
-    return 1;
+    if (ok < 4)
+        TEST_FAILF("%d/5 periods showed correct replenishment (need 4)", ok);
+
+    TEST_PASS();
 #else
-    puts("SKIP");
-    return 0;
+    TEST_SKIP("SCHED_DEADLINE not defined in headers");
 #endif
 }

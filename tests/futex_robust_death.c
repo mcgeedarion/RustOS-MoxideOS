@@ -1,27 +1,25 @@
 /* tests/futex_robust_death.c
  *
- * Stress test: robust futex owner-death cleanup.
+ * Stress: robust futex owner-death cleanup.
  *
  * A thread acquires a PTHREAD_MUTEX_ROBUST mutex and exits without
- * releasing it. The kernel must walk the robust list, write
- * FUTEX_OWNER_DIED (0x40000000) only — NOT preserving FUTEX_WAITERS —
- * and wake one waiter. The parent must receive EOWNERDEAD from
- * pthread_mutex_lock and successfully recover via pthread_mutex_consistent.
- *
+ * releasing it. The kernel must walk the robust list, mark
+ * FUTEX_OWNER_DIED, and wake one waiter. The parent must receive
+ * EOWNERDEAD and recover via pthread_mutex_consistent.
  * Targets robust_list_on_exit / wake_robust_futex (src/proc/futex.rs).
  */
 #define _GNU_SOURCE
 #include <pthread.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <errno.h>
+#include <stdio.h>
+#include "test_helpers.h"
 
 static pthread_mutex_t mtx;
 
 static void *killer(void *arg) {
     (void)arg;
     pthread_mutex_lock(&mtx);
-    return NULL;
+    return NULL; /* exits holding lock — triggers robust list cleanup */
 }
 
 int main(void) {
@@ -36,13 +34,10 @@ int main(void) {
     pthread_join(t, NULL);
 
     int r = pthread_mutex_lock(&mtx);
-    if (r == EOWNERDEAD) {
-        pthread_mutex_consistent(&mtx);
-        pthread_mutex_unlock(&mtx);
-        puts("PASS");
-        return 0;
-    }
-    dprintf(2, "FUTEX_ROBUST FAIL: lock returned %d (expected EOWNERDEAD=%d)\n",
-            r, EOWNERDEAD);
-    return 1;
+    if (r != EOWNERDEAD)
+        TEST_FAILF("expected EOWNERDEAD(%d), got %d", EOWNERDEAD, r);
+
+    pthread_mutex_consistent(&mtx);
+    pthread_mutex_unlock(&mtx);
+    TEST_PASS();
 }

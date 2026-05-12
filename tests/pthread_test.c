@@ -1,35 +1,30 @@
-/*
- * pthread_test.c — minimal static musl pthread smoke test.
+/* tests/pthread_test.c
+ *
+ * Smoke: pthread_create / pthread_join / return value.
+ *
+ * Exercises the clone(CLONE_VM|CLONE_THREAD|...) → TID futex → join
+ * path that musl uses for all thread lifecycle operations.
+ * Targets clear_child_tid / FUTEX_WAKE on exit (src/proc/process.rs).
  */
 #include <pthread.h>
 #include <stdio.h>
+#include "test_helpers.h"
 
-static void *worker(void *arg)
-{
+static void *worker(void *arg) {
     (void)arg;
     return (void *)42;
 }
 
-int main(void)
-{
+int main(void) {
     pthread_t t;
-    void *ret = (void *)0;
+    void *ret = NULL;
 
-    if (pthread_create(&t, NULL, worker, NULL) != 0) {
-        puts("FAIL");
-        return 1;
-    }
+    if (pthread_create(&t, NULL, worker, NULL) != 0)
+        TEST_FAIL("pthread_create failed");
+    if (pthread_join(t, &ret) != 0)
+        TEST_FAIL("pthread_join failed");
+    if ((long)ret != 42)
+        TEST_FAILF("expected retval 42, got %ld", (long)ret);
 
-    if (pthread_join(t, &ret) != 0) {
-        puts("FAIL");
-        return 1;
-    }
-
-    if ((long)ret == 42) {
-        puts("PASS");
-        return 0;
-    }
-
-    puts("FAIL");
-    return 1;
+    TEST_PASS();
 }

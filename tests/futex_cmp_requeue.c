@@ -1,6 +1,6 @@
 /* tests/futex_cmp_requeue.c
  *
- * Stress test: FUTEX_CMP_REQUEUE — the op underlying musl pthread_cond_broadcast.
+ * Stress: FUTEX_CMP_REQUEUE — the op underlying pthread_cond_broadcast.
  *
  * Wake 1 waiter on src, requeue N-1 onto dst. A subsequent FUTEX_WAKE(N)
  * on dst must release all N-1 requeued threads. Total woken must equal N.
@@ -11,13 +11,15 @@
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <stdatomic.h>
-#include <unistd.h>
-#include <stdio.h>
 #include <sched.h>
+#include <stdio.h>
+#include "test_helpers.h"
 
 #define N 16
-static int src = 0, dst = 0;
-static atomic_int woken = 0;
+
+static int        src    = 0;
+static int        dst    = 0;
+static atomic_int woken  = 0;
 static atomic_int staged = 0;
 
 static void *waiter(void *arg) {
@@ -37,11 +39,9 @@ int main(void) {
         sched_yield();
 
     long r = syscall(SYS_futex, &src, FUTEX_CMP_REQUEUE,
-                     1, (void*)(long)(N - 1), &dst, 0);
-    if (r < 0) {
-        dprintf(2, "FUTEX_CMPREQ FAIL: cmp_requeue syscall error\n");
-        return 1;
-    }
+                     1, (void *)(long)(N - 1), &dst, 0);
+    if (r < 0)
+        TEST_FAIL("FUTEX_CMP_REQUEUE syscall failed");
 
     syscall(SYS_futex, &dst, FUTEX_WAKE, N, NULL, NULL, 0);
 
@@ -49,10 +49,8 @@ int main(void) {
         pthread_join(t[i], NULL);
 
     int w = atomic_load(&woken);
-    if (w == N) {
-        puts("PASS");
-        return 0;
-    }
-    dprintf(2, "FUTEX_CMPREQ FAIL: woken=%d expected=%d\n", w, N);
-    return 1;
+    if (w != N)
+        TEST_FAILF("woken=%d expected=%d", w, N);
+
+    TEST_PASS();
 }

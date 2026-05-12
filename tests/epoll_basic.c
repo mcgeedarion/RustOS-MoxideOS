@@ -1,53 +1,49 @@
 /* tests/epoll_basic.c
  *
- * Tests:
- *   - epoll_create1 / epoll_ctl / epoll_wait
- *   - edge-triggered (EPOLLET) and level-triggered modes
- *   - pipe read-readiness detection
+ * Smoke: epoll_create1 / epoll_ctl / epoll_wait correctness.
  *
- * Output: PASS / FAIL
+ * Verifies that a pipe read-end reports no events before data arrives
+ * (0-timeout poll) and exactly one EPOLLIN event after a write.
+ * Targets epoll_create1 / epoll_ctl / epoll_wait (src/fs/epoll.rs).
  */
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdio.h>
+#include "test_helpers.h"
 
-int main(void)
-{
+int main(void) {
     int pipefd[2];
-    if (pipe(pipefd) != 0) { perror("pipe"); return 1; }
+    TEST_SYSCALL(pipe(pipefd), "pipe");
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0) { perror("epoll_create1"); return 1; }
+    TEST_SYSCALL(epfd, "epoll_create1");
 
-    struct epoll_event ev;
-    ev.events  = EPOLLIN;
-    ev.data.fd = pipefd[0];
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev) != 0) {
-        perror("epoll_ctl"); return 1;
-    }
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = pipefd[0] };
+    TEST_SYSCALL(epoll_ctl(epfd, EPOLL_CTL_ADD, pipefd[0], &ev), "epoll_ctl");
 
-    /* Nothing written yet — epoll_wait with 0 timeout should return 0 */
+    /* No data yet — 0-timeout must return 0 events. */
     struct epoll_event events[4];
     int n = epoll_wait(epfd, events, 4, 0);
-    if (n != 0) { fprintf(stderr, "FAIL expected 0 events, got %d\n", n); return 1; }
+    if (n != 0)
+        TEST_FAILF("expected 0 events before write, got %d", n);
 
-    /* Write data — now readable */
-    if (write(pipefd[1], "x", 1) != 1) { perror("write"); return 1; }
+    /* Write one byte — now readable. */
+    TEST_SYSCALL((int)write(pipefd[1], "x", 1) - 1, "write");
 
-    n = epoll_wait(epfd, events, 4, 100 /* ms */);
-    if (n != 1) { fprintf(stderr, "FAIL expected 1 event, got %d\n", n); return 1; }
-    if (events[0].data.fd != pipefd[0]) { puts("FAIL wrong fd"); return 1; }
+    n = epoll_wait(epfd, events, 4, 100);
+    if (n != 1)
+        TEST_FAILF("expected 1 event after write, got %d", n);
+    if (events[0].data.fd != pipefd[0])
+        TEST_FAIL("wrong fd in epoll event");
 
-    /* Drain */
     char buf[4];
     read(pipefd[0], buf, sizeof(buf));
 
-    close(pipefd[0]); close(pipefd[1]); close(epfd);
-    puts("PASS");
-    return 0;
+    close(pipefd[0]);
+    close(pipefd[1]);
+    close(epfd);
+    TEST_PASS();
 }
