@@ -16,6 +16,7 @@ pub mod block;
 pub mod console;
 pub mod crt;
 pub mod drivers;
+pub mod drm;
 pub mod dt;
 pub mod elf;
 pub mod fs;
