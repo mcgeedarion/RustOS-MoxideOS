@@ -155,54 +155,29 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     }
 
     // ── CBS admission gate (SCHED_DEADLINE only) ──────────────────────────────
-    //
-    // Strategy:
-    //   1. Read the task's current cpumask (we need it for both release
-    //      and for the new admit, which may use a different mask set by
-    //      a prior sched_setaffinity call).
-    //   2. If the task is already DEADLINE, release its old utilization
-    //      slot so the check sees the correct remaining headroom.
-    //   3. Determine the cpumask for the *new* parameters: use the task's
-    //      current cpumask (affinity is changed separately via
-    //      sched_setaffinity; we don't allow changing both atomically here
-    //      to keep the locking simple).
-    //   4. Run cbs_admit.  On failure, if we released in step 2 we must
-    //      re-admit the old parameters to leave the table consistent.
-    //   5. On success, fall through to with_proc_mut to update the PCB.
-
     if policy == SchedPolicy::Deadline {
         let privileged = is_privileged(pid);
 
-        // Current cpumask — needed for the new admit.
         let cpumask = crate::proc::scheduler::with_proc(pid, |p| p.sched.cpumask)
             .unwrap_or(CPUMASK_ALL);
 
-        // Read the old deadline params before we mutate anything.
         let old = snapshot_deadline(pid);
 
-        // Release old slot so headroom is accurate.
         if let Some(ref snap) = old {
             cbs_release(snap.runtime, snap.period, snap.cpumask);
         }
 
-        // Attempt admission with new parameters.
         if let Err(e) = cbs_admit(pid, attr.sched_runtime, attr.sched_period,
                                    cpumask, privileged)
         {
-            // Rollback: re-admit old slot to keep the table consistent.
             if let Some(ref snap) = old {
-                // Use privileged=true here because we're just restoring a
-                // previously admitted slot — it must always succeed.
                 let _ = cbs_admit(0, snap.runtime, snap.period, snap.cpumask, true);
             }
             return e as isize;
         }
-        // CBS counters now reflect the new task; fall through to PCB update.
     }
 
     // ── If leaving Deadline, release old CBS slot ─────────────────────────────
-    // (We enter this branch only when policy != Deadline, i.e. the task
-    // is transitioning away from Deadline.)
     if policy != SchedPolicy::Deadline {
         if let Some(snap) = snapshot_deadline(pid) {
             cbs_release(snap.runtime, snap.period, snap.cpumask);
@@ -331,6 +306,8 @@ pub fn sys_getpriority(which: i32, who: usize) -> isize {
 /// `sys_sched_setaffinity(pid, cpusetsize, mask_uptr)` [NR 203]
 pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
     if mask_uptr == 0 || cpusetsize == 0 { return -22; }
+
+    // Copy up to 8 bytes from user; remaining bits are zero (no CPU there).
     let bytes = cpusetsize.min(8);
     let mut raw = [0u8; 8];
     for i in 0..bytes {
@@ -340,30 +317,50 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     }
     let mask = u64::from_le_bytes(raw);
     if mask == 0 { return -22; }
+
+    // Intersect with the online CPU set.
     let ncpus = crate::smp::num_online_cpus();
     let online_mask: u64 = if ncpus >= 64 { u64::MAX } else { (1u64 << ncpus) - 1 };
     let effective = mask & online_mask;
     if effective == 0 { return -22; }
 
     // ── CBS: re-check admission if this is a DEADLINE task ────────────────────
-    // Changing the cpumask may expose CPU(s) that don't have enough headroom.
+    // Changing the cpumask may expose CPUs that do not have enough headroom.
     let snap = snapshot_deadline(pid);
     if let Some(ref s) = snap {
         let privileged = is_privileged(pid);
         cbs_release(s.runtime, s.period, s.cpumask);
         if let Err(e) = cbs_admit(pid, s.runtime, s.period, effective, privileged) {
-            // Rollback.
+            // Rollback: restore old admission slot.
             let _ = cbs_admit(0, s.runtime, s.period, s.cpumask, true);
             return e as isize;
         }
     }
 
-    crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
+    // ── Write new cpumask into PCB ────────────────────────────────────────────
+    // with_proc_mut holds ProcLock::inner; we do NOT call any scheduler
+    // function that re-acquires the same lock inside this closure.
+    let result = crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         pcb.sched.cpumask = effective;
-        // Keep the Task hot copy in sync.
-        if !_pl.inner.try_lock().is_none() { /* already holding inner via with_proc_mut */ }
-    }).map(|_| 0isize).unwrap_or(-3)
+    });
+    if result.is_none() { return -3; } // ESRCH
+
+    // ── Migrate if the task's current CPU is no longer allowed ────────────────
+    // Read the running CPU outside the PCB lock to avoid lock-order inversion
+    // with the per-CPU run-queue lock taken inside migrate_task.
+    let current_cpu = crate::proc::scheduler::with_proc(pid, |pcb| pcb.cpu_id)
+        .unwrap_or(0);
+    if effective & (1u64 << current_cpu) == 0 {
+        // The task is pinned to a CPU no longer in its affinity set.
+        // Pick the lowest-numbered allowed CPU and request a migration.
+        let target = effective.trailing_zeros() as usize;
+        crate::proc::scheduler::migrate_task(pid, target);
+    }
+
+    0
 }
+
+// ── sched_getaffinity ─────────────────────────────────────────────────────────
 
 /// `sys_sched_getaffinity(pid, cpusetsize, mask_uptr)` [NR 204]
 pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
@@ -377,6 +374,7 @@ pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
             return -14;
         }
     }
+    // Zero-pad any bytes beyond what our 64-bit mask covers.
     let zero: u8 = 0;
     for i in bytes_to_write..cpusetsize {
         let _ = copy_to_user((mask_uptr + i) as *mut u8, &zero);
