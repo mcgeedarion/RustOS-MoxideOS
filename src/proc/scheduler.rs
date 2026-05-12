@@ -885,6 +885,16 @@ pub fn task_ptr_for_pid(pid: usize) -> *mut crate::proc::task_types::Task {
 pub fn tgid_of(pid: usize) -> usize {
     proc_table::with_proc(pid, |p| p.tgid).unwrap_or(0)
 }
+
+/// Count live (non-Zombie) threads sharing the same tgid as `pid`.
+/// Returns `None` only if `pid` is not in the process table.
+/// Used by `sys_setns` to enforce the multi-thread guard on CLONE_NEWPID
+/// and CLONE_NEWUSER joins.
+#[inline]
+pub fn thread_count_of(pid: usize) -> Option<usize> {
+    proc_table::thread_count_of(pid)
+}
+
 #[inline]
 pub fn has_current_user_proc() -> bool {
     let blk = crate::smp::percpu::current_block();

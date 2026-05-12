@@ -12,10 +12,11 @@
 //!   5. proc_fd_free         — close all open fds
 //!   6. free_address_space (last thread in group only)
 //!   7. group_pending_clear (last thread in group only) — drain GROUP_PENDING[tgid]
-//!   8. free_kstack + State -> Zombie + exit_code = encode_exit(code)
-//!   9. wake vfork_parent
-//!  10. notify_exit (wakes parent waitpid, sends group-directed SIGCHLD)
-//!  11. schedule()   — never returns
+//!   8. ns_exit (last thread in group only) — tear down private namespaces
+//!   9. free_kstack + State -> Zombie + exit_code = encode_exit(code)
+//!  10. wake vfork_parent
+//!  11. notify_exit (wakes parent waitpid, sends group-directed SIGCHLD)
+//!  12. schedule()   — never returns
 
 extern crate alloc;
 
@@ -55,6 +56,54 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     })
 }
 
+// ── ns_exit ───────────────────────────────────────────────────────────
+//
+// Called only when the last live thread in a thread group exits.
+// Tears down any private (non-INIT_NS) namespaces that have no other
+// living process using them.
+
+fn ns_exit(pid: usize) {
+    use crate::proc::namespace::INIT_NS;
+
+    // Collect the ns ids from this process's NsSet.
+    let ns = match scheduler::with_proc(pid, |p| p.ns.clone()) {
+        Some(n) => n,
+        None    => return,
+    };
+
+    // ── Net namespace ────────────────────────────────────────────────────
+    // Destroy the net ns if it is private and no other process shares it.
+    if ns.net != INIT_NS {
+        let shared = scheduler::with_procs_ro(|pl_vec| {
+            pl_vec.iter().any(|pl| {
+                pl.pid as usize != pid
+                    && pl.load_state() != State::Zombie
+                    && scheduler::with_proc(pl.pid as usize, |p| p.ns.net)
+                           .unwrap_or(INIT_NS) == ns.net
+            })
+        });
+        if !shared {
+            crate::proc::net_ns::destroy_net_ns(ns.net);
+        }
+    }
+
+    // ── Mount namespace ──────────────────────────────────────────────────
+    // Drop the private mount table snapshot if no other process uses it.
+    if ns.mnt != INIT_NS {
+        let shared = scheduler::with_procs_ro(|pl_vec| {
+            pl_vec.iter().any(|pl| {
+                pl.pid as usize != pid
+                    && pl.load_state() != State::Zombie
+                    && scheduler::with_proc(pl.pid as usize, |p| p.ns.mnt)
+                           .unwrap_or(INIT_NS) == ns.mnt
+            })
+        });
+        if !shared {
+            crate::proc::namespace::drop_mount_ns(ns.mnt);
+        }
+    }
+}
+
 // ── zombify ───────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
@@ -91,6 +140,9 @@ pub fn do_exit(pid: usize, code: i32) {
         free_address_space(pid, user_satp);
         // Drain group-directed pending signals so the TGID entry doesn't leak.
         crate::proc::signal::group_pending_clear(tgid);
+        // Tear down private namespaces (net ns interface tables, private mount
+        // snapshots) that are no longer referenced by any other live process.
+        ns_exit(pid);
     }
 
     let vfork_parent = zombify(pid, code);
@@ -136,7 +188,9 @@ pub fn sys_exit_group(status: i32) -> isize {
         wait::notify_exit(sibling);
     }
 
-    // do_exit handles group_pending_clear for the tgid (last live thread path).
+    // do_exit handles group_pending_clear + ns_exit for the tgid (last live
+    // thread path — after all siblings have been zombified above, pid is now
+    // the last live thread so is_last_live_thread will return true).
     do_exit(pid, status);
     0
 }

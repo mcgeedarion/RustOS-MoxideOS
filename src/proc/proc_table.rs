@@ -103,6 +103,33 @@ pub fn with_procs_mut<T, F: FnOnce(&mut Vec<Arc<ProcLock>>) -> T>(f: F) -> T {
     f(&mut PROC_TABLE.lock())
 }
 
+// ── Thread-count helper ───────────────────────────────────────────────────────
+
+/// Count live (non-Zombie) threads that share the same tgid as `pid`.
+/// Used by `sys_setns` to reject CLONE_NEWPID / CLONE_NEWUSER joins from
+/// multi-threaded processes (Linux setns(2) semantics).
+///
+/// We snapshot the table (cheap Arc-clone) so we don't hold PROC_TABLE
+/// while reading inner state.
+pub fn thread_count_of(pid: usize) -> Option<usize> {
+    // First, find the tgid for pid — holds PROC_TABLE briefly.
+    let tgid = {
+        let table = PROC_TABLE.lock();
+        table.iter()
+            .find(|pl| pl.pid as usize == pid)
+            .map(|pl| pl.tgid as usize)?
+    };
+    // Snapshot (Arc clones, no inner locks).
+    let snapshot: Vec<Arc<ProcLock>> = PROC_TABLE.lock().clone();
+    let count = snapshot.iter()
+        .filter(|pl| {
+            pl.tgid as usize == tgid
+                && pl.load_state() != State::Zombie
+        })
+        .count();
+    Some(count)
+}
+
 // ── Insert / remove ───────────────────────────────────────────────────────────
 
 /// Insert a new process.  Wraps the Pcb in a ProcLock and pushes to table.
