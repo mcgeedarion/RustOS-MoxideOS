@@ -11,6 +11,21 @@
 //!        - Zero-fill the BSS region (memsz - filesz bytes).
 //!        - Map each page into the process CR3/SATP via paging::map_page.
 //!   3. Return entry point, brk, and PHDR metadata for auxv.
+//!
+//! ## AT_PHDR derivation
+//!
+//! When no explicit PT_PHDR segment is present (common for static ET_EXEC),
+//! AT_PHDR is synthesised as:
+//!
+//!   AT_PHDR = load_base + e_phoff
+//!
+//! where `load_base` = (first PT_LOAD's p_vaddr + bias) − p_offset.
+//! This is the in-memory base address from which file offsets are measured,
+//! matching what the Linux kernel and ld.so expect.
+//!
+//! Using the raw e_phoff (a file offset) as AT_PHDR is wrong for ET_EXEC
+//! (bias == 0) because e_phoff is e.g. 64 while the in-memory address is
+//! e.g. 0x400040.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -82,7 +97,7 @@ pub struct LoadedElf {
     /// Physical pages allocated (owned by the process).
     pub pages:      Vec<usize>,
     /// Virtual address of the PT_PHDR segment (for AT_PHDR auxv entry).
-    /// Zero if no PT_PHDR segment is present.
+    /// Zero if no PT_PHDR segment is present and e_phoff is zero.
     pub phdr_va:    usize,
     /// Number of program headers (for AT_PHNUM).
     pub phdr_count: usize,
@@ -134,8 +149,16 @@ pub fn load(image: &[u8], cr3: usize) -> Option<LoadedElf> {
 
     let mut pages: Vec<usize> = Vec::new();
     let mut brk: usize = 0;
-    // phdr_va: look for an explicit PT_PHDR; fall back to e_phoff + bias.
+
+    // phdr_va: set from an explicit PT_PHDR segment when present.
+    // If absent, synthesised from first_load_vaddr_base + e_phoff below.
     let mut phdr_va: usize = 0;
+
+    // first_load_vaddr_base tracks (p_vaddr + bias) - p_offset for the
+    // first PT_LOAD segment.  This is the virtual address that corresponds
+    // to file offset 0, and is needed to compute AT_PHDR correctly when
+    // no explicit PT_PHDR segment exists.
+    let mut first_load_vaddr_base: Option<usize> = None;
 
     // Walk program headers.
     for i in 0..phnum {
@@ -154,6 +177,13 @@ pub fn load(image: &[u8], cr3: usize) -> Option<LoadedElf> {
         let memsz  = ph.p_memsz  as usize;
         let offset = ph.p_offset as usize;
         let flags  = ph.p_flags;
+
+        // Record the virtual base (file offset 0 equivalent) for the
+        // first PT_LOAD segment.  Used to synthesise AT_PHDR below.
+        if first_load_vaddr_base.is_none() {
+            // vaddr corresponds to file offset `offset`, so the base is:
+            first_load_vaddr_base = Some(vaddr.wrapping_sub(offset));
+        }
 
         if filesz > image.len() || offset + filesz > image.len() { return None; }
         if memsz == 0 { continue; }
@@ -195,9 +225,18 @@ pub fn load(image: &[u8], cr3: usize) -> Option<LoadedElf> {
         if seg_top > brk { brk = seg_top; }
     }
 
-    // If no PT_PHDR found, synthesise from e_phoff.
+    // Synthesise AT_PHDR when no explicit PT_PHDR segment was found.
+    //
+    // AT_PHDR must be the virtual address of the program header table,
+    // NOT the raw e_phoff file offset.  For a static ET_EXEC with bias==0,
+    // e_phoff is typically 64 while AT_PHDR should be e.g. 0x400040.
+    //
+    // Correct formula:  AT_PHDR = first_load_vaddr_base + e_phoff
+    //   where first_load_vaddr_base = (first PT_LOAD p_vaddr + bias) - p_offset
     if phdr_va == 0 && phoff != 0 {
-        phdr_va = phoff + bias;
+        phdr_va = first_load_vaddr_base
+            .and_then(|base| base.checked_add(phoff))
+            .unwrap_or(0);
     }
 
     brk = (brk + PAGE - 1) & !(PAGE - 1);
