@@ -1,5 +1,5 @@
 //! Core file I/O syscalls: read, write, open, close, pread64, pwrite64,
-//! writev, readv, dup, dup2, dup3, ftruncate, link, rmdir.
+//! writev, readv, dup, dup2, dup3, ftruncate, link, rmdir, mkdir.
 //!
 //! ## fd translation
 //! Every syscall that takes a user-visible fd now calls `proc_fd_backing` to
@@ -9,14 +9,15 @@
 //!
 //! ## Dispatch order for sys_open
 //! Delegated to `process_fd::proc_fd_open` which owns the full dispatch chain
-//! (devfs → procfs → sysfs → vfs) plus O_CREAT / O_TRUNC handling and
-//! RLIMIT_NOFILE enforcement.
+//! (devfs → procfs → cgroupfs → sysfs → vfs) plus O_CREAT / O_TRUNC handling
+//! and RLIMIT_NOFILE enforcement.
 //!
 //! ## Dispatch order for sys_read  (on backing fd)
 //!   stdin(0)        → tty
 //!   devfs fd        → devfs::read
 //!   procfs fd       → procfs::procfs_read
 //!   sysfs fd        → sysfs::sysfs_read
+//!   cgroupfs fd     → cgroupfs::cgroupfs_read
 //!   inotify fd      → inotify::inotify_read
 //!   fanotify fd     → fanotify::fanotify_read
 //!   eventfd fd      → eventfd::eventfd_read
@@ -28,6 +29,7 @@
 //! ## Dispatch order for sys_write  (on backing fd)
 //!   stdout/stderr   → tty
 //!   devfs fd        → devfs::write
+//!   cgroupfs fd     → cgroupfs::cgroupfs_write
 //!   fanotify fd     → fanotify::fanotify_write  (permission responses)
 //!   pipe fd         → pipe::pipe_write
 //!   socket fd       → socket::socket_write
@@ -134,6 +136,9 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
         let off = synth_offset_get(bfd);
         n = crate::fs::sysfs::sysfs_read(bfd, &mut kbuf, off);
         if n > 0 { synth_offset_advance(bfd, n as usize); }
+    } else if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
+        // cgroupfs maintains its own offset internally.
+        n = crate::fs::cgroupfs::cgroupfs_read(bfd, &mut kbuf);
     } else if crate::fs::inotify::is_inotify_fd(bfd) {
         n = crate::fs::inotify::inotify_read(bfd, &mut kbuf);
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
@@ -175,6 +180,9 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         return crate::fs::devfs::write(bfd, &kbuf);
+    }
+    if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
+        return crate::fs::cgroupfs::cgroupfs_write(bfd, &kbuf);
     }
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return crate::fs::fanotify::fanotify_write(bfd, &kbuf);
@@ -246,8 +254,6 @@ pub fn sys_close(fd: usize) -> isize {
         let bfd_r = proc_fd_backing(cpid(), fd);
         if bfd_r >= 0 {
             let bfd = bfd_r as usize;
-            // Namespace fds (NSFD_FD_BASE range): clean up both the ns-fd
-            // entry (NSFD_TABLE) and the stashed procfs content (PROCFS_FDS).
             if crate::proc::namespace::is_ns_fd(bfd) {
                 crate::proc::namespace::ns_fd_close(bfd);
                 crate::fs::procfs::procfs_close(bfd);
@@ -256,6 +262,9 @@ pub fn sys_close(fd: usize) -> isize {
                    || crate::fs::sysfs::is_sysfs_fd(bfd)
             {
                 synth_offset_remove(bfd);
+            } else if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
+                // cgroupfs owns its own TABLE; proc_fd_close will call
+                // close_backing which calls cgroupfs_close.  Nothing extra needed.
             }
         }
     }
@@ -308,7 +317,7 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> isize {
 /// sys_pread64(fd, buf_va, count, offset)  [NR 17]
 pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
-    if offset < 0  { return -22; }  // EINVAL: negative offset is invalid
+    if offset < 0  { return -22; }
     if !validate_user_ptr(buf_va, count) { return -14; }
     let bfd = match resolve(fd) { n if n < 0 => return n, n => n as usize };
     let mut kbuf = alloc::vec![0u8; count];
@@ -321,20 +330,15 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
 // ── sys_pwrite64 ─────────────────────────────────────────────────────────────
 
 /// sys_pwrite64(fd, buf_va, count, offset)  [NR 18]
-///
-/// Writes `count` bytes from `buf_va` to `fd` at `offset` without altering
-/// the fd's current position.  RLIMIT_FSIZE is enforced against the
-/// absolute write end-point (offset + count).
 pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0  { return 0; }
-    if offset < 0  { return -22; }  // EINVAL: negative offset is invalid for pwrite
+    if offset < 0  { return -22; }
 
     let bfd = match resolve(fd) { n if n < 0 => return n, n => n as usize };
 
     let mut kbuf = alloc::vec![0u8; count];
     if copy_from_user(&mut kbuf, buf_va).is_err() { return -14; }
 
-    // RLIMIT_FSIZE: check against the absolute end-point, not current file size.
     let pid = cpid();
     let (soft, _) = crate::proc::rlimit::getrlimit_for(0, RLIMIT_FSIZE);
     if soft != RLIM_INFINITY {
@@ -345,7 +349,6 @@ pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isiz
         }
     }
 
-    // Use direct positional write — does not move the fd's seek position.
     vfs::pwrite(bfd, kbuf.as_ptr(), count, offset)
 }
 
@@ -373,6 +376,7 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
 
     let is_vfs = bfd != 1 && bfd != 2
         && crate::fs::devfs::get_dev_fd(bfd).is_none()
+        && !crate::fs::cgroupfs::is_cgroupfs_fd(bfd)
         && !crate::fs::fanotify::is_fanotify_fd(bfd)
         && !crate::fs::pipe::is_pipe(bfd)
         && !crate::net::socket::is_socket_fd(bfd);
@@ -382,7 +386,6 @@ pub fn sys_writev(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
             Ok(_)  => {}
             Err(e) => return e,
         }
-        // O_APPEND: seek to EOF before the first iov write.
         if fd > 2 {
             let fl = proc_fd_getfl(cpid(), fd);
             if fl & O_APPEND != 0 {
@@ -442,6 +445,8 @@ fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
         let off = synth_offset_get(bfd);
         n = crate::fs::sysfs::sysfs_read(bfd, &mut kbuf, off);
         if n > 0 { synth_offset_advance(bfd, n as usize); }
+    } else if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
+        n = crate::fs::cgroupfs::cgroupfs_read(bfd, &mut kbuf);
     } else if crate::fs::inotify::is_inotify_fd(bfd) {
         n = crate::fs::inotify::inotify_read(bfd, &mut kbuf);
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
@@ -471,6 +476,9 @@ fn write_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         return crate::fs::devfs::write(bfd, &kbuf);
+    }
+    if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
+        return crate::fs::cgroupfs::cgroupfs_write(bfd, &kbuf);
     }
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return crate::fs::fanotify::fanotify_write(bfd, &kbuf);
@@ -502,7 +510,7 @@ pub fn sys_ftruncate(fd: usize, length: i64) -> isize {
     }
 }
 
-// ── link / rmdir ─────────────────────────────────────────────────────────────
+// ── link / rmdir / mkdir ─────────────────────────────────────────────────────
 
 /// sys_link(oldpath_va, newpath_va)  [NR 86]
 pub fn sys_link(old_va: usize, new_va: usize) -> isize {
@@ -514,9 +522,49 @@ pub fn sys_link(old_va: usize, new_va: usize) -> isize {
     }
 }
 
+/// sys_mkdir(path_va, mode)  [NR 83]
+pub fn sys_mkdir(path_va: usize, _mode: u32) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    if path.starts_with("/sys/fs/cgroup") {
+        return crate::fs::cgroupfs::cgroupfs_mkdir(&path);
+    }
+    match crate::fs::vfs_ops::mkdir(&path) {
+        Ok(())  => 0,
+        Err(e)  => e,
+    }
+}
+
+/// sys_mkdirat(dirfd, path_va, mode)  [NR 258]
+pub fn sys_mkdirat(dirfd: i32, path_va: usize, mode: u32) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    if path.starts_with('/') || dirfd == -100 {
+        return sys_mkdir(path_va, mode);
+    }
+    let pid = cpid();
+    let dir = match crate::fs::process_fd::proc_fd_path(pid, dirfd as usize) {
+        Some(p) => p,
+        None    => return -9,
+    };
+    let full = if dir.ends_with('/') {
+        alloc::format!("{}{}", dir, path)
+    } else {
+        alloc::format!("{}/{}", dir, path)
+    };
+    if full.starts_with("/sys/fs/cgroup") {
+        return crate::fs::cgroupfs::cgroupfs_mkdir(&full);
+    }
+    match crate::fs::vfs_ops::mkdir(&full) {
+        Ok(())  => 0,
+        Err(e)  => e,
+    }
+}
+
 /// sys_rmdir(path_va)  [NR 84]
 pub fn sys_rmdir(path_va: usize) -> isize {
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    if path.starts_with("/sys/fs/cgroup") {
+        return crate::fs::cgroupfs::cgroupfs_rmdir(&path);
+    }
     match vfs::rmdir(&path) {
         Ok(())  => 0,
         Err(e)  => e,

@@ -8,16 +8,17 @@
 //!   3. Returns the standard POSIX errno-compatible isize / Result
 //!
 //! ## Backends wired
-//! | FsType     | Module        | Notes                                  |
-//! |------------|---------------|----------------------------------------|
-//! | Ext2       | fs::ext2      | read-write root; full inode ops        |
-//! | Ext4       | fs::ext4      | read-only root; extents + 64-bit blk   |
-//! | Fat32      | fs::fat32     | ESP + USB; VFAT LFN                    |
-//! | Tmpfs      | fs::tmpfs     | /tmp /run /dev/shm (size-limited)      |
-//! | Overlayfs  | fs::overlayfs | copy-up + whiteout merge               |
-//! | Devfs      | fs::devfs     | character / block device nodes         |
-//! | Procfs     | fs::procfs    | /proc virtual files                    |
-//! | Sysfs      | fs::sysfs     | /sys virtual files                     |
+//! | FsType      | Module          | Notes                                  |
+//! |-------------|-----------------|----------------------------------------|
+//! | Ext2        | fs::ext2        | read-write root; full inode ops        |
+//! | Ext4        | fs::ext4        | read-only root; extents + 64-bit blk   |
+//! | Fat32       | fs::fat32       | ESP + USB; VFAT LFN                    |
+//! | Tmpfs       | fs::tmpfs       | /tmp /run /dev/shm (size-limited)      |
+//! | Overlayfs   | fs::overlayfs   | copy-up + whiteout merge               |
+//! | Devfs       | fs::devfs       | character / block device nodes         |
+//! | Procfs      | fs::procfs      | /proc virtual files                    |
+//! | Sysfs       | fs::sysfs       | /sys virtual files                     |
+//! | Cgroupfs    | fs::cgroupfs    | /sys/fs/cgroup cgroup v2 hierarchy     |
 
 extern crate alloc;
 use alloc::{
@@ -61,17 +62,37 @@ pub struct KStatfs {
 
 // Well-known f_type magic numbers (matches Linux)
 const FSTYPE_EXT2:    u64 = 0xEF53;
-const FSTYPE_EXT4:    u64 = 0xEF53; // same magic; kernel identifies ext4 via sb incompat flags
+const FSTYPE_EXT4:    u64 = 0xEF53;
 const FSTYPE_FAT32:   u64 = 0x4d44;
 const FSTYPE_TMPFS:   u64 = 0x0102_1994;
 const FSTYPE_OVERLAY: u64 = 0x794c_7630;
 const FSTYPE_DEVTMPFS:u64 = 0x1373;
 const FSTYPE_PROC:    u64 = 0x9fa0;
 const FSTYPE_SYSFS:   u64 = 0x6265_6572;
+const FSTYPE_CGROUP2: u64 = 0x6367_7270; // matches Linux CGROUP2_SUPER_MAGIC
+
+// ── Cgroupfs path prefix ───────────────────────────────────────────────────────────
+
+#[inline(always)]
+fn is_cgroupfs_path(path: &str) -> bool {
+    path.starts_with("/sys/fs/cgroup")
+}
 
 // ── read_all / write_all ───────────────────────────────────────────────────
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
+    if is_cgroupfs_path(path) {
+        // Open + materialise content via cgroupfs.
+        let fd = crate::fs::cgroupfs::cgroupfs_open(path);
+        if fd < 0 { return Err(fd as isize); }
+        let fd = fd as usize;
+        let mut data = alloc::vec![0u8; 4096];
+        let n = crate::fs::cgroupfs::cgroupfs_read(fd, &mut data);
+        crate::fs::cgroupfs::cgroupfs_close(fd);
+        if n < 0 { return Err(n as isize); }
+        data.truncate(n as usize);
+        return Ok(data);
+    }
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Ext2 => {
@@ -113,6 +134,17 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
 }
 
 pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
+    if is_cgroupfs_path(path) {
+        let s = core::str::from_utf8(data).map_err(|_| -22isize)?;
+        // Derive knob name from last path component.
+        let knob = path.split('/').last().unwrap_or("");
+        let cg_id = crate::proc::cgroup::path_to_cgid(path
+            .strip_suffix(knob).unwrap_or(path)
+            .trim_end_matches('/'))
+            .ok_or(-2isize)?;
+        let rc = crate::proc::cgroup::write_knob(cg_id, knob, s);
+        return if rc == 0 { Ok(()) } else { Err(rc) };
+    }
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     let result = match h.fstype {
@@ -123,7 +155,7 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
             fd_close(fd);
             if n < 0 { Err(n as isize) } else { Ok(()) }
         }
-        FsType::Ext4 => Err(-30), // EROFS: ext4 driver is read-only
+        FsType::Ext4 => Err(-30),
         FsType::Fat32 => {
             let mp = mount_point_for(&h.subpath, path);
             let mut f = crate::fs::fat32::fat_open(&mp, &h.subpath)
@@ -172,7 +204,7 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
             write_all(path, &full)?;
             Ok(data.len())
         }
-        FsType::Ext4 => Err(-30), // read-only
+        FsType::Ext4 => Err(-30),
         _ => Err(-38),
     };
     if result.is_ok() { dcache::invalidate(path); }
@@ -266,6 +298,12 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
 // ── mkdir ────────────────────────────────────────────────────────────────────
 
 pub fn mkdir(path: &str) -> Result<(), isize> {
+    // cgroupfs mkdir is handled before reaching this function (io_syscalls).
+    // Guard here as a safety net for callers that go through vfs_ops directly.
+    if is_cgroupfs_path(path) {
+        let rc = crate::fs::cgroupfs::cgroupfs_mkdir(path);
+        return if rc == 0 { Ok(()) } else { Err(rc) };
+    }
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     let result = match h.fstype {
@@ -291,6 +329,10 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
 // ── rmdir ────────────────────────────────────────────────────────────────────
 
 pub fn rmdir(path: &str) -> Result<(), isize> {
+    if is_cgroupfs_path(path) {
+        let rc = crate::fs::cgroupfs::cgroupfs_rmdir(path);
+        return if rc == 0 { Ok(()) } else { Err(rc) };
+    }
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
     let result = match h.fstype {
@@ -364,6 +406,20 @@ pub fn stat(path: &str) -> Result<KStat, isize> { stat_impl(path, false) }
 pub fn lstat(path: &str) -> Result<KStat, isize> { stat_impl(path, true) }
 
 fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
+    // cgroupfs early-exit — bypass mount table entirely.
+    if is_cgroupfs_path(path) {
+        return match crate::fs::cgroupfs::cgroupfs_exists(path) {
+            None        => Err(-2),
+            Some(is_dir) => Ok(KStat {
+                mode:    if is_dir { 0o040755 } else { 0o100644 },
+                nlink:   if is_dir { 2 } else { 1 },
+                blksize: 4096,
+                is_dir,
+                ..KStat::default()
+            }),
+        };
+    }
+
     if !lstat {
         if let Some(entry) = dcache::lookup(path) {
             return Ok(entry.stat);
@@ -441,6 +497,14 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
 // ── statfs ───────────────────────────────────────────────────────────────────
 
 pub fn statfs(path: &str) -> Result<KStatfs, isize> {
+    if is_cgroupfs_path(path) {
+        return Ok(KStatfs {
+            f_type:    FSTYPE_CGROUP2,
+            f_bsize:   4096,
+            f_namelen: 255,
+            ..KStatfs::default()
+        });
+    }
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Tmpfs => crate::fs::tmpfs::tmpfs_statfs(path),
@@ -519,6 +583,18 @@ pub struct DirEntry {
 }
 
 pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
+    if is_cgroupfs_path(path) {
+        return match crate::fs::cgroupfs::cgroupfs_list_dir_by_path(path) {
+            None => Err(-20), // ENOTDIR
+            Some(entries) => Ok(entries.into_iter().map(|e| DirEntry {
+                name:   e.name,
+                ino:    0,
+                is_dir: e.is_dir,
+                mode:   if e.is_dir { 0o040755 } else { 0o100644 },
+                size:   0,
+            }).collect()),
+        };
+    }
     let h = mount::resolve(path)?;
     match h.fstype {
         FsType::Ext2 => {

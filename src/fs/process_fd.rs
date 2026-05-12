@@ -146,7 +146,9 @@ fn dup_backing(bfd: usize) -> usize {
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         bfd
     } else if crate::fs::procfs::is_procfs_fd(bfd)
-           || crate::fs::sysfs::is_sysfs_fd(bfd) {
+           || crate::fs::sysfs::is_sysfs_fd(bfd)
+           || crate::fs::cgroupfs::is_cgroupfs_fd(bfd)
+    {
         bfd
     } else {
         let r = crate::fs::vfs::dup_from(bfd, bfd);
@@ -229,6 +231,11 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
             (fd as isize, None)
         } else if path.starts_with("/proc") {
             let fd = crate::fs::procfs::procfs_open(path, flags);
+            (fd, Some(path.into()))
+        } else if path.starts_with("/sys/fs/cgroup") {
+            // cgroupfs lives under /sys but is handled separately so it gets
+            // full read/write/mkdir/rmdir support.
+            let fd = crate::fs::cgroupfs::cgroupfs_open(path);
             (fd, Some(path.into()))
         } else if path.starts_with("/sys") {
             let fd = crate::fs::sysfs::sysfs_open(path, flags);
@@ -397,6 +404,8 @@ pub fn proc_fd_install(
 fn close_backing(bfd: usize) {
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         crate::fs::devfs::close(bfd);
+    } else if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
+        crate::fs::cgroupfs::cgroupfs_close(bfd);
     } else if crate::fs::procfs::is_procfs_fd(bfd) {
     } else if crate::fs::sysfs::is_sysfs_fd(bfd) {
     } else if crate::fs::inotify::is_inotify_fd(bfd) {
