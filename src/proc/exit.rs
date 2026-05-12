@@ -44,7 +44,7 @@ fn clear_child_tid(pid: usize) {
     futex_wake_addr(va, 1);
 }
 
-// ── is_last_live_thread ──────────────────────────────────────────────
+// ── is_last_live_thread ─────────────────────────────────────────────────
 
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     scheduler::with_procs_ro(|pl_vec| {
@@ -56,7 +56,7 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     })
 }
 
-// ── ns_exit ───────────────────────────────────────────────────────────
+// ── ns_exit ──────────────────────────────────────────────────────
 //
 // Called only when the last live thread in a thread group exits.
 // Tears down any private (non-INIT_NS) namespaces that have no other
@@ -65,46 +65,43 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
 fn ns_exit(pid: usize) {
     use crate::proc::namespace::INIT_NS;
 
-    // Collect the ns ids from this process's NsSet.
     let ns = match scheduler::with_proc(pid, |p| p.ns.clone()) {
         Some(n) => n,
         None    => return,
     };
 
-    // ── Net namespace ────────────────────────────────────────────────────
-    // Destroy the net ns if it is private and no other process shares it.
-    if ns.net != INIT_NS {
-        let shared = scheduler::with_procs_ro(|pl_vec| {
+    // Helper: returns true if any *other* live process shares the given NsId
+    // for the field identified by `getter`.
+    let shared_by_other = |ns_id: crate::proc::namespace::NsId,
+                            getter: fn(&crate::proc::process::Process)
+                                -> crate::proc::namespace::NsId| -> bool {
+        scheduler::with_procs_ro(|pl_vec| {
             pl_vec.iter().any(|pl| {
                 pl.pid as usize != pid
                     && pl.load_state() != State::Zombie
-                    && scheduler::with_proc(pl.pid as usize, |p| p.ns.net)
-                           .unwrap_or(INIT_NS) == ns.net
+                    && scheduler::with_proc(pl.pid as usize, getter)
+                           .unwrap_or(INIT_NS) == ns_id
             })
-        });
-        if !shared {
-            crate::proc::net_ns::destroy_net_ns(ns.net);
-        }
+        })
+    };
+
+    // ── Net namespace ────────────────────────────────────────────────────────
+    if ns.net != INIT_NS && !shared_by_other(ns.net, |p| p.ns.net) {
+        crate::proc::net_ns::destroy_net_ns(ns.net);
     }
 
-    // ── Mount namespace ──────────────────────────────────────────────────
-    // Drop the private mount table snapshot if no other process uses it.
-    if ns.mnt != INIT_NS {
-        let shared = scheduler::with_procs_ro(|pl_vec| {
-            pl_vec.iter().any(|pl| {
-                pl.pid as usize != pid
-                    && pl.load_state() != State::Zombie
-                    && scheduler::with_proc(pl.pid as usize, |p| p.ns.mnt)
-                           .unwrap_or(INIT_NS) == ns.mnt
-            })
-        });
-        if !shared {
-            crate::proc::namespace::drop_mount_ns(ns.mnt);
-        }
+    // ── Mount namespace ───────────────────────────────────────────────────────
+    if ns.mnt != INIT_NS && !shared_by_other(ns.mnt, |p| p.ns.mnt) {
+        crate::proc::namespace::drop_mount_ns(ns.mnt);
+    }
+
+    // ── UTS namespace ────────────────────────────────────────────────────────
+    if ns.uts != INIT_NS && !shared_by_other(ns.uts, |p| p.ns.uts) {
+        crate::proc::namespace::drop_uts_ns(ns.uts);
     }
 }
 
-// ── zombify ───────────────────────────────────────────────────────────
+// ── zombify ────────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
     let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p, pl| {
@@ -119,7 +116,7 @@ fn zombify(pid: usize, code: i32) -> usize {
     vfork_parent
 }
 
-// ── do_exit ───────────────────────────────────────────────────────────
+// ── do_exit ────────────────────────────────────────────────────────────
 
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
@@ -138,10 +135,7 @@ pub fn do_exit(pid: usize, code: i32) {
     if last {
         let user_satp = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
         free_address_space(pid, user_satp);
-        // Drain group-directed pending signals so the TGID entry doesn't leak.
         crate::proc::signal::group_pending_clear(tgid);
-        // Tear down private namespaces (net ns interface tables, private mount
-        // snapshots) that are no longer referenced by any other live process.
         ns_exit(pid);
     }
 
@@ -153,20 +147,19 @@ pub fn do_exit(pid: usize, code: i32) {
     loop { <Arch as Cpu>::halt(); }
 }
 
-// ── sys_exit [NR 60] ────────────────────────────────────────────────────
+// ── sys_exit [NR 60] ────────────────────────────────────────────────────────
 
 pub fn sys_exit(status: i32) -> isize {
     do_exit(scheduler::current_pid(), status);
     0
 }
 
-// ── sys_exit_group [NR 231] ───────────────────────────────────────────────
+// ── sys_exit_group [NR 231] ───────────────────────────────────────────────────
 
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
-    // Collect sibling pids — only .pid/.tgid needed, no inner lock.
     let siblings: alloc::vec::Vec<usize> = scheduler::with_procs_ro(|pl_vec| {
         pl_vec.iter()
             .filter(|pl| pl.pid as usize != pid && pl.tgid as usize == tgid)
@@ -182,15 +175,11 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::syscall::proc_name_clear(sibling);
         crate::proc::futex::futex_clear_pid(sibling);
         crate::fs::process_fd::proc_fd_free(sibling);
-        // zombify sets exit_code = encode_exit(status) before notify_exit reads it.
         let vfork_parent = zombify(sibling, status);
         if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
         wait::notify_exit(sibling);
     }
 
-    // do_exit handles group_pending_clear + ns_exit for the tgid (last live
-    // thread path — after all siblings have been zombified above, pid is now
-    // the last live thread so is_last_live_thread will return true).
     do_exit(pid, status);
     0
 }

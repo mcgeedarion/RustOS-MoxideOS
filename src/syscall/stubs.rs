@@ -8,12 +8,7 @@ use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::arch::{Arch, api::{Paging, PageFlags}};
 
-// ── NR 18  pwrite64 ─────────────────────────────────────────────────────────
-//
-// Delegate to io_syscalls::sys_pwrite64 which owns the correct
-// proc_fd_backing translation, RLIMIT_FSIZE check, and direct vfs::pwrite
-// call.  The old seek-save/restore pattern here was both racy on SMP and
-// operated on the raw user fd number instead of the backing fd.
+// ── NR 18  pwrite64 ──────────────────────────────────────────────────────
 
 fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     crate::fs::io_syscalls::sys_pwrite64(fd, buf_va, count, offset)
@@ -21,7 +16,6 @@ fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isi
 
 // ── NR 19  readv ────────────────────────────────────────────────────────────────
 
-// Intentionally private to this include!() scope.
 #[allow(dead_code)]
 const IOV_STACK_BUF: usize = 4096;
 
@@ -80,14 +74,14 @@ fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     total
 }
 
-// ── NR 24  sched_yield ───────────────────────────────────────────────────────
+// ── NR 24  sched_yield ─────────────────────────────────────────────────────
 
 fn sys_sched_yield_impl() -> isize {
     crate::proc::scheduler::schedule();
     0
 }
 
-// ── NR 25  mremap ──────────────────────────────────────────────────────────────
+// ── NR 25  mremap ────────────────────────────────────────────────────────────
 
 const MREMAP_MAYMOVE:   usize = 1;
 const MREMAP_FIXED:     usize = 2;
@@ -259,7 +253,7 @@ fn prot_to_flags_mremap(prot: u32) -> PageFlags {
     f
 }
 
-// ── NR 28  madvise ─────────────────────────────────────────────────────────────
+// ── NR 28  madvise ────────────────────────────────────────────────────────────
 
 fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
     const PAGE: usize = 4096;
@@ -299,7 +293,7 @@ fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
     }
 }
 
-// ── NR 40  sendfile ─────────────────────────────────────────────────────────────
+// ── NR 40  sendfile ────────────────────────────────────────────────────────────
 
 fn sys_sendfile_impl(out_fd: usize, in_fd: usize, offset_va: usize, count: usize) -> isize {
     if count == 0 { return 0; }
@@ -338,25 +332,17 @@ fn sys_vfork_impl() -> isize {
     crate::proc::fork_syscall::sys_fork()
 }
 
-// ── NR 62  kill ─────────────────────────────────────────────────────────────────
-//
-// Routing table (POSIX §2.7):
-//   pid > 0  → send to process group of pid   (group-directed)
-//   pid == 0 → send to the caller's own group (group-directed)
-//   pid == -1 → broadcast to all processes     (not yet: -ESRCH)
-//   pid < -1 → send to process group |pid|    (group-directed)
+// ── NR 62  kill ────────────────────────────────────────────────────────────────
 
 fn sys_kill_impl(pid: isize, sig: u32) -> isize {
     if sig == 0  { return 0; }
     if sig > 64  { return -22; }
     match pid {
         p if p > 0 => {
-            // Group-directed to target tgid.
             crate::proc::signal::send_signal_group(p as usize, sig as i32);
             0
         }
         0 => {
-            // Group-directed to the caller's own process group.
             let tgid = crate::proc::thread::tgid_of(
                 crate::proc::scheduler::current_pid()
             );
@@ -364,21 +350,28 @@ fn sys_kill_impl(pid: isize, sig: u32) -> isize {
             crate::proc::signal::send_signal_group(tgid, sig as i32);
             0
         }
-        -1 => {
-            // Broadcast not yet implemented.
-            -3 // ESRCH
-        }
-        p => {
-            // pid < -1: send to process group |pid|.
+        -1 => -3, // broadcast not yet implemented
+        p  => {
             crate::proc::signal::send_signal_group((-p) as usize, sig as i32);
             0
         }
     }
 }
 
-// ── NR 63  uname ───────────────────────────────────────────────────────────────
+// ── NR 63  uname ────────────────────────────────────────────────────────────────
+//
+// struct utsname { sysname[65], nodename[65], release[65],
+//                  version[65], machine[65], domainname[65] }
+//
+// nodename (field 1) is read from the calling process's UTS namespace
+// so that containerised processes see the hostname set via sethostname(2).
 
 fn sys_uname_impl(buf_va: usize) -> isize {
+    let pid = crate::proc::scheduler::current_pid();
+    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
+        .unwrap_or(crate::proc::namespace::INIT_NS);
+    let nodename = crate::proc::namespace::uts_hostname(ns);
+
     let mut kbuf = [0u8; 390];
     fn fill(kbuf: &mut [u8; 390], field: usize, s: &[u8]) {
         let off = field * 65;
@@ -386,7 +379,7 @@ fn sys_uname_impl(buf_va: usize) -> isize {
         kbuf[off..off + n].copy_from_slice(&s[..n]);
     }
     fill(&mut kbuf, 0, b"Linux");
-    fill(&mut kbuf, 1, b"rustos");
+    fill(&mut kbuf, 1, nodename.as_bytes());
     fill(&mut kbuf, 2, b"6.1.0-rustos");
     fill(&mut kbuf, 3, b"#1 SMP");
     fill(&mut kbuf, 4, b"x86_64");
@@ -395,12 +388,24 @@ fn sys_uname_impl(buf_va: usize) -> isize {
     0
 }
 
-// ── NR 74/75  fsync / fdatasync ──────────────────────────────────────────────
-// Intentional no-op: rustos has no write-back cache to flush.
+// ── NR 170/171  sethostname / setdomainname ─────────────────────────────────
+//
+// Forwarded to namespace.rs so the change is scoped to the caller's
+// UTS namespace rather than being a global variable.
+
+fn sys_sethostname_impl(name_va: usize, len: usize) -> isize {
+    crate::proc::namespace::sys_sethostname(name_va, len)
+}
+
+fn sys_setdomainname_impl(name_va: usize, len: usize) -> isize {
+    crate::proc::namespace::sys_setdomainname(name_va, len)
+}
+
+// ── NR 74/75  fsync / fdatasync ───────────────────────────────────────────────
 #[allow(dead_code)]
 fn sys_fsync_impl(_fd: usize) -> isize { 0 }
 
-// ── NR 76/77  truncate / ftruncate ────────────────────────────────────────────
+// ── NR 76/77  truncate / ftruncate ───────────────────────────────────────────────
 
 fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
     let path  = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
@@ -416,7 +421,7 @@ fn sys_ftruncate_impl(fd: usize, length: i64) -> isize {
     0
 }
 
-// ── NR 81  fchdir ─────────────────────────────────────────────────────────────
+// ── NR 81  fchdir ──────────────────────────────────────────────────────────────
 
 fn sys_fchdir_impl(fd: usize) -> isize {
     if let Some(path) = crate::fs::vfs::fd_to_path(fd) {
@@ -424,14 +429,14 @@ fn sys_fchdir_impl(fd: usize) -> isize {
     } else { -9 }
 }
 
-// ── NR 84  rmdir ──────────────────────────────────────────────────────────────
+// ── NR 84  rmdir ───────────────────────────────────────────────────────────────
 
 fn sys_rmdir_impl(path_va: usize) -> isize {
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
     crate::fs::vfs::unlink(&path)
 }
 
-// ── NR 85  creat ─────────────────────────────────────────────────────────────
+// ── NR 85  creat ──────────────────────────────────────────────────────────────
 
 fn sys_creat_impl(path_va: usize, _mode: u32) -> isize {
     let flags = crate::fs::vfs::O_CREAT | crate::fs::vfs::O_WRONLY | crate::fs::vfs::O_TRUNC;
@@ -442,7 +447,7 @@ fn sys_creat_impl(path_va: usize, _mode: u32) -> isize {
     }
 }
 
-// ── NR 86/88  link / symlink ──────────────────────────────────────────────────
+// ── NR 86/88  link / symlink ──────────────────────────────────────────────────────
 
 fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
     let old = match read_cstr_safe(old_va) { Some(s) => s, None => return -14 };
@@ -462,7 +467,7 @@ fn sys_symlink_impl(target_va: usize, link_va: usize) -> isize {
     0
 }
 
-// ── NR 89  readlink ──────────────────────────────────────────────────────────
+// ── NR 89  readlink ────────────────────────────────────────────────────────────
 
 fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     if bufsiz == 0 { return -22; }
@@ -485,7 +490,7 @@ fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     }
 }
 
-// ── NR 95  umask ─────────────────────────────────────────────────────────────
+// ── NR 95  umask ──────────────────────────────────────────────────────────────
 
 use core::sync::atomic::{AtomicU32, Ordering};
 static UMASK: AtomicU32 = AtomicU32::new(0o022);
@@ -494,7 +499,7 @@ fn sys_umask_impl(mask: u32) -> isize {
     UMASK.swap(mask & 0o777, Ordering::Relaxed) as isize
 }
 
-// ── NR 96  gettimeofday ──────────────────────────────────────────────────────────
+// ── NR 96  gettimeofday ───────────────────────────────────────────────────────────
 
 fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     if tv_va == 0 { return 0; }
@@ -508,7 +513,7 @@ fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     0
 }
 
-// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ─────────────────────────
+// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ───────────────────────────────
 
 fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
     let (soft, hard) = crate::proc::rlimit::getrlimit_for(0, resource as usize);
@@ -546,7 +551,7 @@ fn sys_prlimit64_impl(pid: usize, resource: u32, new_va: usize, old_va: usize) -
     0
 }
 
-// ── NR 98  getrusage ────────────────────────────────────────────────────────────
+// ── NR 98  getrusage ──────────────────────────────────────────────────────────────
 
 fn sys_getrusage_impl(who: i32, buf_va: usize) -> isize {
     let mut kbuf = [0u8; 144];
@@ -563,10 +568,8 @@ fn sys_getrusage_impl(who: i32, buf_va: usize) -> isize {
     0
 }
 
-// ── NR 99  sysinfo ─────────────────────────────────────────────────────────────
+// ── NR 99  sysinfo ──────────────────────────────────────────────────────────────
 
-// Private to this include!() scope; fields are written via unsafe transmute
-// into the user buffer, so rustc sees them as "never read" even though they are.
 #[repr(C)]
 #[allow(dead_code)]
 struct SysInfo {
@@ -664,8 +667,6 @@ fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
 
 // ── NR 137/138  statfs / fstatfs ───────────────────────────────────────────────
 
-// Same as SysInfo: fields are written out via pointer cast; rustc cannot see
-// that they are "read" and would warn without this suppression.
 #[repr(C)]
 #[allow(dead_code)]
 struct StatFs {
@@ -701,7 +702,6 @@ fn sys_statfs_impl(_path_va: usize, buf_va: usize) -> isize { fill_statfs(buf_va
 fn sys_fstatfs_impl(_fd: usize,    buf_va: usize) -> isize { fill_statfs(buf_va) }
 
 // ── NR 162  sync ─────────────────────────────────────────────────────────────
-// Intentional no-op: no write-back cache to flush.
 #[allow(dead_code)]
 fn sys_sync_impl() -> isize { 0 }
 
@@ -750,7 +750,7 @@ fn sys_time_impl(t_va: usize) -> isize {
     secs as isize
 }
 
-// ── NR 203/204  sched_setaffinity / sched_getaffinity ───────────────────────────
+// ── NR 203/204  sched_setaffinity / sched_getaffinity ───────────────────────────────
 
 fn sys_sched_getaffinity_impl(_pid: usize, cpusetsize: usize, mask_va: usize) -> isize {
     if cpusetsize == 0 { return -14; }
@@ -762,7 +762,7 @@ fn sys_sched_getaffinity_impl(_pid: usize, cpusetsize: usize, mask_va: usize) ->
 }
 fn sys_sched_setaffinity_impl(_pid: usize, _sz: usize, _mask: usize) -> isize { 0 }
 
-// ── NR 230  clock_getres ──────────────────────────────────────────────────────────
+// ── NR 230  clock_getres ────────────────────────────────────────────────────────────
 
 fn sys_clock_getres_impl(_clkid: u32, res_va: usize) -> isize {
     if res_va != 0 {
@@ -780,7 +780,7 @@ fn sys_waitid_impl(which: i32, id: i32, _infop: usize, options: u32) -> isize {
     crate::proc::wait::sys_waitpid(pid, 0, options)
 }
 
-// ── NR 257-267  *at variants ───────────────────────────────────────────────────────
+// ── NR 257-267  *at variants ────────────────────────────────────────────────────────
 
 const AT_FDCWD: i32 = -100;
 
@@ -829,7 +829,7 @@ fn sys_renameat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize) -
     crate::fs::stat_syscalls::sys_rename_str(&old, &new)
 }
 
-// ── NR 267  readlinkat ───────────────────────────────────────────────────────
+// ── NR 267  readlinkat ──────────────────────────────────────────────────────────
 
 fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     if bufsiz == 0 { return -22; }
@@ -852,11 +852,11 @@ fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize)
     }
 }
 
-// ── NR 280  utimensat ─────────────────────────────────────────────────────────
+// ── NR 280  utimensat ───────────────────────────────────────────────────────────
 
 fn sys_utimensat_impl(_dirfd: i32, _path_va: usize, _times_va: usize, _flags: i32) -> isize { 0 }
 
-// ── NR 318  getrandom ────────────────────────────────────────────────────────
+// ── NR 318  getrandom ──────────────────────────────────────────────────────────
 
 const GETRANDOM_MAX: usize = 4096;
 
@@ -873,7 +873,7 @@ fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
     n as isize
 }
 
-// ── NR 319  memfd_create ─────────────────────────────────────────────────────
+// ── NR 319  memfd_create ───────────────────────────────────────────────────────────
 
 const MFD_CLOEXEC:       u32 = 0x0001;
 const MFD_ALLOW_SEALING: u32 = 0x0002;
@@ -903,10 +903,6 @@ fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
 }
 
 // ── Misc stubs ────────────────────────────────────────────────────────────────
-// All stubs below are intentional no-ops for the single-user root kernel.
-// Permission bits, ownership, locking, mounting, and syslog are unenforceable
-// until multi-user support lands. Each is suppressed individually so that a
-// NEW no-op added here still needs an explicit #[allow(dead_code)].
 
 #[allow(dead_code)] fn sys_chmod_impl(_path_va: usize, _mode: u32) -> isize { 0 }
 #[allow(dead_code)] fn sys_fchmod_impl(_fd: usize, _mode: u32) -> isize { 0 }
