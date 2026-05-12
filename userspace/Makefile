@@ -9,6 +9,11 @@
 # Usage:
 #   make              # build x86_64 binaries (default)
 #   make ARCH=riscv64 # build RISC-V binaries
+#
+# Output layout (matches build_initramfs.sh staging expectations):
+#   build/<arch>/init               → staged as /init        (PID 1)
+#   build/<arch>/hello              → staged as /bin/hello
+#   build/<arch>/rustos-compositor  → staged as /usr/bin/rustos-compositor
 
 ARCH       ?= x86_64
 BUILD_DIR  := build/$(ARCH)
@@ -56,13 +61,22 @@ wayland: $(BUILD_DIR)
 	      -o $(BUILD_DIR)/rustos-compositor \
 	      wayland/compositor.c
 
-# Install all built binaries into a staging rootfs tree.
+# ── Install ────────────────────────────────────────────────────────────────
+#
+# Copies built binaries into a staging rootfs tree whose layout matches
+# what build_initramfs.sh expects when it packs the CPIO archive:
+#
+#   DESTDIR/
+#     init                        ← exec'd directly as PID 1 by the kernel
+#     bin/hello
+#     usr/bin/rustos-compositor   ← spawned by init as PID 2
+#
 # Usage: make install DESTDIR=path/to/initramfs/root
 DESTDIR ?= $(BUILD_DIR)/rootfs
 install: all
-	mkdir -p $(DESTDIR)/usr/bin $(DESTDIR)/bin $(DESTDIR)/sbin
-	cp $(BUILD_DIR)/init                $(DESTDIR)/sbin/init
-	cp $(BUILD_DIR)/hello               $(DESTDIR)/usr/bin/hello
+	mkdir -p $(DESTDIR)/bin $(DESTDIR)/usr/bin
+	cp $(BUILD_DIR)/init                $(DESTDIR)/init
+	cp $(BUILD_DIR)/hello               $(DESTDIR)/bin/hello
 	cp $(BUILD_DIR)/rustos-compositor   $(DESTDIR)/usr/bin/rustos-compositor
 
 clean:

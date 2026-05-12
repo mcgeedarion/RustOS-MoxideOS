@@ -67,7 +67,7 @@
 #define INTF_SEAT         "wl_seat"
 #define INTF_OUTPUT       "wl_output"
 
-/* ── DRM helpers ────────────────────────────────────────────────────────── */
+/* ── DRM state ──────────────────────────────────────────────────────────── */
 
 static int drm_fd    = -1;
 static int input_fd  = -1;
@@ -78,6 +78,7 @@ static uint32_t screen_width  = 0;
 static uint32_t screen_height = 0;
 static uint32_t screen_stride = 0;
 static uint32_t primary_fb_id = 0;
+static uint32_t primary_crtc_id = 0;  /* saved from drm_setup(); used by drm_flip() */
 static void    *primary_map   = NULL;  /* mmap of the primary dumb buffer */
 
 /* DRM dumb buffer for the compositor's back-buffer */
@@ -86,9 +87,11 @@ static uint64_t back_buf_size   = 0;
 static void    *back_buf_map    = NULL;
 
 /*
- * drm_get_resources: query the connected CRTC / connector and learn the
- * current display resolution.  We use DRM_IOCTL_MODE_GETRESOURCES and
+ * drm_setup: query the connected CRTC / connector and learn the current
+ * display resolution.  Uses DRM_IOCTL_MODE_GETRESOURCES and
  * DRM_IOCTL_MODE_GETCONNECTOR (Linux-compatible ioctls).
+ *
+ * Saves the CRTC id into primary_crtc_id for use by drm_flip().
  */
 static int drm_setup(void) {
     struct drm_mode_card_res res = {0};
@@ -118,6 +121,9 @@ static int drm_setup(void) {
     screen_width  = modes[0].hdisplay;
     screen_height = modes[0].vdisplay;
     screen_stride = screen_width * 4;  /* 32-bit ARGB */
+
+    /* Save the CRTC id so drm_flip() doesn't have to hardcode it */
+    primary_crtc_id = crtc_ids[0];
 
     /* Allocate the primary dumb buffer */
     struct drm_mode_create_dumb cd = {
@@ -153,7 +159,7 @@ static int drm_setup(void) {
 
     /* Program the CRTC */
     struct drm_mode_crtc crtc = {
-        .crtc_id      = crtc_ids[0],
+        .crtc_id      = primary_crtc_id,
         .fb_id        = primary_fb_id,
         .set_connectors_ptr = (uintptr_t)&connector_ids[0],
         .count_connectors   = 1,
@@ -164,10 +170,11 @@ static int drm_setup(void) {
     return 0;
 }
 
-/* Flip the back-buffer to the display via DRM page-flip */
+/* Flip the back-buffer to the display via DRM page-flip.
+ * Uses primary_crtc_id saved by drm_setup() — never hardcoded. */
 static void drm_flip(void) {
     struct drm_mode_crtc_page_flip pf = {
-        .crtc_id   = 1,      /* CRTC_ID = 1 (matches kernel drm.rs) */
+        .crtc_id   = primary_crtc_id,
         .fb_id     = primary_fb_id,
         .flags     = DRM_MODE_PAGE_FLIP_EVENT,
         .user_data = 0,
@@ -239,47 +246,39 @@ static int    n_clients = 0;
 
 /* ── Protocol dispatch ──────────────────────────────────────────────────── */
 
+/*
+ * registry_global_send — emit one wl_registry.global event.
+ *
+ * Encodes the (name, interface_string, version) triple into the Wayland
+ * wire format and sends it to the client.  All globals are announced via
+ * this helper so adding a new global (e.g. xdg_wm_base) only requires
+ * one call site instead of 15 lines of manual memcpy.
+ *
+ * Wire layout of the payload:
+ *   [0..3]   uint32  name          — registry numeric name
+ *   [4..7]   uint32  intf_len      — byte length of interface string (no NUL)
+ *   [8..N]   char[]  intf          — interface string, padded to 4-byte align
+ *   [N..N+3] uint32  version
+ */
+static void registry_global_send(Client *c, uint32_t name,
+                                  const char *intf, uint32_t version) {
+    uint8_t  ev[256];
+    size_t   evsz    = 0;
+    uint32_t ilen    = (uint32_t)strlen(intf);
+    uint32_t ipadded = (ilen + 3) & ~3u;  /* round up to 4-byte boundary */
+
+    memcpy(ev + evsz, &name,    4); evsz += 4;
+    memcpy(ev + evsz, &ilen,    4); evsz += 4;
+    memcpy(ev + evsz,  intf, ipadded); evsz += ipadded;
+    memcpy(ev + evsz, &version, 4); evsz += 4;
+
+    wl_send(c->fd, c->registry_id, 0 /* wl_registry.global */, ev, (uint16_t)evsz);
+}
+
 static void send_registry_globals(Client *c) {
-    /* wl_registry.global(name, interface, version) */
-    uint32_t name; uint8_t ev[256]; size_t evsz;
-    /* wl_compositor */
-    name = 1;
-    const char *ci = INTF_COMPOSITOR;
-    uint32_t cilen = (uint32_t)strlen(ci);
-    uint32_t ciplen = (cilen + 3) & ~3u; /* 4-byte aligned */
-    uint32_t ver = 5;
-    evsz = 0;
-    memcpy(ev+evsz, &name,   4); evsz+=4;
-    memcpy(ev+evsz, &cilen,  4); evsz+=4;
-    memcpy(ev+evsz, ci,  ciplen); evsz+=ciplen;
-    memcpy(ev+evsz, &ver,    4); evsz+=4;
-    wl_send(c->fd, c->registry_id, 0 /*global*/, ev, (uint16_t)evsz);
-
-    /* wl_shm */
-    name = 2;
-    const char *si = INTF_SHM;
-    uint32_t silen = (uint32_t)strlen(si);
-    uint32_t siplen = (silen + 3) & ~3u;
-    ver = 1;
-    evsz = 0;
-    memcpy(ev+evsz, &name,   4); evsz+=4;
-    memcpy(ev+evsz, &silen,  4); evsz+=4;
-    memcpy(ev+evsz, si, siplen); evsz+=siplen;
-    memcpy(ev+evsz, &ver,    4); evsz+=4;
-    wl_send(c->fd, c->registry_id, 0, ev, (uint16_t)evsz);
-
-    /* wl_seat */
-    name = 3;
-    const char *sei = INTF_SEAT;
-    uint32_t seilen = (uint32_t)strlen(sei);
-    uint32_t seiplen = (seilen + 3) & ~3u;
-    ver = 7;
-    evsz = 0;
-    memcpy(ev+evsz, &name,    4); evsz+=4;
-    memcpy(ev+evsz, &seilen,  4); evsz+=4;
-    memcpy(ev+evsz, sei, seiplen); evsz+=seiplen;
-    memcpy(ev+evsz, &ver,     4); evsz+=4;
-    wl_send(c->fd, c->registry_id, 0, ev, (uint16_t)evsz);
+    registry_global_send(c, 1, INTF_COMPOSITOR, 5);
+    registry_global_send(c, 2, INTF_SHM,        1);
+    registry_global_send(c, 3, INTF_SEAT,       7);
 }
 
 static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
@@ -334,6 +333,7 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             c->shm_pool_size = (size_t)shm_size;
             c->shm_pool      = mmap(NULL, c->shm_pool_size,
                                     PROT_READ, MAP_SHARED, shm_fd, 0);
+            (void)pool_id;
         }
         return;
     }
@@ -478,16 +478,23 @@ static void forward_input(void) {
 /* ── seccomp filter ─────────────────────────────────────────────────────── */
 
 /*
- * Install a seccomp-BPF whitelist that allows only the syscalls this
- * compositor needs.  Any other syscall → SECCOMP_RET_KILL_PROCESS.
+ * install_seccomp — whitelist the syscalls this compositor needs.
+ *
+ * Called AFTER all fds are opened and the DRM CRTC is programmed, so we
+ * no longer need open(), socket(), bind(), or listen().
  *
  * Allowed syscalls:
  *   read, write, close, mmap, munmap, ioctl, recvmsg, sendmsg,
- *   epoll_create1, epoll_ctl, epoll_wait, accept4,
+ *   clock_gettime, epoll_create1, epoll_ctl, epoll_wait, accept4,
  *   exit, exit_group, rt_sigreturn
  *
- * This is called AFTER all fds are opened and the DRM CRTC is
- * programmed, so we no longer need open(), socket(), bind(), listen().
+ * Any other syscall → SECCOMP_RET_KILL_PROCESS.
+ *
+ * NOTE: log_msg() (write + strlen) is safe to call after this point.
+ * strlen() is a pure memory operation, not a syscall — it will not
+ * trigger the seccomp filter.  Do NOT add calls to any other libc
+ * function after install_seccomp() without first verifying that it
+ * issues no additional syscalls beyond the whitelist above.
  */
 static void install_seccomp(void) {
     /* Architecture check: bail if not x86-64 to avoid breaking RISC-V */
@@ -539,6 +546,12 @@ static void install_seccomp(void) {
 
 /* ── Main event loop ────────────────────────────────────────────────────── */
 
+/*
+ * log_msg — write a message to stdout.
+ *
+ * Safe to call both before and after install_seccomp(): strlen() and
+ * write() are both on the seccomp whitelist / are not syscalls.
+ */
 static void log_msg(const char *s) {
     write(1, s, strlen(s));
     write(1, "\n", 1);
@@ -619,7 +632,6 @@ int main(void) {
                     ev.events  = EPOLLIN | EPOLLET;
                     ev.data.fd = cfd;
                     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &ev);
-                    /* Send wl_display.delete_id synthetic to complete handshake */
                 }
                 continue;
             }

@@ -9,7 +9,7 @@
 #   make x86_64    — build libmusl.a + libc.so for x86_64
 #   make riscv64   — build for riscv64
 #   make all       — both arches
-#   make sysroot   — install headers + libs into sysroot/
+#   make sysroot   — install musl headers into sysroot/<arch>/include/
 #   make clean
 
 MUSL_VERSION   ?= 1.2.5
@@ -71,10 +71,20 @@ riscv64: $(MUSL_SRC)/.patched
 
 all: x86_64 riscv64
 
-# ── Install headers into kernel sysroot ────────────────────────────────────
+# ── Install headers into sysroot ───────────────────────────────────────────
+#
+# Copies the musl public headers from the build tree (produced by
+# 'make install-headers') into sysroot/<arch>/include/rustos/ so the
+# kernel and other userspace programs can #include <rustos/...>.
+#
+# The source is the per-arch build tree, NOT $(TOPDIR)/sysroot/include
+# (which is the destination — copying a directory into itself would
+# produce an infinite recursive tree on some cp implementations).
 sysroot: all
-	cp -r $(TOPDIR)/sysroot/include $(SYSROOT)/x86_64/include/rustos
-	cp -r $(TOPDIR)/sysroot/include $(SYSROOT)/riscv64/include/rustos
+	mkdir -p $(SYSROOT)/x86_64/include/rustos
+	mkdir -p $(SYSROOT)/riscv64/include/rustos
+	cp -r $(BUILD_X86)/include/.  $(SYSROOT)/x86_64/include/rustos/
+	cp -r $(BUILD_RV64)/include/. $(SYSROOT)/riscv64/include/rustos/
 
 clean:
 	rm -rf $(BUILD_X86) $(BUILD_RV64) $(MUSL_SRC) $(MUSL_TARBALL)
