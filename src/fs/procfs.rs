@@ -470,7 +470,12 @@ fn gen_fd_dir(pid: usize) -> Vec<u8> {
 
 // ─── open helper ─────────────────────────────────────────────────────────────
 
-pub fn procfs_open(path: &str) -> Option<usize> {
+/// Open a procfs path and return a synthetic fd number, or a negative errno.
+///
+/// The `_flags` parameter is accepted to match the call-site in
+/// `process_fd::proc_fd_open` which passes the raw `flags` word alongside the
+/// path.  Procfs files are always readable; we ignore write/create flags.
+pub fn procfs_open(path: &str, _flags: u32) -> isize {
     // /proc/<pid>/ns/<name>: open returns a real namespace fd (NSFD_FD_BASE
     // range) so that the caller can pass it directly to setns(2).
     // We also seed a procfs content fd so read() returns the symlink string.
@@ -482,7 +487,7 @@ pub fn procfs_open(path: &str) -> Option<usize> {
         if NS_NAMES.contains(&name) {
             // Allocate the namespace fd via namespace module.
             let ns_fd = crate::proc::namespace::ns_fd_open(tpid, name);
-            if ns_fd < 0 { return None; }
+            if ns_fd < 0 { return ns_fd; }
             // Also stash content so read() works on the same fd number.
             // Content = the symlink target string.
             if let Some(ns_id) = crate::proc::namespace::ns_id_of(tpid, name) {
@@ -490,14 +495,18 @@ pub fn procfs_open(path: &str) -> Option<usize> {
                     .into_bytes();
                 PROCFS_FDS.lock().insert(ns_fd as usize, ProcFd { content, offset: 0 });
             }
-            return Some(ns_fd as usize);
+            return ns_fd;
         }
-        return None;
+        return -2; // ENOENT — unknown ns name
     }
-    let content = generate(path)?;
-    let fdno = next_procfs_fd();
-    PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0 });
-    Some(fdno)
+    match generate(path) {
+        Some(content) => {
+            let fdno = next_procfs_fd();
+            PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0 });
+            fdno as isize
+        }
+        None => -2, // ENOENT
+    }
 }
 
 fn next_procfs_fd() -> usize {

@@ -120,6 +120,17 @@ pub fn create_net_ns(ns_id: NsId) {
     tbl.entries.insert(ns_id, NetNs::new_with_loopback());
 }
 
+/// Destroy a private net-ns when the last process holding it exits.
+///
+/// Removes the entry from `NET_NS_TABLE`, freeing all registered interfaces.
+/// No-op for `INIT_NS` — the boot namespace is never freed.
+/// Called from `exit::ns_exit` after confirming no other live process shares
+/// the namespace.
+pub fn destroy_net_ns(ns_id: NsId) {
+    if ns_id == INIT_NS { return; }
+    NET_NS_TABLE.lock().entries.remove(&ns_id);
+}
+
 /// Return the current process's net namespace id.
 pub fn current_net_ns() -> NsId {
     let pid = crate::proc::scheduler::current_pid();
