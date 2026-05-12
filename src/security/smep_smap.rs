@@ -1,70 +1,58 @@
-//! SMEP (Supervisor Mode Execution Prevention) and
-//! SMAP (Supervisor Mode Access Prevention) enforcement.
+//! SMEP / SMAP / UMIP enforcement.
 //!
-//! SMEP (CR4.SMEP, bit 20): prevents the CPU from executing code at
-//! user-space virtual addresses while in ring 0.  Any #PF with
-//! PFEC.I/D=fetch and the faulting VA in userspace triggers #GP instead.
-//!
-//! SMAP (CR4.SMAP, bit 21): prevents ring-0 code from *reading or writing*
-//! user-space memory without explicitly setting RFLAGS.AC first (via STAC).
-//! After the access, CLAC clears AC, re-arming the protection.
-//!
-//! This module:
-//!   - Sets CR4.SMEP and CR4.SMAP at boot (and on every AP in `ap_entry`).
-//!   - Provides `stac()` / `clac()` intrinsics used by `src/uaccess.rs`.
-//!   - Hooks the page-fault handler to log SMEP/SMAP violations distinctly.
-//!   - Asserts that SMEP/SMAP remain set on every context switch (debug).
+//! ## C4 fix - UMIP must be gated on CPUID
+//! CR4 bit 11 (UMIP) is reserved on pre-Skylake CPUs and some hypervisors.
+//! Writing a reserved CR4 bit causes a #GP, crashing the kernel at boot.
+//! Fix: cpuid_cr4_features() returns (smep, smap, umip) by checking
+//! CPUID leaf 7, sub-leaf 0, EBX bit 2. enforce() only sets CR4_UMIP
+//! when umip == true.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Set to `true` once SMEP has been confirmed active on the BSP.
 pub static SMEP_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Set to `true` once SMAP has been confirmed active on the BSP.
 pub static SMAP_ENABLED: AtomicBool = AtomicBool::new(false);
 
-// ───── CR4 bit positions ─────────────────────────────────────────────────────────
 pub const CR4_SMEP: u64 = 1 << 20;
 pub const CR4_SMAP: u64 = 1 << 21;
-pub const CR4_UMIP: u64 = 1 <<  11; // User-Mode Instruction Prevention (bonus)
+pub const CR4_UMIP: u64 = 1 << 11;
 
-// ───── Capability probing ──────────────────────────────────────────────────────
-
-/// Returns `(smep_supported, smap_supported)` by probing CPUID leaf 7.
+/// Query CPUID leaf 7, sub-leaf 0 for SMEP (EBX[7]), SMAP (EBX[20]),
+/// and UMIP (EBX[2]).
+///
+/// C4 fix: exposes UMIP so enforce() can gate the CR4 write on the flag.
 #[cfg(target_arch = "x86_64")]
-pub fn cpuid_smep_smap() -> (bool, bool) {
+pub fn cpuid_cr4_features() -> (bool, bool, bool) {
     let ebx: u32;
     unsafe {
         core::arch::asm!(
-            "mov eax, 7",
-            "xor ecx, ecx",
-            "cpuid",
-            out("ebx") ebx,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
+            "mov eax, 7", "xor ecx, ecx", "cpuid",
+            out("ebx") ebx, out("eax") _, out("ecx") _, out("edx") _,
             options(nostack)
         );
     }
-    let smep = (ebx >> 7) & 1 != 0;  // CPUID[7,0].EBX bit 7
-    let smap = (ebx >> 20) & 1 != 0; // CPUID[7,0].EBX bit 20
-    (smep, smap)
+    let smep = (ebx >>  7) & 1 != 0;
+    let umip = (ebx >>  2) & 1 != 0; // C4 fix: was never checked
+    let smap = (ebx >> 20) & 1 != 0;
+    (smep, smap, umip)
 }
 
-// ───── Enforcement init ──────────────────────────────────────────────────────────
+/// Compatibility shim for callers that only need (smep, smap).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn cpuid_smep_smap() -> (bool, bool) {
+    let (s, m, _) = cpuid_cr4_features();
+    (s, m)
+}
 
-/// Enable SMEP, SMAP, and UMIP in CR4 on the current CPU.
-/// Called once on BSP from `security::init()` and once per AP from
-/// `ap_entry()` (via `smep_smap::enforce()`).
+/// Enable SMEP, SMAP, and (if supported) UMIP in CR4.
 ///
 /// # Safety
-/// Must be called with interrupts disabled.  CR4 write serialises the
-/// pipeline so no fence is needed before the function returns.
+/// Must be called with interrupts disabled.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn enforce() {
-    let (has_smep, has_smap) = cpuid_smep_smap();
+    let (has_smep, has_smap, has_umip) = cpuid_cr4_features();
     let mut cr4: u64;
     core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack, preserves_flags));
-
     if has_smep {
         cr4 |= CR4_SMEP;
         SMEP_ENABLED.store(true, Ordering::Relaxed);
@@ -77,29 +65,20 @@ pub unsafe fn enforce() {
     } else {
         log::warn!("smep_smap: CPU does not support SMAP");
     }
-    // UMIP: prevents SGDT/SIDT/SLDT/SMSW/STR from userspace (info leak).
-    cr4 |= CR4_UMIP;
-
+    // C4 fix: only set UMIP when the CPU advertises support.
+    if has_umip {
+        cr4 |= CR4_UMIP;
+        log::info!("smep_smap: UMIP enabled");
+    } else {
+        log::warn!("smep_smap: CPU does not support UMIP - skipping");
+    }
     core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
-    log::info!("smep_smap: CR4 updated: SMEP={} SMAP={} UMIP=1", has_smep, has_smap);
+    log::info!("smep_smap: CR4 updated: SMEP={} SMAP={} UMIP={}", has_smep, has_smap, has_umip);
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub unsafe fn enforce() { /* SMEP/SMAP are x86-64 specific */ }
+pub unsafe fn enforce() {}
 
-// ───── STAC / CLAC wrappers for uaccess ────────────────────────────────────────
-
-/// Set AC flag (RFLAGS.AC = 1): permit supervisor access to user pages.
-/// Must be paired with an immediate `clac()` after the access window.
-///
-/// Usage pattern in uaccess.rs:
-/// ```rust
-/// unsafe {
-///     stac();
-///     let val = ptr::read_volatile(user_ptr);
-///     clac();
-/// }
-/// ```
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn stac() {
@@ -108,7 +87,6 @@ pub unsafe fn stac() {
     }
 }
 
-/// Clear AC flag (RFLAGS.AC = 0): re-arm SMAP protection.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn clac() {
@@ -122,10 +100,6 @@ pub unsafe fn clac() {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)] pub unsafe fn clac() {}
 
-// ───── Context-switch integrity check (debug builds) ───────────────────────────
-
-/// Assert that SMEP and SMAP are still set in CR4.  Called from the
-/// context-switch path in debug builds to catch accidental CR4 corruption.
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 #[inline]
 pub unsafe fn assert_smep_smap_set() {
@@ -143,35 +117,26 @@ pub unsafe fn assert_smep_smap_set() {
 #[inline(always)]
 pub unsafe fn assert_smep_smap_set() {}
 
-// ───── Page-fault classification helper ────────────────────────────────────────
-
-/// Bit definitions for the x86_64 page-fault error code (pushed by CPU).
 pub mod pfec {
     pub const PRESENT:      u64 = 1 << 0;
     pub const WRITE:        u64 = 1 << 1;
-    pub const USER:         u64 = 1 << 2; // fault from CPL=3
+    pub const USER:         u64 = 1 << 2;
     pub const RSVD:         u64 = 1 << 3;
     pub const INSTR_FETCH:  u64 = 1 << 4;
-    pub const PK:           u64 = 1 << 5; // Protection Key violation
+    pub const PK:           u64 = 1 << 5;
     pub const SHADOW_STACK: u64 = 1 << 6;
     pub const SGX:          u64 = 1 << 15;
 }
 
-/// Classify a page-fault error code as SMEP or SMAP violation.
-/// Returns `Some("SMEP")`, `Some("SMAP")`, or `None`.
 pub fn classify_violation(error_code: u64, fault_va: u64) -> Option<&'static str> {
     use pfec::*;
-    // SMEP: supervisor instruction fetch from user page.
     if error_code & (PRESENT | INSTR_FETCH) == (PRESENT | INSTR_FETCH)
-        && error_code & USER == 0
-        && fault_va < 0x0000_8000_0000_0000
+        && error_code & USER == 0 && fault_va < 0x0000_8000_0000_0000
     {
         return Some("SMEP");
     }
-    // SMAP: supervisor data access to user page without AC set.
     if error_code & (PRESENT | USER) == PRESENT
-        && error_code & INSTR_FETCH == 0
-        && fault_va < 0x0000_8000_0000_0000
+        && error_code & INSTR_FETCH == 0 && fault_va < 0x0000_8000_0000_0000
     {
         return Some("SMAP");
     }
