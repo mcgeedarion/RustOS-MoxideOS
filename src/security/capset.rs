@@ -108,12 +108,35 @@ impl CapSet {
         self.effective  &= bit;
     }
 
-    /// execve transformation: effective = permitted & inheritable ∪ (file-caps ∩ permitted)
-    /// Here we approximate with a simple inheritable mask propagation.
+    /// execve capability transformation — RFC 2.6.24+ Linux semantics.
+    ///
+    /// Variables:
+    ///   P  = process set (self)        F  = file capability set
+    ///   P' = new process set after execve
+    ///
+    /// Correct formulae (matches dac.rs and Linux kernel):
+    ///   P'(permitted)   = (F(permitted) & P(permitted))
+    ///                   | (F(inheritable) & P(inheritable))
+    ///   P'(effective)   = P'(permitted) & (F(permitted) | P(inheritable))
+    ///   P'(inheritable) = P(inheritable) & F(inheritable)
+    ///
+    /// The old formula used `(file_permitted | file_inheritable) & self.permitted`
+    /// for new_permitted, which was over-broad: it let F(inheritable) bypass
+    /// the P(inheritable) gate, allowing privilege escalation to capabilities
+    /// the process never held in its own inheritable set.
     pub fn exec_transform(&self, file_permitted: u64, file_inheritable: u64) -> Self {
-        let new_permitted   = (file_permitted | file_inheritable) & self.permitted;
-        let new_effective   = new_permitted & (file_permitted | self.inheritable);
-        let new_inheritable = self.inheritable & file_inheritable;
+        // P1 fix: use the correct two-term formula, aligning with dac.rs.
+        // Previously: new_permitted = (file_permitted | file_inheritable) & self.permitted
+        // That allowed F(inheritable) to grant capabilities not in P(inheritable),
+        // diverging from dac.rs and creating a privilege-escalation race depending
+        // on which call path reached execve first.
+        let proc_permitted   = self.permitted;
+        let proc_inheritable = self.inheritable;
+
+        let new_permitted   = (file_permitted   & proc_permitted)
+                            | (file_inheritable & proc_inheritable);
+        let new_effective   = new_permitted & (file_permitted | proc_inheritable);
+        let new_inheritable = proc_inheritable & file_inheritable;
         CapSet {
             permitted:   new_permitted,
             effective:   new_effective,
