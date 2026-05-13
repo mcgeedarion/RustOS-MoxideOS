@@ -19,8 +19,16 @@
 //!
 //! All physical addresses are identity-mapped (PA == VA) in the kernel.
 //! CR3 holds the PA of the current PML4.
+//!
+//! ## Constants
+//!
+//! All magic numbers (page size, PTE address mask, table entry count) are
+//! imported from [`crate::arch::x86_64::mem_layout::page`].
 
-// ── PTE flag constants (pub so loader/elf64.rs and others can reference them) ──
+use super::mem_layout::page as P;
+
+// ── PTE flag constants ─────────────────────────────────────────────────────
+// (pub so loader/elf64.rs and other consumers can reference them)
 
 pub const PTE_PRESENT:  u64 = 1 << 0;
 pub const PTE_WRITABLE: u64 = 1 << 1;
@@ -28,25 +36,28 @@ pub const PTE_USER:     u64 = 1 << 2;
 pub const PTE_COW:      u64 = 1 << 9;  // software-defined CoW marker
 pub const PTE_NX:       u64 = 1 << 63; // No-Execute (IA32_EFER.NXE must be set)
 
-// Internal aliases for use within this file.
+// Internal shorthands.
 const PRESENT:   u64 = PTE_PRESENT;
 const WRITABLE:  u64 = PTE_WRITABLE;
 const USER:      u64 = PTE_USER;
 const COW_BIT:   u64 = PTE_COW;
-const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000; // bits [51:12]
 
-// ── CR3 helpers ───────────────────────────────────────────────────────────
+/// PTE physical address mask — bits [51:12].
+/// Canonical single definition lives in `mem_layout::page::PTE_ADDR_MASK`.
+const ADDR_MASK: u64 = P::PTE_ADDR_MASK;
+
+// ── CR3 helpers ────────────────────────────────────────────────────────────
 
 /// Read the current CR3 (physical address of the active PML4).
 #[inline]
 pub fn current_cr3() -> usize {
     let cr3: usize;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, nomem)); }
-    cr3 & !0xFFF  // mask off PCID / flags in bits 11:0
+    cr3 & !(P::SIZE - 1) // mask off PCID / flags in bits 11:0
 }
 
 /// Kernel CR3 — the one in use before any process is loaded.
-/// We store it once at boot; here we lazily read CR3 and cache it.
+/// Lazily captured from CR3 on the first call and cached thereafter.
 pub fn kernel_cr3() -> usize {
     static KERNEL_CR3: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
@@ -69,29 +80,28 @@ pub fn invlpg(va: usize) {
     unsafe { core::arch::asm!("invlpg [{v}]", v = in(reg) va, options(nostack)); }
 }
 
-// ── Page-table walk ───────────────────────────────────────────────────────
+// ── Page-table walk ────────────────────────────────────────────────────────
 
-/// Allocate a zeroed 4096-byte table page. Returns PA.
+/// Allocate a zeroed page-table page from the PMM. Returns PA.
 fn alloc_table() -> usize {
     let pa = crate::mm::pmm::alloc_page().expect("pmm: out of pages for page table");
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
+    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, P::SIZE); }
     pa
 }
 
-/// Index a page-table level entry (PA of table + 9-bit index).
+/// Index into a page-table level: `table_pa` + 8-byte entry at `idx`.
 #[inline]
 unsafe fn pte_ptr(table_pa: usize, idx: usize) -> *mut u64 {
     (table_pa + idx * 8) as *mut u64
 }
 
-/// Walk the 4-level page table for `va` under `cr3`.
-/// Returns a mutable pointer to the leaf PT entry, creating
-/// intermediate tables as needed.
+/// Walk the 4-level page table for `va` under `cr3`, creating missing
+/// intermediate tables as needed.  Returns a mutable pointer to the leaf PTE.
 unsafe fn walk_mut(cr3: usize, va: usize) -> *mut u64 {
     let pml4_idx = (va >> 39) & 0x1FF;
     let pdpt_idx = (va >> 30) & 0x1FF;
     let pd_idx   = (va >> 21) & 0x1FF;
-    let pt_idx   = (va >> 12) & 0x1FF;
+    let pt_idx   = (va >> P::SHIFT) & 0x1FF;
 
     let pml4e = pte_ptr(cr3, pml4_idx);
     if *pml4e & PRESENT == 0 {
@@ -117,12 +127,12 @@ unsafe fn walk_mut(cr3: usize, va: usize) -> *mut u64 {
     pte_ptr(pt, pt_idx)
 }
 
-/// Walk read-only; returns None if any level is not present.
+/// Walk read-only; returns `None` if any level is not present.
 unsafe fn walk_ro(cr3: usize, va: usize) -> Option<*mut u64> {
     let pml4_idx = (va >> 39) & 0x1FF;
     let pdpt_idx = (va >> 30) & 0x1FF;
     let pd_idx   = (va >> 21) & 0x1FF;
-    let pt_idx   = (va >> 12) & 0x1FF;
+    let pt_idx   = (va >> P::SHIFT) & 0x1FF;
 
     let pml4e = pte_ptr(cr3, pml4_idx);
     if *pml4e & PRESENT == 0 { return None; }
@@ -139,7 +149,7 @@ unsafe fn walk_ro(cr3: usize, va: usize) -> Option<*mut u64> {
     Some(pte_ptr(pt, pt_idx))
 }
 
-// ── Public API ────────────────────────────────────────────────────────────
+// ── Public API ─────────────────────────────────────────────────────────────
 
 /// Map `va` → `pa` under `cr3` with the given PTE `flags`.
 /// Creates any missing intermediate tables.
@@ -151,7 +161,7 @@ pub fn map_page(cr3: usize, va: usize, pa: usize, flags: u64) {
 }
 
 /// Remove the mapping for `va` in the CURRENT address space.
-/// Returns the physical address that was mapped, or None.
+/// Returns the physical address that was mapped, or `None`.
 pub fn unmap_page(va: usize) -> Option<usize> {
     let cr3 = current_cr3();
     unsafe {
@@ -164,7 +174,7 @@ pub fn unmap_page(va: usize) -> Option<usize> {
     }
 }
 
-/// Return the physical address mapped at `va` in `cr3`, or None.
+/// Return the physical address mapped at `va` in `cr3`, or `None`.
 pub fn virt_to_phys(cr3: usize, va: usize) -> Option<usize> {
     unsafe {
         let pte = walk_ro(cr3, va)?;
@@ -173,7 +183,7 @@ pub fn virt_to_phys(cr3: usize, va: usize) -> Option<usize> {
     }
 }
 
-// ── Copy-on-Write PML4 clone ──────────────────────────────────────────────
+// ── Copy-on-Write PML4 clone ───────────────────────────────────────────────
 
 /// Clone the parent's PML4 for a CoW fork.
 ///
@@ -187,49 +197,48 @@ pub fn virt_to_phys(cr3: usize, va: usize) -> Option<usize> {
 /// Returns the physical address of the new child PML4 (child CR3).
 pub fn clone_pml4_cow(parent_cr3: usize) -> usize {
     let child_cr3 = alloc_table();
+    let entries   = P::TABLE_ENTRIES;
 
     unsafe {
-        for pml4i in 0..512usize {
+        for pml4i in 0..entries {
             let parent_pml4e = pte_ptr(parent_cr3, pml4i);
             if *parent_pml4e & PRESENT == 0 { continue; }
 
-            let child_pdpt = alloc_table();
+            let child_pdpt  = alloc_table();
             let child_pml4e = pte_ptr(child_cr3, pml4i);
             *child_pml4e = child_pdpt as u64 | PRESENT | WRITABLE | USER;
 
             let parent_pdpt = (*parent_pml4e & ADDR_MASK) as usize;
-            for pdpti in 0..512usize {
+            for pdpti in 0..entries {
                 let parent_pdpte = pte_ptr(parent_pdpt, pdpti);
                 if *parent_pdpte & PRESENT == 0 { continue; }
 
-                let child_pd = alloc_table();
+                let child_pd    = alloc_table();
                 let child_pdpte = pte_ptr(child_pdpt, pdpti);
                 *child_pdpte = child_pd as u64 | PRESENT | WRITABLE | USER;
 
                 let parent_pd = (*parent_pdpte & ADDR_MASK) as usize;
-                for pdi in 0..512usize {
+                for pdi in 0..entries {
                     let parent_pde = pte_ptr(parent_pd, pdi);
                     if *parent_pde & PRESENT == 0 { continue; }
 
-                    let child_pt = alloc_table();
+                    let child_pt  = alloc_table();
                     let child_pde = pte_ptr(child_pd, pdi);
                     *child_pde = child_pt as u64 | PRESENT | WRITABLE | USER;
 
                     let parent_pt = (*parent_pde & ADDR_MASK) as usize;
-                    for pti in 0..512usize {
+                    for pti in 0..entries {
                         let parent_pte = pte_ptr(parent_pt, pti);
                         if *parent_pte & PRESENT == 0 { continue; }
 
                         let mut entry = *parent_pte;
-
                         if entry & WRITABLE != 0 {
                             entry = (entry & !WRITABLE) | COW_BIT;
                             *parent_pte = entry;
                             let va = (pml4i << 39) | (pdpti << 30)
-                                   | (pdi << 21)   | (pti << 12);
+                                   | (pdi   << 21) | (pti   << P::SHIFT);
                             invlpg(va);
                         }
-
                         let child_pte = pte_ptr(child_pt, pti);
                         *child_pte = entry;
                     }
