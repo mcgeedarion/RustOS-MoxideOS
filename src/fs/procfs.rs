@@ -14,6 +14,7 @@
 //!   /proc/meminfo           → basic memory figures
 //!   /proc/cpuinfo           → single-CPU stub
 //!   /proc/slabinfo          → slab allocator cache statistics
+//!   /proc/schemes           → one registered scheme name per line (Redox-style)
 //!
 //! ## Debug fds  (/proc/<pid>/mem|regs|ctl)
 //!   Delegated to proc_debug.rs — see that file for details.
@@ -40,7 +41,7 @@ use alloc::collections::BTreeMap;
 /// The 7 canonical namespace names in /proc/<pid>/ns/.
 pub const NS_NAMES: &[&str] = &["mnt", "pid", "net", "uts", "ipc", "user", "time"];
 
-// ─── Synthetic fd table ──────────────────────────────────────────────────────
+// ─── Synthetic fd table ────────────────────────────────────────────────────────────────────
 
 /// Returns true if `fdno` is a procfs synthetic (text-content) fd.
 pub fn is_procfs_fd(fdno: usize) -> bool {
@@ -78,7 +79,7 @@ pub fn procfs_fds() -> Vec<usize> {
     PROCFS_FDS.lock().keys().cloned().collect()
 }
 
-// ─── Namespace inode helpers ─────────────────────────────────────────────────
+// ─── Namespace inode helpers ───────────────────────────────────────────────────────────────
 
 /// True if `path` is a /proc/<pid>/ns or /proc/<pid>/ns/<name> path.
 pub fn procfs_is_ns_path(path: &str) -> bool {
@@ -106,7 +107,7 @@ pub fn procfs_ns_stat(path: &str) -> Option<(u64, u32)> {
     Some((ns_id, 0o120444))
 }
 
-// ─── readlink support ────────────────────────────────────────────────────────
+// ─── readlink support ───────────────────────────────────────────────────────────────────────
 
 pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     let pid = crate::proc::scheduler::current_pid();
@@ -155,7 +156,7 @@ fn copy_link(src: &[u8], buf: &mut [u8]) -> isize {
     n as isize
 }
 
-// ─── Content generators ──────────────────────────────────────────────────────
+// ─── Content generators ───────────────────────────────────────────────────────────────────
 
 fn generate(path: &str) -> Option<Vec<u8>> {
     let pid = crate::proc::scheduler::current_pid();
@@ -244,10 +245,31 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     if p == "/proc/slabinfo" {
         return Some(gen_slabinfo().into_bytes());
     }
+    // ── /proc/schemes ────────────────────────────────────────────────────────────
+    // Redox-inspired: expose all currently-registered scheme names so that
+    // userspace service managers can poll this file to discover which drivers
+    // are live.  Format: one bare scheme name per line (no colon suffix),
+    // alphabetically sorted (BTreeMap order from SchemeTable::list).
+    //
+    // Example contents after blk + net + tcp drivers register:
+    //   blk
+    //   file
+    //   net
+    //   tcp
+    //   tty
+    if p == "/proc/schemes" {
+        let names = crate::fs::scheme_table::SCHEME_TABLE.list();
+        let mut out = String::new();
+        for name in &names {
+            out.push_str(name);
+            out.push('\n');
+        }
+        return Some(out.into_bytes());
+    }
     None
 }
 
-// ─── /proc/slabinfo ──────────────────────────────────────────────────────────
+// ─── /proc/slabinfo ───────────────────────────────────────────────────────────────────
 
 fn gen_slabinfo() -> String {
     use crate::mm::slab::slab_stats;
@@ -277,7 +299,7 @@ fn gen_slabinfo() -> String {
     out
 }
 
-// ─── /proc/<pid>/limits ──────────────────────────────────────────────────────
+// ─── /proc/<pid>/limits ───────────────────────────────────────────────────────────────
 
 const RLIM_INFINITY: u64 = u64::MAX;
 
@@ -316,7 +338,7 @@ fn gen_limits(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/status ──────────────────────────────────────────────────────
+// ─── /proc/<pid>/status ───────────────────────────────────────────────────────────────
 
 fn gen_status(pid: usize) -> String {
     use crate::proc::scheduler::with_proc;
@@ -339,7 +361,7 @@ fn gen_status(pid: usize) -> String {
     )
 }
 
-// ─── /proc/<pid>/stat ────────────────────────────────────────────────────────
+// ─── /proc/<pid>/stat ────────────────────────────────────────────────────────────────────
 
 const USER_HZ: u64 = 100;
 
@@ -404,7 +426,7 @@ fn gen_stat(pid: usize) -> String {
     )
 }
 
-// ─── Shared helpers ───────────────────────────────────────────────────────────
+// ─── Shared helpers ───────────────────────────────────────────────────────────────────────
 
 fn exe_basename(exe_path: &Option<String>) -> String {
     exe_path.as_deref()
@@ -413,7 +435,7 @@ fn exe_basename(exe_path: &Option<String>) -> String {
         .unwrap_or_else(|| String::from("rustos"))
 }
 
-// ─── /proc/<pid>/maps ────────────────────────────────────────────────────────
+// ─── /proc/<pid>/maps ───────────────────────────────────────────────────────────────────
 
 fn gen_maps(pid: usize) -> String {
     let mut out = String::new();
@@ -438,7 +460,7 @@ fn gen_maps(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/fd ──────────────────────────────────────────────────────────
+// ─── /proc/<pid>/fd ────────────────────────────────────────────────────────────────────
 
 fn gen_fd_dir(pid: usize) -> Vec<u8> {
     let _ = pid;
@@ -451,7 +473,7 @@ fn gen_fd_dir(pid: usize) -> Vec<u8> {
     out
 }
 
-// ─── open ─────────────────────────────────────────────────────────────────────
+// ─── open ─────────────────────────────────────────────────────────────────────────────────
 
 /// Open a procfs path and return a synthetic fd number, or a negative errno.
 pub fn procfs_open(path: &str, _flags: u32) -> isize {
@@ -516,7 +538,7 @@ fn next_procfs_fd() -> usize {
     256
 }
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// ─── helpers ─────────────────────────────────────────────────────────────────────────────────
 
 fn norm_self(path: &str, pid: usize) -> Cow<'static, str> {
     if path.starts_with("/proc/self") {
