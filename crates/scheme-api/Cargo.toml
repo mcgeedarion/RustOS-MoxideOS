@@ -3,15 +3,10 @@ name = "scheme-api"
 version = "0.1.0"
 edition = "2021"
 
-# no_std so this crate is usable both in the kernel and in userspace drivers
-[lib]
-name = "scheme_api"
-path = "src/lib.rs"
-
-[dependencies]
-# serde is optional; enable only in userspace where we have an allocator
-serde = { version = "1", default-features = false, features = ["derive"], optional = true }
-
 [features]
 default = []
-std = ["serde"]
+# Enable when building for userspace (enables std features like alloc).
+std = []
+
+[dependencies]
+bitflags = "2"

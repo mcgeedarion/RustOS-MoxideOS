@@ -1,197 +1,200 @@
-//! scheme-api — shared types for the RustOS scheme-based VFS.
+//! `scheme-api` — types shared between the kernel and userspace driver processes.
 //!
-//! This crate is `no_std` so it can be linked into both the kernel
-//! (which has no std) and userspace driver binaries (which may opt in
-//! to std via the `std` feature flag).
+//! This crate is `#![no_std]` by default so it can be linked into the kernel.
+//! Enable the `std` feature for userspace consumers.
 //!
-//! # Scheme URL model
+//! # Overview
 //!
-//! Every resource in RustOS is addressed as `<scheme>:<path>`, e.g.:
-//!   - `file:/etc/passwd`
-//!   - `blk:vda`          (virtio-blk block device)
-//!   - `net:eth0`         (virtio-net / e1000e NIC)
-//!   - `tcp:10.0.0.1:80`  (TCP connection, handled by in-kernel net stack)
-//!   - `tty:0`            (serial/tty)
-//!   - `proc:1234/maps`   (in-kernel procfs)
+//! A *scheme* is a named resource namespace, accessed via URLs of the form
+//! `scheme:path`.  The kernel's `SchemeTable` routes `open`/`read`/`write`
+//! calls to the appropriate handler.  For in-kernel schemes the handler is a
+//! native Rust struct; for userspace drivers it is an `IpcProxyScheme` that
+//! forwards these `SchemeRequest` messages over an `IpcEndpoint`.
 
 #![no_std]
 
-#[cfg(feature = "std")]
-extern crate std;
-
 extern crate alloc;
 
-use alloc::string::String;
-use alloc::vec::Vec;
+use alloc::{
+    string::String,
+    vec::Vec,
+};
+
+use bitflags::bitflags;
 
 // ---------------------------------------------------------------------------
-// Core identifiers
+// Primitive ID types
 // ---------------------------------------------------------------------------
 
-/// Opaque handle returned by `sys_driver_bind`.  Kernel-assigned, process-local.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct DriverHandle(pub u64);
-
-/// Opaque endpoint token that the kernel uses to deliver IRQ notifications
-/// and to forward scheme requests to a userspace scheme server.
-/// Created by `sys_ipc_endpoint_create` and passed to `sys_irq_subscribe`
-/// or `sys_scheme_register`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct IpcEndpoint(pub u64);
-
-/// Per-scheme file-descriptor token.  Scheme servers hand these back in
-/// response to `SchemeRequest::Open`; the kernel stores them in the
-/// per-process fd table alongside the owning scheme's endpoint.
+/// A scheme-local file handle.  Opaque to the kernel; meaning is defined
+/// by each individual scheme handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct SchemeFileId(pub u64);
 
+/// A kernel IPC endpoint handle.  Kernel-allocated; identifies a message
+/// queue that can be passed across process boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct IpcEndpoint(pub u64);
+
+/// Authorisation token returned by `sys_driver_bind`.  Encodes (pid, bdf)
+/// so the kernel can validate ownership without a table lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct DriverHandle(pub u64);
+
 // ---------------------------------------------------------------------------
-// Open flags (subset sufficient for drivers; extend as needed)
+// OpenFlags
 // ---------------------------------------------------------------------------
 
-bitflags::bitflags! {
+bitflags! {
+    /// Flags for the `open` system call / scheme `open` method.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct OpenFlags: u32 {
-        const READ      = 1 << 0;
-        const WRITE     = 1 << 1;
-        const NONBLOCK  = 1 << 2;
-        const CREATE    = 1 << 3;
-        const TRUNCATE  = 1 << 4;
+        const READ       = 0b0000_0001;
+        const WRITE      = 0b0000_0010;
+        const CREATE     = 0b0000_0100;
+        const TRUNCATE   = 0b0000_1000;
+        const APPEND     = 0b0001_0000;
+        const NON_BLOCK  = 0b0010_0000;
+        const DIRECTORY  = 0b0100_0000;
+        const EXCLUSIVE  = 0b1000_0000;
     }
 }
 
 // ---------------------------------------------------------------------------
-// IPC message types
-// ---------------------------------------------------------------------------
-
-/// A request sent from the kernel (on behalf of a user process) to a
-/// userspace scheme server over its `IpcEndpoint`.
-#[derive(Debug)]
-pub enum SchemeRequest {
-    /// Open `path` with `flags`; returns `SchemeFileId` on success.
-    Open {
-        path: String,
-        flags: OpenFlags,
-    },
-    /// Read up to `len` bytes from `fd`.
-    Read {
-        fd: SchemeFileId,
-        len: usize,
-    },
-    /// Write `data` to `fd`.
-    Write {
-        fd: SchemeFileId,
-        data: Vec<u8>,
-    },
-    /// Device-specific control command.
-    Ioctl {
-        fd: SchemeFileId,
-        cmd: u64,
-        arg: usize,
-    },
-    /// Seek to `offset` relative to `whence`.
-    Seek {
-        fd: SchemeFileId,
-        offset: i64,
-        whence: SeekWhence,
-    },
-    /// Close `fd` and release driver-side resources.
-    Close {
-        fd: SchemeFileId,
-    },
-}
-
-/// Response from the scheme server back to the kernel.
-#[derive(Debug)]
-pub enum SchemeResponse {
-    /// Newly-opened file handle.
-    Fd(SchemeFileId),
-    /// Data payload (answer to `Read`).
-    Data(Vec<u8>),
-    /// Byte count written / ioctl result.
-    Count(usize),
-    /// Seek position after the operation.
-    SeekPos(i64),
-    /// Success with no payload.
-    Ok,
-    /// Scheme-level error.
-    Err(SchemeError),
-}
-
-/// Notification posted to a driver process when its subscribed IRQ fires.
-#[derive(Debug, Clone, Copy)]
-pub struct IrqNotification {
-    /// IRQ number that fired.
-    pub irq: u32,
-    /// Monotonic timestamp (nanoseconds since boot) of the interrupt.
-    pub timestamp_ns: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum SchemeError {
-    /// Path / scheme prefix not found.
-    NoSuchScheme     = 1,
-    /// File or resource within the scheme not found.
-    NotFound         = 2,
-    /// Caller lacks required capability.
-    PermissionDenied = 3,
-    /// Invalid argument.
-    InvalidArg       = 4,
-    /// Resource is temporarily unavailable (try again).
-    WouldBlock       = 5,
-    /// I/O error.
-    Io               = 6,
-    /// Scheme server is not responding.
-    Unreachable      = 7,
-    /// Catch-all.
-    Other            = 255,
-}
-
-impl core::fmt::Display for SchemeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NoSuchScheme     => write!(f, "no such scheme"),
-            Self::NotFound         => write!(f, "not found"),
-            Self::PermissionDenied => write!(f, "permission denied"),
-            Self::InvalidArg       => write!(f, "invalid argument"),
-            Self::WouldBlock       => write!(f, "would block"),
-            Self::Io               => write!(f, "I/O error"),
-            Self::Unreachable      => write!(f, "scheme server unreachable"),
-            Self::Other            => write!(f, "unknown scheme error"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Seek whence
+// SeekWhence
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SeekWhence {
+    /// Seek from the start of the resource.
     Start   = 0,
+    /// Seek relative to the current position.
     Current = 1,
+    /// Seek from the end.
     End     = 2,
+}
+
+// ---------------------------------------------------------------------------
+// SchemeError
+// ---------------------------------------------------------------------------
+
+/// Error codes returned by scheme handlers and propagated back to callers
+/// as errno values by the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum SchemeError {
+    /// No scheme registered under this name.
+    NoSuchScheme    = 1,
+    /// The requested path does not exist within the scheme.
+    NotFound        = 2,
+    /// Caller lacks permission.
+    PermissionDenied = 3,
+    /// An argument was invalid (bad offset, null pointer, etc.).
+    InvalidArg      = 4,
+    /// The operation would block and `O_NONBLOCK` was set.
+    WouldBlock      = 5,
+    /// Generic I/O error.
+    Io              = 6,
+    /// The driver process has exited or is unreachable.
+    Unreachable     = 7,
+    /// Any other unclassified error.
+    Other           = 0xFF,
+}
+
+impl SchemeError {
+    /// Convert to a POSIX-compatible negative errno value.
+    pub fn to_errno(self) -> i64 {
+        match self {
+            SchemeError::NoSuchScheme     => -2,   // ENOENT
+            SchemeError::NotFound         => -2,   // ENOENT
+            SchemeError::PermissionDenied => -13,  // EACCES
+            SchemeError::InvalidArg       => -22,  // EINVAL
+            SchemeError::WouldBlock       => -11,  // EAGAIN
+            SchemeError::Io               => -5,   // EIO
+            SchemeError::Unreachable      => -111, // ECONNREFUSED
+            SchemeError::Other            => -1,   // EPERM
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC messages: SchemeRequest / SchemeResponse
+// ---------------------------------------------------------------------------
+
+/// A request sent *from* the kernel proxy *to* a userspace driver scheme.
+#[derive(Debug)]
+pub enum SchemeRequest {
+    Open  { path: String, flags: OpenFlags },
+    Read  { fd: SchemeFileId, len: usize },
+    Write { fd: SchemeFileId, data: Vec<u8> },
+    Ioctl { fd: SchemeFileId, cmd: u64, arg: usize },
+    Seek  { fd: SchemeFileId, offset: i64, whence: SeekWhence },
+    Close { fd: SchemeFileId },
+}
+
+/// A response sent *from* the userspace driver *to* the kernel proxy.
+#[derive(Debug)]
+pub enum SchemeResponse {
+    /// `open` succeeded; carries the driver-local file id.
+    Fd(SchemeFileId),
+    /// `read` succeeded; carries the raw bytes.
+    Data(Vec<u8>),
+    /// `write` / `ioctl` succeeded; carries the count/return value.
+    Count(usize),
+    /// `seek` succeeded; carries the new file position.
+    SeekPos(i64),
+    /// Generic success (e.g. `close`).
+    Ok,
+    /// The operation failed.
+    Err(SchemeError),
+}
+
+// ---------------------------------------------------------------------------
+// IrqNotification — sent by the kernel to a subscribed driver endpoint
+// ---------------------------------------------------------------------------
+
+/// Message posted to a driver's IPC endpoint when its subscribed IRQ fires.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct IrqNotification {
+    /// Sentinel byte `0xFF` distinguishing IRQ notifications from scheme
+    /// requests (whose first byte is always < `0x80`).
+    pub tag:          u8,
+    pub irq:          u32,
+    pub timestamp_ns: u64,
 }
 
 // ---------------------------------------------------------------------------
 // URL parsing helper
 // ---------------------------------------------------------------------------
 
-/// Split `"scheme:path"` into `("scheme", "path")`.
+/// Parse a scheme URL of the form `"scheme:path"` and return
+/// `Some((scheme, path))`, or `None` if the input is not a scheme URL.
 ///
-/// Returns `None` if there is no `:` separator.  The path portion may be
-/// empty (e.g. `"blk:"` is valid and means the root of the blk scheme).
+/// The scheme part must be non-empty; the path part may be empty.
+///
+/// ```
+/// # use scheme_api::parse_scheme_url;
+/// assert_eq!(parse_scheme_url("blk:vda"),     Some(("blk", "vda")));
+/// assert_eq!(parse_scheme_url("net:"),         Some(("net", "")));
+/// assert_eq!(parse_scheme_url("/etc/passwd"),  None);
+/// assert_eq!(parse_scheme_url("nocolon"),      None);
+/// ```
 pub fn parse_scheme_url(url: &str) -> Option<(&str, &str)> {
-    url.split_once(':')
+    if url.starts_with('/') {
+        return None;
+    }
+    let (scheme, path) = url.split_once(':')?;
+    if scheme.is_empty()
+        || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some((scheme, path))
 }
 
 #[cfg(test)]
@@ -199,21 +202,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_normal_url() {
-        let (scheme, path) = parse_scheme_url("file:/etc/os-release").unwrap();
-        assert_eq!(scheme, "file");
-        assert_eq!(path, "/etc/os-release");
+    fn parse_round_trip() {
+        assert_eq!(parse_scheme_url("file:/etc"), Some(("file", "/etc")));
+        assert_eq!(parse_scheme_url("blk:"),      Some(("blk", "")));
+        assert_eq!(parse_scheme_url("/dev/null"), None);
+        assert_eq!(parse_scheme_url(""),           None);
     }
 
     #[test]
-    fn parse_bare_scheme() {
-        let (scheme, path) = parse_scheme_url("blk:").unwrap();
-        assert_eq!(scheme, "blk");
-        assert_eq!(path, "");
-    }
-
-    #[test]
-    fn parse_missing_colon() {
-        assert!(parse_scheme_url("nocolon").is_none());
+    fn open_flags_round_trip() {
+        let f = OpenFlags::READ | OpenFlags::WRITE;
+        assert!(f.contains(OpenFlags::READ));
+        assert!(f.contains(OpenFlags::WRITE));
+        assert!(!f.contains(OpenFlags::CREATE));
     }
 }
