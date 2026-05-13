@@ -105,6 +105,7 @@ use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
 use crate::sync::spinlock::SpinLock;
 use crate::proc::process::{State, ProcLock};
 use crate::proc::proc_table;
+use crate::proc::task_types::TaskRunState;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -643,10 +644,41 @@ pub fn schedule() {
         CURRENT_PID.store(next.pid, core::sync::atomic::Ordering::Relaxed);
     }
 
-    if !prev_task.is_null() && prev_task != next_task {
-        unsafe { crate::proc::context::switch(prev_task, next_task); }
-    } else if prev_task.is_null() {
-        unsafe { crate::proc::context::restore(next_task); }
+    // ── Context switch dispatch ───────────────────────────────────────────────
+    //
+    // Match on next.run_state rather than checking prev_task.is_null():
+    //
+    //   Cold { pc, sp } — task has never been scheduled.  The Pcb::ctx fields
+    //     are zeroed and would produce garbage if restored directly.  Instead
+    //     we call context::restore() which uses the arch first-time trampoline
+    //     (task_entry_trampoline on RISC-V / equivalent x86_64 path) and then
+    //     marks the task Live so future preemptions take the switch() path.
+    //
+    //   Live — Pcb::ctx holds a valid saved register file from the last
+    //     context::switch().  Use switch() for both prev-has-task and
+    //     no-prev cases (no-prev cannot happen for a Live task in practice,
+    //     but the match arm is exhaustive for correctness).
+    //
+    unsafe {
+        match &next.run_state {
+            TaskRunState::Cold { .. } => {
+                // Mark live before the jump so that if the task yields before
+                // returning here (impossible in practice but guard anyway) the
+                // next invocation uses switch().
+                next.mark_live();
+                crate::proc::context::restore(next_task);
+            }
+            TaskRunState::Live => {
+                if !prev_task.is_null() && prev_task != next_task {
+                    crate::proc::context::switch(prev_task, next_task);
+                }
+                // If prev_task is null and next is Live, there is nothing to
+                // switch from.  This case arises only if a task is explicitly
+                // moved to Live before ever running (e.g., a kernel thread
+                // that was exec'd in-place).  Fall through without switching;
+                // the caller is responsible for entering user mode.
+            }
+        }
     }
 }
 
