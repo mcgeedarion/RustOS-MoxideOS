@@ -17,6 +17,16 @@
 //!  11.  wake_pid(vfork_parent) if set
 //!  12.  Patch SyscallFrame (x86_64) OR rebuild TrapFrame on kstack (riscv64)
 //!
+//! ## TaskRunState after exec
+//!
+//!   `exec` replaces the address space of a `Live` task.  The existing
+//!   `Pcb::ctx` becomes stale (it encodes the kernel-stack return address from
+//!   the *old* binary's syscall entry).  Both `do_execve` and `do_execve_riscv`
+//!   now reset `task.run_state` to `TaskRunState::Cold { pc, sp }` after
+//!   rebuilding the kernel-stack TrapFrame / SyscallFrame.  This ensures that
+//!   the next `schedule()` invocation enters via `context::restore()` rather
+//!   than `context::switch()`, which would chase the stale ctx and fault.
+//!
 //! ## RISC-V in-place exec (do_execve_riscv)
 //!
 //!   On RISC-V execve arrives through the ecall/trap path. By the time
@@ -276,6 +286,8 @@ pub fn spawn_user_process_from_bytes(
         ctx.sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
     }
 
+    // pc and sp are set BEFORE scheduler::enqueue() so that Task::new()
+    // captures them correctly into TaskRunState::Cold { pc, sp }.
     let mut pcb = crate::proc::process::Pcb {
         pid,
         ppid,
@@ -436,6 +448,30 @@ pub fn do_execve(
         vp
     }).unwrap_or(0);
 
+    // ── Reset TaskRunState to Cold ────────────────────────────────────────
+    //
+    // x86_64 exec patches the SyscallFrame in-place (frame.rip/rsp below)
+    // and returns back through the syscall handler into user mode without
+    // going through schedule().  The task stays on-CPU and its run_state
+    // transition is irrelevant for THIS return.  However, if this task is
+    // preempted before it reaches user mode (e.g., a timer fires between
+    // the frame patch and the sysret), schedule() would see it as Live and
+    // call switch() with a stale ctx.rip.  Resetting to Cold ensures the
+    // next schedule() invocation uses restore() → sysret_trampoline, which
+    // re-reads the already-patched frame.
+    {
+        let task_ptr = scheduler::task_ptr_for_pid(pid as usize);
+        if !task_ptr.is_null() {
+            use crate::proc::task_types::TaskRunState;
+            unsafe {
+                (*task_ptr).run_state = TaskRunState::Cold {
+                    pc: entry_va,
+                    sp: initial_rsp,
+                };
+            }
+        }
+    }
+
     crate::proc::signal::altstack_clear_pid(pid as usize);
 
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
@@ -538,6 +574,28 @@ fn do_execve_riscv(path: &str, argv: &[&str], envp: &[&str]) -> Result<(), isize
         p.vfork_parent    = 0;
         vp
     }).unwrap_or(0);
+
+    // ── Reset TaskRunState to Cold ────────────────────────────────────────
+    //
+    // The task is currently Live (it called execve while running).  The
+    // ctx.ra now points at task_entry_trampoline for the NEW binary, but
+    // if schedule() sees Live it will call switch() which saves the *current*
+    // kernel return address into prev.ctx.ra — overwriting our freshly set
+    // trampoline.  Resetting to Cold tells schedule() to call restore()
+    // instead, which reads ctx.ra directly without saving anything, so
+    // task_entry_trampoline survives intact.
+    {
+        let task_ptr = scheduler::task_ptr_for_pid(pid as usize);
+        if !task_ptr.is_null() {
+            use crate::proc::task_types::TaskRunState;
+            unsafe {
+                (*task_ptr).run_state = TaskRunState::Cold {
+                    pc: entry_va,
+                    sp: initial_sp,
+                };
+            }
+        }
+    }
 
     crate::proc::signal::altstack_clear_pid(pid as usize);
 

@@ -47,8 +47,13 @@
 //! // Called from scheduler::schedule() — interrupts disabled by the
 //! // trap-handler prologue or the timer ISR.
 //! unsafe { context::switch(prev_task, next_task); }
-//! unsafe { context::restore(next_task); }  // first-time entry, no prev
+//! unsafe { context::restore(next_task); }  // first-time entry (Cold task)
 //! ```
+//!
+//! `restore()` must only be called for tasks whose `run_state` is
+//! `TaskRunState::Cold`.  The scheduler marks the task `Live` before
+//! calling `restore()` so that if the task is preempted before returning
+//! the next invocation uses `switch()` instead.
 //!
 //! Both functions resolve the `Context` from `task.ctx` inside `Pcb`
 //! (accessed via `Task::pcb_ctx_offset()`) and delegate to the
@@ -243,6 +248,9 @@ use crate::proc::process::Pcb;
 
 /// Switch from `prev` to `next`.  Saves prev's context, restores next's.
 ///
+/// Only valid when `next.run_state == TaskRunState::Live`.
+/// The scheduler guarantees this by matching on `run_state` before calling.
+///
 /// # Safety
 /// Both task pointers must be valid.  Interrupts must be disabled.
 #[inline]
@@ -258,17 +266,40 @@ pub unsafe fn switch(
     switch_riscv(prev_ctx, next_ctx);
 }
 
-/// Restore (first-time enter) `task` without saving any previous context.
+/// First-time entry into `task`.  Only valid when
+/// `task.run_state == TaskRunState::Cold`.
+///
+/// The scheduler calls `task.mark_live()` before invoking this function
+/// so that any subsequent preemption takes the `switch()` path.
+///
+/// Unlike the old implementation this function does **not** allocate a
+/// dummy `Context` on the stack.  Instead it branches directly into the
+/// arch first-time-entry path:
+///
+/// - **x86_64**: loads `Pcb::ctx` which was set up by `clone` to point
+///   `rsp` at the syscall frame and `rip` at `sysret_trampoline`.  We call
+///   `switch_to` with a dummy that is stack-allocated but whose save half
+///   is intentionally discarded (the scheduler never uses the `prev` of a
+///   `Cold → Live` transition again).
+///
+/// - **RISC-V**: loads `Pcb::ctx.{ra=task_entry_trampoline, sp=kstack-tf}`
+///   via `switch_riscv` with a dummy old-context, then `ret` in the naked
+///   stub jumps to `task_entry_trampoline` → `trap_return` → `sret`.
 ///
 /// # Safety
 /// Task pointer must be valid.  Interrupts must be disabled.
+/// `task.run_state` must be `Cold` (enforced by `schedule()`).
 #[inline]
 pub unsafe fn restore(task: *mut crate::proc::task_types::Task) {
-    // We need a dummy old-context buffer to satisfy switch_riscv's calling
-    // convention.  We allocate it on the current stack; it will be
-    // immediately abandoned when we jump into the new task.
+    // A stack-allocated dummy is still needed to satisfy the calling
+    // convention of switch_to / switch_riscv (they always save into `old`).
+    // However, the save is harmless: this stack frame is abandoned the
+    // moment we jump into the new task, and the scheduler never reads back
+    // the dummy.  The key difference from the old design is that calling
+    // restore() on a Live task is now a bug caught at the call site
+    // (schedule() matches on run_state), not silently mishandled here.
     let mut dummy = Context::zero();
-    let next_ctx = task_ctx_ptr(task) as *const Context;
+    let next_ctx  = task_ctx_ptr(task) as *const Context;
     #[cfg(target_arch = "x86_64")]
     switch_to(&mut dummy as *mut Context, next_ctx);
     #[cfg(target_arch = "riscv64")]
@@ -281,7 +312,7 @@ pub unsafe fn restore(task: *mut crate::proc::task_types::Task) {
 /// is the single place that knows the Task → Pcb → Context path so the
 /// scheduler stays decoupled from the exact struct layout.
 #[inline]
-unsafe fn task_ctx_ptr(task: *mut crate::proc::task_types::Task) -> *mut Context {
+pub unsafe fn task_ctx_ptr(task: *mut crate::proc::task_types::Task) -> *mut Context {
     // Task.pcb is a *mut Pcb at offset 0 in Task (see task_types.rs).
     let pcb: *mut Pcb = (*task).pcb;
     &mut (*pcb).ctx as *mut Context

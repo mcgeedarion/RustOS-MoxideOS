@@ -32,6 +32,16 @@
 //! ### RISC-V
 //!   `push_trap_frame_riscv` builds a full 34-word `TrapFrame` at
 //!   `kstack_top - TRAP_FRAME_SIZE`.
+//!
+//! ## TaskRunState
+//!
+//! Every newly cloned child starts as `TaskRunState::Cold` with the correct
+//! `pc` and `sp` captured from the built `child_ctx` before the Pcb is
+//! enqueued.  `proc_table::enqueue` calls `Task::new(pcb_ptr)` which reads
+//! `pcb.pc` and `pcb.sp` at that moment, so those fields MUST be written
+//! to the Pcb before the enqueue call.  This is enforced by the explicit
+//! `child_pcb.pc = …` / `child_pcb.sp = …` assignments below, which mirror
+//! the values already encoded in `child_ctx`.
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -140,28 +150,42 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         0
     };
 
+    // ── Build arch Context and record the first-entry pc/sp ────────────────
+    //
+    // These values are written to child_pcb.pc / child_pcb.sp BEFORE
+    // scheduler::enqueue() is called.  proc_table::enqueue() constructs a
+    // Task via Task::new(pcb_ptr), which reads pcb.pc and pcb.sp at that
+    // moment to initialise TaskRunState::Cold { pc, sp }.  If the assignment
+    // order were reversed the Cold payload would capture zeros.
     #[cfg(target_arch = "x86_64")]
-    let child_ctx = {
+    let (child_ctx, child_first_pc, child_first_sp) = {
         push_syscall_frame(kstack_top, parent_pc, 0x202, user_sp);
-        Context {
+        let ctx = Context {
             rip:     sysret_trampoline as usize,
             rsp:     kstack_top - 17 * 8,
             fs_base: child_tls,
             ..Context::zero()
-        }
+        };
+        // first-entry pc/sp for TaskRunState::Cold: the user-mode values
+        // that will be in the iretq frame when the child first runs.
+        let first_pc = parent_pc;
+        let first_sp = if user_sp != 0 { user_sp } else { kstack_top };
+        (ctx, first_pc, first_sp)
     };
 
     #[cfg(target_arch = "riscv64")]
-    let child_ctx = {
+    let (child_ctx, child_first_pc, child_first_sp) = {
         let entry_pc = parent_pc;
-        push_trap_frame_riscv(kstack_top, entry_pc, user_sp, child_tls);
+        let effective_sp = if user_sp != 0 { user_sp } else { kstack_top };
+        push_trap_frame_riscv(kstack_top, entry_pc, effective_sp, child_tls);
         let frame_sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
-        Context {
+        let ctx = Context {
             ra:  crate::proc::context::task_entry_trampoline as usize,
             sp:  frame_sp,
             s0:  0,
             ..Context::zero()
-        }
+        };
+        (ctx, entry_pc, effective_sp)
     };
 
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -190,39 +214,21 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         .unwrap_or_else(make_blank_pcb);
 
     // ── Signal handler table ───────────────────────────────────────────────────
-    //
-    // CLONE_SIGHAND: share the parent's Arc — child and parent see the same
-    //   table; sigaction() by either immediately affects the other.
-    //
-    // No CLONE_SIGHAND (fork/vfork): deep-copy so child is independent.
-    //   Uses Pcb::fork_signal_handlers() which locks the parent's table,
-    //   clones the inner value, and wraps it in a new Arc<Mutex<…>>.
     child_pcb.signal_handlers = if flags & CLONE_SIGHAND != 0 {
-        // Share the existing Arc (both point to the same Mutex<SignalHandlers>).
         scheduler::with_proc(parent_pid, |p| p.signal_handlers.clone())
             .unwrap_or_else(|| Arc::new(spin::Mutex::new(
                 crate::proc::fork::SignalHandlers::default())))
     } else {
-        // Deep copy: child gets its own independent table.
         scheduler::with_proc(parent_pid, |p| p.fork_signal_handlers())
             .unwrap_or_else(|| Arc::new(spin::Mutex::new(
                 crate::proc::fork::SignalHandlers::default())))
     };
 
     // ── mm_lock sharing ─────────────────────────────────────────────────────────
-    //
-    // CLONE_VM (threads): share the parent's mm_lock so that a munmap in any
-    //   thread of the group blocks uaccess in every other thread.
-    //
-    // No CLONE_VM (fork/vfork): child got a deep-cloned mm_lock Arc from the
-    //   Pcb::clone() above.  We replace it with a fresh independent RwLock so
-    //   that parent and child don't serialize on each other's mm operations.
     child_pcb.mm_lock = if is_vm_clone {
-        // Share — both threads block on the same RwLock during uaccess.
         scheduler::with_proc(parent_pid, |p| p.share_mm_lock())
             .unwrap_or_else(|| Arc::new(spin::RwLock::new(())))
     } else {
-        // Fork — child has its own independent address space copy.
         Arc::new(spin::RwLock::new(()))
     };
 
@@ -236,6 +242,9 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.user_satp  = child_satp;
     child_pcb.kstack_top = kstack_top;
     child_pcb.ctx        = child_ctx;
+    // ── pc / sp MUST be set before enqueue() so Task::new() captures them ──
+    child_pcb.pc         = child_first_pc;
+    child_pcb.sp         = child_first_sp;
     child_pcb.exit_signal        = ca.exit_signal as u32;
     child_pcb.vfork_parent       = if flags & CLONE_VFORK != 0 { parent_pid } else { 0 };
     child_pcb.child_tid_va       = child_tid_va;
@@ -250,24 +259,17 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.robust_list_len  = 0;
     child_pcb.ptrace_state     = PtraceState::None;
     child_pcb.ptrace_event     = 0;
-    // Clear per-thread pending signal queue for the child.
     child_pcb.pending_signals.clear();
 
-    // rlimits: inherit from parent (already in the clone).
-    // ns: inherit from parent (already in the clone).
-    // seccomp: inherit from parent (already in the clone).
-
-    // ── Namespace cloning ────────────────────────────────────────────────
     if flags & CLONE_NEWNS != 0 {
         child_pcb.ns = scheduler::with_proc(parent_pid, |p| p.ns.clone_for_unshare())
             .unwrap_or_default();
     }
 
-    // ── Enqueue ──────────────────────────────────────────────────────────
+    // ── Enqueue (Task::new reads pcb.pc / pcb.sp here) ───────────────────
     let child_pid_usize = child_pid as usize;
     scheduler::enqueue(child_pcb);
 
-    // ── CLONE_VFORK: suspend parent until child calls exec or exit ───────
     if flags & CLONE_VFORK != 0 {
         scheduler::suspend_current_until_child_exec(child_pid_usize);
     }
@@ -290,10 +292,6 @@ fn push_syscall_frame(
     rflags:     usize,
     user_sp:    usize,
 ) {
-    // 17-slot iretq frame layout (from top of kstack downward):
-    //   [kstack_top - 8*17 .. kstack_top]
-    //   slot 0: ss, 1: rsp, 2: rflags, 3: cs, 4: rip,
-    //   5–16: scratch regs (rax, rbx, …) zero-filled
     let frame = unsafe {
         core::slice::from_raw_parts_mut(
             (kstack_top - 17 * 8) as *mut usize,
