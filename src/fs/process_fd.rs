@@ -227,7 +227,46 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     }
 
     let (bfd, stored_path): (isize, Option<String>) =
-        if let Some(fd) = crate::fs::devfs::try_open(path, flags) {
+        // ── Redox-style scheme routing: check before all POSIX paths ──────────
+        // If the path looks like `scheme:rest` (no leading '/'), dispatch it
+        // through the registered scheme table instead of the POSIX VFS.  This
+        // is the core of Redox's "everything is a URL" model and lets drivers
+        // such as `tcp:`, `blk:`, `net:` be opened exactly like regular files.
+        if crate::fs::scheme_table::is_scheme_url(path) {
+            use scheme_api::OpenFlags;
+            let open_flags = OpenFlags::from_bits_truncate(flags);
+            match crate::fs::scheme_table::SCHEME_TABLE.open(path, open_flags) {
+                Ok((scheme, fid)) => {
+                    // Allocate a synthetic backing-fd in the 0x8000_0000+ range
+                    // so it never collides with POSIX VFS inodes.
+                    let bfd = crate::fs::scheme_fd::alloc_scheme_backing_fd();
+                    crate::fs::scheme_fd::scheme_fd_register(
+                        bfd,
+                        scheme,
+                        fid,
+                    );
+                    // Tag with the original URL so /proc/<pid>/fd/<n> readlink
+                    // returns something human-readable (e.g. "tcp:127.0.0.1:80").
+                    crate::fs::vfs::fd_set_debug_name(
+                        bfd,
+                        alloc::string::String::from(path),
+                    );
+                    (bfd as isize, Some(alloc::string::String::from(path)))
+                }
+                Err(e) => {
+                    use scheme_api::SchemeError;
+                    let errno = match e {
+                        SchemeError::NoSuchScheme     => -2,  // ENOENT
+                        SchemeError::NotFound         => -2,
+                        SchemeError::PermissionDenied => -13, // EACCES
+                        SchemeError::InvalidArg       => -22, // EINVAL
+                        SchemeError::WouldBlock        => -11, // EAGAIN
+                        _                             => -5,  // EIO
+                    };
+                    (errno, None)
+                }
+            }
+        } else if let Some(fd) = crate::fs::devfs::try_open(path, flags) {
             (fd as isize, None)
         } else if path.starts_with("/proc") {
             let fd = crate::fs::procfs::procfs_open(path, flags);
@@ -420,6 +459,13 @@ fn close_backing(bfd: usize) {
         crate::fs::pipe::sys_close_pipe(bfd);
     } else if crate::net::socket::is_socket_fd(bfd) {
         crate::net::socket::sys_close_socket(bfd);
+    // ── Scheme fds — must come after all other named fd types ────────────────
+    // Backing fds in the 0x8000_0000+ range registered by proc_fd_open's
+    // scheme-URL arm are closed here, forwarding the close() to the driver
+    // via IpcProxyScheme.  Without this arm, closing a scheme fd was a no-op
+    // and the driver-side SchemeFileId was leaked forever.
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        crate::fs::scheme_fd::scheme_fd_close(bfd);
     } else {
         crate::fs::vfs::close(bfd);
     }
