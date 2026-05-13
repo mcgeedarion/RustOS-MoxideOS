@@ -15,27 +15,18 @@
 //!   /proc/cpuinfo           → single-CPU stub
 //!   /proc/slabinfo          → slab allocator cache statistics
 //!
+//! ## Debug fds  (/proc/<pid>/mem|regs|ctl)
+//!   Delegated to proc_debug.rs — see that file for details.
+//!
 //! ## Namespace inodes  (/proc/<pid>/ns/)
 //!   /proc/<pid>/ns/         → directory listing of 7 ns names
-//!   /proc/<pid>/ns/<name>   → synthetic symlink; readlink returns
-//!                              "<name>:[<ns_id>]"  e.g. "mnt:[4026531840]"
-//!                              open()+read() also returns the same string
-//!                              so tools that don't use readlink still work.
-//!   stat/lstat on ns paths  → st_ino = ns_id, S_IFLNK | 0444
-//!   Passing an ns fd to setns(2) works via namespace::ns_fd_open which
-//!   allocates a synthetic fd in NSFD_FD_BASE range (namespace.rs).
+//!   /proc/<pid>/ns/<name>   → synthetic symlink
 //!
 //! ## readlink support
 //!   readlink("/proc/self/exe")    → exe path string (no NUL)
 //!   readlink("/proc/self/fd/N")   → path behind fd N
 //!   readlink("/proc/self")        → "/proc/<pid>"
 //!   readlink("/proc/<pid>/ns/X")  → "X:[<ns_id>]"
-//!   procfs_readlink(path, buf) is the entry point; called from
-//!   stat_syscalls::sys_readlink and sys_readlinkat.
-//!
-//! ## Synthetic fd support
-//!   Used by close_range to enumerate synthetic procfs fds without
-//!   allocating real VFS fds.
 
 extern crate alloc;
 use alloc::borrow::Cow;
@@ -51,7 +42,7 @@ pub const NS_NAMES: &[&str] = &["mnt", "pid", "net", "uts", "ipc", "user", "time
 
 // ─── Synthetic fd table ──────────────────────────────────────────────────────
 
-/// Returns true if `fdno` is a procfs synthetic fd.
+/// Returns true if `fdno` is a procfs synthetic (text-content) fd.
 pub fn is_procfs_fd(fdno: usize) -> bool {
     PROCFS_FDS.lock().contains_key(&fdno)
 }
@@ -94,7 +85,6 @@ pub fn procfs_is_ns_path(path: &str) -> bool {
     let pid = crate::proc::scheduler::current_pid();
     let norm = norm_self(path, pid);
     let p = norm.as_ref();
-    // /proc/<N>/ns  or  /proc/<N>/ns/<name>
     if let Some((_, rest)) = strip_pid_prefix(p, "/ns") {
         return rest.is_empty() || rest.starts_with('/');
     }
@@ -102,8 +92,6 @@ pub fn procfs_is_ns_path(path: &str) -> bool {
 }
 
 /// Synthetic stat for a /proc/<pid>/ns/<name> inode.
-/// Returns (ino, mode) where mode = S_IFLNK | 0444 = 0o120444.
-/// Returns None if the path is not a valid ns path.
 pub fn procfs_ns_stat(path: &str) -> Option<(u64, u32)> {
     let pid = crate::proc::scheduler::current_pid();
     let norm = norm_self(path, pid);
@@ -111,12 +99,10 @@ pub fn procfs_ns_stat(path: &str) -> Option<(u64, u32)> {
     let (tpid, rest) = strip_pid_prefix(p, "/ns")?;
     let name = rest.trim_start_matches('/');
     if name.is_empty() {
-        // The directory itself: S_IFDIR | 0555
         return Some((tpid as u64 * 1000 + 7, 0o040555));
     }
     if !NS_NAMES.contains(&name) { return None; }
     let ns_id = crate::proc::namespace::ns_id_of(tpid, name)?;
-    // S_IFLNK | 0444 — same as Linux nsfs inodes
     Some((ns_id, 0o120444))
 }
 
@@ -133,7 +119,6 @@ pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     let norm = norm_self(path, pid);
     let p = norm.as_ref();
 
-    // /proc/<pid>/ns/<name>  →  "<name>:[<ns_id>]"
     if let Some((tpid, rest)) = strip_pid_prefix(p, "/ns/") {
         let name = rest.trim_end_matches('/');
         if NS_NAMES.contains(&name) {
@@ -141,9 +126,9 @@ pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
                 let target = crate::proc::namespace::ns_symlink(name, ns_id);
                 return copy_link(target.as_bytes(), buf);
             }
-            return -3; // ESRCH — pid doesn't exist
+            return -3;
         }
-        return -2; // ENOENT — unknown ns name
+        return -2;
     }
 
     if let Some((epid, "")) = strip_pid_prefix(p, "/exe") {
@@ -177,14 +162,12 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     let norm = norm_self(path, pid);
     let p = norm.as_ref();
 
-    // ── /proc/<pid>/ns  (directory listing) ───────────────────────────────
     if let Some((_tpid, "")) = strip_pid_prefix(p, "/ns") {
         let mut out = String::new();
         for name in NS_NAMES { out.push_str(name); out.push('\n'); }
         return Some(out.into_bytes());
     }
 
-    // ── /proc/<pid>/ns/<name>  (symlink content, also readable as file) ───
     if let Some((tpid, rest)) = strip_pid_prefix(p, "/ns/") {
         let name = rest.trim_end_matches('/');
         if NS_NAMES.contains(&name) {
@@ -244,8 +227,8 @@ fn generate(path: &str) -> Option<Vec<u8>> {
             if let Some(name) = crate::fs::vfs::fd_get_debug_name(fdno) {
                 return Some(name.into_bytes());
             }
-            if let Some(path) = crate::fs::vfs::fd_to_path(fdno) {
-                return Some(path.into_bytes());
+            if let Some(path2) = crate::fs::vfs::fd_to_path(fdno) {
+                return Some(path2.into_bytes());
             }
         }
     }
@@ -264,7 +247,7 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     None
 }
 
-// ─── /proc/slabinfo generator ─────────────────────────────────────────────────
+// ─── /proc/slabinfo ──────────────────────────────────────────────────────────
 
 fn gen_slabinfo() -> String {
     use crate::mm::slab::slab_stats;
@@ -294,7 +277,7 @@ fn gen_slabinfo() -> String {
     out
 }
 
-// ─── /proc/<pid>/limits generator ────────────────────────────────────────────
+// ─── /proc/<pid>/limits ──────────────────────────────────────────────────────
 
 const RLIM_INFINITY: u64 = u64::MAX;
 
@@ -333,7 +316,7 @@ fn gen_limits(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/status generator ────────────────────────────────────────────
+// ─── /proc/<pid>/status ──────────────────────────────────────────────────────
 
 fn gen_status(pid: usize) -> String {
     use crate::proc::scheduler::with_proc;
@@ -356,7 +339,7 @@ fn gen_status(pid: usize) -> String {
     )
 }
 
-// ─── /proc/<pid>/stat generator ──────────────────────────────────────────────
+// ─── /proc/<pid>/stat ────────────────────────────────────────────────────────
 
 const USER_HZ: u64 = 100;
 
@@ -430,7 +413,7 @@ fn exe_basename(exe_path: &Option<String>) -> String {
         .unwrap_or_else(|| String::from("rustos"))
 }
 
-// ─── /proc/<pid>/maps generator ──────────────────────────────────────────────
+// ─── /proc/<pid>/maps ────────────────────────────────────────────────────────
 
 fn gen_maps(pid: usize) -> String {
     let mut out = String::new();
@@ -455,7 +438,7 @@ fn gen_maps(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/fd/<N> ──────────────────────────────────────────────────────
+// ─── /proc/<pid>/fd ──────────────────────────────────────────────────────────
 
 fn gen_fd_dir(pid: usize) -> Vec<u8> {
     let _ = pid;
@@ -468,28 +451,24 @@ fn gen_fd_dir(pid: usize) -> Vec<u8> {
     out
 }
 
-// ─── open helper ─────────────────────────────────────────────────────────────
+// ─── open ─────────────────────────────────────────────────────────────────────
 
 /// Open a procfs path and return a synthetic fd number, or a negative errno.
-///
-/// The `_flags` parameter is accepted to match the call-site in
-/// `process_fd::proc_fd_open` which passes the raw `flags` word alongside the
-/// path.  Procfs files are always readable; we ignore write/create flags.
 pub fn procfs_open(path: &str, _flags: u32) -> isize {
-    // /proc/<pid>/ns/<name>: open returns a real namespace fd (NSFD_FD_BASE
-    // range) so that the caller can pass it directly to setns(2).
-    // We also seed a procfs content fd so read() returns the symlink string.
     let cur_pid = crate::proc::scheduler::current_pid();
+
+    // Delegate /proc/<pid>/mem|regs|ctl to proc_debug
+    if is_debug_path(path) {
+        return crate::fs::proc_debug::proc_debug_open(cur_pid, path);
+    }
+
     let norm = norm_self(path, cur_pid);
     let p = norm.as_ref();
     if let Some((tpid, rest)) = strip_pid_prefix(p, "/ns/") {
         let name = rest.trim_end_matches('/');
         if NS_NAMES.contains(&name) {
-            // Allocate the namespace fd via namespace module.
             let ns_fd = crate::proc::namespace::ns_fd_open(tpid, name);
             if ns_fd < 0 { return ns_fd; }
-            // Also stash content so read() works on the same fd number.
-            // Content = the symlink target string.
             if let Some(ns_id) = crate::proc::namespace::ns_id_of(tpid, name) {
                 let content = crate::proc::namespace::ns_symlink(name, ns_id)
                     .into_bytes();
@@ -497,7 +476,7 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
             }
             return ns_fd;
         }
-        return -2; // ENOENT — unknown ns name
+        return -2;
     }
     match generate(path) {
         Some(content) => {
@@ -505,8 +484,28 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
             PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0 });
             fdno as isize
         }
-        None => -2, // ENOENT
+        None => -2,
     }
+}
+
+fn is_debug_path(path: &str) -> bool {
+    // Quickly check if the leaf is mem/regs/ctl under /proc/<N>/
+    let p = if path.starts_with("/proc/self/") {
+        // norm_self not needed for this check
+        let leaf = path.trim_start_matches("/proc/self/");
+        matches!(leaf, "mem" | "regs" | "ctl")
+    } else {
+        // /proc/<digits>/<leaf>
+        if let Some(after) = path.strip_prefix("/proc/") {
+            if let Some(slash) = after.find('/') {
+                let maybe_pid = &after[..slash];
+                let leaf = &after[slash+1..];
+                maybe_pid.bytes().all(|b| b.is_ascii_digit())
+                    && matches!(leaf, "mem" | "regs" | "ctl")
+            } else { false }
+        } else { false }
+    };
+    p
 }
 
 fn next_procfs_fd() -> usize {
@@ -517,9 +516,8 @@ fn next_procfs_fd() -> usize {
     256
 }
 
-// ─── strip_pid_prefix / norm_self helpers ────────────────────────────────────
+// ─── helpers ─────────────────────────────────────────────────────────────────
 
-/// Normalise /proc/self/... → /proc/<pid>/...
 fn norm_self(path: &str, pid: usize) -> Cow<'static, str> {
     if path.starts_with("/proc/self") {
         Cow::Owned(path.replacen("/proc/self", &format!("/proc/{}", pid), 1))

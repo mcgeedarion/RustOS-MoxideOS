@@ -1,29 +1,23 @@
 //! ptrace(2) — process tracing and debugging interface.
 //!
-//! ## Bug fixes
+//! ## Status
+//! The ptrace syscall (NR 101) is now a compatibility stub that returns EPERM.
+//! All functional debugging is provided through /proc/<pid>/mem, /proc/<pid>/regs,
+//! and /proc/<pid>/ctl — see src/fs/proc_debug.rs.
 //!
-//! ### build_user_regs: UREG_CS was 0x1b (32-bit compat CS)
-//!   64-bit user CS must be 0x33. gdb inspects this field to select
-//!   32-bit vs 64-bit mode; 0x1b caused all register display and
-//!   disassembly to be parsed in 32-bit mode.
-//!
-//! ### ptrace_syscall_stop: send_signal(tracer, sig) type mismatch
-//!   sig is u32 but send_signal expects i32. Won't compile. Fixed with
-//!   explicit `sig as i32` cast.
-//!
-//! ### with_proc_mut closures (post-S2)
-//!   All with_proc_mut closures updated to take (p, _pl). None of these
-//!   sites change p.state so the pl handle is unused.
+//! The PTRACE_* constants, PtraceState enum, build_user_regs_pub, and
+//! apply_user_regs_pub are kept here because they are shared with:
+//!   - proc/process.rs  (PtraceState field)
+//!   - proc/wait.rs     (PTRACE_O_* options)
+//!   - fs/proc_debug.rs (register serialisation)
+//!   - proc/signal.rs   (ptrace_syscall_stop)
 
 extern crate alloc;
 
-use crate::arch::api::{Paging, PageFlags};
-use crate::arch::Arch;
 use crate::proc::scheduler;
 use crate::proc::signal::send_signal;
-use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ── Constants ───────────────────────────────────────────────────────────────────
+// ── Constants (kept for wait.rs / signal.rs consumers) ──────────────────────
 
 pub const PTRACE_TRACEME:     i32 = 0;
 pub const PTRACE_PEEKTEXT:    i32 = 1;
@@ -52,14 +46,62 @@ pub const PTRACE_O_TRACEEXIT:    u64 = 0x00000040;
 pub const PTRACE_O_EXITKILL:     u64 = 0x00100000;
 pub const PTRACE_O_MASK:         u64 = 0x001000ff;
 
-const FRAME_SZ:  usize = 17 * 8;
-const RFLAGS_TF: usize = 1 << 8;
+// ── Register layout constants (shared with proc_debug.rs) ───────────────────
 
-// FIX: 64-bit ring-3 CS is 0x33 (RPL=3, TI=0, index=6).
+pub const FRAME_SZ:  usize = 17 * 8;
+
+const F_R15: usize = 0;
+const F_R14: usize = 1;
+const F_R13: usize = 2;
+const F_R12: usize = 3;
+const F_RBP: usize = 4;
+const F_RBX: usize = 5;
+const F_RAX: usize = 6;
+const F_RDI: usize = 7;
+const F_RSI: usize = 8;
+const F_RDX: usize = 9;
+const F_R10: usize = 10;
+const F_R8:  usize = 11;
+const F_R9:  usize = 12;
+const F_RCX: usize = 13;
+const F_R11: usize = 14; // RFLAGS on SYSRET path
+const F_RSP: usize = 15;
+const F_RIP: usize = 16;
+
+// Linux user_regs_struct offsets
+pub const UREG_R15:      usize = 0;
+pub const UREG_R14:      usize = 1;
+pub const UREG_R13:      usize = 2;
+pub const UREG_R12:      usize = 3;
+pub const UREG_RBP:      usize = 4;
+pub const UREG_RBX:      usize = 5;
+pub const UREG_R11:      usize = 6;
+pub const UREG_R10:      usize = 7;
+pub const UREG_R9:       usize = 8;
+pub const UREG_R8:       usize = 9;
+pub const UREG_RAX:      usize = 10;
+pub const UREG_RCX:      usize = 11;
+pub const UREG_RDX:      usize = 12;
+pub const UREG_RSI:      usize = 13;
+pub const UREG_RDI:      usize = 14;
+pub const UREG_ORIG_RAX: usize = 15;
+pub const UREG_RIP:      usize = 16;
+pub const UREG_CS:       usize = 17;
+pub const UREG_EFLAGS:   usize = 18;
+pub const UREG_RSP:      usize = 19;
+pub const UREG_SS:       usize = 20;
+pub const UREG_FS_BASE:  usize = 21;
+pub const UREG_GS_BASE:  usize = 22;
+pub const UREG_DS:       usize = 23;
+pub const UREG_ES:       usize = 24;
+pub const UREG_FS:       usize = 25;
+pub const UREG_GS:       usize = 26;
+pub const UREG_COUNT:    usize = 27;
+
 const USER_CS64: u64 = 0x33;
 const USER_SS:   u64 = 0x2b;
 
-// ── PtraceState ────────────────────────────────────────────────────────────────
+// ── PtraceState ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtraceState {
@@ -80,66 +122,14 @@ impl Default for PtraceState {
     fn default() -> Self { PtraceState::None }
 }
 
-// ── SyscallFrame field offsets ─────────────────────────────────────────────────
-
-const F_R15: usize = 0;
-const F_R14: usize = 1;
-const F_R13: usize = 2;
-const F_R12: usize = 3;
-const F_RBP: usize = 4;
-const F_RBX: usize = 5;
-const F_RAX: usize = 6;
-const F_RDI: usize = 7;
-const F_RSI: usize = 8;
-const F_RDX: usize = 9;
-const F_R10: usize = 10;
-const F_R8:  usize = 11;
-const F_R9:  usize = 12;
-const F_RCX: usize = 13;
-const F_R11: usize = 14;
-const F_RSP: usize = 15;
-const F_RIP: usize = 16;
-
-// ── Linux user_regs_struct offsets ────────────────────────────────────────────
-
-const UREG_R15:      usize = 0;
-const UREG_R14:      usize = 1;
-const UREG_R13:      usize = 2;
-const UREG_R12:      usize = 3;
-const UREG_RBP:      usize = 4;
-const UREG_RBX:      usize = 5;
-const UREG_R11:      usize = 6;
-const UREG_R10:      usize = 7;
-const UREG_R9:       usize = 8;
-const UREG_R8:       usize = 9;
-const UREG_RAX:      usize = 10;
-const UREG_RCX:      usize = 11;
-const UREG_RDX:      usize = 12;
-const UREG_RSI:      usize = 13;
-const UREG_RDI:      usize = 14;
-const UREG_ORIG_RAX: usize = 15;
-const UREG_RIP:      usize = 16;
-const UREG_CS:       usize = 17;
-const UREG_EFLAGS:   usize = 18;
-const UREG_RSP:      usize = 19;
-const UREG_SS:       usize = 20;
-const UREG_FS_BASE:  usize = 21;
-const UREG_GS_BASE:  usize = 22;
-const UREG_DS:       usize = 23;
-const UREG_ES:       usize = 24;
-const UREG_FS:       usize = 25;
-const UREG_GS:       usize = 26;
-const UREG_COUNT:    usize = 27;
-
-// ── Frame accessor ─────────────────────────────────────────────────────────────
+// ── Public register helpers (used by proc_debug.rs) ─────────────────────────
 
 unsafe fn frame_ptr(kstack_top: usize) -> *mut usize {
     (kstack_top - FRAME_SZ) as *mut usize
 }
 
-// ── Build a Linux user_regs_struct ────────────────────────────────────────────
-
-fn build_user_regs(kstack_top: usize, fs_base: usize) -> [u64; UREG_COUNT] {
+/// Build a Linux `user_regs_struct` from the saved kernel stack frame.
+pub fn build_user_regs_pub(kstack_top: usize, fs_base: usize) -> [u64; UREG_COUNT] {
     let f = unsafe { core::slice::from_raw_parts(frame_ptr(kstack_top), 17) };
     let mut regs = [0u64; UREG_COUNT];
     regs[UREG_R15]      = f[F_R15]  as u64;
@@ -172,9 +162,8 @@ fn build_user_regs(kstack_top: usize, fs_base: usize) -> [u64; UREG_COUNT] {
     regs
 }
 
-// ── Apply user_regs_struct back to the frame ──────────────────────────────────
-
-fn apply_user_regs(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
+/// Apply a `user_regs_struct` back to the saved kernel stack frame.
+pub fn apply_user_regs_pub(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
     let f = unsafe { core::slice::from_raw_parts_mut(frame_ptr(kstack_top), 17) };
     f[F_R15] = regs[UREG_R15]    as usize;
     f[F_R14] = regs[UREG_R14]    as usize;
@@ -195,308 +184,15 @@ fn apply_user_regs(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
     f[F_RIP] = regs[UREG_RIP]    as usize;
 }
 
-// ── PEEKUSER / POKEUSER ───────────────────────────────────────────────────────
+// ── sys_ptrace stub ─────────────────────────────────────────────────────────
 
-fn peekuser_word(kstack_top: usize, fs_base: usize, byte_off: usize) -> u64 {
-    let word_idx = byte_off / 8;
-    if word_idx < UREG_COUNT {
-        let regs = build_user_regs(kstack_top, fs_base);
-        regs[word_idx]
-    } else {
-        0
-    }
+/// NR 101. All functionality has moved to /proc/<pid>/mem|regs|ctl.
+/// Returns EPERM unconditionally so existing callers fail clearly.
+pub fn sys_ptrace(_req: i32, _pid: i32, _addr: usize, _data: usize) -> isize {
+    -1 // EPERM
 }
 
-fn pokeuser_word(kstack_top: usize, byte_off: usize, val: u64) -> isize {
-    let word_idx = byte_off / 8;
-    if word_idx >= UREG_COUNT { return 0; }
-    let f = unsafe { core::slice::from_raw_parts_mut(frame_ptr(kstack_top), 17) };
-    match word_idx {
-        UREG_R15                  => f[F_R15] = val as usize,
-        UREG_R14                  => f[F_R14] = val as usize,
-        UREG_R13                  => f[F_R13] = val as usize,
-        UREG_R12                  => f[F_R12] = val as usize,
-        UREG_RBP                  => f[F_RBP] = val as usize,
-        UREG_RBX                  => f[F_RBX] = val as usize,
-        UREG_R11                  => f[F_R11] = val as usize,
-        UREG_R10                  => f[F_R10] = val as usize,
-        UREG_R9                   => f[F_R9]  = val as usize,
-        UREG_R8                   => f[F_R8]  = val as usize,
-        UREG_RAX | UREG_ORIG_RAX  => f[F_RAX] = val as usize,
-        UREG_RCX                  => f[F_RCX] = val as usize,
-        UREG_RDX                  => f[F_RDX] = val as usize,
-        UREG_RSI                  => f[F_RSI] = val as usize,
-        UREG_RDI                  => f[F_RDI] = val as usize,
-        UREG_RIP => { f[F_RCX] = val as usize; f[F_RIP] = val as usize; }
-        UREG_EFLAGS               => f[F_R11] = val as usize,
-        UREG_RSP                  => f[F_RSP] = val as usize,
-        _ => {}
-    }
-    0
-}
-
-// ── PEEKDATA / POKEDATA ───────────────────────────────────────────────────────
-
-fn peek_tracee_word(cr3: usize, addr: usize) -> Option<u64> {
-    let pa = <Arch as Paging>::virt_to_phys(cr3, addr)?;
-    Some(unsafe { (pa as *const u64).read_unaligned() })
-}
-
-fn poke_tracee_word(cr3: usize, addr: usize, val: u64) -> bool {
-    let pa = match <Arch as Paging>::virt_to_phys(cr3, addr) {
-        Some(p) => p,
-        None    => return false,
-    };
-    unsafe { (pa as *mut u64).write_unaligned(val); }
-    true
-}
-
-// ── Permission check ──────────────────────────────────────────────────────────
-
-fn may_trace(tracer_pid: usize, target_pid: usize) -> bool {
-    scheduler::with_proc(target_pid, |p| p.ppid == tracer_pid).unwrap_or(false)
-    || scheduler::with_proc(tracer_pid, |p| {
-        p.caps.has_cap(crate::security::CAP_SYS_PTRACE)
-    }).unwrap_or(false)
-}
-
-// ── sys_ptrace ────────────────────────────────────────────────────────────────
-
-pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
-    let caller = scheduler::current_pid();
-    let target = pid as usize;
-
-    match req {
-        PTRACE_TRACEME => {
-            scheduler::with_proc_mut(caller, |p, _pl| {
-                if p.ptrace_state != PtraceState::None {
-                    return -16isize;
-                }
-                p.ptrace_state = PtraceState::Tracee {
-                    tracer: p.ppid,
-                    options: 0,
-                    in_syscall_stop: false,
-                };
-                0isize
-            }).unwrap_or(-3)
-        }
-
-        PTRACE_ATTACH => {
-            if target == caller { return -1; }
-            if !may_trace(caller, target) { return -1; }
-            let ok = scheduler::with_proc_mut(target, |p, _pl| {
-                if p.ptrace_state != PtraceState::None { return false; }
-                p.ptrace_state = PtraceState::Tracee {
-                    tracer: caller,
-                    options: 0,
-                    in_syscall_stop: false,
-                };
-                true
-            }).unwrap_or(false);
-            if !ok { return -16; }
-            send_signal(target, 19);
-            0
-        }
-
-        PTRACE_DETACH => {
-            let found = scheduler::with_proc_mut(target, |p, _pl| {
-                match p.ptrace_state {
-                    PtraceState::Tracee { tracer, .. } |
-                    PtraceState::Stopped { tracer, .. } if tracer == caller => {
-                        p.ptrace_state = PtraceState::None;
-                        if p.kstack_top != 0 {
-                            let f = unsafe {
-                                core::slice::from_raw_parts_mut(frame_ptr(p.kstack_top), 17)
-                            };
-                            f[F_R11] &= !RFLAGS_TF;
-                        }
-                        true
-                    }
-                    _ => false,
-                }
-            }).unwrap_or(false);
-            if !found { return -3; }
-            if data != 0 { send_signal(target, data as i32); }
-            scheduler::wake_pid(target);
-            0
-        }
-
-        PTRACE_CONT => {
-            let found = scheduler::with_proc_mut(target, |p, _pl| {
-                match p.ptrace_state {
-                    PtraceState::Stopped { tracer, options, .. } if tracer == caller => {
-                        p.ptrace_state = PtraceState::Tracee {
-                            tracer,
-                            options,
-                            in_syscall_stop: false,
-                        };
-                        true
-                    }
-                    PtraceState::Tracee { tracer, .. } if tracer == caller => true,
-                    _ => false,
-                }
-            }).unwrap_or(false);
-            if !found { return -3; }
-            if data != 0 { send_signal(target, data as i32); }
-            scheduler::wake_pid(target);
-            0
-        }
-
-        PTRACE_KILL => {
-            send_signal(target, 9);
-            0
-        }
-
-        PTRACE_SINGLESTEP => {
-            let found = scheduler::with_proc_mut(target, |p, _pl| {
-                match p.ptrace_state {
-                    PtraceState::Stopped { tracer, options, .. } if tracer == caller => {
-                        p.ptrace_state = PtraceState::Tracee {
-                            tracer,
-                            options,
-                            in_syscall_stop: false,
-                        };
-                        if p.kstack_top != 0 {
-                            let f = unsafe {
-                                core::slice::from_raw_parts_mut(frame_ptr(p.kstack_top), 17)
-                            };
-                            f[F_R11] |= RFLAGS_TF;
-                        }
-                        true
-                    }
-                    _ => false,
-                }
-            }).unwrap_or(false);
-            if !found { return -3; }
-            if data != 0 { send_signal(target, data as i32); }
-            scheduler::wake_pid(target);
-            0
-        }
-
-        PTRACE_SYSCALL => {
-            let found = scheduler::with_proc_mut(target, |p, _pl| {
-                match p.ptrace_state {
-                    PtraceState::Stopped { tracer, options, .. } if tracer == caller => {
-                        p.ptrace_state = PtraceState::Tracee {
-                            tracer,
-                            options,
-                            in_syscall_stop: true,
-                        };
-                        true
-                    }
-                    _ => false,
-                }
-            }).unwrap_or(false);
-            if !found { return -3; }
-            if data != 0 { send_signal(target, data as i32); }
-            scheduler::wake_pid(target);
-            0
-        }
-
-        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
-            let cr3 = match scheduler::with_proc(target, |p| p.user_satp) {
-                Some(c) if c != 0 => c,
-                _ => return -3,
-            };
-            match peek_tracee_word(cr3, addr) {
-                Some(word) => {
-                    if data != 0 {
-                        if !copy_to_user(data, &word.to_le_bytes()) { return -14; }
-                    }
-                    word as isize
-                }
-                None => -14,
-            }
-        }
-
-        PTRACE_POKETEXT | PTRACE_POKEDATA => {
-            let cr3 = match scheduler::with_proc(target, |p| p.user_satp) {
-                Some(c) if c != 0 => c,
-                _ => return -3,
-            };
-            if poke_tracee_word(cr3, addr, data as u64) { 0 } else { -14 }
-        }
-
-        PTRACE_PEEKUSER => {
-            let (kstack_top, fs_base) = match scheduler::with_proc(target, |p| {
-                (p.kstack_top, p.ctx.fs_base)
-            }) {
-                Some(v) => v,
-                None    => return -3,
-            };
-            if kstack_top == 0 { return -3; }
-            let word = peekuser_word(kstack_top, fs_base, addr);
-            if data != 0 {
-                if !copy_to_user(data, &word.to_le_bytes()) { return -14; }
-            }
-            word as isize
-        }
-
-        PTRACE_POKEUSER => {
-            let kstack_top = match scheduler::with_proc(target, |p| p.kstack_top) {
-                Some(k) if k != 0 => k,
-                _ => return -3,
-            };
-            pokeuser_word(kstack_top, addr, data as u64)
-        }
-
-        PTRACE_GETREGS => {
-            let (kstack_top, fs_base) = match scheduler::with_proc(target, |p| {
-                (p.kstack_top, p.ctx.fs_base)
-            }) {
-                Some(v) => v,
-                None    => return -3,
-            };
-            if kstack_top == 0 { return -3; }
-            let regs = build_user_regs(kstack_top, fs_base);
-            let bytes = unsafe {
-                core::slice::from_raw_parts(regs.as_ptr() as *const u8, UREG_COUNT * 8)
-            };
-            if !copy_to_user(data, bytes) { return -14; }
-            0
-        }
-
-        PTRACE_SETREGS => {
-            let kstack_top = match scheduler::with_proc(target, |p| p.kstack_top) {
-                Some(k) if k != 0 => k,
-                _ => return -3,
-            };
-            let mut buf = [0u8; UREG_COUNT * 8];
-            if copy_from_user(&mut buf, addr).is_err() { return -14; }
-            let mut regs = [0u64; UREG_COUNT];
-            for i in 0..UREG_COUNT {
-                regs[i] = u64::from_le_bytes(buf[i*8..(i+1)*8].try_into().unwrap());
-            }
-            apply_user_regs(kstack_top, &regs);
-            0
-        }
-
-        PTRACE_SETOPTIONS => {
-            let opts = (data as u64) & PTRACE_O_MASK;
-            scheduler::with_proc_mut(target, |p, _pl| {
-                match &mut p.ptrace_state {
-                    PtraceState::Tracee  { options, .. } => { *options = opts; }
-                    PtraceState::Stopped { options, .. } => { *options = opts; }
-                    PtraceState::None => {}
-                }
-            });
-            0
-        }
-
-        PTRACE_GETEVENTMSG => {
-            let event = match scheduler::with_proc(target, |p| p.ptrace_event) {
-                Some(e) => e,
-                None    => return -3,
-            };
-            if !copy_to_user(data, &event.to_le_bytes()) { return -14; }
-            0
-        }
-
-        _ => -22,
-    }
-}
-
-// ── Called by the syscall entry path ──────────────────────────────────────────
+// ── ptrace_syscall_stop (still needed by signal.rs) ──────────────────────────
 
 pub fn ptrace_syscall_stop() {
     let pid = scheduler::current_pid();
