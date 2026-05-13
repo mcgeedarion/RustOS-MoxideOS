@@ -13,17 +13,11 @@
 //! ## Signal delivery hook
 //!   After every ecall (scause = 8) the handler calls
 //!   `signal::check_and_deliver(frame)` so that pending signals are delivered
-//!   before the task returns to userspace.  The same call is made after
-//!   interrupt handlers that call `schedule()` (timer IRQ, IPI reschedule)
-//!   because those may wake a task that has a pending signal.
-//!
-//!   NR 139 (rt_sigreturn) is intercepted **before** `dispatch` is called so
-//!   that `sys_rt_sigreturn` receives the live TrapFrame pointer.  It must NOT
-//!   call `check_and_deliver` afterwards — the restored frame already is the
-//!   pre-signal state.
+//!   before the task returns to userspace.
 
 use core::arch::asm;
 use crate::arch::riscv64::csr::*;
+use crate::arch::riscv64::mem_layout::{scause as SC, sstatus as SS, sie as SIE, trap as TF};
 use crate::mm::mmap::{VmaKind, PROT_READ, PROT_WRITE, PROT_EXEC};
 
 /// Trap frame saved by `riscv_trap_entry` (34 × 8 = 272 bytes).
@@ -52,11 +46,11 @@ pub struct TrapFrame {
     pub sstatus: usize,
 }
 
-pub const TRAP_FRAME_SIZE: usize = 34 * 8;   // 272
+pub const TRAP_FRAME_SIZE: usize = TF::FRAME_SIZE;
 
-// sstatus bits used by clone/exec/signal frame setup.
-pub const SSTATUS_SPP:  usize = 1 << 8;   // 1 = S-mode, 0 = U-mode
-pub const SSTATUS_SPIE: usize = 1 << 5;   // interrupts enabled after sret
+// Re-export for consumers that use these directly.
+pub use crate::arch::riscv64::mem_layout::sstatus::{SSTATUS_SPP  = SPP};
+pub use crate::arch::riscv64::mem_layout::sstatus::{SSTATUS_SPIE = SPIE};
 
 #[naked]
 #[no_mangle]
@@ -93,7 +87,6 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t4, 28*8(sp)",
         "sd   t5, 29*8(sp)",
         "sd   t6, 30*8(sp)",
-        // Save user sp: kstack_sp + TRAP_FRAME_SIZE was the pre-trap sp.
         "addi t0, sp, {frame_size}",
         "sd   t0, 1*8(sp)",
         "csrr t0, sepc",
@@ -102,9 +95,6 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "sd   t0, 32*8(sp)",
         "mv   a0, sp",
         "call {handler}",
-        // ── trap_return ─────────────────────────────────────────────────────────────
-        // Also jumped to directly by task_entry_trampoline (context.rs) and
-        // by do_execve_riscv after rebuilding the TrapFrame in-place.
         ".global trap_return",
         "trap_return:",
         "ld   t0, 31*8(sp)",
@@ -143,7 +133,7 @@ pub unsafe extern "C" fn riscv_trap_entry() {
         "ld   t6, 30*8(sp)",
         "ld   sp,  1*8(sp)",
         "sret",
-        frame_size = const TRAP_FRAME_SIZE,
+        frame_size = const TF::FRAME_SIZE,
         handler    = sym riscv_trap_handler,
         options(noreturn)
     );
@@ -152,23 +142,23 @@ pub unsafe extern "C" fn riscv_trap_entry() {
 #[no_mangle]
 pub extern "C" fn riscv_trap_handler(frame: &mut TrapFrame) {
     let scause  = get_scause();
-    let is_intr = scause >> 63 != 0;
-    let code    = scause & !(1usize << 63);
+    let is_intr = scause & SC::INTERRUPT_BIT != 0;
+    let code    = scause & !SC::INTERRUPT_BIT;
     if is_intr { handle_interrupt(frame, code); }
     else       { handle_exception(frame, code); }
 }
 
 fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
     match code {
-        1 => {
+        SC::INT_S_SOFTWARE => {
             unsafe { asm!("csrci sip, 2", options(nostack, nomem)); }
             let cpu_id = crate::smp::percpu::current_cpu_id();
             crate::smp::ipi::dispatch(cpu_id);
             crate::proc::signal::check_and_deliver(frame);
         }
-        5 => {
+        SC::INT_S_TIMER => {
             let sie = csrr!("sie");
-            csrw!("sie", sie & !(1usize << 5));
+            csrw!("sie", sie & !SIE::STIE);
             crate::time::tick_advance(crate::proc::scheduler::TICK_NS);
             crate::time::timer::expire_timers();
             crate::proc::scheduler::schedule();
@@ -176,26 +166,19 @@ fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
                 0, crate::proc::scheduler::TICK_NS,
             );
             let sie2 = csrr!("sie");
-            csrw!("sie", sie2 | (1usize << 5));
+            csrw!("sie", sie2 | SIE::STIE);
             crate::proc::signal::check_and_deliver(frame);
         }
-        9 => { crate::drivers::plic::handle_irq(); }
+        SC::INT_S_EXTERNAL => { crate::drivers::plic::handle_irq(); }
         _ => {}
     }
 }
 
 fn handle_exception(frame: &mut TrapFrame, code: usize) {
     match code {
-        // ── Breakpoint (ebreak / gdbstub) ─────────────────────────────────────────
-        3 => {
+        SC::EXC_BREAKPOINT => {
             #[cfg(feature = "gdbstub")]
             {
-                // Hand off to the GDB stub.  The stub blocks on SBI console
-                // until GDB sends D (detach) or k (kill), modifying the live
-                // TrapFrame in-place for any register/PC writes GDB issues.
-                // We return immediately after — do NOT call check_and_deliver
-                // here because the stub may have rewritten sepc/sstatus and
-                // we must not clobber that with a signal frame.
                 let pid = crate::proc::scheduler::current_pid();
                 unsafe {
                     crate::gdbstub::gdb_trap_rv(
@@ -205,7 +188,6 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
                 }
                 return;
             }
-            // gdbstub feature disabled: deliver SIGTRAP to the faulting task.
             #[cfg(not(feature = "gdbstub"))]
             {
                 let pid = crate::proc::scheduler::current_pid();
@@ -214,40 +196,34 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             }
         }
 
-        // ── Syscall ────────────────────────────────────────────────────────────
-        8 => {
+        SC::EXC_ECALL_U => {
             let nr = frame.a7;
-
-            // NR 139 (rt_sigreturn) must be handled here, not through
-            // dispatch(), so that sys_rt_sigreturn can modify the live
-            // TrapFrame directly.  Do NOT call check_and_deliver after it —
-            // the restored frame IS the pre-signal state.
             if nr == 139 {
-                frame.sepc = frame.sepc.wrapping_add(4);
+                frame.sepc = frame.sepc.wrapping_add(TF::INSN_SIZE);
                 crate::proc::signal::sys_rt_sigreturn(frame);
                 return;
             }
-
             let ret = crate::syscall::dispatch(
                 nr, frame.a0, frame.a1, frame.a2, frame.a3, frame.a4, frame.a5,
             );
             frame.a0   = ret as usize;
-            frame.sepc = frame.sepc.wrapping_add(4);
+            frame.sepc = frame.sepc.wrapping_add(TF::INSN_SIZE);
             crate::proc::signal::check_and_deliver(frame);
         }
 
-        // ── Page faults ─────────────────────────────────────────────────────
-        12 | 13 | 15 => {
+        SC::EXC_INSN_PAGE_FAULT |
+        SC::EXC_LOAD_PAGE_FAULT |
+        SC::EXC_STORE_PAGE_FAULT => {
             let stval       = csrr!("stval");
-            let faulting_va = stval & !0xFFF;
+            let faulting_va = stval & !crate::arch::riscv64::mem_layout::page::MASK;
             let pid         = crate::proc::scheduler::current_pid();
             if let Some(vma) = crate::mm::mmap::find_vma(pid, stval) {
-                if code == 15 && vma.prot & PROT_WRITE == 0 {
+                if code == SC::EXC_STORE_PAGE_FAULT && vma.prot & PROT_WRITE == 0 {
                     crate::proc::signal::send_sigsegv(pid as usize, stval);
                     crate::proc::signal::check_and_deliver(frame);
                     return;
                 }
-                if code == 12 && vma.prot & PROT_EXEC == 0 {
+                if code == SC::EXC_INSN_PAGE_FAULT && vma.prot & PROT_EXEC == 0 {
                     crate::proc::signal::send_sigsegv(pid as usize, stval);
                     crate::proc::signal::check_and_deliver(frame);
                     return;
@@ -260,12 +236,13 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
                         return;
                     }
                 };
-                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
-                let mut pte_bits: u64 = (1 << 0) | (1 << 4);
-                if vma.prot & PROT_READ  != 0 { pte_bits |= 1 << 1; }
-                if vma.prot & PROT_WRITE != 0 { pte_bits |= 1 << 2; }
-                if vma.prot & PROT_EXEC  != 0 { pte_bits |= 1 << 3; }
-                if pte_bits & 0b1110 == 0      { pte_bits |= 1 << 1; }
+                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, crate::arch::riscv64::mem_layout::page::SIZE); }
+                use crate::arch::riscv64::mem_layout::sv39;
+                let mut pte_bits: u64 = sv39::PTE_V as u64 | sv39::PTE_U as u64;
+                if vma.prot & PROT_READ  != 0 { pte_bits |= sv39::PTE_R as u64; }
+                if vma.prot & PROT_WRITE != 0 { pte_bits |= sv39::PTE_W as u64; }
+                if vma.prot & PROT_EXEC  != 0 { pte_bits |= sv39::PTE_X as u64; }
+                if pte_bits & 0b1110 == 0      { pte_bits |= sv39::PTE_R as u64; }
                 riscv_map_page(faulting_va, pa, pte_bits);
                 unsafe { asm!("sfence.vma {va}, zero", va = in(reg) faulting_va); }
                 return;
@@ -274,17 +251,15 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
             crate::proc::signal::check_and_deliver(frame);
         }
 
-        // ── Illegal instruction ───────────────────────────────────────────────
-        2 => {
+        SC::EXC_ILLEGAL_INSN => {
             let pid = crate::proc::scheduler::current_pid();
-            crate::proc::signal::send_signal(pid as usize, 4);
+            crate::proc::signal::send_signal(pid as usize, 4); // SIGILL
             crate::proc::signal::check_and_deliver(frame);
         }
 
-        // ── All other exceptions ──────────────────────────────────────────────
         _ => {
             let pid = crate::proc::scheduler::current_pid();
-            crate::proc::signal::send_signal(pid as usize, 11);
+            crate::proc::signal::send_signal(pid as usize, 11); // SIGSEGV
             crate::proc::signal::check_and_deliver(frame);
         }
     }
@@ -293,9 +268,9 @@ fn handle_exception(frame: &mut TrapFrame, code: usize) {
 pub fn trap_init() {
     set_stvec(riscv_trap_entry as usize);
     let sie = csrr!("sie");
-    csrw!("sie", sie | (1 << 1) | (1 << 5) | (1 << 9));
+    csrw!("sie", sie | SIE::ALL);
     let sstatus = csrr!("sstatus");
-    csrw!("sstatus", sstatus | (1 << 1));
+    csrw!("sstatus", sstatus | SS::SIE);
 }
 
 #[naked]
@@ -304,9 +279,9 @@ pub unsafe extern "C" fn sret_trampoline() -> ! {
     asm!(
         "csrw sepc, a0",
         "mv   sp, a1",
-        "li   t0, 0x120",
+        "li   t0, 0x120",   // SPP | SPIE
         "csrc sstatus, t0",
-        "li   t0, 0x20",
+        "li   t0, 0x20",    // SPIE
         "csrs sstatus, t0",
         "sret",
         options(noreturn)
@@ -314,10 +289,11 @@ pub unsafe extern "C" fn sret_trampoline() -> ! {
 }
 
 fn riscv_map_page(va: usize, pa: usize, pte_bits: u64) {
+    use crate::arch::riscv64::mem_layout::{page as P, sv39 as SV};
     let satp  = get_satp();
-    let root  = (satp & 0x0FFF_FFFF_FFFF) << 12;
-    let vpn   = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
-    let ppn   = (pa >> 12) as u64;
+    let root  = (satp & SV::SATP_PPN_MASK) << P::SHIFT;
+    let vpn   = [SV::vpn0(va), SV::vpn1(va), SV::vpn2(va)];
+    let ppn   = (pa >> P::SHIFT) as u64;
     unsafe {
         let mut pt = root as *mut u64;
         for level in (1..=2).rev() {
@@ -326,14 +302,17 @@ fn riscv_map_page(va: usize, pa: usize, pte_bits: u64) {
             if pte & 1 == 0 {
                 let next_pa = crate::mm::pmm::alloc_page()
                     .expect("OOM while walking page table in trap handler");
-                core::ptr::write_bytes(next_pa as *mut u8, 0, 4096);
-                core::ptr::write_volatile(pte_ptr, ((next_pa as u64 >> 12) << 10) | 1);
+                core::ptr::write_bytes(next_pa as *mut u8, 0, P::SIZE);
+                core::ptr::write_volatile(
+                    pte_ptr,
+                    ((next_pa as u64 >> P::SHIFT) << SV::PPN_SHIFT as u64) | SV::PTE_V as u64,
+                );
                 pt = next_pa as *mut u64;
             } else {
-                pt = (((pte >> 10) << 12) as usize) as *mut u64;
+                pt = (((pte >> SV::PPN_SHIFT as u64) << P::SHIFT as u64) as usize) as *mut u64;
             }
         }
         let leaf = pt.add(vpn[0]);
-        core::ptr::write_volatile(leaf, (ppn << 10) | pte_bits);
+        core::ptr::write_volatile(leaf, (ppn << SV::PPN_SHIFT as u64) | pte_bits);
     }
 }

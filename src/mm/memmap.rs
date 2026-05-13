@@ -8,25 +8,16 @@
 //!   1. UEFI memory map  — stored by uefi_entry.rs in UEFI_MMAP.
 //!   2. Multiboot2 mmap  — EBX pointer stored by _start in MB2_INFO_PA.
 //!
-//! We detect which is present via the boot_source() flag.
-//!
 //! ## Physical-to-virtual translation
 //!
-//! All arch-specific PA → VA translation is delegated to
-//! `crate::arch::x86_64::mem_layout::higher_half::phys_to_virt` (x86_64)
-//! or the RISC-V equivalent.  No local copy of PHYS_OFFSET lives here.
+//! All arch-specific PA → VA translation is delegated to the arch
+//! `mem_layout` module.  No local copy of PHYS_OFFSET lives here.
 
 /// How this kernel instance was booted.
 #[derive(Clone, Copy, PartialEq)]
 pub enum BootSource { Uefi, Multiboot2, Unknown }
 
-/// Set by the appropriate entry point before kernel_main runs.
 pub static mut BOOT_SOURCE: BootSource = BootSource::Unknown;
-
-// ── Physical-to-virtual translation (physmap window) ──────────────────────────
-//
-// Delegates to the arch mem_layout module so there is only ONE definition
-// of PHYS_OFFSET in the entire codebase.
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -37,6 +28,9 @@ fn phys_to_virt(pa: u64) -> usize {
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn phys_to_virt(pa: u64) -> usize {
+    // RISC-V: PHYS_OFFSET is determined by the linker script (not a fixed
+    // constant).  Read KERNEL_PHYS_BASE, which the linker exports, and
+    // use it as the physmap window base.
     extern "C" { static KERNEL_PHYS_BASE: usize; }
     unsafe { pa as usize + KERNEL_PHYS_BASE }
 }
@@ -50,8 +44,6 @@ pub static mut UEFI_DESC_SIZE: usize = 0;
 const EFI_CONVENTIONAL: u32 = 7;
 
 fn ingest_uefi() {
-    // UEFI_MMAP_BUF is a static in the kernel's own BSS; its address is
-    // already a valid kernel VA — no phys_to_virt() translation needed.
     let buf  = unsafe { &UEFI_MMAP_BUF[..UEFI_MMAP_SIZE] };
     let dsz  = unsafe { UEFI_DESC_SIZE };
     if dsz == 0 { return; }
@@ -69,28 +61,19 @@ fn ingest_uefi() {
 
 // ── Multiboot2 memory map ─────────────────────────────────────────────────────
 
-/// Physical address of the Multiboot2 info structure.
-/// Set by the MB2 entry point (_start in asm) before jumping to kernel_main.
-/// Must be translated to a kernel VA via phys_to_virt() before any
-/// pointer dereference.
 pub static mut MB2_INFO_PA: u64 = 0;
 
 const MB2_TAG_MMAP:  u32 = 6;
 const MB2_TAG_END:   u32 = 0;
 const MB2_MEM_AVAIL: u32 = 1;
-/// Sanity cap on the MB2 info total_size field.
-/// No legitimate Multiboot2 info structure exceeds 64 KiB.
 const MB2_MAX_INFO_SIZE: usize = 65536;
 
 fn ingest_multiboot2() {
     let info_pa = unsafe { MB2_INFO_PA };
     if info_pa == 0 { return; }
-
     let info_va = phys_to_virt(info_pa);
-
     let raw_total = unsafe { (info_va as *const u32).read_unaligned() } as usize;
     let total_size = raw_total.min(MB2_MAX_INFO_SIZE);
-
     let mut off = 8usize;
     while off + 8 <= total_size {
         let tag_va   = info_va + off;
@@ -98,13 +81,9 @@ fn ingest_multiboot2() {
         let tag_size = unsafe { ((tag_va + 4) as *const u32).read_unaligned() } as usize;
         if tag_size < 8 { break; }
         if tag_type == MB2_TAG_END { break; }
-
         if tag_type == MB2_TAG_MMAP {
             let entry_size = unsafe { ((tag_va + 8) as *const u32).read_unaligned() } as usize;
-            if entry_size == 0 {
-                off += (tag_size + 7) & !7;
-                continue;
-            }
+            if entry_size == 0 { off += (tag_size + 7) & !7; continue; }
             let entries_off = 16usize;
             let entries_end = tag_size;
             let mut e = entries_off;
@@ -125,8 +104,6 @@ fn ingest_multiboot2() {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Ingest the boot memory map into the PMM.
-/// Call once in kernel_main, after heap_init().
 pub fn memmap_init() {
     match unsafe { BOOT_SOURCE } {
         BootSource::Uefi       => ingest_uefi(),

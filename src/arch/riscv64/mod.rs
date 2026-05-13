@@ -1,9 +1,12 @@
-//! RISC-V 64 architecture module.
-
 pub mod boot;
 pub mod csr;
 pub mod fdt;
 pub mod hal;
+pub mod mem_layout;
 pub mod paging;
 pub mod smp;
+pub mod syscall;
 pub mod trap;
+pub mod trampoline;
+pub mod uefi_entry;
+pub mod uentry;
