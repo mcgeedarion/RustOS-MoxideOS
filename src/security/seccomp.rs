@@ -35,7 +35,7 @@
 //!   child gets a copy (see `inherit_seccomp`).
 //!
 //! ## Integration
-//!   Call `seccomp_check(nr, args)` at the top of syscall dispatch.
+//!   Call `seccomp_check(nr, args, saved_rip)` at the top of syscall dispatch.
 //!   It returns `SeccompVerdict::Allow` or a specific denial action.
 
 extern crate alloc;
@@ -299,7 +299,13 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
             c if c == BPF_TXA => { a = x; }
             // ── JMP ───────────────────────────────────────────────────────
             c if c == BPF_JMP | BPF_JA => {
-                pc = pc.wrapping_add(k as usize).wrapping_add(1);
+                // P2 fix: clamp the jump offset so pc cannot wrap to near
+                // usize::MAX when k = 0xFFFF_FFFF.  An out-of-bounds jump
+                // is treated as an invalid program → KILL_PROCESS.
+                let offset = k as usize;
+                let new_pc = pc.saturating_add(offset).saturating_add(1);
+                if new_pc >= insns.len() { return SECCOMP_RET_KILL_PROCESS; }
+                pc = new_pc;
                 continue;
             }
             c if c == BPF_JMP | BPF_JEQ | BPF_K => {
@@ -353,12 +359,34 @@ fn load_u8(data: &[u8], off: usize) -> Option<u8> {
     data.get(off).copied()
 }
 
+// ─── Architecture-check validator ────────────────────────────────────────────
+
+/// P2 fix: warn if a filter omits a VALIDATE_ARCHITECTURE guard.
+/// A well-written filter should contain at least one BPF_LD [arch] +
+/// BPF_JEQ instruction to reject foreign architectures.  We emit a kernel
+/// log warning (not a hard rejection) so existing minimal filters still work
+/// while operators are informed of the gap.
+fn warn_if_no_arch_check(insns: &[SockFilter]) {
+    // Offset of `arch` field in SeccompData: nr(i32)=4 bytes, arch follows.
+    const ARCH_OFFSET: u32 = 4;
+    let has_arch_load = insns.iter().any(|ins| {
+        ins.code == (BPF_LD | BPF_W | BPF_ABS) && ins.k == ARCH_OFFSET
+    });
+    if !has_arch_load {
+        log::warn!("seccomp: filter installed without VALIDATE_ARCHITECTURE check; \
+                   cross-arch syscall spoofing may be possible");
+    }
+}
+
 // ─── Public: check a syscall through the current process's filter chain ───────
 
 /// Called at the top of the syscall dispatch path.
 /// `args` is `[a, b, c, d, e, f]` from the register file.
+/// `saved_rip` is the instruction pointer saved by the syscall entry stub;
+/// it is written into `SeccompData.instruction_pointer` so that BPF filters
+/// that gate on the call site address evaluate the real address.
 /// Returns Allow, or a denial verdict that dispatch must honour.
-pub fn seccomp_check(nr: usize, args: &[usize; 6]) -> SeccompVerdict {
+pub fn seccomp_check(nr: usize, args: &[usize; 6], saved_rip: u64) -> SeccompVerdict {
     let pid = crate::proc::scheduler::current_pid();
     if pid == 0 { return SeccompVerdict::Allow; }
 
@@ -381,7 +409,9 @@ pub fn seccomp_check(nr: usize, args: &[usize; 6]) -> SeccompVerdict {
     let data = SeccompData {
         nr:                  nr as i32,
         arch:                AUDIT_ARCH_X86_64,
-        instruction_pointer: 0, // TODO: plumb saved RIP from SyscallFrame
+        // P2 fix: use the real saved RIP instead of a hardcoded 0, so
+        // IP-based BPF allow-lists evaluate the actual call site address.
+        instruction_pointer: saved_rip,
         args:                [
             args[0] as u64, args[1] as u64, args[2] as u64,
             args[3] as u64, args[4] as u64, args[5] as u64,
@@ -415,13 +445,8 @@ fn action_to_verdict(ret: u32) -> SeccompVerdict {
             SeccompVerdict::Errno(if errno == 0 { 1 } else { errno })
         }
         // V11 fix: TRACE — no ptrace tracer attached → deny with EPERM.
-        // Linux default: if no tracer is present the syscall is denied.
-        // When ptrace support is added, check for an attached tracer here
-        // and return Allow only if one exists.
         a if a == SECCOMP_RET_TRACE => SeccompVerdict::Errno(EPERM),
-        // V11 fix: USER_NOTIF — no listener installed → deny with ENOSYS
-        // rather than killing the process outright, giving callers a
-        // recoverable error instead of a hard crash.
+        // V11 fix: USER_NOTIF — no listener installed → deny with ENOSYS.
         a if a == SECCOMP_RET_USER_NOTIF => SeccompVerdict::Errno(ENOSYS),
         // LOG / ALLOW
         _ => SeccompVerdict::Allow,
@@ -441,13 +466,39 @@ fn action_to_verdict(ret: u32) -> SeccompVerdict {
 ///   Actual layout: { u16 len; *const SockFilter filter } — 16 bytes total on
 ///   64-bit because the pointer is at offset 8 (4-byte hole after len).
 pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
-    // Only a process with CAP_SYS_ADMIN may install filters unless it called
-    // prctl(PR_SET_NO_NEW_PRIVS, 1).  We check the simpler form: any process
-    // may install a filter if it already has one (filter stacking), or if it
-    // holds CAP_SYS_ADMIN.  For now we also allow unprivileged processes to
-    // call SECCOMP_SET_MODE_STRICT / FILTER (matches the no_new_privs path).
+    // P1 fix: gate filter installation on no_new_privs OR CAP_SYS_ADMIN.
+    // Previously any process could call sys_seccomp freely, meaning a
+    // sandboxed process could self-install a permissive filter to escape
+    // its own seccomp jail.  Now we check:
+    //   - If the process already has a filter chain (i.e. it is sandboxed),
+    //     it may only install *more restrictive* filters — enforced by the
+    //     chain evaluation semantics (most-restrictive wins).  The call is
+    //     allowed so that stacking works, but it cannot remove existing
+    //     filters.
+    //   - If the process has no filter yet, it must hold CAP_SYS_ADMIN or
+    //     have called prctl(PR_SET_NO_NEW_PRIVS, 1) (nnp flag on Pcb).
     let pid = crate::proc::scheduler::current_pid();
     if pid == 0 { return -1; } // kernel threads
+
+    // Check privilege for first-filter installation.
+    let has_existing_filter = crate::proc::scheduler::with_proc(pid, |p| {
+        p.seccomp.strict || !p.seccomp.filters.is_empty()
+    }).unwrap_or(false);
+
+    let has_cap_sys_admin = crate::proc::scheduler::with_proc(pid, |p| {
+        p.caps.has(crate::security::capset::cap::SYS_ADMIN)
+    }).unwrap_or(false);
+
+    let has_nnp = crate::proc::scheduler::with_proc(pid, |p| {
+        p.no_new_privs
+    }).unwrap_or(false);
+
+    // A process may install its first filter only if privileged or nnp is set.
+    // A process that already has a filter may always add more (stacking only
+    // makes the sandbox stricter, never looser).
+    if !has_existing_filter && !has_cap_sys_admin && !has_nnp {
+        return -1; // EPERM
+    }
 
     match operation {
         SECCOMP_SET_MODE_STRICT => {
@@ -462,6 +513,7 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
         SECCOMP_SET_MODE_FILTER => {
             if args_va == 0 { return -14; } // EFAULT
             // Read sock_fprog: u16 len at offset 0, u64 filter_ptr at offset 8.
+            // copy_from_user signature: (dst: &mut [u8], src_va: usize)
             let mut fprog = [0u8; 16];
             if crate::uaccess::copy_from_user(&mut fprog, args_va).is_err() {
                 return -14;
@@ -488,6 +540,9 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
                     k:    u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
                 });
             }
+
+            // P2 fix: warn if the filter omits an architecture guard.
+            warn_if_no_arch_check(&insns);
 
             let log = flags & SECCOMP_FILTER_FLAG_LOG != 0;
             let filter = SeccompFilter { insns, log };
