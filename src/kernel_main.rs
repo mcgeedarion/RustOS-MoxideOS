@@ -19,6 +19,8 @@
 //!   9.  smp::init()            — enumerate MADT CPUs, bring up APs
 //!   10. tty::init()            — PTY registry + /dev/pts
 //!   11. drivers::nic::init()   — NIC driver (e1000e/virtio-net)
+//!   11a. init::schemes::init() — register built-in schemes (file:, net:, blk:,
+//!                                proc:, dev:, pipe:, null:) into SCHEME_TABLE
 //!   12. dhcp::init()           — DORA handshake; sets ip/gw/mask in ip layer
 //!   13. spawn pid 1 from /init — scheduler takes over
 //!
@@ -28,4 +30,51 @@
 //!                                            /soc/plic → plic::set_base(),
 //!                                            virtio_mmio@ → virtio_net_mmio::probe()
 //!   3.  heap::init()           — linked-list allocator over PMM
-//!   3a. mm::in
+//!   3a. mm::init()             — slab cache pre-warm
+//!   4.  initramfs::mount()     — populate VFS from CPIO
+//!   5.  time::init()           — RISC-V timer (mtime/mtimecmp via SBI)
+//!   6.  drivers::nic::init()   — virtio-net MMIO
+//!   6a. init::schemes::init()  — register built-in schemes into SCHEME_TABLE
+//!   7.  dhcp::init()           — DORA handshake
+//!   8.  spawn pid 1 from /init — scheduler takes over
+
+#[cfg(target_arch = "x86_64")]
+pub fn kernel_main_x86_64() -> ! {
+    crate::serial::init();
+    crate::pmm::init();
+    crate::heap::init();
+    crate::mm::init();
+    crate::io_uring::init();
+    crate::init::initramfs::mount();
+    crate::namespace::init();
+    crate::arch::x86_64::gdt::init();
+    crate::arch::x86_64::idt::init();
+    crate::arch::x86_64::apic::init();
+    crate::time::init();
+    crate::smp::init();
+    crate::tty::init();
+    crate::drivers::nic::init();
+    // Step 11a: register all built-in kernel schemes into SCHEME_TABLE.
+    // Must run after NIC init (net: scheme queries the NIC) and before
+    // dhcp::init() (which opens "net:eth0" via the scheme table).
+    crate::init::schemes::init();
+    crate::dhcp::init();
+    crate::proc::spawn_init();
+    unreachable!("scheduler returned to kernel_main");
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn kernel_main_riscv64() -> ! {
+    crate::arch::riscv64::trap::trap_init();
+    crate::arch::riscv64::fdt::init_from_fdt();
+    crate::heap::init();
+    crate::mm::init();
+    crate::init::initramfs::mount();
+    crate::time::init();
+    crate::drivers::nic::init();
+    // Step 6a: register all built-in kernel schemes into SCHEME_TABLE.
+    crate::init::schemes::init();
+    crate::dhcp::init();
+    crate::proc::spawn_init();
+    unreachable!("scheduler returned to kernel_main");
+}

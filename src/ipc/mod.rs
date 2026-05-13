@@ -2,13 +2,16 @@
 //!
 //! ## Modules
 //!
-//! | Module | Facility |
-//! |--------|----------|
-//! | `key`  | `ftok`, IPC key <-> ID mapping, IPC_PRIVATE |
-//! | `msg`  | System V message queues (msgget/msgsnd/msgrcv/msgctl) |
-//! | `sem`  | System V semaphores  (semget/semop/semctl) |
-//! | `shm`  | System V shared memory (shmget/shmat/shmdt/shmctl) |
-//! | `mq`   | POSIX message queues  (mq_open/send/receive/notify) |
+//! | Module        | Facility |
+//! |---------------|----------|
+//! | `key`         | `ftok`, IPC key <-> ID mapping, IPC_PRIVATE |
+//! | `msg`         | System V message queues (msgget/msgsnd/msgrcv/msgctl) |
+//! | `sem`         | System V semaphores  (semget/semop/semctl) |
+//! | `shm`         | System V shared memory (shmget/shmat/shmdt/shmctl) |
+//! | `mq`          | POSIX message queues  (mq_open/send/receive/notify) |
+//! | `pipe_scheme` | Scheme-backed anonymous pipes; `create_pipe()` returns
+//!                  two `FdEntry::Scheme` descriptors backed by a shared
+//!                  `PipeScheme` handler registered in SCHEME_TABLE. |
 //!
 //! ## Permissions
 //!
@@ -21,6 +24,7 @@ pub mod msg;
 pub mod sem;
 pub mod shm;
 pub mod mq;
+pub mod pipe_scheme;
 
 extern crate alloc;
 

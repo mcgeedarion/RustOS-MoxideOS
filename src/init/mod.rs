@@ -12,7 +12,12 @@
 //!   `loader`     — High-level ELF loader: walks program headers, maps
 //!                  PT_LOAD segments into a fresh address space, and sets
 //!                  up the auxiliary vector (`auxv`) for the dynamic linker.
+//!
+//!   `schemes`    — Registers all built-in kernel schemes (file:, net:,
+//!                  blk:, proc:, dev:, pipe:, null:) into SCHEME_TABLE.
+//!                  Called from kernel_main after NIC + DHCP init.
 
 pub mod crt;
 pub mod initramfs;
 pub mod loader;
+pub mod schemes;
