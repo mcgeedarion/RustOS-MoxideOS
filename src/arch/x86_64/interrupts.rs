@@ -1,36 +1,29 @@
-//! IRQ handler stubs.
-//! Real IRQ handling (APIC timer, keyboard, NVMe) is added per-driver.
-//! The IDT is set up in idt.rs; this file holds the Rust-side dispatch.
+//! IRQ handler dispatch — timer, scheduler tick, rlimit enforcement.
 //!
-//! ## RLIMIT_CPU enforcement
+//! ## Timer tick responsibilities (called every TICK_NS = 1 ms)
 //!
-//! Every tick (TICK_NS = 1 ms) the running process's `cpu_time_ns` counter
-//! is incremented.  When the counter crosses a second boundary the accumulated
-//! seconds are compared against the process's soft and hard CPU limits:
+//!  1. Advance the monotonic clock (`time::tick_advance`).
+//!  2. Fire due timer-wheel entries (`time::timer::expire_timers`).
+//!  3. Charge CPU time to the running process.
+//!  4. Enforce RLIMIT_CPU  (SIGXCPU / SIGKILL).
+//!  5. Enforce RLIMIT_RTTIME for SCHED_FIFO/SCHED_RR tasks.
+//!  6. Call the scheduler (`schedule()`) to potentially preempt.
 //!
-//!   cpu_secs >= soft  → SIGXCPU (24) delivered every second as a warning.
-//!   cpu_secs >= hard  → SIGKILL (9) delivered immediately (POSIX mandatory).
+//! ## RLIMIT_CPU
 //!
-//! PID 0 (kernel idle) is never charged or checked.
+//!   cpu_secs >= soft  → SIGXCPU (24) once per second.
+//!   cpu_secs >= hard  → SIGKILL (9) immediately (POSIX mandatory).
 //!
-//! ## RLIMIT_RTTIME enforcement
+//! ## RLIMIT_RTTIME
 //!
-//! Only charged when the current process runs under SCHED_FIFO or SCHED_RR.
-//! The accumulator (`rt_cpu_time_us`) measures microseconds of *continuous*
-//! RT execution.  It is reset to 0 each time the task voluntarily blocks
-//! (see scheduler::block_current).
+//! Charged only for SCHED_FIFO / SCHED_RR.  Accumulator resets on voluntary
+//! block (see scheduler::block_current).  Soft limit fires SIGXCPU once;
+//! hard limit fires SIGKILL.
 //!
-//!   rt_cpu_time_us >= soft  → SIGXCPU delivered once.
-//!   rt_cpu_time_us >= hard  → SIGKILL delivered immediately.
+//! ## Generic exception handler
 //!
-//! Linux delivers SIGXCPU only once (at the soft limit) and then SIGKILL at
-//! the hard limit — there is no repeated-per-interval warning like RLIMIT_CPU.
-//!
-//! ## Timer wheel
-//!
-//! Every tick calls `time::tick_advance(TICK_NS)` to advance the monotonic
-//! clock, then `time::timer::expire_timers()` to fire any due callbacks
-//! (nanosleep wakeups, ITIMER_REAL, timerfd, etc.).
+//! `generic_exception_handler` is defined in idt.rs and exposed here for
+//! documentation purposes only.  All exception routing goes through idt.rs.
 
 use crate::proc::scheduler::TICK_NS;
 use crate::proc::scheduler::SchedPolicy;
@@ -40,25 +33,24 @@ const SIGKILL: u32 = 9;
 const RLIMIT_CPU:    usize = 0;
 const RLIMIT_RTTIME: usize = 15;
 
-/// Called from the APIC timer IRQ to drive the scheduler.
-/// Wired by apic.rs once the APIC is initialised.
+/// Called from the APIC timer IRQ stub (vector 32) on every tick.
+///
+/// Receives the full `InterruptFrame` so it can be inspected by profiling
+/// tools or a future NMI-based sampling profiler.  For the scheduler the
+/// frame pointer itself is not used — `schedule()` saves/restores context
+/// through its own mechanism.
 #[no_mangle]
-pub extern "C" fn timer_irq_handler() {
-    // ────────────────────────────────────────────────────────────────
-    // 0. Advance monotonic clock + fire due timer-wheel entries.
-    //    Must happen before rlimit checks so that nanosleep wakeup callbacks
-    //    run at the correct time and transition tasks to Ready before
-    //    schedule() picks them up.
-    // ────────────────────────────────────────────────────────────────
+pub extern "C" fn timer_irq_handler(frame: &mut crate::arch::x86_64::idt::InterruptFrame) {
+    let _ = frame; // reserved for future profiling use
+
+    // ── 1. Advance clock and fire timer wheel ────────────────────────────
     crate::time::tick_advance(TICK_NS);
     crate::time::timer::expire_timers();
 
     let pid = crate::proc::scheduler::current_pid();
 
     if pid != 0 {
-        // ────────────────────────────────────────────────────────────────
-        // 1. Charge the tick and read back state in one lock acquisition.
-        // ────────────────────────────────────────────────────────────────
+        // ── 2. Charge tick and snapshot rlimit state ─────────────────────
         let (soft_cpu, hard_cpu) = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_CPU);
         let (soft_rt,  hard_rt)  = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_RTTIME);
 
@@ -81,9 +73,7 @@ pub extern "C" fn timer_irq_handler() {
                 )
             }).unwrap_or((0, 0, 0, SchedPolicy::Normal));
 
-        // ────────────────────────────────────────────────────────────────
-        // 2. RLIMIT_CPU enforcement.
-        // ────────────────────────────────────────────────────────────────
+        // ── 3. RLIMIT_CPU enforcement ────────────────────────────────────
         if hard_cpu != crate::proc::rlimit::RLIM_INFINITY && cpu_secs >= hard_cpu {
             crate::proc::signal::send_signal(pid, SIGKILL);
         } else if soft_cpu != crate::proc::rlimit::RLIM_INFINITY && cpu_secs >= soft_cpu {
@@ -93,9 +83,7 @@ pub extern "C" fn timer_irq_handler() {
             }
         }
 
-        // ────────────────────────────────────────────────────────────────
-        // 3. RLIMIT_RTTIME enforcement — only for SCHED_FIFO / SCHED_RR.
-        // ────────────────────────────────────────────────────────────────
+        // ── 4. RLIMIT_RTTIME enforcement (SCHED_FIFO / SCHED_RR only) ────
         if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
             if hard_rt != crate::proc::rlimit::RLIM_INFINITY && rt_us >= hard_rt {
                 crate::proc::signal::send_signal(pid, SIGKILL);
@@ -108,5 +96,10 @@ pub extern "C" fn timer_irq_handler() {
         }
     }
 
+    // ── 5. Send EOI before calling schedule() so the APIC is unblocked ───
+    // schedule() may switch to another task and not return for a long time.
+    crate::arch::x86_64::apic::send_eoi();
+
+    // ── 6. Preemption point ──────────────────────────────────────────────
     crate::proc::scheduler::schedule();
 }
