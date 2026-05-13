@@ -6,28 +6,36 @@
 //!
 //! When `proc_fd_open` resolves a scheme URL it:
 //! 1. Calls `SCHEME_TABLE.open(url, flags)` → `(Arc<dyn Scheme>, SchemeFileId)`.
-//! 2. Allocates a *synthetic* backing-fd number (a plain `usize` from an
-//!    atomic counter — no underlying VFS inode is needed).
+//! 2. Calls `alloc_scheme_backing_fd()` to get a synthetic backing-fd number.
 //! 3. Inserts `(scheme, fid)` into `SCHEME_FD_STORE` keyed by that backing fd.
 //! 4. Stores the backing fd in the process `FdEntry` as usual.
 //!
 //! All subsequent I/O on the user-visible fd flows through
 //! `scheme_fd_read` / `scheme_fd_write` / `scheme_fd_seek` / `scheme_fd_ioctl`.
-//! `close_backing` calls `scheme_fd_close` which forwards to the scheme handler
-//! and removes the entry from the store.
+//! `close_backing` calls `scheme_fd_close` which forwards to the scheme handler,
+//! removes the entry from the store, and *returns the fd to the free list*.
+//!
+//! # Backing-fd allocator
+//!
+//! Synthetic backing fds live in the 0x8000_0000…0xFFFF_FFFF range so they
+//! never collide with real VFS inode numbers (which start at 0).  A free list
+//! (`FREE_SCHEME_FDS`) is drained before bumping the atomic counter, so fd
+//! numbers are recycled under sustained open/close cycling (e.g. many short-
+//! lived `tcp:` connections) and the counter never overflows the range.
 //!
 //! # Thread-safety
 //!
-//! The store is protected by a `spin::Mutex`. Each operation holds the lock
-//! only long enough to clone the `Arc` and copy the `SchemeFileId`, then
-//! releases it before calling into the scheme handler. This means multiple
-//! kernel threads can issue concurrent scheme I/O without holding the global
-//! lock during the (potentially blocking) driver IPC round-trip.
+//! The store and free list are each protected by a `spin::Mutex`.  The I/O
+//! helpers clone the `Arc` and copy the `SchemeFileId` while the lock is held,
+//! then release it *before* calling into the scheme handler so that concurrent
+//! kernel threads are not serialised on a single global lock during potentially
+//! blocking driver IPC round-trips.
 
 extern crate alloc;
 use alloc::{
     collections::BTreeMap,
     sync::Arc,
+    vec::Vec,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
@@ -39,17 +47,31 @@ use super::scheme_table::Scheme;
 // Synthetic backing-fd allocator
 // ---------------------------------------------------------------------------
 //
-// Regular VFS fds come from the ramfs/ext2 file tables (small integers).
-// We place scheme backing-fds in a high range (starting at 0x8000_0000) so
-// they never collide with real VFS fds. The counter only increases; the
-// reclaimed fd numbers from `remove` are *not* reused (fine for the
-// expected number of open scheme fds per session).
+// Fds are drawn from the 0x8000_0000…0xFFFF_FFFF range.  The free list is
+// checked first; only when it is empty does the counter increment.
+// `scheme_fd_close` returns the fd to the free list via
+// `free_scheme_backing_fd` so numbers are reused rather than lost.
 
 static SCHEME_FD_COUNTER: AtomicUsize = AtomicUsize::new(0x8000_0000);
+static FREE_SCHEME_FDS:   Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Allocate a fresh synthetic backing-fd number for a scheme fd.
+///
+/// Prefers recycled numbers from the free list; falls back to the
+/// monotonically-increasing counter when the list is empty.
 pub fn alloc_scheme_backing_fd() -> usize {
+    if let Some(fd) = FREE_SCHEME_FDS.lock().pop() {
+        return fd;
+    }
     SCHEME_FD_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Return a synthetic backing-fd to the free list.
+///
+/// Called automatically by `scheme_fd_close`.  May also be called directly
+/// if a backing fd is recycled via a code path that does not use `scheme_fd_close`.
+pub fn free_scheme_backing_fd(fd: usize) {
+    FREE_SCHEME_FDS.lock().push(fd);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,8 +190,8 @@ pub fn scheme_fd_ioctl(backing_fd: usize, cmd: u64, arg: usize) -> isize {
     }
 }
 
-/// Close a scheme fd — forwards to the scheme handler and removes the entry
-/// from the store.
+/// Close a scheme fd — forwards to the scheme handler, removes the entry
+/// from the store, and **returns the backing fd to the free list**.
 ///
 /// Called from `close_backing` in `process_fd.rs`.
 pub fn scheme_fd_close(backing_fd: usize) {
@@ -178,6 +200,8 @@ pub fn scheme_fd_close(backing_fd: usize) {
         if let Err(e) = scheme.close(fid) {
             log::warn!("[scheme] close({:#x}) error: {:?}\n", backing_fd, e);
         }
+        // Return the fd number to the free list for reuse.
+        free_scheme_backing_fd(backing_fd);
     }
 }
 
@@ -188,14 +212,14 @@ pub fn scheme_fd_close(backing_fd: usize) {
 #[inline]
 fn scheme_error_to_errno(e: SchemeError) -> isize {
     match e {
-        SchemeError::NoSuchScheme    => -2,   // ENOENT
-        SchemeError::NotFound        => -2,   // ENOENT
-        SchemeError::PermissionDenied => -13, // EACCES
-        SchemeError::InvalidArg      => -22,  // EINVAL
-        SchemeError::WouldBlock      => -11,  // EAGAIN
-        SchemeError::Io              => -5,   // EIO
-        SchemeError::Unreachable     => -5,   // EIO
-        SchemeError::Other           => -5,   // EIO
+        SchemeError::NoSuchScheme     => -2,   // ENOENT
+        SchemeError::NotFound         => -2,   // ENOENT
+        SchemeError::PermissionDenied => -13,  // EACCES
+        SchemeError::InvalidArg       => -22,  // EINVAL
+        SchemeError::WouldBlock       => -11,  // EAGAIN
+        SchemeError::Io               => -5,   // EIO
+        SchemeError::Unreachable      => -5,   // EIO
+        SchemeError::Other            => -5,   // EIO
     }
 }
 
@@ -243,5 +267,21 @@ mod tests {
         assert!(!is_scheme_fd(bfd));
         // After close, read should return EBADF.
         assert_eq!(scheme_fd_read(bfd, &mut buf), -9);
+    }
+
+    #[test]
+    fn fd_numbers_are_recycled_after_close() {
+        // Open two scheme fds and close them; the allocator must return the
+        // same numbers on the next two allocations (LIFO from the free list).
+        let a = alloc_scheme_backing_fd();
+        let b = alloc_scheme_backing_fd();
+        assert_ne!(a, b, "each allocation must be unique");
+
+        free_scheme_backing_fd(a);
+        free_scheme_backing_fd(b);
+
+        // Free list is LIFO, so b comes back first.
+        assert_eq!(alloc_scheme_backing_fd(), b);
+        assert_eq!(alloc_scheme_backing_fd(), a);
     }
 }
