@@ -1,0 +1,14 @@
+[package]
+name = "virtio-net-drv"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "virtio_net_drv"
+path = "main.rs"
+
+[dependencies]
+scheme-api = { path = "../../../crates/scheme-api", features = ["std"] }
+
+# Minimal logging to kernel serial console via a custom logger.
+log = "0.4"

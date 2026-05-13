@@ -1,0 +1,12 @@
+[package]
+name = "scheme-api"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Enable when building for userspace (enables std features like alloc).
+std = []
+
+[dependencies]
+bitflags = "2"
