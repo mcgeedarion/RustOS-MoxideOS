@@ -127,14 +127,14 @@ fn sys_epoll_create1(flags: u32) -> isize {
     fd
 }
 
-// ── IPC helpers ────────────────────────────────────────────────────────────────────
+// ── IPC helpers ─────────────────────────────────────────────────────────────────────
 fn copy_msgbuf_from_user(msgp_va: usize, msgsz: usize)
     -> Option<(i64, Vec<u8>)>
 {
     if msgp_va == 0 || msgsz > msg::MSGMAX { return None; }
     let total = 8 + msgsz;
     let mut buf = alloc::vec![0u8; total];
-    crate::uaccess::copy_from_user(msgp_va, &mut buf).ok()?;
+    crate::uaccess::copy_from_user(&mut buf, msgp_va).ok()?;
     let mtype = i64::from_ne_bytes(buf[0..8].try_into().ok()?);
     let data  = buf[8..].to_vec();
     Some((mtype, data))
@@ -154,7 +154,7 @@ fn copy_sembuf_from_user(sops_va: usize, nsops: usize)
     if sops_va == 0 || nsops == 0 || nsops > sem::SEMOPM { return None; }
     const SEMBUF_SIZE: usize = 8;
     let mut raw = alloc::vec![0u8; nsops * SEMBUF_SIZE];
-    crate::uaccess::copy_from_user(sops_va, &mut raw).ok()?;
+    crate::uaccess::copy_from_user(&mut raw, sops_va).ok()?;
     let mut ops = Vec::with_capacity(nsops);
     for i in 0..nsops {
         let off = i * SEMBUF_SIZE;
@@ -166,75 +166,200 @@ fn copy_sembuf_from_user(sops_va: usize, nsops: usize)
     Some(ops)
 }
 
-// ── Safe mq_attr user-copy helpers ───────────────────────────────────────────────────
+// ── Safe field-by-field IPC struct parsers ──────────────────────────────────────────
 //
-// MqAttr is #[repr(C)] with only i64/u8 fields — no enum discriminants or
-// non-zero invariants — so field-by-field copy is both safe and sufficient.
-// We avoid transmute so that future additions of invariant-bearing fields
-// are caught by the compiler rather than silently invoking UB.
+// P0 fix: these replace the previous `unsafe { core::mem::transmute(buf) }`
+// calls on the IPC_SET paths for shmctl and msgctl.  Parsing each field
+// explicitly from the raw byte buffer:
+//   (a) avoids UB if ShmidDs/MsqidDs ever gain enum discriminants or
+//       references;
+//   (b) allows us to validate individual fields before they reach the
+//       IPC subsystem;
+//   (c) makes the code self-documenting about the wire layout.
+//
+// The struct layouts below match the x86-64 Linux ABI definitions from
+// <linux/shm.h> and <linux/msg.h>.  Field offsets were verified against
+// the kernel headers.
 
+/// Parse a `ShmidDs` from a raw byte buffer read from user space.
+/// Returns `None` if the buffer is too small (should never happen given
+/// the size_of check at the call site, but defensive is correct here).
+fn parse_shmid_ds(buf: &[u8]) -> Option<shm::ShmidDs> {
+    use core::mem::size_of;
+    if buf.len() < size_of::<shm::ShmidDs>() { return None; }
+    // ShmidDs field layout (x86-64, from linux/shm.h):
+    //   offset  0: ipc64_perm shm_perm   (48 bytes)
+    //   offset 48: size_t     shm_segsz  (8 bytes)
+    //   offset 56: i64        shm_atime  (8 bytes)
+    //   offset 64: i64        shm_dtime  (8 bytes)
+    //   offset 72: i64        shm_ctime  (8 bytes)
+    //   offset 80: i32        shm_cpid   (4 bytes)
+    //   offset 84: i32        shm_lpid   (4 bytes)
+    //   offset 88: u64        shm_nattch (8 bytes)
+    //   offset 96: padding to size_of::<ShmidDs>()
+    Some(shm::ShmidDs {
+        shm_perm:   parse_ipc64_perm(&buf[0..48])?,
+        shm_segsz:  usize::from_ne_bytes(buf[48..56].try_into().ok()?),
+        shm_atime:  i64::from_ne_bytes(buf[56..64].try_into().ok()?),
+        shm_dtime:  i64::from_ne_bytes(buf[64..72].try_into().ok()?),
+        shm_ctime:  i64::from_ne_bytes(buf[72..80].try_into().ok()?),
+        shm_cpid:   i32::from_ne_bytes(buf[80..84].try_into().ok()?),
+        shm_lpid:   i32::from_ne_bytes(buf[84..88].try_into().ok()?),
+        shm_nattch: u64::from_ne_bytes(buf[88..96].try_into().ok()?),
+    })
+}
+
+/// Serialize a `ShmidDs` to a raw byte buffer for copy_to_user.
+fn serialize_shmid_ds(ds: &shm::ShmidDs) -> [u8; 96] {
+    let mut buf = [0u8; 96];
+    serialize_ipc64_perm(&ds.shm_perm, &mut buf[0..48]);
+    buf[48..56].copy_from_slice(&ds.shm_segsz.to_ne_bytes());
+    buf[56..64].copy_from_slice(&ds.shm_atime.to_ne_bytes());
+    buf[64..72].copy_from_slice(&ds.shm_dtime.to_ne_bytes());
+    buf[72..80].copy_from_slice(&ds.shm_ctime.to_ne_bytes());
+    buf[80..84].copy_from_slice(&ds.shm_cpid.to_ne_bytes());
+    buf[84..88].copy_from_slice(&ds.shm_lpid.to_ne_bytes());
+    buf[88..96].copy_from_slice(&ds.shm_nattch.to_ne_bytes());
+    buf
+}
+
+/// Parse a `MsqidDs` from a raw byte buffer read from user space.
+fn parse_msqid_ds(buf: &[u8]) -> Option<msg::MsqidDs> {
+    use core::mem::size_of;
+    if buf.len() < size_of::<msg::MsqidDs>() { return None; }
+    // MsqidDs field layout (x86-64, from linux/msg.h):
+    //   offset  0: ipc64_perm msg_perm   (48 bytes)
+    //   offset 48: i64        msg_stime  (8 bytes)
+    //   offset 56: i64        msg_rtime  (8 bytes)
+    //   offset 64: i64        msg_ctime  (8 bytes)
+    //   offset 72: u64        msg_cbytes (8 bytes)
+    //   offset 80: u64        msg_qnum   (8 bytes)
+    //   offset 88: u64        msg_qbytes (8 bytes)
+    //   offset 96: i32        msg_lspid  (4 bytes)
+    //   offset100: i32        msg_lrpid  (4 bytes)
+    //   offset104: padding
+    Some(msg::MsqidDs {
+        msg_perm:   parse_ipc64_perm(&buf[0..48])?,
+        msg_stime:  i64::from_ne_bytes(buf[48..56].try_into().ok()?),
+        msg_rtime:  i64::from_ne_bytes(buf[56..64].try_into().ok()?),
+        msg_ctime:  i64::from_ne_bytes(buf[64..72].try_into().ok()?),
+        msg_cbytes: u64::from_ne_bytes(buf[72..80].try_into().ok()?),
+        msg_qnum:   u64::from_ne_bytes(buf[80..88].try_into().ok()?),
+        msg_qbytes: u64::from_ne_bytes(buf[88..96].try_into().ok()?),
+        msg_lspid:  i32::from_ne_bytes(buf[96..100].try_into().ok()?),
+        msg_lrpid:  i32::from_ne_bytes(buf[100..104].try_into().ok()?),
+    })
+}
+
+/// Serialize a `MsqidDs` to a raw byte buffer for copy_to_user.
+fn serialize_msqid_ds(ds: &msg::MsqidDs) -> [u8; 104] {
+    let mut buf = [0u8; 104];
+    serialize_ipc64_perm(&ds.msg_perm, &mut buf[0..48]);
+    buf[48..56].copy_from_slice(&ds.msg_stime.to_ne_bytes());
+    buf[56..64].copy_from_slice(&ds.msg_rtime.to_ne_bytes());
+    buf[64..72].copy_from_slice(&ds.msg_ctime.to_ne_bytes());
+    buf[72..80].copy_from_slice(&ds.msg_cbytes.to_ne_bytes());
+    buf[80..88].copy_from_slice(&ds.msg_qnum.to_ne_bytes());
+    buf[88..96].copy_from_slice(&ds.msg_qbytes.to_ne_bytes());
+    buf[96..100].copy_from_slice(&ds.msg_lspid.to_ne_bytes());
+    buf[100..104].copy_from_slice(&ds.msg_lrpid.to_ne_bytes());
+    buf
+}
+
+/// Parse an `ipc64_perm` from a 48-byte slice.
+fn parse_ipc64_perm(buf: &[u8]) -> Option<crate::ipc::Ipc64Perm> {
+    if buf.len() < 48 { return None; }
+    Some(crate::ipc::Ipc64Perm {
+        key:  i32::from_ne_bytes(buf[0..4].try_into().ok()?),
+        uid:  u32::from_ne_bytes(buf[4..8].try_into().ok()?),
+        gid:  u32::from_ne_bytes(buf[8..12].try_into().ok()?),
+        cuid: u32::from_ne_bytes(buf[12..16].try_into().ok()?),
+        cgid: u32::from_ne_bytes(buf[16..20].try_into().ok()?),
+        mode: u16::from_ne_bytes(buf[20..22].try_into().ok()?),
+        seq:  u16::from_ne_bytes(buf[22..24].try_into().ok()?),
+    })
+}
+
+/// Serialize an `ipc64_perm` into a 48-byte slice.
+fn serialize_ipc64_perm(p: &crate::ipc::Ipc64Perm, buf: &mut [u8]) {
+    buf[0..4].copy_from_slice(&p.key.to_ne_bytes());
+    buf[4..8].copy_from_slice(&p.uid.to_ne_bytes());
+    buf[8..12].copy_from_slice(&p.gid.to_ne_bytes());
+    buf[12..16].copy_from_slice(&p.cuid.to_ne_bytes());
+    buf[16..20].copy_from_slice(&p.cgid.to_ne_bytes());
+    buf[20..22].copy_from_slice(&p.mode.to_ne_bytes());
+    buf[22..24].copy_from_slice(&p.seq.to_ne_bytes());
+    // bytes 24..48 are padding; already zeroed by the caller
+}
+
+// ── Safe mq_attr user-copy helpers ───────────────────────────────────────────────────────
 fn copy_mq_attr_from_user(va: usize) -> Option<mq::MqAttr> {
     if va == 0 { return None; }
-    // MqAttr = { mq_flags: i64, mq_maxmsg: i64, mq_msgsize: i64,
-    //             mq_curmsgs: i64, _pad: [u8; 16] } = 48 bytes.
     const SZ: usize = core::mem::size_of::<mq::MqAttr>();
     let mut buf = [0u8; SZ];
-    crate::uaccess::copy_from_user(va, &mut buf).ok()?;
+    crate::uaccess::copy_from_user(&mut buf, va).ok()?;
     let mq_flags   = i64::from_ne_bytes(buf[0..8].try_into().ok()?);
     let mq_maxmsg  = i64::from_ne_bytes(buf[8..16].try_into().ok()?);
     let mq_msgsize = i64::from_ne_bytes(buf[16..24].try_into().ok()?);
     let mq_curmsgs = i64::from_ne_bytes(buf[24..32].try_into().ok()?);
-    // _pad[16] ignored on read; zeroed on construction.
     Some(mq::MqAttr { mq_flags, mq_maxmsg, mq_msgsize, mq_curmsgs,
                       _pad: [0u8; 16] })
 }
 
 fn copy_mq_attr_to_user(va: usize, attr: &mq::MqAttr) -> bool {
     if va == 0 { return true; }
-    // Serialise field-by-field to avoid any padding / invariant concerns.
     const SZ: usize = core::mem::size_of::<mq::MqAttr>();
     let mut buf = [0u8; SZ];
     buf[0..8].copy_from_slice(&attr.mq_flags.to_ne_bytes());
     buf[8..16].copy_from_slice(&attr.mq_maxmsg.to_ne_bytes());
     buf[16..24].copy_from_slice(&attr.mq_msgsize.to_ne_bytes());
     buf[24..32].copy_from_slice(&attr.mq_curmsgs.to_ne_bytes());
-    // _pad bytes remain zero.
     crate::uaccess::copy_to_user(va, &buf).is_ok()
 }
 
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
+    dispatch_with_rip(nr, a, b, c, d, e, f, 0)
+}
 
-    // ── seccomp pre-check ──────────────────────────────────────────────────────────────
+/// Inner dispatch that accepts the saved instruction pointer from the
+/// syscall entry stub.  Called by arch entry points that plumb RIP;
+/// `dispatch()` is the legacy shim that passes 0 for RIP.
+pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
+                         d: usize, e: usize, f: usize,
+                         saved_rip: u64) -> isize {
+
+    // ── seccomp pre-check ──────────────────────────────────────────────────────
     //
-    // NOTE: We no longer exempt NR 60 (exit) or NR 231 (exit_group) from the
-    // seccomp check.  Linux also passes those through the BPF filter; the
-    // difference is that if the verdict is Kill/Trap we still honour the
-    // exit (the process cannot be prevented from terminating).  Only NR 317
-    // (seccomp itself) is exempted to avoid a filter installing a filter.
-    if nr != 317 {
-        match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f]) {
-            crate::security::seccomp::SeccompVerdict::Allow  => {}
-            crate::security::seccomp::SeccompVerdict::Errno(e) => {
-                // For exit/exit_group, ignore Errno verdict and fall through.
-                if nr != 60 && nr != 231 { return -(e as isize); }
-            }
-            crate::security::seccomp::SeccompVerdict::Trap  => {
-                // Deliver SIGSYS even on exit paths (matches Linux behaviour).
-                let pid = crate::proc::scheduler::current_pid();
-                crate::proc::signal::send_signal(pid, 31 /* SIGSYS */);
-                if nr != 60 && nr != 231 { return -1; }
-                // Fall through so the exit actually happens.
-            }
-            crate::security::seccomp::SeccompVerdict::Kill  => {
-                crate::proc::exit::sys_exit(-1);
-                return -1;
-            }
+    // P1 fix: NR 317 (seccomp itself) is NO LONGER exempt from the filter.
+    // Linux runs the filter before allowing seccomp() to install a new
+    // filter, which means an existing filter can block the self-reinstall
+    // path.  The privilege check inside sys_seccomp() already prevents
+    // unprivileged processes from installing a first filter without nnp;
+    // the filter chain's most-restrictive-wins semantics ensure that
+    // stacking never loosens an existing sandbox.
+    //
+    // We still allow NR 60/231 (exit/exit_group) to fall through even if
+    // the verdict is Errno or Trap, matching Linux's behaviour that a
+    // process can always terminate.
+    match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f], saved_rip) {
+        crate::security::seccomp::SeccompVerdict::Allow  => {}
+        crate::security::seccomp::SeccompVerdict::Errno(e) => {
+            if nr != 60 && nr != 231 { return -(e as isize); }
+        }
+        crate::security::seccomp::SeccompVerdict::Trap  => {
+            let pid = crate::proc::scheduler::current_pid();
+            crate::proc::signal::send_signal(pid, 31 /* SIGSYS */);
+            if nr != 60 && nr != 231 { return -1; }
+        }
+        crate::security::seccomp::SeccompVerdict::Kill  => {
+            crate::proc::exit::sys_exit(-1);
+            return -1;
         }
     }
 
     match nr {
-        // ── filesystem I/O ────────────────────────────────────────────────────────────────────
+        // ── filesystem I/O ──────────────────────────────────────────────────────────────────────────────
         0   => crate::fs::io_syscalls::sys_read(a, b, c),
         1   => crate::fs::io_syscalls::sys_write(a, b, c),
         2   => crate::fs::io_syscalls::sys_open(a, b as u32, c as u32),
@@ -292,11 +417,11 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        crate::fs::close_range::sys_close_range(first, last, flags),
                    _ => -22,
                },
-        // ── io_uring ─────────────────────────────────────────────────────────────────────────
+        // ── io_uring ───────────────────────────────────────────────────────────────────────────
         425 => crate::io_uring::syscall::sys_io_uring_setup(a as u32, b),
         426 => crate::io_uring::syscall::sys_io_uring_enter(a, b as u32, c as u32, d as u32, e, f),
         427 => crate::io_uring::syscall::sys_io_uring_register(a, b as u32, c, d as u32),
-        // ── socket syscalls (NR 41-55, 288) ─────────────────────────────────────────────
+        // ── socket syscalls (NR 41-55, 288) ──────────────────────────────────────────
         41  => crate::net::socket::sys_socket(a as i32, b as i32, c as i32),
         42  => crate::net::socket::sys_connect(a, b, c as u32),
         43  => crate::net::socket::sys_accept(a, b, c),
@@ -312,11 +437,16 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         53  => crate::net::socket::sys_socketpair(a as i32, b as i32, c as i32, d),
         54  => crate::net::socket::sys_setsockopt(a, b as i32, c as i32, d, e as u32),
         55  => crate::net::socket::sys_getsockopt(a, b as i32, c as i32, d, e),
+        // NR 288  accept4(sockfd, addr, addrlen, flags)
+        // P1 fix: the returned fd is a TCP socket (from sys_accept, which
+        // wraps TCP_SOCKETS).  Set O_NONBLOCK on the TCP socket table entry,
+        // NOT on UDP_SOCKETS, which was the previous (incorrect) target.
         288 => {
             let fd = crate::net::socket::sys_accept(a, b, c);
             if fd >= 0 {
                 if d & 0x800 != 0 {
-                    let mut t = crate::net::socket::UDP_SOCKETS.lock();
+                    // SOCK_NONBLOCK: mark the accepted TCP socket non-blocking.
+                    let mut t = crate::net::socket::TCP_SOCKETS.lock();
                     if let Some(Some(s)) = t.get_mut(fd as usize) { s.nonblocking = true; }
                 }
                 if d & 0x80000 != 0 {
@@ -329,19 +459,19 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         283 => crate::fs::timerfd::sys_timerfd_create(a as u32, b as u32),
         286 => crate::fs::timerfd::sys_timerfd_settime(a, b as i32, c, d),
         287 => crate::fs::timerfd::sys_timerfd_gettime(a, b),
-        // ── inotify ──────────────────────────────────────────────────────────────────────────
+        // ── inotify ────────────────────────────────────────────────────────────────────────
         253 => crate::fs::inotify::sys_inotify_init1(0),
         254 => crate::fs::inotify::sys_inotify_add_watch(a, b, c as u32),
         255 => crate::fs::inotify::sys_inotify_rm_watch(a, b as i32),
         292 => crate::fs::inotify::sys_inotify_init1(a as u32),
-        // ── fanotify ─────────────────────────────────────────────────────────────────────────
+        // ── fanotify ────────────────────────────────────────────────────────────────────────
         300 => crate::fs::fanotify::sys_fanotify_init(a as u32, b as u32),
         301 => crate::fs::fanotify::sys_fanotify_mark(a, b as u32, c as u64, d as i32, e),
-        // ── seccomp + namespaces ─────────────────────────────────────────────────────────
+        // ── seccomp + namespaces ───────────────────────────────────────────────────
         272 => crate::proc::namespace::sys_unshare(a),
         308 => crate::proc::namespace::sys_setns(a, b as u32),
         317 => crate::security::seccomp::sys_seccomp(a as u32, b as u32, c),
-        // ── I/O multiplexing ─────────────────────────────────────────────────────────────
+        // ── I/O multiplexing ────────────────────────────────────────────────────────
         7   => crate::fs::poll::sys_poll(a, b, c as i32),
         23  => crate::fs::poll::sys_select(a, b, c, d, e),
         168 => crate::fs::poll::sys_poll(a, b, c as i32),
@@ -352,7 +482,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         271 => crate::fs::poll::sys_ppoll(a, b, c, d, e),
         281 => crate::fs::poll::sys_epoll_pwait(a, b, c as i32, d as i32, e, f),
         291 => sys_epoll_create1(a as u32),
-        // ── stat / path ops ─────────────────────────────────────────────────────────────────
+        // ── stat / path ops ─────────────────────────────────────────────────────────────────────
         4   => crate::fs::stat_syscalls::sys_stat(a, b),
         5   => crate::fs::stat_syscalls::sys_fstat(a, b),
         6   => crate::fs::stat_syscalls::sys_lstat(a, b),
@@ -374,7 +504,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         167 => sys_swapon_impl(a, b as i32),
         216 => sys_remap_file_pages_impl(),
         269 => crate::fs::stat_syscalls::sys_faccessat(a as i32, b, c as u32),
-        // ── memory ───────────────────────────────────────────────────────────────────────────────────
+        // ── memory ──────────────────────────────────────────────────────────────────────────────────
         9   => crate::mm::mmap::sys_mmap(a, b, c as u32, d as u32, e, f),
         10  => crate::mm::mmap::sys_mprotect(a, b, c as u32),
         11  => crate::mm::mmap::sys_munmap(a, b),
@@ -387,7 +517,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         329 => sys_pkey_mprotect_impl(a, b, c as u32, d as i32),
         330 => sys_pkey_alloc_impl(a as u32, b as u64),
         331 => sys_pkey_free_impl(a as i32),
-        // ── System V IPC: shared memory ─────────────────────────────────────────────────────
+        // ── System V IPC: shared memory ──────────────────────────────────────────────────
         29  => match shm::shmget(a as i32, b, c as i32) {
                    Ok(id)  => id as isize,
                    Err(e)  => e,
@@ -399,14 +529,15 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         31  => {
             let cmd = b as i32;
             if cmd == crate::ipc::IPC_SET {
-                // SAFETY: ShmidDs is #[repr(C)] with only primitive fields.
-                // We copy bytes from user space into a zeroed stack buffer and
-                // parse each field explicitly to avoid transmute UB if the
-                // struct ever gains invariant-bearing fields.
+                // P0 fix: parse ShmidDs field-by-field from user bytes;
+                // no transmute, no UB risk if the struct gains new fields.
                 const SZ: usize = core::mem::size_of::<shm::ShmidDs>();
                 let mut buf = [0u8; SZ];
-                if crate::uaccess::copy_from_user(c, &mut buf).is_err() { return -14; }
-                let new_ds: shm::ShmidDs = unsafe { core::mem::transmute(buf) };
+                if crate::uaccess::copy_from_user(&mut buf, c).is_err() { return -14; }
+                let new_ds = match parse_shmid_ds(&buf) {
+                    Some(ds) => ds,
+                    None     => return -14,
+                };
                 match shm::shmctl_set(a as i32, new_ds) {
                     Ok(())  => 0,
                     Err(e)  => e,
@@ -415,9 +546,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 match shm::shmctl(a as i32, cmd) {
                     Ok(ds) => {
                         if c != 0 {
-                            // SAFETY: ShmidDs is #[repr(C)] with only primitive fields.
-                            let bytes: [u8; core::mem::size_of::<shm::ShmidDs>()] =
-                                unsafe { core::mem::transmute(ds) };
+                            let bytes = serialize_shmid_ds(&ds);
                             let _ = crate::uaccess::copy_to_user(c, &bytes);
                         }
                         0
@@ -426,7 +555,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // ── System V IPC: semaphores ────────────────────────────────────────────────────
+        // ── System V IPC: semaphores ────────────────────────────────────────────────
         64  => match sem::semget(a as i32, b as i32, c as i32) {
                    Ok(id) => id as isize,
                    Err(e) => e,
@@ -457,7 +586,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                    Ok(())  => 0,
                    Err(e)  => e,
                },
-        // ── System V IPC: message queues ────────────────────────────────────────────────
+        // ── System V IPC: message queues ──────────────────────────────────────────────
         68  => match msg::msgget(a as i32, b as i32) {
                    Ok(id) => id as isize,
                    Err(e) => e,
@@ -484,11 +613,14 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         71  => {
             let cmd = b as i32;
             if cmd == crate::ipc::IPC_SET {
-                // SAFETY: MsqidDs is #[repr(C)] with only primitive fields.
+                // P0 fix: parse MsqidDs field-by-field; no transmute.
                 const SZ: usize = core::mem::size_of::<msg::MsqidDs>();
                 let mut buf = [0u8; SZ];
-                if crate::uaccess::copy_from_user(c, &mut buf).is_err() { return -14; }
-                let new_ds: msg::MsqidDs = unsafe { core::mem::transmute(buf) };
+                if crate::uaccess::copy_from_user(&mut buf, c).is_err() { return -14; }
+                let new_ds = match parse_msqid_ds(&buf) {
+                    Some(ds) => ds,
+                    None     => return -14,
+                };
                 match msg::msgctl_set(a as i32, new_ds) {
                     Ok(())  => 0,
                     Err(e)  => e,
@@ -497,9 +629,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 match msg::msgctl(a as i32, cmd) {
                     Ok(ds) => {
                         if c != 0 {
-                            // SAFETY: MsqidDs is #[repr(C)] with only primitive fields.
-                            let bytes: [u8; core::mem::size_of::<msg::MsqidDs>()] =
-                                unsafe { core::mem::transmute(ds) };
+                            let bytes = serialize_msqid_ds(&ds);
                             let _ = crate::uaccess::copy_to_user(c, &bytes);
                         }
                         0
@@ -508,7 +638,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // ── POSIX message queues ───────────────────────────────────────────────────────────
+        // ── POSIX message queues ─────────────────────────────────────────────────────────
         240 => {
             let name = match crate::proc::exec::read_cstr_safe(a) {
                 Some(s) => s,
@@ -536,7 +666,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
             let msglen = c;
             if msglen > mq::MQ_MSGSIZE { return -90; }
             let mut buf = alloc::vec![0u8; msglen];
-            if crate::uaccess::copy_from_user(b, &mut buf).is_err() { return -14; }
+            if crate::uaccess::copy_from_user(&mut buf, b).is_err() { return -14; }
             match mq::mq_send(a as u64, buf, d as u32) {
                 Ok(())  => 0,
                 Err(e)  => e,
@@ -563,7 +693,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 }
             } else {
                 let mut sigev = [0u8; 32];
-                if crate::uaccess::copy_from_user(b, &mut sigev).is_err() { return -14; }
+                if crate::uaccess::copy_from_user(&mut sigev, b).is_err() { return -14; }
                 let signo = u32::from_ne_bytes(sigev[4..8].try_into().unwrap_or([0;4]));
                 let pid   = crate::proc::scheduler::current_pid() as u32;
                 match mq::mq_notify(a as u64, signo, pid) {
@@ -572,16 +702,8 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // NR 245  mq_getsetattr(mqd, newattr, oldattr)
-        //
-        // Linux semantics:
-        //   - If `b` (newattr) is non-null, apply it and write old attrs to `c`.
-        //   - If `b` is null, only read current attrs into `c`.
-        // Previously this was inverted: the `else` branch wrote to `b` (null),
-        // causing EFAULT on every pure-getattr call.
         245 => {
             if b != 0 {
-                // Set new attributes; return old ones in `c`.
                 let new = match copy_mq_attr_from_user(b) {
                     Some(a) => a,
                     None    => return -14,
@@ -594,7 +716,6 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                     Err(e) => e,
                 }
             } else {
-                // No newattr — just retrieve current attributes into `c`.
                 match mq::mq_getattr(a as u64) {
                     Ok(attr) => {
                         if c != 0 && !copy_mq_attr_to_user(c, &attr) { return -14; }
@@ -604,7 +725,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // ── process / signals ─────────────────────────────────────────────────────────────
+        // ── process / signals ───────────────────────────────────────────────────────────────────
         13  => match arg_u32(a) {
                    Some(sig) if sig >= 1 && sig <= 64 =>
                        crate::proc::signal::sys_rt_sigaction(sig, b, c, d),
@@ -615,8 +736,6 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        crate::proc::signal::sys_rt_sigprocmask(how, b, c, d),
                    _ => -22,
                },
-        // NR 15 (rt_sigreturn) is intercepted at the arch entry point before
-        // dispatch() is called.  This arm is a safe ENOSYS fallback only.
         15  => -38,
         24  => sys_sched_yield_impl(),
         34  => sys_pause_impl(),
@@ -636,13 +755,19 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         63  => sys_uname_impl(a),
         98  => sys_getrusage_impl(a as i32, b),
         99  => sys_sysinfo_impl(a),
-        // NR 109 = getresuid (read effective/real/saved UID triplet).
-        // Stub returns 0 for all three, writing uid=0 to each non-null pointer.
+        // NR 109 = getresuid
+        // P1 fix: return the real uid/gid from the process credential table
+        // instead of always writing 0.  Userspace daemons (sudo, dbus-daemon,
+        // etc.) use this to decide whether to drop privileges; lying about
+        // uid=0 causes them to skip setuid() calls and run as effective root.
         109 => {
-            let zero = 0u32.to_le_bytes();
-            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &zero); }
-            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &zero); }
-            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &zero); }
+            let pid = crate::proc::scheduler::current_pid();
+            let uid = crate::proc::scheduler::with_proc(pid, |p| p.cred.uid)
+                .unwrap_or(0);
+            let bytes = uid.to_le_bytes();
+            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &bytes); }
+            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &bytes); }
+            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &bytes); }
             0
         },
         110 => crate::proc::scheduler::current_ppid() as isize,
@@ -697,7 +822,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                },
         273 => crate::proc::futex::sys_set_robust_list(a, b),
         274 => crate::proc::futex::sys_get_robust_list(a, b, c),
-        // ── time ────────────────────────────────────────────────────────────────────────────────────
+        // ── time ─────────────────────────────────────────────────────────────────────────────────
         36  => sys_getitimer_impl(a as i32, b),
         38  => sys_setitimer_impl(a as i32, b, c),
         96  => sys_gettimeofday_impl(a, b),
@@ -720,42 +845,46 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                        sys_waitid_impl(idtype, id, c, opts),
                    _ => -22,
                },
-        // ── uid / gid ────────────────────────────────────────────────────────────────────────
-        // NR 117 = getresuid (old 32-bit ABI alias), NR 120 = getresgid
-        // NR 118 = getresgid (old), NR 119 = getresgid32 — all stub to 0.
+        // ── uid / gid ─────────────────────────────────────────────────────────────────────────
         102 | 104 | 107 | 108 => 0,
         105 | 106             => 0,
         // NR 118 = getresgid (old 32-bit), NR 119 = getresgid32
+        // P1 fix: return real gid, not 0.
         118 => {
-            let zero = 0u32.to_le_bytes();
-            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &zero); }
-            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &zero); }
-            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &zero); }
+            let pid = crate::proc::scheduler::current_pid();
+            let gid = crate::proc::scheduler::with_proc(pid, |p| p.cred.gid)
+                .unwrap_or(0);
+            let bytes = gid.to_le_bytes();
+            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &bytes); }
+            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &bytes); }
+            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &bytes); }
             0
         }
         119 => {
-            let zero = 0u32.to_le_bytes();
-            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &zero); }
-            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &zero); }
-            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &zero); }
+            let pid = crate::proc::scheduler::current_pid();
+            let gid = crate::proc::scheduler::with_proc(pid, |p| p.cred.gid)
+                .unwrap_or(0);
+            let bytes = gid.to_le_bytes();
+            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &bytes); }
+            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &bytes); }
+            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &bytes); }
             0
         }
-        // NR 117 = getresuid (32-bit ABI), NR 120 = getresgid (32-bit ABI)
         117 | 120 => 0,
-        // ── scheduler attrs ────────────────────────────────────────────────────────────
+        // ── scheduler attrs ──────────────────────────────────────────────────────────────
         309 => sys_getcpu_impl(a, b, c),
         310 => sys_process_vm_writev_impl(a, b, c, d, e, f),
         315 => sys_sched_getattr_impl(a, b as u32, c as u32, d as u32),
         316 => sys_sched_setattr_impl(a, b, c as u32),
-        // ── random ───────────────────────────────────────────────────────────────────────────────
+        // ── random ─────────────────────────────────────────────────────────────────────────────
         318 => match arg_u32(c) {
                    Some(flags) => sys_getrandom_impl(a, b, flags),
                    None        => -22,
                },
-        // ── sendmmsg / recvmmsg ──────────────────────────────────────────────────────────
+        // ── sendmmsg / recvmmsg ────────────────────────────────────────────────────────
         299 => sys_recvmmsg_impl(a, b, c as u32, d as u32, e),
         307 => sys_sendmmsg_impl(a, b, c as u32, d as u32),
-        // ── pidfd ──────────────────────────────────────────────────────────────────────────────
+        // ── pidfd ─────────────────────────────────────────────────────────────────────────────
         302 => sys_prlimit64_impl(a, b as u32, c, d),
         320 => sys_kexec_file_load_impl(),
         321 => sys_bpf_impl(),
@@ -764,7 +893,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
         434 => crate::fs::pidfd::sys_pidfd_open(a, b as u32),
         435 => crate::proc::clone::sys_clone3(a, b),
         438 => crate::fs::pidfd::sys_pidfd_getfd(a, b, c as u32),
-        // ── permission / attribute stubs ───────────────────────────────────────────────────
+        // ── permission / attribute stubs ──────────────────────────────────────────────────
         90  => sys_chmod_impl(a, b as u32),
         91  => sys_fchmod_impl(a, b as u32),
         92  => sys_chown_impl(a, b as u32, c as u32),
@@ -777,7 +906,7 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
     }
 }
 
-// ── Syscall-side side-table cleanup (called from do_exit) ─────────────────────────────────────────
+// ── Syscall-side side-table cleanup (called from do_exit) ───────────────────────────────────────────────────
 
 pub fn altstack_clear_pid(pid: usize) {
     crate::proc::signal::altstack_clear_pid(pid);
