@@ -31,6 +31,17 @@
 //! the memory map is identity-mapped so phys == virt before we switch page
 //! tables.  After the kernel installs its own page tables, apic.rs must be
 //! revisited to remap LAPIC_PHYS_BASE_ACTUAL into the kernel VA space.
+//!
+//! ## AP trampoline shared-memory layout
+//!
+//! Before firing a SIPI, the BSP writes per-AP state into the trampoline page:
+//!
+//! | Offset | Size  | Written by            | Content                    |
+//! |--------|-------|-----------------------|----------------------------|
+//! | 0x8FD0 | 10 B  | `gdt::gdt_init()`     | GdtPointer (limit + base)  |
+//! | 0x8FE8 | 8 B   | `gdt::write_trampoline_kstack()` | AP kernel RSP top |
+//! | 0x8FF0 | 4 B   | `paging.rs`           | PML4 physical address      |
+//! | 0x8FF8 | 4 B   | `apic::start_ap()`    | Logical cpu_id             |
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::ptr::{read_volatile, write_volatile};
@@ -131,15 +142,10 @@ unsafe fn icr_wait() {
 
 // ───── BSP init ─────────────────────────────────────────────────────────────────
 
-/// Initialise the BSP’s local APIC and calibrate the timer.
+/// Initialise the BSP's local APIC and calibrate the timer.
 /// Called once from `apic_init()` in kernel_main.
 pub unsafe fn init() {
     // ── Step 0: read actual LAPIC base from IA32_APIC_BASE (MSR 0x1B) ───────
-    //
-    // Bits 51:12 = physical base address (4 KiB aligned).
-    // Bit  11    = APIC global enable.
-    // Bit  10    = x2APIC enable (written back below if supported).
-    // Bit   8    = BSP flag (read-only).
     let apic_base_lo: u32;
     let apic_base_hi: u32;
     core::arch::asm!(
@@ -149,7 +155,6 @@ pub unsafe fn init() {
         out("edx") apic_base_hi,
         options(nostack, preserves_flags)
     );
-    // Reconstruct 64-bit physical address, mask off flag bits 11:0.
     let apic_base_raw: u64 = ((apic_base_hi as u64) << 32) | (apic_base_lo as u64);
     let apic_phys: u64 = apic_base_raw & !0xFFF;
 
@@ -161,7 +166,7 @@ pub unsafe fn init() {
     }
     log::info!("apic: LAPIC base = {:#x}", LAPIC_PHYS_BASE_ACTUAL.load(Ordering::Relaxed));
 
-    // ── Step 1: check for x2APIC (CPUID leaf 1, ECX bit 21) ─────────────
+    // ── Step 1: check for x2APIC ─────────────────────────────────────────
     let ecx: u32;
     core::arch::asm!(
         "mov eax, 1",
@@ -173,7 +178,6 @@ pub unsafe fn init() {
         options(nostack)
     );
     if ecx & (1 << 21) != 0 {
-        // Enable x2APIC in IA32_APIC_BASE: set bit 10 alongside bit 11 (global enable).
         let new_lo = apic_base_lo | (1 << 10) | (1 << 11);
         core::arch::asm!(
             "wrmsr",
@@ -198,7 +202,7 @@ pub unsafe fn init() {
 
     log::info!("apic: BSP LAPIC id={}", lapic_read(LAPIC_ID));
 
-    // ── Step 3: calibrate TSC and APIC timer ─────────────────────────────
+    // ── Step 3: calibrate ─────────────────────────────────────────────────
     calibrate_tsc();
     calibrate_apic_timer();
 }
@@ -216,6 +220,20 @@ pub fn apic_timer_start_ms(ms: u64, vector: u8) {
         lapic_write(LAPIC_TIMER_ICR, initial_count);
     }
 }
+
+/// Send End-Of-Interrupt to the local APIC.
+///
+/// Must be called by every IRQ handler (except NMI, SMI, INIT, ExtINT,
+/// start-up, and fixed-delivery-mode IPIs to self) before returning.
+/// Renamed from the old `eoi()` to match the call site in idt.rs.
+#[inline]
+pub fn send_eoi() {
+    unsafe { lapic_write(LAPIC_EOI, 0); }
+}
+
+/// Alias kept for any code that still calls the old name.
+#[inline]
+pub fn eoi() { send_eoi(); }
 
 // ───── AP init ────────────────────────────────────────────────────────────────
 
@@ -236,6 +254,9 @@ pub fn start_all_aps() {
     for cpu in 0..n {
         if let Some(info) = crate::smp::cpu_info(cpu) {
             if !info.is_bsp {
+                // Allocate and publish the AP's kernel stack before the SIPI.
+                let kstack = crate::mm::kstack::alloc_kstack();
+                crate::arch::x86_64::gdt::write_trampoline_kstack(kstack);
                 unsafe { start_ap(info.hw_id, cpu); }
             }
         }
@@ -293,11 +314,6 @@ pub fn send_ipi(hw_id: u32, vector: u8) {
     }
 }
 
-#[inline]
-pub fn eoi() {
-    unsafe { lapic_write(LAPIC_EOI, 0); }
-}
-
 // ───── Timer calibration ───────────────────────────────────────────────────────
 
 unsafe fn calibrate_tsc() {
@@ -325,7 +341,6 @@ unsafe fn calibrate_tsc() {
         }
     }
 
-    // Fallback: PIT channel 0, 50 ms window.
     const PIT_DIVISOR: u16 = 59659;
     const PIT_CMD: u16 = 0x43;
     const PIT_CH0: u16 = 0x40;

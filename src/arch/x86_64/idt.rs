@@ -125,11 +125,6 @@ pub fn unregister_irq(vector: u8) {
 }
 
 // ── Macro: full GPR save/restore ─────────────────────────────────────────
-//
-// Push order must match InterruptFrame field order (reversed because push
-// grows the stack downward).
-//   push rdi first → rdi ends up at the highest address (InterruptFrame.rdi)
-//   push r15 last  → r15 ends up at rsp (InterruptFrame.r15)
 
 macro_rules! push_all {
     () => { concat!(
@@ -173,21 +168,15 @@ macro_rules! pop_all {
 
 // ── IDT gate descriptor (16 bytes, Intel SDM Vol.3 §6.14.1) ──────────────
 
-/// Flags byte for a present, DPL=0, 64-bit interrupt gate.
-/// `0x8E` = Present(1) | DPL(00) | S(0) | Type(01110 = 64-bit interrupt gate)
-const GATE_INT:   u8 = 0x8E;
-/// Trap gate: same as interrupt gate but bit 0 = 1 (does NOT clear IF on entry).
-const GATE_TRAP:  u8 = 0x8F;
-/// DPL=3 interrupt gate — callable from ring 3 (e.g. INT 0x80 syscall)
-#[allow(dead_code)]
-const GATE_INT3:  u8 = 0xEE;
+const GATE_INT:  u8 = 0x8E; // Present | DPL=0 | 64-bit interrupt gate (IF cleared)
+const GATE_TRAP: u8 = 0x8F; // Present | DPL=0 | 64-bit trap gate     (IF preserved)
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct IdtEntry {
     offset_low:  u16,
     selector:    u16,
-    ist:         u8,   // bits[2:0] = IST index (0 = use RSP0, 1–7 = IST1–IST7)
+    ist:         u8,
     flags:       u8,
     offset_mid:  u16,
     offset_high: u32,
@@ -200,10 +189,9 @@ impl IdtEntry {
                offset_mid: 0, offset_high: 0, _reserved: 0 }
     }
 
-    /// Build a gate pointing at `handler` with the given flags and IST index.
     fn set(&mut self, handler: usize, flags: u8, ist: u8) {
         self.offset_low  = handler as u16;
-        self.selector    = 0x08;            // kernel CS
+        self.selector    = crate::arch::x86_64::gdt::SELECTOR_KERNEL_CS;
         self.ist         = ist & 0x07;
         self.flags       = flags;
         self.offset_mid  = (handler >> 16) as u16;
@@ -215,13 +203,14 @@ impl IdtEntry {
 #[repr(C, packed)]
 struct IdtPointer { limit: u16, base: u64 }
 
-// 256-entry IDT, statically allocated.
+// The IDT is shared across all CPUs — gate descriptors point to global stubs.
+// Per-CPU state lives in the TSS (stacks) and the handler registry.
 static mut IDT: [IdtEntry; 256] = [IdtEntry::zero(); 256];
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 
 // ── Public init ───────────────────────────────────────────────────────────
 
-/// Initialise and load the IDT.
+/// Build and load the IDT on the BSP.
 ///
 /// **Must** be called after `gdt_init()` because the TSS (and therefore IST
 /// stacks) must be live before we load the IDT pointer.
@@ -229,29 +218,18 @@ static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 pub fn idt_init() {
     if IDT_LOADED.swap(true, Ordering::SeqCst) { return; }
     unsafe {
-        // ── CPU exceptions (vectors 0–31) ─────────────────────────────────
-        //
-        // Exceptions are split into three groups:
-        //   A) No error code pushed by CPU       → stub pushes dummy 0
-        //   B) Error code pushed by CPU           → stub does NOT push dummy
-        //   C) Faults needing special handling    → dedicated stub
-        //
-        // IST1 is used for NMI (#2), #DF (#8), and #MC (#18) — these are the
-        // three faults that can arrive on a corrupted or exhausted stack.
-        // gdt_init() already wired TSS.ist1 to a dedicated kernel stack.
-
-        // Group A — no error code (stub pushes 0)
+        // ── Exceptions without CPU-pushed error code (stub pushes 0) ────────
         IDT[ 0].set(exc_noerr_asm:: <0>  as usize, GATE_INT,  0); // #DE
         IDT[ 4].set(exc_noerr_asm:: <4>  as usize, GATE_INT,  0); // #OF
         IDT[ 5].set(exc_noerr_asm:: <5>  as usize, GATE_INT,  0); // #BR
         IDT[ 6].set(exc_noerr_asm:: <6>  as usize, GATE_INT,  0); // #UD
         IDT[ 7].set(exc_noerr_asm:: <7>  as usize, GATE_INT,  0); // #NM
-        IDT[ 9].set(exc_noerr_asm:: <9>  as usize, GATE_INT,  0); // coprocessor overrun (reserved)
-        IDT[16].set(exc_noerr_asm::<16>  as usize, GATE_INT,  0); // #MF x87
-        IDT[19].set(exc_noerr_asm::<19>  as usize, GATE_INT,  0); // #XM SIMD
-        IDT[20].set(exc_noerr_asm::<20>  as usize, GATE_INT,  0); // #VE virtualisation
+        IDT[ 9].set(exc_noerr_asm:: <9>  as usize, GATE_INT,  0); // legacy coproc
+        IDT[16].set(exc_noerr_asm::<16>  as usize, GATE_INT,  0); // #MF
+        IDT[19].set(exc_noerr_asm::<19>  as usize, GATE_INT,  0); // #XM
+        IDT[20].set(exc_noerr_asm::<20>  as usize, GATE_INT,  0); // #VE
 
-        // Group B — CPU pushes an error code
+        // ── Exceptions with CPU-pushed error code ─────────────────────────
         IDT[10].set(exc_err_asm::<10>    as usize, GATE_INT,  0); // #TS
         IDT[11].set(exc_err_asm::<11>    as usize, GATE_INT,  0); // #NP
         IDT[12].set(exc_err_asm::<12>    as usize, GATE_INT,  0); // #SS
@@ -259,31 +237,36 @@ pub fn idt_init() {
         IDT[17].set(exc_err_asm::<17>    as usize, GATE_INT,  0); // #AC
         IDT[21].set(exc_err_asm::<21>    as usize, GATE_INT,  0); // #CP
 
-        // Group C — special handling
-        IDT[ 1].set(db_asm              as usize, GATE_TRAP, 0); // #DB debug (trap gate — IF stays set)
-        IDT[ 2].set(nmi_asm             as usize, GATE_INT,  1); // #NMI — IST1
-        IDT[ 3].set(bp_asm              as usize, GATE_TRAP, 0); // #BP INT3 (trap gate)
-        IDT[ 8].set(exc_err_asm:: <8>   as usize, GATE_INT,  1); // #DF — IST1, error_code always 0
+        // ── Special / IST-switched exceptions ───────────────────────────
+        IDT[ 1].set(db_asm              as usize, GATE_TRAP, 0); // #DB  (trap gate)
+        IDT[ 2].set(nmi_asm             as usize, GATE_INT,  1); // #NMI IST1
+        IDT[ 3].set(bp_asm              as usize, GATE_TRAP, 0); // #BP  (trap gate)
+        IDT[ 8].set(exc_err_asm:: <8>   as usize, GATE_INT,  1); // #DF  IST1
         IDT[14].set(page_fault_asm      as usize, GATE_INT,  0); // #PF
-        IDT[18].set(exc_noerr_asm::<18> as usize, GATE_INT,  1); // #MC — IST1
+        IDT[18].set(exc_noerr_asm::<18> as usize, GATE_INT,  1); // #MC  IST1
 
-        // Vectors 15, 22–31 are reserved by Intel.  Install a catch-all so a
-        // spurious delivery does not triple-fault.
+        // Reserved vectors 15, 22–31 — catch-all prevents triple-fault.
         for v in [15u8, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] {
             IDT[v as usize].set(exc_noerr_asm::<255> as usize, GATE_INT, 0);
         }
 
-        // ── IRQ vectors (32–255) ──────────────────────────────────────────
-        //
-        // A single generic_irq_asm stub is installed for ALL 224 IRQ vectors.
-        // The stub records the vector number in rsi, loads the InterruptFrame
-        // pointer in rdi, and calls generic_irq_dispatch().  Drivers that need
-        // faster paths can call register_irq() but still share this stub.
-        IDT[32].set(timer_irq_asm as usize, GATE_INT, 0); // APIC timer — fast path
+        // ── IRQ vectors 32–255 ──────────────────────────────────────────
+        IDT[32].set(timer_irq_asm as usize, GATE_INT, 0); // APIC timer
         for v in 33u8..=255 {
-            IDT[v as usize].set(generic_irq_asm_for(v) as usize, GATE_INT, 0);
+            IDT[v as usize].set(generic_irq_asm_stub as usize, GATE_INT, 0);
         }
 
+        load();
+    }
+}
+
+/// Load (or reload) the IDT pointer on the calling CPU.
+///
+/// Called once by `idt_init()` (BSP) and once by each AP from `ap_entry()`
+/// after `gdt::init_ap()`.  All CPUs share the same IDT table; only the
+/// `lidt` instruction needs to be re-executed per CPU.
+pub fn load() {
+    unsafe {
         let ptr = IdtPointer {
             limit: (core::mem::size_of::<[IdtEntry; 256]>() - 1) as u16,
             base:  IDT.as_ptr() as u64,
@@ -294,9 +277,6 @@ pub fn idt_init() {
 
 // ── Generic IRQ dispatch (vectors 33–255) ─────────────────────────────────
 
-/// Called from generic_irq_asm stubs with:
-///   rdi = *mut InterruptFrame
-///   rsi = vector number (u64)
 #[no_mangle]
 pub extern "C" fn generic_irq_dispatch(frame: &mut InterruptFrame, vector: u64) {
     let v = vector as usize;
@@ -305,25 +285,12 @@ pub extern "C" fn generic_irq_dispatch(frame: &mut InterruptFrame, vector: u64) 
         h(frame);
     } else {
         crate::console::println!("[IDT] spurious IRQ vector={:#x} — no handler registered", v);
-        // Send EOI anyway to prevent the APIC from locking up.
         crate::arch::x86_64::apic::send_eoi();
     }
 }
 
-/// Returns the generic IRQ stub address for vector `v`.
-/// For now all use the same stub; the vector is encoded in rsi by the stub.
-/// This is a placeholder — in production you would generate 224 tiny stubs
-/// (each pushing its own vector number) via a build.rs macro expansion or a
-/// const-generic #[naked] fn as shown below for vectors that matter.
-#[inline(always)]
-fn generic_irq_asm_for(_v: u8) -> unsafe extern "C" fn() {
-    generic_irq_asm_stub
-}
-
 // ── Exception C handlers ──────────────────────────────────────────────────
 
-/// Rust-side handler for all CPU exceptions that do not have dedicated logic.
-/// Receives the full InterruptFrame so it can print registers and RIP.
 #[no_mangle]
 pub extern "C" fn generic_exception_handler(frame: &mut InterruptFrame, vector: u64) {
     let mnemonic = EXCEPTION_NAMES.get(vector as usize).copied().unwrap_or("UNKNOWN");
@@ -335,29 +302,21 @@ pub extern "C" fn generic_exception_handler(frame: &mut InterruptFrame, vector: 
 
     let pid = crate::proc::scheduler::current_pid();
     if pid != 0 {
-        // Deliver SIGSEGV to the offending process and reschedule.
         crate::proc::signal::send_signal(pid, 11);
         crate::proc::scheduler::schedule();
     } else {
-        // Kernel-mode exception — halt.
         loop { crate::arch::api::Cpu::halt(); }
     }
 }
 
-/// Non-maskable interrupt handler.
-/// NMIs can arrive on a corrupted stack, so we use IST1 and keep this short.
 #[no_mangle]
 pub extern "C" fn nmi_handler(frame: &mut InterruptFrame) {
     crate::console::println!(
-        "[NMI] rip={:#x} rsp={:#x} — checking hardware watchdogs",
+        "[NMI] rip={:#x} rsp={:#x}",
         frame.rip, frame.rsp
     );
-    // TODO: check NMI source (ECC, watchdog timer, IOCK#).
-    // For now we return from the NMI; if it is truly fatal the platform will
-    // fire a second NMI which x86 architecture forbids being nested → triple fault.
+    // TODO: inspect NMI source (ECC, watchdog, IOCK#).
 }
-
-// ── #DB / #BP handlers ────────────────────────────────────────────────────
 
 #[no_mangle]
 pub unsafe extern "C" fn db_handler(frame: *mut InterruptFrame) {
@@ -389,26 +348,16 @@ pub unsafe extern "C" fn bp_handler(frame: *mut InterruptFrame) {
     generic_exception_handler(&mut *frame, 3);
 }
 
-// ── Page-fault handler ─────────────────────────────────────────────────────
-
-/// #PF handler.  Called from page_fault_asm with the full InterruptFrame.
-/// The faulting virtual address is in CR2; the ASM stub puts it in rdi as the
-/// first argument and shifts the frame pointer to rsi.
 #[no_mangle]
 pub extern "C" fn page_fault_handler(frame: &mut InterruptFrame, faulting_va: u64) {
     let error_code = frame.error_code;
     let va = faulting_va as usize;
-
-    // Bit 0 = P (present), bit 1 = W (write), bit 2 = U (user), bit 3 = RSVD, bit 4 = I (ifetch)
     let present = error_code & 0x1 != 0;
     let user    = error_code & 0x4 != 0;
 
     if !present {
-        // Demand-paging / swap fault.
         if crate::mm::page_fault::handle_demand_fault(va) { return; }
     }
-
-    // Copy-on-write
     if crate::proc::cow_fault::handle_cow_fault(va, error_code) { return; }
 
     let pid = crate::proc::scheduler::current_pid();
@@ -416,9 +365,8 @@ pub extern "C" fn page_fault_handler(frame: &mut InterruptFrame, faulting_va: u6
         "[#PF] pid={} va={:#x} err={:#x} present={} user={} rip={:#x}",
         pid, va, error_code, present, user, frame.rip
     );
-
     if pid != 0 {
-        crate::proc::signal::send_signal(pid, 11); // SIGSEGV
+        crate::proc::signal::send_signal(pid, 11);
         crate::proc::scheduler::schedule();
         return;
     }
@@ -438,7 +386,7 @@ fn dump_registers(f: &InterruptFrame) {
         f.rsi, f.rdi, f.rbp, f.rsp
     );
     crate::console::println!(
-        "  r8={:#018x}  r9={:#018x}  r10={:#018x} r11={:#018x}",
+        "  r8 ={:#018x} r9 ={:#018x} r10={:#018x} r11={:#018x}",
         f.r8, f.r9, f.r10, f.r11
     );
     crate::console::println!(
@@ -455,53 +403,37 @@ static EXCEPTION_NAMES: &[&str] = &[
 ];
 
 // ── ASM stubs ─────────────────────────────────────────────────────────────
-//
-// Two families:
-//   exc_noerr_asm<N>  — exceptions WITHOUT a CPU-pushed error code
-//                        (stub pushes 0 as a dummy so the frame layout
-//                         is uniform regardless of exception type)
-//   exc_err_asm<N>    — exceptions WITH a CPU-pushed error code
-//                        (stub does NOT push a dummy; real code is on stack)
-//
-// Both call generic_exception_handler(frame: &mut InterruptFrame, vector: u64)
-//   rdi = pointer to InterruptFrame (= rsp after saving GPRs)
-//   rsi = vector number
 
-/// Stub for exceptions that do NOT push an error code.
 #[naked]
 unsafe extern "C" fn exc_noerr_asm<const N: u64>() {
     core::arch::asm!(
-        "push 0",           // dummy error code — keeps frame layout uniform
+        "push 0",
         push_all!(),
-        "mov rdi, rsp",     // rdi = &InterruptFrame
-        "mov rsi, {N}",     // rsi = vector number
+        "mov rdi, rsp",
+        "mov rsi, {N}",
         "call generic_exception_handler",
         pop_all!(),
-        "add rsp, 8",       // discard dummy error code
+        "add rsp, 8",
         "iretq",
         N = const N,
         options(noreturn)
     );
 }
 
-/// Stub for exceptions that DO push an error code.
 #[naked]
 unsafe extern "C" fn exc_err_asm<const N: u64>() {
     core::arch::asm!(
-        // error code already on stack — no dummy needed
         push_all!(),
-        "mov rdi, rsp",     // rdi = &InterruptFrame
-        "mov rsi, {N}",     // rsi = vector number
+        "mov rdi, rsp",
+        "mov rsi, {N}",
         "call generic_exception_handler",
         pop_all!(),
-        "add rsp, 8",       // discard error code
+        "add rsp, 8",
         "iretq",
         N = const N,
         options(noreturn)
     );
 }
-
-// ── #DB (vector 1) ────────────────────────────────────────────────────────
 
 #[naked]
 unsafe extern "C" fn db_asm() {
@@ -517,8 +449,6 @@ unsafe extern "C" fn db_asm() {
     );
 }
 
-// ── #NMI (vector 2) — IST1 ────────────────────────────────────────────────
-
 #[naked]
 unsafe extern "C" fn nmi_asm() {
     core::arch::asm!(
@@ -532,8 +462,6 @@ unsafe extern "C" fn nmi_asm() {
         options(noreturn)
     );
 }
-
-// ── #BP (vector 3) ────────────────────────────────────────────────────────
 
 #[naked]
 unsafe extern "C" fn bp_asm() {
@@ -549,36 +477,19 @@ unsafe extern "C" fn bp_asm() {
     );
 }
 
-// ── #PF (vector 14) ───────────────────────────────────────────────────────
-//
-// The CPU pushes [error_code, RIP, CS, RFLAGS, RSP, SS] in that order.
-// CR2 holds the faulting virtual address.
-//
-// Stack on entry (before the stub does anything):
-//   [rsp+0]  error_code  (CPU-pushed)
-//   [rsp+8]  rip
-//   ...
-//
-// We save GPRs normally (push_all!), then:
-//   rdi = rsp           → &InterruptFrame  (first arg)
-//   rsi = CR2           → faulting_va      (second arg)
-
 #[naked]
 unsafe extern "C" fn page_fault_asm() {
     core::arch::asm!(
-        // error code already pushed by CPU — do NOT push a dummy
         push_all!(),
-        "mov rdi, rsp",     // arg1 = &InterruptFrame
-        "mov rsi, cr2",     // arg2 = faulting virtual address
+        "mov rdi, rsp",
+        "mov rsi, cr2",
         "call page_fault_handler",
         pop_all!(),
-        "add rsp, 8",       // discard CPU-pushed error code
+        "add rsp, 8",
         "iretq",
         options(noreturn)
     );
 }
-
-// ── Timer IRQ (vector 32) — fast path ────────────────────────────────────
 
 #[naked]
 unsafe extern "C" fn timer_irq_asm() {
@@ -594,24 +505,13 @@ unsafe extern "C" fn timer_irq_asm() {
     );
 }
 
-// ── Generic IRQ stub (vectors 33–255) ────────────────────────────────────
-//
-// All unregistered IRQ vectors share this single stub.  The vector number is
-// NOT encoded here; instead the dispatcher reads it from the APIC ISR register
-// or falls back to a "spurious" message.  For production use, replace with
-// 224 const-generic stubs (or a build.rs trampoline table) so each stub pushes
-// its own vector number into rsi before calling generic_irq_dispatch.
-//
-// rdi = &InterruptFrame
-// rsi = 0  (unknown vector — dispatcher will log a warning)
-
 #[naked]
 unsafe extern "C" fn generic_irq_asm_stub() {
     core::arch::asm!(
-        "push 0",           // dummy error code
+        "push 0",
         push_all!(),
-        "mov rdi, rsp",     // arg1 = &InterruptFrame
-        "xor rsi, rsi",     // arg2 = vector = 0 (unknown — use APIC ISR)
+        "mov rdi, rsp",
+        "xor rsi, rsi",
         "call generic_irq_dispatch",
         pop_all!(),
         "add rsp, 8",
