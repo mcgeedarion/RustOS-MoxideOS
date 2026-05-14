@@ -10,18 +10,18 @@
 //! ## x86_64 boot sequence
 //!
 //! ```text
-//!  1. serial::init()          — UART output (console before heap)
-//!  2. pmm::init()             — physical memory manager
-//!  3. heap::init()            — linked-list allocator over PMM
-//!  4. mm::init()              — slab cache pre-warm (8 size classes)
-//!  5. io_uring::init()        — ring table (requires alloc)
-//!  6. initramfs::mount()      — populate VFS from CPIO archive
-//!  7. namespace::init()       — seed INIT_NS mount + UTS namespace tables
-//!  8. gdt::init()             — GDT + TSS
-//!  9. idt::init()             — IDT / exception vectors
-//! 10. apic::init()            — local + IO APIC, timer IRQ
-//! 11. time::init()            — clocksource calibration (TSC/HPET), timerfd
-//! 12. smp::init()             — enumerate MADT CPUs, bring up APs
+//!  1. serial::init()          — UART output (console before everything)
+//!  2. gdt::init()             — GDT + TSS (must precede any fault/NMI)
+//!  3. idt::init()             — IDT / exception vectors (must precede PMM)
+//!  4. pmm::init()             — physical memory manager
+//!  5. heap::init()            — linked-list allocator over PMM
+//!  6. mm::init()              — slab cache pre-warm (8 size classes)
+//!  7. initramfs::mount()      — populate VFS from CPIO archive
+//!  8. namespace::init()       — seed INIT_NS mount + UTS namespace tables
+//!  9. apic::init()            — local + IO APIC, timer IRQ
+//! 10. time::init()            — clocksource calibration (TSC/HPET), timerfd
+//! 11. smp::init()             — enumerate MADT CPUs, bring up APs
+//! 12. io_uring::init()        — ring table (requires alloc + live APIC/IDT)
 //! 13. tty::init()             — PTY registry + /dev/pts
 //! 14. drivers::nic::init()    — NIC driver (e1000e / virtio-net)
 //! 15. init::schemes::init()   — register built-in schemes into SCHEME_TABLE
@@ -56,17 +56,17 @@ pub fn kernel_main() -> ! {
     use crate::arch::x86_64::{apic, gdt, idt};
 
     crate::serial::init();
+    gdt::init();
+    idt::init();
     crate::pmm::init();
     crate::heap::init();
     crate::mm::init();
-    crate::io_uring::init();
     crate::init::initramfs::mount();
     crate::namespace::init();
-    gdt::init();
-    idt::init();
     apic::init();
     crate::time::init();
     crate::smp::init();
+    crate::io_uring::init();
     crate::tty::init();
     crate::drivers::nic::init();
     crate::init::schemes::init();
