@@ -1,1 +1,1 @@
-$(python3 -c "import json; f=open('/tmp/all_files_with_sha.json'); d=json.load(f); print(d[0]['content'])")
+$(python3 -c "import json; d=json.load(open('/tmp/push_batches.json')); print(d[0][0]['content'])")
