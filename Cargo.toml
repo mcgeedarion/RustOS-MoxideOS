@@ -1,88 +1,59 @@
 [workspace]
-members = [".", "xtask"]
+members  = [".", "xtask"]
 resolver = "2"
 
 [package]
-name = "rustos"
+name    = "rustos"
 version = "0.2.0"
 edition = "2021"
 
+# ── Profiles ────────────────────────────────────────────────────────────────
+
 [profile.release]
-opt-level = 3
-codegen-units = 1
-lto = true
-panic = "abort"
+opt-level      = 3
+codegen-units  = 1
+lto            = true
+panic          = "abort"
 
 [profile.dev]
 panic = "abort"
 
+# ── Dependencies ────────────────────────────────────────────────────────────
+
 [dependencies]
-spin = { version = "0.9", features = ["mutex", "spin_mutex"] }
-bitflags = "2"
+spin                  = { version = "0.9", features = ["mutex", "spin_mutex"] }
+bitflags              = "2"
 linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
 
 [build-dependencies]
 cc = "1"
 
-[features]
-# ── Default build ────────────────────────────────────────────────────────────────────
-# Primary boot path: UEFI (bare-metal + OVMF/QEMU).
-# The kernel produces target/esp/EFI/BOOT/BOOTX64.EFI via build.rs.
+# ── Features ────────────────────────────────────────────────────────────────
 #
-# cargo build                         → UEFI boot (default)
-# cargo build --features multiboot2_boot --no-default-features \
-#   --features sysv_ipc,namespaces    → legacy GRUB2/multiboot2 boot
-# cargo build --features cgroups      → + cgroups v2 cgroupfs
-# cargo build --features gdbstub      → + GDB RSP stub
-# cargo build --features input_events → + /dev/input evdev layer (WIP)
-# cargo build --features wayland      → + Wayland compositor scaffold (WIP)
+# Boot paths (mutually exclusive):
+#   cargo build                                       → UEFI (default)
+#   cargo build --no-default-features \
+#     --features multiboot2_boot,sysv_ipc,namespaces  → multiboot2 / GRUB2
+#
+# Optional subsystems:
+#   --features cgroups       → cgroups v2 cgroupfs
+#   --features gdbstub       → GDB RSP stub (UART/SBI)
+#   --features input_events  → /dev/input evdev layer (WIP)
+#   --features wayland       → Wayland compositor scaffold (WIP)
+
+[features]
 default = ["uefi_boot", "sysv_ipc", "namespaces"]
 
-# ── Boot path (mutually exclusive) ───────────────────────────────────────────
+# Boot paths
+uefi_boot       = []  # PE32+ BOOTX64.EFI via build.rs; primary path
+multiboot2_boot = []  # GRUB2 / QEMU -kernel fallback; use --no-default-features
 
-# UEFI bare-metal boot via uefi_start() in src/arch/x86_64/uefi_entry.rs.
-# build.rs converts the ELF to PE32+ BOOTX64.EFI under target/esp/.
-# On real hardware: copy target/esp/ to a FAT32 EFI System Partition.
-# In QEMU: run_qemu.sh uses OVMF + a loop-mounted FAT ESP by default.
-# Status: primary / production path.
-uefi_boot = []
+# Stable subsystems (enabled by default)
+sysv_ipc   = []  # SysV IPC + POSIX message queues (NR 29-31, 64-71, 240-245)
+namespaces = []  # Linux-compatible ns isolation (NEWNS/PID/NET/UTS/IPC/USER)
 
-# Legacy multiboot2 boot via multiboot2_entry() for GRUB2 or QEMU -kernel.
-# Enables src/arch/x86_64/multiboot2.rs and multiboot2_entry() in kernel_main.
-# Use --no-default-features to disable uefi_boot when enabling this.
-# Status: maintained but not the primary path.
-multiboot2_boot = []
-
-# ── Stable subsystems (on by default) ────────────────────────────────────────
-
-# System V IPC + POSIX message queues.
-# Status: Stable. NR 29–31, 64–71, 240–245 fully wired. CAP_IPC_OWNER
-#   always-grants (pre-namespace behavior; full check requires user ns).
-sysv_ipc = []
-
-# Linux-compatible namespace isolation.
-# Status: Stable.
-#   Namespace types: NEWNS (mount), NEWPID, NEWNET, NEWUTS, NEWIPC, NEWUSER.
-#   unshare(2)  [NR 272]: fully wired; forks mount/net backing state.
-#   setns(2)    [NR 308]: fully wired; resolves ns fd → NsSet install.
-#   /proc/<pid>/ns/: synthetic symlinks + stat inodes in procfs.
-#   ns_fd_open: NSFD_FD_BASE synthetic fds usable directly with setns.
-namespaces = []
-
-# ── WIP / optional subsystems ────────────────────────────────────────────────
-
-# GDB remote serial protocol stub — x86_64 (UART/COM1) + RISC-V (SBI console).
-# Status: Complete.
-gdbstub = []
-
-# Linux /dev/input evdev routing layer.
-# Status: stub no-ops — event routing to /dev/input/eventN not yet wired.
-input_events = []
-
-# cgroups v2: hierarchy + knob API + cgroupfs VFS mount.
-# Status: complete as of cgroupfs dispatch wiring (io_syscalls + vfs_ops).
-cgroups = []
-
-# Wayland compositor subsystem.
-# Status: directory scaffolded, no protocol implementation yet.
-wayland = []
+# Optional / WIP subsystems
+gdbstub      = []  # Complete: GDB RSP over UART (x86_64) / SBI console (RISC-V)
+cgroups      = []  # Complete: cgroups v2 hierarchy + cgroupfs VFS mount
+input_events = []  # WIP stub: /dev/input evdev routing not yet wired
+wayland      = []  # WIP stub: directory scaffolded, no protocol implementation

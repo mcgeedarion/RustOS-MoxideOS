@@ -1,35 +1,24 @@
 # Pinned nightly toolchain for rustos.
 #
-# WHY NIGHTLY
-# -----------
-# The following unstable features are required and have no stable equivalent
-# as of this pin date:
-#
+# WHY NIGHTLY — unstable features in use:
 #   naked_functions      — zero-overhead asm entry points (boot, trap vectors,
-#                          syscall entry, AP trampoline). Stabilisation tracking:
-#                          https://github.com/rust-lang/rust/issues/90957
+#                          syscall entry, AP trampoline).
+#                          Tracking: https://github.com/rust-lang/rust/issues/90957
+#   alloc_error_handler  — custom OOM handler in no_std heap.
+#                          Tracking: https://github.com/rust-lang/rust/issues/51540
+#   core_intrinsics      — memory barriers / compiler-fence in PMM + percpu paths.
+#   abi_x86_interrupt    — x86_64 interrupt calling convention for IDT handlers
+#                          (cfg(target_arch = "x86_64") only).
+#   -Z build-std         — cross-compile core/alloc/compiler_builtins for
+#                          riscv64-uefi.json and x86_64-unknown-none.
 #
-#   alloc_error_handler  — custom OOM handler required in no_std heap. Tracking:
-#                          https://github.com/rust-lang/rust/issues/51540
+# UPGRADING:
+#   1. Update `channel` below.
+#   2. Sync NIGHTLY_DATE in Dockerfile and flake.nix to the same date.
+#   3. Run `cargo build` for each target and fix any API churn.
+#   4. Update CHANGELOG with the new pin and reason.
 #
-#   core_intrinsics      — memory barrier and compiler-fence intrinsics used in
-#                          the lock-free PMM and percpu ring-buffer paths.
-#
-#   abi_x86_interrupt    — x86_64-only interrupt calling convention for IDT
-#                          handlers (conditional on cfg(target_arch = "x86_64")).
-#
-#   -Z build-std         — required to cross-compile core + alloc + compiler_builtins
-#                          for riscv64-uefi.json (custom target JSON) and
-#                          x86_64-unknown-none.  Not yet stable.
-#
-# UPGRADING
-# ---------
-# 1. Update the `channel` date below.
-# 2. Update NIGHTLY_DATE in Dockerfile and flake.nix to the same date.
-# 3. Run `cargo build` for each target and fix any API churn.
-# 4. Update the CHANGELOG with the new pin and the reason for the bump.
-#
-# The three files that must always agree on the pin date:
+# These three files must always agree on the pin date:
 #   rust-toolchain.toml  (this file)
 #   Dockerfile           (ARG NIGHTLY_DATE)
 #   flake.nix            (rustToolchain = ...)
@@ -37,16 +26,15 @@
 [toolchain]
 channel = "nightly-2025-05-15"
 components = [
-  "rust-src",          # required by -Z build-std
+  "rust-src",           # required by -Z build-std
   "llvm-tools-preview", # required by cargo-objcopy / llvm-strip
   "rustfmt",            # enforced by fmt.yml CI
-  "clippy",             # optional but useful: cargo clippy --target ...
+  "clippy",             # optional: cargo clippy --target ...
 ]
-# Targets pre-installed locally.  CI jobs install only what they need.
+# Targets pre-installed locally; CI installs only what it needs.
 targets = [
-  "riscv64gc-unknown-none-elf",   # SBI / bare RISC-V boot
-  "x86_64-unknown-none",          # x86_64 bare-metal
-  # riscv64-uefi.json is a *custom* target (not a rustup target) so it is
-  # NOT listed here.  It is used via --target riscv64-uefi.json with
-  # -Z build-std to compile core/alloc from source.
+  "riscv64gc-unknown-none-elf", # SBI / bare RISC-V boot
+  "x86_64-unknown-none",        # x86_64 bare-metal
+  # riscv64-uefi.json is a *custom* target — not listed here.
+  # Used via --target riscv64-uefi.json with -Z build-std.
 ]
