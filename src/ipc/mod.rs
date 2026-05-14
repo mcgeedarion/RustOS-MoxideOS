@@ -1,34 +1,31 @@
 //! IPC subsystem
 //!
-//! ## Modules
-//!
 //! | Module        | Facility |
 //! |---------------|----------|
-//! | `key`         | `ftok`, IPC key <-> ID mapping, IPC_PRIVATE |
-//! | `msg`         | System V message queues (msgget/msgsnd/msgrcv/msgctl) |
-//! | `sem`         | System V semaphores  (semget/semop/semctl) |
-//! | `shm`         | System V shared memory (shmget/shmat/shmdt/shmctl) |
-//! | `mq`          | POSIX message queues  (mq_open/send/receive/notify) |
-//! | `pipe_scheme` | Scheme-backed anonymous pipes; `create_pipe()` returns
-//!                  two `FdEntry::Scheme` descriptors backed by a shared
-//!                  `PipeScheme` handler registered in SCHEME_TABLE. |
+//! | `key`         | `ftok`, IPC key ↔ ID mapping, `IPC_PRIVATE` |
+//! | `msg`         | System V message queues (`msgget`/`msgsnd`/`msgrcv`/`msgctl`) |
+//! | `sem`         | System V semaphores (`semget`/`semop`/`semctl`) |
+//! | `shm`         | System V shared memory (`shmget`/`shmat`/`shmdt`/`shmctl`) |
+//! | `mq`          | POSIX message queues (`mq_open`/`send`/`receive`/`notify`) |
+//! | `pipe_scheme` | Scheme-backed anonymous pipes; `create_pipe()` returns two
+//! |               | `FdEntry::Scheme` descriptors backed by a shared `PipeScheme`. |
 //!
 //! ## Permissions
 //!
-//! All SysV objects store a `IpcPerm` with `uid/gid/cuid/cgid/mode`.
+//! All SysV objects store an `IpcPerm` with `uid/gid/cuid/cgid/mode`.
 //! `check_perm(perm, uid, gid, access_bits)` enforces rwx on owner/group/other.
-//! Capability checks (CAP_IPC_OWNER) are left as integration stubs.
+//! Capability checks (`CAP_IPC_OWNER`) are left as integration stubs.
 
 pub mod key;
+pub mod mq;
 pub mod msg;
+pub mod pipe_scheme;
 pub mod sem;
 pub mod shm;
-pub mod mq;
-pub mod pipe_scheme;
 
 extern crate alloc;
 
-// ── Common IPC permission structure ──────────────────────────────────────────────
+// ── Common IPC permission structure ──────────────────────────────────────────
 
 /// `struct ipc_perm` — matches Linux x86_64 UAPI layout.
 #[repr(C)]
@@ -50,16 +47,14 @@ impl IpcPerm {
     }
 }
 
-/// Check that `uid`/`gid` has `need` bits (0o4=read, 0o2=write) on `perm`.
+/// Returns `true` if `uid`/`gid` has `need` bits (0o4=read, 0o2=write) on `perm`.
 pub fn check_perm(perm: &IpcPerm, uid: u32, gid: u32, need: u16) -> bool {
-    // Root bypass
-    if uid == 0 { return true; }
-    let mode = perm.mode;
+    if uid == 0 { return true; } // root bypass
     let shift = if uid == perm.uid { 6 } else if gid == perm.gid { 3 } else { 0 };
-    (mode >> shift) & need == need
+    (perm.mode >> shift) & need == need
 }
 
-// ── Common IPC flags / commands ────────────────────────────────────────────────
+// ── Common IPC flags / commands ───────────────────────────────────────────────
 
 pub const IPC_PRIVATE: i32 = 0;
 pub const IPC_CREAT:   i32 = 0o001000;
