@@ -11,6 +11,19 @@
 //! `PIPE_FD_BASE` (0x8000_0000).  This keeps them well clear of VFS fds,
 //! devfs fds, and socket fds, so `is_pipe(bfd)` is a single range check.
 //!
+//! ## Scheme integration
+//!
+//! `sys_pipe2` now allocates scheme backing fds via `alloc_scheme_backing_fd`
+//! and registers a `PipeScheme` instance for each end in `SCHEME_FD_STORE`.
+//! This means pipe fds flow through the same `scheme_fd_read` / `scheme_fd_write`
+//! / `scheme_fd_close` dispatch as every other scheme resource, giving splice,
+//! io_uring, and epoll unified access without any special-casing.
+//!
+//! The raw `PIPE_TABLE` is still populated for the poll/epoll readiness path
+//! (`is_pipe`, `is_pipe_fd`, `pipe_poll`) which keys off the pipe-range bfd.
+//! `PipeScheme` reconstructs the ring-buffer bfd from its `SchemeFileId` on
+//! every I/O call, so no additional global state is required.
+//!
 //! ## Backing-fd lifetime
 //!
 //! Two bfds are allocated per pipe: an even one (read end) and an odd one
@@ -68,6 +81,9 @@ use alloc::collections::BTreeMap;
 use spin::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
+use crate::fs::scheme_table::Scheme;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Capacity of every pipe's ring buffer (bytes).
@@ -78,7 +94,7 @@ pub const PIPE_BUF: usize = 4096;
 
 /// Backing fd range reserved for pipe ends.  Read end = even, write end = odd.
 /// 0x8000_0000 is far above any VFS / devfs / socket fd.
-const PIPE_FD_BASE: usize = 0x8000_0000;
+pub(crate) const PIPE_FD_BASE: usize = 0x8000_0000;
 
 /// Linux errno values used internally.
 const EAGAIN: isize = -11;
@@ -184,7 +200,6 @@ fn alloc_pipe_fds() -> (usize, usize) {
 /// Return `true` if `bfd` is a pipe backing fd (either read or write end).
 #[inline]
 pub fn is_pipe(bfd: usize) -> bool {
-    // Fast path: all pipe bfds are >= PIPE_FD_BASE.
     if bfd < PIPE_FD_BASE { return false; }
     PIPE_TABLE.lock().contains(bfd)
 }
@@ -204,45 +219,11 @@ pub fn is_pipe_fd(user_fd: usize) -> bool {
 
 /// Return the subset of `events` that are currently ready on the pipe end
 /// identified by the **user-visible** fd `user_fd`.
-///
-/// This is the function called by `poll::fd_ready` for pipe fds.
-///
-/// ## Readiness rules
-///
-/// ### Read end (even backing fd)
-///
-/// | Condition                    | Bits returned              |
-/// |------------------------------|----------------------------|
-/// | `len > 0`                    | POLLIN \| POLLRDNORM        |
-/// | `write_open == 0` (EOF/HUP)  | POLLHUP \| POLLIN \| POLLRDNORM |
-/// | Both of the above            | POLLHUP \| POLLIN \| POLLRDNORM |
-/// | Buffer empty, writer alive   | 0 (not ready)              |
-///
-/// POLLHUP is always set when `write_open == 0`, even if the buffer is
-/// still empty (Linux behaviour: HUP triggers without data so the reader
-/// unblocks and gets EOF on the next `read`).
-///
-/// ### Write end (odd backing fd)
-///
-/// | Condition                    | Bits returned              |
-/// |------------------------------|----------------------------|
-/// | `space() > 0`                | POLLOUT \| POLLWRNORM       |
-/// | `read_open == 0` (EPIPE)     | POLLERR                    |
-/// | Both of the above            | POLLOUT \| POLLWRNORM \| POLLERR |
-/// | Buffer full, reader alive    | 0 (not ready)              |
-///
-/// POLLERR is always set when `read_open == 0`; a write attempt will
-/// deliver SIGPIPE + EPIPE regardless of available buffer space.
-///
-/// ### Invalid / unknown fd
-///
-/// Returns POLLNVAL if `user_fd` does not resolve to a pipe backing fd.
 pub fn pipe_poll(user_fd: usize, events: u32) -> u32 {
     use crate::fs::poll::{
         POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, POLLHUP, POLLERR, POLLNVAL,
     };
 
-    // Resolve user-visible fd → backing fd for the current process.
     let pid = crate::proc::scheduler::current_pid();
     let bfd_raw = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
     if bfd_raw < 0 {
@@ -250,52 +231,32 @@ pub fn pipe_poll(user_fd: usize, events: u32) -> u32 {
     }
     let bfd = bfd_raw as usize;
 
-    // Look up the shared PipeInner.
     let pipe = match PIPE_TABLE.lock().get(bfd) {
         Some(p) => p,
         None    => return POLLNVAL,
     };
     let inner = pipe.lock();
 
-    // Odd bfd = write end; even bfd = read end.
     let is_write_end = bfd & 1 != 0;
 
     if is_write_end {
-        // ── Write-end readiness ───────────────────────────────────────────────
         let mut ready = 0u32;
-
-        // POLLERR: all read-ends are closed — next write → SIGPIPE + EPIPE.
-        // Report unconditionally (regardless of requested events) so that
-        // poll/select always surface a broken pipe.
         if inner.read_open == 0 {
             ready |= POLLERR;
         }
-
-        // POLLOUT: room in the buffer for at least one byte.
         if events & (POLLOUT | POLLWRNORM) != 0 && inner.space() > 0 {
             ready |= POLLOUT | POLLWRNORM;
         }
-
         ready
     } else {
-        // ── Read-end readiness ────────────────────────────────────────────────
         let mut ready = 0u32;
-
-        // POLLHUP: all write-ends are closed.  Unconditional — wakes the
-        // reader so it can drain the remaining data and then get EOF.
         if inner.write_open == 0 {
             ready |= POLLHUP;
-            // Also assert POLLIN so that select(readfds) wakes up correctly
-            // (select does not expose POLLHUP directly; it maps it to a
-            // readable condition just like Linux does).
             ready |= POLLIN | POLLRDNORM;
         }
-
-        // POLLIN: data available to read.
         if events & (POLLIN | POLLRDNORM) != 0 && inner.len > 0 {
             ready |= POLLIN | POLLRDNORM;
         }
-
         ready
     }
 }
@@ -304,12 +265,6 @@ pub fn pipe_poll(user_fd: usize, events: u32) -> u32 {
 
 /// Called by `sys_dup`, `sys_dup2`, and the fork fd-table copy whenever a
 /// pipe-end fd is duplicated or inherited into a new process.
-///
-/// Increments `read_open` (even bfd = read end) or `write_open` (odd bfd =
-/// write end) in the shared `PipeInner` so that the last `close()` of *any*
-/// fd pointing at that end is what finally signals EOF or SIGPIPE to the peer.
-///
-/// A no-op if `bfd` is not in the pipe table (safe to call unconditionally).
 pub fn pipe_dup(bfd: usize) {
     if bfd < PIPE_FD_BASE { return; }
     let pipe = match PIPE_TABLE.lock().get(bfd) {
@@ -327,14 +282,6 @@ pub fn pipe_dup(bfd: usize) {
 // ── Read / write ──────────────────────────────────────────────────────────────
 
 /// Read up to `buf.len()` bytes from the read end of a pipe.
-///
-/// Blocking behaviour:
-///   - If the buffer is empty and writers exist → yield-loop until data arrives.
-///   - If the buffer is empty and all writers are closed → return 0 (EOF).
-///   - O_NONBLOCK + empty buffer → return -EAGAIN.
-///
-/// `bfd` must be the *read* end (even fd).  Passing the write end returns
-/// -EBADF (-9).
 pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
     if buf.is_empty() { return 0; }
 
@@ -343,7 +290,6 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
         None    => return -9, // EBADF
     };
 
-    // Read end is even; write end is odd.
     if bfd & 1 != 0 { return -9; } // wrong end
 
     loop {
@@ -353,39 +299,27 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
                 let n = inner.read_bytes(buf);
                 return n as isize;
             }
-            // Buffer empty.
             if inner.write_open == 0 {
-                // All writers gone — EOF.
-                return 0;
+                return 0; // EOF
             }
             if inner.nonblocking {
                 return EAGAIN;
             }
         }
-        // TODO: block on a wait-queue; for now yield-spin.
         crate::proc::scheduler::schedule();
         core::hint::spin_loop();
     }
 }
 
 /// Write `buf` to the write end of a pipe.
-///
-/// Blocking behaviour:
-///   - If the buffer is full and readers exist → yield-loop.
-///   - If all readers are closed → deliver SIGPIPE + return -EPIPE.
-///   - O_NONBLOCK + full buffer → return -EAGAIN.
-///
-/// Writes ≤ PIPE_BUF are atomic (the mutex is held for the full write).
-/// Writes > PIPE_BUF may be split across multiple lock acquisitions.
 pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
     if buf.is_empty() { return 0; }
 
     let pipe = match PIPE_TABLE.lock().get(bfd) {
         Some(p) => p,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
 
-    // Write end is odd.
     if bfd & 1 == 0 { return -9; } // wrong end
 
     let pid = crate::proc::scheduler::current_pid();
@@ -393,7 +327,6 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
     let mut remaining = buf;
 
     while !remaining.is_empty() {
-        // For writes ≤ PIPE_BUF we must not split — hold the lock the whole time.
         let atomic = remaining.len() <= PIPE_BUF;
 
         loop {
@@ -401,7 +334,6 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
                 let mut inner = pipe.lock();
 
                 if inner.read_open == 0 {
-                    // Broken pipe.
                     crate::proc::signal::send_signal(pid, SIGPIPE);
                     return if written == 0 { EPIPE } else { written as isize };
                 }
@@ -411,26 +343,21 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
                     if inner.nonblocking {
                         return if written == 0 { EAGAIN } else { written as isize };
                     }
-                    // Release lock and yield.
                 } else if atomic {
-                    // Entire chunk fits (or we wait until it does).
                     if space >= remaining.len() {
                         inner.write_bytes(remaining);
                         written += remaining.len();
                         remaining = &[];
                         break;
                     }
-                    // Not enough space yet — yield and retry.
                 } else {
-                    // Non-atomic: write as much as fits now.
                     let chunk = remaining.len().min(space);
                     inner.write_bytes(&remaining[..chunk]);
                     written    += chunk;
                     remaining   = &remaining[chunk..];
-                    break; // re-enter outer loop for the rest
+                    break;
                 }
             }
-            // Yield while holding nothing.
             crate::proc::scheduler::schedule();
             core::hint::spin_loop();
         }
@@ -441,55 +368,107 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
 
 // ── Close ─────────────────────────────────────────────────────────────────────
 
-/// Called by `close_backing` when a pipe-end fd is closed.
-///
-/// ## What this does
-///
-/// 1. Decrements `read_open` or `write_open` in the shared `PipeInner`.
-/// 2. Removes only *this* bfd's entry from `PIPE_TABLE`, so the bfd can no
-///    longer be used for reads/writes.
-/// 3. The peer bfd's entry remains intact.  The peer's Arc clone of PipeInner
-///    keeps the buffer alive; the peer will see EOF (read end) or SIGPIPE
-///    (write end) only once the relevant refcount reaches zero.
-/// 4. The PipeInner (and its 64 KiB buffer) is freed only when the last Arc
-///    clone is dropped, i.e. when both bfd entries have been removed.
-///
-/// This is a no-op if `bfd` is not in the table.
+/// Called by `PipeScheme::close` (and legacy paths) when a pipe-end fd closes.
 pub fn sys_close_pipe(bfd: usize) {
-    // Clone the Arc out of the table under the table lock, then drop the
-    // table lock before taking the inner lock to avoid lock-order issues.
     let pipe = match PIPE_TABLE.lock().get(bfd) {
         Some(p) => p,
         None    => return,
     };
 
-    // Decrement the refcount for this end.
     {
         let mut inner = pipe.lock();
         if bfd & 1 == 0 {
-            // Read end.
             inner.read_open = inner.read_open.saturating_sub(1);
         } else {
-            // Write end.
             inner.write_open = inner.write_open.saturating_sub(1);
         }
     }
 
-    // Remove only this end's entry from the table.
-    // The peer's entry (and Arc clone) stays until the peer is closed.
     PIPE_TABLE.lock().remove(bfd);
+}
 
-    // `pipe` (the local Arc clone obtained above) is dropped here.
-    // If this was the last clone (strong_count goes to 0), PipeInner is freed.
-    // Otherwise the peer's clone keeps it alive.
+// ── PipeScheme — Scheme trait wrapper around the ring-buffer ─────────────────
+//
+// Each pipe end is represented as a PipeScheme whose `ring_bfd` field is the
+// even (read) backing fd.  The SchemeFileId passed to every method encodes
+// which end is being operated on:
+//
+//   fid.0 is even  =>  read  end  (ring_bfd itself)
+//   fid.0 is odd   =>  write end  (ring_bfd + 1)
+//
+// This lets a single PipeScheme Arc serve both ends while keeping the
+// PIPE_TABLE lookup simple.
+
+pub struct PipeScheme {
+    /// The even (read-end) backing fd for this pipe.  The write end is + 1.
+    ring_bfd: usize,
+}
+
+impl PipeScheme {
+    fn new(read_bfd: usize) -> Self {
+        Self { ring_bfd: read_bfd }
+    }
+
+    /// Reconstruct the ring-buffer backing fd from a SchemeFileId.
+    #[inline]
+    fn bfd_from_fid(&self, fid: SchemeFileId) -> usize {
+        // fid.0: 0 = read end, 1 = write end (matches even/odd convention)
+        self.ring_bfd + (fid.0 as usize & 1)
+    }
+}
+
+impl Scheme for PipeScheme {
+    // Pipes are created by sys_pipe2, not opened by URL.
+    fn open(&self, _url: &str, _flags: OpenFlags) -> Result<SchemeFileId, SchemeError> {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn read(&self, fid: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
+        let bfd = self.bfd_from_fid(fid);
+        let n = pipe_read(bfd, buf);
+        if n < 0 {
+            Err(SchemeError::Io)
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    fn write(&self, fid: SchemeFileId, buf: &[u8]) -> Result<usize, SchemeError> {
+        let bfd = self.bfd_from_fid(fid);
+        let n = pipe_write(bfd, buf);
+        if n == EPIPE {
+            Err(SchemeError::Other) // caller translates to -EPIPE
+        } else if n < 0 {
+            Err(SchemeError::Io)
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8)
+        -> Result<u64, SchemeError>
+    {
+        Err(SchemeError::InvalidArg) // pipes are not seekable
+    }
+
+    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize)
+        -> Result<usize, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn close(&self, fid: SchemeFileId) -> Result<(), SchemeError> {
+        let bfd = self.bfd_from_fid(fid);
+        sys_close_pipe(bfd);
+        Ok(())
+    }
 }
 
 // ── sys_pipe / sys_pipe2 ──────────────────────────────────────────────────────
 
 /// Create a pipe and return the read/write fd pair in the array at `pipefd_va`.
 ///
-/// `pipefd_va` must point to a user-space `int[2]`:  pipefd[0] = read end,
-/// pipefd[1] = write end.
+/// Internally delegates to `sys_pipe2` with flags = 0.
 ///
 /// NR 22.
 pub fn sys_pipe(pipefd_va: usize) -> isize {
@@ -499,12 +478,19 @@ pub fn sys_pipe(pipefd_va: usize) -> isize {
 /// Like `sys_pipe` but honours `flags`:
 ///   O_CLOEXEC  (0o2000000) — set FD_CLOEXEC on both ends.
 ///   O_NONBLOCK (0o4000)    — set O_NONBLOCK on both ends.
-///   O_DIRECT   (0o40000)   — accepted but treated as advisory (ring buf is
-///                            already in-kernel, so O_DIRECT has no meaning).
+///   O_DIRECT   (0o40000)   — accepted (advisory; in-kernel ring has no meaning
+///                            for O_DIRECT).
+///
+/// Both ends are now registered through `SCHEME_FD_STORE` via a `PipeScheme`
+/// wrapper, so reads/writes/closes flow through `scheme_fd_read` /
+/// `scheme_fd_write` / `scheme_fd_close` like every other scheme resource.
+/// The raw `PIPE_TABLE` entries are still inserted so that `is_pipe`,
+/// `pipe_poll`, and `pipe_dup` continue to work for the poll/epoll layer.
 ///
 /// NR 293.
 pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     use crate::uaccess::{copy_to_user, validate_user_ptr};
+    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
     use crate::fs::process_fd::proc_fd_install;
 
     const O_CLOEXEC:  u32 = 0o2000000;
@@ -519,47 +505,71 @@ pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     let nonblocking = flags & O_NONBLOCK != 0;
     let cloexec     = flags & O_CLOEXEC  != 0;
 
-    // Allocate the shared pipe object.
-    let pipe = Arc::new(Mutex::new(PipeInner::new(nonblocking)));
+    // ── 1. Allocate the shared ring-buffer ───────────────────────────────────
+    let pipe_arc = Arc::new(Mutex::new(PipeInner::new(nonblocking)));
 
-    // Allocate two backing fds.
+    // ── 2. Allocate ring-buffer bfds (PIPE_TABLE namespace) ─────────────────
     let (read_bfd, write_bfd) = alloc_pipe_fds();
 
-    // Register both ends — they share the *same* Arc.
+    // ── 3. Register both ends in PIPE_TABLE (needed by poll/dup) ────────────
     {
         let mut tbl = PIPE_TABLE.lock();
-        tbl.insert(read_bfd,  Arc::clone(&pipe));
-        tbl.insert(write_bfd, Arc::clone(&pipe));
+        tbl.insert(read_bfd,  Arc::clone(&pipe_arc));
+        tbl.insert(write_bfd, Arc::clone(&pipe_arc));
     }
 
-    // Install into the process fd table.
+    // ── 4. Build a PipeScheme and allocate *scheme* backing fds ─────────────
+    //
+    // The scheme backing fds are drawn from SCHEME_FD_STORE's namespace
+    // (0x8000_0000+), independent of the PIPE_TABLE fds.  We use:
+    //   SchemeFileId(0)  for the read  end
+    //   SchemeFileId(1)  for the write end
+    //
+    // Both scheme entries share *one* Arc<PipeScheme>; the PipeScheme
+    // reconstructs the correct ring_bfd from the fid parity on each call.
+    let scheme: Arc<dyn Scheme> = Arc::new(PipeScheme::new(read_bfd));
+
+    let scheme_read_bfd  = alloc_scheme_backing_fd();
+    let scheme_write_bfd = alloc_scheme_backing_fd();
+
+    scheme_fd_register(scheme_read_bfd,  Arc::clone(&scheme), SchemeFileId(0));
+    scheme_fd_register(scheme_write_bfd, Arc::clone(&scheme), SchemeFileId(1));
+
+    // ── 5. RLIMIT_NOFILE check ───────────────────────────────────────────────
     let pid = crate::proc::scheduler::current_pid();
-
-    // Read end: O_RDONLY (0).  Write end: O_WRONLY (1).
-    let rd_flags = if cloexec { O_CLOEXEC } else { 0 };
-    let wr_flags = 1 | if cloexec { O_CLOEXEC } else { 0 };
-
-    // Check RLIMIT_NOFILE before installing.
     {
         use crate::fs::process_fd::proc_fd_list;
         let open_count = proc_fd_list(pid).len();
-        let (soft, _) = crate::proc::rlimit::getrlimit_for(pid, 7 /* RLIMIT_NOFILE */);
+        let (soft, _)  = crate::proc::rlimit::getrlimit_for(pid, 7 /* RLIMIT_NOFILE */);
         if (open_count + 2) as u64 > soft {
-            // Roll back pipe table entries.
+            // Roll back all allocations.
             PIPE_TABLE.lock().remove(read_bfd);
             PIPE_TABLE.lock().remove(write_bfd);
+            crate::fs::scheme_fd::scheme_fd_close(scheme_read_bfd);
+            crate::fs::scheme_fd::scheme_fd_close(scheme_write_bfd);
             return EMFILE;
         }
     }
 
-    let read_fd  = proc_fd_install(pid, read_bfd,  None, rd_flags, None);
-    let write_fd = proc_fd_install(pid, write_bfd, None, wr_flags, None);
+    // ── 6. Install scheme backing fds into the process fd table ─────────────
+    //
+    // We install the *scheme* backing fds (not the ring-buffer bfds) so
+    // that all subsequent read/write/close on the user-visible fd routes
+    // through scheme_fd_read / scheme_fd_write / scheme_fd_close.
+    //
+    // The ring-buffer bfds live only in PIPE_TABLE and are accessed
+    // indirectly through PipeScheme.
+    let rd_flags = if cloexec { O_CLOEXEC } else { 0 };
+    let wr_flags = 1 /* O_WRONLY */ | if cloexec { O_CLOEXEC } else { 0 };
 
-    // Write [read_fd, write_fd] to user-space pipefd[2].
+    let read_fd  = proc_fd_install(pid, scheme_read_bfd,  None, rd_flags, None);
+    let write_fd = proc_fd_install(pid, scheme_write_bfd, None, wr_flags, None);
+
+    // ── 7. Copy [read_fd, write_fd] back to user space ───────────────────────
     let pair: [i32; 2] = [read_fd as i32, write_fd as i32];
     let bytes: [u8; 8] = unsafe { core::mem::transmute(pair) };
     if copy_to_user(pipefd_va, &bytes).is_err() {
-        // Clean up the fds we just installed.
+        // Clean up all fds on fault.
         crate::fs::process_fd::proc_fd_close(pid, read_fd);
         crate::fs::process_fd::proc_fd_close(pid, write_fd);
         return EFAULT;
