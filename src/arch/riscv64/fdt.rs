@@ -1,26 +1,28 @@
 //! Flattened Device Tree (FDT/DTB) walker for RISC-V early boot.
 //!
-//! Reads the FDT blob passed by OpenSBI in `a1` to:
-//!   1. Register physical RAM regions with the PMM (`pmm::add_region`).
-//!   2. Record the initramfs location (`initramfs::set_initramfs_range`).
-//!   3. Discover VirtIO-MMIO devices → `virtio_net_mmio::probe(base, irq)`.
-//!   4. Discover the PLIC → `plic::set_base(base)`.
-//!   5. Enumerate /cpus/cpu@ nodes → `smp::register_cpu(hw_id, node, is_bsp)`.
+//! The original monolithic `init_from_fdt()` has been split into two phases
+//! to respect the heap initialisation barrier:
 //!
-//! Only the subset of the FDT spec needed for QEMU `virt` machine is
-//! implemented — big-endian u32 token stream, no dynamic allocation required.
+//! | Phase        | Heap required | What it does                                  |
+//! |--------------|---------------|-----------------------------------------------|
+//! | `fdt_phase1` | **No**        | PMM regions, initramfs bounds, PLIC base, CPUs|
+//! | `fdt_phase2` | **Yes**       | virtio-net MMIO probe (allocates ring buffers) |
 //!
-//! ## FDT binary format (abbreviated)
-//! Offset 0:  magic  0xD00DFEED (big-endian u32)
-//! Offset 4:  totalsize
-//! Offset 8:  off_dt_struct
-//! Offset 12: off_dt_strings
-//! Offset 16: off_mem_rsvmap
-//! Offset 20: version (expected ≥17)
-//! Offset 24: last_comp_version (must be ≤17)
-//! Offset 36: size_dt_struct
+//! ## Boot call order (kernel_main riscv64)
+//! ```text
+//! trap::trap_init()      — stvec, SSIE/STIE/SEIE
+//! fdt::fdt_phase1(ptr)   — PMM + PLIC base + initramfs + CPUs  (no alloc)
+//! plic::init()           — set S-mode threshold = 0
+//! heap::init()           — linked-list allocator over PMM
+//! mm::init()             — slab cache pre-warm
+//! fdt::fdt_phase2(ptr)   — virtio probe (alloc now safe)
+//! initramfs::mount()
+//! namespace::init()
+//! ...
+//! ```
 //!
-//! Token types: BEGIN_NODE=1, END_NODE=2, PROP=3, NOP=4, END=9
+//! Only the subset of the FDT spec needed for QEMU `virt` is implemented:
+//! big-endian u32 token stream, no dynamic allocation required in phase 1.
 
 use crate::mm::pmm;
 
@@ -79,7 +81,7 @@ fn be64(b: &[u8], off: usize) -> u64 {
 
 extern "C" { static _kernel_end: u8; }
 
-// ── Node tracking state ──────────────────────────────────────────────────────
+// ── Node-tracking state (shared by both phases) ──────────────────────────────
 
 #[derive(Default)]
 struct VirtioMmioNode {
@@ -88,68 +90,73 @@ struct VirtioMmioNode {
     is_virtio: bool,
 }
 
-/// Current child type under /soc (depth 2 when in_soc is true).
 #[derive(PartialEq)]
 enum SocChild { None, Plic, Other }
 
-/// Current child type under /cpus (depth 2 when in_cpus is true).
 #[derive(PartialEq)]
 enum CpusChild { None, Cpu }
 
-// ── Main walker ──────────────────────────────────────────────────────────────
+// ── Shared walker primitive ───────────────────────────────────────────────────
 
-/// Walk the FDT blob and initialise PMM, initramfs, PLIC, VirtIO-MMIO, and SMP.
-///
-/// # Safety
-/// `fdt_ptr` must be the physical address of a valid DTB blob as passed by
-/// OpenSBI.  The blob must remain readable for the duration of this call.
-pub unsafe fn init_from_fdt(fdt_ptr: usize) {
-    if fdt_ptr == 0 { return; }
-
+/// Validate FDT magic and return (blob slice, structs offset, strings offset).
+/// Returns `None` and prints a diagnostic if the blob is invalid.
+unsafe fn open_fdt(fdt_ptr: usize) -> Option<(&'static [u8], usize, usize)> {
+    if fdt_ptr == 0 { return None; }
     let hdr = FdtHeader::from_ptr(fdt_ptr);
     if hdr.magic() != FDT_MAGIC {
         crate::println!("fdt: invalid magic {:#010x} at {:#x}", hdr.magic(), fdt_ptr);
-        return;
+        return None;
     }
-
     let total   = hdr.totalsize() as usize;
     let blob    = core::slice::from_raw_parts(fdt_ptr as *const u8, total);
-    let structs = &blob[hdr.off_dt_struct()  as usize ..];
-    let strings = &blob[hdr.off_dt_strings() as usize ..];
+    let s_off   = hdr.off_dt_struct()  as usize;
+    let str_off = hdr.off_dt_strings() as usize;
+    Some((blob, s_off, str_off))
+}
 
-    crate::println!("fdt: blob at {:#x}, {} bytes", fdt_ptr, total);
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 1 — pre-heap: PMM + PLIC base + initramfs bounds + CPU enumeration
+// No heap allocations permitted here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk the FDT and populate:
+///   - PMM (`pmm::add_region`) from `/memory` nodes
+///   - PLIC base (`plic::set_base`) from `/soc/plic`
+///   - initramfs range (`initramfs::set_initramfs_range`) from `/chosen`
+///   - SMP CPU table (`smp::register_cpu`) from `/cpus/cpu@`
+///
+/// **No heap allocation is performed.**  Must be called before `heap::init()`.
+///
+/// # Safety
+/// `fdt_ptr` must be the physical address of a valid DTB as passed by OpenSBI.
+pub unsafe fn fdt_phase1(fdt_ptr: usize) {
+    let (blob, s_off, str_off) = match open_fdt(fdt_ptr) {
+        Some(v) => v,
+        None    => return,
+    };
+    let total   = blob.len();
+    let structs = &blob[s_off..];
+    let strings = &blob[str_off..];
+    crate::println!("fdt: phase1 blob at {:#x}, {} bytes", fdt_ptr, total);
 
     let mut pos:           usize = 0;
     let mut depth:         usize = 0;
 
-    // /memory node
     let mut in_memory:     bool  = false;
-    // /chosen node
     let mut in_chosen:     bool  = false;
-    // /virtio_mmio@ top-level node
-    let mut in_virtio:     bool  = false;
-    let mut vmmio:         VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
-    // /soc node and its children
     let mut in_soc:        bool  = false;
     let mut soc_child:     SocChild = SocChild::None;
     let mut plic_base:     usize = 0;
-    // /cpus node and its children
     let mut in_cpus:       bool  = false;
     let mut cpus_child:    CpusChild = CpusChild::None;
-    let mut cpu_reg:       u32   = u32::MAX;  // hart-id from `reg` property
-    let mut cpu_status_ok: bool  = false;     // `status` is "okay" or absent
-    let mut cpu_count:     u32   = 0;         // total CPU nodes seen
-    // /chosen
+    let mut cpu_reg:       u32   = u32::MAX;
+    let mut cpu_status_ok: bool  = false;
+    let mut cpu_count:     u32   = 0;
     let mut initrd_start:  u64   = 0;
     let mut initrd_end:    u64   = 0;
 
     let kernel_end_pa = (&_kernel_end as *const u8 as usize + 0xFFF) & !0xFFF;
-
-    // Register BSP (hart 0) first so logical id 0 is always the boot hart.
-    // We will re-register APs as we find their nodes in /cpus.
-    // Actually we enumerate all /cpus/cpu@ nodes and use the `reg` property
-    // as hw_id; the first one with reg==BOOT_HART_ID becomes the BSP.
-    let boot_hart = crate::arch::riscv64::boot::BOOT_HART_ID;
+    let boot_hart     = crate::arch::riscv64::boot::BOOT_HART_ID;
 
     loop {
         if pos + 4 > structs.len() { break; }
@@ -171,14 +178,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                         in_chosen = node_name == "chosen";
                         in_soc    = node_name == "soc";
                         in_cpus   = node_name == "cpus";
-                        in_virtio = node_name.starts_with("virtio_mmio@");
-                        if in_virtio {
-                            let addr_str = &node_name["virtio_mmio@".len()..];
-                            vmmio = VirtioMmioNode {
-                                base: usize::from_str_radix(addr_str, 16).unwrap_or(0),
-                                irq: 0, is_virtio: false,
-                            };
-                        }
+                        // virtio_mmio@ nodes are handled in phase 2 only
                     }
                     2 if in_soc => {
                         soc_child = if node_name == "plic"
@@ -189,11 +189,10 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                         };
                     }
                     2 if in_cpus => {
-                        // /cpus/cpu@ or /cpus/cpu-map etc.
                         if node_name == "cpu" || node_name.starts_with("cpu@") {
                             cpus_child    = CpusChild::Cpu;
                             cpu_reg       = u32::MAX;
-                            cpu_status_ok = true; // assume okay unless disabled
+                            cpu_status_ok = true;
                         } else {
                             cpus_child = CpusChild::None;
                         }
@@ -207,26 +206,21 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                 if depth > 0 { depth -= 1; }
                 match depth {
                     1 => {
-                        // Leaving a top-level node.
-                        if in_virtio && vmmio.is_virtio && vmmio.base != 0 {
-                            crate::drivers::virtio_net_mmio::probe(vmmio.base, vmmio.irq);
-                        }
                         in_memory = false;
                         in_chosen = false;
-                        in_virtio = false;
                         in_soc    = false;
                         in_cpus   = false;
                     }
                     2 if in_soc => {
                         if soc_child == SocChild::Plic && plic_base != 0 {
-                            crate::drivers::plic::set_base(plic_base);
+                            crate::arch::riscv64::plic::set_base(plic_base);
                         }
                         soc_child = SocChild::None;
                     }
                     2 if in_cpus => {
                         if cpus_child == CpusChild::Cpu && cpu_reg != u32::MAX && cpu_status_ok {
                             let is_bsp = cpu_reg == boot_hart as u32;
-                            crate::smp::register_cpu(cpu_reg, 0 /*node*/, is_bsp);
+                            crate::smp::register_cpu(cpu_reg, 0, is_bsp);
                             cpu_count += 1;
                             crate::println!(
                                 "fdt: cpu hart {} logical {} {}",
@@ -252,7 +246,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                 } else { &[] };
                 pos = (pos + prop_len + 3) & !3;
 
-                // ── /memory reg ──────────────────────────────────────────────
+                // /memory reg
                 if in_memory && prop_name == "reg" {
                     let mut i = 0usize;
                     while i + 16 <= prop_data.len() {
@@ -284,7 +278,7 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── /chosen ──────────────────────────────────────────────────
+                // /chosen
                 if in_chosen {
                     match prop_name {
                         "linux,initrd-start" => {
@@ -301,7 +295,129 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                     }
                 }
 
-                // ── virtio_mmio@ node ─────────────────────────────────────────
+                // /soc/plic reg
+                if soc_child == SocChild::Plic && prop_name == "reg" {
+                    if prop_data.len() >= 16 {
+                        let addr_hi = be32(prop_data, 0) as usize;
+                        let addr_lo = be32(prop_data, 4) as usize;
+                        let addr    = (addr_hi << 32) | addr_lo;
+                        if addr != 0 { plic_base = addr; }
+                    } else if prop_data.len() >= 8 {
+                        let addr = be64(prop_data, 0) as usize;
+                        if addr != 0 { plic_base = addr; }
+                    } else if prop_data.len() >= 4 {
+                        let addr = be32(prop_data, 0) as usize;
+                        if addr != 0 { plic_base = addr; }
+                    }
+                }
+
+                // /cpus/cpu@ reg + status
+                if cpus_child == CpusChild::Cpu {
+                    match prop_name {
+                        "reg" => {
+                            if prop_data.len() >= 4 { cpu_reg = be32(prop_data, 0); }
+                        }
+                        "status" => {
+                            let s = core::str::from_utf8(
+                                prop_data.split(|&c| c == 0).next().unwrap_or(&[])
+                            ).unwrap_or("");
+                            cpu_status_ok = s == "okay" || s == "ok";
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            FDT_NOP => {}
+            FDT_END | _ => { break; }
+        }
+    }
+
+    if cpu_count == 0 {
+        crate::smp::register_cpu(boot_hart as u32, 0, true);
+        crate::println!("fdt: no /cpus nodes — registering boot hart {} only", boot_hart);
+    }
+
+    if initrd_start != 0 && initrd_end > initrd_start {
+        let len = (initrd_end - initrd_start) as usize;
+        crate::println!("initramfs: found at {:#x}, {} bytes", initrd_start as usize, len);
+        crate::initramfs::set_initramfs_range(initrd_start as usize, len);
+    } else {
+        crate::println!("initramfs: WARNING: /chosen missing linux,initrd-start/end");
+        crate::println!("initramfs: Pass -initrd <cpio> to QEMU.");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 2 — post-heap: virtio-net MMIO device probe
+// Heap allocations ARE permitted here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk the FDT a second time and probe all `virtio,mmio` nodes.
+/// Heap must be initialised before calling this function.
+///
+/// # Safety
+/// Same requirements as `fdt_phase1`.
+pub unsafe fn fdt_phase2(fdt_ptr: usize) {
+    let (blob, s_off, str_off) = match open_fdt(fdt_ptr) {
+        Some(v) => v,
+        None    => return,
+    };
+    let structs = &blob[s_off..];
+    let strings = &blob[str_off..];
+    crate::println!("fdt: phase2 probing virtio-mmio devices");
+
+    let mut pos:      usize = 0;
+    let mut depth:    usize = 0;
+    let mut in_virtio:bool  = false;
+    let mut vmmio: VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
+
+    loop {
+        if pos + 4 > structs.len() { break; }
+        let token = be32(structs, pos); pos += 4;
+
+        match token {
+            FDT_BEGIN_NODE => {
+                let name_start = pos;
+                let name_end   = structs[pos..].iter().position(|&c| c == 0)
+                                     .unwrap_or(0) + pos + 1;
+                let padded     = (name_end + 3) & !3;
+                let node_name  = core::str::from_utf8(&structs[name_start..name_end - 1])
+                                     .unwrap_or("");
+                pos = padded;
+
+                if depth == 1 && node_name.starts_with("virtio_mmio@") {
+                    let addr_str = &node_name["virtio_mmio@".len()..];
+                    in_virtio = true;
+                    vmmio = VirtioMmioNode {
+                        base: usize::from_str_radix(addr_str, 16).unwrap_or(0),
+                        irq: 0,
+                        is_virtio: false,
+                    };
+                }
+                depth += 1;
+            }
+
+            FDT_END_NODE => {
+                if depth > 0 { depth -= 1; }
+                if depth == 1 && in_virtio {
+                    if vmmio.is_virtio && vmmio.base != 0 {
+                        crate::drivers::virtio_net_mmio::probe(vmmio.base, vmmio.irq);
+                    }
+                    in_virtio = false;
+                }
+            }
+
+            FDT_PROP => {
+                if pos + 8 > structs.len() { break; }
+                let prop_len  = be32(structs, pos) as usize; pos += 4;
+                let name_off  = be32(structs, pos) as usize; pos += 4;
+                let prop_name = cstr(strings, name_off);
+                let prop_data = if pos + prop_len <= structs.len() {
+                    &structs[pos..pos + prop_len]
+                } else { &[] };
+                pos = (pos + prop_len + 3) & !3;
+
                 if in_virtio {
                     match prop_name {
                         "compatible" => {
@@ -322,61 +438,10 @@ pub unsafe fn init_from_fdt(fdt_ptr: usize) {
                         _ => {}
                     }
                 }
-
-                // ── /soc/plic node ────────────────────────────────────────────
-                if soc_child == SocChild::Plic && prop_name == "reg" {
-                    if prop_data.len() >= 16 {
-                        let addr_hi = be32(prop_data, 0) as usize;
-                        let addr_lo = be32(prop_data, 4) as usize;
-                        let addr    = (addr_hi << 32) | addr_lo;
-                        if addr != 0 { plic_base = addr; }
-                    } else if prop_data.len() >= 8 {
-                        let addr = be64(prop_data, 0) as usize;
-                        if addr != 0 { plic_base = addr; }
-                    } else if prop_data.len() >= 4 {
-                        let addr = be32(prop_data, 0) as usize;
-                        if addr != 0 { plic_base = addr; }
-                    }
-                }
-
-                // ── /cpus/cpu@ node ───────────────────────────────────────────
-                // `reg` = hart id (u32 big-endian cell).
-                // `status` = "okay" | "disabled".
-                if cpus_child == CpusChild::Cpu {
-                    match prop_name {
-                        "reg" => {
-                            if prop_data.len() >= 4 {
-                                cpu_reg = be32(prop_data, 0);
-                            }
-                        }
-                        "status" => {
-                            let s = core::str::from_utf8(
-                                prop_data.split(|&c| c == 0).next().unwrap_or(&[])
-                            ).unwrap_or("");
-                            cpu_status_ok = s == "okay" || s == "ok";
-                        }
-                        _ => {}
-                    }
-                }
             }
 
             FDT_NOP => {}
             FDT_END | _ => { break; }
         }
-    }
-
-    // If no /cpus nodes were found (e.g. FDT omits them), register hart 0 as BSP.
-    if cpu_count == 0 {
-        crate::smp::register_cpu(boot_hart as u32, 0, true);
-        crate::println!("fdt: no /cpus nodes found — registering boot hart {} only", boot_hart);
-    }
-
-    if initrd_start != 0 && initrd_end > initrd_start {
-        let len = (initrd_end - initrd_start) as usize;
-        crate::println!("initramfs: found at {:#x}, {} bytes", initrd_start as usize, len);
-        crate::initramfs::set_initramfs_range(initrd_start as usize, len);
-    } else {
-        crate::println!("initramfs: WARNING: /chosen missing linux,initrd-start/end");
-        crate::println!("initramfs: Pass -initrd <cpio> to QEMU.");
     }
 }
