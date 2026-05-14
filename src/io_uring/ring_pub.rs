@@ -1,12 +1,11 @@
-//! Public re-export of CqRingHdr fields for syscall.rs.
-//! This is a thin shim so syscall.rs can read cq head/tail without
-//! depending on the private SqRingHdr/CqRingHdr structs.
+//! Public CQ-ring head/tail view used by the GETEVENTS spin-wait in
+//! `sys_io_uring_enter` without pulling in the private `CqRingHdr` type.
 
 use core::sync::atomic::AtomicU32;
 
-/// Public view of the first two fields of CqRingHdr (head, tail).
-/// Used only for the GETEVENTS spin-wait in sys_io_uring_enter.
+/// Head + tail overlay for `CqRingHdr` (first two fields, same layout).
 #[repr(C)]
+#[allow(dead_code)]
 pub struct CqRingHdrPub {
     pub head: AtomicU32,
     pub tail: AtomicU32,

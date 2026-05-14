@@ -1,20 +1,22 @@
-//! IPC subsystem
+//! IPC subsystem.
 //!
-//! | Module        | Facility |
-//! |---------------|----------|
-//! | `key`         | `ftok`, IPC key ↔ ID mapping, `IPC_PRIVATE` |
-//! | `msg`         | System V message queues (`msgget`/`msgsnd`/`msgrcv`/`msgctl`) |
-//! | `sem`         | System V semaphores (`semget`/`semop`/`semctl`) |
-//! | `shm`         | System V shared memory (`shmget`/`shmat`/`shmdt`/`shmctl`) |
-//! | `mq`          | POSIX message queues (`mq_open`/`send`/`receive`/`notify`) |
-//! | `pipe_scheme` | Scheme-backed anonymous pipes; `create_pipe()` returns two
-//! |               | `FdEntry::Scheme` descriptors backed by a shared `PipeScheme`. |
+//! | Module        | Facility                                                      |
+//! |---------------|---------------------------------------------------------------|
+//! | `key`         | `ftok`, IPC key ↔ ID mapping, `IPC_PRIVATE`                  |
+//! | `msg`         | System V message queues (`msgget`/`msgsnd`/`msgrcv`/`msgctl`)|
+//! | `sem`         | System V semaphores (`semget`/`semop`/`semctl`)               |
+//! | `shm`         | System V shared memory (`shmget`/`shmat`/`shmdt`/`shmctl`)   |
+//! | `mq`          | POSIX message queues (`mq_open`/`send`/`receive`/`notify`)    |
+//! | `pipe_scheme` | Scheme-backed anonymous pipes; `create_pipe()` returns two   |
+//! |               | `FdEntry::Scheme` descriptors backed by a shared `PipeScheme`.|
 //!
 //! ## Permissions
 //!
 //! All SysV objects store an `IpcPerm` with `uid/gid/cuid/cgid/mode`.
 //! `check_perm(perm, uid, gid, access_bits)` enforces rwx on owner/group/other.
-//! Capability checks (`CAP_IPC_OWNER`) are left as integration stubs.
+//! Capability checks (`CAP_IPC_OWNER`) are integration stubs.
+
+extern crate alloc;
 
 pub mod key;
 pub mod mq;
@@ -23,9 +25,7 @@ pub mod pipe_scheme;
 pub mod sem;
 pub mod shm;
 
-extern crate alloc;
-
-// ── Common IPC permission structure ──────────────────────────────────────────
+// ── Common IPC permission structure ───────────────────────────────────────────
 
 /// `struct ipc_perm` — matches Linux x86_64 UAPI layout.
 #[repr(C)]
@@ -42,12 +42,15 @@ pub struct IpcPerm {
 }
 
 impl IpcPerm {
+    #[inline]
     pub fn new(key: i32, uid: u32, gid: u32, mode: u16) -> Self {
         IpcPerm { key, uid, gid, cuid: uid, cgid: gid, mode, seq: 0, _pad: [0; 4] }
     }
 }
 
-/// Returns `true` if `uid`/`gid` has `need` bits (0o4=read, 0o2=write) on `perm`.
+/// Returns `true` if `uid`/`gid` has the `need` permission bits on `perm`.
+/// `need`: 0o4 = read, 0o2 = write.
+#[inline]
 pub fn check_perm(perm: &IpcPerm, uid: u32, gid: u32, need: u16) -> bool {
     if uid == 0 { return true; } // root bypass
     let shift = if uid == perm.uid { 6 } else if gid == perm.gid { 3 } else { 0 };
