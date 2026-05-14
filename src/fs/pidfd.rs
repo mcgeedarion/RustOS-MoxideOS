@@ -9,55 +9,121 @@
 //!   pidfd_send_signal(pidfd, sig, info, flags) [NR 424] -> 0/-errno
 //!   pidfd_getfd(pidfd, targetfd, flags)  [NR 438] -> new_fd/-errno
 //!
-//! ## Design
-//! pidfd fds occupy numbers PID_FD_BASE (1024) .. PID_FD_MAX (2048),
-//! stored in a separate PIDFD_TABLE (BTreeMap<fd, pid>).
-//! is_pidfd(fd) lets close() dispatch to free() without touching FdBacking.
-//! PIDFD_NONBLOCK and O_CLOEXEC stored in FD_META via fcntl helpers.
+//! ## Scheme integration
+//!
+//! `sys_pidfd_open` now allocates a scheme backing fd via
+//! `alloc_scheme_backing_fd` and registers a `PidFdScheme` in
+//! `SCHEME_FD_STORE`.  The scheme backing fd is installed into the process
+//! fd table; the raw PIDFD_TABLE entry is still inserted first so that
+//! `is_pidfd()` and `resolve()` never see a gap.
+//!
+//! `sys_pidfd_send_signal` and `sys_pidfd_getfd` receive the scheme backing
+//! fd (resolved from the user fd by the syscall dispatch) and use
+//! `scheme_bfd_to_table_fdno` to recover the raw PIDFD_TABLE key.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 
-const PID_FD_BASE:    usize = 1024;
-const PID_FD_MAX:     usize = 2048;
-const PIDFD_NONBLOCK: u32   = 0x800;
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
+use crate::fs::scheme_table::Scheme;
+
+const PIDFD_NONBLOCK: u32 = 0x800;
 const SIGKILL:  u32 =  9;
 const SIGSTOP:  u32 = 19;
 const SIGCONT:  u32 = 18;
 
-/// Maps pidfd number -> target pid.
+// Raw PIDFD_TABLE fdno namespace — still used by is_pidfd / resolve.
+const PID_FD_BASE: usize = 1024;
+const PID_FD_MAX:  usize = 2048;
+
+/// Maps raw PIDFD_TABLE fdno -> target pid.
 static PIDFD_TABLE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 /// Pending signal queue: maps pid -> pending signal (one slot; SIGKILL wins).
 static PENDING_SIGNAL: Mutex<BTreeMap<usize, u32>> = Mutex::new(BTreeMap::new());
 
-// ── Allocation ──────────────────────────────────────────────────────────
+// ── scheme_bfd → PIDFD_TABLE fdno translation ───────────────────────────────────
 
-/// Allocate a fresh pidfd pointing at `pid`. Returns fd# or -EMFILE.
-pub fn alloc(pid: usize) -> isize {
+/// Translate a scheme backing fd to the PIDFD_TABLE fdno.
+/// Returns None if `scheme_bfd` is not a registered pidfd scheme fd.
+pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
+    let (_, fid) = crate::fs::scheme_fd::scheme_fd_get_fid(scheme_bfd)?;
+    let table_fdno = fid.0 as usize;
+    if table_fdno >= PID_FD_BASE
+        && table_fdno < PID_FD_MAX
+        && PIDFD_TABLE.lock().contains_key(&table_fdno)
+    {
+        Some(table_fdno)
+    } else {
+        None
+    }
+}
+
+// ── PidFdScheme ────────────────────────────────────────────────────────────────────
+
+pub struct PidFdScheme;
+
+impl Scheme for PidFdScheme {
+    fn open(&self, _url: &str, _flags: OpenFlags) -> Result<SchemeFileId, SchemeError> {
+        Err(SchemeError::InvalidArg) // created via pidfd_open only
+    }
+
+    /// pidfds are not directly readable (poll for POLLIN signals child exit).
+    fn read(&self, _fid: SchemeFileId, _buf: &mut [u8]) -> Result<usize, SchemeError> {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn write(&self, _fid: SchemeFileId, _buf: &[u8]) -> Result<usize, SchemeError> {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8)
+        -> Result<u64, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize)
+        -> Result<usize, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn close(&self, fid: SchemeFileId) -> Result<(), SchemeError> {
+        let table_fdno = fid.0 as usize;
+        free(table_fdno);
+        Ok(())
+    }
+}
+
+// ── Allocation helpers (internal) ────────────────────────────────────────────────
+
+/// Allocate a raw PIDFD_TABLE fdno for `pid`. Returns fdno or -EMFILE.
+fn alloc_table_fdno(pid: usize) -> Result<usize, isize> {
     let mut tbl = PIDFD_TABLE.lock();
     for fd in PID_FD_BASE..PID_FD_MAX {
         if !tbl.contains_key(&fd) {
             tbl.insert(fd, pid);
-            return fd as isize;
+            return Ok(fd);
         }
     }
-    -24 // EMFILE
+    Err(-24) // EMFILE
 }
 
-/// Release a pidfd (called from sys_close_fd dispatch).
+/// Release a raw PIDFD_TABLE entry.
 pub fn free(fd: usize) {
     PIDFD_TABLE.lock().remove(&fd);
 }
 
-/// True if `fd` is a live pidfd.
+/// True if `fd` is a live raw PIDFD_TABLE fdno.
 pub fn is_pidfd(fd: usize) -> bool {
     PIDFD_TABLE.lock().contains_key(&fd)
 }
 
-/// Resolve pidfd -> target pid (None if fd invalid or process is zombie).
-fn resolve(pidfd: usize) -> Option<usize> {
-    let pid = *PIDFD_TABLE.lock().get(&pidfd)?;
+/// Resolve raw PIDFD_TABLE fdno -> target pid.
+/// Returns None if the entry is missing or the process is a zombie.
+fn resolve(table_fdno: usize) -> Option<usize> {
+    let pid = *PIDFD_TABLE.lock().get(&table_fdno)?;
     let procs = crate::proc::scheduler::procs_lock();
     let alive = procs.iter().any(|p| {
         p.pid == pid && p.state != crate::proc::process::State::Zombie
@@ -66,12 +132,13 @@ fn resolve(pidfd: usize) -> Option<usize> {
     if alive { Some(pid) } else { None }
 }
 
-// ── sys_pidfd_open ───────────────────────────────────────────────────────
-/// pidfd_open(pid, flags) -> pidfd  [NR 434]
-///
-/// flags: 0 or PIDFD_NONBLOCK (0x800). All other bits -> EINVAL.
-/// Returns ESRCH if pid does not exist or is a zombie.
+// ── sys_pidfd_open [NR 434] ──────────────────────────────────────────────────────
+
 pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
+    use alloc::sync::Arc;
+    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
+    use crate::fs::process_fd::proc_fd_install;
+
     if flags & !(PIDFD_NONBLOCK) != 0 { return -22; } // EINVAL
     if pid == 0 { return -3; }                         // ESRCH
 
@@ -82,32 +149,48 @@ pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
     crate::proc::scheduler::procs_unlock();
     if !alive { return -3; } // ESRCH
 
-    let fd = alloc(pid);
-    if fd < 0 { return fd; }
+    // ── 1. Allocate raw PIDFD_TABLE entry ─────────────────────────────────────
+    let table_fdno = match alloc_table_fdno(pid) {
+        Ok(f)  => f,
+        Err(e) => return e,
+    };
 
-    if flags & PIDFD_NONBLOCK != 0 {
-        crate::fs::fcntl::set_nonblock(fd as usize, true);
-    }
-    // pidfd is always FD_CLOEXEC per spec
-    crate::fs::fcntl::set_cloexec(fd as usize, true);
-    fd
+    // ── 2. Register PidFdScheme ───────────────────────────────────────────────
+    let scheme: Arc<dyn Scheme> = Arc::new(PidFdScheme);
+    let scheme_bfd = alloc_scheme_backing_fd();
+    scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
+
+    // ── 3. Install scheme bfd (pidfds are always FD_CLOEXEC per spec) ───
+    let pid_caller  = crate::proc::scheduler::current_pid();
+    let nonblock_fl = if flags & PIDFD_NONBLOCK != 0 { PIDFD_NONBLOCK } else { 0 };
+    // FD_CLOEXEC flag value is 1 in the install flags convention.
+    let user_fd = proc_fd_install(
+        pid_caller, scheme_bfd, None,
+        nonblock_fl | 1, /* FD_CLOEXEC */
+        None,
+    );
+    user_fd as isize
 }
 
-// ── sys_pidfd_send_signal ────────────────────────────────────────────────
-/// pidfd_send_signal(pidfd, sig, info_va, flags) -> 0/-errno  [NR 424]
-///
-/// sig == 0: existence check only.
-/// SIGKILL: immediate Zombie + notify_exit wakes waitpid.
-/// SIGSTOP: Blocked. SIGCONT: wake_pid. Others: queued in PENDING_SIGNAL.
+// ── sys_pidfd_send_signal [NR 424] ───────────────────────────────────────────────
+//
+// The syscall dispatch resolves the user-visible fd to a scheme bfd before
+// calling this.  We translate to the PIDFD_TABLE fdno via
+// scheme_bfd_to_table_fdno.
+
 pub fn sys_pidfd_send_signal(
-    pidfd: usize, sig: u32, _info_va: usize, flags: u32,
+    scheme_bfd: usize, sig: u32, _info_va: usize, flags: u32,
 ) -> isize {
     if flags != 0 { return -22; }
     if sig > 64   { return -22; }
 
-    let pid = match resolve(pidfd) {
+    let table_fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
+        Some(f) => f,
+        None    => return -9, // EBADF
+    };
+    let pid = match resolve(table_fdno) {
         Some(p) => p,
-        None    => return if !is_pidfd(pidfd) { -9 } else { -3 }, // EBADF / ESRCH
+        None    => return -3, // ESRCH
     };
 
     if sig == 0 { return 0; } // existence check
@@ -132,45 +215,35 @@ pub fn sys_pidfd_send_signal(
             0
         }
         SIGCONT => { crate::proc::scheduler::wake_pid(pid); 0 }
-        _ => {
-            PENDING_SIGNAL.lock().insert(pid, sig);
-            0
-        }
+        _ => { PENDING_SIGNAL.lock().insert(pid, sig); 0 }
     }
 }
 
 /// Check and consume one pending signal for `pid`.
-/// Called by the syscall dispatcher before returning to userspace.
 pub fn check_pending_signal(pid: usize) -> u32 {
     PENDING_SIGNAL.lock().remove(&pid).unwrap_or(0)
 }
 
-// ── sys_pidfd_getfd ──────────────────────────────────────────────────────
-/// pidfd_getfd(pidfd, targetfd, flags) -> new_fd/-errno  [NR 438]
-///
-/// Dups `targetfd` from the process identified by `pidfd` into the caller.
-/// New fd always has FD_CLOEXEC set (per spec).
-/// Requires CAP_SYS_PTRACE or caller == target (same PID).
-pub fn sys_pidfd_getfd(pidfd: usize, targetfd: usize, flags: u32) -> isize {
-    if flags != 0 { return -22; } // EINVAL
+// ── sys_pidfd_getfd [NR 438] ──────────────────────────────────────────────────────
 
-    let target_pid = match resolve(pidfd) {
+pub fn sys_pidfd_getfd(scheme_bfd: usize, targetfd: usize, flags: u32) -> isize {
+    if flags != 0 { return -22; }
+
+    let table_fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
+        Some(f) => f,
+        None    => return -9,
+    };
+    let target_pid = match resolve(table_fdno) {
         Some(p) => p,
-        None    => return if !is_pidfd(pidfd) { -9 } else { -3 },
+        None    => return -3,
     };
 
-    let caller_pid = crate::proc::scheduler::current_pid();
-    // Allow if same process OR if capability check passes (always true in stub)
-    let has_ptrace = crate::security::check_capability(19 /* CAP_SYS_PTRACE */);
-    if !has_ptrace && caller_pid != target_pid {
-        return -1; // EPERM
-    }
+    let caller_pid  = crate::proc::scheduler::current_pid();
+    let has_ptrace  = crate::security::check_capability(19 /* CAP_SYS_PTRACE */);
+    if !has_ptrace && caller_pid != target_pid { return -1; } // EPERM
 
-    // Validate fd belongs to target (or is unowned in legacy flat table)
     let owner = crate::fs::fcntl::fd_owner(targetfd);
-    if owner != 0 && owner != target_pid {
-        return -9; // EBADF
-    }
+    if owner != 0 && owner != target_pid { return -9; } // EBADF
 
     let new_fd = crate::fs::vfs::dup_from(targetfd, 3);
     if new_fd < 0 { return new_fd; }

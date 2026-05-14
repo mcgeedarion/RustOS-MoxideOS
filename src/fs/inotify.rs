@@ -8,33 +8,24 @@
 //!   read(fd, buf, n)          — dequeue inotify_event records
 //!   close(fd)                 — destroy the instance
 //!
-//! ## Event mask constants (IN_*) — match Linux uapi/linux/inotify.h
-//!   Callers typically combine these with OR.
+//! ## Scheme integration
 //!
-//! ## inotify_event wire format (read(2) output)
-//!   struct inotify_event {
-//!       i32  wd;       // watch descriptor
-//!       u32  mask;     // event mask
-//!       u32  cookie;   // rename cookie (0 if not rename)
-//!       u32  len;      // length of name[] incl. NUL and padding
-//!       char name[];   // optional NUL-padded name (only for dir watches)
-//!   };
-//!   Total size = 16 + len.  len is always a multiple of 4 (aligned).
+//! `sys_inotify_init1` allocates a scheme backing fd via
+//! `alloc_scheme_backing_fd` and registers an `InotifyScheme` in
+//! `SCHEME_FD_STORE`.  The scheme backing fd is installed into the process
+//! fd table; the raw TABLE entry is still inserted first.
 //!
-//! ## Kernel-side event delivery
-//!   Other fs operations (vfs::create, vfs::unlink, vfs::write, etc.) call
-//!   inotify_emit(path, mask) after completing successfully.  This function
-//!   scans all active watches and enqueues inotify_event records on every
-//!   matching inotify instance.
-//!
-//! ## poll/select readiness
-//!   POLLIN when the event queue is non-empty.
+//! `sys_inotify_add_watch` and `sys_inotify_rm_watch` receive the scheme
+//! backing fd and use `scheme_bfd_to_table_fdno` to recover the TABLE key.
 
 extern crate alloc;
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use spin::Mutex;
 
-// ─── Public event mask constants ────────────────────────────────────────────
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
+use crate::fs::scheme_table::Scheme;
+
+// ── Public event mask constants ────────────────────────────────────────────────────────────────
 
 pub const IN_ACCESS:        u32 = 0x0000_0001;
 pub const IN_MODIFY:        u32 = 0x0000_0002;
@@ -62,20 +53,15 @@ pub const IN_ISDIR:         u32 = 0x4000_0000;
 pub const IN_ONESHOT:       u32 = 0x8000_0000;
 pub const IN_ALL_EVENTS:    u32 = 0x0000_0FFF;
 
-// inotify_init1 flags
-pub const IN_CLOEXEC:  u32 = 0x0008_0000; // O_CLOEXEC
-pub const IN_NONBLOCK: u32 = 0x0000_0800; // O_NONBLOCK
+pub const IN_CLOEXEC:  u32 = 0x0008_0000;
+pub const IN_NONBLOCK: u32 = 0x0000_0800;
 
-// Maximum queued events per instance before IN_Q_OVERFLOW is emitted.
 const MAX_QUEUE: usize = 16384;
-
-// ─── fd base ────────────────────────────────────────────────────────────────
 
 pub const INOTIFY_FD_BASE: usize = 0x8000_0000;
 
-// ─── Internal structures ─────────────────────────────────────────────────────
+// ── Internal structures ──────────────────────────────────────────────────────────────
 
-/// A single queued event ready to be read by userspace.
 struct QueuedEvent {
     wd:     i32,
     mask:   u32,
@@ -83,7 +69,6 @@ struct QueuedEvent {
     name:   Option<String>,
 }
 
-/// A single watch inside an inotify instance.
 struct Watch {
     path:    String,
     mask:    u32,
@@ -91,12 +76,11 @@ struct Watch {
     oneshot: bool,
 }
 
-/// One inotify instance (one fd).
 struct InotifyInstance {
-    nonblock:   bool,
-    queue:      Vec<QueuedEvent>,
-    watches:    Vec<Watch>,
-    next_wd:    i32,
+    nonblock: bool,
+    queue:    Vec<QueuedEvent>,
+    watches:  Vec<Watch>,
+    next_wd:  i32,
 }
 
 static TABLE: Mutex<BTreeMap<usize, InotifyInstance>> =
@@ -104,29 +88,94 @@ static TABLE: Mutex<BTreeMap<usize, InotifyInstance>> =
 static COUNTER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-// ─── Syscall implementations ────────────────────────────────────────────────
+// ── scheme_bfd → TABLE fdno translation ───────────────────────────────────────────
 
-/// inotify_init1(flags)  [NR 294]
-/// inotify_init()  [NR 253]  — call with flags = 0
+/// Translate a scheme backing fd to the inotify TABLE fdno.
+pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
+    let (_, fid) = crate::fs::scheme_fd::scheme_fd_get_fid(scheme_bfd)?;
+    let table_fdno = fid.0 as usize;
+    if table_fdno >= INOTIFY_FD_BASE && TABLE.lock().contains_key(&table_fdno) {
+        Some(table_fdno)
+    } else {
+        None
+    }
+}
+
+// ── InotifyScheme ───────────────────────────────────────────────────────────────────
+
+pub struct InotifyScheme;
+
+impl Scheme for InotifyScheme {
+    fn open(&self, _url: &str, _flags: OpenFlags) -> Result<SchemeFileId, SchemeError> {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn read(&self, fid: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
+        let fdno = fid.0 as usize;
+        let n = inotify_read(fdno, buf);
+        if n < 0 { Err(SchemeError::Io) } else { Ok(n as usize) }
+    }
+
+    fn write(&self, _fid: SchemeFileId, _buf: &[u8]) -> Result<usize, SchemeError> {
+        Err(SchemeError::InvalidArg) // inotify fds are not writable
+    }
+
+    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8)
+        -> Result<u64, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize)
+        -> Result<usize, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn close(&self, fid: SchemeFileId) -> Result<(), SchemeError> {
+        inotify_close(fid.0 as usize);
+        Ok(())
+    }
+}
+
+// ── sys_inotify_init1 [NR 294] ──────────────────────────────────────────────────────
+
 pub fn sys_inotify_init1(flags: u32) -> isize {
-    let id   = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let fdno = INOTIFY_FD_BASE + id;
-    let nonblock = flags & IN_NONBLOCK != 0;
-    TABLE.lock().insert(fdno, InotifyInstance {
-        nonblock,
+    use alloc::sync::Arc;
+    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
+    use crate::fs::process_fd::proc_fd_install;
+
+    // ── 1. Allocate raw TABLE entry ────────────────────────────────────────────
+    let id       = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let table_fdno = INOTIFY_FD_BASE + id;
+    TABLE.lock().insert(table_fdno, InotifyInstance {
+        nonblock: flags & IN_NONBLOCK != 0,
         queue:    Vec::new(),
         watches:  Vec::new(),
         next_wd:  1,
     });
-    if flags & IN_CLOEXEC != 0 {
-        crate::fs::fcntl::set_cloexec(fdno, true);
-    }
-    fdno as isize
+
+    // ── 2. Register InotifyScheme ───────────────────────────────────────────────
+    let scheme: Arc<dyn Scheme> = Arc::new(InotifyScheme);
+    let scheme_bfd = alloc_scheme_backing_fd();
+    scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
+
+    // ── 3. Install scheme bfd ──────────────────────────────────────────────────
+    let pid = crate::proc::scheduler::current_pid();
+    let install_flags = if flags & IN_CLOEXEC != 0 { IN_CLOEXEC } else { 0 };
+    let user_fd = proc_fd_install(pid, scheme_bfd, None, install_flags, None);
+    user_fd as isize
 }
 
-/// inotify_add_watch(fd, path_va, mask)  [NR 254]
-/// Returns watch descriptor (wd >= 1) or -errno.
-pub fn sys_inotify_add_watch(fdno: usize, path_va: usize, mask: u32) -> isize {
+// ── sys_inotify_add_watch [NR 254] ──────────────────────────────────────────────────
+//
+// Called with the scheme bfd (already resolved from user fd).
+
+pub fn sys_inotify_add_watch(scheme_bfd: usize, path_va: usize, mask: u32) -> isize {
+    let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
+        Some(f) => f,
+        None    => return -9, // EBADF
+    };
     let path = match crate::proc::exec::read_cstr_safe(path_va) {
         Some(p) => p,
         None    => return -14, // EFAULT
@@ -134,9 +183,8 @@ pub fn sys_inotify_add_watch(fdno: usize, path_va: usize, mask: u32) -> isize {
     let mut tbl = TABLE.lock();
     let inst = match tbl.get_mut(&fdno) {
         Some(i) => i,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
-    // If a watch for this path already exists, update its mask.
     for w in inst.watches.iter_mut() {
         if w.path == path {
             if mask & IN_MASK_ADD != 0 {
@@ -148,7 +196,6 @@ pub fn sys_inotify_add_watch(fdno: usize, path_va: usize, mask: u32) -> isize {
             return w.wd as isize;
         }
     }
-    // New watch.
     let wd = inst.next_wd;
     inst.next_wd += 1;
     inst.watches.push(Watch {
@@ -160,32 +207,32 @@ pub fn sys_inotify_add_watch(fdno: usize, path_va: usize, mask: u32) -> isize {
     wd as isize
 }
 
-/// inotify_rm_watch(fd, wd)  [NR 255]
-pub fn sys_inotify_rm_watch(fdno: usize, wd: i32) -> isize {
+// ── sys_inotify_rm_watch [NR 255] ───────────────────────────────────────────────────
+
+pub fn sys_inotify_rm_watch(scheme_bfd: usize, wd: i32) -> isize {
+    let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
+        Some(f) => f,
+        None    => return -9,
+    };
     let mut tbl = TABLE.lock();
     let inst = match tbl.get_mut(&fdno) {
         Some(i) => i,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
     let before = inst.watches.len();
     inst.watches.retain(|w| w.wd != wd);
-    if inst.watches.len() == before {
-        return -22; // EINVAL — wd not found
-    }
-    // Enqueue IN_IGNORED to notify userspace the watch was removed.
+    if inst.watches.len() == before { return -22; } // EINVAL
     if inst.queue.len() < MAX_QUEUE {
         inst.queue.push(QueuedEvent { wd, mask: IN_IGNORED, cookie: 0, name: None });
     }
     0
 }
 
-// ─── read — dequeue inotify_event records ───────────────────────────────────
+// ── read (called via InotifyScheme::read) ─────────────────────────────────────────
 
-/// Dequeue events into `buf`, encoding as packed inotify_event structs.
-/// Returns the number of bytes written, or -EAGAIN / -EINVAL.
 pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
-    const HDR: usize = 16; // sizeof(inotify_event) without name[]
-    if buf.len() < HDR { return -22; } // EINVAL
+    const HDR: usize = 16;
+    if buf.len() < HDR { return -22; }
     let deadline = crate::time::monotonic_ns() + 5_000_000_000;
     loop {
         {
@@ -197,7 +244,6 @@ pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
             if !inst.queue.is_empty() {
                 let mut written = 0usize;
                 while let Some(ev) = inst.queue.first() {
-                    // Compute len: 0 if no name, else align4(name_bytes + 1).
                     let name_bytes = ev.name.as_ref().map(|n| n.as_bytes()).unwrap_or(&[]);
                     let len: u32 = if name_bytes.is_empty() { 0 } else {
                         ((name_bytes.len() + 1 + 3) & !3) as u32
@@ -212,14 +258,13 @@ pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
                     if len > 0 {
                         let nl = name_bytes.len();
                         b[16..16 + nl].copy_from_slice(name_bytes);
-                        // zero padding already zero (kbuf was zeroed by caller)
                     }
                     written += rec;
                     inst.queue.remove(0);
                 }
                 if written > 0 { return written as isize; }
             }
-            if inst.nonblock { return -11; } // EAGAIN
+            if inst.nonblock { return -11; }
         }
         if crate::time::monotonic_ns() >= deadline { return -11; }
         crate::proc::scheduler::schedule();
@@ -227,19 +272,19 @@ pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
     }
 }
 
-// ─── close ──────────────────────────────────────────────────────────────────
+// ── close ──────────────────────────────────────────────────────────────────────
 
 pub fn inotify_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
-// ─── Predicate ──────────────────────────────────────────────────────────────
+// ── Predicate ────────────────────────────────────────────────────────────────────
 
 pub fn is_inotify_fd(fdno: usize) -> bool {
     fdno >= INOTIFY_FD_BASE && TABLE.lock().contains_key(&fdno)
 }
 
-// ─── poll readiness ──────────────────────────────────────────────────────────
+// ── poll readiness ─────────────────────────────────────────────────────────────
 
 pub fn inotify_poll(fdno: usize, events: u32) -> u32 {
     let tbl = TABLE.lock();
@@ -248,26 +293,14 @@ pub fn inotify_poll(fdno: usize, events: u32) -> u32 {
         Some(inst) => {
             if events & crate::fs::poll::POLLIN != 0 && !inst.queue.is_empty() {
                 crate::fs::poll::POLLIN
-            } else {
-                0
-            }
+            } else { 0 }
         }
     }
 }
 
-// ─── Kernel-internal event emission ─────────────────────────────────────────
-//
-// Called by vfs write/create/unlink/rename paths after a successful operation.
-// Scans every inotify instance for watches matching `path`, and enqueues the
-// appropriate event if the watch's mask covers it.
-//
-// `path`   — absolute path of the affected file/directory
-// `mask`   — one of the IN_* event bits (single event per call)
-// `cookie` — non-zero only for IN_MOVED_FROM / IN_MOVED_TO pairs
-// `name`   — leaf name to embed in the event (None for self-events)
+// ── Kernel-internal event emission ──────────────────────────────────────────────────
 
 pub fn inotify_emit(path: &str, mask: u32, cookie: u32, name: Option<&str>) {
-    // Derive the parent directory of `path` for directory watches.
     let parent: &str = match path.rfind('/') {
         Some(0) => "/",
         Some(i) => &path[..i],
@@ -279,40 +312,30 @@ pub fn inotify_emit(path: &str, mask: u32, cookie: u32, name: Option<&str>) {
 
     let mut tbl = TABLE.lock();
     for inst in tbl.values_mut() {
-        // Collect matching wd indices (avoid borrow-checker issues with retain later).
         let mut to_remove: Vec<i32> = Vec::new();
         for w in inst.watches.iter() {
             let watches_exact  = w.path == path;
             let watches_parent = w.path == parent;
             if !watches_exact && !watches_parent { continue; }
             if w.mask & mask == 0 { continue; }
-
             if inst.queue.len() >= MAX_QUEUE {
-                // Overflow: emit IN_Q_OVERFLOW and stop filling.
                 inst.queue.push(QueuedEvent {
                     wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: None,
                 });
                 break;
             }
-
             let event_name: Option<String> = if watches_parent {
-                // Parent-dir watch: embed the leaf name.
                 Some(name.unwrap_or(leaf).into())
             } else {
-                // Exact-path watch: no name field.
                 None
             };
-
             inst.queue.push(QueuedEvent {
                 wd:     w.wd,
                 mask:   mask | if watches_parent && is_directory(path) { IN_ISDIR } else { 0 },
                 cookie,
                 name:   event_name,
             });
-
-            if w.oneshot {
-                to_remove.push(w.wd);
-            }
+            if w.oneshot { to_remove.push(w.wd); }
         }
         for wd in to_remove {
             inst.watches.retain(|w| w.wd != wd);
@@ -320,10 +343,8 @@ pub fn inotify_emit(path: &str, mask: u32, cookie: u32, name: Option<&str>) {
     }
 }
 
-// Cheap heuristic: treat a path as a directory if it has no extension-like
-// suffix and the ext2 layer confirms it, or fall back to false.
 fn is_directory(path: &str) -> bool {
     crate::fs::ext2::stat(path)
-        .map(|ino| crate::fs::ext2::is_dir(path))
+        .map(|_ino| crate::fs::ext2::is_dir(path))
         .unwrap_or(false)
 }
