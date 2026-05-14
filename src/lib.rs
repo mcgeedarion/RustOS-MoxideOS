@@ -1,11 +1,9 @@
-//! rustos kernel crate root.
+//! RustOS kernel crate root.
 
 #![no_std]
 #![feature(alloc_error_handler)]
 #![feature(naked_functions)]
 #![feature(asm_const)]
-#![allow(dead_code, unused_imports, unused_variables, unused_mut,
-         unused_assignments, non_camel_case_types)]
 
 extern crate alloc;
 
@@ -48,6 +46,7 @@ pub mod exec;
 pub mod firmware;
 pub mod fs;
 pub mod init;
+pub mod input;
 pub mod io_uring;
 pub mod ipc;
 pub mod kernel;
@@ -61,16 +60,13 @@ pub mod sync;
 pub mod syscall;
 pub mod time;
 pub mod tty;
-pub mod input;
 
 // ── Legacy top-level aliases (backward compat) ───────────────────────────────
 //
-// The modules below are kept at their original paths so that all existing
-// `crate::foo` references in kernel_main.rs and elsewhere continue to compile
-// without modification. They will be removed once all call-sites are updated
-// to use the new paths above.
+// Kept so that existing `crate::foo` references compile unchanged.
+// Migrate call-sites to the canonical paths and delete these.
 //
-//   Old path            New canonical path
+//   Old path            Canonical path
 //   crate::acpi      →  crate::firmware::acpi
 //   crate::allocator →  crate::mm::allocator
 //   crate::crt       →  crate::init::crt
@@ -86,19 +82,33 @@ pub mod input;
 //   crate::utils     →  crate::kernel::utils
 //   crate::wayland   →  crate::display::wayland
 
+#[deprecated(since = "0.1.0", note = "use `crate::firmware::acpi`")]
 pub mod acpi;
+#[deprecated(since = "0.1.0", note = "use `crate::mm::allocator`")]
 pub mod allocator;
+#[deprecated(since = "0.1.0", note = "use `crate::init::crt`")]
 pub mod crt;
+#[deprecated(since = "0.1.0", note = "use `crate::display::drm`")]
 pub mod drm;
+#[deprecated(since = "0.1.0", note = "use `crate::firmware::dt`")]
 pub mod dt;
+#[deprecated(since = "0.1.0", note = "use `crate::exec::elf`")]
 pub mod elf;
+#[deprecated(since = "0.1.0", note = "use `crate::debug::gdbstub`")]
 pub mod gdbstub;
+#[deprecated(since = "0.1.0", note = "use `crate::init::initramfs`")]
 pub mod initramfs;
+#[deprecated(since = "0.1.0", note = "use `crate::init::loader`")]
 pub mod loader;
+#[deprecated(since = "0.1.0", note = "use `crate::kernel::panic`")]
 pub mod panic;
+#[deprecated(since = "0.1.0", note = "use `crate::kernel::rand`")]
 pub mod rand;
+#[deprecated(since = "0.1.0", note = "use `crate::kernel::uaccess`")]
 pub mod uaccess;
+#[deprecated(since = "0.1.0", note = "use `crate::kernel::utils`")]
 pub mod utils;
+#[deprecated(since = "0.1.0", note = "use `crate::display::wayland`")]
 pub mod wayland;
 
 pub use kernel_main::kernel_main;
