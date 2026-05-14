@@ -27,56 +27,128 @@
 //!   TFD_NONBLOCK  (O_NONBLOCK = 2048)
 //!   TFD_CLOEXEC   (O_CLOEXEC  = 524288)
 //!   TFD_TIMER_ABSTIME (1) — it_value is absolute, not relative
+//!
+//! ## Scheme integration
+//!
+//! `sys_timerfd_create` now allocates a scheme backing fd via
+//! `alloc_scheme_backing_fd` and registers a `TimerFdScheme` in
+//! `SCHEME_FD_STORE`.  All subsequent read/close on the user-visible fd
+//! flows through `scheme_fd_read` / `scheme_fd_close`.
+//!
+//! `sys_timerfd_settime` and `sys_timerfd_gettime` receive the scheme
+//! backing fd (already resolved from the user fd by the syscall dispatch)
+//! and need the raw TABLE fdno.  `scheme_bfd_to_table_fdno` provides that
+//! translation by walking SCHEME_FD_STORE to extract the SchemeFileId,
+//! which carries the TABLE fdno directly.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── constants ─────────────────────────────────────────────────────────────
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
+use crate::fs::scheme_table::Scheme;
 
+// ── constants ──────────────────────────────────────────────────────────────────
+
+/// Raw fdno namespace for the TABLE.
 pub const TIMERFD_FD_BASE: usize = 0x6000_0000;
-const MAX_TIMERFDS: usize = 256;
 
-pub const TFD_NONBLOCK:       u32 = 2048;    // O_NONBLOCK
-pub const TFD_CLOEXEC:        u32 = 524288;  // O_CLOEXEC
-pub const TFD_TIMER_ABSTIME:  i32 = 1;
+pub const TFD_NONBLOCK:      u32 = 2048;
+pub const TFD_CLOEXEC:       u32 = 524288;
+pub const TFD_TIMER_ABSTIME: i32 = 1;
 
 const CLOCK_REALTIME:  u32 = 0;
 const CLOCK_MONOTONIC: u32 = 1;
 
-// ── data structures ───────────────────────────────────────────────────────
+// ── data structures ─────────────────────────────────────────────────────────────
 
-/// One `struct itimerspec` represented in nanoseconds.
 #[derive(Clone, Copy, Default)]
 pub struct ItimerspecNs {
-    /// Repetition interval; 0 = one-shot.
     pub interval_ns: u64,
-    /// Absolute deadline for next expiry; 0 = disarmed.
     pub next_ns:     u64,
 }
 
 #[derive(Clone, Copy)]
 pub struct TimerFdEntry {
-    pub spec:          ItimerspecNs,
-    pub expirations:   u64,
-    pub nonblocking:   bool,
+    pub spec:        ItimerspecNs,
+    pub expirations: u64,
+    pub nonblocking: bool,
 }
 
-// ── global table ──────────────────────────────────────────────────────────
+// ── global table ────────────────────────────────────────────────────────────────
 
-static TABLE: Mutex<BTreeMap<usize, TimerFdEntry>> = Mutex::new(BTreeMap::new());
+static TABLE: Mutex<BTreeMap<usize, TimerFdEntry>> =
+    Mutex::new(BTreeMap::new());
 static COUNTER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-// ── helpers ───────────────────────────────────────────────────────────────
+// ── scheme bfd → TABLE fdno translation ───────────────────────────────────────
+//
+// `sys_timerfd_settime` and `sys_timerfd_gettime` are called from the
+// syscall dispatch table with the *scheme* backing fd (already resolved
+// from the user-visible fd).  They need the raw TABLE fdno to look up
+// the timer state.  We retrieve it by reading the SchemeFileId that was
+// stored at registration time (which holds the TABLE fdno directly).
+
+/// Translate a scheme backing fd to the TABLE fdno for this timerfd.
+///
+/// Returns `None` if `scheme_bfd` is not a registered timerfd scheme fd.
+pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
+    let (_, fid) = crate::fs::scheme_fd::scheme_fd_get_fid(scheme_bfd)?;
+    // The TABLE fdno is stored verbatim in SchemeFileId.0.
+    let table_fdno = fid.0 as usize;
+    if table_fdno >= TIMERFD_FD_BASE && TABLE.lock().contains_key(&table_fdno) {
+        Some(table_fdno)
+    } else {
+        None
+    }
+}
+
+// ── TimerFdScheme — Scheme trait wrapper ───────────────────────────────────────
+
+pub struct TimerFdScheme;
+
+impl Scheme for TimerFdScheme {
+    fn open(&self, _url: &str, _flags: OpenFlags) -> Result<SchemeFileId, SchemeError> {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn read(&self, fid: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
+        let fdno = fid.0 as usize;
+        let n = timerfd_read(fdno, buf);
+        if n < 0 { Err(SchemeError::Io) } else { Ok(n as usize) }
+    }
+
+    /// timerfds are not writable.
+    fn write(&self, _fid: SchemeFileId, _buf: &[u8]) -> Result<usize, SchemeError> {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8)
+        -> Result<u64, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize)
+        -> Result<usize, SchemeError>
+    {
+        Err(SchemeError::InvalidArg)
+    }
+
+    fn close(&self, fid: SchemeFileId) -> Result<(), SchemeError> {
+        let fdno = fid.0 as usize;
+        timerfd_close(fdno);
+        Ok(())
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn now_ns() -> u64 { crate::time::monotonic_ns() }
 
-/// Read a `struct itimerspec` from user space.
-/// Layout: { {i64 tv_sec, i64 tv_nsec}, {i64 tv_sec, i64 tv_nsec} } = 32 bytes.
-/// Returns (interval_ns, value_ns) or Err(-14).
 fn read_itimerspec(va: usize) -> Result<(u64, u64), isize> {
     if !validate_user_ptr(va, 32) { return Err(-14); }
     let mut buf = [0u8; 32];
@@ -92,7 +164,6 @@ fn read_itimerspec(va: usize) -> Result<(u64, u64), isize> {
     Ok((interval_ns, value_ns))
 }
 
-/// Write a `struct itimerspec` to user space.
 fn write_itimerspec(va: usize, interval_ns: u64, remaining_ns: u64) {
     if va == 0 { return; }
     let isec  = (interval_ns  / 1_000_000_000) as i64;
@@ -107,61 +178,77 @@ fn write_itimerspec(va: usize, interval_ns: u64, remaining_ns: u64) {
     let _ = copy_to_user(va, &buf);
 }
 
-/// Tick the timer for `fdno`: advance expirations if the deadline has passed.
-/// Must be called with the table lock held.
 fn tick(entry: &mut TimerFdEntry) {
     if entry.spec.next_ns == 0 { return; }
     let now = now_ns();
     if now < entry.spec.next_ns { return; }
     if entry.spec.interval_ns == 0 {
-        // One-shot: fire once, disarm.
         entry.expirations += 1;
         entry.spec.next_ns = 0;
     } else {
-        // Repeating: count all missed intervals.
-        let elapsed   = now - entry.spec.next_ns;
-        let full      = elapsed / entry.spec.interval_ns;
+        let elapsed = now - entry.spec.next_ns;
+        let full    = elapsed / entry.spec.interval_ns;
         entry.expirations += full + 1;
         entry.spec.next_ns += (full + 1) * entry.spec.interval_ns;
     }
 }
 
-// ── public API ────────────────────────────────────────────────────────────
+// ── public API ─────────────────────────────────────────────────────────────────
 
-/// Returns true if `fdno` is a live timerfd.
 pub fn is_timerfd(fdno: usize) -> bool {
     fdno >= TIMERFD_FD_BASE && TABLE.lock().contains_key(&fdno)
 }
 
-// ── sys_timerfd_create [NR 283] ───────────────────────────────────────────
+// ── sys_timerfd_create [NR 283] ────────────────────────────────────────────────
 
 pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
+    use alloc::sync::Arc;
+    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
+    use crate::fs::process_fd::proc_fd_install;
+
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC => {}
-        _ => return -22, // EINVAL — unsupported clock
+        _ => return -22, // EINVAL
     }
-    if TABLE.lock().len() >= MAX_TIMERFDS { return -24; } // EMFILE
-    let id   = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let fdno = TIMERFD_FD_BASE + id;
-    TABLE.lock().insert(fdno, TimerFdEntry {
+
+    // ── 1. Allocate a raw TABLE fdno ──────────────────────────────────────────
+    let id         = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let table_fdno = TIMERFD_FD_BASE + id;
+
+    TABLE.lock().insert(table_fdno, TimerFdEntry {
         spec:        ItimerspecNs::default(),
         expirations: 0,
         nonblocking: flags & TFD_NONBLOCK != 0,
     });
-    if flags & TFD_CLOEXEC != 0 {
-        crate::fs::fcntl::set_cloexec(fdno, true);
-    }
-    fdno as isize
+
+    // ── 2. Register a TimerFdScheme in SCHEME_FD_STORE ─────────────────────
+    //
+    // SchemeFileId carries the TABLE fdno for reverse lookup in
+    // scheme_bfd_to_table_fdno (used by settime/gettime).
+    let scheme: Arc<dyn Scheme> = Arc::new(TimerFdScheme);
+    let scheme_bfd = alloc_scheme_backing_fd();
+    scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
+
+    // ── 3. Install scheme bfd into the process fd table ───────────────────
+    let pid           = crate::proc::scheduler::current_pid();
+    let install_flags = if flags & TFD_CLOEXEC != 0 { TFD_CLOEXEC } else { 0 };
+    let user_fd       = proc_fd_install(pid, scheme_bfd, None, install_flags, None);
+
+    user_fd as isize
 }
 
-// ── sys_timerfd_settime [NR 286] ──────────────────────────────────────────
+// ── sys_timerfd_settime [NR 286] ───────────────────────────────────────────────
 //
-// int timerfd_settime(int fd, int flags,
-//                    const struct itimerspec *new_value,
-//                    struct itimerspec       *old_value);
+// The syscall dispatch calls this with the scheme backing fd already
+// resolved from the user-visible fd.  We translate to the TABLE fdno
+// via scheme_bfd_to_table_fdno.
 
-pub fn sys_timerfd_settime(fdno: usize, flags: i32,
+pub fn sys_timerfd_settime(scheme_bfd: usize, flags: i32,
                            new_va: usize, old_va: usize) -> isize {
+    let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
+        Some(f) => f,
+        None    => return -9, // EBADF
+    };
     let (interval_ns, value_ns) = match read_itimerspec(new_va) {
         Ok(v)  => v,
         Err(e) => return e,
@@ -169,19 +256,15 @@ pub fn sys_timerfd_settime(fdno: usize, flags: i32,
     let mut tbl = TABLE.lock();
     let entry = match tbl.get_mut(&fdno) {
         Some(e) => e,
-        None    => return -9, // EBADF
+        None    => return -9,
     };
-    // Write back old spec before modifying.
     if old_va != 0 {
         let remaining = if entry.spec.next_ns > 0 {
-            let n = now_ns();
-            entry.spec.next_ns.saturating_sub(n)
+            entry.spec.next_ns.saturating_sub(now_ns())
         } else { 0 };
-        drop(tbl); // release lock while doing user copy
-        write_itimerspec(old_va, {
-            let tbl2 = TABLE.lock();
-            tbl2[&fdno].spec.interval_ns
-        }, remaining);
+        let old_interval = entry.spec.interval_ns;
+        drop(tbl);
+        write_itimerspec(old_va, old_interval, remaining);
         tbl = TABLE.lock();
         if let Some(e) = tbl.get_mut(&fdno) {
             entry_settime(e, flags, interval_ns, value_ns);
@@ -192,32 +275,29 @@ pub fn sys_timerfd_settime(fdno: usize, flags: i32,
     0
 }
 
-/// Arm/disarm helper (called with lock held).
 fn entry_settime(entry: &mut TimerFdEntry,
                  flags: i32, interval_ns: u64, value_ns: u64) {
-    // Reset expirations on re-arm.
     entry.expirations = 0;
     if value_ns == 0 {
-        // Disarm.
         entry.spec = ItimerspecNs::default();
         return;
     }
     entry.spec.interval_ns = interval_ns;
     entry.spec.next_ns = if flags & TFD_TIMER_ABSTIME != 0 {
-        // Absolute: value_ns is the deadline.
         value_ns
     } else {
-        // Relative: deadline = now + value_ns.
         now_ns() + value_ns
     };
 }
 
-// ── sys_timerfd_gettime [NR 287 / 288] ────────────────────────────────────
-//
-// int timerfd_gettime(int fd, struct itimerspec *curr_value);
+// ── sys_timerfd_gettime [NR 287 / 288] ────────────────────────────────────────
 
-pub fn sys_timerfd_gettime(fdno: usize, curr_va: usize) -> isize {
+pub fn sys_timerfd_gettime(scheme_bfd: usize, curr_va: usize) -> isize {
     if !validate_user_ptr(curr_va, 32) { return -14; }
+    let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
+        Some(f) => f,
+        None    => return -9,
+    };
     let mut tbl = TABLE.lock();
     let entry = match tbl.get_mut(&fdno) {
         Some(e) => e,
@@ -233,15 +313,11 @@ pub fn sys_timerfd_gettime(fdno: usize, curr_va: usize) -> isize {
     0
 }
 
-// ── timerfd_read (called from io_syscalls) ────────────────────────────────
-//
-// Returns 8 on success (expirations as u64 LE in buf[0..8]).
-// EAGAIN if nonblocking and no expirations yet.
-// Blocks (spin) until expirations > 0 or 5 s timeout.
+// ── timerfd_read (called via TimerFdScheme::read) ───────────────────────────
 
 pub fn timerfd_read(fdno: usize, buf: &mut [u8]) -> isize {
-    if buf.len() < 8 { return -22; } // EINVAL
-    let deadline = now_ns() + 5_000_000_000; // 5 s max spin
+    if buf.len() < 8 { return -22; }
+    let deadline = now_ns() + 5_000_000_000;
     loop {
         {
             let mut tbl = TABLE.lock();
@@ -253,19 +329,20 @@ pub fn timerfd_read(fdno: usize, buf: &mut [u8]) -> isize {
                     buf[..8].copy_from_slice(&val.to_le_bytes());
                     return 8;
                 }
-                if entry.nonblocking { return -11; } // EAGAIN
+                if entry.nonblocking { return -11; }
             } else {
-                return -9; // EBADF
+                return -9;
             }
         }
-        if now_ns() >= deadline { return -110; } // ETIMEDOUT
+        if now_ns() >= deadline { return -110; }
         crate::proc::scheduler::schedule();
         core::hint::spin_loop();
     }
 }
 
-// ── poll readiness ────────────────────────────────────────────────────────
+// ── poll readiness ─────────────────────────────────────────────────────────────
 
+/// `fdno` here is the raw TABLE fdno (not the scheme bfd).
 pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
     let mut tbl = TABLE.lock();
     match tbl.get_mut(&fdno) {
@@ -281,7 +358,7 @@ pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
     }
 }
 
-// ── close ─────────────────────────────────────────────────────────────────
+// ── close ──────────────────────────────────────────────────────────────────────
 
 pub fn timerfd_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
