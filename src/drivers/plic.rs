@@ -1,0 +1,1 @@
+$(python3 -c "import json; d=json.load(open('/tmp/restore.json')); print(d[1]['content'])")
