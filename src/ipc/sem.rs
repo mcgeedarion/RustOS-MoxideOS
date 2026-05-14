@@ -2,9 +2,11 @@
 //!
 //! ## API
 //!
-//!   semget(key, nsems, semflg)         -> semid
-//!   semop(semid, sops, nsops)          -> 0
-//!   semctl(semid, semnum, cmd, ...)    -> varies
+//! | Function                            | Returns |
+//! |-------------------------------------|---------|
+//! | `semget(key, nsems, semflg)`        | `semid` |
+//! | `semop(semid, sops, nsops)`         | `0`     |
+//! | `semctl(semid, semnum, cmd, ...)`   | varies  |
 //!
 //! ## `semop` atomicity
 //!
@@ -29,195 +31,179 @@
 //! | IPC_SET    | Set uid/gid/mode from buf |
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{
+    collections::BTreeMap,
+    vec::Vec,
+};
 use spin::Mutex;
-use alloc::collections::BTreeMap;
-use crate::ipc::{IpcPerm, IPC_PRIVATE, IPC_CREAT, IPC_EXCL, IPC_RMID, IPC_SET, IPC_STAT, check_perm};
+use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
-// ── Limits ────────────────────────────────────────────────────────────────────────────
-pub const SEMMAX:  u16  = 32767;
-pub const SEMMNI:  usize = 128;
-pub const SEMMSL:  usize = 250;
-pub const SEMOPM:  usize = 32;
+// ── semctl command constants ─────────────────────────────────────────────────
 
-// ── semctl command constants (Linux UAPI) ──────────────────────────────────────
-pub const GETPID:  i32 = 11;
 pub const GETVAL:  i32 = 12;
+pub const SETVAL:  i32 = 16;
 pub const GETALL:  i32 = 13;
+pub const SETALL:  i32 = 17;
+pub const GETPID:  i32 = 11;
 pub const GETNCNT: i32 = 14;
 pub const GETZCNT: i32 = 15;
-pub const SETVAL:  i32 = 16;
-pub const SETALL:  i32 = 17;
-pub const SEM_STAT: i32 = 18;
-pub const SEM_INFO: i32 = 19;
 
-// ── Data structures ───────────────────────────────────────────────────────────────────
+// ── Data structures ──────────────────────────────────────────────────────────
 
-/// One semaphore in a set.
-#[derive(Clone, Copy, Default, Debug)]
+/// One semaphore within a set.
+#[derive(Clone)]
 struct Sem {
-    val:   u16,
-    pid:   u32, // PID of last semop
-    ncnt:  u32, // waiting for val > 0
-    zcnt:  u32, // waiting for val == 0
+    val:   i16,
+    pid:   u32,  // PID of last semop
+    ncnt:  u32,  // waiting for val > 0
+    zcnt:  u32,  // waiting for val == 0
 }
 
-/// `struct semid_ds`
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct SemidDs {
-    pub sem_perm:  IpcPerm,
-    pub sem_otime: i64,
-    pub sem_ctime: i64,
-    pub sem_nsems: u64,
-    _pad: [u8; 16],
+/// Kernel-side semaphore set.
+struct SemSet {
+    perm: IpcPerm,
+    sems: Vec<Sem>,
 }
 
-/// `struct sembuf` — one operation in a `semop` call.
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Sembuf {
+// ── Global table ─────────────────────────────────────────────────────────────
+
+use alloc::sync::Arc;
+static SEM_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<SemSet>>>> = Mutex::new(BTreeMap::new());
+static NEXT_ID:   Mutex<i32>                                = Mutex::new(1);
+
+#[inline]
+fn alloc_id() -> i32 {
+    let mut id = NEXT_ID.lock();
+    let v = *id;
+    *id += 1;
+    v
+}
+
+// ── semget ───────────────────────────────────────────────────────────────────
+
+pub fn semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, isize> {
+    if nsems < 0 { return Err(-22); } // EINVAL
+    let mut tbl = SEM_TABLE.lock();
+
+    if key == IPC_PRIVATE {
+        let id = alloc_id();
+        tbl.insert(id, Arc::new(Mutex::new(SemSet {
+            perm: IpcPerm::new(IPC_PRIVATE, 0, 0, (semflg & 0o777) as u16),
+            sems: (0..nsems as usize).map(|_| Sem { val: 0, pid: 0, ncnt: 0, zcnt: 0 }).collect(),
+        })));
+        return Ok(id);
+    }
+
+    if let Some((&id, _)) = tbl.iter().find(|(_, s)| s.lock().perm.key == key) {
+        if semflg & IPC_CREAT != 0 && semflg & IPC_EXCL != 0 { return Err(-17); }
+        return Ok(id);
+    }
+    if semflg & IPC_CREAT == 0 { return Err(-2); } // ENOENT
+
+    let id = alloc_id();
+    tbl.insert(id, Arc::new(Mutex::new(SemSet {
+        perm: IpcPerm::new(key, 0, 0, (semflg & 0o777) as u16),
+        sems: (0..nsems as usize).map(|_| Sem { val: 0, pid: 0, ncnt: 0, zcnt: 0 }).collect(),
+    })));
+    Ok(id)
+}
+
+// ── sembuf (input to semop) ───────────────────────────────────────────────────
+
+/// One element of the `sembuf` array passed to `semop(2)`.
+pub struct SemBuf {
     pub sem_num: u16,
     pub sem_op:  i16,
     pub sem_flg: i16,
 }
 
-struct SemSet {
-    ds:   SemidDs,
-    sems: Vec<Sem>,
-    key:  i32,
-}
+// ── semop ────────────────────────────────────────────────────────────────────
 
-static SETS: Mutex<BTreeMap<i32, SemSet>> = Mutex::new(BTreeMap::new());
-static NEXT_ID: spin::Mutex<i32> = spin::Mutex::new(1);
-fn alloc_id() -> i32 { let mut n = NEXT_ID.lock(); let id = *n; *n += 1; id }
-
-// ── semget ────────────────────────────────────────────────────────────────────────────
-
-pub fn semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, isize> {
-    let mut sets = SETS.lock();
-    if key != IPC_PRIVATE {
-        if let Some((&id, s)) = sets.iter().find(|(_, s)| s.key == key) {
-            if semflg & IPC_CREAT != 0 && semflg & IPC_EXCL != 0 {
-                return Err(-17); // EEXIST
-            }
-            if nsems > 0 && s.sems.len() < nsems as usize {
-                return Err(-22); // EINVAL: existing set has fewer sems
-            }
-            return Ok(id);
-        }
-        if semflg & IPC_CREAT == 0 { return Err(-2); }
-    }
-    if nsems <= 0 || nsems as usize > SEMMSL { return Err(-22); }
-    if sets.len() >= SEMMNI { return Err(-28); }
-    let id   = alloc_id();
-    let mode = (semflg & 0o777) as u16;
-    let perm = IpcPerm::new(key, 0, 0, mode);
-    let now  = crate::time::clock::time_secs();
-    let ds   = SemidDs {
-        sem_perm:  perm,
-        sem_ctime: now,
-        sem_nsems: nsems as u64,
-        ..Default::default()
-    };
-    sets.insert(id, SemSet {
-        ds,
-        sems: alloc::vec![Sem::default(); nsems as usize],
-        key,
-    });
-    Ok(id)
-}
-
-// ── semop ────────────────────────────────────────────────────────────────────────────
-
-pub fn semop(semid: i32, ops: &[Sembuf]) -> Result<(), isize> {
-    if ops.len() > SEMOPM { return Err(-22); }
+pub fn semop(semid: i32, sops: &[SemBuf]) -> Result<(), isize> {
     loop {
-        let mut sets = SETS.lock();
-        let s = sets.get_mut(&semid).ok_or(-43isize)?;
-        if !check_perm(&s.ds.sem_perm, 0, 0, 0o2) { return Err(-13); }
-        // Check all ops first (atomicity).
+        let arc = {
+            let tbl = SEM_TABLE.lock();
+            tbl.get(&semid).cloned().ok_or(-43isize)? // EIDRM
+        };
+        let mut set = arc.lock();
+
+        if !check_perm(&set.perm, 0, 0, 0o2) { return Err(-13); } // EACCES
+
+        // Check-phase: ensure all ops can proceed without blocking.
         let mut would_block = false;
-        for op in ops {
-            let i = op.sem_num as usize;
-            if i >= s.sems.len() { return Err(-22); }
-            let val = s.sems[i].val as i32;
-            if op.sem_op < 0 {
-                let need = (-op.sem_op) as i32;
-                if val < need {
-                    if op.sem_flg as i32 & crate::ipc::IPC_NOWAIT != 0 {
-                        return Err(-11); // EAGAIN
-                    }
-                    would_block = true;
-                    break;
-                }
-            } else if op.sem_op == 0 && val != 0 {
-                if op.sem_flg as i32 & crate::ipc::IPC_NOWAIT != 0 {
-                    return Err(-11);
-                }
+        for sop in sops {
+            let idx = sop.sem_num as usize;
+            if idx >= set.sems.len() { return Err(-22); } // EINVAL
+            let val = set.sems[idx].val;
+            if sop.sem_op < 0 && (val as i32 + sop.sem_op as i32) < 0 {
+                would_block = true;
+                break;
+            }
+            if sop.sem_op == 0 && val != 0 {
                 would_block = true;
                 break;
             }
         }
-        if would_block { drop(sets); core::hint::spin_loop(); continue; }
-        // Apply all ops.
-        let pid = current_pid();
-        for op in ops {
-            let i = op.sem_num as usize;
-            let v = s.sems[i].val as i32 + op.sem_op as i32;
-            s.sems[i].val = v.max(0) as u16;
-            s.sems[i].pid = pid;
+
+        if would_block {
+            // Check IPC_NOWAIT on any blocking op.
+            let nowait = sops.iter().any(|s| s.sem_flg & 1 != 0); // SEM_UNDO would be bit 1
+            if nowait { return Err(-11); } // EAGAIN
+            drop(set);
+            core::hint::spin_loop(); continue;
         }
-        s.ds.sem_otime = crate::time::clock::time_secs();
+
+        // Apply-phase.
+        let pid = crate::proc::scheduler::current_pid() as u32;
+        for sop in sops {
+            let s = &mut set.sems[sop.sem_num as usize];
+            s.val = (s.val as i32 + sop.sem_op as i32) as i16;
+            s.pid = pid;
+        }
         return Ok(());
     }
 }
 
-// ── semctl ────────────────────────────────────────────────────────────────────────────
+// ── semctl ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
-pub enum SemctlArg { Val(i32), Buf(SemidDs), Array(Vec<u16>) }
+pub fn semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, isize> {
+    let arc = {
+        let tbl = SEM_TABLE.lock();
+        tbl.get(&semid).cloned().ok_or(-43isize)?
+    };
+    let mut set = arc.lock();
+    let n = semnum as usize;
 
-pub fn semctl(semid: i32, semnum: i32, cmd: i32, arg: Option<SemctlArg>)
-    -> Result<i32, isize>
-{
-    let mut sets = SETS.lock();
     match cmd {
-        IPC_RMID => { sets.remove(&semid).ok_or(-43isize)?; Ok(0) }
-        IPC_STAT => Ok(0), // ds returned via arg in real impl
-        GETVAL => {
-            let s = sets.get(&semid).ok_or(-43isize)?;
-            let i = semnum as usize;
-            if i >= s.sems.len() { return Err(-22); }
-            Ok(s.sems[i].val as i32)
+        c if c == GETVAL => {
+            if n >= set.sems.len() { return Err(-22); }
+            Ok(set.sems[n].val as i32)
         }
-        SETVAL => {
-            let v = match arg { Some(SemctlArg::Val(v)) => v, _ => return Err(-22) };
-            if v < 0 || v > SEMMAX as i32 { return Err(-22); }
-            let s = sets.get_mut(&semid).ok_or(-43isize)?;
-            let i = semnum as usize;
-            if i >= s.sems.len() { return Err(-22); }
-            s.sems[i].val = v as u16;
-            s.ds.sem_ctime = crate::time::clock::time_secs();
+        c if c == SETVAL => {
+            if n >= set.sems.len() { return Err(-22); }
+            set.sems[n].val = arg as i16;
             Ok(0)
         }
-        GETALL => Ok(0), // array returned via arg
-        SETALL => {
-            let arr = match arg { Some(SemctlArg::Array(a)) => a, _ => return Err(-22) };
-            let s = sets.get_mut(&semid).ok_or(-43isize)?;
-            if arr.len() != s.sems.len() { return Err(-22); }
-            for (sem, &v) in s.sems.iter_mut().zip(arr.iter()) {
-                if v > SEMMAX { return Err(-22); }
-                sem.val = v;
-            }
-            s.ds.sem_ctime = crate::time::clock::time_secs();
+        c if c == GETPID => {
+            if n >= set.sems.len() { return Err(-22); }
+            Ok(set.sems[n].pid as i32)
+        }
+        c if c == GETNCNT => {
+            if n >= set.sems.len() { return Err(-22); }
+            Ok(set.sems[n].ncnt as i32)
+        }
+        c if c == GETZCNT => {
+            if n >= set.sems.len() { return Err(-22); }
+            Ok(set.sems[n].zcnt as i32)
+        }
+        c if c == GETALL => Ok(0), // stub: caller must copy vals
+        c if c == SETALL => Ok(0), // stub
+        c if c == IPC_RMID => {
+            SEM_TABLE.lock().remove(&semid);
             Ok(0)
         }
-        GETPID  => { let s = sets.get(&semid).ok_or(-43isize)?; Ok(s.sems.get(semnum as usize).map(|sem| sem.pid as i32).unwrap_or(0)) }
-        GETNCNT => { let s = sets.get(&semid).ok_or(-43isize)?; Ok(s.sems.get(semnum as usize).map(|sem| sem.ncnt as i32).unwrap_or(0)) }
-        GETZCNT => { let s = sets.get(&semid).ok_or(-43isize)?; Ok(s.sems.get(semnum as usize).map(|sem| sem.zcnt as i32).unwrap_or(0)) }
+        c if c == IPC_STAT => Ok(0),
+        c if c == IPC_SET  => Ok(0),
         _ => Err(-22),
     }
 }
-
-fn current_pid() -> u32 { 0 } // integrate with crate::proc::current().pid

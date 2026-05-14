@@ -2,10 +2,12 @@
 //!
 //! ## API
 //!
-//!   shmget(key, size, shmflg)       -> shmid
-//!   shmat(shmid, shmaddr, shmflg)   -> *void  (virtual address)
-//!   shmdt(shmaddr)                  -> 0
-//!   shmctl(shmid, cmd, buf)         -> varies
+//! | Function                          | Returns      |
+//! |-----------------------------------|--------------|
+//! | `shmget(key, size, shmflg)`       | `shmid`      |
+//! | `shmat(shmid, shmaddr, shmflg)`   | `*void` (VA) |
+//! | `shmdt(shmaddr)`                  | `0`          |
+//! | `shmctl(shmid, cmd, buf)`         | varies       |
 //!
 //! ## Implementation
 //!
@@ -23,231 +25,188 @@
 //! (integration point: replace with `vmm::find_free_region`).
 
 extern crate alloc;
-use alloc::vec::Vec;
+use alloc::{
+    collections::BTreeMap,
+    vec::Vec,
+};
 use spin::Mutex;
-use alloc::collections::BTreeMap;
-use crate::ipc::{IpcPerm, IPC_PRIVATE, IPC_CREAT, IPC_EXCL, IPC_RMID, IPC_SET, IPC_STAT, check_perm};
+use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
-// ── Flags ────────────────────────────────────────────────────────────────────────────
-pub const SHM_RDONLY: i32 = 0o010000;
-pub const SHM_RND:    i32 = 0o020000;
-pub const SHM_REMAP:  i32 = 0o040000;
+// ── SHM_* flags ──────────────────────────────────────────────────────────────
+
+pub const SHM_RDONLY: i32 = 0o10000;
+pub const SHM_RND:    i32 = 0o20000;
 pub const SHM_EXEC:   i32 = 0o100000;
-pub const SHMLBA:     usize = 4096;
 
-// ── Limits ────────────────────────────────────────────────────────────────────────────
-pub const SHMMIN:  usize = 1;
-pub const SHMMAX:  usize = 0x1000_0000; // 256 MiB hard cap
-pub const SHMMNI:  usize = 4096;
+const PAGE_SIZE: usize = 4096;
 
-// ── shmctl extra commands ──────────────────────────────────────────────────────────
-pub const SHM_LOCK:   i32 = 11;
-pub const SHM_UNLOCK: i32 = 12;
-pub const SHM_STAT:   i32 = 13;
-pub const SHM_INFO:   i32 = 14;
+// ── Data structures ──────────────────────────────────────────────────────────
 
-// ── Data structures ───────────────────────────────────────────────────────────────────
-
-/// `struct shmid_ds` (Linux x86_64 UAPI).
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct ShmidDs {
-    pub shm_perm:   IpcPerm,
-    pub shm_segsz:  u64,
-    pub shm_atime:  i64,
-    pub shm_dtime:  i64,
-    pub shm_ctime:  i64,
-    pub shm_cpid:   u32,
-    pub shm_lpid:   u32,
-    pub shm_nattch: u64,
-    _pad: [u8; 16],
+/// Kernel-side shared memory segment.
+struct ShmSegment {
+    perm:    IpcPerm,
+    size:    usize,
+    frames:  Vec<usize>, // physical page addresses
+    nattch:  usize,      // number of current attaches
+    cpid:    u32,
+    lpid:    u32,
+    removed: bool,       // IPC_RMID was issued; free on last detach
 }
 
-/// Kernel-internal segment descriptor.
-struct ShmSeg {
-    ds:       ShmidDs,
-    key:      i32,
-    /// Physical frame base addresses (one per PAGE_SIZE page).
-    frames:   Vec<u64>,
-    /// True once IPC_RMID is issued; freed when nattch hits 0.
-    marked_for_removal: bool,
+// ── Global tables ────────────────────────────────────────────────────────────
+
+use alloc::sync::Arc;
+static SHM_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<ShmSegment>>>> = Mutex::new(BTreeMap::new());
+static NEXT_ID:   Mutex<i32>                                    = Mutex::new(1);
+
+/// Per-process attach table: `(shmid, va)` pairs.
+static ATTACH_TABLE: Mutex<BTreeMap<(usize, usize), i32>> = Mutex::new(BTreeMap::new());
+
+#[inline]
+fn alloc_id() -> i32 {
+    let mut id = NEXT_ID.lock();
+    let v = *id;
+    *id += 1;
+    v
 }
 
-/// Per-process attachment record (stored in proc::Task).
-#[derive(Clone, Copy, Debug)]
-pub struct ShmAttach {
-    pub shmid:  i32,
-    pub vaddr:  usize,
-    pub size:   usize,
-    pub rdonly: bool,
-}
-
-static SEGS: Mutex<BTreeMap<i32, ShmSeg>> = Mutex::new(BTreeMap::new());
-static NEXT_ID: spin::Mutex<i32> = spin::Mutex::new(1);
-fn alloc_id() -> i32 { let mut n = NEXT_ID.lock(); let id = *n; *n += 1; id }
-
-// ── shmget ────────────────────────────────────────────────────────────────────────────
+// ── shmget ───────────────────────────────────────────────────────────────────
 
 pub fn shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, isize> {
-    let mut segs = SEGS.lock();
-    if key != IPC_PRIVATE {
-        if let Some((&id, _)) = segs.iter().find(|(_, s)| s.key == key) {
-            if shmflg & IPC_CREAT != 0 && shmflg & IPC_EXCL != 0 {
-                return Err(-17);
-            }
-            return Ok(id);
-        }
-        if shmflg & IPC_CREAT == 0 { return Err(-2); }
+    if size == 0 { return Err(-22); } // EINVAL
+    let pages = size.div_ceil(PAGE_SIZE);
+    let mut tbl = SHM_TABLE.lock();
+
+    if key == IPC_PRIVATE {
+        let frames = alloc_frames(pages)?;
+        let id = alloc_id();
+        tbl.insert(id, Arc::new(Mutex::new(ShmSegment {
+            perm:    IpcPerm::new(IPC_PRIVATE, 0, 0, (shmflg & 0o777) as u16),
+            size:    pages * PAGE_SIZE,
+            frames,
+            nattch:  0,
+            cpid:    crate::proc::scheduler::current_pid() as u32,
+            lpid:    0,
+            removed: false,
+        })));
+        return Ok(id);
     }
-    if size < SHMMIN || size > SHMMAX { return Err(-22); }
-    if segs.len() >= SHMMNI { return Err(-28); }
 
-    // Allocate physical frames.
-    let n_pages = (size + 4095) / 4096;
-    let frames  = alloc_frames(n_pages)?;
+    if let Some((&id, _)) = tbl.iter().find(|(_, s)| s.lock().perm.key == key) {
+        if shmflg & IPC_CREAT != 0 && shmflg & IPC_EXCL != 0 { return Err(-17); } // EEXIST
+        return Ok(id);
+    }
+    if shmflg & IPC_CREAT == 0 { return Err(-2); } // ENOENT
 
-    let id   = alloc_id();
-    let mode = (shmflg & 0o777) as u16;
-    let perm = IpcPerm::new(key, 0, 0, mode);
-    let now  = crate::time::clock::time_secs();
-    let ds   = ShmidDs {
-        shm_perm:  perm,
-        shm_segsz: size as u64,
-        shm_ctime: now,
-        shm_cpid:  current_pid(),
-        ..Default::default()
-    };
-    segs.insert(id, ShmSeg { ds, key, frames, marked_for_removal: false });
+    let frames = alloc_frames(pages)?;
+    let id = alloc_id();
+    tbl.insert(id, Arc::new(Mutex::new(ShmSegment {
+        perm:    IpcPerm::new(key, 0, 0, (shmflg & 0o777) as u16),
+        size:    pages * PAGE_SIZE,
+        frames,
+        nattch:  0,
+        cpid:    crate::proc::scheduler::current_pid() as u32,
+        lpid:    0,
+        removed: false,
+    })));
     Ok(id)
 }
 
-// ── shmat ────────────────────────────────────────────────────────────────────────────
+// ── shmat ────────────────────────────────────────────────────────────────────
 
-/// Map shared memory into the current process's address space.
-/// Returns the virtual address the segment was mapped at.
 pub fn shmat(shmid: i32, shmaddr: usize, shmflg: i32) -> Result<usize, isize> {
-    let mut segs = SEGS.lock();
-    let seg = segs.get_mut(&shmid).ok_or(-22isize)?;
-    if !check_perm(&seg.ds.shm_perm, 0, 0, 0o4) { return Err(-13); }
-    let rdonly = shmflg & SHM_RDONLY != 0;
-    let size   = seg.ds.shm_segsz as usize;
-    let frames = seg.frames.clone();
+    let arc = {
+        let tbl = SHM_TABLE.lock();
+        tbl.get(&shmid).cloned().ok_or(-22isize)? // EINVAL
+    };
+    let mut seg = arc.lock();
 
-    // Choose virtual address.
-    let vaddr = if shmaddr == 0 {
-        find_free_vaddr(size)
-    } else if shmflg & SHM_RND != 0 {
-        shmaddr & !(SHMLBA - 1)
+    if !check_perm(&seg.perm, 0, 0, if shmflg & SHM_RDONLY != 0 { 0o4 } else { 0o6 }) {
+        return Err(-13); // EACCES
+    }
+
+    let prot = if shmflg & SHM_RDONLY != 0 {
+        crate::mm::mmap::PROT_READ
     } else {
-        if shmaddr % 4096 != 0 { return Err(-22); }
-        shmaddr
+        crate::mm::mmap::PROT_READ | crate::mm::mmap::PROT_WRITE
     };
 
-    // Map each frame into the process's page table.
-    let flags = if rdonly { vmm_flags::READ } else { vmm_flags::READ | vmm_flags::WRITE };
-    map_frames(vaddr, &frames, flags)?;
+    let hint = if shmaddr == 0 {
+        crate::proc::scheduler::current_mmap_base()
+    } else {
+        if shmflg & SHM_RND != 0 { shmaddr & !(65536 - 1) } else { shmaddr }
+    };
 
-    seg.ds.shm_nattch += 1;
-    seg.ds.shm_atime   = crate::time::clock::time_secs();
-    seg.ds.shm_lpid    = current_pid();
-    Ok(vaddr)
+    let va = crate::mm::vmm::map_range(
+        hint, seg.size, prot, &seg.frames,
+    )?;
+
+    seg.nattch += 1;
+    seg.lpid    = crate::proc::scheduler::current_pid() as u32;
+
+    let pid = crate::proc::scheduler::current_pid();
+    ATTACH_TABLE.lock().insert((pid, va), shmid);
+    Ok(va)
 }
 
-// ── shmdt ────────────────────────────────────────────────────────────────────────────
+// ── shmdt ────────────────────────────────────────────────────────────────────
 
 pub fn shmdt(shmaddr: usize) -> Result<(), isize> {
-    // Look up by vaddr in the calling process's attach list.
-    // Integration point: walk crate::proc::current().shm_attaches.
-    let shmid = vaddr_to_shmid(shmaddr).ok_or(-22isize)?;
-    let mut segs = SEGS.lock();
-    let seg = segs.get_mut(&shmid).ok_or(-22isize)?;
-    let size = seg.ds.shm_segsz as usize;
-    unmap_range(shmaddr, size);
-    seg.ds.shm_nattch  = seg.ds.shm_nattch.saturating_sub(1);
-    seg.ds.shm_dtime   = crate::time::clock::time_secs();
-    seg.ds.shm_lpid    = current_pid();
-    let remove = seg.marked_for_removal && seg.ds.shm_nattch == 0;
-    if remove {
-        let frames = seg.frames.clone();
-        drop(segs);
-        free_frames(&frames);
-        SEGS.lock().remove(&shmid);
+    let pid = crate::proc::scheduler::current_pid();
+    let shmid = ATTACH_TABLE.lock().remove(&(pid, shmaddr)).ok_or(-22isize)?;
+
+    crate::mm::vmm::unmap_range(shmaddr);
+
+    let should_free = {
+        let tbl = SHM_TABLE.lock();
+        let arc = tbl.get(&shmid).ok_or(-22isize)?;
+        let mut seg = arc.lock();
+        seg.nattch = seg.nattch.saturating_sub(1);
+        seg.lpid   = pid as u32;
+        seg.removed && seg.nattch == 0
+    };
+
+    if should_free {
+        if let Some(arc) = SHM_TABLE.lock().remove(&shmid) {
+            let seg = arc.lock();
+            for &pa in &seg.frames {
+                unsafe { crate::mm::pmm::free_page(pa as *mut u8); }
+            }
+        }
     }
     Ok(())
 }
 
-// ── shmctl ────────────────────────────────────────────────────────────────────────────
+// ── shmctl ───────────────────────────────────────────────────────────────────
 
-pub fn shmctl(shmid: i32, cmd: i32) -> Result<ShmidDs, isize> {
-    let mut segs = SEGS.lock();
+pub fn shmctl(shmid: i32, cmd: i32) -> Result<i32, isize> {
+    let arc = {
+        let tbl = SHM_TABLE.lock();
+        tbl.get(&shmid).cloned().ok_or(-22isize)?
+    };
     match cmd {
-        IPC_RMID => {
-            let seg = segs.get_mut(&shmid).ok_or(-22isize)?;
-            seg.marked_for_removal = true;
-            if seg.ds.shm_nattch == 0 {
-                let frames = seg.frames.clone();
-                drop(segs);
-                free_frames(&frames);
-                SEGS.lock().remove(&shmid);
+        c if c == IPC_RMID => {
+            let mut seg = arc.lock();
+            seg.removed = true;
+            if seg.nattch == 0 {
+                drop(seg);
+                SHM_TABLE.lock().remove(&shmid);
             }
-            Ok(ShmidDs::default())
+            Ok(0)
         }
-        IPC_STAT | SHM_STAT => {
-            Ok(segs.get(&shmid).ok_or(-22isize)?.ds)
-        }
-        SHM_LOCK | SHM_UNLOCK => Ok(ShmidDs::default()), // no-op for now
+        c if c == IPC_STAT => Ok(0),
+        c if c == IPC_SET  => Ok(0),
         _ => Err(-22),
     }
 }
 
-pub fn shmctl_set(shmid: i32, new_ds: ShmidDs) -> Result<(), isize> {
-    let mut segs = SEGS.lock();
-    let seg = segs.get_mut(&shmid).ok_or(-22isize)?;
-    seg.ds.shm_perm.uid  = new_ds.shm_perm.uid;
-    seg.ds.shm_perm.gid  = new_ds.shm_perm.gid;
-    seg.ds.shm_perm.mode = new_ds.shm_perm.mode & 0o777;
-    seg.ds.shm_ctime     = crate::time::clock::time_secs();
-    Ok(())
+// ── Physical frame allocator helper ──────────────────────────────────────────
+
+fn alloc_frames(n: usize) -> Result<Vec<usize>, isize> {
+    let mut frames = Vec::with_capacity(n);
+    for _ in 0..n {
+        let pa = crate::mm::pmm::alloc_page().ok_or(-12isize)? as usize;
+        frames.push(pa);
+    }
+    Ok(frames)
 }
-
-// ── VMM / PMM stubs ──────────────────────────────────────────────────────────────────
-
-mod vmm_flags {
-    pub const READ:  u32 = 1;
-    pub const WRITE: u32 = 2;
-}
-
-/// Allocate `n` 4 KiB physical frames.  Returns their physical addresses.
-fn alloc_frames(n: usize) -> Result<Vec<u64>, isize> {
-    // crate::mem::pmm::alloc_frames(n).ok_or(-12) // ENOMEM
-    Ok((0..n).map(|_| 0u64).collect()) // stub
-}
-
-fn free_frames(_frames: &[u64]) {
-    // crate::mem::pmm::free_frames(frames);
-}
-
-fn map_frames(vaddr: usize, frames: &[u64], _flags: u32) -> Result<(), isize> {
-    // crate::mem::vmm::map_range(vaddr, frames, flags)
-    let _ = (vaddr, frames);
-    Ok(())
-}
-
-fn unmap_range(vaddr: usize, size: usize) {
-    // crate::mem::vmm::unmap_range(vaddr, size);
-    let _ = (vaddr, size);
-}
-
-fn find_free_vaddr(size: usize) -> usize {
-    // crate::proc::current().mmap_bump(size)
-    let _ = size;
-    0x7000_0000_0000 // placeholder
-}
-
-fn vaddr_to_shmid(vaddr: usize) -> Option<i32> {
-    // Walk crate::proc::current().shm_attaches
-    let _ = vaddr;
-    None
-}
-
-fn current_pid() -> u32 { 0 }

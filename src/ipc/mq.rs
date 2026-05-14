@@ -2,7 +2,7 @@
 //!
 //! ## API
 //!
-//! | Function                              | Returns  |
+//! | Function                              | Returns   |
 //! |---------------------------------------|----------|
 //! | `mq_open(name, oflag, mode, attr)`    | `mqd_t`  |
 //! | `mq_close(mqd)`                       | `0`      |
@@ -40,8 +40,7 @@ use core::{
 };
 use spin::Mutex;
 
-// ── O_* flags (match Linux) ──────────────────────────────────────────────────
-
+// ── O_* flags (match Linux) ─────────────────────────────────────────────────
 pub const O_RDONLY:   i32 = 0;
 pub const O_WRONLY:   i32 = 1;
 pub const O_RDWR:     i32 = 2;
@@ -50,10 +49,9 @@ pub const O_EXCL:     i32 = 0o200;
 pub const O_NONBLOCK: i32 = 0o4000;
 pub const O_CLOEXEC:  i32 = 0o2000000;
 
-// ── Limits ───────────────────────────────────────────────────────────────────
-
+// ── Limits ──────────────────────────────────────────────────────────────────
 pub const MQ_MAXMSG:   usize = 10;
- pub const MQ_MSGSIZE:  usize = 8192;
+pub const MQ_MSGSIZE:  usize = 8192;
 pub const MQ_PRIO_MAX: u32   = 32768;
 
 /// Bytes of overhead per queue (mirrors `struct mqueue_inode_info`).
@@ -61,7 +59,7 @@ const QUEUE_OVERHEAD: u64 = 272;
 /// Bytes of overhead per queued message (mirrors `struct msg_msg`).
 const MSG_OVERHEAD:   u64 = 48;
 
-// ── struct mq_attr ───────────────────────────────────────────────────────────
+// ── struct mq_attr ──────────────────────────────────────────────────────────
 
 /// `struct mq_attr` — matches Linux POSIX mqueue UAPI.
 #[repr(C)]
@@ -74,7 +72,7 @@ pub struct MqAttr {
     _pad: [u8; 16],
 }
 
-// ── Internal message ─────────────────────────────────────────────────────────
+// ── Internal message ────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct PriMsg {
@@ -115,8 +113,8 @@ struct MqObject {
 
 // ── Global tables ────────────────────────────────────────────────────────────
 
-static QUEUES:    Mutex<BTreeMap<String, Arc<MqObject>>> = Mutex::new(BTreeMap::new());
-static NEXT_MQD:  AtomicU64                              = AtomicU64::new(1);
+static QUEUES:   Mutex<BTreeMap<String, Arc<MqObject>>> = Mutex::new(BTreeMap::new());
+static NEXT_MQD: AtomicU64                              = AtomicU64::new(1);
 
 /// Open-file-table entry for an mq fd.
 pub struct MqdEntry {
@@ -219,6 +217,7 @@ pub fn mq_open(
     Ok(alloc_mqd(obj, oflag))
 }
 
+#[inline]
 fn alloc_mqd(queue: Arc<MqObject>, oflag: i32) -> u64 {
     let id = NEXT_MQD.fetch_add(1, AOrdering::SeqCst);
     MQD_TABLE.lock().insert(id, MqdEntry { id, oflag, queue });
@@ -292,7 +291,7 @@ pub fn mq_send(mqd: u64, data: Vec<u8>, prio: u32) -> Result<(), isize> {
             if let Some(sig) = inner2.notify_sig.take() {
                 let pid = inner2.notify_pid;
                 drop(inner2); drop(tbl2);
-                crate::serial_println!("[mq] notify signal {} -> pid {}", sig, pid);
+                crate::proc::signal::send_signal(pid as usize, sig);
                 return Ok(());
             }
         }
@@ -302,24 +301,24 @@ pub fn mq_send(mqd: u64, data: Vec<u8>, prio: u32) -> Result<(), isize> {
 
 // ── mq_receive ───────────────────────────────────────────────────────────────
 
-/// Returns `(data, priority)` of the highest-priority (then oldest) message.
-pub fn mq_receive(mqd: u64, buflen: usize) -> Result<(Vec<u8>, u32), isize> {
+pub fn mq_receive(mqd: u64, max_len: usize) -> Result<(Vec<u8>, u32), isize> {
     loop {
         let tbl   = MQD_TABLE.lock();
         let entry = tbl.get(&mqd).ok_or(-9isize)?;
+        if entry.oflag & O_WRONLY != 0 { return Err(-9); } // EBADF — write-only
         let mut inner = entry.queue.inner.lock();
-        if inner.heap.is_empty() {
-            if entry.oflag & O_NONBLOCK != 0 { return Err(-11); } // EAGAIN
+        if inner.attr.mq_msgsize > max_len as i64 { return Err(-90); } // EMSGSIZE
+        if let Some(msg) = inner.heap.pop() {
+            inner.attr.mq_curmsgs -= 1;
+            let charge = MSG_OVERHEAD + msg.data.len() as u64;
+            let creator = inner.creator_pid;
             drop(inner); drop(tbl);
-            core::hint::spin_loop(); continue;
+            mq_bytes_discharge(creator, charge);
+            return Ok((msg.data, msg.prio));
         }
-        let msg = inner.heap.pop().unwrap();
-        if msg.data.len() > buflen { return Err(-90); } // EMSGSIZE
-        inner.attr.mq_curmsgs -= 1;
-        let (creator, msg_charge) = (inner.creator_pid, MSG_OVERHEAD + msg.data.len() as u64);
+        if entry.oflag & O_NONBLOCK != 0 { return Err(-11); } // EAGAIN
         drop(inner); drop(tbl);
-        mq_bytes_discharge(creator, msg_charge);
-        return Ok((msg.data, msg.prio));
+        core::hint::spin_loop();
     }
 }
 
@@ -329,32 +328,40 @@ pub fn mq_getattr(mqd: u64) -> Result<MqAttr, isize> {
     let tbl   = MQD_TABLE.lock();
     let entry = tbl.get(&mqd).ok_or(-9isize)?;
     let inner = entry.queue.inner.lock();
-    let mut attr = inner.attr;
-    attr.mq_flags = (entry.oflag & O_NONBLOCK) as i64;
-    Ok(attr)
+    let mut a = inner.attr;
+    a.mq_flags = if entry.oflag & O_NONBLOCK != 0 { O_NONBLOCK as i64 } else { 0 };
+    Ok(a)
 }
 
-pub fn mq_setattr(mqd: u64, new_attr: MqAttr) -> Result<MqAttr, isize> {
+pub fn mq_setattr(mqd: u64, new: MqAttr) -> Result<MqAttr, isize> {
     let tbl   = MQD_TABLE.lock();
     let entry = tbl.get(&mqd).ok_or(-9isize)?;
     let mut inner = entry.queue.inner.lock();
     let old = inner.attr;
-    inner.attr.mq_flags = new_attr.mq_flags & O_NONBLOCK as i64;
+    // Only mq_flags (O_NONBLOCK) is settable via mq_setattr.
+    inner.attr.mq_flags = new.mq_flags;
     Ok(old)
 }
 
-// ── mq_notify (stub) ─────────────────────────────────────────────────────────
+// ── mq_notify ────────────────────────────────────────────────────────────────
 
-pub fn mq_notify(mqd: u64, sig: u32, pid: u32) -> Result<(), isize> {
+/// Register a signal-based notification for the next message arrival.
+/// `signo == 0` cancels any existing registration.
+/// `pid == 0` uses the calling process.
+pub fn mq_notify(mqd: u64, signo: u32, pid: u32) -> Result<(), isize> {
+    let pid = if pid == 0 {
+        crate::proc::scheduler::current_pid() as u32
+    } else {
+        pid
+    };
     let tbl   = MQD_TABLE.lock();
     let entry = tbl.get(&mqd).ok_or(-9isize)?;
     let mut inner = entry.queue.inner.lock();
-    if sig == 0 {
+    if signo == 0 {
         inner.notify_sig = None;
         inner.notify_pid = 0;
     } else {
-        if inner.notify_sig.is_some() { return Err(-16); } // EBUSY
-        inner.notify_sig = Some(sig);
+        inner.notify_sig = Some(signo);
         inner.notify_pid = pid;
     }
     Ok(())
