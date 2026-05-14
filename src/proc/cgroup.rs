@@ -10,7 +10,7 @@
 //! ## Resource controllers implemented
 //!
 //! | Controller    | Key knobs                                  |
-//! |---------------|--------------------------------------------|
+//! |---------------|-------------------------------------------|
 //! | **cpu**       | `cpu.weight` (nice-like 1..10000)          |
 //! | **memory**    | `memory.max` (bytes, u64::MAX = unlimited) |
 //! | **pids**      | `pids.max`   (count,  u64::MAX = unlimited)|
@@ -142,6 +142,47 @@ impl CgroupTable {
 }
 
 static CGROUPS: Mutex<CgroupTable> = Mutex::new(CgroupTable::new());
+
+// ─── Boot initialisation ──────────────────────────────────────────────────────
+
+/// Called once from `kernel_main` after `dhcp::init()` and before
+/// `proc::spawn_init()`.
+///
+/// The `CGROUPS` static is already seeded with `ROOT_CGROUP` by
+/// `CgroupTable::new()`, so this function's job is purely to:
+///
+/// 1. Assert the root node is healthy (debug sanity check).
+/// 2. Register the cgroup v2 unified-hierarchy mount with the kernel
+///    mount table (via `fs::mount::kernel_mount`) so that
+///    `/sys/fs/cgroup` resolves to `FsType::Cgroupfs` before pid-1
+///    runs.  The `init_mounts()` call in the initramfs path already does
+///    this for the normal boot path; calling `kernel_mount` here is a
+///    no-op (`-EBUSY`) if the entry already exists, which is safe to
+///    ignore.
+/// 3. Emit a boot log line so the init sequence is traceable.
+pub fn init() {
+    // Sanity: root node must exist.
+    debug_assert!(
+        CGROUPS.lock().nodes.contains_key(&ROOT_CGROUP),
+        "cgroup: ROOT_CGROUP missing at init"
+    );
+
+    // Ensure /sys/fs/cgroup is registered in the mount table.  This is
+    // normally done by fs::mount::init_mounts(); the call here is a
+    // belt-and-suspenders guard for boot paths that skip init_mounts().
+    let _ = crate::fs::mount::kernel_mount(
+        "cgroup2",
+        "/sys/fs/cgroup",
+        crate::fs::mount::FsType::Cgroupfs,
+        crate::fs::mount::MS_NOSUID
+            | crate::fs::mount::MS_NODEV
+            | crate::fs::mount::MS_NOEXEC,
+        None,
+    );
+    // -EBUSY (-16) means it was already mounted — that's fine.
+
+    log::info!("cgroup: v2 unified hierarchy ready (root cgid={})", ROOT_CGROUP);
+}
 
 // ─── Public API — hierarchy management ──────────────────────────────────────
 
