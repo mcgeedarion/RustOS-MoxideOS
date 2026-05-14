@@ -27,7 +27,8 @@
 //! 15. init::schemes::init()   — register built-in schemes into SCHEME_TABLE
 //!                               (must follow NIC; must precede DHCP)
 //! 16. dhcp::init()            — DORA handshake; sets IP/GW/mask
-//! 17. proc::spawn_init()      — spawn pid 1 from /init; scheduler takes over
+//! 17. cgroup::init()          — seed ROOT_CGROUP; ensure cgroup subsystem ready
+//! 18. proc::spawn_init()      — spawn pid 1 from /init; scheduler takes over
 //! ```
 //!
 //! ## RISC-V boot sequence
@@ -44,7 +45,8 @@
 //!  7. drivers::nic::init()    — virtio-net MMIO
 //!  8. init::schemes::init()   — register built-in schemes into SCHEME_TABLE
 //!  9. dhcp::init()            — DORA handshake
-//! 10. proc::spawn_init()      — spawn pid 1; scheduler takes over
+//! 10. cgroup::init()          — seed ROOT_CGROUP
+//! 11. proc::spawn_init()      — spawn pid 1; scheduler takes over
 //! ```
 
 // ── x86_64 ───────────────────────────────────────────────────────────────────
@@ -69,6 +71,7 @@ pub fn kernel_main() -> ! {
     crate::drivers::nic::init();
     crate::init::schemes::init();
     crate::dhcp::init();
+    crate::proc::cgroup::init();
     crate::proc::spawn_init();
 
     unreachable!("scheduler returned to kernel_main");
@@ -89,6 +92,7 @@ pub fn kernel_main() -> ! {
     crate::drivers::nic::init();
     crate::init::schemes::init();
     crate::dhcp::init();
+    crate::proc::cgroup::init();
     crate::proc::spawn_init();
 
     unreachable!("scheduler returned to kernel_main");

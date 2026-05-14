@@ -21,6 +21,7 @@
 //! | Devfs      | fs::devfs            | /dev                      |
 //! | Procfs     | fs::procfs           | /proc                     |
 //! | Sysfs      | fs::sysfs            | /sys                      |
+//! | Cgroupfs   | fs::cgroupfs         | /sys/fs/cgroup            |
 
 extern crate alloc;
 use alloc::{
@@ -41,20 +42,22 @@ pub enum FsType {
     Devfs,
     Procfs,
     Sysfs,
+    Cgroupfs,
 }
 
 impl FsType {
     /// Parse the kernel-facing filesystem name string (as passed to mount(2)).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "ext2" | "ext3" => Some(FsType::Ext2),
-            "ext4"          => Some(FsType::Ext4),
+            "ext2" | "ext3"          => Some(FsType::Ext2),
+            "ext4"                   => Some(FsType::Ext4),
             "vfat" | "fat32" | "fat" => Some(FsType::Fat32),
             "tmpfs"                  => Some(FsType::Tmpfs),
             "overlay" | "overlayfs"  => Some(FsType::Overlayfs),
             "devtmpfs" | "devfs"     => Some(FsType::Devfs),
             "proc"                   => Some(FsType::Procfs),
             "sysfs"                  => Some(FsType::Sysfs),
+            "cgroup2" | "cgroup"     => Some(FsType::Cgroupfs),
             _                        => None,
         }
     }
@@ -69,6 +72,7 @@ impl FsType {
             FsType::Devfs     => "devtmpfs",
             FsType::Procfs    => "proc",
             FsType::Sysfs     => "sysfs",
+            FsType::Cgroupfs  => "cgroup2",
         }
     }
 }
@@ -286,6 +290,11 @@ pub fn init_mounts() {
     let _ = tbl.mount("devtmpfs", "/dev",  FsType::Devfs,  MS_NOSUID, None);
     let _ = tbl.mount("proc",     "/proc", FsType::Procfs, MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
     let _ = tbl.mount("sysfs",    "/sys",  FsType::Sysfs,  MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
+
+    // cgroup v2 unified hierarchy — must follow sysfs since the mount point
+    // /sys/fs/cgroup lives under /sys.
+    let _ = tbl.mount("cgroup2", "/sys/fs/cgroup", FsType::Cgroupfs,
+                      MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
 
     tbl.sort();
 }
