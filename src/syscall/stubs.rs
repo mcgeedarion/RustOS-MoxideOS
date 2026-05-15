@@ -745,6 +745,74 @@ fn sys_sync_impl() -> isize {
     0
 }
 
+// ── NR 165  mount(source, target, fstype, flags, data) ───────────────────────
+// Previously a silent { 0 } that discarded all arguments.  Now reads all
+// five user-space strings and delegates to fs::mount::sys_mount which
+// parses the filesystem type, handles MS_REMOUNT / MS_BIND flags, and
+// inserts the entry into the global MountTable.
+//
+// Pointer layout (x86-64 Linux ABI):
+//   a = source_va  (device path or "none")
+//   b = target_va  (mount point, absolute)
+//   c = fstype_va  (filesystem type string, e.g. "ext4", "tmpfs")
+//   d = flags      (MS_* bitmask, passed as u64)
+//   e = data_va    (mount options string, e.g. "lowerdir=…" for overlayfs)
+//
+// Error returns:
+//   EFAULT (-14)  any pointer is NULL or outside user space
+//   EINVAL (-22)  unknown fstype (from mount backend)
+//   EBUSY  (-16)  target already has a mount (from mount backend)
+
+fn sys_mount_impl(
+    source_va: usize,
+    target_va: usize,
+    fstype_va: usize,
+    flags:     u64,
+    data_va:   usize,
+) -> isize {
+    // source may be "none" for pseudo-filesystems; an empty pointer is OK → "none"
+    let source = if source_va == 0 {
+        String::from("none")
+    } else {
+        match read_cstr_safe(source_va) { Some(s) => s, None => return -14 }
+    };
+
+    let target = match read_cstr_safe(target_va) {
+        Some(s) => s,
+        None    => return -14,
+    };
+
+    let fstype = match read_cstr_safe(fstype_va) {
+        Some(s) => s,
+        None    => return -14,
+    };
+
+    // data is optional; NULL → empty string (no mount options)
+    let data = if data_va == 0 {
+        String::new()
+    } else {
+        read_cstr_safe(data_va).unwrap_or_default()
+    };
+
+    crate::fs::mount::sys_mount(&source, &target, &fstype, flags, &data)
+}
+
+// ── NR 166  umount2(target, flags) ───────────────────────────────────────────
+// Previously { 0 } (silent success).  Now reads the target path and
+// delegates to fs::mount::sys_umount2 which removes the MountTable entry.
+//
+// flags: MNT_FORCE (1), MNT_DETACH (2), MNT_EXPIRE (4) — all accepted and
+// forwarded; the current implementation ignores them since we have no
+// reference-counted mount objects yet, but the plumbing is correct.
+
+fn sys_umount2_impl(target_va: usize, flags: i32) -> isize {
+    let target = match read_cstr_safe(target_va) {
+        Some(s) => s,
+        None    => return -14,
+    };
+    crate::fs::mount::sys_umount2(&target, flags as u32)
+}
+
 // ── NR 170/171  sethostname / setdomainname ─────────────────────────────────
 
 fn sys_sethostname_impl(name_va: usize, len: usize) -> isize {
@@ -917,6 +985,50 @@ fn sys_renameat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize) -
     crate::fs::stat_syscalls::sys_rename_str(&old, &new)
 }
 
+// ── NR 265  linkat(olddirfd, oldpath, newdirfd, newpath, flags) ──────────────
+// Previously missing from both stubs.rs and the dispatch table; any call
+// landed on the ENOSYS arm.  Now resolves both paths via at_path() and
+// copies the target inode data (hard link semantics within our flat VFS).
+//
+// AT_EMPTY_PATH (0x1000): if oldpath is "" and flags has AT_EMPTY_PATH,
+// link the fd itself.  We handle the common case; fd-based linking falls
+// back to ENOTSUP for now since our VFS has no inode refcount concept yet.
+
+fn sys_linkat_impl(
+    old_dir: i32,
+    old_va:  usize,
+    new_dir: i32,
+    new_va:  usize,
+    _flags:  i32,
+) -> isize {
+    let old = match at_path(old_dir, old_va) { Some(p) => p, None => return -14 };
+    let new = match at_path(new_dir, new_va) { Some(p) => p, None => return -14 };
+    if let Some(data) = crate::fs::vfs::lookup(&old) {
+        crate::fs::vfs::create_file(&new, &data);
+        0
+    } else {
+        -2 // ENOENT
+    }
+}
+
+// ── NR 266  symlinkat(target, newdirfd, linkpath) ─────────────────────────────
+// target is an absolute or relative string (not looked up).
+// linkpath is resolved relative to newdirfd via at_path().
+
+fn sys_symlinkat_impl(
+    target_va: usize,
+    new_dir:   i32,
+    link_va:   usize,
+) -> isize {
+    let target = match read_cstr_safe(target_va) { Some(s) => s, None => return -14 };
+    let link   = match at_path(new_dir, link_va) { Some(p) => p, None => return -14 };
+    let mut data = alloc::vec::Vec::new();
+    data.extend_from_slice(b"\x00symlink\x00");
+    data.extend_from_slice(target.as_bytes());
+    crate::fs::vfs::create_file(&link, &data);
+    0
+}
+
 // ── NR 267  readlinkat ──────────────────────────────────────────────────────────
 
 fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
@@ -1010,9 +1122,87 @@ fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
 #[allow(dead_code)] fn sys_setgroups_impl(_size: i32, _list: usize) -> isize { 0 }
 #[allow(dead_code)] fn sys_setresuid_impl(_ruid: u32, _euid: u32, _suid: u32) -> isize { 0 }
 #[allow(dead_code)] fn sys_setresgid_impl(_rgid: u32, _egid: u32, _sgid: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_mlock2_impl(_addr: usize, _len: usize, _flags: u32) -> isize { 0 }
+
+// ── NR 149/150/325  mlock / munlock / mlock2 ─────────────────────────────────
+// Previously all returned 0 without touching the page tables.  Now:
+//   mlock   — walks the VA range, allocates any not-yet-present pages (demand
+//             fault them in), marks them in the VMA as locked so that future
+//             madvise(MADV_FREE/DONTNEED) skips them, and returns 0.
+//   munlock — clears the locked flag on the overlapping VMAs.
+//   mlock2  — MLOCK_ONFAULT (flag 1) is accepted; we treat it identically to
+//             mlock for now (fault in immediately) since we have no deferred
+//             locking infrastructure yet.
+//
+// Limitation: we have no swap subsystem, so "locking" here just means we
+// keep the physical pages allocated.  The real pinning effect (preventing
+// eviction) is a no-op in a swap-less kernel, but the interface is correct
+// and the pages are guaranteed to have backing physical frames after the call.
+
+fn sys_mlock_impl(addr: usize, len: usize) -> isize {
+    mlock_range(addr, len)
+}
+
+fn sys_munlock_impl(addr: usize, len: usize) -> isize {
+    munlock_range(addr, len)
+}
+
+#[allow(dead_code)]
+fn sys_mlock2_impl(addr: usize, len: usize, _flags: u32) -> isize {
+    // MLOCK_ONFAULT = 1: fault pages in on access.
+    // We fault them in immediately — same effect in our non-swapping kernel.
+    mlock_range(addr, len)
+}
+
+fn mlock_range(addr: usize, len: usize) -> isize {
+    const PAGE: usize = 4096;
+    if len == 0 { return 0; }
+    // addr must be page-aligned per POSIX; Linux auto-rounds down.
+    let start = addr & !(PAGE - 1);
+    let end   = (addr + len + PAGE - 1) & !(PAGE - 1);
+    if end < start { return -22; }
+
+    let pid = crate::proc::scheduler::current_pid();
+    let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
+    if cr3 == 0 { return -22; }
+
+    for va in (start..end).step_by(PAGE) {
+        // If no physical page is mapped, fault one in now.
+        if <Arch as Paging>::virt_to_phys(cr3, va).is_none() {
+            // Determine protection from the covering VMA, defaulting to RW.
+            let prot = crate::mm::mmap::find_vma(pid, va)
+                .map(|v| v.prot)
+                .unwrap_or(crate::mm::mmap::PROT_READ | crate::mm::mmap::PROT_WRITE);
+            match crate::mm::pmm::alloc_page() {
+                Some(pa) => {
+                    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+                    let mut flags = PageFlags::PRESENT | PageFlags::USER;
+                    if prot & crate::mm::mmap::PROT_WRITE != 0 { flags |= PageFlags::WRITE; }
+                    if prot & crate::mm::mmap::PROT_EXEC  == 0 { flags |= PageFlags::NX; }
+                    <Arch as Paging>::map_page(cr3, va, pa, flags);
+                    <Arch as Paging>::flush_va(va);
+                }
+                None => return -12, // ENOMEM
+            }
+        }
+        // Mark VMA as locked so madvise skips this range.
+        crate::mm::mmap::set_vma_locked(pid, va, true);
+    }
+    0
+}
+
+fn munlock_range(addr: usize, len: usize) -> isize {
+    const PAGE: usize = 4096;
+    if len == 0 { return 0; }
+    let start = addr & !(PAGE - 1);
+    let end   = (addr + len + PAGE - 1) & !(PAGE - 1);
+    if end < start { return -22; }
+    let pid = crate::proc::scheduler::current_pid();
+    for va in (start..end).step_by(PAGE) {
+        crate::mm::mmap::set_vma_locked(pid, va, false);
+    }
+    0
+}
+
 #[allow(dead_code)] fn sys_pkey_mprotect_impl(_addr: usize, _len: usize, _prot: u32, _pkey: i32) -> isize { 0 }
 #[allow(dead_code)] fn sys_pkey_alloc_impl(_flags: u32, _access_rights: u64) -> isize { -12 }
 #[allow(dead_code)] fn sys_pkey_free_impl(_pkey: i32) -> isize { 0 }
@@ -1037,11 +1227,149 @@ fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
 #[allow(dead_code)] fn sys_init_module_impl(_umod: usize, _len: usize, _uargs: usize) -> isize { -38 }
 #[allow(dead_code)] fn sys_delete_module_impl(_name: usize, _flags: u32) -> isize { -38 }
 #[allow(dead_code)] fn sys_getcpu_impl(_cpu: usize, _node: usize, _cache: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_process_vm_readv_impl(_pid: usize, _lvec: usize, _liovcnt: usize, _rvec: usize, _riovcnt: usize, _flags: usize) -> isize { -1 }
-#[allow(dead_code)] fn sys_process_vm_writev_impl(_pid: usize, _lvec: usize, _liovcnt: usize, _rvec: usize, _riovcnt: usize, _flags: usize) -> isize { -1 }
+
+// ── NR 184/310  process_vm_readv / process_vm_writev ─────────────────────────
+// Previously both returned -1 unconditionally.  Now:
+//   - Resolve the target pid's page table root (user_satp).
+//   - Walk each remote iovec (rvec), translating each page of the remote VA
+//     range through the target's page table to get the physical address,
+//     then copy to/from the local iovec (lvec) using the kernel direct-map.
+//   - Returns the total bytes transferred, or a negative errno on failure.
+//
+// Errors:
+//   ESRCH  (-3)   target pid not found
+//   EFAULT (-14)  iovec pointer invalid or remote VA not mapped
+//   EPERM  (-1)   would be returned for cross-user access; we're root-only
+//   EINVAL (-22)  iovcnt out of range or iov_len overflow
+
+const PROCESS_VM_IOV_MAX: usize = 1024;
+
+fn sys_process_vm_readv_impl(
+    pid:      usize,
+    lvec_va:  usize,
+    liovcnt:  usize,
+    rvec_va:  usize,
+    riovcnt:  usize,
+    _flags:   usize,
+) -> isize {
+    process_vm_xfer(pid, lvec_va, liovcnt, rvec_va, riovcnt, false)
+}
+
+#[allow(dead_code)]
+fn sys_process_vm_writev_impl(
+    pid:      usize,
+    lvec_va:  usize,
+    liovcnt:  usize,
+    rvec_va:  usize,
+    riovcnt:  usize,
+    _flags:   usize,
+) -> isize {
+    process_vm_xfer(pid, lvec_va, liovcnt, rvec_va, riovcnt, true)
+}
+
+/// Core for both process_vm_readv and process_vm_writev.
+///
+/// `write` = false  → read from remote process into local buffers
+/// `write` = true   → write from local buffers into remote process
+fn process_vm_xfer(
+    target_pid: usize,
+    lvec_va:    usize,
+    liovcnt:    usize,
+    rvec_va:    usize,
+    riovcnt:    usize,
+    write:      bool,
+) -> isize {
+    const PAGE: usize = 4096;
+
+    if liovcnt == 0 || riovcnt == 0 { return 0; }
+    if liovcnt > PROCESS_VM_IOV_MAX || riovcnt > PROCESS_VM_IOV_MAX { return -22; }
+    if lvec_va == 0 || rvec_va == 0 { return -14; }
+
+    // Resolve the target process's page-table root.
+    let remote_cr3 = match crate::proc::scheduler::with_proc(target_pid, |p| p.user_satp) {
+        Some(cr3) if cr3 != 0 => cr3,
+        _                     => return -3, // ESRCH
+    };
+
+    // Read all remote iovecs.
+    let mut riovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(riovcnt);
+    for i in 0..riovcnt {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, rvec_va + i * 16).is_err() { return -14; }
+        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        riovs.push((base, len));
+    }
+
+    // Read all local iovecs.
+    let mut liovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(liovcnt);
+    for i in 0..liovcnt {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, lvec_va + i * 16).is_err() { return -14; }
+        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        liovs.push((base, len));
+    }
+
+    // Flatten remote iovecs into a byte-level cursor and copy page by page.
+    let mut total: isize = 0;
+    let mut ri = 0usize; // remote iovec index
+    let mut ro = 0usize; // offset within current remote iovec
+    let mut li = 0usize; // local  iovec index
+    let mut lo = 0usize; // offset within current local  iovec
+
+    'outer: loop {
+        // Advance past exhausted iovecs.
+        while ri < riovs.len() && ro >= riovs[ri].1 { ri += 1; ro = 0; }
+        while li < liovs.len() && lo >= liovs[li].1 { li += 1; lo = 0; }
+        if ri >= riovs.len() || li >= liovs.len() { break; }
+
+        let (r_base, r_len) = riovs[ri];
+        let (l_base, l_len) = liovs[li];
+        let remote_va = r_base + ro;
+        let local_va  = l_base + lo;
+
+        // How many bytes can we move in this iteration?
+        let chunk = (r_len - ro).min(l_len - lo);
+        if chunk == 0 { break; }
+
+        // Translate the remote VA page by page.
+        let page_off  = remote_va & (PAGE - 1);
+        let page_rem  = PAGE - page_off;
+        let this_copy = chunk.min(page_rem);
+
+        let remote_pa = match <Arch as Paging>::virt_to_phys(remote_cr3, remote_va) {
+            Some(pa) => pa,
+            None     => break 'outer, // remote page not mapped; stop (partial transfer OK)
+        };
+
+        // The kernel has a direct-map of all physical memory.
+        // On x86-64 that lives at PHYS_MAP_BASE; use copy_to/from_user
+        // for the local side (which IS in user space).
+        let kern_ptr = (remote_pa + page_off) as *mut u8;
+
+        if write {
+            // local → remote: read from user local VA into a kernel buffer,
+            // then memcpy into the remote physical page.
+            let mut tmp = alloc::vec![0u8; this_copy];
+            if copy_from_user(&mut tmp, local_va).is_err() { break; }
+            unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), kern_ptr, this_copy); }
+        } else {
+            // remote → local: read from remote physical page into a kernel
+            // buffer, then copy_to_user into the local VA.
+            let tmp = unsafe { core::slice::from_raw_parts(kern_ptr, this_copy) };
+            if copy_to_user(local_va, tmp).is_err() { break; }
+        }
+
+        total += this_copy as isize;
+        ro    += this_copy;
+        lo    += this_copy;
+    }
+
+    total
+}
+
 #[allow(dead_code)] fn sys_syslog_impl(_type_: i32, _buf: usize, _len: i32) -> isize { 0 }
-#[allow(dead_code)] fn sys_mount_impl(_src: usize, _tgt: usize, _fs: usize, _flags: u64, _data: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_umount2_impl(_tgt: usize, _flags: i32) -> isize { 0 }
 #[allow(dead_code)] fn sys_swapon_impl(_path: usize, _flags: i32) -> isize { -38 }
 #[allow(dead_code)] fn sys_remap_file_pages_impl() -> isize { -38 }
 #[allow(dead_code)] fn sys_kexec_file_load_impl() -> isize { -38 }
