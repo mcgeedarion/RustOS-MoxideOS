@@ -272,3 +272,153 @@ pub(super) fn sys_syncfs_impl(_fd: usize) -> isize {
     crate::fs::vfs_extras::sync_all();
     0
 }
+
+// ── NR 86/265  link / linkat ───────────────────────────────────────────────────
+pub(super) fn sys_link_impl(oldpath_va: usize, newpath_va: usize) -> isize {
+    let old = match crate::uaccess::read_path(oldpath_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    let new = match crate::uaccess::read_path(newpath_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    match crate::fs::vfs_ops::link(&old, &new) {
+        Ok(())   => 0,
+        Err(e)   => e,
+    }
+}
+
+pub(super) fn sys_linkat_impl(
+    _olddirfd: i32, oldpath_va: usize,
+    _newdirfd: i32, newpath_va: usize,
+    _flags: i32,
+) -> isize {
+    sys_link_impl(oldpath_va, newpath_va)
+}
+
+// ── NR 88/266  symlink / symlinkat ────────────────────────────────────────────
+pub(super) fn sys_symlink_impl(target_va: usize, linkpath_va: usize) -> isize {
+    let target = match crate::uaccess::read_path(target_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    let link = match crate::uaccess::read_path(linkpath_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    match crate::fs::vfs_ops::symlink(&target, &link) {
+        Ok(())   => 0,
+        Err(e)   => e,
+    }
+}
+
+pub(super) fn sys_symlinkat_impl(target_va: usize, _newdirfd: i32, linkpath_va: usize) -> isize {
+    sys_symlink_impl(target_va, linkpath_va)
+}
+
+// ── NR 132  utime ─────────────────────────────────────────────────────────────
+pub(super) fn sys_utime_impl(path_va: usize, times_va: usize) -> isize {
+    let path = match crate::uaccess::read_path(path_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    let (atime_ns, mtime_ns) = if times_va == 0 {
+        let now = crate::time::clock::monotonic_ns();
+        (now, now)
+    } else {
+        // struct utimbuf { time_t actime; time_t modtime; } — 16 bytes
+        let mut buf = [0u8; 16];
+        if crate::uaccess::copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let a = i64::from_ne_bytes(buf[0..8].try_into().unwrap()) as u64 * 1_000_000_000;
+        let m = i64::from_ne_bytes(buf[8..16].try_into().unwrap()) as u64 * 1_000_000_000;
+        (a, m)
+    };
+    match crate::fs::vfs_ops::utimens(&path, atime_ns, mtime_ns) {
+        Ok(()) => 0, Err(e) => e,
+    }
+}
+
+// ── NR 235  utimes ────────────────────────────────────────────────────────────
+pub(super) fn sys_utimes_impl(path_va: usize, times_va: usize) -> isize {
+    let path = match crate::uaccess::read_path(path_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    let (atime_ns, mtime_ns) = if times_va == 0 {
+        let now = crate::time::clock::monotonic_ns();
+        (now, now)
+    } else {
+        // struct timeval[2] — 2 × { i64 tv_sec, i64 tv_usec } = 32 bytes
+        let mut buf = [0u8; 32];
+        if crate::uaccess::copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let a_sec  = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let a_usec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let m_sec  = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let m_usec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
+        let a = (a_sec as u64) * 1_000_000_000 + (a_usec as u64) * 1_000;
+        let m = (m_sec as u64) * 1_000_000_000 + (m_usec as u64) * 1_000;
+        (a, m)
+    };
+    match crate::fs::vfs_ops::utimens(&path, atime_ns, mtime_ns) {
+        Ok(()) => 0, Err(e) => e,
+    }
+}
+
+// ── NR 280  utimensat ─────────────────────────────────────────────────────────
+pub(super) fn sys_utimensat_impl(dirfd: i32, path_va: usize, times_va: usize, _flags: i32) -> isize {
+    let _ = dirfd; // AT_FDCWD resolution delegated to path resolver
+    let path = match crate::uaccess::read_path(path_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    const UTIME_NOW:  i64 = 0x3fffffff;
+    const UTIME_OMIT: i64 = 0x3ffffffe;
+    let now_ns = crate::time::clock::monotonic_ns();
+    let (atime_ns, mtime_ns) = if times_va == 0 {
+        (now_ns, now_ns)
+    } else {
+        // struct timespec[2] — 2 × { i64 tv_sec, i64 tv_nsec } = 32 bytes
+        let mut buf = [0u8; 32];
+        if crate::uaccess::copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let a_sec  = i64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        let a_nsec = i64::from_ne_bytes(buf[8..16].try_into().unwrap());
+        let m_sec  = i64::from_ne_bytes(buf[16..24].try_into().unwrap());
+        let m_nsec = i64::from_ne_bytes(buf[24..32].try_into().unwrap());
+        let a = if a_nsec == UTIME_NOW  { now_ns }
+                else if a_nsec == UTIME_OMIT { 0 }
+                else { (a_sec as u64) * 1_000_000_000 + a_nsec as u64 };
+        let m = if m_nsec == UTIME_NOW  { now_ns }
+                else if m_nsec == UTIME_OMIT { 0 }
+                else { (m_sec as u64) * 1_000_000_000 + m_nsec as u64 };
+        (a, m)
+    };
+    match crate::fs::vfs_ops::utimens(&path, atime_ns, mtime_ns) {
+        Ok(()) => 0, Err(e) => e,
+    }
+}
+
+// ── NR 261  futimesat ─────────────────────────────────────────────────────────
+pub(super) fn sys_futimesat_impl(dirfd: i32, path_va: usize, times_va: usize) -> isize {
+    if times_va == 0 {
+        return sys_utimensat_impl(dirfd, path_va, 0, 0);
+    }
+    let mut tv = [0u8; 32];
+    if crate::uaccess::copy_from_user(&mut tv, times_va).is_err() { return -14; }
+    let a_sec  = i64::from_ne_bytes(tv[0..8].try_into().unwrap());
+    let a_usec = i64::from_ne_bytes(tv[8..16].try_into().unwrap());
+    let m_sec  = i64::from_ne_bytes(tv[16..24].try_into().unwrap());
+    let m_usec = i64::from_ne_bytes(tv[24..32].try_into().unwrap());
+    let a = (a_sec as u64) * 1_000_000_000 + (a_usec as u64) * 1_000;
+    let m = (m_sec as u64) * 1_000_000_000 + (m_usec as u64) * 1_000;
+    let path = match crate::uaccess::read_path(path_va as *const u8) {
+        Some(p) => p, None => return -14,
+    };
+    match crate::fs::vfs_ops::utimens(&path, a, m) {
+        Ok(()) => 0, Err(e) => e,
+    }
+}
+
+// ── NR 129  rt_sigqueueinfo ───────────────────────────────────────────────────
+pub(super) fn sys_rt_sigqueueinfo_impl(tgid: i32, sig: usize, _uinfo: usize) -> isize {
+    if sig == 0 || sig > 64 { return -22; }
+    let target = if tgid <= 0 {
+        crate::proc::scheduler::current_pid()
+    } else {
+        tgid as usize
+    };
+    crate::proc::signal::send_signal(target, sig as i32)
+}
