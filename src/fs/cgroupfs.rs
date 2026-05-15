@@ -131,9 +131,7 @@ pub fn cgroupfs_close(fdno: usize) {
 /// Returns `Some(true)` for directories, `Some(false)` for knob files,
 /// `None` if the path does not exist.
 pub fn cgroupfs_exists(path: &str) -> Option<bool> {
-    let stripped = path
-        .strip_prefix("/sys/fs/cgroup")
-        .unwrap_or(path);
+    let stripped = path.strip_prefix("/sys/fs/cgroup").unwrap_or(path);
 
     // Root mount point itself.
     if stripped.is_empty() || stripped == "/" {
