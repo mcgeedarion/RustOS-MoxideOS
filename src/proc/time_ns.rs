@@ -1,223 +1,294 @@
-//! Time namespace — per-namespace clock offsets.
+//! Time-namespace-aware clock_gettime / clock_settime / settimeofday.
 //!
-//! Linux time namespaces (CLONE_NEWTIME, added in 5.6) allow processes to
-//! see a different value for CLOCK_MONOTONIC and CLOCK_BOOTTIME by applying
-//! a fixed offset stored in the namespace.  CLOCK_REALTIME is **not**
-//! affected (it is always the global wall clock).
-//!
-//! ## Data model
-//!
-//! Each time namespace stores:
-//!   - `monotonic_offset_ns: i64` — added to `crate::time::monotonic_ns()`
-//!     before returning it to user-space for CLOCK_MONOTONIC.
-//!   - `boottime_offset_ns: i64`  — same for CLOCK_BOOTTIME.
-//!
-//! INIT_NS has both offsets at 0 (pass-through).
-//!
-//! ## Syscall integration
-//!
-//! `clock_gettime(CLOCK_MONOTONIC, tp)` and `clock_gettime(CLOCK_BOOTTIME, tp)`
-//! call `time_ns_adjust_monotonic(ns_id, raw_ns)` before writing the result
-//! to user-space.  All other clocks are unaffected.
-//!
-//! `clock_settime` is rejected with EPERM for CLOCK_MONOTONIC / CLOCK_BOOTTIME
-//! (consistent with Linux; use `timens_offsets` write instead).  For
-//! CLOCK_REALTIME a privileged caller may use adjtime — not yet implemented.
-//!
-//! ## /proc/PID/timens_offsets
-//!
-//! Writing `"monotonic <secs> <nsecs>\n"` or `"boottime <secs> <nsecs>\n"`
-//! to this file sets the offset.  Reading returns the current offsets.
-//! This matches the Linux interface added in kernel 5.6.
+//! Clock IDs handled:
+//!   0  CLOCK_REALTIME           – wall clock, offset by realtime_offset_ns
+//!   1  CLOCK_MONOTONIC          – time since boot, ns-timens offset applied
+//!   2  CLOCK_PROCESS_CPUTIME_ID – cpu_time_ns from current process entry
+//!   3  CLOCK_THREAD_CPUTIME_ID  – same as process for now
+//!   4  CLOCK_MONOTONIC_RAW      – raw monotonic, no offset
+//!   5  CLOCK_REALTIME_COARSE    – same as REALTIME (no coarse hw here)
+//!   6  CLOCK_MONOTONIC_COARSE   – same as MONOTONIC
+//!   7  CLOCK_BOOTTIME           – alias for MONOTONIC
+//!   8  CLOCK_REALTIME_ALARM     – alias for REALTIME
+//!   9  CLOCK_BOOTTIME_ALARM     – alias for MONOTONIC
 
 extern crate alloc;
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use spin::Mutex;
-use crate::proc::namespace::{NsId, INIT_NS, alloc_ns_id};
+use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ─── Per-namespace offsets ────────────────────────────────────────────────────
+// Nanosecond special values from <time.h>.
+const UTIME_NOW:  i64 = 0x3fff_ffff;
+const UTIME_OMIT: i64 = 0x3fff_fffe;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TimeNsOffsets {
-    /// Added to CLOCK_MONOTONIC reads.  May be negative.
-    pub monotonic_ns: i64,
-    /// Added to CLOCK_BOOTTIME reads.
-    pub boottime_ns:  i64,
+// ── helpers ─────────────────────────────────────────────────────────────────────────────────
+
+/// Read a `struct timespec { i64 tv_sec; i64 tv_nsec; }` from userspace.
+#[inline]
+fn read_timespec(va: usize) -> Option<(i64, i64)> {
+    if va == 0 { return None; }
+    let mut buf = [0u8; 16];
+    copy_from_user(&mut buf, va).ok()?;
+    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    Some((sec, nsec))
 }
 
-static TIME_NS_TABLE: Mutex<BTreeMap<NsId, TimeNsOffsets>> =
-    Mutex::new(BTreeMap::new());
-
-/// Seed INIT_NS with zero offsets.  Called once from kernel init.
-pub fn init_time_ns() {
-    TIME_NS_TABLE.lock().entry(INIT_NS).or_default();
+/// Write a `struct timespec` to userspace.
+#[inline]
+fn write_timespec(va: usize, sec: i64, nsec: i64) -> isize {
+    if va == 0 { return 0; }
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&sec.to_le_bytes());
+    buf[8..16].copy_from_slice(&nsec.to_le_bytes());
+    if copy_to_user(va, &buf).is_err() { -14 } else { 0 }
 }
 
-/// Create a new child time namespace.
-/// The new namespace **inherits** the parent's current offsets (Linux 5.6
-/// semantics: the child starts at the same apparent time as the parent).
-pub fn create_time_ns(parent: NsId) -> NsId {
-    let new_id = alloc_ns_id();
-    let parent_offsets = TIME_NS_TABLE.lock()
-        .get(&parent)
-        .copied()
-        .unwrap_or_default();
-    TIME_NS_TABLE.lock().insert(new_id, parent_offsets);
-    new_id
+/// Return the monotonic ns adjusted for the current process's time namespace.
+fn mono_ns_for_current() -> u64 {
+    let raw = crate::time::read_monotonic_ns();
+    let pid = crate::proc::scheduler::current_pid();
+    // Fetch the timens monotonic offset if one has been set.
+    let tns_off = crate::proc::scheduler::with_proc(pid, |p| p.timens_mono_off)
+        .unwrap_or(0i64);
+    (raw as i64).wrapping_add(tns_off) as u64
 }
 
-/// Destroy a time namespace.  No-op for INIT_NS.
-pub fn drop_time_ns(ns: NsId) {
-    if ns == INIT_NS { return; }
-    TIME_NS_TABLE.lock().remove(&ns);
+/// Read cpu_time_ns for a pid; returns 0 if the process is not found.
+fn cpu_ns(pid: usize) -> u64 {
+    crate::proc::scheduler::with_proc(pid, |p| p.cpu_time_ns).unwrap_or(0)
 }
 
-// ─── Offset read / write ──────────────────────────────────────────────────────
+// ── sys_clock_gettime ─────────────────────────────────────────────────────────────────────────
 
-/// Get the offsets for `ns`.  Returns all-zero for unknown namespaces.
-pub fn get_offsets(ns: NsId) -> TimeNsOffsets {
-    TIME_NS_TABLE.lock()
-        .get(&ns)
-        .copied()
-        .unwrap_or_default()
-}
-
-/// Set the CLOCK_MONOTONIC offset for `ns` (in nanoseconds).
-pub fn set_monotonic_offset(ns: NsId, offset_ns: i64) {
-    TIME_NS_TABLE.lock()
-        .entry(ns)
-        .or_default()
-        .monotonic_ns = offset_ns;
-}
-
-/// Set the CLOCK_BOOTTIME offset for `ns`.
-pub fn set_boottime_offset(ns: NsId, offset_ns: i64) {
-    TIME_NS_TABLE.lock()
-        .entry(ns)
-        .or_default()
-        .boottime_ns = offset_ns;
-}
-
-// ─── Clock adjustment helpers ─────────────────────────────────────────────────
-
-/// Adjust a raw CLOCK_MONOTONIC reading for the calling process's time namespace.
-/// Call this immediately before copying the timespec to user-space.
-pub fn adjust_monotonic(ns: NsId, raw_ns: u64) -> u64 {
-    let off = get_offsets(ns).monotonic_ns;
-    if off >= 0 {
-        raw_ns.saturating_add(off as u64)
-    } else {
-        raw_ns.saturating_sub((-off) as u64)
-    }
-}
-
-/// Adjust a raw CLOCK_BOOTTIME reading.
-pub fn adjust_boottime(ns: NsId, raw_ns: u64) -> u64 {
-    let off = get_offsets(ns).boottime_ns;
-    if off >= 0 {
-        raw_ns.saturating_add(off as u64)
-    } else {
-        raw_ns.saturating_sub((-off) as u64)
-    }
-}
-
-// ─── /proc/<pid>/timens_offsets ──────────────────────────────────────────────
-
-/// Format the offsets for `/proc/<pid>/timens_offsets` reads.
-/// Output format (two lines):
-///   `monotonic <secs> <nsecs>\n`
-///   `boottime  <secs> <nsecs>\n`
-pub fn format_offsets(ns: NsId) -> String {
-    let off = get_offsets(ns);
-    let (mono_s, mono_ns) = split_offset(off.monotonic_ns);
-    let (boot_s, boot_ns) = split_offset(off.boottime_ns);
-    alloc::format!(
-        "monotonic {} {}\nboottime  {} {}\n",
-        mono_s, mono_ns,
-        boot_s, boot_ns,
-    )
-}
-
-/// Parse and apply a write to `/proc/<pid>/timens_offsets`.
-/// Accepted lines: `"monotonic <secs> <nsecs>"` or `"boottime <secs> <nsecs>"`
-/// Returns 0 on success, -EINVAL on parse error, -EPERM if the namespace
-/// already has processes other than the writing process inside it.
-pub fn write_offsets(ns: NsId, text: &str) -> isize {
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        let mut parts = line.split_whitespace();
-        let clock = parts.next().unwrap_or("");
-        let secs  = parts.next().and_then(|s| s.parse::<i64>().ok());
-        let nsecs = parts.next().and_then(|s| s.parse::<i64>().ok());
-        match (clock, secs, nsecs) {
-            ("monotonic", Some(s), Some(n)) => {
-                let total = s.saturating_mul(1_000_000_000).saturating_add(n);
-                set_monotonic_offset(ns, total);
-            }
-            ("boottime", Some(s), Some(n)) => {
-                let total = s.saturating_mul(1_000_000_000).saturating_add(n);
-                set_boottime_offset(ns, total);
-            }
-            _ => return -22,
-        }
-    }
-    0
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Split a nanosecond offset into (whole_seconds, remaining_ns) for display.
-fn split_offset(ns: i64) -> (i64, i64) {
-    let s  = ns / 1_000_000_000;
-    let ns = ns % 1_000_000_000;
-    (s, ns)
-}
-
-// ─── clock_gettime integration ────────────────────────────────────────────────
-
-pub const CLOCK_REALTIME:          u32 = 0;
-pub const CLOCK_MONOTONIC:         u32 = 1;
-pub const CLOCK_PROCESS_CPUTIME:   u32 = 2;
-pub const CLOCK_THREAD_CPUTIME:    u32 = 3;
-pub const CLOCK_MONOTONIC_RAW:     u32 = 4;
-pub const CLOCK_REALTIME_COARSE:   u32 = 5;
-pub const CLOCK_MONOTONIC_COARSE:  u32 = 6;
-pub const CLOCK_BOOTTIME:          u32 = 7;
-pub const CLOCK_TAI:               u32 = 11;
-
-/// Full `clock_gettime(2)` implementation with time-namespace support.
-/// Called from `sys_clock_gettime_impl` in stubs.rs.
 pub fn sys_clock_gettime(clkid: u32, tp_va: usize) -> isize {
-    use crate::uaccess::copy_to_user;
-    if tp_va == 0 { return -22; }
+    if tp_va == 0 { return -14; }
 
-    let raw_ns = crate::time::monotonic_ns();
-    let pid    = crate::proc::scheduler::current_pid();
-    let ns     = crate::proc::scheduler::with_proc(pid, |p| p.ns.time)
-        .unwrap_or(INIT_NS);
+    let ns: u64 = match clkid {
+        // CLOCK_REALTIME / CLOCK_REALTIME_COARSE / CLOCK_REALTIME_ALARM
+        0 | 5 | 8 => {
+            let mono = crate::time::read_monotonic_ns();
+            let off  = crate::time::realtime_offset_ns();
+            (mono as i64).wrapping_add(off) as u64
+        }
 
-    let final_ns: u64 = match clkid {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI => raw_ns,
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
-            adjust_monotonic(ns, raw_ns)
+        // CLOCK_MONOTONIC / CLOCK_MONOTONIC_COARSE / CLOCK_BOOTTIME /
+        // CLOCK_BOOTTIME_ALARM
+        1 | 6 | 7 | 9 => mono_ns_for_current(),
+
+        // CLOCK_MONOTONIC_RAW
+        4 => crate::time::read_monotonic_ns(),
+
+        // CLOCK_PROCESS_CPUTIME_ID
+        2 => {
+            let pid = crate::proc::scheduler::current_pid();
+            cpu_ns(pid)
         }
-        CLOCK_BOOTTIME => adjust_boottime(ns, raw_ns),
-        CLOCK_PROCESS_CPUTIME => {
-            crate::proc::scheduler::with_proc(pid, |p| p.cpu_time_ns).unwrap_or(raw_ns)
+
+        // CLOCK_THREAD_CPUTIME_ID
+        // We track cpu_time_ns per-task, so this is the same value.
+        // When per-thread split accounting lands, update here.
+        3 => {
+            let tid = crate::proc::scheduler::current_pid();
+            cpu_ns(tid)
         }
-        CLOCK_THREAD_CPUTIME => {
-            crate::proc::scheduler::with_proc(pid, |p| p.cpu_time_ns).unwrap_or(raw_ns)
-        }
+
         _ => return -22, // EINVAL
     };
 
-    let secs  = (final_ns / 1_000_000_000) as i64;
-    let nanos = (final_ns % 1_000_000_000) as i64;
+    let sec  = (ns / 1_000_000_000) as i64;
+    let nsec = (ns % 1_000_000_000) as i64;
+    write_timespec(tp_va, sec, nsec)
+}
+
+// ── sys_clock_settime ─────────────────────────────────────────────────────────────────────────
+
+pub fn sys_clock_settime(clkid: u32, tp_va: usize) -> isize {
+    match clkid {
+        // CLOCK_REALTIME only – other clocks cannot be set.
+        0 => {
+            let (sec, nsec) = match read_timespec(tp_va) {
+                Some(v) => v,
+                None    => return -14,
+            };
+            if nsec < 0 || nsec >= 1_000_000_000 { return -22; }
+            let new_real_ns = sec as u64 * 1_000_000_000 + nsec as u64;
+            let mono_ns     = crate::time::read_monotonic_ns();
+            let offset      = new_real_ns as i64 - mono_ns as i64;
+            crate::time::set_realtime_offset_ns(offset);
+            0
+        }
+        // CPU clocks, monotonic clocks: EINVAL per POSIX.
+        _ => -22,
+    }
+}
+
+// ── sys_settimeofday ─────────────────────────────────────────────────────────────────────────
+
+/// settimeofday(tv: *const timeval, tz: *const timezone)
+///
+/// Sets CLOCK_REALTIME by computing offset = new_real_ns - mono_ns.
+/// The timezone argument is accepted but ignored (Linux behaviour).
+pub fn sys_settimeofday(tv_va: usize, _tz_va: usize) -> isize {
+    if tv_va == 0 { return 0; }
     let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&secs.to_le_bytes());
-    buf[8..16].copy_from_slice(&nanos.to_le_bytes());
-    if copy_to_user(tp_va, &buf).is_err() { return -14; }
+    if copy_from_user(&mut buf, tv_va).is_err() { return -14; }
+    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if usec < 0 || usec >= 1_000_000 { return -22; }
+    let new_real_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1_000;
+    let mono_ns     = crate::time::read_monotonic_ns();
+    let offset      = new_real_ns as i64 - mono_ns as i64;
+    crate::time::set_realtime_offset_ns(offset);
     0
+}
+
+// ── utime / utimes / utimensat ───────────────────────────────────────────────────────────────────
+
+/// Return current realtime in nanoseconds.
+fn now_real_ns() -> u64 {
+    let mono = crate::time::read_monotonic_ns();
+    let off  = crate::time::realtime_offset_ns();
+    (mono as i64).wrapping_add(off) as u64
+}
+
+/// utime(path, times: *const utimbuf)  [NR 132]
+///
+/// struct utimbuf { time_t actime; time_t modtime; } -- both are i64 seconds.
+pub fn sys_utime(path_va: usize, times_va: usize) -> isize {
+    if path_va == 0 { return -14; }
+    let mut path_buf = [0u8; 4096];
+    if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
+    let end  = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    let path = match core::str::from_utf8(&path_buf[..end]) {
+        Ok(s) => s,
+        Err(_) => return -14,
+    };
+
+    let (atime_ns, mtime_ns) = if times_va == 0 {
+        let now = now_real_ns();
+        (now, now)
+    } else {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let actime  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let modtime = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+        (actime as u64 * 1_000_000_000, modtime as u64 * 1_000_000_000)
+    };
+
+    match crate::fs::vfs_ops::utimens(path, atime_ns, mtime_ns) {
+        Ok(())  => 0,
+        Err(e)  => e,
+    }
+}
+
+/// utimes(path, times: *const [timeval; 2])  [NR 235]
+///
+/// struct timeval { i64 tv_sec; i64 tv_usec; }
+pub fn sys_utimes(path_va: usize, times_va: usize) -> isize {
+    if path_va == 0 { return -14; }
+    let mut path_buf = [0u8; 4096];
+    if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
+    let end  = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    let path = match core::str::from_utf8(&path_buf[..end]) {
+        Ok(s) => s,
+        Err(_) => return -14,
+    };
+
+    let (atime_ns, mtime_ns) = if times_va == 0 {
+        let now = now_real_ns();
+        (now, now)
+    } else {
+        let mut buf = [0u8; 32];
+        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let a_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let a_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let m_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let m_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
+        (
+            a_sec as u64 * 1_000_000_000 + a_usec as u64 * 1_000,
+            m_sec as u64 * 1_000_000_000 + m_usec as u64 * 1_000,
+        )
+    };
+
+    match crate::fs::vfs_ops::utimens(path, atime_ns, mtime_ns) {
+        Ok(())  => 0,
+        Err(e)  => e,
+    }
+}
+
+/// utimensat(dirfd, path, times: *const [timespec; 2], flags)  [NR 280]
+///
+/// UTIME_NOW (0x3fffffff) and UTIME_OMIT (0x3ffffffe) are honoured.
+/// AT_FDCWD and absolute paths are handled; relative paths resolve via
+/// dirfd's path.
+pub fn sys_utimensat(
+    dirfd:    i32,
+    path_va:  usize,
+    times_va: usize,
+    _flags:   u32,
+) -> isize {
+    // Build the full path string.
+    let path: alloc::string::String = if path_va == 0 {
+        // path_va==0 with AT_EMPTY_PATH applies to dirfd itself.
+        match crate::fs::vfs::fd_path(dirfd as usize) {
+            Some(p) => p,
+            None    => return -9, // EBADF
+        }
+    } else {
+        let mut path_buf = [0u8; 4096];
+        if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
+        let end = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+        let s = match core::str::from_utf8(&path_buf[..end]) {
+            Ok(s) => s,
+            Err(_) => return -14,
+        };
+        if s.starts_with('/') {
+            alloc::string::String::from(s)
+        } else {
+            const AT_FDCWD: i32 = -100;
+            let dir = if dirfd == AT_FDCWD {
+                let pid = crate::proc::scheduler::current_pid();
+                crate::proc::cwd::get_cwd(pid)
+            } else {
+                crate::fs::vfs::fd_path(dirfd as usize)
+                    .unwrap_or_else(|| alloc::string::String::from("/"))
+            };
+            alloc::format!("{}/{}", dir.trim_end_matches('/'), s)
+        }
+    };
+
+    let now = now_real_ns();
+
+    let (atime_ns, mtime_ns) = if times_va == 0 {
+        (now, now)
+    } else {
+        let mut buf = [0u8; 32];
+        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let a_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let a_nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let m_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let m_nsec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
+
+        let resolve_ts = |sec: i64, nsec: i64| -> Option<u64> {
+            if nsec == UTIME_NOW  { return Some(now); }
+            if nsec == UTIME_OMIT { return None; }
+            Some(sec as u64 * 1_000_000_000 + nsec as u64)
+        };
+
+        let a = resolve_ts(a_sec, a_nsec);
+        let m = resolve_ts(m_sec, m_nsec);
+
+        // If both are OMIT, nothing to do.
+        if a.is_none() && m.is_none() { return 0; }
+
+        // For OMIT fields, read the existing inode timestamp to preserve it.
+        let (existing_atime, existing_mtime) =
+            crate::fs::vfs_ops::get_times(&path).unwrap_or((now, now));
+
+        (a.unwrap_or(existing_atime), m.unwrap_or(existing_mtime))
+    };
+
+    match crate::fs::vfs_ops::utimens(&path, atime_ns, mtime_ns) {
+        Ok(())  => 0,
+        Err(e)  => e,
+    }
 }
