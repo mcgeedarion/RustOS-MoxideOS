@@ -9,9 +9,9 @@
 //!   sepc         = entry virtual address
 //!   satp         = (8 << 60) | root_ppn  (Sv39)
 
-use core::arch::asm;
+use crate::arch::riscv64::paging::{self, PTE_R, PTE_U, PTE_W};
 use crate::mm::pmm;
-use crate::arch::riscv64::paging::{self, PTE_R, PTE_W, PTE_U};
+use core::arch::asm;
 
 const USER_STACK_PAGES: usize = 4;
 const PAGE: usize = 4096;
@@ -21,14 +21,16 @@ const PAGE: usize = 4096;
 /// user virtual address of the stack top.
 pub fn alloc_user_stack(root_ppn: usize) -> Option<usize> {
     const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
-    let size            = USER_STACK_PAGES * PAGE;
+    let size = USER_STACK_PAGES * PAGE;
     let stack_virt_base = USER_STACK_TOP - size;
-    let root_pa         = root_ppn << 12;
+    let root_pa = root_ppn << 12;
 
     for i in 0..USER_STACK_PAGES {
-        let pa    = pmm::alloc_page()?;
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
-        let va    = stack_virt_base + i * PAGE;
+        let pa = pmm::alloc_page()?;
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
+        }
+        let va = stack_virt_base + i * PAGE;
         // Use map_page_into so we target the new process's table, not current SATP.
         paging::map_page_into(root_pa, va, pa, PTE_R | PTE_W | PTE_U);
     }

@@ -19,7 +19,7 @@
 use std::{
     env,
     path::PathBuf,
-    process::{Command, exit},
+    process::{exit, Command},
 };
 
 // ─── helpers ────────────────────────────────────────────────────────────────────────
@@ -88,18 +88,18 @@ enum Boot {
 
 #[derive(Debug)]
 struct BuildOpts {
-    arch:   Arch,
-    boot:   Boot,
-    debug:  bool,
+    arch: Arch,
+    boot: Boot,
+    debug: bool,
     initrd: bool,
 }
 
 impl Default for BuildOpts {
     fn default() -> Self {
         Self {
-            arch:   Arch::RiscV64,
-            boot:   Boot::Uefi,
-            debug:  false,
+            arch: Arch::RiscV64,
+            boot: Boot::Uefi,
+            debug: false,
             initrd: false,
         }
     }
@@ -114,7 +114,7 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                 i += 1;
                 match args.get(i).map(String::as_str) {
                     Some("riscv64") => opts.arch = Arch::RiscV64,
-                    Some("x86_64")  => opts.arch = Arch::X86_64,
+                    Some("x86_64") => opts.arch = Arch::X86_64,
                     other => {
                         eprintln!("[xtask] unknown --arch value: {:?}", other);
                         exit(1);
@@ -125,14 +125,14 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                 i += 1;
                 match args.get(i).map(String::as_str) {
                     Some("uefi") => opts.boot = Boot::Uefi,
-                    Some("sbi")  => opts.boot = Boot::Sbi,
+                    Some("sbi") => opts.boot = Boot::Sbi,
                     other => {
                         eprintln!("[xtask] unknown --boot value: {:?}", other);
                         exit(1);
                     }
                 }
             }
-            "--debug"  => opts.debug  = true,
+            "--debug" => opts.debug = true,
             "--initrd" => opts.initrd = true,
             other => {
                 eprintln!("[xtask] unknown argument: {other}");
@@ -156,21 +156,28 @@ fn build_riscv_uefi(root: &PathBuf, debug: bool) {
         .args(["build", "--target"])
         .arg(&target_json)
         .args([
-            "--features", "uefi_boot",
-            "-Z", "build-std=core,alloc,compiler_builtins",
-            "-Z", "build-std-features=compiler-builtins-mem",
+            "--features",
+            "uefi_boot",
+            "-Z",
+            "build-std=core,alloc,compiler_builtins",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
         ]);
-    if !debug { cmd.arg("--release"); }
+    if !debug {
+        cmd.arg("--release");
+    }
     run(cmd);
 
-    let efi_with    = root.join(format!("target/riscv64-uefi/{profile}/rustos.efi"));
+    let efi_with = root.join(format!("target/riscv64-uefi/{profile}/rustos.efi"));
     let efi_without = root.join(format!("target/riscv64-uefi/{profile}/rustos"));
-    let kernel_efi = if efi_with.exists() { efi_with }
-                     else if efi_without.exists() { efi_without }
-                     else {
-                         eprintln!("[xtask] ERROR: could not find EFI binary under target/riscv64-uefi/{profile}/");
-                         exit(1);
-                     };
+    let kernel_efi = if efi_with.exists() {
+        efi_with
+    } else if efi_without.exists() {
+        efi_without
+    } else {
+        eprintln!("[xtask] ERROR: could not find EFI binary under target/riscv64-uefi/{profile}/");
+        exit(1);
+    };
 
     let esp = root.join("esp/EFI/BOOT");
     std::fs::create_dir_all(&esp).expect("create esp dir");
@@ -186,15 +193,19 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
     eprintln!("[xtask] Building rustos (RISC-V SBI, {profile})...");
 
     let mut cmd = cargo();
-    cmd.current_dir(root)
-        .args([
-            "build",
-            "--target", "riscv64gc-unknown-none-elf",
-            "--no-default-features",
-            "-Z", "build-std=core,alloc,compiler_builtins",
-            "-Z", "build-std-features=compiler-builtins-mem",
-        ]);
-    if !debug { cmd.arg("--release"); }
+    cmd.current_dir(root).args([
+        "build",
+        "--target",
+        "riscv64gc-unknown-none-elf",
+        "--no-default-features",
+        "-Z",
+        "build-std=core,alloc,compiler_builtins",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+    ]);
+    if !debug {
+        cmd.arg("--release");
+    }
     run(cmd);
 
     let kernel_elf = root.join(format!(
@@ -203,7 +214,9 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
     eprintln!("[xtask] Built: {}", kernel_elf.display());
 
     for tool in ["llvm-size", "size"] {
-        if Command::new(tool).arg(&kernel_elf).status().is_ok() { break; }
+        if Command::new(tool).arg(&kernel_elf).status().is_ok() {
+            break;
+        }
     }
 
     if initrd {
@@ -211,7 +224,10 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
         run(Command::new("bash")
             .current_dir(root)
             .args(["tools/build_userspace.sh", "riscv64"]));
-        eprintln!("[xtask] Initramfs: {}", root.join("initramfs.cpio").display());
+        eprintln!(
+            "[xtask] Initramfs: {}",
+            root.join("initramfs.cpio").display()
+        );
     }
 }
 
@@ -225,23 +241,27 @@ fn build_x86_64(root: &PathBuf, debug: bool, initrd: bool) {
     eprintln!("[xtask] Building rustos (x86_64, {profile})...");
 
     let mut cmd = cargo();
-    cmd.current_dir(root)
-        .args([
-            "build",
-            "--target", "x86_64-unknown-none",
-            "-Z", "build-std=core,alloc,compiler_builtins",
-            "-Z", "build-std-features=compiler-builtins-mem",
-        ]);
-    if !debug { cmd.arg("--release"); }
+    cmd.current_dir(root).args([
+        "build",
+        "--target",
+        "x86_64-unknown-none",
+        "-Z",
+        "build-std=core,alloc,compiler_builtins",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+    ]);
+    if !debug {
+        cmd.arg("--release");
+    }
     run(cmd);
 
     let elf = root.join(format!("target/x86_64-unknown-none/{profile}/rustos"));
     let bin = root.join("kernel.bin");
-    let objcopy = require_tool(
-        &["llvm-objcopy", "objcopy"],
-        "apt install llvm binutils",
-    );
-    run(Command::new(&objcopy).args(["-O", "binary"]).arg(&elf).arg(&bin));
+    let objcopy = require_tool(&["llvm-objcopy", "objcopy"], "apt install llvm binutils");
+    run(Command::new(&objcopy)
+        .args(["-O", "binary"])
+        .arg(&elf)
+        .arg(&bin));
     eprintln!("[xtask] Built: {}", bin.display());
 }
 
@@ -259,25 +279,22 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         &["mformat"],
         "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS",
     );
-    require_tool(&["mmd"],   "apt install mtools");
+    require_tool(&["mmd"], "apt install mtools");
     require_tool(&["mcopy"], "apt install mtools");
-    let objcopy = require_tool(
-        &["llvm-objcopy", "objcopy"],
-        "apt install llvm binutils",
-    );
+    let objcopy = require_tool(&["llvm-objcopy", "objcopy"], "apt install llvm binutils");
 
     eprintln!("[xtask] image: building kernel...");
     match (opts.arch, opts.boot) {
         (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(root, opts.debug),
-        (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(root, opts.debug, opts.initrd),
-        (Arch::X86_64,  _)          => build_x86_64(root, opts.debug, opts.initrd),
+        (Arch::RiscV64, Boot::Sbi) => build_riscv_sbi(root, opts.debug, opts.initrd),
+        (Arch::X86_64, _) => build_x86_64(root, opts.debug, opts.initrd),
     }
 
     let profile = if opts.debug { "debug" } else { "release" };
 
     let (efi_name, img_name) = match opts.arch {
-        Arch::X86_64  => ("BOOTx64.EFI",      "boot.img"),
-        Arch::RiscV64 => ("BOOTRISCV64.EFI",  "boot-riscv64.img"),
+        Arch::X86_64 => ("BOOTx64.EFI", "boot.img"),
+        Arch::RiscV64 => ("BOOTRISCV64.EFI", "boot-riscv64.img"),
     };
 
     let efi_path = root.join("esp/EFI/BOOT").join(efi_name);
@@ -297,7 +314,10 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     }
 
     if !efi_path.exists() {
-        eprintln!("[xtask] ERROR: EFI binary not found at {}", efi_path.display());
+        eprintln!(
+            "[xtask] ERROR: EFI binary not found at {}",
+            efi_path.display()
+        );
         eprintln!("[xtask]        Did the build step succeed?");
         exit(1);
     }
@@ -337,7 +357,10 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
 
     eprintln!("\n[xtask] ✓ Image ready: {}", img_path.display());
     eprintln!("\n  Flash to USB:");
-    eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync", img_path.display());
+    eprintln!(
+        "    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync",
+        img_path.display()
+    );
     match opts.arch {
         Arch::X86_64 => {
             eprintln!("\n  Smoke-test in QEMU (before flashing):");
@@ -373,8 +396,8 @@ fn main() {
             let opts = parse_build_args(&rest);
             match (opts.arch, opts.boot) {
                 (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(&root, opts.debug),
-                (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(&root, opts.debug, opts.initrd),
-                (Arch::X86_64,  _)          => build_x86_64(&root, opts.debug, opts.initrd),
+                (Arch::RiscV64, Boot::Sbi) => build_riscv_sbi(&root, opts.debug, opts.initrd),
+                (Arch::X86_64, _) => build_x86_64(&root, opts.debug, opts.initrd),
             }
         }
         "image" => {

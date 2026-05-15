@@ -17,19 +17,19 @@
 //! directly, but musl will reach us via the open/unlink paths automatically.
 
 extern crate alloc;
-use alloc::string::{String, ToString};
 use crate::fs::vfs;
 use crate::fs::vfs_ops;
 use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::copy_to_user;
+use alloc::string::{String, ToString};
 
 // O_* flags (Linux x86-64 ABI)
-const O_RDONLY:  u32 = 0;
-const O_WRONLY:  u32 = 1;
-const O_RDWR:    u32 = 2;
-const O_CREAT:   u32 = 0o100;
-const O_EXCL:    u32 = 0o200;
-const O_TRUNC:   u32 = 0o1000;
+const O_RDONLY: u32 = 0;
+const O_WRONLY: u32 = 1;
+const O_RDWR: u32 = 2;
+const O_CREAT: u32 = 0o100;
+const O_EXCL: u32 = 0o200;
+const O_TRUNC: u32 = 0o1000;
 const O_CLOEXEC: u32 = 0o2000000;
 
 /// Normalise a POSIX shm name into an absolute /dev/shm path.
@@ -38,9 +38,13 @@ const O_CLOEXEC: u32 = 0o2000000;
 /// slashes and prepend "/dev/shm".
 fn shm_path(name: &str) -> Option<String> {
     let name = name.trim_start_matches('/');
-    if name.is_empty() { return None; }
+    if name.is_empty() {
+        return None;
+    }
     // Reject names with embedded slashes (subdirectories not allowed by POSIX).
-    if name.contains('/') { return None; }
+    if name.contains('/') {
+        return None;
+    }
     Some(alloc::format!("/dev/shm/{}", name))
 }
 
@@ -58,7 +62,7 @@ pub fn shm_open(name: &str, oflag: u32, _mode: u32) -> isize {
 
     let path = match shm_path(name) {
         Some(p) => p,
-        None    => return -22, // EINVAL
+        None => return -22, // EINVAL
     };
 
     let exists = vfs::exists(&path);
@@ -88,8 +92,8 @@ pub fn shm_open(name: &str, oflag: u32, _mode: u32) -> isize {
     // Open via VFS.  Pass the original oflag so the FD table records the
     // access mode (O_RDONLY / O_RDWR) correctly.
     match vfs::open(&path, oflag) {
-        Ok(fd)  => fd as isize,
-        Err(e)  => e as isize,
+        Ok(fd) => fd as isize,
+        Err(e) => e as isize,
     }
 }
 
@@ -102,11 +106,11 @@ pub fn shm_open(name: &str, oflag: u32, _mode: u32) -> isize {
 pub fn shm_unlink(name: &str) -> isize {
     let path = match shm_path(name) {
         Some(p) => p,
-        None    => return -22,
+        None => return -22,
     };
     match vfs_ops::unlink(&path) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
@@ -116,11 +120,17 @@ pub fn shm_unlink(name: &str) -> isize {
 /// open(2) path with a /dev/shm/ prefix (musl does this); kept here for
 /// completeness and for any ABI path that jumps directly.
 pub fn sys_shm_open(name_va: usize, oflag: u32, mode: u32) -> isize {
-    let name = match read_cstr_safe(name_va) { Some(s) => s, None => return -14 };
+    let name = match read_cstr_safe(name_va) {
+        Some(s) => s,
+        None => return -14,
+    };
     shm_open(&name, oflag, mode)
 }
 
 pub fn sys_shm_unlink(name_va: usize) -> isize {
-    let name = match read_cstr_safe(name_va) { Some(s) => s, None => return -14 };
+    let name = match read_cstr_safe(name_va) {
+        Some(s) => s,
+        None => return -14,
+    };
     shm_unlink(&name)
 }

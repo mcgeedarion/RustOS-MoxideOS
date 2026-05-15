@@ -20,7 +20,7 @@
 //! }
 //! ```
 
-use super::{virtio_gpu, gop};
+use super::{gop, virtio_gpu};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Backend selection
@@ -42,13 +42,13 @@ pub enum Backend {
 /// **BGRX u32** (byte 0 = B, byte 1 = G, byte 2 = R, byte 3 = unused).
 pub struct Framebuffer {
     /// Kernel-virtual (= physical for identity-mapped pages) base address.
-    pub base:    *mut u32,
+    pub base: *mut u32,
     /// Width in pixels.
-    pub width:   u32,
+    pub width: u32,
     /// Height in pixels.
-    pub height:  u32,
+    pub height: u32,
     /// Bytes per row (stride).
-    pub stride:  u32,
+    pub stride: u32,
     /// Which hardware backs this handle.
     pub backend: Backend,
 }
@@ -64,16 +64,22 @@ impl Framebuffer {
     /// Write a single pixel.  `color` is in BGRX u32 format.
     #[inline]
     pub fn put_pixel(&mut self, x: u32, y: u32, color: u32) {
-        if x >= self.width || y >= self.height { return; }
+        if x >= self.width || y >= self.height {
+            return;
+        }
         let offset = (y * (self.stride / 4) + x) as usize;
-        unsafe { self.base.add(offset).write_volatile(color); }
+        unsafe {
+            self.base.add(offset).write_volatile(color);
+        }
     }
 
     /// Fill the entire framebuffer with `color`.
     pub fn fill(&mut self, color: u32) {
         let words = (self.stride as usize / 4) * self.height as usize;
         for i in 0..words {
-            unsafe { self.base.add(i).write_volatile(color); }
+            unsafe {
+                self.base.add(i).write_volatile(color);
+            }
         }
     }
 
@@ -82,10 +88,14 @@ impl Framebuffer {
     pub fn blit(&mut self, dst_x: u32, dst_y: u32, w: u32, h: u32, src: &[u32]) {
         for row in 0..h {
             let sy = dst_y + row;
-            if sy >= self.height { break; }
+            if sy >= self.height {
+                break;
+            }
             for col in 0..w {
                 let sx = dst_x + col;
-                if sx >= self.width { continue; }
+                if sx >= self.width {
+                    continue;
+                }
                 let src_idx = (row * w + col) as usize;
                 if src_idx < src.len() {
                     self.put_pixel(sx, sy, src[src_idx]);
@@ -119,14 +129,14 @@ impl Framebuffer {
         (r as u32) << 16 | (g as u32) << 8 | (b as u32)
     }
 
-    pub const BLACK:   u32 = 0x0000_0000;
-    pub const WHITE:   u32 = 0x00FF_FFFF;
-    pub const RED:     u32 = 0x00FF_0000;
-    pub const GREEN:   u32 = 0x0000_FF00;
-    pub const BLUE:    u32 = 0x0000_00FF;
+    pub const BLACK: u32 = 0x0000_0000;
+    pub const WHITE: u32 = 0x00FF_FFFF;
+    pub const RED: u32 = 0x00FF_0000;
+    pub const GREEN: u32 = 0x0000_FF00;
+    pub const BLUE: u32 = 0x0000_00FF;
     pub const MAGENTA: u32 = 0x00FF_00FF;
-    pub const CYAN:    u32 = 0x0000_FFFF;
-    pub const YELLOW:  u32 = 0x00FF_FF00;
+    pub const CYAN: u32 = 0x0000_FFFF;
+    pub const YELLOW: u32 = 0x00FF_FF00;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -153,10 +163,10 @@ pub fn acquire() -> Option<Framebuffer> {
     // 2. Fall back to UEFI GOP.
     let info = gop::get()?;
     Some(Framebuffer {
-        base:    info.fb_phys as *mut u32,
-        width:   info.width,
-        height:  info.height,
-        stride:  info.pixels_per_line * 4,
+        base: info.fb_phys as *mut u32,
+        width: info.width,
+        height: info.height,
+        stride: info.pixels_per_line * 4,
         backend: Backend::Gop,
     })
 }
@@ -167,7 +177,9 @@ pub fn acquire() -> Option<Framebuffer> {
 
 /// Physical base address for /dev/fb0 mmap.
 pub fn fb0_phys() -> Option<u64> {
-    if virtio_gpu::is_present() { return virtio_gpu::fb_phys(); }
+    if virtio_gpu::is_present() {
+        return virtio_gpu::fb_phys();
+    }
     gop::get().map(|g| g.fb_phys)
 }
 
@@ -182,6 +194,8 @@ pub fn fb0_size() -> Option<usize> {
 
 /// Width, height in pixels.
 pub fn fb0_dimensions() -> Option<(u32, u32)> {
-    if virtio_gpu::is_present() { return virtio_gpu::dimensions(); }
+    if virtio_gpu::is_present() {
+        return virtio_gpu::dimensions();
+    }
     gop::get().map(|g| (g.width, g.height))
 }

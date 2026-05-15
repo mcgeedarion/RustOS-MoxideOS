@@ -28,23 +28,23 @@
 //! once cpu_time_ns tracking is wired into the scheduler tick.
 
 extern crate alloc;
+use crate::uaccess::{copy_from_user, copy_to_user};
 use alloc::collections::BTreeMap;
 use spin::Mutex as SpinMutex;
-use crate::uaccess::{copy_from_user, copy_to_user};
 
 // ── per-process alarm state ────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 struct AlarmState {
     /// Monotonic ns deadline; 0 means disarmed.
-    deadline_ns:  u64,
+    deadline_ns: u64,
     /// Reload interval in ns; 0 means one-shot.
-    interval_ns:  u64,
+    interval_ns: u64,
     // Per-timer-which copies for VIRTUAL and PROF (stored, not triggered).
-    virtual_deadline_ns:  u64,
-    virtual_interval_ns:  u64,
-    prof_deadline_ns:     u64,
-    prof_interval_ns:     u64,
+    virtual_deadline_ns: u64,
+    virtual_interval_ns: u64,
+    prof_deadline_ns: u64,
+    prof_interval_ns: u64,
 }
 
 static ITIMER_TABLE: SpinMutex<BTreeMap<usize /* pid */, AlarmState>> =
@@ -56,33 +56,43 @@ static ITIMER_TABLE: SpinMutex<BTreeMap<usize /* pid */, AlarmState>> =
 /// Layout: { timeval value_ns[2] } = { { i64 sec; i64 usec; } x2 }
 /// [0] = it_interval, [1] = it_value
 fn read_itimerval(va: usize) -> Option<(u64 /* interval_ns */, u64 /* value_ns */)> {
-    if va == 0 { return None; }
+    if va == 0 {
+        return None;
+    }
     let mut buf = [0u8; 32]; // two timevals, 16 bytes each
     copy_from_user(&mut buf, va).ok()?;
-    let itv_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let itv_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
     let itv_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let val_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let val_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
     let val_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
-    if itv_sec < 0 || itv_usec < 0 || val_sec < 0 || val_usec < 0 { return None; }
+    if itv_sec < 0 || itv_usec < 0 || val_sec < 0 || val_usec < 0 {
+        return None;
+    }
     let interval_ns = itv_sec as u64 * 1_000_000_000 + itv_usec as u64 * 1_000;
-    let value_ns    = val_sec as u64 * 1_000_000_000 + val_usec as u64 * 1_000;
+    let value_ns = val_sec as u64 * 1_000_000_000 + val_usec as u64 * 1_000;
     Some((interval_ns, value_ns))
 }
 
 /// Write a `struct itimerval` to userspace.
 /// [0] = it_interval (reload), [1] = it_value (remaining)
 fn write_itimerval(va: usize, interval_ns: u64, remaining_ns: u64) -> isize {
-    if va == 0 { return 0; }
+    if va == 0 {
+        return 0;
+    }
     let mut buf = [0u8; 32];
     let write_timeval = |buf: &mut [u8], off: usize, ns: u64| {
-        let sec  = (ns / 1_000_000_000) as i64;
+        let sec = (ns / 1_000_000_000) as i64;
         let usec = ((ns % 1_000_000_000) / 1_000) as i64;
-        buf[off..off+8].copy_from_slice(&sec.to_le_bytes());
-        buf[off+8..off+16].copy_from_slice(&usec.to_le_bytes());
+        buf[off..off + 8].copy_from_slice(&sec.to_le_bytes());
+        buf[off + 8..off + 16].copy_from_slice(&usec.to_le_bytes());
     };
-    write_timeval(&mut buf, 0,  interval_ns);
+    write_timeval(&mut buf, 0, interval_ns);
     write_timeval(&mut buf, 16, remaining_ns);
-    if copy_to_user(va, &buf).is_err() { -14 } else { 0 }
+    if copy_to_user(va, &buf).is_err() {
+        -14
+    } else {
+        0
+    }
 }
 
 /// Remaining ns on an ITIMER_REAL alarm for `pid`; 0 if disarmed.
@@ -91,9 +101,11 @@ fn remaining_real_ns(pid: usize) -> u64 {
     let table = ITIMER_TABLE.lock();
     let state = match table.get(&pid) {
         Some(s) => s,
-        None    => return 0,
+        None => return 0,
     };
-    if state.deadline_ns == 0 { return 0; }
+    if state.deadline_ns == 0 {
+        return 0;
+    }
     state.deadline_ns.saturating_sub(mono)
 }
 
@@ -105,7 +117,7 @@ fn remaining_real_ns(pid: usize) -> u64 {
 // alarm(0) cancels any pending alarm.
 
 pub fn sys_alarm(seconds: u32) -> isize {
-    let pid  = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid();
     let mono = crate::time::read_monotonic_ns();
     let mut table = ITIMER_TABLE.lock();
     let state = table.entry(pid).or_default();
@@ -141,13 +153,15 @@ pub fn sys_alarm(seconds: u32) -> isize {
 // Returns 0 on success, -EINVAL if `which` is out of range.
 
 pub fn sys_setitimer(which: i32, new_va: usize, old_va: usize) -> isize {
-    const ITIMER_REAL:    i32 = 0;
+    const ITIMER_REAL: i32 = 0;
     const ITIMER_VIRTUAL: i32 = 1;
-    const ITIMER_PROF:    i32 = 2;
+    const ITIMER_PROF: i32 = 2;
 
-    if which < ITIMER_REAL || which > ITIMER_PROF { return -22; } // EINVAL
+    if which < ITIMER_REAL || which > ITIMER_PROF {
+        return -22;
+    } // EINVAL
 
-    let pid  = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid();
     let mono = crate::time::read_monotonic_ns();
     let mut table = ITIMER_TABLE.lock();
     let state = table.entry(pid).or_default();
@@ -218,14 +232,18 @@ pub fn sys_setitimer(which: i32, new_va: usize, old_va: usize) -> isize {
 // Writes the remaining time and reload interval into the userspace itimerval.
 
 pub fn sys_getitimer(which: i32, cur_va: usize) -> isize {
-    const ITIMER_REAL:    i32 = 0;
+    const ITIMER_REAL: i32 = 0;
     const ITIMER_VIRTUAL: i32 = 1;
-    const ITIMER_PROF:    i32 = 2;
+    const ITIMER_PROF: i32 = 2;
 
-    if which < ITIMER_REAL || which > ITIMER_PROF { return -22; }
-    if cur_va == 0 { return -14; } // EFAULT
+    if which < ITIMER_REAL || which > ITIMER_PROF {
+        return -22;
+    }
+    if cur_va == 0 {
+        return -14;
+    } // EFAULT
 
-    let pid  = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid();
     let mono = crate::time::read_monotonic_ns();
     let table = ITIMER_TABLE.lock();
     let state = table.get(&pid).cloned().unwrap_or_default();
@@ -233,15 +251,27 @@ pub fn sys_getitimer(which: i32, cur_va: usize) -> isize {
 
     let (interval_ns, remaining_ns) = match which {
         x if x == ITIMER_REAL => {
-            let rem = if state.deadline_ns == 0 { 0 } else { state.deadline_ns.saturating_sub(mono) };
+            let rem = if state.deadline_ns == 0 {
+                0
+            } else {
+                state.deadline_ns.saturating_sub(mono)
+            };
             (state.interval_ns, rem)
         }
         x if x == ITIMER_VIRTUAL => {
-            let rem = if state.virtual_deadline_ns == 0 { 0 } else { state.virtual_deadline_ns.saturating_sub(mono) };
+            let rem = if state.virtual_deadline_ns == 0 {
+                0
+            } else {
+                state.virtual_deadline_ns.saturating_sub(mono)
+            };
             (state.virtual_interval_ns, rem)
         }
         _ => {
-            let rem = if state.prof_deadline_ns == 0 { 0 } else { state.prof_deadline_ns.saturating_sub(mono) };
+            let rem = if state.prof_deadline_ns == 0 {
+                0
+            } else {
+                state.prof_deadline_ns.saturating_sub(mono)
+            };
             (state.prof_interval_ns, rem)
         }
     };
@@ -264,12 +294,12 @@ pub fn check_itimers(pid: usize) {
     // Non-blocking: skip if the table is contended.
     let mut table = match ITIMER_TABLE.try_lock() {
         Some(g) => g,
-        None    => return,
+        None => return,
     };
 
     let state = match table.get_mut(&pid) {
         Some(s) => s,
-        None    => return,
+        None => return,
     };
 
     if state.deadline_ns == 0 || mono < state.deadline_ns {

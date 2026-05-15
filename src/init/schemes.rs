@@ -24,16 +24,16 @@ pub fn init() {
     // ── Storage ───────────────────────────────────────────────────────────────
     // Registered early so schemes that open config files (e.g. /etc/resolv.conf)
     // can use open_url before network init.
-    SCHEME_TABLE.register("blk",  Arc::new(crate::block::BlkScheme::new()));
+    SCHEME_TABLE.register("blk", Arc::new(crate::block::BlkScheme::new()));
     SCHEME_TABLE.register("file", Arc::new(crate::fs::vfs::VfsScheme::new()));
 
     // ── TTY ───────────────────────────────────────────────────────────────────
-    SCHEME_TABLE.register("tty",  Arc::new(crate::tty::TtyScheme::new()));
+    SCHEME_TABLE.register("tty", Arc::new(crate::tty::TtyScheme::new()));
 
     // ── Networking ────────────────────────────────────────────────────────────
-    SCHEME_TABLE.register("net",  Arc::new(crate::net::NetScheme::new()));
-    SCHEME_TABLE.register("tcp",  Arc::new(crate::net::tcp::TcpScheme::new()));
-    SCHEME_TABLE.register("udp",  Arc::new(crate::net::udp::UdpScheme::new()));
+    SCHEME_TABLE.register("net", Arc::new(crate::net::NetScheme::new()));
+    SCHEME_TABLE.register("tcp", Arc::new(crate::net::tcp::TcpScheme::new()));
+    SCHEME_TABLE.register("udp", Arc::new(crate::net::udp::UdpScheme::new()));
 
     // ── IPC ───────────────────────────────────────────────────────────────────
     SCHEME_TABLE.register("pipe", Arc::new(crate::ipc::pipe_scheme::PipeScheme));

@@ -31,12 +31,16 @@
 //!   `ptsname(fd)`     — returns "/dev/pts/<n>" from the pair's index
 
 extern crate alloc;
-use alloc::{collections::VecDeque, string::{String, ToString}, vec::Vec};
-use spin::Mutex;
+use alloc::{
+    collections::VecDeque,
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use spin::Mutex;
 
-use crate::tty::termios::{Termios, Winsize, cc};
 use crate::tty::ldisc::{self, LdiscAction, OutputBytes};
+use crate::tty::termios::{cc, Termios, Winsize};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Shared state between master and slave
@@ -44,36 +48,41 @@ use crate::tty::ldisc::{self, LdiscAction, OutputBytes};
 
 /// Shared interior of a PTY pair.
 struct PtyInner {
-    termios:         Termios,
-    winsize:         Winsize,
+    termios: Termios,
+    winsize: Winsize,
     /// Bytes from slave→master (application output, after opost).
     master_read_buf: VecDeque<u8>,
     /// Bytes ready for slave read in raw mode.
-    slave_read_buf:  VecDeque<u8>,
+    slave_read_buf: VecDeque<u8>,
     /// Canonical line accumulator.
-    line_buf:        Vec<u8>,
+    line_buf: Vec<u8>,
     /// Complete canonical lines ready for slave::read.
-    canon_queue:     VecDeque<Vec<u8>>,
+    canon_queue: VecDeque<Vec<u8>>,
     /// XOFF state: master output is paused.
-    xoff_active:     bool,
+    xoff_active: bool,
     /// Foreground process group ID (for signal delivery).
-    fg_pgid:         u32,
+    fg_pgid: u32,
     /// Session ID owning this PTY.
-    session_id:      u32,
+    session_id: u32,
 }
 
 impl PtyInner {
     fn new() -> Self {
         PtyInner {
-            termios:         Termios::cooked_default(),
-            winsize:         Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 },
+            termios: Termios::cooked_default(),
+            winsize: Winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
             master_read_buf: VecDeque::new(),
-            slave_read_buf:  VecDeque::new(),
-            line_buf:        Vec::new(),
-            canon_queue:     VecDeque::new(),
-            xoff_active:     false,
-            fg_pgid:         0,
-            session_id:      0,
+            slave_read_buf: VecDeque::new(),
+            line_buf: Vec::new(),
+            canon_queue: VecDeque::new(),
+            xoff_active: false,
+            fg_pgid: 0,
+            session_id: 0,
         }
     }
 }
@@ -83,48 +92,69 @@ impl PtyInner {
 // ───────────────────────────────────────────────────────────────────────────
 
 pub struct PtyPair {
-    pub index:  u32,
-    locked:     AtomicBool,
+    pub index: u32,
+    locked: AtomicBool,
     master_open: AtomicBool,
-    slave_open:  AtomicBool,
-    inner:      Mutex<PtyInner>,
+    slave_open: AtomicBool,
+    inner: Mutex<PtyInner>,
 }
 
 impl PtyPair {
     pub fn new(index: u32) -> Self {
         PtyPair {
             index,
-            locked:      AtomicBool::new(true), // must call unlockpt
+            locked: AtomicBool::new(true), // must call unlockpt
             master_open: AtomicBool::new(false),
-            slave_open:  AtomicBool::new(false),
-            inner:       Mutex::new(PtyInner::new()),
+            slave_open: AtomicBool::new(false),
+            inner: Mutex::new(PtyInner::new()),
         }
     }
 
     // ── termios / winsize getters ─────────────────────────────────────────
 
-    pub fn get_termios(&self) -> Termios { self.inner.lock().termios }
-    pub fn set_termios(&self, t: Termios) { self.inner.lock().termios = t; }
+    pub fn get_termios(&self) -> Termios {
+        self.inner.lock().termios
+    }
+    pub fn set_termios(&self, t: Termios) {
+        self.inner.lock().termios = t;
+    }
 
-    pub fn get_winsize(&self) -> Winsize { self.inner.lock().winsize }
+    pub fn get_winsize(&self) -> Winsize {
+        self.inner.lock().winsize
+    }
     pub fn set_winsize(&self, ws: Winsize) {
         self.inner.lock().winsize = ws;
         // Deliver SIGWINCH to foreground process group.
         let pgid = self.inner.lock().fg_pgid;
-        if pgid != 0 { signal_pgrp(pgid, SIGWINCH); }
+        if pgid != 0 {
+            signal_pgrp(pgid, SIGWINCH);
+        }
     }
 
     // ── locking (unlockpt / grantpt) ─────────────────────────────────────
 
-    pub fn unlock(&self) { self.locked.store(false, Ordering::SeqCst); }
-    pub fn is_locked(&self) -> bool { self.locked.load(Ordering::SeqCst); false }
+    pub fn unlock(&self) {
+        self.locked.store(false, Ordering::SeqCst);
+    }
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst);
+        false
+    }
 
     // ── session / pgrp ───────────────────────────────────────────────────
 
-    pub fn set_fg_pgrp(&self, pgid: u32) { self.inner.lock().fg_pgid = pgid; }
-    pub fn fg_pgrp(&self)     -> u32     { self.inner.lock().fg_pgid }
-    pub fn set_session(&self, sid: u32)  { self.inner.lock().session_id = sid; }
-    pub fn session(&self)     -> u32     { self.inner.lock().session_id }
+    pub fn set_fg_pgrp(&self, pgid: u32) {
+        self.inner.lock().fg_pgid = pgid;
+    }
+    pub fn fg_pgrp(&self) -> u32 {
+        self.inner.lock().fg_pgid
+    }
+    pub fn set_session(&self, sid: u32) {
+        self.inner.lock().session_id = sid;
+    }
+    pub fn session(&self) -> u32 {
+        self.inner.lock().session_id
+    }
 
     // ── Master write  (keyboard input → ldisc → slave read buf) ──────────
 
@@ -151,7 +181,9 @@ impl PtyPair {
                 if inner.termios.is_canonical() {
                     if inner.line_buf.len() < crate::tty::ldisc::MAX_CANON {
                         inner.line_buf.push(b);
-                        if inner.termios.is_echo() { inner.master_read_buf.push_back(b); }
+                        if inner.termios.is_echo() {
+                            inner.master_read_buf.push_back(b);
+                        }
                         // Flush canonical line on NL / EOL
                         if b == b'\n'
                             || b == inner.termios.c_cc[cc::VEOL]
@@ -163,7 +195,9 @@ impl PtyPair {
                     }
                 } else {
                     inner.slave_read_buf.push_back(b);
-                    if inner.termios.is_echo() { inner.master_read_buf.push_back(b); }
+                    if inner.termios.is_echo() {
+                        inner.master_read_buf.push_back(b);
+                    }
                 }
             }
             LdiscAction::LineReady(_) => {
@@ -210,11 +244,17 @@ impl PtyPair {
             LdiscAction::Signal(sig) => {
                 let pgid = inner.fg_pgid;
                 drop(inner); // release lock before signal delivery
-                if pgid != 0 { signal_pgrp(pgid, sig); }
+                if pgid != 0 {
+                    signal_pgrp(pgid, sig);
+                }
                 return;
             }
-            LdiscAction::Xoff => { inner.xoff_active = true; }
-            LdiscAction::Xon  => { inner.xoff_active = false; }
+            LdiscAction::Xoff => {
+                inner.xoff_active = true;
+            }
+            LdiscAction::Xon => {
+                inner.xoff_active = false;
+            }
             LdiscAction::Discard => {}
         }
     }
@@ -227,7 +267,7 @@ impl PtyPair {
         let mut inner = self.inner.lock();
         for &byte in data {
             match ldisc::process_output(&inner.termios, byte) {
-                OutputBytes::One(b)    => inner.master_read_buf.push_back(b),
+                OutputBytes::One(b) => inner.master_read_buf.push_back(b),
                 OutputBytes::Two(a, b) => {
                     inner.master_read_buf.push_back(a);
                     inner.master_read_buf.push_back(b);
@@ -242,11 +282,15 @@ impl PtyPair {
     pub fn master_read(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
         let n = buf.len().min(inner.master_read_buf.len());
-        for i in 0..n { buf[i] = inner.master_read_buf.pop_front().unwrap(); }
+        for i in 0..n {
+            buf[i] = inner.master_read_buf.pop_front().unwrap();
+        }
         n
     }
 
-    pub fn master_readable(&self) -> usize { self.inner.lock().master_read_buf.len() }
+    pub fn master_readable(&self) -> usize {
+        self.inner.lock().master_read_buf.len()
+    }
 
     // ── Slave read   (canonical or raw) ──────────────────────────────────
 
@@ -265,9 +309,13 @@ impl PtyPair {
         }
         // Raw: respect VMIN
         let vmin = inner.termios.c_cc[cc::VMIN] as usize;
-        if inner.slave_read_buf.len() < vmin.max(1) { return 0; }
+        if inner.slave_read_buf.len() < vmin.max(1) {
+            return 0;
+        }
         let n = buf.len().min(inner.slave_read_buf.len());
-        for i in 0..n { buf[i] = inner.slave_read_buf.pop_front().unwrap(); }
+        for i in 0..n {
+            buf[i] = inner.slave_read_buf.pop_front().unwrap();
+        }
         n
     }
 
@@ -320,7 +368,9 @@ pub fn posix_openpt() -> Result<(u32, alloc::sync::Arc<PtyPair>), isize> {
 }
 
 /// `grantpt(fd)` — no-op in a single-user kernel (no /dev/pts uid-chown needed).
-pub fn grantpt(_pair: &PtyPair) -> Result<(), isize> { Ok(()) }
+pub fn grantpt(_pair: &PtyPair) -> Result<(), isize> {
+    Ok(())
+}
 
 /// `unlockpt(fd)` — clears the locked flag, allowing the slave to be opened.
 pub fn unlockpt(pair: &PtyPair) -> Result<(), isize> {
@@ -329,7 +379,9 @@ pub fn unlockpt(pair: &PtyPair) -> Result<(), isize> {
 }
 
 /// `ptsname(fd)` — returns the slave path string (e.g. "/dev/pts/3").
-pub fn ptsname(pair: &PtyPair) -> String { pair.ptsname() }
+pub fn ptsname(pair: &PtyPair) -> String {
+    pair.ptsname()
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // ioctl dispatcher (called from syscall::ioctl)
@@ -345,7 +397,9 @@ pub fn pty_ioctl(pair: &PtyPair, request: usize, arg: usize) -> Result<isize, is
             // Copy termios to userspace.
             let t = pair.get_termios();
             let dst = arg as *mut Termios;
-            unsafe { dst.write(t); }
+            unsafe {
+                dst.write(t);
+            }
             Ok(0)
         }
         req::TCSETS | req::TCSETSW | req::TCSETSF => {
@@ -357,7 +411,9 @@ pub fn pty_ioctl(pair: &PtyPair, request: usize, arg: usize) -> Result<isize, is
         req::TIOCGWINSZ => {
             let ws = pair.get_winsize();
             let dst = arg as *mut Winsize;
-            unsafe { dst.write(ws); }
+            unsafe {
+                dst.write(ws);
+            }
             Ok(0)
         }
         req::TIOCSWINSZ => {
@@ -367,18 +423,24 @@ pub fn pty_ioctl(pair: &PtyPair, request: usize, arg: usize) -> Result<isize, is
         }
         req::TIOCGPTN => {
             let dst = arg as *mut u32;
-            unsafe { dst.write(pair.index); }
+            unsafe {
+                dst.write(pair.index);
+            }
             Ok(0)
         }
         req::TIOCSPTLCK => {
             let val = unsafe { (arg as *const i32).read() };
-            if val == 0 { pair.unlock(); }
+            if val == 0 {
+                pair.unlock();
+            }
             Ok(0)
         }
         req::TIOCGPTLCK => {
             let locked = pair.locked.load(Ordering::SeqCst) as i32;
             let dst = arg as *mut i32;
-            unsafe { dst.write(locked); }
+            unsafe {
+                dst.write(locked);
+            }
             Ok(0)
         }
         req::TIOCSCTTY => {
@@ -388,7 +450,9 @@ pub fn pty_ioctl(pair: &PtyPair, request: usize, arg: usize) -> Result<isize, is
         }
         req::TIOCGPGRP => {
             let dst = arg as *mut u32;
-            unsafe { dst.write(pair.fg_pgrp()); }
+            unsafe {
+                dst.write(pair.fg_pgrp());
+            }
             Ok(0)
         }
         req::TIOCSPGRP => {
@@ -398,12 +462,16 @@ pub fn pty_ioctl(pair: &PtyPair, request: usize, arg: usize) -> Result<isize, is
         }
         req::TIOCGSID => {
             let dst = arg as *mut u32;
-            unsafe { dst.write(pair.session()); }
+            unsafe {
+                dst.write(pair.session());
+            }
             Ok(0)
         }
         req::FIONREAD => {
             let dst = arg as *mut i32;
-            unsafe { dst.write(pair.master_readable() as i32); }
+            unsafe {
+                dst.write(pair.master_readable() as i32);
+            }
             Ok(0)
         }
         _ => Err(-25), // ENOTTY

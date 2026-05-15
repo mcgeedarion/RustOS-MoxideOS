@@ -10,7 +10,7 @@
 //!   get_state() -> MouseState — snapshot of current pointer position + buttons.
 //!   reset_delta()             — zero REL_X / REL_Y accumulators.
 
-use crate::drivers::evdev::{pop_event, EventType, RelCode, KeyCode};
+use crate::drivers::evdev::{pop_event, EventType, KeyCode, RelCode};
 use spin::Mutex;
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -30,7 +30,12 @@ pub struct MouseState {
 }
 
 static STATE: Mutex<MouseState> = Mutex::new(MouseState {
-    x: 0, y: 0, dx: 0, dy: 0, buttons: 0, wheel: 0,
+    x: 0,
+    y: 0,
+    dx: 0,
+    dy: 0,
+    buttons: 0,
+    wheel: 0,
 });
 
 // ── Evdev drain ───────────────────────────────────────────────────────────────
@@ -41,19 +46,25 @@ pub fn mouse_update() {
     let mut state = STATE.lock();
     while let Some(ev) = pop_event() {
         match ev.typ {
-            EventType::Rel => {
-                match ev.code {
-                    c if c == RelCode::REL_X     as u16 => { state.dx += ev.value; state.x += ev.value; }
-                    c if c == RelCode::REL_Y     as u16 => { state.dy += ev.value; state.y += ev.value; }
-                    c if c == RelCode::REL_WHEEL as u16 => { state.wheel += ev.value; }
-                    _ => {}
+            EventType::Rel => match ev.code {
+                c if c == RelCode::REL_X as u16 => {
+                    state.dx += ev.value;
+                    state.x += ev.value;
                 }
-            }
+                c if c == RelCode::REL_Y as u16 => {
+                    state.dy += ev.value;
+                    state.y += ev.value;
+                }
+                c if c == RelCode::REL_WHEEL as u16 => {
+                    state.wheel += ev.value;
+                }
+                _ => {}
+            },
             EventType::Key => {
                 let down = ev.value != 0;
                 match ev.code {
-                    c if c == KeyCode::BTN_LEFT   as u16 => set_btn(&mut state.buttons, 0, down),
-                    c if c == KeyCode::BTN_RIGHT  as u16 => set_btn(&mut state.buttons, 1, down),
+                    c if c == KeyCode::BTN_LEFT as u16 => set_btn(&mut state.buttons, 0, down),
+                    c if c == KeyCode::BTN_RIGHT as u16 => set_btn(&mut state.buttons, 1, down),
                     c if c == KeyCode::BTN_MIDDLE as u16 => set_btn(&mut state.buttons, 2, down),
                     _ => {}
                 }
@@ -65,8 +76,11 @@ pub fn mouse_update() {
 
 #[inline]
 fn set_btn(buttons: &mut u8, bit: u8, down: bool) {
-    if down { *buttons |=  (1 << bit); }
-    else    { *buttons &= !(1 << bit); }
+    if down {
+        *buttons |= (1 << bit);
+    } else {
+        *buttons &= !(1 << bit);
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

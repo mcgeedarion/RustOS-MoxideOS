@@ -46,3 +46,9 @@ use fixed_size_block::FIXED_BLOCK_ALLOC;
 pub unsafe fn init(region_start: usize, region_size: usize) {
     FIXED_BLOCK_ALLOC.lock().init(region_start, region_size);
 }
+
+/// Legacy early-boot heap initialisation hook.
+///
+/// The canonical heap setup is performed by `mm::heap`; this shim remains for
+/// old boot code that still calls `crate::allocator::heap_init()`.
+pub fn heap_init() {}

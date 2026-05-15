@@ -47,16 +47,12 @@
 //!   vga::init() probes BDA 0x0449.  When UEFI/GOP took over it returns false
 //!   and the GOP framebuffer driver stays in control.  Safe unconditionally.
 
-use core::arch::asm;
 use crate::arch::x86_64::{
-    gdt::gdt_init,
-    idt::idt_init,
-    syscall::syscall_setup,
-    serial,
-    apic::apic_init,
+    apic::apic_init, gdt::gdt_init, idt::idt_init, serial, syscall::syscall_setup,
     xsave::xsave_init,
 };
 use crate::proc::exec::spawn_user_process;
+use core::arch::asm;
 
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
@@ -129,7 +125,9 @@ pub extern "C" fn kernel_main() -> ! {
     {
         let mbi = unsafe { MBI_PTR };
         if mbi != 0 {
-            unsafe { crate::arch::x86_64::multiboot2::parse_mbi(mbi); }
+            unsafe {
+                crate::arch::x86_64::multiboot2::parse_mbi(mbi);
+            }
             serial_println!("mb2: MBI at {:#x} parsed", mbi);
         }
     }
@@ -150,14 +148,18 @@ pub extern "C" fn kernel_main() -> ! {
     //     Must come after pcie_init() so BARs are mapped, and before
     //     drm::init_heads() which reads num_scanouts().
     crate::drivers::virtio_gpu::init();
-    serial_println!("virtio-gpu: {} scanout(s)",
-                    crate::drivers::virtio_gpu::num_scanouts());
+    serial_println!(
+        "virtio-gpu: {} scanout(s)",
+        crate::drivers::virtio_gpu::num_scanouts()
+    );
 
     // 8b. DRM head registration: GOP → head 0, virtio-gpu scanouts → heads 1+.
     //     NUM_HEADS was 0 until this call; KMS ioctls are useless before it.
     crate::drivers::drm::init_heads();
-    serial_println!("drm: {} head(s) registered",
-                    crate::drivers::drm::num_heads());
+    serial_println!(
+        "drm: {} head(s) registered",
+        crate::drivers::drm::num_heads()
+    );
 
     // 9. APIC + timer (enables interrupts).
     apic_init();
@@ -210,7 +212,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 15. Idle loop.
     serial_println!("kernel_main: idle");
     loop {
-        unsafe { asm!("hlt", options(nostack, nomem)); }
+        unsafe {
+            asm!("hlt", options(nostack, nomem));
+        }
         crate::proc::scheduler::schedule();
     }
 }
@@ -219,7 +223,7 @@ fn probe_ahci() -> bool {
     use crate::drivers::pcie::{find_device_by_class, PCI_CLASS_STORAGE_AHCI};
     let dev = match find_device_by_class(PCI_CLASS_STORAGE_AHCI) {
         Some(d) => d,
-        None    => {
+        None => {
             serial_println!("ahci: no controller on PCI bus");
             return false;
         }
@@ -227,7 +231,7 @@ fn probe_ahci() -> bool {
     dev.enable();
     let bar5 = match dev.bar_mmio(5) {
         Some(b) => b as usize,
-        None    => {
+        None => {
             serial_println!("ahci: BAR5 not decoded");
             return false;
         }

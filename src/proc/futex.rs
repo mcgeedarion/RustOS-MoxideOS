@@ -65,33 +65,33 @@
 //!   Fixed to `!copy_to_user(...)`.
 
 extern crate alloc;
+use crate::proc::{process::State, scheduler, thread};
+use crate::uaccess::{copy_from_user, copy_to_user};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::proc::{scheduler, thread, process::State};
-use crate::uaccess::{copy_from_user, copy_to_user};
 
 // ── Constants ───────────────────────────────────────────────────────────────────
 
-pub const FUTEX_WAIT:         u32 = 0;
-pub const FUTEX_WAKE:         u32 = 1;
-pub const FUTEX_FD:           u32 = 2;
-pub const FUTEX_REQUEUE:      u32 = 3;
-pub const FUTEX_CMP_REQUEUE:  u32 = 4;
-pub const FUTEX_WAKE_OP:      u32 = 5;
-pub const FUTEX_LOCK_PI:      u32 = 6;
-pub const FUTEX_UNLOCK_PI:    u32 = 7;
-pub const FUTEX_TRYLOCK_PI:   u32 = 8;
-pub const FUTEX_WAIT_BITSET:  u32 = 9;
-pub const FUTEX_WAKE_BITSET:  u32 = 10;
+pub const FUTEX_WAIT: u32 = 0;
+pub const FUTEX_WAKE: u32 = 1;
+pub const FUTEX_FD: u32 = 2;
+pub const FUTEX_REQUEUE: u32 = 3;
+pub const FUTEX_CMP_REQUEUE: u32 = 4;
+pub const FUTEX_WAKE_OP: u32 = 5;
+pub const FUTEX_LOCK_PI: u32 = 6;
+pub const FUTEX_UNLOCK_PI: u32 = 7;
+pub const FUTEX_TRYLOCK_PI: u32 = 8;
+pub const FUTEX_WAIT_BITSET: u32 = 9;
+pub const FUTEX_WAKE_BITSET: u32 = 10;
 pub const FUTEX_PRIVATE_FLAG: u32 = 128;
-pub const FUTEX_CLOCK_RT:     u32 = 256;
+pub const FUTEX_CLOCK_RT: u32 = 256;
 
 pub const FUTEX_BITSET_MATCH_ANY: u32 = 0xFFFF_FFFF;
 
-const FUTEX_WAITERS:    u32 = 0x8000_0000;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
-const FUTEX_TID_MASK:   u32 = 0x3FFF_FFFF;
+const FUTEX_TID_MASK: u32 = 0x3FFF_FFFF;
 
 /// Maximum PI boost chain depth (mirrors Linux MAX_LOCK_DEPTH).
 const PI_CHAIN_LIMIT: usize = 8;
@@ -106,14 +106,20 @@ struct FutexKey {
 
 impl FutexKey {
     fn new(uaddr: usize) -> Self {
-        let pid  = scheduler::current_pid();
+        let pid = scheduler::current_pid();
         let tgid = thread::tgid_of(pid);
-        FutexKey { as_id: if tgid != 0 { tgid } else { pid }, uaddr }
+        FutexKey {
+            as_id: if tgid != 0 { tgid } else { pid },
+            uaddr,
+        }
     }
 
     fn for_pid(pid: usize, uaddr: usize) -> Self {
         let tgid = thread::tgid_of(pid);
-        FutexKey { as_id: if tgid != 0 { tgid } else { pid }, uaddr }
+        FutexKey {
+            as_id: if tgid != 0 { tgid } else { pid },
+            uaddr,
+        }
     }
 }
 
@@ -121,7 +127,7 @@ impl FutexKey {
 
 #[derive(Clone)]
 struct Waiter {
-    pid:    usize,
+    pid: usize,
     bitset: u32,
 }
 
@@ -138,7 +144,7 @@ struct PiRecord {
     owner_pid: usize,
     /// Waiter PIDs, sorted descending by rt_priority at insertion time.
     /// The head is always the highest-priority waiter (the one that boosts).
-    waiters:   Vec<usize>,
+    waiters: Vec<usize>,
 }
 
 static PI_CHAIN: Mutex<BTreeMap<FutexKey, PiRecord>> = Mutex::new(BTreeMap::new());
@@ -153,9 +159,10 @@ static PI_CHAIN: Mutex<BTreeMap<FutexKey, PiRecord>> = Mutex::new(BTreeMap::new(
 /// for the transitive step).
 fn pi_boost(mut owner_pid: usize, waiter_pid: usize) {
     // Snapshot the waiter's priority without locking PI_CHAIN.
-    let waiter_prio = scheduler::with_proc(waiter_pid, |p| p.sched.rt_priority)
-        .unwrap_or(0);
-    if waiter_prio == 0 { return; }
+    let waiter_prio = scheduler::with_proc(waiter_pid, |p| p.sched.rt_priority).unwrap_or(0);
+    if waiter_prio == 0 {
+        return;
+    }
 
     for _ in 0..PI_CHAIN_LIMIT {
         // Boost the current owner if the waiter outranks it.
@@ -167,14 +174,16 @@ fn pi_boost(mut owner_pid: usize, waiter_pid: usize) {
                     // Mirror the boost into the live Task so the RT heap
                     // re-enqueue (on next schedule()) sees the new priority.
                     if !pcb.task.is_null() {
-                        unsafe { (*pcb.task).sched.rt_priority = waiter_prio; }
+                        unsafe {
+                            (*pcb.task).sched.rt_priority = waiter_prio;
+                        }
                     }
                 }
                 // If this owner is itself a PI waiter somewhere, return the
                 // futex_va it is blocked on so we can climb the chain.
                 (waiter_prio <= current, pcb.sched.rt_priority)
             })
-            .map(|(already, _)| (already, 0_usize))   // transitive hop TBD below
+            .map(|(already, _)| (already, 0_usize)) // transitive hop TBD below
             .unwrap_or((true, 0));
 
         // Climb: find if `owner_pid` is itself waiting on a PI lock.
@@ -192,7 +201,9 @@ fn pi_boost(mut owner_pid: usize, waiter_pid: usize) {
         };
 
         match next_owner {
-            Some(next) if !already_highest => { owner_pid = next; }
+            Some(next) if !already_highest => {
+                owner_pid = next;
+            }
             _ => break,
         }
     }
@@ -208,12 +219,11 @@ fn pi_unboost(owner_pid: usize) {
     // Collect the maximum priority across all PI locks this task still owns.
     let max_remaining: u8 = {
         let chain = PI_CHAIN.lock();
-        chain.values()
+        chain
+            .values()
             .filter(|rec| rec.owner_pid == owner_pid)
             .flat_map(|rec| rec.waiters.iter())
-            .filter_map(|&wpid| {
-                scheduler::with_proc(wpid, |p| p.sched.rt_priority)
-            })
+            .filter_map(|&wpid| scheduler::with_proc(wpid, |p| p.sched.rt_priority))
             .max()
             .unwrap_or(0)
     };
@@ -223,7 +233,9 @@ fn pi_unboost(owner_pid: usize) {
         let effective = base.max(max_remaining);
         pcb.sched.rt_priority = effective;
         if !pcb.task.is_null() {
-            unsafe { (*pcb.task).sched.rt_priority = effective; }
+            unsafe {
+                (*pcb.task).sched.rt_priority = effective;
+            }
         }
     });
 }
@@ -231,7 +243,9 @@ fn pi_unboost(owner_pid: usize) {
 // ── Low-level wait / wake ────────────────────────────────────────────────────────
 
 pub fn futex_wait_bitset(addr: usize, expected: u32, bitset: u32) -> Result<(), isize> {
-    if bitset == 0 { return Err(-22); }
+    if bitset == 0 {
+        return Err(-22);
+    }
 
     let pid = scheduler::current_pid();
     let key = FutexKey::new(addr);
@@ -258,30 +272,43 @@ pub fn futex_wait(addr: usize, expected: u32) -> Result<(), isize> {
 }
 
 pub fn futex_wake_bitset(addr: usize, count: usize, mask: u32) -> usize {
-    if mask == 0 { return 0; }
+    if mask == 0 {
+        return 0;
+    }
 
     let key = FutexKey::new(addr);
 
     let to_wake: Vec<usize> = {
         let mut map = WAITERS.lock();
-        let list = match map.get_mut(&key) { Some(l) => l, None => return 0 };
+        let list = match map.get_mut(&key) {
+            Some(l) => l,
+            None => return 0,
+        };
 
         let mut woken_indices: Vec<usize> = Vec::new();
         for (i, w) in list.iter().enumerate() {
             if w.bitset & mask != 0 {
                 woken_indices.push(i);
-                if woken_indices.len() >= count { break; }
+                if woken_indices.len() >= count {
+                    break;
+                }
             }
         }
-        let pids: Vec<usize> = woken_indices.iter().rev().map(|&i| {
-            list.remove(i).pid
-        }).collect();
-        if list.is_empty() { map.remove(&key); }
+        let pids: Vec<usize> = woken_indices
+            .iter()
+            .rev()
+            .map(|&i| list.remove(i).pid)
+            .collect();
+        if list.is_empty() {
+            map.remove(&key);
+        }
         pids
     };
 
     let n = to_wake.len();
-    for pid in to_wake { scheduler::wake_pid(pid); }
+    for pid in to_wake {
+        scheduler::wake_pid(pid);
+    }
     n
 }
 
@@ -294,12 +321,17 @@ pub fn futex_wake_addr(addr: usize, count: usize) {
 fn futex_requeue_inner(src: FutexKey, dst: FutexKey, requeue_count: usize) -> usize {
     let mut map = WAITERS.lock();
     let to_move: Vec<Waiter> = {
-        let src_list = match map.get_mut(&src) { Some(l) => l, None => return 0 };
+        let src_list = match map.get_mut(&src) {
+            Some(l) => l,
+            None => return 0,
+        };
         let n = requeue_count.min(src_list.len());
         src_list.drain(..n).collect()
     };
     let n = to_move.len();
-    if n > 0 { map.entry(dst).or_default().extend(to_move); }
+    if n > 0 {
+        map.entry(dst).or_default().extend(to_move);
+    }
     n
 }
 
@@ -317,7 +349,9 @@ pub fn futex_lock_pi(addr: usize) -> isize {
     loop {
         // ── Try atomic acquire ────────────────────────────────────────────
         let mut word_bytes = [0u8; 4];
-        if copy_from_user(&mut word_bytes, addr).is_err() { return -14; }
+        if copy_from_user(&mut word_bytes, addr).is_err() {
+            return -14;
+        }
         let word = u32::from_ne_bytes(word_bytes);
         let owner_tid = (word & FUTEX_TID_MASK) as usize;
 
@@ -327,12 +361,16 @@ pub fn futex_lock_pi(addr: usize) -> isize {
             let mut chain = PI_CHAIN.lock();
             // Re-read under lock to close the TOCTOU gap.
             let mut wb2 = [0u8; 4];
-            if copy_from_user(&mut wb2, addr).is_err() { return -14; }
+            if copy_from_user(&mut wb2, addr).is_err() {
+                return -14;
+            }
             let word2 = u32::from_ne_bytes(wb2);
             if (word2 & FUTEX_TID_MASK) == 0 {
                 // No waiters yet, just write our TID.
                 let new_word = tid as u32;
-                if !copy_to_user(addr, &new_word.to_ne_bytes()) { return -14; }
+                if !copy_to_user(addr, &new_word.to_ne_bytes()) {
+                    return -14;
+                }
                 chain.remove(&key); // clear any stale record
                 return 0;
             }
@@ -351,7 +389,9 @@ pub fn futex_lock_pi(addr: usize) -> isize {
 
             // Re-read word under lock.
             let mut wb3 = [0u8; 4];
-            if copy_from_user(&mut wb3, addr).is_err() { return -14; }
+            if copy_from_user(&mut wb3, addr).is_err() {
+                return -14;
+            }
             let word3 = u32::from_ne_bytes(wb3);
             let live_owner = (word3 & FUTEX_TID_MASK) as usize;
             if live_owner == 0 {
@@ -362,19 +402,19 @@ pub fn futex_lock_pi(addr: usize) -> isize {
 
             // Set FUTEX_WAITERS bit so the owner knows to do UNLOCK_PI.
             let flagged = word3 | FUTEX_WAITERS;
-            if !copy_to_user(addr, &flagged.to_ne_bytes()) { return -14; }
+            if !copy_to_user(addr, &flagged.to_ne_bytes()) {
+                return -14;
+            }
 
             let rec = chain.entry(key).or_insert(PiRecord {
                 owner_pid: live_owner,
-                waiters:   Vec::new(),
+                waiters: Vec::new(),
             });
             rec.owner_pid = live_owner;
             // Insert in descending priority order.
-            let my_prio = scheduler::with_proc(tid, |p| p.sched.rt_priority)
-                .unwrap_or(0);
+            let my_prio = scheduler::with_proc(tid, |p| p.sched.rt_priority).unwrap_or(0);
             let pos = rec.waiters.partition_point(|&wpid| {
-                scheduler::with_proc(wpid, |p| p.sched.rt_priority)
-                    .unwrap_or(0) >= my_prio
+                scheduler::with_proc(wpid, |p| p.sched.rt_priority).unwrap_or(0) >= my_prio
             });
             rec.waiters.insert(pos, tid);
         }
@@ -388,7 +428,10 @@ pub fn futex_lock_pi(addr: usize) -> isize {
         {
             let mut map = WAITERS.lock();
             let my_bitset = FUTEX_BITSET_MATCH_ANY;
-            map.entry(key).or_default().push(Waiter { pid: tid, bitset: my_bitset });
+            map.entry(key).or_default().push(Waiter {
+                pid: tid,
+                bitset: my_bitset,
+            });
         }
         scheduler::block_current();
 
@@ -408,7 +451,9 @@ pub fn futex_trylock_pi(addr: usize) -> isize {
 
     let mut chain = PI_CHAIN.lock();
     let mut wb = [0u8; 4];
-    if copy_from_user(&mut wb, addr).is_err() { return -14; }
+    if copy_from_user(&mut wb, addr).is_err() {
+        return -14;
+    }
     let word = u32::from_ne_bytes(wb);
     let owner_tid = (word & FUTEX_TID_MASK) as usize;
 
@@ -417,7 +462,9 @@ pub fn futex_trylock_pi(addr: usize) -> isize {
     }
 
     let new_word = tid as u32;
-    if !copy_to_user(addr, &new_word.to_ne_bytes()) { return -14; }
+    if !copy_to_user(addr, &new_word.to_ne_bytes()) {
+        return -14;
+    }
     chain.remove(&key);
     0
 }
@@ -433,7 +480,9 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
 
     // Verify ownership.
     let mut wb = [0u8; 4];
-    if copy_from_user(&mut wb, addr).is_err() { return -14; }
+    if copy_from_user(&mut wb, addr).is_err() {
+        return -14;
+    }
     let word = u32::from_ne_bytes(wb);
     if (word & FUTEX_TID_MASK) as usize != tid {
         return -1; // EPERM — not the owner
@@ -445,12 +494,16 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
         match chain.get_mut(&key) {
             None => {
                 // No PI waiters — simply zero the word.
-                if !copy_to_user(addr, &0u32.to_ne_bytes()) { return -14; }
+                if !copy_to_user(addr, &0u32.to_ne_bytes()) {
+                    return -14;
+                }
                 successor = None;
             }
             Some(rec) => {
                 if rec.waiters.is_empty() {
-                    if !copy_to_user(addr, &0u32.to_ne_bytes()) { return -14; }
+                    if !copy_to_user(addr, &0u32.to_ne_bytes()) {
+                        return -14;
+                    }
                     chain.remove(&key);
                     successor = None;
                 } else {
@@ -459,7 +512,9 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
                     let still_contested = !rec.waiters.is_empty();
                     let new_word = (next_pid as u32 & FUTEX_TID_MASK)
                         | if still_contested { FUTEX_WAITERS } else { 0 };
-                    if !copy_to_user(addr, &new_word.to_ne_bytes()) { return -14; }
+                    if !copy_to_user(addr, &new_word.to_ne_bytes()) {
+                        return -14;
+                    }
 
                     // Update the record's owner to the successor so that any
                     // remaining waiters boost it correctly on their next tick.
@@ -483,7 +538,9 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
         let mut map = WAITERS.lock();
         if let Some(list) = map.get_mut(&key) {
             list.retain(|w| w.pid != spid);
-            if list.is_empty() { map.remove(&key); }
+            if list.is_empty() {
+                map.remove(&key);
+            }
         }
     }
 
@@ -526,18 +583,23 @@ pub fn futex_clear_pid(pid: usize) {
 const MAX_ROBUST: usize = 512;
 
 pub fn robust_list_on_exit(pid: usize) {
-    let (head_va, len) = match scheduler::with_proc(pid, |p| {
-        (p.robust_list_head, p.robust_list_len)
-    }) {
-        Some(x) => x,
-        None    => return,
-    };
-    if head_va == 0 { return; }
-    if len != 24 && len != 16 { return; }
+    let (head_va, len) =
+        match scheduler::with_proc(pid, |p| (p.robust_list_head, p.robust_list_len)) {
+            Some(x) => x,
+            None => return,
+        };
+    if head_va == 0 {
+        return;
+    }
+    if len != 24 && len != 16 {
+        return;
+    }
 
     let futex_offset: isize = {
         let mut buf = [0u8; 8];
-        if copy_from_user(&mut buf, head_va + 8).is_err() { return; }
+        if copy_from_user(&mut buf, head_va + 8).is_err() {
+            return;
+        }
         i64::from_ne_bytes(buf) as isize
     };
 
@@ -553,15 +615,21 @@ pub fn robust_list_on_exit(pid: usize) {
 
     let mut cur_va: usize = {
         let mut buf = [0u8; 8];
-        if copy_from_user(&mut buf, head_va).is_err() { return; }
+        if copy_from_user(&mut buf, head_va).is_err() {
+            return;
+        }
         usize::from_ne_bytes(buf)
     };
 
     for _ in 0..MAX_ROBUST {
-        if cur_va == 0 || cur_va == head_va { break; }
+        if cur_va == 0 || cur_va == head_va {
+            break;
+        }
         let next_va: usize = {
             let mut buf = [0u8; 8];
-            if copy_from_user(&mut buf, cur_va).is_err() { break; }
+            if copy_from_user(&mut buf, cur_va).is_err() {
+                break;
+            }
             usize::from_ne_bytes(buf)
         };
         wake_robust_futex(cur_va, futex_offset, pid);
@@ -571,13 +639,19 @@ pub fn robust_list_on_exit(pid: usize) {
 
 fn wake_robust_futex(entry_va: usize, futex_offset: isize, tid: usize) {
     let futex_va = (entry_va as isize).wrapping_add(futex_offset) as usize;
-    if futex_va < 0x1000 || futex_va >= crate::uaccess::USER_SPACE_END { return; }
+    if futex_va < 0x1000 || futex_va >= crate::uaccess::USER_SPACE_END {
+        return;
+    }
 
     let mut buf = [0u8; 4];
-    if copy_from_user(&mut buf, futex_va).is_err() { return; }
+    if copy_from_user(&mut buf, futex_va).is_err() {
+        return;
+    }
     let word = u32::from_ne_bytes(buf);
 
-    if (word & FUTEX_TID_MASK) as usize != tid { return; }
+    if (word & FUTEX_TID_MASK) as usize != tid {
+        return;
+    }
 
     let had_waiters = word & FUTEX_WAITERS != 0;
     let new_word: u32 = FUTEX_OWNER_DIED;
@@ -586,24 +660,41 @@ fn wake_robust_futex(entry_va: usize, futex_offset: isize, tid: usize) {
     if had_waiters {
         let tgid = thread::tgid_of(tid);
         let as_id = if tgid != 0 { tgid } else { tid };
-        let key = FutexKey { as_id, uaddr: futex_va };
+        let key = FutexKey {
+            as_id,
+            uaddr: futex_va,
+        };
         let to_wake: Vec<usize> = {
             let mut map = WAITERS.lock();
-            let list = match map.get_mut(&key) { Some(l) => l, None => return };
-            if list.is_empty() { return; }
+            let list = match map.get_mut(&key) {
+                Some(l) => l,
+                None => return,
+            };
+            if list.is_empty() {
+                return;
+            }
             let w = list.remove(0).pid;
-            if list.is_empty() { map.remove(&key); }
+            if list.is_empty() {
+                map.remove(&key);
+            }
             alloc::vec![w]
         };
-        for p in to_wake { scheduler::wake_pid(p); }
+        for p in to_wake {
+            scheduler::wake_pid(p);
+        }
     }
 }
 
 // ── sys_futex [NR 202] ─────────────────────────────────────────────────────────────
 
-pub fn sys_futex(uaddr: usize, op: u32, val: u32,
-                 timeout_or_val2: usize, uaddr2: usize, val3: u32) -> isize {
-
+pub fn sys_futex(
+    uaddr: usize,
+    op: u32,
+    val: u32,
+    timeout_or_val2: usize,
+    uaddr2: usize,
+    val3: u32,
+) -> isize {
     if uaddr < 0x1000 || uaddr >= crate::uaccess::USER_SPACE_END {
         return -14;
     }
@@ -611,27 +702,23 @@ pub fn sys_futex(uaddr: usize, op: u32, val: u32,
     let base_op = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_RT);
 
     match base_op {
-        FUTEX_WAIT => {
-            match futex_wait_bitset(uaddr, val, FUTEX_BITSET_MATCH_ANY) {
-                Ok(_)  => 0,
-                Err(e) => e,
-            }
-        }
+        FUTEX_WAIT => match futex_wait_bitset(uaddr, val, FUTEX_BITSET_MATCH_ANY) {
+            Ok(_) => 0,
+            Err(e) => e,
+        },
 
-        FUTEX_WAKE => {
-            futex_wake_bitset(uaddr, val as usize, FUTEX_BITSET_MATCH_ANY) as isize
-        }
+        FUTEX_WAKE => futex_wake_bitset(uaddr, val as usize, FUTEX_BITSET_MATCH_ANY) as isize,
 
         FUTEX_REQUEUE => {
             if uaddr2 < 0x1000 || uaddr2 >= crate::uaccess::USER_SPACE_END {
                 return -14;
             }
-            let val2  = timeout_or_val2 as u32;
-            let pid   = scheduler::current_pid();
-            let src   = FutexKey::for_pid(pid, uaddr);
-            let dst   = FutexKey::for_pid(pid, uaddr2);
+            let val2 = timeout_or_val2 as u32;
+            let pid = scheduler::current_pid();
+            let src = FutexKey::for_pid(pid, uaddr);
+            let dst = FutexKey::for_pid(pid, uaddr2);
             let woken = futex_wake_bitset(uaddr, val as usize, FUTEX_BITSET_MATCH_ANY);
-            let _req  = futex_requeue_inner(src, dst, val2 as usize);
+            let _req = futex_requeue_inner(src, dst, val2 as usize);
             woken as isize
         }
 
@@ -641,33 +728,41 @@ pub fn sys_futex(uaddr: usize, op: u32, val: u32,
             }
             {
                 let mut val_bytes = [0u8; 4];
-                if copy_from_user(&mut val_bytes, uaddr).is_err() { return -14; }
-                if u32::from_ne_bytes(val_bytes) != val3 { return -11; }
+                if copy_from_user(&mut val_bytes, uaddr).is_err() {
+                    return -14;
+                }
+                if u32::from_ne_bytes(val_bytes) != val3 {
+                    return -11;
+                }
             }
-            let val2  = timeout_or_val2 as u32;
-            let pid   = scheduler::current_pid();
-            let src   = FutexKey::for_pid(pid, uaddr);
-            let dst   = FutexKey::for_pid(pid, uaddr2);
+            let val2 = timeout_or_val2 as u32;
+            let pid = scheduler::current_pid();
+            let src = FutexKey::for_pid(pid, uaddr);
+            let dst = FutexKey::for_pid(pid, uaddr2);
             let woken = futex_wake_bitset(uaddr, val as usize, FUTEX_BITSET_MATCH_ANY);
-            let _req  = futex_requeue_inner(src, dst, val2 as usize);
+            let _req = futex_requeue_inner(src, dst, val2 as usize);
             woken as isize
         }
 
         FUTEX_WAIT_BITSET => {
-            if val3 == 0 { return -22; }
+            if val3 == 0 {
+                return -22;
+            }
             match futex_wait_bitset(uaddr, val, val3) {
-                Ok(_)  => 0,
+                Ok(_) => 0,
                 Err(e) => e,
             }
         }
 
         FUTEX_WAKE_BITSET => {
-            if val3 == 0 { return -22; }
+            if val3 == 0 {
+                return -22;
+            }
             futex_wake_bitset(uaddr, val as usize, val3) as isize
         }
 
-        FUTEX_LOCK_PI    => futex_lock_pi(uaddr),
-        FUTEX_UNLOCK_PI  => futex_unlock_pi(uaddr),
+        FUTEX_LOCK_PI => futex_lock_pi(uaddr),
+        FUTEX_UNLOCK_PI => futex_unlock_pi(uaddr),
         FUTEX_TRYLOCK_PI => futex_trylock_pi(uaddr),
 
         FUTEX_FD | FUTEX_WAKE_OP => -38, // ENOSYS
@@ -679,25 +774,36 @@ pub fn sys_futex(uaddr: usize, op: u32, val: u32,
 // ── sys_set_robust_list / sys_get_robust_list ────────────────────────────────────
 
 pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
-    if len != 16 && len != 24 { return -22; }
+    if len != 16 && len != 24 {
+        return -22;
+    }
     let pid = scheduler::current_pid();
-    if pid == 0 { return -1; }
+    if pid == 0 {
+        return -1;
+    }
     scheduler::with_proc_mut(pid, |p, _| {
         p.robust_list_head = head;
-        p.robust_list_len  = len;
+        p.robust_list_len = len;
     });
     0
 }
 
 pub fn sys_get_robust_list(tid: usize, headp: usize, lenp: usize) -> isize {
-    let target = if tid == 0 { scheduler::current_pid() } else { tid };
-    let (head, len) = match scheduler::with_proc(target, |p| {
-        (p.robust_list_head, p.robust_list_len)
-    }) {
-        Some(x) => x,
-        None    => return -3,
+    let target = if tid == 0 {
+        scheduler::current_pid()
+    } else {
+        tid
     };
-    if !copy_to_user(headp, &head.to_ne_bytes()) { return -14; }
-    if !copy_to_user(lenp,  &len.to_ne_bytes())  { return -14; }
+    let (head, len) =
+        match scheduler::with_proc(target, |p| (p.robust_list_head, p.robust_list_len)) {
+            Some(x) => x,
+            None => return -3,
+        };
+    if !copy_to_user(headp, &head.to_ne_bytes()) {
+        return -14;
+    }
+    if !copy_to_user(lenp, &len.to_ne_bytes()) {
+        return -14;
+    }
     0
 }

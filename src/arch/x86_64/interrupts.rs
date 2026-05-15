@@ -26,12 +26,12 @@
 //! `generic_exception_handler` is defined in idt.rs and exposed here for
 //! documentation purposes only.  All exception routing goes through idt.rs.
 
-use crate::proc::scheduler::TICK_NS;
 use crate::proc::scheduler::SchedPolicy;
+use crate::proc::scheduler::TICK_NS;
 
 const SIGXCPU: u32 = 24;
 const SIGKILL: u32 = 9;
-const RLIMIT_CPU:    usize = 0;
+const RLIMIT_CPU: usize = 0;
 const RLIMIT_RTTIME: usize = 15;
 
 /// Called from the APIC timer IRQ stub (vector 32) on every tick.
@@ -59,26 +59,25 @@ pub extern "C" fn timer_irq_handler(frame: &mut crate::arch::x86_64::idt::Interr
     if pid != 0 {
         // ── 3. Charge tick and snapshot rlimit state ─────────────────────
         let (soft_cpu, hard_cpu) = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_CPU);
-        let (soft_rt,  hard_rt)  = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_RTTIME);
+        let (soft_rt, hard_rt) = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_RTTIME);
 
-        let (cpu_secs, prev_ns, rt_us, policy) =
-            crate::proc::scheduler::with_proc_mut(pid, |p| {
-                let prev = p.cpu_time_ns;
-                p.cpu_time_ns = p.cpu_time_ns.saturating_add(TICK_NS);
+        let (cpu_secs, prev_ns, rt_us, policy) = crate::proc::scheduler::with_proc_mut(pid, |p| {
+            let prev = p.cpu_time_ns;
+            p.cpu_time_ns = p.cpu_time_ns.saturating_add(TICK_NS);
 
-                let policy = p.sched.policy;
-                if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
-                    p.rt_cpu_time_us = p.rt_cpu_time_us
-                        .saturating_add(TICK_NS / 1_000);
-                }
+            let policy = p.sched.policy;
+            if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
+                p.rt_cpu_time_us = p.rt_cpu_time_us.saturating_add(TICK_NS / 1_000);
+            }
 
-                (
-                    p.cpu_time_ns / 1_000_000_000,
-                    prev,
-                    p.rt_cpu_time_us,
-                    policy,
-                )
-            }).unwrap_or((0, 0, 0, SchedPolicy::Normal));
+            (
+                p.cpu_time_ns / 1_000_000_000,
+                prev,
+                p.rt_cpu_time_us,
+                policy,
+            )
+        })
+        .unwrap_or((0, 0, 0, SchedPolicy::Normal));
 
         // ── 4. RLIMIT_CPU enforcement ────────────────────────────────────
         if hard_cpu != crate::proc::rlimit::RLIM_INFINITY && cpu_secs >= hard_cpu {

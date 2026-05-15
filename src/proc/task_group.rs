@@ -49,15 +49,13 @@
 //! owning CPU touches them while holding no cross-CPU lock).
 
 extern crate alloc;
-use alloc::collections::BinaryHeap;
 use alloc::collections::BTreeMap;
+use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-pub use crate::proc::scheduler::{
-    CfsEntry, NICE0_WEIGHT, SchedPolicy,
-};
+pub use crate::proc::scheduler::{CfsEntry, SchedPolicy, NICE0_WEIGHT};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -91,9 +89,9 @@ unsafe impl Send for GroupRq {}
 impl GroupRq {
     pub const fn new() -> Self {
         GroupRq {
-            inner_heap:   BinaryHeap::new(),
+            inner_heap: BinaryHeap::new(),
             min_vruntime: 0,
-            on_top_rq:    false,
+            on_top_rq: false,
         }
     }
 
@@ -105,15 +103,13 @@ impl GroupRq {
         }
         self.inner_heap.push(CfsEntry {
             vruntime: t.sched.vruntime,
-            pid:      t.pid,
+            pid: t.pid,
             task_ptr: task,
         });
     }
 
     /// Pop the lowest-vruntime task from this group.
-    pub fn dequeue_next(
-        &mut self,
-    ) -> Option<*mut crate::proc::task_types::Task> {
+    pub fn dequeue_next(&mut self) -> Option<*mut crate::proc::task_types::Task> {
         self.inner_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
@@ -126,8 +122,7 @@ impl GroupRq {
 
     /// Remove a specific `pid`.  Returns true if found.
     pub fn remove_pid(&mut self, pid: u32) -> bool {
-        let old: Vec<CfsEntry> =
-            core::mem::take(&mut self.inner_heap).into_vec();
+        let old: Vec<CfsEntry> = core::mem::take(&mut self.inner_heap).into_vec();
         let mut found = false;
         for e in old {
             if e.pid == pid {
@@ -141,8 +136,14 @@ impl GroupRq {
         found
     }
 
-    #[inline] pub fn is_empty(&self) -> bool { self.inner_heap.is_empty() }
-    #[inline] pub fn len(&self)     -> usize { self.inner_heap.len() }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner_heap.is_empty()
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner_heap.len()
+    }
 }
 
 // ── TaskGroup ─────────────────────────────────────────────────────────────────
@@ -154,10 +155,10 @@ impl GroupRq {
 /// - `vruntime`: group-level virtual runtime, one slot per CPU
 /// - `grq`     : per-CPU inner run queues
 pub struct TaskGroup {
-    pub id:       usize,
-    pub weight:   u64,
+    pub id: usize,
+    pub weight: u64,
     pub vruntime: [u64; MAX_GROUP_CPUS],
-    pub grq:      [GroupRq; MAX_GROUP_CPUS],
+    pub grq: [GroupRq; MAX_GROUP_CPUS],
 }
 
 unsafe impl Send for TaskGroup {}
@@ -167,9 +168,9 @@ impl TaskGroup {
     pub fn new(id: usize) -> Self {
         TaskGroup {
             id,
-            weight:   NICE0_WEIGHT,
+            weight: NICE0_WEIGHT,
             vruntime: [0u64; MAX_GROUP_CPUS],
-            grq:      core::array::from_fn(|_| GroupRq::new()),
+            grq: core::array::from_fn(|_| GroupRq::new()),
         }
     }
 
@@ -183,12 +184,10 @@ impl TaskGroup {
 
 /// Global registry of all TaskGroups.
 /// Key = tg_id.  Value = Arc<Mutex<TaskGroup>>.
-static TASK_GROUPS: Mutex<BTreeMap<usize, Arc<Mutex<TaskGroup>>>> =
-    Mutex::new(BTreeMap::new());
+static TASK_GROUPS: Mutex<BTreeMap<usize, Arc<Mutex<TaskGroup>>>> = Mutex::new(BTreeMap::new());
 
 /// Monotonically-increasing group id allocator.
-static NEXT_TG_ID: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(1);
+static NEXT_TG_ID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
 
 /// Allocate a fresh task group id.
 pub fn alloc_tg_id() -> usize {
@@ -227,9 +226,9 @@ pub fn destroy_task_group(tg_id: usize) {
 /// Returns `None` if the sentinel is already on the top-level heap
 /// (group is already represented there; nothing more to do).
 pub fn group_enqueue(
-    task:   *mut crate::proc::task_types::Task,
-    tg_id:  usize,
-    cpu:    u32,
+    task: *mut crate::proc::task_types::Task,
+    tg_id: usize,
+    cpu: u32,
 ) -> Option<CfsEntry> {
     let tg_arc = find_task_group(tg_id)?;
     let mut tg = tg_arc.lock();
@@ -244,7 +243,7 @@ pub fn group_enqueue(
     Some(CfsEntry {
         vruntime: tg.vruntime[cpu],
         // pid == 0 + task_ptr == null → group sentinel convention.
-        pid:      tg_id as u32,
+        pid: tg_id as u32,
         task_ptr: GROUP_SENTINEL,
     })
 }
@@ -260,16 +259,12 @@ pub fn group_enqueue(
 ///    already empty — caller should skip this slot).
 pub struct GroupDequeueResult {
     /// The concrete task to run.  Null if the group inner heap was empty.
-    pub task:           *mut crate::proc::task_types::Task,
+    pub task: *mut crate::proc::task_types::Task,
     /// If `Some`, caller must push this back onto the top-level cfs_heap.
     pub requeue_sentinel: Option<CfsEntry>,
 }
 
-pub fn group_dequeue_next(
-    tg_id:   usize,
-    cpu:     u32,
-    elapsed: u64,
-) -> GroupDequeueResult {
+pub fn group_dequeue_next(tg_id: usize, cpu: u32, elapsed: u64) -> GroupDequeueResult {
     let null_result = GroupDequeueResult {
         task: core::ptr::null_mut(),
         requeue_sentinel: None,
@@ -277,7 +272,7 @@ pub fn group_dequeue_next(
 
     let tg_arc = match find_task_group(tg_id) {
         Some(a) => a,
-        None    => return null_result,
+        None => return null_result,
     };
     let mut tg = tg_arc.lock();
     let cpu = (cpu as usize).min(MAX_GROUP_CPUS - 1);
@@ -287,7 +282,7 @@ pub fn group_dequeue_next(
 
     let task = match tg.grq[cpu].dequeue_next() {
         Some(t) => t,
-        None    => return null_result,
+        None => return null_result,
     };
 
     // Advance group vruntime: delta = elapsed * NICE0_WEIGHT / group_weight.
@@ -303,7 +298,7 @@ pub fn group_dequeue_next(
         tg.grq[cpu].on_top_rq = true;
         Some(CfsEntry {
             vruntime: tg.vruntime[cpu],
-            pid:      tg_id as u32,
+            pid: tg_id as u32,
             task_ptr: GROUP_SENTINEL,
         })
     } else {
@@ -322,7 +317,7 @@ pub fn group_dequeue_next(
 pub fn group_remove_pid(tg_id: usize, pid: u32, cpu: u32) -> bool {
     let tg_arc = match find_task_group(tg_id) {
         Some(a) => a,
-        None    => return false,
+        None => return false,
     };
     let mut tg = tg_arc.lock();
     let cpu = (cpu as usize).min(MAX_GROUP_CPUS - 1);
@@ -342,7 +337,9 @@ pub fn sys_create_task_group() -> isize {
     let ok = crate::proc::scheduler::with_proc_mut(pid, |pcb, _| {
         pcb.tg_id = tg_id;
     });
-    if ok.is_none() { return -3; } // ESRCH
+    if ok.is_none() {
+        return -3;
+    } // ESRCH
     tg_id as isize
 }
 
@@ -357,7 +354,11 @@ pub fn sys_setgroup(pid: usize, tg_id: usize) -> isize {
     let ok = crate::proc::scheduler::with_proc_mut(pid, |pcb, _| {
         pcb.tg_id = tg_id;
     });
-    if ok.is_none() { -3 } else { 0 }
+    if ok.is_none() {
+        -3
+    } else {
+        0
+    }
 }
 
 /// Set the CPU weight of a task group.
@@ -367,7 +368,7 @@ pub fn sys_setgroup(pid: usize, tg_id: usize) -> isize {
 pub fn sys_setweight(tg_id: usize, weight: u64) -> isize {
     let tg_arc = match find_task_group(tg_id) {
         Some(a) => a,
-        None    => return -3, // ESRCH
+        None => return -3, // ESRCH
     };
     tg_arc.lock().set_weight(weight);
     0
@@ -379,7 +380,9 @@ pub fn sys_setweight(tg_id: usize, weight: u64) -> isize {
 ///
 /// Returns 0 always (idempotent).
 pub fn sys_destroy_task_group(tg_id: usize) -> isize {
-    if tg_id == ROOT_TG_ID { return -22; } // EINVAL: cannot destroy root
+    if tg_id == ROOT_TG_ID {
+        return -22;
+    } // EINVAL: cannot destroy root
     destroy_task_group(tg_id);
     0
 }

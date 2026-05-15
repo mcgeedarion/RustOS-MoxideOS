@@ -16,18 +16,18 @@
 //!      never match, making group-restricted IPC objects accessible to
 //!      all processes via the 'other' bits.
 
-use super::lsm::{LsmHooks, LsmVerdict, LsmCtx, SOCK_RAW};
+use super::lsm::{LsmCtx, LsmHooks, LsmVerdict, SOCK_RAW};
 
 // ─── Capability bit positions ─────────────────────────────────────────────────
 
-const CAP_DAC_OVERRIDE:    u64 = 1 << 1;
+const CAP_DAC_OVERRIDE: u64 = 1 << 1;
 const CAP_DAC_READ_SEARCH: u64 = 1 << 2;
-const CAP_FOWNER:          u64 = 1 << 3;
-const CAP_SETUID:          u64 = 1 << 7;
-const CAP_SETGID:          u64 = 1 << 6;
-const CAP_KILL:            u64 = 1 << 5;
-const CAP_NET_RAW:         u64 = 1 << 13;
-const CAP_SYS_ADMIN:       u64 = 1 << 21;
+const CAP_FOWNER: u64 = 1 << 3;
+const CAP_SETUID: u64 = 1 << 7;
+const CAP_SETGID: u64 = 1 << 6;
+const CAP_KILL: u64 = 1 << 5;
+const CAP_NET_RAW: u64 = 1 << 13;
+const CAP_SYS_ADMIN: u64 = 1 << 21;
 
 // ─── Mode bits ────────────────────────────────────────────────────────────────
 
@@ -44,7 +44,9 @@ const S_IXOTH: u16 = 0o0001;
 const PROT_EXEC: u32 = 0x4;
 
 #[inline]
-fn has_cap(caps: u64, cap: u64) -> bool { caps & cap != 0 }
+fn has_cap(caps: u64, cap: u64) -> bool {
+    caps & cap != 0
+}
 
 #[inline]
 fn in_group(ctx: &LsmCtx, gid: u32) -> bool {
@@ -52,8 +54,12 @@ fn in_group(ctx: &LsmCtx, gid: u32) -> bool {
 }
 
 fn check_read(ctx: &LsmCtx) -> LsmVerdict {
-    if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) { return LsmVerdict::Allow; }
-    if has_cap(ctx.caps, CAP_DAC_READ_SEARCH)               { return LsmVerdict::Allow; }
+    if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) {
+        return LsmVerdict::Allow;
+    }
+    if has_cap(ctx.caps, CAP_DAC_READ_SEARCH) {
+        return LsmVerdict::Allow;
+    }
     let ok = if ctx.euid == ctx.inode_uid {
         ctx.inode_mode & S_IRUSR != 0
     } else if in_group(ctx, ctx.inode_gid) {
@@ -61,11 +67,17 @@ fn check_read(ctx: &LsmCtx) -> LsmVerdict {
     } else {
         ctx.inode_mode & S_IROTH != 0
     };
-    if ok { LsmVerdict::Allow } else { LsmVerdict::Deny(-13) }
+    if ok {
+        LsmVerdict::Allow
+    } else {
+        LsmVerdict::Deny(-13)
+    }
 }
 
 fn check_write(ctx: &LsmCtx) -> LsmVerdict {
-    if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) { return LsmVerdict::Allow; }
+    if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) {
+        return LsmVerdict::Allow;
+    }
     let ok = if ctx.euid == ctx.inode_uid {
         ctx.inode_mode & S_IWUSR != 0
     } else if in_group(ctx, ctx.inode_gid) {
@@ -73,13 +85,21 @@ fn check_write(ctx: &LsmCtx) -> LsmVerdict {
     } else {
         ctx.inode_mode & S_IWOTH != 0
     };
-    if ok { LsmVerdict::Allow } else { LsmVerdict::Deny(-13) }
+    if ok {
+        LsmVerdict::Allow
+    } else {
+        LsmVerdict::Deny(-13)
+    }
 }
 
 fn check_exec(ctx: &LsmCtx) -> LsmVerdict {
     if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) {
         let any_x = ctx.inode_mode & (S_IXUSR | S_IXGRP | S_IXOTH) != 0;
-        return if any_x { LsmVerdict::Allow } else { LsmVerdict::Deny(-13) };
+        return if any_x {
+            LsmVerdict::Allow
+        } else {
+            LsmVerdict::Deny(-13)
+        };
     }
     let ok = if ctx.euid == ctx.inode_uid {
         ctx.inode_mode & S_IXUSR != 0
@@ -88,30 +108,52 @@ fn check_exec(ctx: &LsmCtx) -> LsmVerdict {
     } else {
         ctx.inode_mode & S_IXOTH != 0
     };
-    if ok { LsmVerdict::Allow } else { LsmVerdict::Deny(-13) }
+    if ok {
+        LsmVerdict::Allow
+    } else {
+        LsmVerdict::Deny(-13)
+    }
 }
 
 pub struct DacModule;
 
 impl LsmHooks for DacModule {
-    fn name(&self) -> &'static str { "dac" }
+    fn name(&self) -> &'static str {
+        "dac"
+    }
 
-    fn file_open (&self, ctx: &LsmCtx) -> LsmVerdict { check_read(ctx) }
-    fn file_read (&self, ctx: &LsmCtx) -> LsmVerdict { check_read(ctx) }
-    fn file_write(&self, ctx: &LsmCtx) -> LsmVerdict { check_write(ctx) }
-    fn file_exec (&self, ctx: &LsmCtx) -> LsmVerdict { check_exec(ctx) }
+    fn file_open(&self, ctx: &LsmCtx) -> LsmVerdict {
+        check_read(ctx)
+    }
+    fn file_read(&self, ctx: &LsmCtx) -> LsmVerdict {
+        check_read(ctx)
+    }
+    fn file_write(&self, ctx: &LsmCtx) -> LsmVerdict {
+        check_write(ctx)
+    }
+    fn file_exec(&self, ctx: &LsmCtx) -> LsmVerdict {
+        check_exec(ctx)
+    }
 
-    fn inode_create(&self, ctx: &LsmCtx) -> LsmVerdict { check_write(ctx) }
-
-    fn inode_unlink(&self, ctx: &LsmCtx) -> LsmVerdict {
-        if has_cap(ctx.caps, CAP_FOWNER) { return LsmVerdict::Allow; }
-        let sticky = ctx.inode_mode & 0o1000 != 0;
-        if sticky && ctx.euid != ctx.inode_uid { return LsmVerdict::Deny(-13); }
+    fn inode_create(&self, ctx: &LsmCtx) -> LsmVerdict {
         check_write(ctx)
     }
 
-    fn inode_rename (&self, ctx: &LsmCtx) -> LsmVerdict {
-        if has_cap(ctx.caps, CAP_FOWNER) { return LsmVerdict::Allow; }
+    fn inode_unlink(&self, ctx: &LsmCtx) -> LsmVerdict {
+        if has_cap(ctx.caps, CAP_FOWNER) {
+            return LsmVerdict::Allow;
+        }
+        let sticky = ctx.inode_mode & 0o1000 != 0;
+        if sticky && ctx.euid != ctx.inode_uid {
+            return LsmVerdict::Deny(-13);
+        }
+        check_write(ctx)
+    }
+
+    fn inode_rename(&self, ctx: &LsmCtx) -> LsmVerdict {
+        if has_cap(ctx.caps, CAP_FOWNER) {
+            return LsmVerdict::Allow;
+        }
         check_write(ctx)
     }
 
@@ -124,25 +166,39 @@ impl LsmHooks for DacModule {
     }
 
     fn inode_getattr(&self, ctx: &LsmCtx) -> LsmVerdict {
-        if has_cap(ctx.caps, CAP_DAC_READ_SEARCH) { return LsmVerdict::Allow; }
+        if has_cap(ctx.caps, CAP_DAC_READ_SEARCH) {
+            return LsmVerdict::Allow;
+        }
         check_read(ctx)
     }
 
     fn mmap_file(&self, ctx: &LsmCtx) -> LsmVerdict {
-        if ctx.prot & PROT_EXEC != 0 { return check_exec(ctx); }
-        if ctx.prot & 0x2 != 0       { return check_write(ctx); }
-        if ctx.prot & 0x1 != 0       { return check_read(ctx); }
+        if ctx.prot & PROT_EXEC != 0 {
+            return check_exec(ctx);
+        }
+        if ctx.prot & 0x2 != 0 {
+            return check_write(ctx);
+        }
+        if ctx.prot & 0x1 != 0 {
+            return check_read(ctx);
+        }
         LsmVerdict::Allow
     }
 
-    fn task_create(&self, _ctx: &LsmCtx) -> LsmVerdict { LsmVerdict::Allow }
-    fn task_exec  (&self, ctx: &LsmCtx)  -> LsmVerdict { check_exec(ctx) }
+    fn task_create(&self, _ctx: &LsmCtx) -> LsmVerdict {
+        LsmVerdict::Allow
+    }
+    fn task_exec(&self, ctx: &LsmCtx) -> LsmVerdict {
+        check_exec(ctx)
+    }
 
     fn task_kill(&self, ctx: &LsmCtx) -> LsmVerdict {
         let target_uid = ctx.arg0 as u32;
         let signo = ctx.signo;
         if (signo == 9 || signo == 19) && ctx.euid != target_uid {
-            if !has_cap(ctx.caps, CAP_KILL) { return LsmVerdict::Deny(-1); }
+            if !has_cap(ctx.caps, CAP_KILL) {
+                return LsmVerdict::Deny(-1);
+            }
         }
         if ctx.euid == target_uid || ctx.euid == 0 || has_cap(ctx.caps, CAP_KILL) {
             LsmVerdict::Allow
@@ -176,9 +232,15 @@ impl LsmHooks for DacModule {
         LsmVerdict::Allow
     }
 
-    fn socket_connect(&self, _ctx: &LsmCtx) -> LsmVerdict { LsmVerdict::Allow }
-    fn socket_bind   (&self, _ctx: &LsmCtx) -> LsmVerdict { LsmVerdict::Allow }
-    fn socket_accept (&self, _ctx: &LsmCtx) -> LsmVerdict { LsmVerdict::Allow }
+    fn socket_connect(&self, _ctx: &LsmCtx) -> LsmVerdict {
+        LsmVerdict::Allow
+    }
+    fn socket_bind(&self, _ctx: &LsmCtx) -> LsmVerdict {
+        LsmVerdict::Allow
+    }
+    fn socket_accept(&self, _ctx: &LsmCtx) -> LsmVerdict {
+        LsmVerdict::Allow
+    }
 
     fn ipc_permission(&self, ctx: &LsmCtx) -> LsmVerdict {
         if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) {
@@ -194,7 +256,11 @@ impl LsmHooks for DacModule {
         } else {
             ctx.ipc_mode & S_IROTH != 0
         };
-        if ok { LsmVerdict::Allow } else { LsmVerdict::Deny(-13) }
+        if ok {
+            LsmVerdict::Allow
+        } else {
+            LsmVerdict::Deny(-13)
+        }
     }
 
     fn sb_mount(&self, ctx: &LsmCtx) -> LsmVerdict {
@@ -227,20 +293,19 @@ pub static DAC_MODULE: DacModule = DacModule;
 /// Returns (new_permitted, new_effective, new_inheritable).
 #[inline]
 pub fn exec_cap_transform(
-    proc_permitted:   u64,
-    proc_effective:   u64,
+    proc_permitted: u64,
+    proc_effective: u64,
     proc_inheritable: u64,
-    file_permitted:   u64,
+    file_permitted: u64,
     file_inheritable: u64,
-    file_effective_bit: bool,  // fE in POSIX — single bit, not a mask
+    file_effective_bit: bool, // fE in POSIX — single bit, not a mask
 ) -> (u64, u64, u64) {
     // H1 fix: intersection with proc_inheritable prevents file-inheritable
     // caps from being granted beyond what the process already has.
-    let new_permitted   = (file_permitted | (file_inheritable & proc_inheritable))
-                          & proc_permitted;
+    let new_permitted = (file_permitted | (file_inheritable & proc_inheritable)) & proc_permitted;
     // new_effective: if fE bit set, all permitted; otherwise zero (ambient
     // caps would be added here when ambient support is implemented).
-    let new_effective   = if file_effective_bit { new_permitted } else { 0 };
+    let new_effective = if file_effective_bit { new_permitted } else { 0 };
     let new_inheritable = proc_inheritable;
     (new_permitted, new_effective, new_inheritable)
 }

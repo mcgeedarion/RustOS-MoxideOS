@@ -50,12 +50,11 @@
 
 extern crate alloc;
 use alloc::string::String;
-use spin::Mutex;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use spin::Mutex;
 
 use crate::drivers::pcie::{
-    find_device_by_class, pci_enable_msix, pci_enable_msi_ex,
-    PCI_CLASS_STORAGE_NVME,
+    find_device_by_class, pci_enable_msi_ex, pci_enable_msix, PCI_CLASS_STORAGE_NVME,
 };
 use crate::mm::pmm;
 
@@ -65,36 +64,36 @@ pub const NVME_IRQ_VECTOR: u8 = 0x32;
 
 // ── NVMe register offsets (BAR0) ──────────────────────────────────────────
 
-const NVME_REG_CAP:    u64 = 0x000;
-const NVME_REG_VS:     u64 = 0x008;
-const NVME_REG_INTMS:  u64 = 0x014;
-const NVME_REG_INTMC:  u64 = 0x018;
-const NVME_REG_CC:     u64 = 0x01C;
-const NVME_REG_CSTS:   u64 = 0x020;
-const NVME_REG_AQA:    u64 = 0x024;
-const NVME_REG_ASQ:    u64 = 0x028;
-const NVME_REG_ACQ:    u64 = 0x030;
+const NVME_REG_CAP: u64 = 0x000;
+const NVME_REG_VS: u64 = 0x008;
+const NVME_REG_INTMS: u64 = 0x014;
+const NVME_REG_INTMC: u64 = 0x018;
+const NVME_REG_CC: u64 = 0x01C;
+const NVME_REG_CSTS: u64 = 0x020;
+const NVME_REG_AQA: u64 = 0x024;
+const NVME_REG_ASQ: u64 = 0x028;
+const NVME_REG_ACQ: u64 = 0x030;
 
 const NVME_DOORBELL_BASE: u64 = 0x1000;
 
-const CC_EN:       u32 = 1 << 0;
-const CC_CSS_NVM:  u32 = 0 << 4;
-const CC_MPS_4K:   u32 = 0 << 7;
-const CC_AMS_RR:   u32 = 0 << 11;
-const CC_SQS_64:   u32 = 6 << 16;
-const CC_CQS_16:   u32 = 4 << 20;
+const CC_EN: u32 = 1 << 0;
+const CC_CSS_NVM: u32 = 0 << 4;
+const CC_MPS_4K: u32 = 0 << 7;
+const CC_AMS_RR: u32 = 0 << 11;
+const CC_SQS_64: u32 = 6 << 16;
+const CC_CQS_16: u32 = 4 << 20;
 
-const CSTS_RDY:   u32 = 1 << 0;
-const CSTS_CFS:   u32 = 1 << 1;
+const CSTS_RDY: u32 = 1 << 0;
+const CSTS_CFS: u32 = 1 << 1;
 
-const ADMIN_CREATE_IO_SQ:  u8 = 0x01;
-const ADMIN_CREATE_IO_CQ:  u8 = 0x05;
-const ADMIN_IDENTIFY:      u8 = 0x06;
+const ADMIN_CREATE_IO_SQ: u8 = 0x01;
+const ADMIN_CREATE_IO_CQ: u8 = 0x05;
+const ADMIN_IDENTIFY: u8 = 0x06;
 
-const NVM_WRITE:  u8 = 0x01;
-const NVM_READ:   u8 = 0x02;
+const NVM_WRITE: u8 = 0x01;
+const NVM_READ: u8 = 0x02;
 
-const CNS_NAMESPACE:  u8 = 0x00;
+const CNS_NAMESPACE: u8 = 0x00;
 const CNS_CONTROLLER: u8 = 0x01;
 
 const QUEUE_DEPTH: usize = 64;
@@ -104,19 +103,19 @@ const QUEUE_DEPTH: usize = 64;
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Default)]
 struct Sqe {
-    cdw0:    u32,
-    nsid:    u32,
-    cdw2:    u32,
-    cdw3:    u32,
-    mptr:    u64,
-    prp1:    u64,
-    prp2:    u64,
-    cdw10:   u32,
-    cdw11:   u32,
-    cdw12:   u32,
-    cdw13:   u32,
-    cdw14:   u32,
-    cdw15:   u32,
+    cdw0: u32,
+    nsid: u32,
+    cdw2: u32,
+    cdw3: u32,
+    mptr: u64,
+    prp1: u64,
+    prp2: u64,
+    cdw10: u32,
+    cdw11: u32,
+    cdw12: u32,
+    cdw13: u32,
+    cdw14: u32,
+    cdw15: u32,
 }
 
 // ── Completion Queue Entry (CQE) — 16 bytes ───────────────────────────────
@@ -124,29 +123,38 @@ struct Sqe {
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
 struct Cqe {
-    dw0:  u32,
-    dw1:  u32,
-    dw2:  u32,
-    dw3:  u32,
+    dw0: u32,
+    dw1: u32,
+    dw2: u32,
+    dw3: u32,
 }
 
 impl Cqe {
-    #[inline] fn phase(&self) -> bool { self.dw3 & (1 << 16) != 0 }
-    #[inline] fn status(&self) -> u16 { ((self.dw3 >> 17) & 0x7FFF) as u16 }
-    #[inline] fn cid(&self)   -> u16 { (self.dw3 & 0xFFFF) as u16 }
+    #[inline]
+    fn phase(&self) -> bool {
+        self.dw3 & (1 << 16) != 0
+    }
+    #[inline]
+    fn status(&self) -> u16 {
+        ((self.dw3 >> 17) & 0x7FFF) as u16
+    }
+    #[inline]
+    fn cid(&self) -> u16 {
+        (self.dw3 & 0xFFFF) as u16
+    }
 }
 
 // ── Queue pair ────────────────────────────────────────────────────────────
 
 struct Queue {
-    sq_base:  u64,
-    cq_base:  u64,
-    sq_tail:  u32,
-    cq_head:  u32,
+    sq_base: u64,
+    cq_base: u64,
+    sq_tail: u32,
+    cq_head: u32,
     cq_phase: bool,
     next_cid: u16,
-    sq_db:    *mut u32,
-    cq_db:    *mut u32,
+    sq_db: *mut u32,
+    cq_db: *mut u32,
 }
 
 unsafe impl Send for Queue {}
@@ -154,8 +162,10 @@ unsafe impl Send for Queue {}
 impl Queue {
     const fn uninit() -> Self {
         Queue {
-            sq_base: 0, cq_base: 0,
-            sq_tail: 0, cq_head: 0,
+            sq_base: 0,
+            cq_base: 0,
+            sq_tail: 0,
+            cq_head: 0,
             cq_phase: true,
             next_cid: 1,
             sq_db: core::ptr::null_mut(),
@@ -208,7 +218,9 @@ impl Queue {
             if cqe.phase() == self.cq_phase && cqe.cid() == cid {
                 let status = cqe.status();
                 self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u32;
-                if self.cq_head == 0 { self.cq_phase = !self.cq_phase; }
+                if self.cq_head == 0 {
+                    self.cq_phase = !self.cq_phase;
+                }
                 core::ptr::write_volatile(self.cq_db, self.cq_head);
                 return status;
             }
@@ -227,9 +239,13 @@ impl Queue {
 
             let slot = (self.cq_base as *mut Cqe).add(self.cq_head as usize);
             let cqe = core::ptr::read_volatile(slot);
-            if cqe.phase() != self.cq_phase { break; }
+            if cqe.phase() != self.cq_phase {
+                break;
+            }
             self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u32;
-            if self.cq_head == 0 { self.cq_phase = !self.cq_phase; }
+            if self.cq_head == 0 {
+                self.cq_phase = !self.cq_phase;
+            }
         }
         core::ptr::write_volatile(self.cq_db, self.cq_head);
     }
@@ -238,13 +254,13 @@ impl Queue {
 // ── Controller state ──────────────────────────────────────────────────────
 
 struct NvmeCtrl {
-    bar0:      u64,
+    bar0: u64,
     db_stride: u64,
-    admin:     Queue,
-    io:        Queue,
-    ns_size:   u64,
+    admin: Queue,
+    io: Queue,
+    ns_size: u64,
     lba_shift: u32,
-    ready:     bool,
+    ready: bool,
 }
 
 unsafe impl Send for NvmeCtrl {}
@@ -252,24 +268,30 @@ unsafe impl Send for NvmeCtrl {}
 impl NvmeCtrl {
     const fn uninit() -> Self {
         NvmeCtrl {
-            bar0: 0, db_stride: 4,
+            bar0: 0,
+            db_stride: 4,
             admin: Queue::uninit(),
-            io:    Queue::uninit(),
-            ns_size: 0, lba_shift: 9,
+            io: Queue::uninit(),
+            ns_size: 0,
+            lba_shift: 9,
             ready: false,
         }
     }
 
-    #[inline] unsafe fn read32(&self, off: u64) -> u32 {
+    #[inline]
+    unsafe fn read32(&self, off: u64) -> u32 {
         core::ptr::read_volatile((self.bar0 + off) as *const u32)
     }
-    #[inline] unsafe fn write32(&self, off: u64, v: u32) {
+    #[inline]
+    unsafe fn write32(&self, off: u64, v: u32) {
         core::ptr::write_volatile((self.bar0 + off) as *mut u32, v);
     }
-    #[inline] unsafe fn read64(&self, off: u64) -> u64 {
+    #[inline]
+    unsafe fn read64(&self, off: u64) -> u64 {
         core::ptr::read_volatile((self.bar0 + off) as *const u64)
     }
-    #[inline] unsafe fn write64(&self, off: u64, v: u64) {
+    #[inline]
+    unsafe fn write64(&self, off: u64, v: u64) {
         core::ptr::write_volatile((self.bar0 + off) as *mut u64, v);
     }
 
@@ -283,10 +305,11 @@ impl NvmeCtrl {
     /// Panics if the PMM is out of memory.  All internal NVMe DMA buffers
     /// are allocated at init time, so OOM here is a fatal boot error.
     fn alloc_page() -> u64 {
-        let pa = pmm::alloc_page()
-            .expect("nvme: PMM out of memory during init");
+        let pa = pmm::alloc_page().expect("nvme: PMM out of memory during init");
         // Zero the page through the physical alias (identity-mapped kernel).
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, 4096); }
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, 4096);
+        }
         pa as u64
     }
 
@@ -299,7 +322,9 @@ impl NvmeCtrl {
         self.write32(NVME_REG_CC, cc & !CC_EN);
 
         for _ in 0..spin_limit {
-            if self.read32(NVME_REG_CSTS) & CSTS_RDY == 0 { return true; }
+            if self.read32(NVME_REG_CSTS) & CSTS_RDY == 0 {
+                return true;
+            }
             core::arch::asm!("pause", options(nomem, nostack));
         }
         false
@@ -314,13 +339,13 @@ impl NvmeCtrl {
         self.write64(NVME_REG_ASQ, sq_pa);
         self.write64(NVME_REG_ACQ, cq_pa);
 
-        self.admin.sq_base  = sq_pa;
-        self.admin.cq_base  = cq_pa;
-        self.admin.sq_tail  = 0;
-        self.admin.cq_head  = 0;
+        self.admin.sq_base = sq_pa;
+        self.admin.cq_base = cq_pa;
+        self.admin.sq_tail = 0;
+        self.admin.cq_head = 0;
         self.admin.cq_phase = true;
-        self.admin.sq_db    = self.db_ptr(0);
-        self.admin.cq_db    = self.db_ptr(1);
+        self.admin.sq_db = self.db_ptr(0);
+        self.admin.cq_db = self.db_ptr(1);
     }
 
     unsafe fn enable(&mut self) -> bool {
@@ -333,8 +358,12 @@ impl NvmeCtrl {
 
         for _ in 0..spin_limit {
             let csts = self.read32(NVME_REG_CSTS);
-            if csts & CSTS_CFS != 0 { return false; }
-            if csts & CSTS_RDY != 0 { return true;  }
+            if csts & CSTS_CFS != 0 {
+                return false;
+            }
+            if csts & CSTS_RDY != 0 {
+                return true;
+            }
             core::arch::asm!("pause", options(nomem, nostack));
         }
         false
@@ -348,10 +377,10 @@ impl NvmeCtrl {
     unsafe fn identify_controller(&mut self) -> String {
         let buf_pa = Self::alloc_page();
         let sqe = Sqe {
-            cdw0:  ADMIN_IDENTIFY as u32,
-            nsid:  0,
-            prp1:  buf_pa,  // physical address — correct for DMA
-            prp2:  0,
+            cdw0: ADMIN_IDENTIFY as u32,
+            nsid: 0,
+            prp1: buf_pa, // physical address — correct for DMA
+            prp2: 0,
             cdw10: CNS_CONTROLLER as u32,
             ..Default::default()
         };
@@ -362,7 +391,9 @@ impl NvmeCtrl {
             let ptr = buf_pa as *const u8;
             for i in 24..64usize {
                 let b = core::ptr::read_volatile(ptr.add(i));
-                if b == 0 || b == b' ' { continue; }
+                if b == 0 || b == b' ' {
+                    continue;
+                }
                 model.push(b as char);
             }
         }
@@ -373,10 +404,10 @@ impl NvmeCtrl {
     unsafe fn identify_namespace(&mut self) {
         let buf_pa = Self::alloc_page();
         let sqe = Sqe {
-            cdw0:  ADMIN_IDENTIFY as u32,
-            nsid:  1,
-            prp1:  buf_pa,  // physical address — correct for DMA
-            prp2:  0,
+            cdw0: ADMIN_IDENTIFY as u32,
+            nsid: 1,
+            prp1: buf_pa, // physical address — correct for DMA
+            prp2: 0,
             cdw10: CNS_NAMESPACE as u32,
             ..Default::default()
         };
@@ -395,7 +426,9 @@ impl NvmeCtrl {
             // Guard: lbaf_off max = 128 + 15*4 = 188; well within 4096 bytes.
             let lbaf = core::ptr::read_volatile(ptr.add(lbaf_off) as *const u32);
             self.lba_shift = (lbaf >> 16) & 0xFF;
-            if self.lba_shift == 0 { self.lba_shift = 9; }
+            if self.lba_shift == 0 {
+                self.lba_shift = 9;
+            }
         }
         pmm::free_page(buf_pa as usize);
     }
@@ -404,9 +437,10 @@ impl NvmeCtrl {
         let cdw10: u32 = 1 | (((QUEUE_DEPTH - 1) as u32) << 16);
         let cdw11: u32 = 1 | (1 << 1); // PC=1, IEN=1
         let sqe = Sqe {
-            cdw0:  ADMIN_CREATE_IO_CQ as u32,
-            prp1:  cq_pa,
-            cdw10, cdw11,
+            cdw0: ADMIN_CREATE_IO_CQ as u32,
+            prp1: cq_pa,
+            cdw10,
+            cdw11,
             ..Default::default()
         };
         self.admin_cmd(sqe) == 0
@@ -416,9 +450,10 @@ impl NvmeCtrl {
         let cdw10: u32 = 1 | (((QUEUE_DEPTH - 1) as u32) << 16);
         let cdw11: u32 = 1 | (1 << 16); // CQID=1
         let sqe = Sqe {
-            cdw0:  ADMIN_CREATE_IO_SQ as u32,
-            prp1:  sq_pa,
-            cdw10, cdw11,
+            cdw0: ADMIN_CREATE_IO_SQ as u32,
+            prp1: sq_pa,
+            cdw10,
+            cdw11,
             ..Default::default()
         };
         self.admin_cmd(sqe) == 0
@@ -428,16 +463,20 @@ impl NvmeCtrl {
         let cq_pa = Self::alloc_page();
         let sq_pa = Self::alloc_page();
 
-        if !self.create_io_cq(cq_pa) { return false; }
-        if !self.create_io_sq(sq_pa) { return false; }
+        if !self.create_io_cq(cq_pa) {
+            return false;
+        }
+        if !self.create_io_sq(sq_pa) {
+            return false;
+        }
 
-        self.io.sq_base  = sq_pa;
-        self.io.cq_base  = cq_pa;
-        self.io.sq_tail  = 0;
-        self.io.cq_head  = 0;
+        self.io.sq_base = sq_pa;
+        self.io.cq_base = cq_pa;
+        self.io.sq_tail = 0;
+        self.io.cq_head = 0;
         self.io.cq_phase = true;
-        self.io.sq_db    = self.db_ptr(2);
-        self.io.cq_db    = self.db_ptr(3);
+        self.io.sq_db = self.db_ptr(2);
+        self.io.cq_db = self.db_ptr(3);
         true
     }
 }
@@ -486,7 +525,8 @@ pub fn nvme_probe() {
     crate::arch::x86_64::serial::serial_println!(
         "nvme: BAR0={:#x} vs={}.{} irq={}",
         bar0,
-        (vs >> 16), (vs >> 8) & 0xFF,
+        (vs >> 16),
+        (vs >> 8) & 0xFF,
         irq_mode
     );
 
@@ -495,7 +535,9 @@ pub fn nvme_probe() {
         return;
     }
 
-    unsafe { ctrl.setup_admin_queues(); }
+    unsafe {
+        ctrl.setup_admin_queues();
+    }
 
     if !unsafe { ctrl.enable() } {
         crate::arch::x86_64::serial::serial_println!("nvme: enable timeout / CFS");
@@ -505,10 +547,13 @@ pub fn nvme_probe() {
     let model = unsafe { ctrl.identify_controller() };
     crate::arch::x86_64::serial::serial_println!("nvme: model: {}", model);
 
-    unsafe { ctrl.identify_namespace(); }
+    unsafe {
+        ctrl.identify_namespace();
+    }
     crate::arch::x86_64::serial::serial_println!(
         "nvme: ns1 size={} LBAs  lba_shift={}",
-        ctrl.ns_size, ctrl.lba_shift
+        ctrl.ns_size,
+        ctrl.lba_shift
     );
 
     if !unsafe { ctrl.setup_io_queues() } {
@@ -538,13 +583,15 @@ pub fn nvme_lba_size() -> u32 {
 /// `virt_to_phys(buf_ptr)`.
 pub fn nvme_read(lba: u64, count: u16, buf_pa: u64) -> bool {
     let mut ctrl = CTRL.lock();
-    if !ctrl.ready { return false; }
+    if !ctrl.ready {
+        return false;
+    }
 
     let sqe = Sqe {
-        cdw0:  NVM_READ as u32,
-        nsid:  1,
-        prp1:  buf_pa,   // physical address — required by NVMe spec
-        prp2:  0,
+        cdw0: NVM_READ as u32,
+        nsid: 1,
+        prp1: buf_pa, // physical address — required by NVMe spec
+        prp2: 0,
         cdw10: (lba & 0xFFFF_FFFF) as u32,
         cdw11: (lba >> 32) as u32,
         cdw12: (count as u32).saturating_sub(1),
@@ -561,13 +608,15 @@ pub fn nvme_read(lba: u64, count: u16, buf_pa: u64) -> bool {
 /// `buf_pa` must be a valid physical address.  See `nvme_read` for details.
 pub fn nvme_write(lba: u64, count: u16, buf_pa: u64) -> bool {
     let mut ctrl = CTRL.lock();
-    if !ctrl.ready { return false; }
+    if !ctrl.ready {
+        return false;
+    }
 
     let sqe = Sqe {
-        cdw0:  NVM_WRITE as u32,
-        nsid:  1,
-        prp1:  buf_pa,   // physical address — required by NVMe spec
-        prp2:  0,
+        cdw0: NVM_WRITE as u32,
+        nsid: 1,
+        prp1: buf_pa, // physical address — required by NVMe spec
+        prp2: 0,
         cdw10: (lba & 0xFFFF_FFFF) as u32,
         cdw11: (lba >> 32) as u32,
         cdw12: (count as u32).saturating_sub(1),
@@ -581,17 +630,27 @@ pub fn nvme_write(lba: u64, count: u16, buf_pa: u64) -> bool {
 /// Convenience wrapper: read one 512-byte sector into a stack buffer.
 /// The buffer must be identity-mapped (stack = kernel = PA == VA).
 pub fn nvme_read_sector(lba: u64, buf: &mut [u8; 512]) -> bool {
-    nvme_read(lba, 1, crate::mm::vmm::virt_to_phys(buf.as_mut_ptr() as usize) as u64)
+    nvme_read(
+        lba,
+        1,
+        crate::mm::vmm::virt_to_phys(buf.as_mut_ptr() as usize) as u64,
+    )
 }
 
 /// Convenience wrapper: write one 512-byte sector from a stack buffer.
 pub fn nvme_write_sector(lba: u64, buf: &[u8; 512]) -> bool {
-    nvme_write(lba, 1, crate::mm::vmm::virt_to_phys(buf.as_ptr() as usize) as u64)
+    nvme_write(
+        lba,
+        1,
+        crate::mm::vmm::virt_to_phys(buf.as_ptr() as usize) as u64,
+    )
 }
 
 pub fn nvme_irq() {
     let mut ctrl = CTRL.lock();
-    if !ctrl.ready { return; }
+    if !ctrl.ready {
+        return;
+    }
     unsafe {
         ctrl.write32(NVME_REG_INTMC, 1);
         ctrl.io.drain();

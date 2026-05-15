@@ -27,8 +27,8 @@ pub mod pids;
 
 extern crate alloc;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cgroup identity
@@ -38,7 +38,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub struct CgroupId(pub u64);
 
 static NEXT_CG_ID: AtomicU64 = AtomicU64::new(1);
-fn alloc_cg_id() -> CgroupId { CgroupId(NEXT_CG_ID.fetch_add(1, Ordering::SeqCst)) }
+fn alloc_cg_id() -> CgroupId {
+    CgroupId(NEXT_CG_ID.fetch_add(1, Ordering::SeqCst))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cgroup node
@@ -46,42 +48,44 @@ fn alloc_cg_id() -> CgroupId { CgroupId(NEXT_CG_ID.fetch_add(1, Ordering::SeqCst
 
 /// One cgroup node in the hierarchy.
 pub struct Cgroup {
-    pub id:      CgroupId,
-    pub name:    String,
-    pub parent:  Option<CgroupId>,
-    pub cpu:     cpu::CpuCg,
-    pub memory:  memory::MemCg,
-    pub pids:    pids::PidsCg,
+    pub id: CgroupId,
+    pub name: String,
+    pub parent: Option<CgroupId>,
+    pub cpu: cpu::CpuCg,
+    pub memory: memory::MemCg,
+    pub pids: pids::PidsCg,
     /// Kernel task-IDs attached to this cgroup.
-    tasks:       Mutex<Vec<u64>>,
+    tasks: Mutex<Vec<u64>>,
 }
 
 impl Cgroup {
     fn new_root() -> Self {
         Cgroup {
-            id:      CgroupId(0),
-            name:    String::from("/"),
-            parent:  None,
-            cpu:     cpu::CpuCg::default(),
-            memory:  memory::MemCg::default(),
-            pids:    pids::PidsCg::default(),
-            tasks:   Mutex::new(Vec::new()),
+            id: CgroupId(0),
+            name: String::from("/"),
+            parent: None,
+            cpu: cpu::CpuCg::default(),
+            memory: memory::MemCg::default(),
+            pids: pids::PidsCg::default(),
+            tasks: Mutex::new(Vec::new()),
         }
     }
 
     fn new_child(name: String, parent: CgroupId) -> Self {
         Cgroup {
-            id:      alloc_cg_id(),
+            id: alloc_cg_id(),
             name,
-            parent:  Some(parent),
-            cpu:     cpu::CpuCg::default(),
-            memory:  memory::MemCg::default(),
-            pids:    pids::PidsCg::default(),
-            tasks:   Mutex::new(Vec::new()),
+            parent: Some(parent),
+            cpu: cpu::CpuCg::default(),
+            memory: memory::MemCg::default(),
+            pids: pids::PidsCg::default(),
+            tasks: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn task_list(&self) -> Vec<u64> { self.tasks.lock().clone() }
+    pub fn task_list(&self) -> Vec<u64> {
+        self.tasks.lock().clone()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -98,7 +102,10 @@ impl CgroupTree {
     fn new() -> Self {
         let mut groups = BTreeMap::new();
         groups.insert(CgroupId(0), Cgroup::new_root());
-        CgroupTree { groups, task_cg: BTreeMap::new() }
+        CgroupTree {
+            groups,
+            task_cg: BTreeMap::new(),
+        }
     }
 }
 
@@ -108,16 +115,24 @@ static CGTREE: Mutex<Option<CgroupTree>> = Mutex::new(None);
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn init() { *CGTREE.lock() = Some(CgroupTree::new()); }
+pub fn init() {
+    *CGTREE.lock() = Some(CgroupTree::new());
+}
 
 /// Create a new child cgroup under `parent`.
 /// Returns the new `CgroupId` or EEXIST if `name` is taken.
 pub fn create(parent: CgroupId, name: String) -> Result<CgroupId, isize> {
     let mut tree = CGTREE.lock();
     let tree = tree.as_mut().ok_or(-1isize)?;
-    if !tree.groups.contains_key(&parent) { return Err(-2); } // ENOENT
-    // Check name uniqueness under parent.
-    if tree.groups.values().any(|g| g.parent == Some(parent) && g.name == name) {
+    if !tree.groups.contains_key(&parent) {
+        return Err(-2);
+    } // ENOENT
+      // Check name uniqueness under parent.
+    if tree
+        .groups
+        .values()
+        .any(|g| g.parent == Some(parent) && g.name == name)
+    {
         return Err(-17); // EEXIST
     }
     let cg = Cgroup::new_child(name, parent);
@@ -128,12 +143,18 @@ pub fn create(parent: CgroupId, name: String) -> Result<CgroupId, isize> {
 
 /// Remove a leaf cgroup.  Returns EBUSY if it has tasks or children.
 pub fn remove(id: CgroupId) -> Result<(), isize> {
-    if id == CgroupId(0) { return Err(-1); } // cannot remove root
+    if id == CgroupId(0) {
+        return Err(-1);
+    } // cannot remove root
     let mut tree = CGTREE.lock();
     let tree = tree.as_mut().ok_or(-1isize)?;
     let cg = tree.groups.get(&id).ok_or(-2isize)?;
-    if !cg.tasks.lock().is_empty() { return Err(-16); } // EBUSY
-    if tree.groups.values().any(|g| g.parent == Some(id)) { return Err(-16); }
+    if !cg.tasks.lock().is_empty() {
+        return Err(-16);
+    } // EBUSY
+    if tree.groups.values().any(|g| g.parent == Some(id)) {
+        return Err(-16);
+    }
     tree.groups.remove(&id);
     Ok(())
 }
@@ -150,7 +171,9 @@ pub fn attach(task_id: u64, cgroup_id: CgroupId) -> Result<(), isize> {
     }
     let cg = tree.groups.get(&cgroup_id).ok_or(-2isize)?;
     // Check pids.max.
-    if !cg.pids.can_fork() { return Err(-11); } // EAGAIN
+    if !cg.pids.can_fork() {
+        return Err(-11);
+    } // EAGAIN
     cg.tasks.lock().push(task_id);
     cg.pids.increment();
     tree.task_cg.insert(task_id, cgroup_id);
@@ -160,7 +183,10 @@ pub fn attach(task_id: u64, cgroup_id: CgroupId) -> Result<(), isize> {
 /// Called on task exit to decrement pids counter and clean up.
 pub fn task_exit(task_id: u64) {
     let mut tree = CGTREE.lock();
-    let tree = match tree.as_mut() { Some(t) => t, None => return };
+    let tree = match tree.as_mut() {
+        Some(t) => t,
+        None => return,
+    };
     if let Some(&cg_id) = tree.task_cg.get(&task_id) {
         if let Some(cg) = tree.groups.get(&cg_id) {
             cg.tasks.lock().retain(|&t| t != task_id);
@@ -172,37 +198,59 @@ pub fn task_exit(task_id: u64) {
 
 /// Look up which cgroup a task belongs to.
 pub fn task_cgroup(task_id: u64) -> CgroupId {
-    CGTREE.lock().as_ref()
-          .and_then(|t| t.task_cg.get(&task_id).copied())
-          .unwrap_or(CgroupId(0))
+    CGTREE
+        .lock()
+        .as_ref()
+        .and_then(|t| t.task_cg.get(&task_id).copied())
+        .unwrap_or(CgroupId(0))
 }
 
 /// Read a knob from the cpu controller by name.
 /// Returns Err(ENOENT) for unknown knobs.
 pub fn cpu_read(id: CgroupId, knob: &str) -> Result<i64, isize> {
     let tree = CGTREE.lock();
-    let cg = tree.as_ref().ok_or(-1isize)?.groups.get(&id).ok_or(-2isize)?;
+    let cg = tree
+        .as_ref()
+        .ok_or(-1isize)?
+        .groups
+        .get(&id)
+        .ok_or(-2isize)?;
     cg.cpu.read(knob)
 }
 
 /// Write a knob to the cpu controller.
 pub fn cpu_write(id: CgroupId, knob: &str, val: i64) -> Result<(), isize> {
     let tree = CGTREE.lock();
-    let cg = tree.as_ref().ok_or(-1isize)?.groups.get(&id).ok_or(-2isize)?;
+    let cg = tree
+        .as_ref()
+        .ok_or(-1isize)?
+        .groups
+        .get(&id)
+        .ok_or(-2isize)?;
     cg.cpu.write(knob, val)
 }
 
 /// Read a memory controller knob.
 pub fn mem_read(id: CgroupId, knob: &str) -> Result<i64, isize> {
     let tree = CGTREE.lock();
-    let cg = tree.as_ref().ok_or(-1isize)?.groups.get(&id).ok_or(-2isize)?;
+    let cg = tree
+        .as_ref()
+        .ok_or(-1isize)?
+        .groups
+        .get(&id)
+        .ok_or(-2isize)?;
     cg.memory.read(knob)
 }
 
 /// Write a memory controller knob.
 pub fn mem_write(id: CgroupId, knob: &str, val: i64) -> Result<(), isize> {
     let tree = CGTREE.lock();
-    let cg = tree.as_ref().ok_or(-1isize)?.groups.get(&id).ok_or(-2isize)?;
+    let cg = tree
+        .as_ref()
+        .ok_or(-1isize)?
+        .groups
+        .get(&id)
+        .ok_or(-2isize)?;
     cg.memory.write(knob, val)
 }
 
@@ -210,16 +258,25 @@ pub fn mem_write(id: CgroupId, knob: &str, val: i64) -> Result<(), isize> {
 /// if over the hard limit.  Adds `bytes` to usage on success.
 pub fn mem_charge(task_id: u64, bytes: u64) -> Result<(), isize> {
     let tree = CGTREE.lock();
-    let tree = match tree.as_ref() { Some(t) => t, None => return Ok(()) };
+    let tree = match tree.as_ref() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
     let cg_id = tree.task_cg.get(&task_id).copied().unwrap_or(CgroupId(0));
-    let cg = match tree.groups.get(&cg_id) { Some(c) => c, None => return Ok(()) };
+    let cg = match tree.groups.get(&cg_id) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
     cg.memory.charge(bytes)
 }
 
 /// Release `bytes` from memory accounting.
 pub fn mem_uncharge(task_id: u64, bytes: u64) {
     let tree = CGTREE.lock();
-    let tree = match tree.as_ref() { Some(t) => t, None => return };
+    let tree = match tree.as_ref() {
+        Some(t) => t,
+        None => return,
+    };
     let cg_id = tree.task_cg.get(&task_id).copied().unwrap_or(CgroupId(0));
     if let Some(cg) = tree.groups.get(&cg_id) {
         cg.memory.uncharge(bytes);
@@ -229,12 +286,22 @@ pub fn mem_uncharge(task_id: u64, bytes: u64) {
 /// Read a pids controller knob.
 pub fn pids_read(id: CgroupId, knob: &str) -> Result<i64, isize> {
     let tree = CGTREE.lock();
-    let cg = tree.as_ref().ok_or(-1isize)?.groups.get(&id).ok_or(-2isize)?;
+    let cg = tree
+        .as_ref()
+        .ok_or(-1isize)?
+        .groups
+        .get(&id)
+        .ok_or(-2isize)?;
     cg.pids.read(knob)
 }
 pub fn pids_write(id: CgroupId, knob: &str, val: i64) -> Result<(), isize> {
     let tree = CGTREE.lock();
-    let cg = tree.as_ref().ok_or(-1isize)?.groups.get(&id).ok_or(-2isize)?;
+    let cg = tree
+        .as_ref()
+        .ok_or(-1isize)?
+        .groups
+        .get(&id)
+        .ok_or(-2isize)?;
     cg.pids.write(knob, val)
 }
 

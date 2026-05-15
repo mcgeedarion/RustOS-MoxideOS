@@ -21,8 +21,8 @@
 //!   fault allocates a new frame.
 //! - `proc/exit.rs` — call `rss_reset(pid)` on process exit.
 
-use crate::proc::scheduler::{with_proc, with_proc_mut};
 use crate::proc::rlimit::{RLIMIT_RSS, RLIM_INFINITY};
+use crate::proc::scheduler::{with_proc, with_proc_mut};
 
 /// Charge `pages` physical pages to process `pid`.
 ///
@@ -37,7 +37,8 @@ pub fn rss_charge(pid: usize, pages: usize) -> isize {
         }
         p.rss_pages = new_rss;
         0isize
-    }).unwrap_or(0) // if pid not found just succeed silently
+    })
+    .unwrap_or(0) // if pid not found just succeed silently
 }
 
 /// Refund `pages` physical pages from process `pid`'s RSS counter.
@@ -49,7 +50,9 @@ pub fn rss_discharge(pid: usize, pages: usize) {
 
 /// Reset RSS counter to zero (called from `exit.rs`).
 pub fn rss_reset(pid: usize) {
-    let _ = with_proc_mut(pid, |p| { p.rss_pages = 0; });
+    let _ = with_proc_mut(pid, |p| {
+        p.rss_pages = 0;
+    });
 }
 
 /// Read the current RSS page count for `pid`.

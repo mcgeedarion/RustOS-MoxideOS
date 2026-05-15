@@ -45,9 +45,9 @@
 //! released before the new parameters are admitted, so the counters
 //! always reflect the live set of admitted tasks.
 
-use crate::proc::scheduler::{SchedPolicy, SchedEntity, CPUMASK_ALL};
 use crate::proc::rlimit::{RLIMIT_NICE, RLIMIT_RTPRIO, RLIM_INFINITY};
 use crate::proc::sched_helpers::{cbs_admit, cbs_release};
+use crate::proc::scheduler::{SchedEntity, SchedPolicy, CPUMASK_ALL};
 use crate::uaccess::{copy_from_user, copy_to_user};
 
 // ── Linux ABI structs ─────────────────────────────────────────────────────────
@@ -79,22 +79,28 @@ fn nice_floor(pid: usize) -> i8 {
     use crate::proc::scheduler::with_proc;
     let (soft, _) = crate::proc::scheduler::with_proc(pid, |p| p.rlimits.get(RLIMIT_NICE))
         .unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
-    let privileged = with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice))
-        .unwrap_or(false);
-    if privileged { return -20; }
-    if soft == RLIM_INFINITY { return -20; }
+    let privileged = with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice)).unwrap_or(false);
+    if privileged {
+        return -20;
+    }
+    if soft == RLIM_INFINITY {
+        return -20;
+    }
     let floor = 20i64 - soft as i64;
     floor.clamp(-20, 19) as i8
 }
 
 fn rt_prio_ceiling(pid: usize) -> u8 {
     use crate::proc::scheduler::with_proc;
-    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_RTPRIO))
-        .unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
-    let privileged = with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice))
-        .unwrap_or(false);
-    if privileged { return 99; }
-    if soft == RLIM_INFINITY { return 99; }
+    let (soft, _) =
+        with_proc(pid, |p| p.rlimits.get(RLIMIT_RTPRIO)).unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
+    let privileged = with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice)).unwrap_or(false);
+    if privileged {
+        return 99;
+    }
+    if soft == RLIM_INFINITY {
+        return 99;
+    }
     soft.min(99) as u8
 }
 
@@ -110,7 +116,7 @@ fn is_privileged(pid: usize) -> bool {
 /// to release CBS utilization before applying new parameters.
 struct DeadlineSnapshot {
     runtime: u64,
-    period:  u64,
+    period: u64,
     cpumask: u64,
 }
 
@@ -118,13 +124,16 @@ struct DeadlineSnapshot {
 /// currently a SCHED_DEADLINE task.  Returns None otherwise.
 fn snapshot_deadline(pid: usize) -> Option<DeadlineSnapshot> {
     crate::proc::scheduler::with_proc(pid, |pcb| {
-        if pcb.sched.policy != SchedPolicy::Deadline { return None; }
+        if pcb.sched.policy != SchedPolicy::Deadline {
+            return None;
+        }
         Some(DeadlineSnapshot {
             runtime: pcb.sched.dl_runtime,
-            period:  pcb.sched.dl_period,
+            period: pcb.sched.dl_period,
             cpumask: pcb.sched.cpumask,
         })
-    }).flatten()
+    })
+    .flatten()
 }
 
 /// Returns -ESRCH if pid not found, -EPERM if the change violates a
@@ -132,7 +141,7 @@ fn snapshot_deadline(pid: usize) -> Option<DeadlineSnapshot> {
 fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     let policy = match SchedPolicy::from_u32(attr.sched_policy) {
         Some(p) => p,
-        None    => return -22, // EINVAL
+        None => return -22, // EINVAL
     };
 
     // ── Parameter sanity check for Deadline ──────────────────────────────────
@@ -150,16 +159,20 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     // ── RLIMIT_RTPRIO: reject unprivileged RT elevation ───────────────────────
     if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
         let ceiling = rt_prio_ceiling(pid);
-        if ceiling == 0 { return -13; }
-        if attr.sched_priority as u8 > ceiling { return -13; }
+        if ceiling == 0 {
+            return -13;
+        }
+        if attr.sched_priority as u8 > ceiling {
+            return -13;
+        }
     }
 
     // ── CBS admission gate (SCHED_DEADLINE only) ──────────────────────────────
     if policy == SchedPolicy::Deadline {
         let privileged = is_privileged(pid);
 
-        let cpumask = crate::proc::scheduler::with_proc(pid, |p| p.sched.cpumask)
-            .unwrap_or(CPUMASK_ALL);
+        let cpumask =
+            crate::proc::scheduler::with_proc(pid, |p| p.sched.cpumask).unwrap_or(CPUMASK_ALL);
 
         let old = snapshot_deadline(pid);
 
@@ -167,9 +180,13 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
             cbs_release(snap.runtime, snap.period, snap.cpumask);
         }
 
-        if let Err(e) = cbs_admit(pid, attr.sched_runtime, attr.sched_period,
-                                   cpumask, privileged)
-        {
+        if let Err(e) = cbs_admit(
+            pid,
+            attr.sched_runtime,
+            attr.sched_period,
+            cpumask,
+            privileged,
+        ) {
             if let Some(ref snap) = old {
                 let _ = cbs_admit(0, snap.runtime, snap.period, snap.cpumask, true);
             }
@@ -188,21 +205,21 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
 
     // ── Apply to PCB ─────────────────────────────────────────────────────────
     crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
-        let was_rt     = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
+        let was_rt = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
         let becomes_rt = matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr);
 
         match policy {
             SchedPolicy::Normal => {
                 let floor = nice_floor(pid);
-                let nice  = attr.sched_nice.clamp(floor as i32, 19) as i8;
-                pcb.sched.nice   = nice;
+                let nice = attr.sched_nice.clamp(floor as i32, 19) as i8;
+                pcb.sched.nice = nice;
                 pcb.sched.weight = crate::proc::scheduler::nice_to_weight_pub(nice);
                 pcb.sched.policy = SchedPolicy::Normal;
                 pcb.sched.rt_priority = 0;
             }
             SchedPolicy::Fifo | SchedPolicy::Rr => {
                 let ceiling = rt_prio_ceiling(pid);
-                let prio    = (attr.sched_priority as u8).min(ceiling);
+                let prio = (attr.sched_priority as u8).min(ceiling);
                 pcb.sched.rt_priority = prio.max(1);
                 pcb.sched.policy = policy;
             }
@@ -219,7 +236,9 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
         if was_rt || becomes_rt {
             pcb.rt_cpu_time_us = 0;
         }
-    }).map(|_| 0isize).unwrap_or(-3)
+    })
+    .map(|_| 0isize)
+    .unwrap_or(-3)
 }
 
 // ── sched_setscheduler ────────────────────────────────────────────────────────
@@ -244,8 +263,7 @@ pub fn sys_sched_setscheduler(pid: usize, policy: u32, param_uptr: usize) -> isi
 
 /// `sys_sched_getscheduler(pid)` [NR 145]
 pub fn sys_sched_getscheduler(pid: usize) -> isize {
-    crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.policy as i32 as isize)
-        .unwrap_or(-3)
+    crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.policy as i32 as isize).unwrap_or(-3)
 }
 
 // ── sched_setparam / sched_getparam ──────────────────────────────────────────
@@ -261,18 +279,24 @@ pub fn sys_sched_setparam(pid: usize, param_uptr: usize) -> isize {
             // No-op for CFS tasks.
         } else {
             let ceiling = rt_prio_ceiling(pid);
-            let prio    = (param.sched_priority.clamp(1, 99) as u8).min(ceiling);
+            let prio = (param.sched_priority.clamp(1, 99) as u8).min(ceiling);
             pcb.sched.rt_priority = prio;
         }
-    }).map(|_| 0isize).unwrap_or(-3)
+    })
+    .map(|_| 0isize)
+    .unwrap_or(-3)
 }
 
 /// `sys_sched_getparam(pid, param_uptr)` [NR 143]
 pub fn sys_sched_getparam(pid: usize, param_uptr: usize) -> isize {
     let prio = crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.rt_priority as i32)
         .unwrap_or_else(|| -3i32);
-    if prio < 0 { return prio as isize; }
-    let param = SchedParam { sched_priority: prio };
+    if prio < 0 {
+        return prio as isize;
+    }
+    let param = SchedParam {
+        sched_priority: prio,
+    };
     if copy_to_user(param_uptr as *mut SchedParam, &param).is_err() {
         return -14;
     }
@@ -283,20 +307,34 @@ pub fn sys_sched_getparam(pid: usize, param_uptr: usize) -> isize {
 
 /// `sys_setpriority(which, who, prio)` [NR 141]
 pub fn sys_setpriority(which: i32, who: usize, prio: i32) -> isize {
-    if which != 0 { return -38; }
-    let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
+    if which != 0 {
+        return -38;
+    }
+    let pid = if who == 0 {
+        crate::proc::scheduler::current_pid()
+    } else {
+        who
+    };
     let floor = nice_floor(pid as usize);
     let clamped = prio.clamp(floor as i32, 19) as i8;
     crate::proc::scheduler::with_proc_mut(pid as usize, |p, _pl| {
-        p.sched.nice   = clamped;
+        p.sched.nice = clamped;
         p.sched.weight = crate::proc::scheduler::nice_to_weight_pub(clamped);
-    }).map(|_| 0isize).unwrap_or(-3)
+    })
+    .map(|_| 0isize)
+    .unwrap_or(-3)
 }
 
 /// `sys_getpriority(which, who)` [NR 140]
 pub fn sys_getpriority(which: i32, who: usize) -> isize {
-    if which != 0 { return -38; }
-    let pid = if who == 0 { crate::proc::scheduler::current_pid() } else { who };
+    if which != 0 {
+        return -38;
+    }
+    let pid = if who == 0 {
+        crate::proc::scheduler::current_pid()
+    } else {
+        who
+    };
     crate::proc::scheduler::with_proc(pid as usize, |p| (20 - p.sched.nice as i32) as isize)
         .unwrap_or(-3)
 }
@@ -305,7 +343,9 @@ pub fn sys_getpriority(which: i32, who: usize) -> isize {
 
 /// `sys_sched_setaffinity(pid, cpusetsize, mask_uptr)` [NR 203]
 pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
-    if mask_uptr == 0 || cpusetsize == 0 { return -22; }
+    if mask_uptr == 0 || cpusetsize == 0 {
+        return -22;
+    }
 
     // Copy up to 8 bytes from user; remaining bits are zero (no CPU there).
     let bytes = cpusetsize.min(8);
@@ -316,13 +356,21 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
         }
     }
     let mask = u64::from_le_bytes(raw);
-    if mask == 0 { return -22; }
+    if mask == 0 {
+        return -22;
+    }
 
     // Intersect with the online CPU set.
     let ncpus = crate::smp::num_online_cpus();
-    let online_mask: u64 = if ncpus >= 64 { u64::MAX } else { (1u64 << ncpus) - 1 };
+    let online_mask: u64 = if ncpus >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << ncpus) - 1
+    };
     let effective = mask & online_mask;
-    if effective == 0 { return -22; }
+    if effective == 0 {
+        return -22;
+    }
 
     // ── CBS: re-check admission if this is a DEADLINE task ────────────────────
     // Changing the cpumask may expose CPUs that do not have enough headroom.
@@ -343,13 +391,14 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     let result = crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         pcb.sched.cpumask = effective;
     });
-    if result.is_none() { return -3; } // ESRCH
+    if result.is_none() {
+        return -3;
+    } // ESRCH
 
     // ── Migrate if the task's current CPU is no longer allowed ────────────────
     // Read the running CPU outside the PCB lock to avoid lock-order inversion
     // with the per-CPU run-queue lock taken inside migrate_task.
-    let current_cpu = crate::proc::scheduler::with_proc(pid, |pcb| pcb.cpu_id)
-        .unwrap_or(0);
+    let current_cpu = crate::proc::scheduler::with_proc(pid, |pcb| pcb.cpu_id).unwrap_or(0);
     if effective & (1u64 << current_cpu) == 0 {
         // The task is pinned to a CPU no longer in its affinity set.
         // Pick the lowest-numbered allowed CPU and request a migration.
@@ -364,9 +413,11 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
 
 /// `sys_sched_getaffinity(pid, cpusetsize, mask_uptr)` [NR 204]
 pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
-    if mask_uptr == 0 || cpusetsize == 0 { return -22; }
-    let mask = crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.cpumask)
-        .unwrap_or(CPUMASK_ALL);
+    if mask_uptr == 0 || cpusetsize == 0 {
+        return -22;
+    }
+    let mask =
+        crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.cpumask).unwrap_or(CPUMASK_ALL);
     let bytes_to_write = cpusetsize.min(8);
     let raw = mask.to_le_bytes();
     for i in 0..bytes_to_write {
@@ -396,8 +447,8 @@ pub fn sys_sched_yield() -> isize {
 pub fn sys_sched_get_priority_max(policy: u32) -> isize {
     match policy {
         1 | 2 => 99,
-        6     => 0,
-        _     => 0,
+        6 => 0,
+        _ => 0,
     }
 }
 
@@ -405,7 +456,7 @@ pub fn sys_sched_get_priority_max(policy: u32) -> isize {
 pub fn sys_sched_get_priority_min(policy: u32) -> isize {
     match policy {
         1 | 2 => 1,
-        _     => 0,
+        _ => 0,
     }
 }
 
@@ -413,7 +464,9 @@ pub fn sys_sched_get_priority_min(policy: u32) -> isize {
 
 /// `sys_sched_setattr(pid, attr_uptr, flags)` [NR 314]
 pub fn sys_sched_setattr(pid: usize, attr_uptr: usize, _flags: u32) -> isize {
-    if attr_uptr == 0 { return -22; }
+    if attr_uptr == 0 {
+        return -22;
+    }
     let mut attr = SchedAttr::default();
     if copy_from_user(attr_uptr as *const SchedAttr, &mut attr).is_err() {
         return -14;
@@ -423,23 +476,27 @@ pub fn sys_sched_setattr(pid: usize, attr_uptr: usize, _flags: u32) -> isize {
 
 /// `sys_sched_getattr(pid, attr_uptr, size, flags)` [NR 315]
 pub fn sys_sched_getattr(pid: usize, attr_uptr: usize, _size: u32, _flags: u32) -> isize {
-    if attr_uptr == 0 { return -22; }
-    let result = crate::proc::scheduler::with_proc(pid, |pcb| {
-        SchedAttr {
-            size: core::mem::size_of::<SchedAttr>() as u32,
-            sched_policy:   pcb.sched.policy as u32,
-            sched_flags:    0,
-            sched_nice:     pcb.sched.nice as i32,
-            sched_priority: pcb.sched.rt_priority as u32,
-            sched_runtime:  pcb.sched.dl_runtime,
-            sched_deadline: pcb.sched.dl_deadline,
-            sched_period:   pcb.sched.dl_period,
-        }
+    if attr_uptr == 0 {
+        return -22;
+    }
+    let result = crate::proc::scheduler::with_proc(pid, |pcb| SchedAttr {
+        size: core::mem::size_of::<SchedAttr>() as u32,
+        sched_policy: pcb.sched.policy as u32,
+        sched_flags: 0,
+        sched_nice: pcb.sched.nice as i32,
+        sched_priority: pcb.sched.rt_priority as u32,
+        sched_runtime: pcb.sched.dl_runtime,
+        sched_deadline: pcb.sched.dl_deadline,
+        sched_period: pcb.sched.dl_period,
     });
     match result {
-        None    => -3,
+        None => -3,
         Some(a) => {
-            if copy_to_user(attr_uptr as *mut SchedAttr, &a).is_err() { -14 } else { 0 }
+            if copy_to_user(attr_uptr as *mut SchedAttr, &a).is_err() {
+                -14
+            } else {
+                0
+            }
         }
     }
 }

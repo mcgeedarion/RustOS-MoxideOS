@@ -18,7 +18,7 @@
 
 pub mod console;
 
-pub use console::{print, println, print_fmt};
+pub use console::{print, print_fmt, println};
 
 /// Kernel print macro — works like `print!` in std.
 #[macro_export]

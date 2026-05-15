@@ -20,6 +20,6 @@ pub mod gem;
 pub mod plane;
 
 pub use crate::drm::{
-    DisplayMode, DrmDriver, DrmError,
-    connector::*, crtc::*, encoder::*, framebuffer::*, gem::*, plane::*,
+    connector::*, crtc::*, encoder::*, framebuffer::*, gem::*, plane::*, DisplayMode, DrmDriver,
+    DrmError,
 };

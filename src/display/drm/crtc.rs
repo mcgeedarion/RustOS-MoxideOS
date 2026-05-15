@@ -15,7 +15,13 @@ pub struct Crtc {
 
 impl Crtc {
     pub fn new(id: u32) -> Self {
-        Self { id, mode: None, enabled: false, x: 0, y: 0 }
+        Self {
+            id,
+            mode: None,
+            enabled: false,
+            x: 0,
+            y: 0,
+        }
     }
 
     pub fn set_mode(&mut self, mode: DisplayMode) {

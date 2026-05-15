@@ -55,8 +55,8 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use spin::Mutex;
 use core::ptr;
+use spin::Mutex;
 
 use crate::mm::pmm;
 
@@ -106,19 +106,19 @@ const fn slots_per_page(obj_size: usize) -> usize {
 #[repr(C)]
 struct SlabHdr {
     /// Next slab in the same list (partial / full / empty).  Null = end.
-    next:      *mut SlabHdr,
+    next: *mut SlabHdr,
     /// Previous slab in the same list.  Null = head.
-    prev:      *mut SlabHdr,
+    prev: *mut SlabHdr,
     /// Head of the in-slab free list.  Null = all slots allocated.
     free_head: *mut u8,
     /// Number of currently allocated (in-use) slots.
-    in_use:    u16,
+    in_use: u16,
     /// Total capacity (slots_per_page for this class).
-    capacity:  u16,
+    capacity: u16,
     /// Size class index (0..NUM_CACHES).  Used by slab_free to locate
     /// the owning cache without an O(n) scan.
     class_idx: u8,
-    _pad:      [u8; 3],
+    _pad: [u8; 3],
 }
 
 // SlabHdr must fit in 40 bytes so hdr_offset(8) == 40, which leaves
@@ -131,9 +131,9 @@ struct Cache {
     /// Slabs with at least one free slot.
     partial: *mut SlabHdr,
     /// Slabs with no free slots.
-    full:    *mut SlabHdr,
+    full: *mut SlabHdr,
     /// Slabs with all slots free (ready to return to PMM).
-    empty:   *mut SlabHdr,
+    empty: *mut SlabHdr,
     /// Size of one object in this cache.
     obj_size: usize,
     /// Cached slots_per_page for this obj_size.
@@ -146,9 +146,9 @@ unsafe impl Send for Cache {}
 impl Cache {
     const fn new(obj_size: usize) -> Self {
         Cache {
-            partial:  ptr::null_mut(),
-            full:     ptr::null_mut(),
-            empty:    ptr::null_mut(),
+            partial: ptr::null_mut(),
+            full: ptr::null_mut(),
+            empty: ptr::null_mut(),
             obj_size,
             capacity: slots_per_page(obj_size),
         }
@@ -170,8 +170,14 @@ impl Cache {
     unsafe fn list_remove(list: &mut *mut SlabHdr, slab: *mut SlabHdr) {
         let prev = (*slab).prev;
         let next = (*slab).next;
-        if !prev.is_null() { (*prev).next = next; } else { *list = next; }
-        if !next.is_null() { (*next).prev = prev; }
+        if !prev.is_null() {
+            (*prev).next = next;
+        } else {
+            *list = next;
+        }
+        if !next.is_null() {
+            (*next).prev = prev;
+        }
         (*slab).next = ptr::null_mut();
         (*slab).prev = ptr::null_mut();
     }
@@ -183,14 +189,14 @@ impl Cache {
     unsafe fn grow(&mut self, class_idx: u8) -> bool {
         let pa = match pmm::alloc_page() {
             Some(p) => p,
-            None    => return false,
+            None => return false,
         };
         let page = pa as *mut u8;
-        let hdr  = page as *mut SlabHdr;
+        let hdr = page as *mut SlabHdr;
 
         // Build the intrusive free list through all slots.
-        let obj_sz    = self.obj_size;
-        let cap       = self.capacity;
+        let obj_sz = self.obj_size;
+        let cap = self.capacity;
         let slot0_off = hdr_offset(obj_sz);
 
         let mut prev_slot: *mut u8 = ptr::null_mut();
@@ -203,13 +209,13 @@ impl Cache {
             prev_slot = slot;
         }
 
-        (*hdr).next      = ptr::null_mut();
-        (*hdr).prev      = ptr::null_mut();
+        (*hdr).next = ptr::null_mut();
+        (*hdr).prev = ptr::null_mut();
         (*hdr).free_head = prev_slot; // = slot_0
-        (*hdr).in_use    = 0;
-        (*hdr).capacity  = cap as u16;
+        (*hdr).in_use = 0;
+        (*hdr).capacity = cap as u16;
         (*hdr).class_idx = class_idx;
-        (*hdr)._pad      = [0u8; 3];
+        (*hdr)._pad = [0u8; 3];
 
         Self::list_push(&mut self.partial, hdr);
         true
@@ -227,7 +233,9 @@ impl Cache {
                 Self::list_push(&mut self.partial, s);
             } else {
                 // 3. Carve a fresh slab.
-                if !self.grow(class_idx) { return None; }
+                if !self.grow(class_idx) {
+                    return None;
+                }
             }
         }
 
@@ -235,10 +243,10 @@ impl Cache {
         debug_assert!(!(*slab).free_head.is_null());
 
         // Pop the head of the free list.
-        let slot      = (*slab).free_head;
+        let slot = (*slab).free_head;
         let next_free = *(slot as *const *mut u8);
         (*slab).free_head = next_free;
-        (*slab).in_use   += 1;
+        (*slab).in_use += 1;
 
         // If slab is now full, move it to the full list.
         if (*slab).in_use as usize == (*slab).capacity as usize {
@@ -258,9 +266,9 @@ impl Cache {
     unsafe fn free(&mut self, ptr: *mut u8) {
         // Locate the slab: the slab header lives at the page base.
         let page_base = (ptr as usize) & !(PAGE_SIZE - 1);
-        let slab      = page_base as *mut SlabHdr;
+        let slab = page_base as *mut SlabHdr;
 
-        let was_full    = (*slab).in_use as usize == (*slab).capacity as usize;
+        let was_full = (*slab).in_use as usize == (*slab).capacity as usize;
         let was_partial = !was_full && (*slab).in_use > 0;
 
         // Scrub the slot before relinking (security: no stale data).
@@ -269,11 +277,11 @@ impl Cache {
         // Push onto the slab's free list.
         *(ptr as *mut *mut u8) = (*slab).free_head;
         (*slab).free_head = ptr;
-        (*slab).in_use   -= 1;
+        (*slab).in_use -= 1;
 
         if was_full {
             // full → partial
-            Self::list_remove(&mut self.full,    slab);
+            Self::list_remove(&mut self.full, slab);
             Self::list_push(&mut self.partial, slab);
         } else if was_partial && (*slab).in_use == 0 {
             // partial → empty
@@ -299,26 +307,35 @@ impl Cache {
 
     unsafe fn count_list(mut head: *mut SlabHdr) -> usize {
         let mut n = 0;
-        while !head.is_null() { n += 1; head = (*head).next; }
+        while !head.is_null() {
+            n += 1;
+            head = (*head).next;
+        }
         n
     }
 
     unsafe fn stats(&self) -> CacheStats {
         let partial_slabs = Self::count_list(self.partial);
-        let full_slabs    = Self::count_list(self.full);
-        let empty_slabs   = Self::count_list(self.empty);
+        let full_slabs = Self::count_list(self.full);
+        let empty_slabs = Self::count_list(self.empty);
         let active = {
             let mut n = 0usize;
             let mut s = self.partial;
-            while !s.is_null() { n += (*s).in_use as usize; s = (*s).next; }
+            while !s.is_null() {
+                n += (*s).in_use as usize;
+                s = (*s).next;
+            }
             s = self.full;
-            while !s.is_null() { n += (*s).in_use as usize; s = (*s).next; }
+            while !s.is_null() {
+                n += (*s).in_use as usize;
+                s = (*s).next;
+            }
             n
         };
         CacheStats {
-            obj_size:     self.obj_size,
-            active_objs:  active,
-            total_slabs:  partial_slabs + full_slabs + empty_slabs,
+            obj_size: self.obj_size,
+            active_objs: active,
+            total_slabs: partial_slabs + full_slabs + empty_slabs,
             partial_slabs,
             full_slabs,
             empty_slabs,
@@ -342,9 +359,13 @@ static CACHES: [Mutex<Cache>; NUM_CACHES] = make_caches![8, 16, 32, 64, 128, 256
 /// if `size` exceeds the largest class (1024 bytes).
 #[inline]
 fn size_class(size: usize) -> Option<usize> {
-    if size == 0 { return Some(0); }
+    if size == 0 {
+        return Some(0);
+    }
     for (i, &s) in SIZE_CLASSES.iter().enumerate() {
-        if size <= s { return Some(i); }
+        if size <= s {
+            return Some(i);
+        }
     }
     None
 }
@@ -364,7 +385,9 @@ pub fn init() {
     for (i, cache) in CACHES.iter().enumerate() {
         let mut c = cache.lock();
         if c.partial.is_null() && c.empty.is_null() {
-            unsafe { c.grow(i as u8); }
+            unsafe {
+                c.grow(i as u8);
+            }
         }
     }
 }
@@ -383,14 +406,16 @@ pub fn init() {
 /// aligned to at least the size-class boundary (power of two).
 pub fn slab_alloc(size: usize) -> Option<*mut u8> {
     match size_class(size) {
-        Some(idx) => {
-            unsafe { CACHES[idx].lock().alloc(idx as u8) }
-        }
+        Some(idx) => unsafe { CACHES[idx].lock().alloc(idx as u8) },
         None => {
             // Fall back to the global heap for large objects.
             let layout = alloc::alloc::Layout::from_size_align(size, 8).ok()?;
             let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
-            if ptr.is_null() { None } else { Some(ptr) }
+            if ptr.is_null() {
+                None
+            } else {
+                Some(ptr)
+            }
         }
     }
 }
@@ -406,15 +431,19 @@ pub fn slab_alloc(size: usize) -> Option<*mut u8> {
 ///   a second free on a zeroed slot will pass, but the slab's `in_use`
 ///   counter will underflow and trigger a panic in debug mode).
 pub fn slab_free(ptr: *mut u8, size: usize) {
-    if ptr.is_null() { return; }
+    if ptr.is_null() {
+        return;
+    }
     match size_class(size) {
-        Some(idx) => {
-            unsafe { CACHES[idx].lock().free(ptr); }
-        }
+        Some(idx) => unsafe {
+            CACHES[idx].lock().free(ptr);
+        },
         None => {
             // Was a heap allocation; reconstruct the layout and free it.
             if let Ok(layout) = alloc::alloc::Layout::from_size_align(size, 8) {
-                unsafe { alloc::alloc::dealloc(ptr, layout); }
+                unsafe {
+                    alloc::alloc::dealloc(ptr, layout);
+                }
             }
         }
     }
@@ -427,7 +456,9 @@ pub fn slab_free(ptr: *mut u8, size: usize) {
 /// briefly in sequence).
 pub fn slab_shrink() {
     for cache in CACHES.iter() {
-        unsafe { cache.lock().shrink(); }
+        unsafe {
+            cache.lock().shrink();
+        }
     }
 }
 
@@ -437,22 +468,22 @@ pub fn slab_shrink() {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheStats {
     /// Object size in bytes.
-    pub obj_size:     usize,
+    pub obj_size: usize,
     /// Number of objects currently allocated from this cache.
-    pub active_objs:  usize,
+    pub active_objs: usize,
     /// Total number of slabs (partial + full + empty).
-    pub total_slabs:  usize,
+    pub total_slabs: usize,
     pub partial_slabs: usize,
-    pub full_slabs:   usize,
-    pub empty_slabs:  usize,
+    pub full_slabs: usize,
+    pub empty_slabs: usize,
 }
 
 /// Aggregate across all caches (for /proc/meminfo slab lines).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SlabStats {
-    pub total_slabs:   usize,
-    pub active_objs:   usize,
-    pub per_cache:     [CacheStats; NUM_CACHES],
+    pub total_slabs: usize,
+    pub active_objs: usize,
+    pub per_cache: [CacheStats; NUM_CACHES],
 }
 
 /// Snapshot the slab allocator's current state.
@@ -492,9 +523,11 @@ impl<T> SlabBox<T> {
     /// `SlabBox<T>`.  Returns `None` on OOM.
     pub fn new(value: T) -> Option<Self> {
         let size = core::mem::size_of::<T>();
-        let ptr  = slab_alloc(size)? as *mut T;
+        let ptr = slab_alloc(size)? as *mut T;
         // SAFETY: ptr is valid, aligned, and exclusively owned.
-        unsafe { ptr.write(value); }
+        unsafe {
+            ptr.write(value);
+        }
         Some(SlabBox { ptr })
     }
 
@@ -509,16 +542,22 @@ impl<T> SlabBox<T> {
 
 impl<T> core::ops::Deref for SlabBox<T> {
     type Target = T;
-    fn deref(&self) -> &T { unsafe { &*self.ptr } }
+    fn deref(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
 }
 
 impl<T> core::ops::DerefMut for SlabBox<T> {
-    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.ptr } }
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.ptr }
+    }
 }
 
 impl<T> Drop for SlabBox<T> {
     fn drop(&mut self) {
-        unsafe { ptr::drop_in_place(self.ptr); }
+        unsafe {
+            ptr::drop_in_place(self.ptr);
+        }
         slab_free(self.ptr as *mut u8, core::mem::size_of::<T>());
     }
 }

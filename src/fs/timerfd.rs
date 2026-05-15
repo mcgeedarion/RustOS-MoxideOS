@@ -42,23 +42,23 @@
 //! which carries the TABLE fdno directly.
 
 extern crate alloc;
+use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 use alloc::collections::BTreeMap;
 use spin::Mutex;
-use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 use crate::fs::scheme_table::Scheme;
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 
 // ── constants ──────────────────────────────────────────────────────────────────
 
 /// Raw fdno namespace for the TABLE.
 pub const TIMERFD_FD_BASE: usize = 0x6000_0000;
 
-pub const TFD_NONBLOCK:      u32 = 2048;
-pub const TFD_CLOEXEC:       u32 = 524288;
+pub const TFD_NONBLOCK: u32 = 2048;
+pub const TFD_CLOEXEC: u32 = 524288;
 pub const TFD_TIMER_ABSTIME: i32 = 1;
 
-const CLOCK_REALTIME:  u32 = 0;
+const CLOCK_REALTIME: u32 = 0;
 const CLOCK_MONOTONIC: u32 = 1;
 
 // ── data structures ─────────────────────────────────────────────────────────────
@@ -66,22 +66,20 @@ const CLOCK_MONOTONIC: u32 = 1;
 #[derive(Clone, Copy, Default)]
 pub struct ItimerspecNs {
     pub interval_ns: u64,
-    pub next_ns:     u64,
+    pub next_ns: u64,
 }
 
 #[derive(Clone, Copy)]
 pub struct TimerFdEntry {
-    pub spec:        ItimerspecNs,
+    pub spec: ItimerspecNs,
     pub expirations: u64,
     pub nonblocking: bool,
 }
 
 // ── global table ────────────────────────────────────────────────────────────────
 
-static TABLE: Mutex<BTreeMap<usize, TimerFdEntry>> =
-    Mutex::new(BTreeMap::new());
-static COUNTER: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static TABLE: Mutex<BTreeMap<usize, TimerFdEntry>> = Mutex::new(BTreeMap::new());
+static COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // ── scheme bfd → TABLE fdno translation ───────────────────────────────────────
 //
@@ -117,7 +115,11 @@ impl Scheme for TimerFdScheme {
     fn read(&self, fid: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
         let fdno = fid.0 as usize;
         let n = timerfd_read(fdno, buf);
-        if n < 0 { Err(SchemeError::Io) } else { Ok(n as usize) }
+        if n < 0 {
+            Err(SchemeError::Io)
+        } else {
+            Ok(n as usize)
+        }
     }
 
     /// timerfds are not writable.
@@ -125,15 +127,11 @@ impl Scheme for TimerFdScheme {
         Err(SchemeError::InvalidArg)
     }
 
-    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8)
-        -> Result<u64, SchemeError>
-    {
+    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8) -> Result<u64, SchemeError> {
         Err(SchemeError::InvalidArg)
     }
 
-    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize)
-        -> Result<usize, SchemeError>
-    {
+    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize) -> Result<usize, SchemeError> {
         Err(SchemeError::InvalidArg)
     }
 
@@ -147,47 +145,55 @@ impl Scheme for TimerFdScheme {
 // ── helpers ──────────────────────────────────────────────────────────────────────
 
 #[inline]
-fn now_ns() -> u64 { crate::time::monotonic_ns() }
+fn now_ns() -> u64 {
+    crate::time::monotonic_ns()
+}
 
 fn read_itimerspec(va: usize) -> Result<(u64, u64), isize> {
-    if !validate_user_ptr(va, 32) { return Err(-14); }
+    if !validate_user_ptr(va, 32) {
+        return Err(-14);
+    }
     let mut buf = [0u8; 32];
     copy_from_user(&mut buf, va).map_err(|_| -14isize)?;
-    let interval_sec  = i64::from_le_bytes(buf[ 0.. 8].try_into().unwrap());
-    let interval_nsec = i64::from_le_bytes(buf[ 8..16].try_into().unwrap());
-    let value_sec     = i64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let value_nsec    = i64::from_le_bytes(buf[24..32].try_into().unwrap());
-    let interval_ns = (interval_sec.max(0) as u64) * 1_000_000_000
-                    + (interval_nsec.max(0) as u64);
-    let value_ns    = (value_sec.max(0) as u64) * 1_000_000_000
-                    + (value_nsec.max(0) as u64);
+    let interval_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let interval_nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let value_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let value_nsec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
+    let interval_ns = (interval_sec.max(0) as u64) * 1_000_000_000 + (interval_nsec.max(0) as u64);
+    let value_ns = (value_sec.max(0) as u64) * 1_000_000_000 + (value_nsec.max(0) as u64);
     Ok((interval_ns, value_ns))
 }
 
 fn write_itimerspec(va: usize, interval_ns: u64, remaining_ns: u64) {
-    if va == 0 { return; }
-    let isec  = (interval_ns  / 1_000_000_000) as i64;
-    let insec = (interval_ns  % 1_000_000_000) as i64;
-    let rsec  = (remaining_ns / 1_000_000_000) as i64;
+    if va == 0 {
+        return;
+    }
+    let isec = (interval_ns / 1_000_000_000) as i64;
+    let insec = (interval_ns % 1_000_000_000) as i64;
+    let rsec = (remaining_ns / 1_000_000_000) as i64;
     let rnsec = (remaining_ns % 1_000_000_000) as i64;
     let mut buf = [0u8; 32];
-    buf[ 0.. 8].copy_from_slice(&isec .to_le_bytes());
-    buf[ 8..16].copy_from_slice(&insec.to_le_bytes());
-    buf[16..24].copy_from_slice(&rsec .to_le_bytes());
+    buf[0..8].copy_from_slice(&isec.to_le_bytes());
+    buf[8..16].copy_from_slice(&insec.to_le_bytes());
+    buf[16..24].copy_from_slice(&rsec.to_le_bytes());
     buf[24..32].copy_from_slice(&rnsec.to_le_bytes());
     let _ = copy_to_user(va, &buf);
 }
 
 fn tick(entry: &mut TimerFdEntry) {
-    if entry.spec.next_ns == 0 { return; }
+    if entry.spec.next_ns == 0 {
+        return;
+    }
     let now = now_ns();
-    if now < entry.spec.next_ns { return; }
+    if now < entry.spec.next_ns {
+        return;
+    }
     if entry.spec.interval_ns == 0 {
         entry.expirations += 1;
         entry.spec.next_ns = 0;
     } else {
         let elapsed = now - entry.spec.next_ns;
-        let full    = elapsed / entry.spec.interval_ns;
+        let full = elapsed / entry.spec.interval_ns;
         entry.expirations += full + 1;
         entry.spec.next_ns += (full + 1) * entry.spec.interval_ns;
     }
@@ -202,9 +208,9 @@ pub fn is_timerfd(fdno: usize) -> bool {
 // ── sys_timerfd_create [NR 283] ────────────────────────────────────────────────
 
 pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
-    use alloc::sync::Arc;
-    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
     use crate::fs::process_fd::proc_fd_install;
+    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
+    use alloc::sync::Arc;
 
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC => {}
@@ -212,14 +218,17 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
     }
 
     // ── 1. Allocate a raw TABLE fdno ──────────────────────────────────────────
-    let id         = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let id = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let table_fdno = TIMERFD_FD_BASE + id;
 
-    TABLE.lock().insert(table_fdno, TimerFdEntry {
-        spec:        ItimerspecNs::default(),
-        expirations: 0,
-        nonblocking: flags & TFD_NONBLOCK != 0,
-    });
+    TABLE.lock().insert(
+        table_fdno,
+        TimerFdEntry {
+            spec: ItimerspecNs::default(),
+            expirations: 0,
+            nonblocking: flags & TFD_NONBLOCK != 0,
+        },
+    );
 
     // ── 2. Register a TimerFdScheme in SCHEME_FD_STORE ─────────────────────
     //
@@ -230,9 +239,13 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
     scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
 
     // ── 3. Install scheme bfd into the process fd table ───────────────────
-    let pid           = crate::proc::scheduler::current_pid();
-    let install_flags = if flags & TFD_CLOEXEC != 0 { TFD_CLOEXEC } else { 0 };
-    let user_fd       = proc_fd_install(pid, scheme_bfd, None, install_flags, None);
+    let pid = crate::proc::scheduler::current_pid();
+    let install_flags = if flags & TFD_CLOEXEC != 0 {
+        TFD_CLOEXEC
+    } else {
+        0
+    };
+    let user_fd = proc_fd_install(pid, scheme_bfd, None, install_flags, None);
 
     user_fd as isize
 }
@@ -243,25 +256,26 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
 // resolved from the user-visible fd.  We translate to the TABLE fdno
 // via scheme_bfd_to_table_fdno.
 
-pub fn sys_timerfd_settime(scheme_bfd: usize, flags: i32,
-                           new_va: usize, old_va: usize) -> isize {
+pub fn sys_timerfd_settime(scheme_bfd: usize, flags: i32, new_va: usize, old_va: usize) -> isize {
     let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
         Some(f) => f,
-        None    => return -9, // EBADF
+        None => return -9, // EBADF
     };
     let (interval_ns, value_ns) = match read_itimerspec(new_va) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(e) => return e,
     };
     let mut tbl = TABLE.lock();
     let entry = match tbl.get_mut(&fdno) {
         Some(e) => e,
-        None    => return -9,
+        None => return -9,
     };
     if old_va != 0 {
         let remaining = if entry.spec.next_ns > 0 {
             entry.spec.next_ns.saturating_sub(now_ns())
-        } else { 0 };
+        } else {
+            0
+        };
         let old_interval = entry.spec.interval_ns;
         drop(tbl);
         write_itimerspec(old_va, old_interval, remaining);
@@ -275,8 +289,7 @@ pub fn sys_timerfd_settime(scheme_bfd: usize, flags: i32,
     0
 }
 
-fn entry_settime(entry: &mut TimerFdEntry,
-                 flags: i32, interval_ns: u64, value_ns: u64) {
+fn entry_settime(entry: &mut TimerFdEntry, flags: i32, interval_ns: u64, value_ns: u64) {
     entry.expirations = 0;
     if value_ns == 0 {
         entry.spec = ItimerspecNs::default();
@@ -293,21 +306,25 @@ fn entry_settime(entry: &mut TimerFdEntry,
 // ── sys_timerfd_gettime [NR 287 / 288] ────────────────────────────────────────
 
 pub fn sys_timerfd_gettime(scheme_bfd: usize, curr_va: usize) -> isize {
-    if !validate_user_ptr(curr_va, 32) { return -14; }
+    if !validate_user_ptr(curr_va, 32) {
+        return -14;
+    }
     let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
         Some(f) => f,
-        None    => return -9,
+        None => return -9,
     };
     let mut tbl = TABLE.lock();
     let entry = match tbl.get_mut(&fdno) {
         Some(e) => e,
-        None    => return -9,
+        None => return -9,
     };
     tick(entry);
-    let interval_ns  = entry.spec.interval_ns;
+    let interval_ns = entry.spec.interval_ns;
     let remaining_ns = if entry.spec.next_ns > 0 {
         entry.spec.next_ns.saturating_sub(now_ns())
-    } else { 0 };
+    } else {
+        0
+    };
     drop(tbl);
     write_itimerspec(curr_va, interval_ns, remaining_ns);
     0
@@ -316,7 +333,9 @@ pub fn sys_timerfd_gettime(scheme_bfd: usize, curr_va: usize) -> isize {
 // ── timerfd_read (called via TimerFdScheme::read) ───────────────────────────
 
 pub fn timerfd_read(fdno: usize, buf: &mut [u8]) -> isize {
-    if buf.len() < 8 { return -22; }
+    if buf.len() < 8 {
+        return -22;
+    }
     let deadline = now_ns() + 5_000_000_000;
     loop {
         {
@@ -329,12 +348,16 @@ pub fn timerfd_read(fdno: usize, buf: &mut [u8]) -> isize {
                     buf[..8].copy_from_slice(&val.to_le_bytes());
                     return 8;
                 }
-                if entry.nonblocking { return -11; }
+                if entry.nonblocking {
+                    return -11;
+                }
             } else {
                 return -9;
             }
         }
-        if now_ns() >= deadline { return -110; }
+        if now_ns() >= deadline {
+            return -110;
+        }
         crate::proc::scheduler::schedule();
         core::hint::spin_loop();
     }

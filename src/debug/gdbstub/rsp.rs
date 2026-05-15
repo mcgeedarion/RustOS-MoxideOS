@@ -20,12 +20,9 @@ use alloc::vec::Vec;
 
 use super::target::GdbTarget;
 use crate::proc::ptrace::{
-    UREG_COUNT, UREG_RIP, UREG_RSP, UREG_EFLAGS,
-    UREG_RAX, UREG_RBX, UREG_RCX, UREG_RDX,
-    UREG_RSI, UREG_RDI, UREG_RBP,
-    UREG_R8, UREG_R9, UREG_R10, UREG_R11,
-    UREG_R12, UREG_R13, UREG_R14, UREG_R15,
-    UREG_CS, UREG_SS,
+    UREG_COUNT, UREG_CS, UREG_EFLAGS, UREG_R10, UREG_R11, UREG_R12, UREG_R13, UREG_R14, UREG_R15,
+    UREG_R8, UREG_R9, UREG_RAX, UREG_RBP, UREG_RBX, UREG_RCX, UREG_RDI, UREG_RDX, UREG_RIP,
+    UREG_RSI, UREG_RSP, UREG_SS,
 };
 
 // ── RSP framing helpers ───────────────────────────────────────────────────────
@@ -51,7 +48,7 @@ fn decode_hex_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len() / 2);
     let mut i = 0;
     while i + 1 < b.len() {
-        if let (Some(hi), Some(lo)) = (from_hex(b[i]), from_hex(b[i+1])) {
+        if let (Some(hi), Some(lo)) = (from_hex(b[i]), from_hex(b[i + 1])) {
             out.push((hi << 4) | lo);
         }
         i += 2;
@@ -88,15 +85,39 @@ const GDB_REG_COUNT: usize = 32;
 
 fn gdb_reg_order() -> [usize; GDB_REG_COUNT] {
     [
-        UREG_RAX, UREG_RCX, UREG_RDX, UREG_RBX,
-        UREG_RSP, UREG_RBP, UREG_RSI, UREG_RDI,
-        UREG_R8,  UREG_R9,  UREG_R10, UREG_R11,
-        UREG_R12, UREG_R13, UREG_R14, UREG_R15,
-        UREG_RIP, UREG_EFLAGS, UREG_CS, UREG_SS,
+        UREG_RAX,
+        UREG_RCX,
+        UREG_RDX,
+        UREG_RBX,
+        UREG_RSP,
+        UREG_RBP,
+        UREG_RSI,
+        UREG_RDI,
+        UREG_R8,
+        UREG_R9,
+        UREG_R10,
+        UREG_R11,
+        UREG_R12,
+        UREG_R13,
+        UREG_R14,
+        UREG_R15,
+        UREG_RIP,
+        UREG_EFLAGS,
+        UREG_CS,
+        UREG_SS,
         // regs 20-31: fs/gs/ds/es + 8 padding
-        UREG_COUNT, UREG_COUNT, UREG_COUNT, UREG_COUNT,
-        UREG_COUNT, UREG_COUNT, UREG_COUNT, UREG_COUNT,
-        UREG_COUNT, UREG_COUNT, UREG_COUNT, UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
     ]
 }
 
@@ -105,7 +126,9 @@ fn gdb_reg_order() -> [usize; GDB_REG_COUNT] {
 /// Process one RSP packet body (without the `$` prefix and `#XX` suffix).
 /// Returns the response string (already framed with `rsp_packet`).
 pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
-    if body.is_empty() { return rsp_packet(""); }
+    if body.is_empty() {
+        return rsp_packet("");
+    }
 
     match body.as_bytes()[0] {
         // ── ? — stop reason ──────────────────────────────────────────────────
@@ -138,10 +161,14 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
             let order = gdb_reg_order();
             let mut regs = target.read_regs(); // start from current
             for (i, &idx) in order.iter().enumerate() {
-                if idx >= UREG_COUNT { continue; }
+                if idx >= UREG_COUNT {
+                    continue;
+                }
                 let off = i * 8;
-                if off + 8 > bytes.len() { break; }
-                regs[idx] = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+                if off + 8 > bytes.len() {
+                    break;
+                }
+                regs[idx] = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
             }
             target.write_regs(&regs);
             rsp_packet("OK")
@@ -153,7 +180,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
             let rest = &body[1..];
             let mut parts = rest.splitn(2, ',');
             let addr = parse_hex_u64(parts.next().unwrap_or(""));
-            let len  = parse_hex_u64(parts.next().unwrap_or("")) as usize;
+            let len = parse_hex_u64(parts.next().unwrap_or("")) as usize;
             let data = target.read_mem(addr, len);
             rsp_packet(&encode_hex_bytes(&data))
         }
@@ -164,7 +191,11 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
             let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
             let addr_len = &rest[..colon];
-            let hex_data = if colon < rest.len() { &rest[colon+1..] } else { "" };
+            let hex_data = if colon < rest.len() {
+                &rest[colon + 1..]
+            } else {
+                ""
+            };
             let mut al = addr_len.splitn(2, ',');
             let addr = parse_hex_u64(al.next().unwrap_or(""));
             let data = decode_hex_bytes(hex_data);

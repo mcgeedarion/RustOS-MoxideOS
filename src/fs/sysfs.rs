@@ -46,15 +46,14 @@ pub const SYSFS_FD_BASE: usize = 0x7000_0000;
 struct SysEntry {
     content: Vec<u8>,
     /// true when the fd was opened on a directory (getdents path)
-    is_dir:  bool,
+    is_dir: bool,
     /// canonical path stored so getdents can enumerate children
-    path:    String,
+    path: String,
 }
 
 static TABLE: Mutex<alloc::collections::BTreeMap<usize, SysEntry>> =
     Mutex::new(alloc::collections::BTreeMap::new());
-static COUNTER: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Returns true if `fdno` is a sysfs synthetic fd.
 pub fn is_sysfs_fd(fdno: usize) -> bool {
@@ -66,15 +65,18 @@ pub fn is_sysfs_fd(fdno: usize) -> bool {
 pub fn sysfs_open(path: &str) -> isize {
     let (content, is_dir) = match generate(path) {
         Some(pair) => pair,
-        None       => return -2,
+        None => return -2,
     };
-    let id   = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let id = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let fdno = SYSFS_FD_BASE + id;
-    TABLE.lock().insert(fdno, SysEntry {
-        content,
-        is_dir,
-        path: alloc::format!("{}", path),
-    });
+    TABLE.lock().insert(
+        fdno,
+        SysEntry {
+            content,
+            is_dir,
+            path: alloc::format!("{}", path),
+        },
+    );
     fdno as isize
 }
 
@@ -85,7 +87,9 @@ pub fn sysfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
         match tbl.get(&fdno) {
             None => return -9, // EBADF
             Some(e) => {
-                if e.is_dir || offset >= e.content.len() { return 0; }
+                if e.is_dir || offset >= e.content.len() {
+                    return 0;
+                }
                 let avail = &e.content[offset..];
                 let n = avail.len().min(buf.len());
                 avail[..n].to_vec()
@@ -104,7 +108,7 @@ pub fn sysfs_close(fdno: usize) {
 // ─── getdents support ───────────────────────────────────────────────────────
 
 pub struct DirEntry {
-    pub name:   String,
+    pub name: String,
     pub is_dir: bool,
 }
 
@@ -158,14 +162,14 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
     }
 
     // ── /sys/devices/system/cpu/* ────────────────────────────────────────────
-    if path == "/sys/devices"
-        || path == "/sys/devices/system"
-        || path == "/sys/devices/system/cpu" {
+    if path == "/sys/devices" || path == "/sys/devices/system" || path == "/sys/devices/system/cpu"
+    {
         return Some((Vec::new(), true));
     }
     if path == "/sys/devices/system/cpu/online"
         || path == "/sys/devices/system/cpu/possible"
-        || path == "/sys/devices/system/cpu/present" {
+        || path == "/sys/devices/system/cpu/present"
+    {
         let cpus = cpu_count();
         let mask = if cpus <= 1 {
             alloc::format!("0\n")
@@ -176,9 +180,7 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
     }
 
     // ── /sys/bus/pci* ───────────────────────────────────────────────────────
-    if path == "/sys/bus"
-        || path == "/sys/bus/pci"
-        || path == "/sys/bus/pci/devices" {
+    if path == "/sys/bus" || path == "/sys/bus/pci" || path == "/sys/bus/pci/devices" {
         return Some((Vec::new(), true));
     }
 
@@ -186,7 +188,8 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
     if path == "/sys/class"
         || path == "/sys/class/net"
         || path == "/sys/class/net/lo"
-        || path == "/sys/class/net/eth0" {
+        || path == "/sys/class/net/eth0"
+    {
         return Some((Vec::new(), true));
     }
     if path == "/sys/class/net/lo/operstate" {
@@ -224,34 +227,47 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
 /// Return the names of the immediate children of a sysfs directory.
 /// Returns None when the path is not a known directory.
 fn static_children(path: &str) -> Option<Vec<DirEntry>> {
-    let dir = |n: &str| DirEntry { name: alloc::format!("{}", n), is_dir: true  };
-    let fil = |n: &str| DirEntry { name: alloc::format!("{}", n), is_dir: false };
+    let dir = |n: &str| DirEntry {
+        name: alloc::format!("{}", n),
+        is_dir: true,
+    };
+    let fil = |n: &str| DirEntry {
+        name: alloc::format!("{}", n),
+        is_dir: false,
+    };
 
     let entries: Vec<DirEntry> = match path {
         "/sys" | "/sys/" => vec![
-            dir("kernel"), dir("devices"), dir("bus"),
-            dir("class"),  dir("block"),   dir("power"),
+            dir("kernel"),
+            dir("devices"),
+            dir("bus"),
+            dir("class"),
+            dir("block"),
+            dir("power"),
         ],
         "/sys/kernel" => vec![
-            fil("hostname"), fil("ostype"), fil("osrelease"),
-            fil("version"),  fil("pid_max"),fil("threads-max"),
-            fil("dmesg_restrict"), fil("perf_event_paranoid"),
+            fil("hostname"),
+            fil("ostype"),
+            fil("osrelease"),
+            fil("version"),
+            fil("pid_max"),
+            fil("threads-max"),
+            fil("dmesg_restrict"),
+            fil("perf_event_paranoid"),
             fil("randomize_va_space"),
         ],
-        "/sys/devices"                 => vec![dir("system")],
-        "/sys/devices/system"          => vec![dir("cpu")],
-        "/sys/devices/system/cpu"      => vec![
-            fil("online"), fil("possible"), fil("present"),
-        ],
-        "/sys/bus"                     => vec![dir("pci")],
-        "/sys/bus/pci"                 => vec![dir("devices")],
-        "/sys/bus/pci/devices"         => vec![],
-        "/sys/class"                   => vec![dir("net")],
-        "/sys/class/net"               => vec![dir("lo"), dir("eth0")],
-        "/sys/class/net/lo"            => vec![fil("operstate"), fil("mtu")],
-        "/sys/class/net/eth0"          => vec![fil("operstate"), fil("mtu")],
-        "/sys/block"                   => vec![],
-        "/sys/power"                   => vec![fil("state"), fil("wakeup_count")],
+        "/sys/devices" => vec![dir("system")],
+        "/sys/devices/system" => vec![dir("cpu")],
+        "/sys/devices/system/cpu" => vec![fil("online"), fil("possible"), fil("present")],
+        "/sys/bus" => vec![dir("pci")],
+        "/sys/bus/pci" => vec![dir("devices")],
+        "/sys/bus/pci/devices" => vec![],
+        "/sys/class" => vec![dir("net")],
+        "/sys/class/net" => vec![dir("lo"), dir("eth0")],
+        "/sys/class/net/lo" => vec![fil("operstate"), fil("mtu")],
+        "/sys/class/net/eth0" => vec![fil("operstate"), fil("mtu")],
+        "/sys/block" => vec![],
+        "/sys/power" => vec![fil("state"), fil("wakeup_count")],
         _ => return None,
     };
     Some(entries)
@@ -261,6 +277,12 @@ fn static_children(path: &str) -> Option<Vec<DirEntry>> {
 
 fn cpu_count() -> usize {
     let mut n = 0usize;
-    crate::acpi::with_cpus(|_| { n += 1; });
-    if n == 0 { 1 } else { n }
+    crate::acpi::with_cpus(|_| {
+        n += 1;
+    });
+    if n == 0 {
+        1
+    } else {
+        n
+    }
 }

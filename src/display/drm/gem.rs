@@ -12,7 +12,11 @@ pub struct GemObject {
 
 impl GemObject {
     pub fn new(handle: u32, size: usize) -> Self {
-        Self { handle, size, phys_addr: None }
+        Self {
+            handle,
+            size,
+            phys_addr: None,
+        }
     }
 
     pub fn pin(&mut self, phys_addr: u64) {

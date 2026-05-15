@@ -34,12 +34,12 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 // ── O_* constants ───────────────────────────────────────────────────────────────
-const O_RDONLY:   i32 = 0;
-const O_WRONLY:   i32 = 1;
-const O_RDWR:     i32 = 2;
-const O_CREAT:    u32 = 0o100;
-const O_TRUNC:    u32 = 0o1000;
-const O_APPEND:   u32 = 0o2000;
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+const O_RDWR: i32 = 2;
+const O_CREAT: u32 = 0o100;
+const O_TRUNC: u32 = 0o1000;
+const O_APPEND: u32 = 0o2000;
 const O_NONBLOCK: u32 = 0o4000;
 /// Public alias for O_CLOEXEC, used by io_syscalls::sys_dup.
 pub const O_CLOEXEC_FLAG: u32 = 0o2000000;
@@ -55,13 +55,13 @@ pub struct FdEntry {
     /// Kernel-internal backing fd (used with vfs/devfs/pipe/socket helpers).
     pub backing_fd: usize,
     /// VFS path, if this is a path-backed file (regular, directory, procfs, …).
-    pub path:       Option<String>,
+    pub path: Option<String>,
     /// FD_CLOEXEC — closed across execve.
-    pub cloexec:    bool,
+    pub cloexec: bool,
     /// O_NONBLOCK
-    pub nonblock:   bool,
+    pub nonblock: bool,
     /// Open-file status flags (O_RDONLY / O_WRONLY / O_RDWR / O_APPEND).
-    pub fl_flags:   i32,
+    pub fl_flags: i32,
 }
 
 impl FdEntry {
@@ -71,12 +71,16 @@ impl FdEntry {
             1 => O_WRONLY,
             _ => O_RDWR,
         };
-        let fl = if flags & O_APPEND != 0 { fl | 0o2000 } else { fl };
+        let fl = if flags & O_APPEND != 0 {
+            fl | 0o2000
+        } else {
+            fl
+        };
         FdEntry {
             backing_fd,
             path,
-            cloexec:  flags & O_CLOEXEC_FLAG != 0,
-            nonblock: flags & O_NONBLOCK      != 0,
+            cloexec: flags & O_CLOEXEC_FLAG != 0,
+            nonblock: flags & O_NONBLOCK != 0,
             fl_flags: fl,
         }
     }
@@ -92,22 +96,35 @@ struct ProcFdTable {
 impl ProcFdTable {
     fn alloc_fd(&self, min: usize) -> usize {
         let mut n = min;
-        while self.fds.contains_key(&n) { n += 1; }
+        while self.fds.contains_key(&n) {
+            n += 1;
+        }
         n
     }
 
-    fn get(&self, fd: usize) -> Option<&FdEntry> { self.fds.get(&fd) }
-    fn get_mut(&mut self, fd: usize) -> Option<&mut FdEntry> { self.fds.get_mut(&fd) }
-    fn insert(&mut self, fd: usize, e: FdEntry) { self.fds.insert(fd, e); }
-    fn remove(&mut self, fd: usize) -> Option<FdEntry> { self.fds.remove(&fd) }
-    fn len(&self) -> usize { self.fds.len() }
-    fn fds_vec(&self) -> Vec<usize> { self.fds.keys().cloned().collect() }
+    fn get(&self, fd: usize) -> Option<&FdEntry> {
+        self.fds.get(&fd)
+    }
+    fn get_mut(&mut self, fd: usize) -> Option<&mut FdEntry> {
+        self.fds.get_mut(&fd)
+    }
+    fn insert(&mut self, fd: usize, e: FdEntry) {
+        self.fds.insert(fd, e);
+    }
+    fn remove(&mut self, fd: usize) -> Option<FdEntry> {
+        self.fds.remove(&fd)
+    }
+    fn len(&self) -> usize {
+        self.fds.len()
+    }
+    fn fds_vec(&self) -> Vec<usize> {
+        self.fds.keys().cloned().collect()
+    }
 }
 
 // ── Global table: pid → ProcFdTable ─────────────────────────────────────────────────────
 
-static PROC_FD_TABLES: Mutex<BTreeMap<usize, ProcFdTable>> =
-    Mutex::new(BTreeMap::new());
+static PROC_FD_TABLES: Mutex<BTreeMap<usize, ProcFdTable>> = Mutex::new(BTreeMap::new());
 
 #[inline]
 fn current_pid() -> usize {
@@ -117,9 +134,8 @@ fn current_pid() -> usize {
 // ── RLIMIT_NOFILE check ─────────────────────────────────────────────────────────────
 
 fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
-    crate::proc::scheduler::with_proc(pid, |p| {
-        p.rlimits.exceeds_nofile(table.len())
-    }).unwrap_or(false)
+    crate::proc::scheduler::with_proc(pid, |p| p.rlimits.exceeds_nofile(table.len()))
+        .unwrap_or(false)
 }
 
 // ── dup_backing ────────────────────────────────────────────────────────────────
@@ -146,13 +162,17 @@ fn dup_backing(bfd: usize) -> usize {
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         bfd
     } else if crate::fs::procfs::is_procfs_fd(bfd)
-           || crate::fs::sysfs::is_sysfs_fd(bfd)
-           || crate::fs::cgroupfs::is_cgroupfs_fd(bfd)
+        || crate::fs::sysfs::is_sysfs_fd(bfd)
+        || crate::fs::cgroupfs::is_cgroupfs_fd(bfd)
     {
         bfd
     } else {
         let r = crate::fs::vfs::dup_from(bfd, bfd);
-        if r >= 0 { r as usize } else { bfd }
+        if r >= 0 {
+            r as usize
+        } else {
+            bfd
+        }
     }
 }
 
@@ -160,17 +180,45 @@ fn dup_backing(bfd: usize) -> usize {
 
 pub fn proc_fd_alloc(pid: usize, stdin_bfd: usize, stdout_bfd: usize, stderr_bfd: usize) {
     let mut table = ProcFdTable::default();
-    table.insert(0, FdEntry { backing_fd: stdin_bfd,  path: None, cloexec: false, nonblock: false, fl_flags: O_RDONLY });
-    table.insert(1, FdEntry { backing_fd: stdout_bfd, path: None, cloexec: false, nonblock: false, fl_flags: O_WRONLY });
-    table.insert(2, FdEntry { backing_fd: stderr_bfd, path: None, cloexec: false, nonblock: false, fl_flags: O_WRONLY });
+    table.insert(
+        0,
+        FdEntry {
+            backing_fd: stdin_bfd,
+            path: None,
+            cloexec: false,
+            nonblock: false,
+            fl_flags: O_RDONLY,
+        },
+    );
+    table.insert(
+        1,
+        FdEntry {
+            backing_fd: stdout_bfd,
+            path: None,
+            cloexec: false,
+            nonblock: false,
+            fl_flags: O_WRONLY,
+        },
+    );
+    table.insert(
+        2,
+        FdEntry {
+            backing_fd: stderr_bfd,
+            path: None,
+            cloexec: false,
+            nonblock: false,
+            fl_flags: O_WRONLY,
+        },
+    );
     PROC_FD_TABLES.lock().insert(pid, table);
 }
 
 pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
-    let parent_clone: Option<ProcFdTable> = {
-        PROC_FD_TABLES.lock().get(&parent_pid).cloned()
+    let parent_clone: Option<ProcFdTable> = { PROC_FD_TABLES.lock().get(&parent_pid).cloned() };
+    let parent = match parent_clone {
+        Some(t) => t,
+        None => return,
     };
-    let parent = match parent_clone { Some(t) => t, None => return };
 
     let mut child_table = ProcFdTable::default();
     for (fd, entry) in &parent.fds {
@@ -179,13 +227,16 @@ pub fn proc_fd_fork(parent_pid: usize, child_pid: usize) {
         } else {
             dup_backing(entry.backing_fd)
         };
-        child_table.insert(*fd, FdEntry {
-            backing_fd: new_bfd,
-            path:    entry.path.clone(),
-            cloexec: entry.cloexec,
-            nonblock: entry.nonblock,
-            fl_flags: entry.fl_flags,
-        });
+        child_table.insert(
+            *fd,
+            FdEntry {
+                backing_fd: new_bfd,
+                path: entry.path.clone(),
+                cloexec: entry.cloexec,
+                nonblock: entry.nonblock,
+                fl_flags: entry.fl_flags,
+            },
+        );
     }
     PROC_FD_TABLES.lock().insert(child_pid, child_table);
 }
@@ -195,7 +246,9 @@ pub fn proc_fd_close_on_exec(pid: usize) {
         let lock = PROC_FD_TABLES.lock();
         match lock.get(&pid) {
             None => return,
-            Some(t) => t.fds.iter()
+            Some(t) => t
+                .fds
+                .iter()
                 .filter(|(_, e)| e.cloexec)
                 .map(|(fd, e)| (*fd, e.backing_fd))
                 .collect(),
@@ -222,7 +275,9 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     {
         let lock = PROC_FD_TABLES.lock();
         if let Some(t) = lock.get(&pid) {
-            if check_nofile(pid, t) { return -24; }
+            if check_nofile(pid, t) {
+                return -24;
+            }
         }
     }
 
@@ -299,7 +354,9 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
             }
         };
 
-    if bfd < 0 { return bfd; }
+    if bfd < 0 {
+        return bfd;
+    }
     let bfd = bfd as usize;
 
     if flags & O_TRUNC != 0 && stored_path.is_some() {
@@ -319,14 +376,17 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
 }
 
 pub fn proc_fd_close(pid: usize, fd: usize) -> isize {
-    let entry = PROC_FD_TABLES.lock()
+    let entry = PROC_FD_TABLES
+        .lock()
         .get_mut(&pid)
         .and_then(|t| t.remove(fd));
 
     match entry {
         None => -9,
         Some(e) => {
-            if fd > 2 { close_backing(e.backing_fd); }
+            if fd > 2 {
+                close_backing(e.backing_fd);
+            }
             crate::fs::fcntl::close_fd_meta(e.backing_fd);
             0
         }
@@ -334,13 +394,15 @@ pub fn proc_fd_close(pid: usize, fd: usize) -> isize {
 }
 
 pub fn proc_fd_dup2(pid: usize, old_fd: usize, new_fd: usize) -> isize {
-    if old_fd == new_fd { return old_fd as isize; }
+    if old_fd == new_fd {
+        return old_fd as isize;
+    }
 
     let old_entry = {
         let lock = PROC_FD_TABLES.lock();
         match lock.get(&pid).and_then(|t| t.get(old_fd)).cloned() {
             Some(e) => e,
-            None    => return -9,
+            None => return -9,
         }
     };
 
@@ -349,14 +411,16 @@ pub fn proc_fd_dup2(pid: usize, old_fd: usize, new_fd: usize) -> isize {
 
     let new_entry = FdEntry {
         backing_fd: new_bfd,
-        path:       old_entry.path.clone(),
-        cloexec:    false,
-        nonblock:   old_entry.nonblock,
-        fl_flags:   old_entry.fl_flags,
+        path: old_entry.path.clone(),
+        cloexec: false,
+        nonblock: old_entry.nonblock,
+        fl_flags: old_entry.fl_flags,
     };
 
-    PROC_FD_TABLES.lock()
-        .entry(pid).or_default()
+    PROC_FD_TABLES
+        .lock()
+        .entry(pid)
+        .or_default()
         .insert(new_fd, new_entry);
 
     new_fd as isize
@@ -369,26 +433,29 @@ pub fn proc_fd_get(pid: usize, fd: usize) -> Option<FdEntry> {
 pub fn proc_fd_backing(pid: usize, fd: usize) -> isize {
     match proc_fd_get(pid, fd) {
         Some(e) => e.backing_fd as isize,
-        None    => -9,
+        None => -9,
     }
 }
 
 pub fn proc_fd_set_cloexec(pid: usize, fd: usize, val: bool) {
-    PROC_FD_TABLES.lock()
+    PROC_FD_TABLES
+        .lock()
         .get_mut(&pid)
         .and_then(|t| t.get_mut(fd))
         .map(|e| e.cloexec = val);
 }
 
 pub fn proc_fd_set_nonblock(pid: usize, fd: usize, val: bool) {
-    PROC_FD_TABLES.lock()
+    PROC_FD_TABLES
+        .lock()
         .get_mut(&pid)
         .and_then(|t| t.get_mut(fd))
         .map(|e| e.nonblock = val);
 }
 
 pub fn proc_fd_getfl(pid: usize, fd: usize) -> i32 {
-    PROC_FD_TABLES.lock()
+    PROC_FD_TABLES
+        .lock()
         .get(&pid)
         .and_then(|t| t.get(fd))
         .map(|e| e.fl_flags)
@@ -396,7 +463,8 @@ pub fn proc_fd_getfl(pid: usize, fd: usize) -> i32 {
 }
 
 pub fn proc_fd_setfl(pid: usize, fd: usize, flags: i32) {
-    PROC_FD_TABLES.lock()
+    PROC_FD_TABLES
+        .lock()
         .get_mut(&pid)
         .and_then(|t| t.get_mut(fd))
         .map(|e| {
@@ -406,25 +474,22 @@ pub fn proc_fd_setfl(pid: usize, fd: usize, flags: i32) {
 }
 
 pub fn proc_fd_path(pid: usize, fd: usize) -> Option<String> {
-    PROC_FD_TABLES.lock()
-        .get(&pid)?
-        .get(fd)?
-        .path
-        .clone()
+    PROC_FD_TABLES.lock().get(&pid)?.get(fd)?.path.clone()
 }
 
 pub fn proc_fd_list(pid: usize) -> Vec<usize> {
-    PROC_FD_TABLES.lock()
+    PROC_FD_TABLES
+        .lock()
         .get(&pid)
         .map(|t| t.fds_vec())
         .unwrap_or_default()
 }
 
 pub fn proc_fd_install(
-    pid:    usize,
-    bfd:    usize,
-    path:   Option<String>,
-    flags:  u32,
+    pid: usize,
+    bfd: usize,
+    path: Option<String>,
+    flags: u32,
     preferred: Option<usize>,
 ) -> usize {
     let entry = FdEntry::new(bfd, path, flags);
@@ -432,7 +497,7 @@ pub fn proc_fd_install(
     let table = lock.entry(pid).or_default();
     let fd = match preferred {
         Some(n) => n,
-        None    => table.alloc_fd(3),
+        None => table.alloc_fd(3),
     };
     table.insert(fd, entry);
     fd

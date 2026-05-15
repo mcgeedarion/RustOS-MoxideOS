@@ -1,1 +1,2 @@
-$(python3 -c "import json; d=json.load(open('/tmp/push_batches.json')); print(d[0][0]['content'])")
+// Legacy shim — code has moved to src/firmware/acpi/power.rs.
+pub use crate::firmware::acpi::power::*;

@@ -21,7 +21,11 @@ pub struct WaylandClient {
 
 impl WaylandClient {
     pub fn new(id: u32) -> Self {
-        Self { id, state: ClientState::Connecting, surface_ids: Vec::new() }
+        Self {
+            id,
+            state: ClientState::Connecting,
+            surface_ids: Vec::new(),
+        }
     }
 
     pub fn activate(&mut self) {
@@ -44,7 +48,10 @@ pub struct WaylandServer {
 
 impl WaylandServer {
     pub fn new() -> Self {
-        Self { clients: Vec::new(), next_client_id: 1 }
+        Self {
+            clients: Vec::new(),
+            next_client_id: 1,
+        }
     }
 
     pub fn connect_client(&mut self) -> u32 {

@@ -171,7 +171,16 @@ pub mod sbi {
     #[inline]
     pub fn probe_extension(eid: usize) -> bool {
         let r = unsafe {
-            sbi_call(SBI_EID_BASE, SBI_FID_BASE_PROBE_EXTENSION, eid, 0, 0, 0, 0, 0)
+            sbi_call(
+                SBI_EID_BASE,
+                SBI_FID_BASE_PROBE_EXTENSION,
+                eid,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
         };
         r.is_ok() && r.value != 0
     }
@@ -180,7 +189,16 @@ pub mod sbi {
     #[inline]
     pub fn spec_version() -> (u32, u32) {
         let r = unsafe {
-            sbi_call(SBI_EID_BASE, SBI_FID_BASE_GET_SPEC_VERSION, 0, 0, 0, 0, 0, 0)
+            sbi_call(
+                SBI_EID_BASE,
+                SBI_FID_BASE_GET_SPEC_VERSION,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
         };
         let v = r.value as u32;
         ((v >> 24) & 0x7f, v & 0x00ff_ffff)
@@ -189,17 +207,13 @@ pub mod sbi {
     /// Return the SBI implementation ID.
     #[inline]
     pub fn impl_id() -> usize {
-        unsafe {
-            sbi_call(SBI_EID_BASE, SBI_FID_BASE_GET_IMPL_ID, 0, 0, 0, 0, 0, 0).value
-        }
+        unsafe { sbi_call(SBI_EID_BASE, SBI_FID_BASE_GET_IMPL_ID, 0, 0, 0, 0, 0, 0).value }
     }
 
     /// Return the RISC-V `marchid` CSR value (M-mode; relayed via SBI).
     #[inline]
     pub fn marchid() -> usize {
-        unsafe {
-            sbi_call(SBI_EID_BASE, SBI_FID_BASE_GET_MARCHID, 0, 0, 0, 0, 0, 0).value
-        }
+        unsafe { sbi_call(SBI_EID_BASE, SBI_FID_BASE_GET_MARCHID, 0, 0, 0, 0, 0, 0).value }
     }
 
     // ── Console (legacy) ─────────────────────────────────────────────────────
@@ -253,7 +267,11 @@ pub mod sbi {
                 SBI_EID_TIMER,
                 SBI_FID_TIMER_SET_TIMER,
                 stime_value as usize,
-                0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )
         };
         if !r.is_ok() {
@@ -263,7 +281,11 @@ pub mod sbi {
                     SBI_EID_LEGACY_SET_TIMER,
                     0,
                     stime_value as usize,
-                    0, 0, 0, 0, 0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 );
             }
         }
@@ -283,7 +305,10 @@ pub mod sbi {
                 SBI_FID_IPI_SEND_IPI,
                 hart_mask,
                 hart_mask_base,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
             )
         }
     }
@@ -309,7 +334,8 @@ pub mod sbi {
                 hart_mask_base,
                 vaddr,
                 size,
-                0, 0,
+                0,
+                0,
             )
         }
     }
@@ -346,7 +372,10 @@ pub mod sbi {
                 SBI_FID_RFENCE_REMOTE_FENCE_I,
                 hart_mask,
                 hart_mask_base,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
             )
         }
     }
@@ -366,7 +395,9 @@ pub mod sbi {
                 hartid,
                 start_addr,
                 opaque,
-                0, 0, 0,
+                0,
+                0,
+                0,
             )
         }
     }
@@ -386,7 +417,11 @@ pub mod sbi {
                 SBI_EID_HSM,
                 SBI_FID_HSM_HART_GET_STATUS,
                 hartid,
-                0, 0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
+                0,
             )
         }
     }
@@ -404,7 +439,9 @@ pub mod sbi {
                 suspend_type,
                 resume_addr,
                 opaque,
-                0, 0, 0,
+                0,
+                0,
+                0,
             )
         }
     }
@@ -422,7 +459,10 @@ pub mod sbi {
                 SBI_FID_SRST_SYSTEM_RESET,
                 reset_type,
                 reset_reason,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
             )
         }
     }
@@ -549,9 +589,9 @@ pub const SATP_PPN_MASK: usize = (1 << 44) - 1;
 pub const SCAUSE_INTERRUPT_BIT: usize = 1 << 63;
 
 // Interrupt causes (SCAUSE_INTERRUPT_BIT set).
-pub const CAUSE_SSI: usize = SCAUSE_INTERRUPT_BIT | 1;  // S-mode software interrupt
-pub const CAUSE_STI: usize = SCAUSE_INTERRUPT_BIT | 5;  // S-mode timer interrupt
-pub const CAUSE_SEI: usize = SCAUSE_INTERRUPT_BIT | 9;  // S-mode external interrupt
+pub const CAUSE_SSI: usize = SCAUSE_INTERRUPT_BIT | 1; // S-mode software interrupt
+pub const CAUSE_STI: usize = SCAUSE_INTERRUPT_BIT | 5; // S-mode timer interrupt
+pub const CAUSE_SEI: usize = SCAUSE_INTERRUPT_BIT | 9; // S-mode external interrupt
 
 // Exception causes (SCAUSE_INTERRUPT_BIT clear).
 pub const CAUSE_INSTR_MISALIGN: usize = 0;
@@ -814,9 +854,7 @@ pub fn sfence_vma_all() {
 /// Flush the TLB entry for `vaddr` on this hart (all ASIDs).
 #[inline]
 pub fn sfence_vma_addr(vaddr: usize) {
-    unsafe {
-        asm!("sfence.vma {0}, zero", in(reg) vaddr, options(nostack, nomem))
-    }
+    unsafe { asm!("sfence.vma {0}, zero", in(reg) vaddr, options(nostack, nomem)) }
 }
 
 /// Flush the TLB entry for `vaddr` in the given `asid` on this hart.
@@ -834,9 +872,7 @@ pub fn sfence_vma_addr_asid(vaddr: usize, asid: usize) {
 /// Flush all TLB entries belonging to `asid` on this hart.
 #[inline]
 pub fn sfence_vma_asid(asid: usize) {
-    unsafe {
-        asm!("sfence.vma zero, {0}", in(reg) asid, options(nostack, nomem))
-    }
+    unsafe { asm!("sfence.vma zero, {0}", in(reg) asid, options(nostack, nomem)) }
 }
 
 /// Instruction-cache fence on this hart.
@@ -857,7 +893,12 @@ pub fn memory_fence() {
 /// Used by the MM subsystem after page-table modifications that affect shared
 /// address spaces (e.g. kernel mappings, COW promotion).
 #[inline]
-pub fn tlb_flush_range_all_harts(hart_mask: usize, hart_mask_base: usize, vaddr: usize, size: usize) {
+pub fn tlb_flush_range_all_harts(
+    hart_mask: usize,
+    hart_mask_base: usize,
+    vaddr: usize,
+    size: usize,
+) {
     sfence_vma_all();
     sbi::remote_sfence_vma(hart_mask, hart_mask_base, vaddr, size);
 }
@@ -1082,7 +1123,11 @@ pub fn current_hart_id() -> usize {
 #[inline]
 pub fn start_hart(hartid: usize, start_addr: usize, opaque: usize) -> Result<(), SbiRet> {
     let r = sbi::hart_start(hartid, start_addr, opaque);
-    if r.is_ok() { Ok(()) } else { Err(r) }
+    if r.is_ok() {
+        Ok(())
+    } else {
+        Err(r)
+    }
 }
 
 /// Stop the calling hart permanently (does not return on success).

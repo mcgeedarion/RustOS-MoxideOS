@@ -9,8 +9,7 @@ use alloc::string::{String, ToString};
 
 /// Return the cwd for `pid`.  Defaults to `"/"` if the process is not found.
 pub fn get_cwd(pid: usize) -> String {
-    crate::proc::scheduler::with_proc(pid, |p| p.cwd.clone())
-        .unwrap_or_else(|| String::from("/"))
+    crate::proc::scheduler::with_proc(pid, |p| p.cwd.clone()).unwrap_or_else(|| String::from("/"))
 }
 
 /// Set the cwd for `pid`.
@@ -44,8 +43,10 @@ fn canonicalise(path: &str) -> String {
     for seg in path.split('/') {
         match seg {
             "" | "." => {}
-            ".." => { parts.pop(); }
-            s    => parts.push(s),
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
         }
     }
     if parts.is_empty() {

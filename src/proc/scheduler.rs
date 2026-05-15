@@ -100,19 +100,19 @@
 //! dropped before the `Arc`, which means the `RwLock` is never freed while
 //! the guard still holds a reference into it.
 
-use core::cmp::Reverse;
-use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
-use crate::sync::spinlock::SpinLock;
-use crate::proc::process::{State, ProcLock};
 use crate::proc::proc_table;
+use crate::proc::process::{ProcLock, State};
 use crate::proc::task_types::TaskRunState;
+use crate::sync::spinlock::SpinLock;
+use alloc::{collections::BinaryHeap, collections::VecDeque, vec::Vec};
+use core::cmp::Reverse;
 
 // ── Constants ────────────────────────────────────────────────────────────────────────
 
-pub const TICK_NS:        u64 = 1_000_000;
-pub const NICE0_WEIGHT:   u64 = 1_024;
-pub const BALANCE_TICKS:  u64 = 10;
-pub const CPUMASK_ALL:    u64 = u64::MAX;
+pub const TICK_NS: u64 = 1_000_000;
+pub const NICE0_WEIGHT: u64 = 1_024;
+pub const BALANCE_TICKS: u64 = 10;
+pub const CPUMASK_ALL: u64 = u64::MAX;
 
 /// Fixed weight for SCHED_IDLE tasks — always 1, regardless of nice value.
 pub const IDLE_WEIGHT: u64 = 1;
@@ -126,16 +126,18 @@ pub const BATCH_WEIGHT_CAP: u64 = 820;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum SchedPolicy {
-    Normal   = 0,
-    Fifo     = 1,
-    Rr       = 2,
-    Batch    = 3,
-    Idle     = 5,
+    Normal = 0,
+    Fifo = 1,
+    Rr = 2,
+    Batch = 3,
+    Idle = 5,
     Deadline = 6,
 }
 
 impl Default for SchedPolicy {
-    fn default() -> Self { SchedPolicy::Normal }
+    fn default() -> Self {
+        SchedPolicy::Normal
+    }
 }
 
 impl SchedPolicy {
@@ -156,33 +158,41 @@ impl SchedPolicy {
 
 #[derive(Debug, Clone)]
 pub struct SchedEntity {
-    pub vruntime:          u64,
-    pub weight:            u64,
-    pub nice:              i8,
-    pub rt_priority:       u8,
-    pub dl_runtime:        u64,
-    pub dl_deadline:       u64,
-    pub dl_period:         u64,
-    pub dl_remaining:      u64,
-    pub dl_abs_deadline:   u64,
+    pub vruntime: u64,
+    pub weight: u64,
+    pub nice: i8,
+    pub rt_priority: u8,
+    pub dl_runtime: u64,
+    pub dl_deadline: u64,
+    pub dl_period: u64,
+    pub dl_remaining: u64,
+    pub dl_abs_deadline: u64,
     pub dl_next_replenish: u64,
-    pub policy:            SchedPolicy,
-    pub cpumask:           u64,
-    pub last_cpu:          u32,
-    pub on_rq:             bool,
+    pub policy: SchedPolicy,
+    pub cpumask: u64,
+    pub last_cpu: u32,
+    pub on_rq: bool,
 }
 
 impl Default for SchedEntity {
-    fn default() -> Self { Self::new(0) }
+    fn default() -> Self {
+        Self::new(0)
+    }
 }
 
 impl SchedEntity {
     pub fn new(nice: i8) -> Self {
         SchedEntity {
-            vruntime: 0, weight: nice_to_weight(nice), nice,
+            vruntime: 0,
+            weight: nice_to_weight(nice),
+            nice,
             rt_priority: 0,
-            dl_runtime: 0, dl_deadline: 0, dl_period: 0,
-            dl_remaining: 0, dl_abs_deadline: 0, dl_next_replenish: 0,
+            dl_runtime: 0,
+            dl_deadline: 0,
+            dl_period: 0,
+            dl_remaining: 0,
+            dl_abs_deadline: 0,
+            dl_next_replenish: 0,
             policy: SchedPolicy::Normal,
             cpumask: CPUMASK_ALL,
             last_cpu: 0,
@@ -190,19 +200,13 @@ impl SchedEntity {
         }
     }
 
-    pub fn set_deadline(
-        &mut self,
-        runtime_ns:  u64,
-        deadline_ns: u64,
-        period_ns:   u64,
-        now_ns:      u64,
-    ) {
-        self.dl_runtime          = runtime_ns;
-        self.dl_deadline         = deadline_ns;
-        self.dl_period           = period_ns.max(1);
-        self.dl_remaining        = runtime_ns;
-        self.dl_abs_deadline     = now_ns + deadline_ns;
-        self.dl_next_replenish   = now_ns + period_ns;
+    pub fn set_deadline(&mut self, runtime_ns: u64, deadline_ns: u64, period_ns: u64, now_ns: u64) {
+        self.dl_runtime = runtime_ns;
+        self.dl_deadline = deadline_ns;
+        self.dl_period = period_ns.max(1);
+        self.dl_remaining = runtime_ns;
+        self.dl_abs_deadline = now_ns + deadline_ns;
+        self.dl_next_replenish = now_ns + period_ns;
         self.policy = SchedPolicy::Deadline;
     }
 
@@ -217,23 +221,29 @@ impl SchedEntity {
 pub(crate) fn nice_to_weight(nice: i8) -> u64 {
     let n = nice.clamp(-20, 19) as i64;
     let base: u64 = 1024;
-    if n == 0 { return base; }
+    if n == 0 {
+        return base;
+    }
     if n > 0 {
         let mut w = base;
-        for _ in 0..n { w = w * 4 / 5; }
+        for _ in 0..n {
+            w = w * 4 / 5;
+        }
         w.max(1)
     } else {
         let mut w = base;
-        for _ in 0..(-n) { w = w * 5 / 4; }
+        for _ in 0..(-n) {
+            w = w * 5 / 4;
+        }
         w
     }
 }
 
 pub fn effective_weight(policy: SchedPolicy, nice: i8) -> u64 {
     match policy {
-        SchedPolicy::Idle  => IDLE_WEIGHT,
+        SchedPolicy::Idle => IDLE_WEIGHT,
         SchedPolicy::Batch => nice_to_weight(nice).min(BATCH_WEIGHT_CAP),
-        _                  => nice_to_weight(nice),
+        _ => nice_to_weight(nice),
     }
 }
 
@@ -242,7 +252,7 @@ pub fn effective_weight(policy: SchedPolicy, nice: i8) -> u64 {
 #[derive(Eq, PartialEq)]
 pub struct CfsEntry {
     pub vruntime: u64,
-    pub pid:      u32,
+    pub pid: u32,
     pub task_ptr: *mut crate::proc::task_types::Task,
 }
 impl Ord for CfsEntry {
@@ -261,15 +271,16 @@ unsafe impl Send for CfsEntry {}
 
 #[derive(Eq, PartialEq)]
 struct RtEntry {
-    rt_priority:  u8,
-    enqueue_seq:  Reverse<u64>,
-    pid:          u32,
-    task_ptr:     *mut crate::proc::task_types::Task,
+    rt_priority: u8,
+    enqueue_seq: Reverse<u64>,
+    pid: u32,
+    task_ptr: *mut crate::proc::task_types::Task,
 }
 
 impl Ord for RtEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        self.rt_priority.cmp(&other.rt_priority)
+        self.rt_priority
+            .cmp(&other.rt_priority)
             .then(self.enqueue_seq.cmp(&other.enqueue_seq))
     }
 }
@@ -285,8 +296,8 @@ unsafe impl Send for RtEntry {}
 #[derive(Eq, PartialEq)]
 struct DlEntry {
     abs_deadline: u64,
-    pid:          u32,
-    task_ptr:     *mut crate::proc::task_types::Task,
+    pid: u32,
+    task_ptr: *mut crate::proc::task_types::Task,
 }
 impl Ord for DlEntry {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
@@ -303,16 +314,16 @@ unsafe impl Send for DlEntry {}
 // ── Per-CPU RunQueue ───────────────────────────────────────────────────────────────
 
 pub struct RunQueue {
-    pub cfs_heap:            BinaryHeap<CfsEntry>,
-    pub min_vruntime:        u64,
-    pub rt_heap:             BinaryHeap<RtEntry>,
-    rt_seq:                  u64,
-    pub dl_heap:             BinaryHeap<DlEntry>,
-    pub batch_heap:          BinaryHeap<CfsEntry>,
-    pub idle_queue:          VecDeque<*mut crate::proc::task_types::Task>,
-    pub nr_running:          u32,
-    pub load_weight:         u64,
-    pub tick_count:          u64,
+    pub cfs_heap: BinaryHeap<CfsEntry>,
+    pub min_vruntime: u64,
+    pub rt_heap: BinaryHeap<RtEntry>,
+    rt_seq: u64,
+    pub dl_heap: BinaryHeap<DlEntry>,
+    pub batch_heap: BinaryHeap<CfsEntry>,
+    pub idle_queue: VecDeque<*mut crate::proc::task_types::Task>,
+    pub nr_running: u32,
+    pub load_weight: u64,
+    pub tick_count: u64,
     pub curr_vruntime_start: u64,
 }
 
@@ -321,30 +332,30 @@ unsafe impl Send for RunQueue {}
 impl RunQueue {
     pub const fn new() -> Self {
         RunQueue {
-            cfs_heap:            BinaryHeap::new(),
-            min_vruntime:        0,
-            rt_heap:             BinaryHeap::new(),
-            rt_seq:              0,
-            dl_heap:             BinaryHeap::new(),
-            batch_heap:          BinaryHeap::new(),
-            idle_queue:          VecDeque::new(),
-            nr_running:          0,
-            load_weight:         0,
-            tick_count:          0,
+            cfs_heap: BinaryHeap::new(),
+            min_vruntime: 0,
+            rt_heap: BinaryHeap::new(),
+            rt_seq: 0,
+            dl_heap: BinaryHeap::new(),
+            batch_heap: BinaryHeap::new(),
+            idle_queue: VecDeque::new(),
+            nr_running: 0,
+            load_weight: 0,
+            tick_count: 0,
             curr_vruntime_start: 0,
         }
     }
 
     pub fn enqueue(&mut self, task: *mut crate::proc::task_types::Task) {
         let t = unsafe { &mut *task };
-        self.nr_running  += 1;
+        self.nr_running += 1;
         self.load_weight += t.sched.weight;
         t.sched.on_rq = true;
         match t.sched.policy {
             SchedPolicy::Deadline => {
                 self.dl_heap.push(DlEntry {
                     abs_deadline: t.sched.dl_abs_deadline,
-                    pid:      t.pid,
+                    pid: t.pid,
                     task_ptr: task,
                 });
             }
@@ -354,8 +365,8 @@ impl RunQueue {
                 self.rt_heap.push(RtEntry {
                     rt_priority: t.sched.rt_priority,
                     enqueue_seq: Reverse(seq),
-                    pid:         t.pid,
-                    task_ptr:    task,
+                    pid: t.pid,
+                    task_ptr: task,
                 });
             }
             SchedPolicy::Normal => {
@@ -364,7 +375,7 @@ impl RunQueue {
                 }
                 self.cfs_heap.push(CfsEntry {
                     vruntime: t.sched.vruntime,
-                    pid:      t.pid,
+                    pid: t.pid,
                     task_ptr: task,
                 });
             }
@@ -374,7 +385,7 @@ impl RunQueue {
                 }
                 self.batch_heap.push(CfsEntry {
                     vruntime: t.sched.vruntime,
-                    pid:      t.pid,
+                    pid: t.pid,
                     task_ptr: task,
                 });
             }
@@ -388,7 +399,7 @@ impl RunQueue {
         self.cfs_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.nr_running = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
             if t.sched.vruntime > self.min_vruntime {
                 self.min_vruntime = t.sched.vruntime;
@@ -401,7 +412,7 @@ impl RunQueue {
         self.rt_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.nr_running = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
             e.task_ptr
         })
@@ -411,7 +422,7 @@ impl RunQueue {
         self.dl_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.nr_running = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
             e.task_ptr
         })
@@ -421,7 +432,7 @@ impl RunQueue {
         self.batch_heap.pop().map(|e| {
             let t = unsafe { &mut *e.task_ptr };
             t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.nr_running = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
             e.task_ptr
         })
@@ -431,26 +442,44 @@ impl RunQueue {
         self.idle_queue.pop_front().map(|task| {
             let t = unsafe { &mut *task };
             t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.nr_running = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
             task
         })
     }
 
     pub fn dequeue_next(&mut self) -> Option<*mut crate::proc::task_types::Task> {
-        if !self.dl_heap.is_empty()   { return self.dequeue_dl(); }
-        if !self.rt_heap.is_empty()   { return self.dequeue_rt(); }
-        if !self.cfs_heap.is_empty()  { return self.dequeue_cfs(); }
-        if !self.batch_heap.is_empty(){ return self.dequeue_batch(); }
-        if !self.idle_queue.is_empty(){ return self.dequeue_idle(); }
+        if !self.dl_heap.is_empty() {
+            return self.dequeue_dl();
+        }
+        if !self.rt_heap.is_empty() {
+            return self.dequeue_rt();
+        }
+        if !self.cfs_heap.is_empty() {
+            return self.dequeue_cfs();
+        }
+        if !self.batch_heap.is_empty() {
+            return self.dequeue_batch();
+        }
+        if !self.idle_queue.is_empty() {
+            return self.dequeue_idle();
+        }
         None
     }
 
     pub fn peek_next(&self) -> Option<u32> {
-        if let Some(e) = self.dl_heap.peek()   { return Some(e.pid); }
-        if let Some(e) = self.rt_heap.peek()   { return Some(e.pid); }
-        if let Some(e) = self.cfs_heap.peek()  { return Some(e.pid); }
-        if let Some(e) = self.batch_heap.peek(){ return Some(e.pid); }
+        if let Some(e) = self.dl_heap.peek() {
+            return Some(e.pid);
+        }
+        if let Some(e) = self.rt_heap.peek() {
+            return Some(e.pid);
+        }
+        if let Some(e) = self.cfs_heap.peek() {
+            return Some(e.pid);
+        }
+        if let Some(e) = self.batch_heap.peek() {
+            return Some(e.pid);
+        }
         if let Some(&tp) = self.idle_queue.front() {
             return Some(unsafe { (*tp).pid });
         }
@@ -465,14 +494,16 @@ impl RunQueue {
                 if e.pid == pid {
                     let t = unsafe { &mut *e.task_ptr };
                     t.sched.on_rq = false;
-                    self.nr_running  = self.nr_running.saturating_sub(1);
+                    self.nr_running = self.nr_running.saturating_sub(1);
                     self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
                     found = true;
                 } else {
                     self.rt_heap.push(e);
                 }
             }
-            if found { return true; }
+            if found {
+                return true;
+            }
         }
 
         {
@@ -482,14 +513,16 @@ impl RunQueue {
                 if e.pid == pid {
                     let t = unsafe { &mut *e.task_ptr };
                     t.sched.on_rq = false;
-                    self.nr_running  = self.nr_running.saturating_sub(1);
+                    self.nr_running = self.nr_running.saturating_sub(1);
                     self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
                     found = true;
                 } else {
                     self.cfs_heap.push(e);
                 }
             }
-            if found { return true; }
+            if found {
+                return true;
+            }
         }
 
         {
@@ -499,14 +532,16 @@ impl RunQueue {
                 if e.pid == pid {
                     let t = unsafe { &mut *e.task_ptr };
                     t.sched.on_rq = false;
-                    self.nr_running  = self.nr_running.saturating_sub(1);
+                    self.nr_running = self.nr_running.saturating_sub(1);
                     self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
                     found = true;
                 } else {
                     self.dl_heap.push(e);
                 }
             }
-            if found { return true; }
+            if found {
+                return true;
+            }
         }
 
         {
@@ -516,23 +551,27 @@ impl RunQueue {
                 if e.pid == pid {
                     let t = unsafe { &mut *e.task_ptr };
                     t.sched.on_rq = false;
-                    self.nr_running  = self.nr_running.saturating_sub(1);
+                    self.nr_running = self.nr_running.saturating_sub(1);
                     self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
                     found = true;
                 } else {
                     self.batch_heap.push(e);
                 }
             }
-            if found { return true; }
+            if found {
+                return true;
+            }
         }
 
-        if let Some(pos) = self.idle_queue.iter()
+        if let Some(pos) = self
+            .idle_queue
+            .iter()
             .position(|&tp| unsafe { (*tp).pid } == pid)
         {
             let task = self.idle_queue.remove(pos).unwrap();
             let t = unsafe { &mut *task };
             t.sched.on_rq = false;
-            self.nr_running  = self.nr_running.saturating_sub(1);
+            self.nr_running = self.nr_running.saturating_sub(1);
             self.load_weight = self.load_weight.saturating_sub(t.sched.weight);
             return true;
         }
@@ -546,14 +585,17 @@ impl RunQueue {
 pub fn schedule() {
     let cpu = crate::smp::percpu::current_cpu_id();
     let blk = crate::smp::percpu::current_block();
-    if blk.is_null() { schedule_early(); return; }
+    if blk.is_null() {
+        schedule_early();
+        return;
+    }
     let blk = unsafe { &mut *blk };
 
     let now = crate::time::clock::monotonic_ns();
 
     let prev_task = blk.current_task;
     if !prev_task.is_null() {
-        let prev    = unsafe { &mut *prev_task };
+        let prev = unsafe { &mut *prev_task };
         let elapsed = now.saturating_sub(blk.runqueue.curr_vruntime_start);
 
         match prev.sched.policy {
@@ -564,8 +606,7 @@ pub fn schedule() {
                 }
             }
             SchedPolicy::Deadline => {
-                prev.sched.dl_remaining =
-                    prev.sched.dl_remaining.saturating_sub(elapsed);
+                prev.sched.dl_remaining = prev.sched.dl_remaining.saturating_sub(elapsed);
             }
             _ => {}
         }
@@ -628,11 +669,14 @@ pub fn schedule() {
 
 fn schedule_early() {
     let next_pid_val = proc_table::with_procs_ro(|pl_vec| {
-        pl_vec.iter()
+        pl_vec
+            .iter()
             .find(|pl| pl.load_state() == State::Ready)
             .map(|pl| pl.pid)
     });
-    let Some(npid) = next_pid_val else { return; };
+    let Some(npid) = next_pid_val else {
+        return;
+    };
     CURRENT_PID.store(npid, core::sync::atomic::Ordering::Relaxed);
     proc_table::with_proc_mut(npid as usize, |pcb, pl| {
         pl.set_state(pcb, State::Running);
@@ -674,24 +718,32 @@ pub fn tick(cpu: u32) {
             let s = pl.load_state();
             let inner_opt = pl.inner.try_lock();
             if let Some(mut inner) = inner_opt {
-                if inner.sched.policy != SchedPolicy::Deadline { continue; }
-                if inner.sched.dl_remaining > 0              { continue; }
-                if now < inner.sched.dl_next_replenish       { continue; }
+                if inner.sched.policy != SchedPolicy::Deadline {
+                    continue;
+                }
+                if inner.sched.dl_remaining > 0 {
+                    continue;
+                }
+                if now < inner.sched.dl_next_replenish {
+                    continue;
+                }
                 let period = inner.sched.dl_period;
-                inner.sched.dl_remaining      = inner.sched.dl_runtime;
-                inner.sched.dl_abs_deadline   = now + inner.sched.dl_deadline;
+                inner.sched.dl_remaining = inner.sched.dl_runtime;
+                inner.sched.dl_abs_deadline = now + inner.sched.dl_deadline;
                 inner.sched.dl_next_replenish = now + period;
                 if !inner.task.is_null() {
                     let t = unsafe { &mut *inner.task };
-                    t.sched.dl_remaining      = inner.sched.dl_remaining;
-                    t.sched.dl_abs_deadline   = inner.sched.dl_abs_deadline;
+                    t.sched.dl_remaining = inner.sched.dl_remaining;
+                    t.sched.dl_abs_deadline = inner.sched.dl_abs_deadline;
                     t.sched.dl_next_replenish = inner.sched.dl_next_replenish;
                 }
                 if s == State::Blocked {
                     pl.set_state(&mut inner, State::Ready);
                     let task = inner.task;
                     drop(inner);
-                    if !task.is_null() { blk.runqueue.enqueue(task); }
+                    if !task.is_null() {
+                        blk.runqueue.enqueue(task);
+                    }
                 }
             }
         }
@@ -726,14 +778,12 @@ pub fn tick(cpu: u32) {
             if let Some(pl) = proc_table::find_proc_lock(t.pid as usize) {
                 let kill = {
                     let mut inner = pl.inner.lock();
-                    inner.rt_cpu_time_us = inner.rt_cpu_time_us
-                        .saturating_add(TICK_NS / 1000);
+                    inner.rt_cpu_time_us = inner.rt_cpu_time_us.saturating_add(TICK_NS / 1000);
                     let (soft, _) = crate::proc::rlimit::getrlimit_for(
                         t.pid as usize,
                         crate::proc::rlimit::RLIMIT_RTTIME,
                     );
-                    soft != crate::proc::rlimit::RLIM_INFINITY
-                        && inner.rt_cpu_time_us >= soft
+                    soft != crate::proc::rlimit::RLIM_INFINITY && inner.rt_cpu_time_us >= soft
                 };
                 if kill {
                     crate::proc::signal::send_signal(t.pid as usize, 24);
@@ -752,20 +802,25 @@ pub fn tick(cpu: u32) {
 #[derive(Copy, Clone)]
 struct RqSnapshot {
     load_weight: u64,
-    nr_running:  u32,
+    nr_running: u32,
 }
 
 fn load_balance(this_cpu: u32) {
     let ncpus = crate::smp::percpu::cpu_count();
-    if ncpus <= 1 { return; }
+    if ncpus <= 1 {
+        return;
+    }
 
-    let mut snapshots: [RqSnapshot; 64] = [RqSnapshot { load_weight: 0, nr_running: 0 }; 64];
+    let mut snapshots: [RqSnapshot; 64] = [RqSnapshot {
+        load_weight: 0,
+        nr_running: 0,
+    }; 64];
     let ncpus_clamped = (ncpus as usize).min(64);
     for cpu in 0..ncpus_clamped {
         let blk = unsafe { &crate::smp::percpu::PERCPU_BLOCKS[cpu] };
         snapshots[cpu] = RqSnapshot {
             load_weight: blk.runqueue.load_weight,
-            nr_running:  blk.runqueue.nr_running,
+            nr_running: blk.runqueue.nr_running,
         };
     }
 
@@ -777,15 +832,19 @@ fn load_balance(this_cpu: u32) {
             busiest_cpu = cpu as u32;
         }
     }
-    if busiest_cpu == this_cpu { return; }
+    if busiest_cpu == this_cpu {
+        return;
+    }
 
     let this_load = snapshots[this_cpu as usize].load_weight;
-    if max_load <= this_load + this_load / 4 { return; }
+    if max_load <= this_load + this_load / 4 {
+        return;
+    }
 
-    let busy_blk = unsafe {
-        &mut crate::smp::percpu::PERCPU_BLOCKS[busiest_cpu as usize]
-    };
-    if busy_blk.runqueue.nr_running <= 1 { return; }
+    let busy_blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[busiest_cpu as usize] };
+    if busy_blk.runqueue.nr_running <= 1 {
+        return;
+    }
 
     if let Some(task) = busy_blk.runqueue.dequeue_next() {
         let t = unsafe { &mut *task };
@@ -800,7 +859,8 @@ fn load_balance(this_cpu: u32) {
         t.sched.last_cpu = this_cpu;
         unsafe {
             crate::smp::percpu::PERCPU_BLOCKS[this_cpu as usize]
-                .runqueue.enqueue(task);
+                .runqueue
+                .enqueue(task);
         }
         crate::smp::ipi::send_reschedule(this_cpu);
     }
@@ -809,33 +869,49 @@ fn load_balance(this_cpu: u32) {
 // ── Enqueue helpers ───────────────────────────────────────────────────────────────
 
 pub fn enqueue_task(task: *mut crate::proc::task_types::Task) {
-    if task.is_null() { return; }
+    if task.is_null() {
+        return;
+    }
     let t = unsafe { &mut *task };
     let ncpus = crate::smp::percpu::cpu_count();
 
-    let mut best_cpu  = u32::MAX;
+    let mut best_cpu = u32::MAX;
     let mut best_load = u64::MAX;
     for cpu in 0..ncpus {
-        if !t.sched.cpu_allowed(cpu) { continue; }
+        if !t.sched.cpu_allowed(cpu) {
+            continue;
+        }
         let load = unsafe {
-            crate::smp::percpu::PERCPU_BLOCKS[cpu as usize].runqueue.load_weight
+            crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
+                .runqueue
+                .load_weight
         };
-        if load < best_load { best_load = load; best_cpu = cpu; }
+        if load < best_load {
+            best_load = load;
+            best_cpu = cpu;
+        }
     }
-    if best_cpu == u32::MAX { best_cpu = 0; }
+    if best_cpu == u32::MAX {
+        best_cpu = 0;
+    }
 
     t.sched.last_cpu = best_cpu;
     unsafe {
         crate::smp::percpu::PERCPU_BLOCKS[best_cpu as usize]
-            .runqueue.enqueue(task);
+            .runqueue
+            .enqueue(task);
     }
     crate::smp::ipi::send_reschedule(best_cpu);
 }
 
 pub fn schedule_on(task: *mut crate::proc::task_types::Task, cpu: u32) {
-    if task.is_null() { return; }
+    if task.is_null() {
+        return;
+    }
     let ncpus = crate::smp::percpu::cpu_count();
-    if cpu >= ncpus { return; }
+    if cpu >= ncpus {
+        return;
+    }
     let t = unsafe { &mut *task };
     let pid = t.pid;
     if t.sched.on_rq {
@@ -843,15 +919,17 @@ pub fn schedule_on(task: *mut crate::proc::task_types::Task, cpu: u32) {
         if prev_cpu < ncpus {
             unsafe {
                 crate::smp::percpu::PERCPU_BLOCKS[prev_cpu as usize]
-                    .runqueue.remove_pid(pid);
+                    .runqueue
+                    .remove_pid(pid);
             }
         }
     }
-    t.sched.cpumask  = 1u64 << cpu;
+    t.sched.cpumask = 1u64 << cpu;
     t.sched.last_cpu = cpu;
     unsafe {
-        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]\
-            .runqueue.enqueue(task);
+        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
+            .runqueue
+            .enqueue(task);
     }
     crate::smp::ipi::send_reschedule(cpu);
 }
@@ -870,11 +948,14 @@ pub fn block_current() {
     let cpu = crate::smp::percpu::current_cpu_id();
     unsafe {
         crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
-            .runqueue.remove_pid(pid);
+            .runqueue
+            .remove_pid(pid);
     }
     let blk = crate::smp::percpu::current_block();
     if !blk.is_null() {
-        unsafe { (*blk).current_task = core::ptr::null_mut(); }
+        unsafe {
+            (*blk).current_task = core::ptr::null_mut();
+        }
     }
     schedule();
 }
@@ -882,20 +963,28 @@ pub fn block_current() {
 pub fn wake_pid(pid: usize) {
     let pl = match proc_table::find_proc_lock(pid) {
         Some(p) => p,
-        None    => return,
+        None => return,
     };
-    if pl.load_state() != State::Blocked { return; }
+    if pl.load_state() != State::Blocked {
+        return;
+    }
 
     let task = {
         let mut inner = pl.inner.lock();
-        if inner.state != State::Blocked { return; }
+        if inner.state != State::Blocked {
+            return;
+        }
         pl.set_state(&mut inner, State::Ready);
         inner.task
     };
 
-    if task.is_null() { return; }
+    if task.is_null() {
+        return;
+    }
     let already = unsafe { (*task).sched.on_rq };
-    if !already { enqueue_task(task); }
+    if !already {
+        enqueue_task(task);
+    }
 }
 
 pub fn suspend_current_until_child_exec(_child_pid: usize) {
@@ -905,7 +994,7 @@ pub fn suspend_current_until_child_exec(_child_pid: usize) {
 // ── mm_lock helpers ─────────────────────────────────────────────────────────────
 
 pub struct MmReadGuard {
-    _arc:   alloc::sync::Arc<spin::RwLock<()>>,
+    _arc: alloc::sync::Arc<spin::RwLock<()>>,
     _guard: spin::RwLockReadGuard<'static, ()>,
 }
 
@@ -919,15 +1008,16 @@ pub fn with_current_mm_read() -> MmReadGuard {
         let raw: *const spin::RwLock<()> = alloc::sync::Arc::as_ptr(&arc);
         (*raw).read()
     };
-    MmReadGuard { _arc: arc, _guard: guard }
+    MmReadGuard {
+        _arc: arc,
+        _guard: guard,
+    }
 }
 
 // ── current_pid ───────────────────────────────────────────────────────────────────
 
-static CURRENT_PID: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-static NEXT_PID: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(1);
+static CURRENT_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static NEXT_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 pub fn next_pid() -> u32 {
     NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
@@ -944,7 +1034,9 @@ pub fn current_pid() -> u32 {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     }
     let blk_ref = unsafe { &*blk };
-    if blk_ref.current_pid != 0 { return blk_ref.current_pid; }
+    if blk_ref.current_pid != 0 {
+        return blk_ref.current_pid;
+    }
     let task = blk_ref.current_task;
     if task.is_null() {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
@@ -954,26 +1046,36 @@ pub fn current_pid() -> u32 {
 
 #[inline]
 pub fn with_proc<T, F>(pid: usize, f: F) -> Option<T>
-where F: FnOnce(&crate::proc::process::Pcb) -> T {
+where
+    F: FnOnce(&crate::proc::process::Pcb) -> T,
+{
     proc_table::with_proc(pid, f)
 }
 #[inline]
 pub fn with_proc_mut<T, F>(pid: usize, f: F) -> Option<T>
-where F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> T {
+where
+    F: FnOnce(&mut crate::proc::process::Pcb, &ProcLock) -> T,
+{
     proc_table::with_proc_mut(pid, f)
 }
 #[inline]
 pub fn with_procs_ro<T, F>(f: F) -> T
-where F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T {
+where
+    F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
+{
     proc_table::with_procs_ro(f)
 }
 #[inline]
 pub fn with_procs_mut<T, F>(f: F) -> T
-where F: FnOnce(&mut alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T {
+where
+    F: FnOnce(&mut alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
+{
     proc_table::with_procs_mut(f)
 }
 #[inline]
-pub fn enqueue(pcb: crate::proc::process::Pcb) { proc_table::enqueue(pcb) }
+pub fn enqueue(pcb: crate::proc::process::Pcb) {
+    proc_table::enqueue(pcb)
+}
 #[inline]
 pub fn task_ptr_for_pid(pid: usize) -> *mut crate::proc::task_types::Task {
     proc_table::task_ptr_for_pid(pid)
@@ -989,9 +1091,13 @@ pub fn thread_count_of(pid: usize) -> Option<usize> {
 #[inline]
 pub fn has_current_user_proc() -> bool {
     let blk = crate::smp::percpu::current_block();
-    if blk.is_null() { return false; }
+    if blk.is_null() {
+        return false;
+    }
     let task = unsafe { (*blk).current_task };
-    if task.is_null() { return false; }
+    if task.is_null() {
+        return false;
+    }
     unsafe { (*task).pid > 0 }
 }
 pub fn current_ppid() -> u32 {
@@ -1002,8 +1108,12 @@ pub fn ap_idle() -> ! {
     loop {
         schedule();
         #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("wfi", options(nostack, nomem)); }
+        unsafe {
+            core::arch::asm!("wfi", options(nostack, nomem));
+        }
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
+        unsafe {
+            core::arch::asm!("hlt", options(nostack, nomem));
+        }
     }
 }

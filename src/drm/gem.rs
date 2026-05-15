@@ -20,7 +20,12 @@ impl GemObject {
         if size == 0 {
             return Err(DrmError::HardwareError("GEM: zero-size allocation"));
         }
-        Ok(Self { handle, size, paddr, ref_count: 1 })
+        Ok(Self {
+            handle,
+            size,
+            paddr,
+            ref_count: 1,
+        })
     }
 
     pub fn get(&mut self) {

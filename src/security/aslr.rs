@@ -108,7 +108,12 @@ impl AslrLayout {
         let heap_base = aslr_heap_base();
         let mmap_base = aslr_mmap_base();
         let vdso_base = aslr_vdso_base(mmap_base);
-        AslrLayout { stack_top, heap_base, mmap_base, vdso_base }
+        AslrLayout {
+            stack_top,
+            heap_base,
+            mmap_base,
+            vdso_base,
+        }
     }
 
     /// Fixed layout for the kernel-thread / idle process (no user stack).

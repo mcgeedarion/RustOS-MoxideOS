@@ -35,23 +35,23 @@
 //! `PID_NS_TABLE: Mutex<BTreeMap<NsId, PidNsEntry>>`
 
 extern crate alloc;
+use crate::proc::namespace::{alloc_ns_id, NsId, INIT_NS};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::proc::namespace::{NsId, INIT_NS, alloc_ns_id};
 
 // ── Per-namespace entry ───────────────────────────────────────────────────────────
 
 struct PidNsEntry {
     /// Parent namespace.  INIT_NS entries have parent == INIT_NS (sentinel).
-    parent:   NsId,
+    parent: NsId,
     /// Global PID of the init process (PID 1 as seen inside this namespace).
     /// None until the first process is registered.
     init_pid: Option<usize>,
     /// Monotone local-PID counter; starts at 1.
-    counter:  u32,
+    counter: u32,
     /// global PID → local PID
-    map:  BTreeMap<usize, u32>,
+    map: BTreeMap<usize, u32>,
     /// local PID → global PID
     rmap: BTreeMap<u32, usize>,
 }
@@ -62,7 +62,7 @@ impl PidNsEntry {
             parent,
             init_pid: None,
             counter: 1,
-            map:  BTreeMap::new(),
+            map: BTreeMap::new(),
             rmap: BTreeMap::new(),
         }
     }
@@ -100,13 +100,13 @@ impl PidNsEntry {
 
 // ── Global registry ──────────────────────────────────────────────────────────────
 
-static PID_NS_TABLE: Mutex<BTreeMap<NsId, PidNsEntry>> =
-    Mutex::new(BTreeMap::new());
+static PID_NS_TABLE: Mutex<BTreeMap<NsId, PidNsEntry>> = Mutex::new(BTreeMap::new());
 
 /// Seed INIT_NS.  Called once from kernel init.
 pub fn init_pid_ns() {
     let mut tbl = PID_NS_TABLE.lock();
-    tbl.entry(INIT_NS).or_insert_with(|| PidNsEntry::new(INIT_NS));
+    tbl.entry(INIT_NS)
+        .or_insert_with(|| PidNsEntry::new(INIT_NS));
 }
 
 /// Create a new child PID namespace under `parent_ns` and return its NsId.
@@ -114,14 +114,18 @@ pub fn init_pid_ns() {
 /// Note: CLONE_NEWPID takes effect for *children*, not the caller.
 pub fn create_pid_ns(parent_ns: NsId) -> NsId {
     let new_id = alloc_ns_id();
-    PID_NS_TABLE.lock().insert(new_id, PidNsEntry::new(parent_ns));
+    PID_NS_TABLE
+        .lock()
+        .insert(new_id, PidNsEntry::new(parent_ns));
     new_id
 }
 
 /// Destroy a PID namespace when it is no longer referenced.
 /// No-op for INIT_NS.
 pub fn drop_pid_ns(ns: NsId) {
-    if ns == INIT_NS { return; }
+    if ns == INIT_NS {
+        return;
+    }
     PID_NS_TABLE.lock().remove(&ns);
 }
 
@@ -136,10 +140,12 @@ fn ancestor_chain(ns: NsId) -> Vec<NsId> {
     let mut cur = ns;
     for _ in 0..32 {
         chain.push(cur);
-        if cur == INIT_NS { break; }
+        if cur == INIT_NS {
+            break;
+        }
         match tbl.get(&cur) {
             Some(e) => cur = e.parent,
-            None    => break,
+            None => break,
         }
     }
     chain
@@ -150,16 +156,18 @@ fn ancestor_chain(ns: NsId) -> Vec<NsId> {
 /// Used by signal and ptrace permission checks: a process in `ancestor` can
 /// target a process in `descendant`.
 pub fn ns_is_ancestor_or_equal(ancestor: NsId, descendant: NsId) -> bool {
-    if ancestor == descendant { return true; }
+    if ancestor == descendant {
+        return true;
+    }
     // Walk descendant's parent chain looking for ancestor.
     let tbl = PID_NS_TABLE.lock();
     let mut cur = descendant;
     for _ in 0..32 {
         match tbl.get(&cur) {
             Some(e) if e.parent == ancestor => return true,
-            Some(e) if e.parent == INIT_NS  => return ancestor == INIT_NS,
+            Some(e) if e.parent == INIT_NS => return ancestor == INIT_NS,
             Some(e) => cur = e.parent,
-            None    => break,
+            None => break,
         }
     }
     false
@@ -183,7 +191,9 @@ pub fn register_pid(ns: NsId, global_pid: usize) -> u32 {
     let mut innermost_local: u32 = global_pid as u32;
     // Allocate from innermost (index 0) to outermost (INIT_NS).
     for &level_ns in &chain {
-        if level_ns == INIT_NS { break; } // identity — no allocation needed
+        if level_ns == INIT_NS {
+            break;
+        } // identity — no allocation needed
         if let Some(entry) = tbl.get_mut(&level_ns) {
             let local = entry.alloc(global_pid);
             if level_ns == ns {
@@ -199,7 +209,9 @@ pub fn register_pid(ns: NsId, global_pid: usize) -> u32 {
 /// Translate `global_pid` to its local PID as seen from namespace `ns`.
 /// Returns the global PID unchanged for INIT_NS or unregistered processes.
 pub fn local_pid(ns: NsId, global_pid: usize) -> usize {
-    if ns == INIT_NS { return global_pid; }
+    if ns == INIT_NS {
+        return global_pid;
+    }
     let tbl = PID_NS_TABLE.lock();
     tbl.get(&ns)
         .and_then(|e| e.local_of(global_pid))
@@ -209,7 +221,9 @@ pub fn local_pid(ns: NsId, global_pid: usize) -> usize {
 
 /// Translate a local PID (as seen in `ns`) back to the global PID.
 pub fn global_pid(ns: NsId, local: usize) -> usize {
-    if ns == INIT_NS { return local; }
+    if ns == INIT_NS {
+        return local;
+    }
     let tbl = PID_NS_TABLE.lock();
     tbl.get(&ns)
         .and_then(|e| e.global_of(local as u32))
@@ -224,7 +238,9 @@ pub fn global_pid(ns: NsId, local: usize) -> usize {
 ///
 /// Called from `exit::do_exit`.
 pub fn unregister_pid(ns: NsId, global_pid: usize) {
-    if ns == INIT_NS { return; }
+    if ns == INIT_NS {
+        return;
+    }
 
     // Check whether this is the namespace init *before* we remove the entry.
     let is_init = {
@@ -237,7 +253,9 @@ pub fn unregister_pid(ns: NsId, global_pid: usize) {
     {
         let mut tbl = PID_NS_TABLE.lock();
         for &level_ns in &chain {
-            if level_ns == INIT_NS { break; }
+            if level_ns == INIT_NS {
+                break;
+            }
             if let Some(e) = tbl.get_mut(&level_ns) {
                 e.remove(global_pid);
             }
@@ -272,8 +290,7 @@ fn kill_namespace(ns: NsId) {
 /// Used by `getpid(2)` (NR 39) and `gettid(2)` (NR 186).
 pub fn current_visible_pid() -> usize {
     let pid = crate::proc::scheduler::current_pid();
-    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.pid)
-        .unwrap_or(INIT_NS);
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.pid).unwrap_or(INIT_NS);
     local_pid(ns, pid)
 }
 
@@ -281,13 +298,15 @@ pub fn current_visible_pid() -> usize {
 /// If the parent lives *outside* this namespace, returns 0 (Linux convention).
 pub fn current_visible_ppid() -> usize {
     let pid = crate::proc::scheduler::current_pid();
-    let (ppid, ns) = crate::proc::scheduler::with_proc(pid, |p| (p.ppid, p.ns.pid))
-        .unwrap_or((0, INIT_NS));
-    if ns == INIT_NS { return ppid; }
+    let (ppid, ns) =
+        crate::proc::scheduler::with_proc(pid, |p| (p.ppid, p.ns.pid)).unwrap_or((0, INIT_NS));
+    if ns == INIT_NS {
+        return ppid;
+    }
     let tbl = PID_NS_TABLE.lock();
     match tbl.get(&ns).and_then(|e| e.local_of(ppid)) {
         Some(local) => local as usize,
-        None        => 0, // parent is outside (or above) this ns
+        None => 0, // parent is outside (or above) this ns
     }
 }
 

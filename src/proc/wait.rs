@@ -24,7 +24,9 @@ use crate::uaccess::copy_to_user;
 // ── wstatus encoding ──────────────────────────────────────────────────
 
 #[inline]
-pub fn encode_exit(code: i32) -> i32 { (code & 0xFF) << 8 }
+pub fn encode_exit(code: i32) -> i32 {
+    (code & 0xFF) << 8
+}
 
 #[inline]
 pub fn encode_signal(signum: u32, coredump: bool) -> i32 {
@@ -40,25 +42,27 @@ pub const WSTATUS_CONTINUED: i32 = 0xFFFF;
 
 // ── option flags ─────────────────────────────────────────────────────
 
-pub const WNOHANG:    u32 = 1;
-pub const WUNTRACED:  u32 = 2;
+pub const WNOHANG: u32 = 1;
+pub const WUNTRACED: u32 = 2;
 pub const WCONTINUED: u32 = 8;
-pub const WNOWAIT:    u32 = 0x01000000;
+pub const WNOWAIT: u32 = 0x01000000;
 
 // ── rusage ────────────────────────────────────────────────────────────
 
 const RUSAGE_SIZE: usize = 144;
 
 fn write_rusage(va: usize, utime_ns: u64, stime_ns: u64) {
-    if va == 0 { return; }
+    if va == 0 {
+        return;
+    }
     let mut buf = [0u8; RUSAGE_SIZE];
     // ru_utime (bytes 0..16)
-    let us  = utime_ns / 1_000_000_000;
+    let us = utime_ns / 1_000_000_000;
     let uus = (utime_ns % 1_000_000_000) / 1_000;
     buf[0..8].copy_from_slice(&us.to_ne_bytes());
     buf[8..16].copy_from_slice(&uus.to_ne_bytes());
     // ru_stime (bytes 16..32)
-    let ss  = stime_ns / 1_000_000_000;
+    let ss = stime_ns / 1_000_000_000;
     let sus = (stime_ns % 1_000_000_000) / 1_000;
     buf[16..24].copy_from_slice(&ss.to_ne_bytes());
     buf[24..32].copy_from_slice(&sus.to_ne_bytes());
@@ -68,9 +72,11 @@ fn write_rusage(va: usize, utime_ns: u64, stime_ns: u64) {
 // ── notify_exit ────────────────────────────────────────────────────────
 
 pub fn notify_exit(exited_pid: usize) {
-    let (ppid, exit_signal) = scheduler::with_proc(exited_pid, |p| (p.ppid, p.exit_signal))
-        .unwrap_or((0, 17));
-    if ppid == 0 { return; }
+    let (ppid, exit_signal) =
+        scheduler::with_proc(exited_pid, |p| (p.ppid, p.exit_signal)).unwrap_or((0, 17));
+    if ppid == 0 {
+        return;
+    }
 
     // Wake the parent's thread group — any thread can collect the child.
     scheduler::wake_pid(ppid);
@@ -80,7 +86,11 @@ pub fn notify_exit(exited_pid: usize) {
         // parent's process group, not just the ppid TID.
         let parent_tgid = {
             let t = crate::proc::thread::tgid_of(ppid);
-            if t != 0 { t } else { ppid }
+            if t != 0 {
+                t
+            } else {
+                ppid
+            }
         };
         crate::proc::signal::send_signal_group(parent_tgid, exit_signal as i32);
     }
@@ -95,7 +105,9 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     });
 
     let ppid = scheduler::with_proc(stopped_pid, |p| p.ppid).unwrap_or(0);
-    if ppid == 0 { return; }
+    if ppid == 0 {
+        return;
+    }
     scheduler::wake_pid(ppid);
 
     const SIGCHLD: usize = 17;
@@ -103,14 +115,22 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
 
     let nocldstop = scheduler::with_proc(ppid, |p| {
         let h = p.signal_handlers.lock();
-        h.flags.get(SIGCHLD).map(|&f| f & SA_NOCLDSTOP != 0).unwrap_or(false)
-    }).unwrap_or(false);
+        h.flags
+            .get(SIGCHLD)
+            .map(|&f| f & SA_NOCLDSTOP != 0)
+            .unwrap_or(false)
+    })
+    .unwrap_or(false);
 
     if !nocldstop {
         // Group-directed: any unblocked thread in the parent may handle it.
         let parent_tgid = {
             let t = crate::proc::thread::tgid_of(ppid);
-            if t != 0 { t } else { ppid }
+            if t != 0 {
+                t
+            } else {
+                ppid
+            }
         };
         crate::proc::signal::send_signal_group(parent_tgid, SIGCHLD as i32);
     }
@@ -124,7 +144,9 @@ pub fn notify_continue(cont_pid: usize) {
         pl.set_state(p, State::Continued);
     });
     let ppid = scheduler::with_proc(cont_pid, |p| p.ppid).unwrap_or(0);
-    if ppid != 0 { scheduler::wake_pid(ppid); }
+    if ppid != 0 {
+        scheduler::wake_pid(ppid);
+    }
 }
 
 // ── pid / pgid match predicate ──────────────────────────────────────────
@@ -132,17 +154,22 @@ pub fn notify_continue(cont_pid: usize) {
 #[inline]
 fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
     match wait_pid {
-        -1       => true,
-        0        => true,
+        -1 => true,
+        0 => true,
         n if n > 0 => p_pid == n as usize,
-        n        => p_pgid == (-n) as usize,
+        n => p_pgid == (-n) as usize,
     }
 }
 
 // ── WaitHit: result of one scan pass ──────────────────────────────────────
 
 enum WaitHit {
-    Harvested { child_pid: usize, wstatus: i32, utime_ns: u64, stime_ns: u64 },
+    Harvested {
+        child_pid: usize,
+        wstatus: i32,
+        utime_ns: u64,
+        stime_ns: u64,
+    },
     /// Matching children exist but none are in a waitable state yet.
     HasLiving,
     /// No child matches the requested pid/pgid at all.
@@ -160,11 +187,11 @@ pub fn sys_wait4(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize) 
 }
 
 fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize) -> isize {
-    let caller    = scheduler::current_pid();
-    let wnohang   = options & WNOHANG    != 0;
-    let wuntraced = options & WUNTRACED  != 0;
-    let wcont     = options & WCONTINUED != 0;
-    let nowait    = options & WNOWAIT    != 0;
+    let caller = scheduler::current_pid();
+    let wnohang = options & WNOHANG != 0;
+    let wuntraced = options & WUNTRACED != 0;
+    let wcont = options & WCONTINUED != 0;
+    let nowait = options & WNOWAIT != 0;
 
     loop {
         // Snapshot Arc vec; table lock released before we touch any inner lock.
@@ -174,13 +201,17 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
             for pl in pl_vec.iter() {
                 // Single lock call — no try_lock pre-filter (TOCTOU / deadlock risk).
                 let inner = pl.inner.lock();
-                let p_pid   = inner.pid;
-                let p_ppid  = inner.ppid;
-                let p_pgid  = inner.pgid;
+                let p_pid = inner.pid;
+                let p_ppid = inner.ppid;
+                let p_pgid = inner.pgid;
                 let p_state = inner.state;
 
-                if p_ppid != caller { continue; }
-                if !matches_pid(p_pid, p_pgid, pid) { continue; }
+                if p_ppid != caller {
+                    continue;
+                }
+                if !matches_pid(p_pid, p_pgid, pid) {
+                    continue;
+                }
 
                 // At least one matching child found.
                 any_child = true;
@@ -189,25 +220,25 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                     State::Zombie => {
                         return WaitHit::Harvested {
                             child_pid: p_pid,
-                            wstatus:   inner.exit_code,
-                            utime_ns:  inner.utime_ns,
-                            stime_ns:  inner.stime_ns,
+                            wstatus: inner.exit_code,
+                            utime_ns: inner.utime_ns,
+                            stime_ns: inner.stime_ns,
                         };
                     }
                     State::Stopped if wuntraced => {
                         return WaitHit::Harvested {
                             child_pid: p_pid,
-                            wstatus:   inner.exit_code,
-                            utime_ns:  inner.utime_ns,
-                            stime_ns:  inner.stime_ns,
+                            wstatus: inner.exit_code,
+                            utime_ns: inner.utime_ns,
+                            stime_ns: inner.stime_ns,
                         };
                     }
                     State::Continued if wcont => {
                         return WaitHit::Harvested {
                             child_pid: p_pid,
-                            wstatus:   WSTATUS_CONTINUED,
-                            utime_ns:  inner.utime_ns,
-                            stime_ns:  inner.stime_ns,
+                            wstatus: WSTATUS_CONTINUED,
+                            utime_ns: inner.utime_ns,
+                            stime_ns: inner.stime_ns,
                         };
                     }
                     _ => {}
@@ -216,11 +247,20 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                 drop(inner);
             }
 
-            if any_child { WaitHit::HasLiving } else { WaitHit::NoChild }
+            if any_child {
+                WaitHit::HasLiving
+            } else {
+                WaitHit::NoChild
+            }
         });
 
         match hit {
-            WaitHit::Harvested { child_pid, wstatus, utime_ns, stime_ns } => {
+            WaitHit::Harvested {
+                child_pid,
+                wstatus,
+                utime_ns,
+                stime_ns,
+            } => {
                 if !nowait {
                     scheduler::with_proc_mut(child_pid, |p, pl| {
                         match p.state {
@@ -236,14 +276,13 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                         }
                     });
                     // Remove zombie from table.
-                    let is_zombie = scheduler::with_proc(child_pid, |p| {
-                        p.state == State::Zombie
-                    }).unwrap_or(false);
+                    let is_zombie = scheduler::with_proc(child_pid, |p| p.state == State::Zombie)
+                        .unwrap_or(false);
                     if is_zombie {
                         scheduler::with_procs_mut(|pl_vec| {
-                            if let Some(idx) = pl_vec.iter().position(|pl| {
-                                pl.pid as usize == child_pid
-                            }) {
+                            if let Some(idx) =
+                                pl_vec.iter().position(|pl| pl.pid as usize == child_pid)
+                            {
                                 pl_vec.swap_remove(idx);
                             }
                         });
@@ -259,7 +298,9 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
 
             // POSIX: WNOHANG + matching children exist but none waitable -> 0.
             WaitHit::HasLiving => {
-                if wnohang { return 0; }
+                if wnohang {
+                    return 0;
+                }
                 scheduler::block_current();
                 if crate::proc::signal::has_pending_signal(caller) {
                     return -4; // EINTR
@@ -273,11 +314,36 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
 
 // ── wstatus decode helpers ─────────────────────────────────────────────────
 
-#[inline] pub fn wifexited(ws: i32)    -> bool { (ws & 0x7F) == 0 }
-#[inline] pub fn wexitstatus(ws: i32)  -> i32  { (ws >> 8) & 0xFF }
-#[inline] pub fn wifsignaled(ws: i32)  -> bool { let l = ws & 0x7F; l != 0 && l != 0x7F }
-#[inline] pub fn wtermsig(ws: i32)     -> i32  { ws & 0x7F }
-#[inline] pub fn wcoredump(ws: i32)    -> bool { ws & 0x80 != 0 }
-#[inline] pub fn wifstopped(ws: i32)   -> bool { (ws & 0xFF) == 0x7F }
-#[inline] pub fn wstopsig(ws: i32)     -> i32  { (ws >> 8) & 0xFF }
-#[inline] pub fn wifcontinued(ws: i32) -> bool { ws == WSTATUS_CONTINUED }
+#[inline]
+pub fn wifexited(ws: i32) -> bool {
+    (ws & 0x7F) == 0
+}
+#[inline]
+pub fn wexitstatus(ws: i32) -> i32 {
+    (ws >> 8) & 0xFF
+}
+#[inline]
+pub fn wifsignaled(ws: i32) -> bool {
+    let l = ws & 0x7F;
+    l != 0 && l != 0x7F
+}
+#[inline]
+pub fn wtermsig(ws: i32) -> i32 {
+    ws & 0x7F
+}
+#[inline]
+pub fn wcoredump(ws: i32) -> bool {
+    ws & 0x80 != 0
+}
+#[inline]
+pub fn wifstopped(ws: i32) -> bool {
+    (ws & 0xFF) == 0x7F
+}
+#[inline]
+pub fn wstopsig(ws: i32) -> i32 {
+    (ws >> 8) & 0xFF
+}
+#[inline]
+pub fn wifcontinued(ws: i32) -> bool {
+    ws == WSTATUS_CONTINUED
+}

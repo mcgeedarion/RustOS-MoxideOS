@@ -54,7 +54,11 @@ pub fn init() {
         (threshold_addr as *mut u32).write_volatile(0);
     }
 
-    crate::println!("plic: hart {} S-mode context {} threshold set to 0", hart, ctx);
+    crate::println!(
+        "plic: hart {} S-mode context {} threshold set to 0",
+        hart,
+        ctx
+    );
 }
 
 /// Enable a single interrupt source for this hart's S-mode context.
@@ -63,10 +67,12 @@ pub fn init() {
 /// `interrupts` property).
 pub fn enable_irq(irq: u32) {
     let base = PLIC_BASE.load(Ordering::Relaxed);
-    if base == 0 || irq == 0 { return; }
+    if base == 0 || irq == 0 {
+        return;
+    }
 
     let hart = crate::arch::riscv64::current_hart_id();
-    let ctx  = 2 * hart + 1;
+    let ctx = 2 * hart + 1;
     // enable array: PLIC_BASE + 0x0000_2000 + ctx * 0x80 + (irq / 32) * 4
     let word_addr = base + 0x0000_2000 + ctx * 0x80 + ((irq / 32) as usize) * 4;
     unsafe {
@@ -79,19 +85,25 @@ pub fn enable_irq(irq: u32) {
 /// Priority 0 effectively disables the source.
 pub fn set_priority(irq: u32, priority: u32) {
     let base = PLIC_BASE.load(Ordering::Relaxed);
-    if base == 0 || irq == 0 { return; }
+    if base == 0 || irq == 0 {
+        return;
+    }
     // priority[irq] at PLIC_BASE + irq * 4
     let addr = base + (irq as usize) * 4;
-    unsafe { (addr as *mut u32).write_volatile(priority & 0x7); }
+    unsafe {
+        (addr as *mut u32).write_volatile(priority & 0x7);
+    }
 }
 
 /// Claim the highest-priority pending interrupt for this hart's S-mode context.
 /// Returns the IRQ number, or 0 if none is pending.
 pub fn claim() -> u32 {
     let base = PLIC_BASE.load(Ordering::Relaxed);
-    if base == 0 { return 0; }
+    if base == 0 {
+        return 0;
+    }
     let hart = crate::arch::riscv64::current_hart_id();
-    let ctx  = 2 * hart + 1;
+    let ctx = 2 * hart + 1;
     let claim_addr = base + 0x0020_0000 + ctx * 0x1000 + 0x4;
     unsafe { (claim_addr as *const u32).read_volatile() }
 }
@@ -99,9 +111,13 @@ pub fn claim() -> u32 {
 /// Complete handling of `irq` for this hart's S-mode context.
 pub fn complete(irq: u32) {
     let base = PLIC_BASE.load(Ordering::Relaxed);
-    if base == 0 || irq == 0 { return; }
+    if base == 0 || irq == 0 {
+        return;
+    }
     let hart = crate::arch::riscv64::current_hart_id();
-    let ctx  = 2 * hart + 1;
+    let ctx = 2 * hart + 1;
     let complete_addr = base + 0x0020_0000 + ctx * 0x1000 + 0x4;
-    unsafe { (complete_addr as *mut u32).write_volatile(irq); }
+    unsafe {
+        (complete_addr as *mut u32).write_volatile(irq);
+    }
 }

@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 
 // Re-export the seek constants used by callers.
-pub use crate::fs::fcntl::{SEEK_SET, SEEK_CUR, SEEK_END};
+pub use crate::fs::fcntl::{SEEK_CUR, SEEK_END, SEEK_SET};
 
 // ── fd-table dispatch stubs ───────────────────────────────────────────────
 // These are thin forwarders into fcntl's fd table. They exist so callers
@@ -112,7 +112,7 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
 //   - stat fails for any reason
 pub fn inode_id_of_fd(fd: usize) -> Option<u64> {
     let path = crate::fs::fcntl::fd_get_path(fd)?;
-    let st   = crate::fs::vfs_ops::stat(&path).ok()?;
+    let st = crate::fs::vfs_ops::stat(&path).ok()?;
     Some(st.ino)
 }
 
@@ -139,12 +139,12 @@ pub fn inode_id_of_fd(fd: usize) -> Option<u64> {
 pub fn flush_fd(fd: usize, include_metadata: bool) -> isize {
     let path = match crate::fs::fcntl::fd_get_path(fd) {
         Some(p) => p,
-        None    => return -9,  // EBADF
+        None => return -9, // EBADF
     };
 
     // Resolve the mount to pick the right flush strategy.
     let h = match crate::fs::mount::resolve(&path) {
-        Ok(h)  => h,
+        Ok(h) => h,
         Err(e) => return e,
     };
 
@@ -207,14 +207,14 @@ where
 {
     // Fetch current timestamps via stat so we start from real values.
     let st = match crate::fs::vfs_ops::stat(path) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return,
     };
 
     let mut meta = InodeMeta {
         atime_ns: st.atime,
         mtime_ns: st.mtime,
-        _path:    alloc::string::ToString::to_string(path),
+        _path: alloc::string::ToString::to_string(path),
     };
 
     f(&mut meta);
@@ -248,11 +248,15 @@ where
 //   - mm/page_fault.rs: FileBacked VMA demand fault
 //   - fs/elf.rs:        ELF segment loading
 pub fn pread(fd: usize, buf: *mut u8, len: usize, offset: i64) -> isize {
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
 
     // Save current position.
     let saved = seek(fd, 0, SEEK_CUR);
-    if saved < 0 { return saved; }   // fd doesn't support seek (pipe, socket)
+    if saved < 0 {
+        return saved;
+    } // fd doesn't support seek (pipe, socket)
 
     // Seek to the requested offset.
     let seeked = seek(fd, offset, SEEK_SET);
@@ -292,11 +296,15 @@ pub fn pread(fd: usize, buf: *mut u8, len: usize, offset: i64) -> isize {
 // Called from:
 //   - fs/io_syscalls.rs: sys_pwrite64
 pub fn pwrite(fd: usize, buf: *const u8, len: usize, offset: i64) -> isize {
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
 
     // Save current position.
     let saved = seek(fd, 0, SEEK_CUR);
-    if saved < 0 { return saved; }   // fd doesn't support seek (pipe, socket)
+    if saved < 0 {
+        return saved;
+    } // fd doesn't support seek (pipe, socket)
 
     // Seek to the requested offset.
     let seeked = seek(fd, offset, SEEK_SET);

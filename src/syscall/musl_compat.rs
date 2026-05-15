@@ -19,8 +19,8 @@
 //! 9.  `clock_gettime(CLOCK_REALTIME, &ts)` — libc time initialisation
 //! 10. `futex(addr, FUTEX_WAIT, ...)` — threading (pthread_create path)
 
-use crate::proc::scheduler;
 use crate::arch;
+use crate::proc::scheduler;
 
 // ─── arch_prctl ────────────────────────────────────────────────────────────
 
@@ -76,7 +76,9 @@ pub fn sys_arch_prctl(code: u64, addr: u64) -> isize {
                 );
             }
             // Write val to user pointer.
-            unsafe { (addr as *mut u64).write_volatile(val); }
+            unsafe {
+                (addr as *mut u64).write_volatile(val);
+            }
             0
         }
         ARCH_SET_GS => {
@@ -135,7 +137,7 @@ pub fn sys_set_robust_list(head: u64, len: usize) -> isize {
 #[repr(C)]
 pub struct RobustListHead {
     /// Pointer to the first element of the robust list.
-    pub list:        u64,
+    pub list: u64,
     /// Per-thread futex offset.
     pub futex_offset: i64,
     /// List-op pending pointer.
@@ -154,7 +156,9 @@ pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> isize {
     let mut written = 0usize;
     while written + 8 <= buflen {
         let r = crate::rand::rdrand64();
-        unsafe { (buf.add(written) as *mut u64).write_unaligned(r); }
+        unsafe {
+            (buf.add(written) as *mut u64).write_unaligned(r);
+        }
         written += 8;
     }
     // Tail bytes.
@@ -162,7 +166,10 @@ pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> isize {
         let r = crate::rand::rdrand64();
         let tail = buflen - written;
         for i in 0..tail {
-            unsafe { buf.add(written + i).write_volatile(((r >> (i * 8)) & 0xFF) as u8); }
+            unsafe {
+                buf.add(written + i)
+                    .write_volatile(((r >> (i * 8)) & 0xFF) as u8);
+            }
         }
     }
     buflen as isize
@@ -179,16 +186,16 @@ pub struct Rlimit {
 
 const RLIM_INFINITY: u64 = u64::MAX;
 
-pub const RLIMIT_CPU:     u32 = 0;
-pub const RLIMIT_FSIZE:   u32 = 1;
-pub const RLIMIT_DATA:    u32 = 2;
-pub const RLIMIT_STACK:   u32 = 3;
-pub const RLIMIT_CORE:    u32 = 4;
-pub const RLIMIT_RSS:     u32 = 5;
-pub const RLIMIT_NPROC:   u32 = 6;
-pub const RLIMIT_NOFILE:  u32 = 7;
+pub const RLIMIT_CPU: u32 = 0;
+pub const RLIMIT_FSIZE: u32 = 1;
+pub const RLIMIT_DATA: u32 = 2;
+pub const RLIMIT_STACK: u32 = 3;
+pub const RLIMIT_CORE: u32 = 4;
+pub const RLIMIT_RSS: u32 = 5;
+pub const RLIMIT_NPROC: u32 = 6;
+pub const RLIMIT_NOFILE: u32 = 7;
 pub const RLIMIT_MEMLOCK: u32 = 8;
-pub const RLIMIT_AS:      u32 = 9;
+pub const RLIMIT_AS: u32 = 9;
 
 /// `prlimit64(pid, resource, new_limit, old_limit)` — get/set resource limits.
 /// musl only queries `RLIMIT_STACK` during startup to decide guard page size.
@@ -200,23 +207,28 @@ pub fn sys_prlimit64(
 ) -> isize {
     // Default limits table.
     let defaults: [(u64, u64); 10] = [
-        (RLIM_INFINITY, RLIM_INFINITY), // CPU
-        (RLIM_INFINITY, RLIM_INFINITY), // FSIZE
-        (RLIM_INFINITY, RLIM_INFINITY), // DATA
+        (RLIM_INFINITY, RLIM_INFINITY),   // CPU
+        (RLIM_INFINITY, RLIM_INFINITY),   // FSIZE
+        (RLIM_INFINITY, RLIM_INFINITY),   // DATA
         (8 * 1024 * 1024, RLIM_INFINITY), // STACK: 8 MiB soft
-        (0, 0),                          // CORE: disabled
-        (RLIM_INFINITY, RLIM_INFINITY), // RSS
-        (1024, 1024),                   // NPROC
-        (1024, 4096),                   // NOFILE
-        (64 * 1024, 64 * 1024),         // MEMLOCK
-        (RLIM_INFINITY, RLIM_INFINITY), // AS
+        (0, 0),                           // CORE: disabled
+        (RLIM_INFINITY, RLIM_INFINITY),   // RSS
+        (1024, 1024),                     // NPROC
+        (1024, 4096),                     // NOFILE
+        (64 * 1024, 64 * 1024),           // MEMLOCK
+        (RLIM_INFINITY, RLIM_INFINITY),   // AS
     ];
     if resource >= 10 {
         return -(crate::syscall::errno::EINVAL as isize);
     }
     if !old_limit.is_null() {
         let (cur, max) = defaults[resource as usize];
-        unsafe { old_limit.write_volatile(Rlimit { rlim_cur: cur, rlim_max: max }); }
+        unsafe {
+            old_limit.write_volatile(Rlimit {
+                rlim_cur: cur,
+                rlim_max: max,
+            });
+        }
     }
     // Ignore new_limit for now (full enforcement is future work).
     let _ = new_limit;
@@ -238,7 +250,10 @@ pub fn sys_rustos_debug_print(msg_ptr: u64) -> isize {
     use crate::uaccess::copy_str_from_user;
     let mut buf = [0u8; 256];
     match copy_str_from_user(msg_ptr, &mut buf) {
-        Ok(s) => { log::debug!("[userspace] {}", s); 0 }
+        Ok(s) => {
+            log::debug!("[userspace] {}", s);
+            0
+        }
         Err(_) => -(crate::syscall::errno::EFAULT as isize),
     }
 }

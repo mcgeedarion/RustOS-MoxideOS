@@ -15,7 +15,15 @@ pub struct Surface {
 
 impl Surface {
     pub fn new(id: u32) -> Self {
-        Self { id, width: 0, height: 0, buffer_id: None, x: 0, y: 0, visible: false }
+        Self {
+            id,
+            width: 0,
+            height: 0,
+            buffer_id: None,
+            x: 0,
+            y: 0,
+            visible: false,
+        }
     }
 
     pub fn attach_buffer(&mut self, buffer_id: u32, width: u32, height: u32) {
@@ -37,7 +45,10 @@ pub struct Compositor {
 
 impl Compositor {
     pub fn new() -> Self {
-        Self { surfaces: Vec::new(), next_id: 1 }
+        Self {
+            surfaces: Vec::new(),
+            next_id: 1,
+        }
     }
 
     pub fn create_surface(&mut self) -> u32 {

@@ -3,16 +3,17 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 pub const MSR_IA32_APIC_BASE: u32 = 0x1B;
-pub const MSR_EFER:           u32 = 0xC000_0080;
-pub const MSR_STAR:           u32 = 0xC000_0081;
-pub const MSR_LSTAR:          u32 = 0xC000_0082;
-pub const MSR_FMASK:          u32 = 0xC000_0084;
+pub const MSR_EFER: u32 = 0xC000_0080;
+pub const MSR_STAR: u32 = 0xC000_0081;
+pub const MSR_LSTAR: u32 = 0xC000_0082;
+pub const MSR_FMASK: u32 = 0xC000_0084;
 pub const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
-pub const MSR_FS_BASE:        u32 = 0xC000_0100;
+pub const MSR_FS_BASE: u32 = 0xC000_0100;
 
 #[inline(always)]
 pub unsafe fn rdmsr(msr: u32) -> u64 {
-    let lo: u32; let hi: u32;
+    let lo: u32;
+    let hi: u32;
     core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nostack));
     (hi as u64) << 32 | lo as u64
 }
@@ -91,5 +92,9 @@ fn cpuid1_ecx() -> u32 {
     ecx
 }
 
-pub fn has_xsave() -> bool { cpuid1_ecx() & (1 << 26) != 0 }
-pub fn has_avx()   -> bool { cpuid1_ecx() & (1 << 28) != 0 }
+pub fn has_xsave() -> bool {
+    cpuid1_ecx() & (1 << 26) != 0
+}
+pub fn has_avx() -> bool {
+    cpuid1_ecx() & (1 << 28) != 0
+}

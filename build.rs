@@ -55,14 +55,17 @@ fn assemble_riscv_uentry(out: &PathBuf) {
 // `cargo build` a second time will always find it.
 fn produce_uefi_image(out: &PathBuf) {
     let out_str = out.to_string_lossy();
-    let profile = if out_str.contains("/release/") { "release" } else { "debug" };
+    let profile = if out_str.contains("/release/") {
+        "release"
+    } else {
+        "debug"
+    };
     let elf_path = format!("target/x86_64-unknown-none/{profile}/rustos");
 
     println!("cargo:rerun-if-changed={elf_path}");
 
     let esp_dir = PathBuf::from("target/esp/EFI/BOOT");
-    std::fs::create_dir_all(&esp_dir)
-        .unwrap_or_else(|e| eprintln!("build.rs: mkdir esp: {e}"));
+    std::fs::create_dir_all(&esp_dir).unwrap_or_else(|e| eprintln!("build.rs: mkdir esp: {e}"));
     let efi_path = esp_dir.join("BOOTX64.EFI");
 
     let objcopy_bin = locate_llvm_objcopy();

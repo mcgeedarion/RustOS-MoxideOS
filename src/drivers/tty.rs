@@ -32,14 +32,18 @@ const TTY_BUF_SIZE: usize = 512;
 // ── Line buffer ─────────────────────────────────────────────────────────────
 
 struct LineBuf {
-    data:   [u8; TTY_BUF_SIZE],
-    len:    usize,
-    ready:  bool,
+    data: [u8; TTY_BUF_SIZE],
+    len: usize,
+    ready: bool,
 }
 
 impl LineBuf {
     const fn new() -> Self {
-        Self { data: [0u8; TTY_BUF_SIZE], len: 0, ready: false }
+        Self {
+            data: [0u8; TTY_BUF_SIZE],
+            len: 0,
+            ready: false,
+        }
     }
 
     fn push_char(&mut self, c: char) {
@@ -52,7 +56,10 @@ impl LineBuf {
             }
             '\n' | '\r' => {
                 tty_echo(b"\r\n");
-                if self.len < TTY_BUF_SIZE { self.data[self.len] = b'\n'; self.len += 1; }
+                if self.len < TTY_BUF_SIZE {
+                    self.data[self.len] = b'\n';
+                    self.len += 1;
+                }
                 self.ready = true;
             }
             c if c.is_ascii() => {
@@ -68,12 +75,14 @@ impl LineBuf {
     }
 
     fn read_into(&mut self, dst: &mut [u8]) -> usize {
-        if !self.ready { return 0; }
+        if !self.ready {
+            return 0;
+        }
         let n = self.len.min(dst.len());
         dst[..n].copy_from_slice(&self.data[..n]);
         let remaining = self.len - n;
-        self.data.copy_within(n..n+remaining, 0);
-        self.len   = remaining;
+        self.data.copy_within(n..n + remaining, 0);
+        self.len = remaining;
         self.ready = self.data[..remaining].contains(&b'\n');
         n
     }
@@ -82,21 +91,32 @@ impl LineBuf {
 // ── Output ring ─────────────────────────────────────────────────────────────
 
 struct OutRing {
-    buf:  [u8; TTY_BUF_SIZE],
+    buf: [u8; TTY_BUF_SIZE],
     head: usize,
     tail: usize,
 }
 
 impl OutRing {
-    const fn new() -> Self { Self { buf: [0u8; TTY_BUF_SIZE], head: 0, tail: 0 } }
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; TTY_BUF_SIZE],
+            head: 0,
+            tail: 0,
+        }
+    }
     fn push(&mut self, bytes: &[u8]) {
         for &b in bytes {
             let next = (self.head + 1) & (TTY_BUF_SIZE - 1);
-            if next != self.tail { self.buf[self.head] = b; self.head = next; }
+            if next != self.tail {
+                self.buf[self.head] = b;
+                self.head = next;
+            }
         }
     }
     fn pop(&mut self) -> Option<u8> {
-        if self.head == self.tail { return None; }
+        if self.head == self.tail {
+            return None;
+        }
         let b = self.buf[self.tail];
         self.tail = (self.tail + 1) & (TTY_BUF_SIZE - 1);
         Some(b)
@@ -105,11 +125,14 @@ impl OutRing {
 
 // ── Global state ────────────────────────────────────────────────────────────
 
-struct TtyState { line: LineBuf, out: OutRing }
+struct TtyState {
+    line: LineBuf,
+    out: OutRing,
+}
 
 static TTY: Mutex<TtyState> = Mutex::new(TtyState {
     line: LineBuf::new(),
-    out:  OutRing::new(),
+    out: OutRing::new(),
 });
 
 fn tty_echo(bytes: &[u8]) {
@@ -127,23 +150,38 @@ pub fn tty_keyboard_tick() {
     let mut n = 0usize;
     while n < chars.len() {
         match crate::drivers::keyboard::read_char() {
-            Some(c) if c.is_ascii() => { chars[n] = c as u8; n += 1; }
+            Some(c) if c.is_ascii() => {
+                chars[n] = c as u8;
+                n += 1;
+            }
             Some(_) => {}
-            None    => break,
+            None => break,
         }
     }
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     let mut tty = TTY.lock();
-    for &b in &chars[..n] { tty.line.push_char(b as char); }
+    for &b in &chars[..n] {
+        tty.line.push_char(b as char);
+    }
 }
 
-pub fn tty_line_ready() -> bool { TTY.lock().line.ready }
+pub fn tty_line_ready() -> bool {
+    TTY.lock().line.ready
+}
 
-pub fn tty_read(buf: &mut [u8]) -> usize { TTY.lock().line.read_into(buf) }
+pub fn tty_read(buf: &mut [u8]) -> usize {
+    TTY.lock().line.read_into(buf)
+}
 
 pub fn tty_write(bytes: &[u8]) {
-    for &b in bytes { crate::arch::x86_64::serial::serial_write_byte(b); }
+    for &b in bytes {
+        crate::arch::x86_64::serial::serial_write_byte(b);
+    }
     TTY.lock().out.push(bytes);
 }
 
-pub fn tty_out_pop() -> Option<u8> { TTY.lock().out.pop() }
+pub fn tty_out_pop() -> Option<u8> {
+    TTY.lock().out.pop()
+}

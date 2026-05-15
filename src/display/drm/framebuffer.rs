@@ -23,7 +23,15 @@ impl FramebufferDesc {
         depth: u32,
         gem_handle: u32,
     ) -> Self {
-        Self { id, width, height, pitch, bpp, depth, gem_handle }
+        Self {
+            id,
+            width,
+            height,
+            pitch,
+            bpp,
+            depth,
+            gem_handle,
+        }
     }
 
     pub fn size_bytes(&self) -> usize {

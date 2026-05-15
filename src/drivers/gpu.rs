@@ -55,14 +55,9 @@ use spin::Mutex;
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub use crate::drivers::drm::{
-    HeadInfo, DrmModeInfo, MAX_HEADS,
-    num_heads, head_info, crtc_id, plane_id,
-    vblank_tick_head, vblank_count_head, wait_vblank_head,
-    create_dumb, map_dumb, destroy_dumb,
-    add_fb, rm_fb,
-    set_crtc_for, page_flip_for,
-    atomic_commit, AtomicProp,
-    KmsResources, get_resources,
+    add_fb, atomic_commit, create_dumb, crtc_id, destroy_dumb, get_resources, head_info, map_dumb,
+    num_heads, page_flip_for, plane_id, rm_fb, set_crtc_for, vblank_count_head, vblank_tick_head,
+    wait_vblank_head, AtomicProp, DrmModeInfo, HeadInfo, KmsResources, MAX_HEADS,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,7 +95,7 @@ impl PixelFormat {
             PixelFormat::Bgra32 => fourcc(b'A', b'R', b'2', b'4'), // AR24
             PixelFormat::Rgbx32 => fourcc(b'X', b'B', b'2', b'4'), // XB24
             PixelFormat::Rgba32 => fourcc(b'A', b'B', b'2', b'4'), // AB24
-            PixelFormat::Grey8  => fourcc(b'R', b'8', b' ', b' '), // R8
+            PixelFormat::Grey8 => fourcc(b'R', b'8', b' ', b' '),  // R8
         }
     }
 }
@@ -122,19 +117,19 @@ const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 #[derive(Clone, Copy, Debug)]
 pub struct GpuBuffer {
     /// Guest-physical (= kernel-virtual for identity pages) base address.
-    pub phys:    u64,
+    pub phys: u64,
     /// Width in pixels.
-    pub width:   u32,
+    pub width: u32,
     /// Height in pixels.
-    pub height:  u32,
+    pub height: u32,
     /// Bytes per row.  Always `width * format.bpp()` unless the backend
     /// requires alignment padding.
-    pub stride:  u32,
+    pub stride: u32,
     /// Pixel format of the buffer.
-    pub format:  PixelFormat,
+    pub format: PixelFormat,
     /// Opaque backend handle (GEM handle, BAR offset, etc.).
     /// Zero if unused by the backing driver.
-    pub handle:  u64,
+    pub handle: u64,
     /// Which backend owns this buffer (index into `REGISTRY`).
     pub backend: u8,
 }
@@ -169,26 +164,40 @@ impl GpuBuffer {
     /// Write a single pixel (BGRX / BGRA u32 value).  Bounds-checked.
     #[inline]
     pub fn put_pixel(&mut self, x: u32, y: u32, color: u32) {
-        if x >= self.width || y >= self.height { return; }
+        if x >= self.width || y >= self.height {
+            return;
+        }
         let off = (y * (self.stride / 4) + x) as usize;
-        unsafe { (self.phys as *mut u32).add(off).write_volatile(color); }
+        unsafe {
+            (self.phys as *mut u32).add(off).write_volatile(color);
+        }
     }
 
     /// Fill entire buffer with a constant colour.
     pub fn fill(&mut self, color: u32) {
         let words = (self.stride as usize / 4) * self.height as usize;
-        let base  = self.phys as *mut u32;
-        for i in 0..words { unsafe { base.add(i).write_volatile(color); } }
+        let base = self.phys as *mut u32;
+        for i in 0..words {
+            unsafe {
+                base.add(i).write_volatile(color);
+            }
+        }
     }
 
     /// Copy a row-major BGRX/BGRA slice into the buffer at `(dx, dy)`.
     pub fn blit(&mut self, dx: u32, dy: u32, src_w: u32, src_h: u32, src: &[u32]) {
         for row in 0..src_h {
-            if dy + row >= self.height { break; }
+            if dy + row >= self.height {
+                break;
+            }
             for col in 0..src_w {
-                if dx + col >= self.width { continue; }
+                if dx + col >= self.width {
+                    continue;
+                }
                 let si = (row * src_w + col) as usize;
-                if si < src.len() { self.put_pixel(dx + col, dy + row, src[si]); }
+                if si < src.len() {
+                    self.put_pixel(dx + col, dy + row, src[si]);
+                }
             }
         }
     }
@@ -230,7 +239,9 @@ pub trait GpuDevice: Send + Sync {
     // ── Display geometry ────────────────────────────────────────────────
 
     /// Number of independent display outputs (scanouts / CRTCs).
-    fn num_outputs(&self) -> usize { 1 }
+    fn num_outputs(&self) -> usize {
+        1
+    }
 
     /// Resolution of output `idx`.  Returns `None` if `idx` is out of range.
     fn output_size(&self, idx: usize) -> Option<(u32, u32)>;
@@ -259,7 +270,8 @@ pub trait GpuDevice: Send + Sync {
     /// have dimensions matching the output.  Returns `-22` (EINVAL) if the
     /// dimensions do not match.
     fn set_scanout(&self, output_idx: usize, buf: &GpuBuffer) -> Result<(), isize> {
-        let _ = (output_idx, buf); Err(-38) // ENOSYS
+        let _ = (output_idx, buf);
+        Err(-38) // ENOSYS
     }
 
     /// Flush a dirty rectangle of `buf` to the physical display.
@@ -267,12 +279,7 @@ pub trait GpuDevice: Send + Sync {
     /// Returns a `FenceId` that will be signalled once the GPU transfer is
     /// complete.  For memory-coherent backends (GOP) this is always
     /// `FenceId::SIGNALLED`.
-    fn flush(
-        &self,
-        buf:    &GpuBuffer,
-        x: u32, y: u32,
-        w: u32, h: u32,
-    ) -> FenceId;
+    fn flush(&self, buf: &GpuBuffer, x: u32, y: u32, w: u32, h: u32) -> FenceId;
 
     /// Flush the entire buffer.
     fn flush_all(&self, buf: &GpuBuffer) -> FenceId {
@@ -285,25 +292,21 @@ pub trait GpuDevice: Send + Sync {
     ///
     /// The default implementation is a no-op (correct for GOP / coherent
     /// backends that always return `FenceId::SIGNALLED`).
-    fn wait_fence(&self, fence: FenceId) { let _ = fence; }
+    fn wait_fence(&self, fence: FenceId) {
+        let _ = fence;
+    }
 
     // ── Cursor ──────────────────────────────────────────────────────────
 
     /// Upload a 64×64 ARGB cursor bitmap to `output_idx` at `(x, y)`.
-    fn cursor_update(
-        &self,
-        output_idx: usize,
-        pixels: &[u32],
-        x: i32, y: i32,
-    ) { let _ = (output_idx, pixels, x, y); }
+    fn cursor_update(&self, output_idx: usize, pixels: &[u32], x: i32, y: i32) {
+        let _ = (output_idx, pixels, x, y);
+    }
 
     /// Move the cursor on `output_idx` without re-uploading the bitmap.
-    fn cursor_move(
-        &self,
-        output_idx: usize,
-        x: i32, y: i32,
-        visible: bool,
-    ) { let _ = (output_idx, x, y, visible); }
+    fn cursor_move(&self, output_idx: usize, x: i32, y: i32, visible: bool) {
+        let _ = (output_idx, x, y, visible);
+    }
 
     // ── Mode setting (optional) ──────────────────────────────────────────
 
@@ -312,7 +315,8 @@ pub trait GpuDevice: Send + Sync {
     fn set_mode(
         &self,
         output_idx: usize,
-        width: u32, height: u32,
+        width: u32,
+        height: u32,
         refresh_hz: u32,
     ) -> Result<(), isize> {
         let _ = (output_idx, width, height, refresh_hz);
@@ -324,12 +328,14 @@ pub trait GpuDevice: Send + Sync {
     /// Import a dma-buf file-descriptor.  Returns a backend-specific handle
     /// and the physical address of the buffer.
     fn import_dmabuf(&self, fd: i32) -> Result<(u64, u64), isize> {
-        let _ = fd; Err(-38)
+        let _ = fd;
+        Err(-38)
     }
 
     /// Export a buffer as a dma-buf file-descriptor.
     fn export_dmabuf(&self, buf: &GpuBuffer) -> Result<i32, isize> {
-        let _ = buf; Err(-38)
+        let _ = buf;
+        Err(-38)
     }
 }
 
@@ -344,10 +350,16 @@ pub struct VirtioGpuBackend;
 static VIRTIO_FENCE_CTR: AtomicU64 = AtomicU64::new(1);
 
 impl GpuDevice for VirtioGpuBackend {
-    fn name(&self) -> &'static str { "virtio-gpu" }
-    fn is_available(&self) -> bool { crate::drivers::virtio_gpu::is_present() }
+    fn name(&self) -> &'static str {
+        "virtio-gpu"
+    }
+    fn is_available(&self) -> bool {
+        crate::drivers::virtio_gpu::is_present()
+    }
 
-    fn num_outputs(&self) -> usize { crate::drivers::virtio_gpu::num_scanouts() }
+    fn num_outputs(&self) -> usize {
+        crate::drivers::virtio_gpu::num_scanouts()
+    }
 
     fn output_size(&self, idx: usize) -> Option<(u32, u32)> {
         crate::drivers::virtio_gpu::scanout_info(idx).map(|(w, h, _)| (w, h))
@@ -364,11 +376,19 @@ impl GpuDevice for VirtioGpuBackend {
         // return a buffer backed by them.  The caller is responsible for
         // calling set_scanout before flush.
         let pages = size_pages(w as usize * h as usize * fmt.bpp() as usize);
-        let phys  = crate::mm::pmm::alloc_pages(pages)
+        let phys = crate::mm::pmm::alloc_pages(pages)
             .map(|p| p.as_ptr() as u64)
             .ok_or(-12isize)?; // ENOMEM
         let stride = w * fmt.bpp();
-        Ok(GpuBuffer { phys, width: w, height: h, stride, format: fmt, handle: 0, backend: 0 })
+        Ok(GpuBuffer {
+            phys,
+            width: w,
+            height: h,
+            stride,
+            format: fmt,
+            handle: 0,
+            backend: 0,
+        })
     }
 
     fn free(&self, buf: GpuBuffer) {
@@ -386,7 +406,7 @@ impl GpuDevice for VirtioGpuBackend {
         match crate::drivers::virtio_gpu::scanout_info(output_idx) {
             Some((w, h, _)) if w == buf.width && h == buf.height => Ok(()),
             Some(_) => Err(-22), // EINVAL
-            None    => Err(-6),  // ENXIO
+            None => Err(-6),     // ENXIO
         }
     }
 
@@ -426,18 +446,32 @@ impl GpuDevice for VirtioGpuBackend {
 pub struct GopBackend;
 
 impl GpuDevice for GopBackend {
-    fn name(&self) -> &'static str { "gop" }
-    fn is_available(&self) -> bool { crate::drivers::gop::get().is_some() }
+    fn name(&self) -> &'static str {
+        "gop"
+    }
+    fn is_available(&self) -> bool {
+        crate::drivers::gop::get().is_some()
+    }
 
-    fn num_outputs(&self) -> usize { if self.is_available() { 1 } else { 0 } }
+    fn num_outputs(&self) -> usize {
+        if self.is_available() {
+            1
+        } else {
+            0
+        }
+    }
 
     fn output_size(&self, idx: usize) -> Option<(u32, u32)> {
-        if idx != 0 { return None; }
+        if idx != 0 {
+            return None;
+        }
         crate::drivers::gop::get().map(|g| (g.width, g.height))
     }
 
     fn output_fb_phys(&self, idx: usize) -> Option<u64> {
-        if idx != 0 { return None; }
+        if idx != 0 {
+            return None;
+        }
         crate::drivers::gop::get().map(|g| g.fb_phys)
     }
 
@@ -448,32 +482,35 @@ impl GpuDevice for GopBackend {
         if let Some(g) = crate::drivers::gop::get() {
             if w == g.width && h == g.height {
                 return Ok(GpuBuffer {
-                    phys:    g.fb_phys,
-                    width:   w,
-                    height:  h,
-                    stride:  g.pixels_per_line * 4,
-                    format:  fmt,
-                    handle:  0,
+                    phys: g.fb_phys,
+                    width: w,
+                    height: h,
+                    stride: g.pixels_per_line * 4,
+                    format: fmt,
+                    handle: 0,
                     backend: 1,
                 });
             }
         }
         // Off-screen allocation.
-        let pages  = size_pages(w as usize * h as usize * fmt.bpp() as usize);
-        let phys   = crate::mm::pmm::alloc_pages(pages)
+        let pages = size_pages(w as usize * h as usize * fmt.bpp() as usize);
+        let phys = crate::mm::pmm::alloc_pages(pages)
             .map(|p| p.as_ptr() as u64)
             .ok_or(-12isize)?;
         Ok(GpuBuffer {
-            phys, width: w, height: h,
+            phys,
+            width: w,
+            height: h,
             stride: w * fmt.bpp(),
-            format: fmt, handle: 0, backend: 1,
+            format: fmt,
+            handle: 0,
+            backend: 1,
         })
     }
 
     fn free(&self, buf: GpuBuffer) {
         // If the buffer points to the GOP linear fb don't free it.
-        let is_gop = crate::drivers::gop::get()
-            .map_or(false, |g| g.fb_phys == buf.phys);
+        let is_gop = crate::drivers::gop::get().map_or(false, |g| g.fb_phys == buf.phys);
         if !is_gop {
             let pages = size_pages(buf.byte_len());
             unsafe {
@@ -498,10 +535,16 @@ pub struct AmdGpuBackend;
 static AMD_FENCE_CTR: AtomicU64 = AtomicU64::new(1);
 
 impl GpuDevice for AmdGpuBackend {
-    fn name(&self) -> &'static str { "amdgpu" }
-    fn is_available(&self) -> bool { crate::drivers::amdgpu_gem::is_present() }
+    fn name(&self) -> &'static str {
+        "amdgpu"
+    }
+    fn is_available(&self) -> bool {
+        crate::drivers::amdgpu_gem::is_present()
+    }
 
-    fn num_outputs(&self) -> usize { crate::drivers::amdgpu_gem::num_crtcs() }
+    fn num_outputs(&self) -> usize {
+        crate::drivers::amdgpu_gem::num_crtcs()
+    }
 
     fn output_size(&self, idx: usize) -> Option<(u32, u32)> {
         crate::drivers::amdgpu_gem::crtc_size(idx)
@@ -512,11 +555,15 @@ impl GpuDevice for AmdGpuBackend {
 
     fn alloc(&self, w: u32, h: u32, fmt: PixelFormat) -> Result<GpuBuffer, isize> {
         let (handle, phys, stride) =
-            crate::drivers::amdgpu_gem::gem_alloc(w, h, fmt.bpp())
-            .map_err(|_| -12isize)?;
+            crate::drivers::amdgpu_gem::gem_alloc(w, h, fmt.bpp()).map_err(|_| -12isize)?;
         Ok(GpuBuffer {
-            phys, width: w, height: h, stride,
-            format: fmt, handle: handle as u64, backend: 2,
+            phys,
+            width: w,
+            height: h,
+            stride,
+            format: fmt,
+            handle: handle as u64,
+            backend: 2,
         })
     }
 
@@ -540,7 +587,11 @@ impl GpuDevice for AmdGpuBackend {
         crate::drivers::amdgpu_gem::cursor_move(idx, x, y, visible);
     }
     fn set_mode(
-        &self, output_idx: usize, width: u32, height: u32, refresh_hz: u32,
+        &self,
+        output_idx: usize,
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
     ) -> Result<(), isize> {
         crate::drivers::amdgpu_gem::set_mode(output_idx, width, height, refresh_hz)
     }
@@ -563,32 +614,48 @@ const NULL_H: u32 = 768;
 static NULL_FB: Mutex<Option<u64>> = Mutex::new(None);
 
 impl GpuDevice for NullBackend {
-    fn name(&self) -> &'static str { "null" }
-    fn is_available(&self) -> bool { true } // always available as last resort
+    fn name(&self) -> &'static str {
+        "null"
+    }
+    fn is_available(&self) -> bool {
+        true
+    } // always available as last resort
 
     fn output_size(&self, idx: usize) -> Option<(u32, u32)> {
-        if idx == 0 { Some((NULL_W, NULL_H)) } else { None }
+        if idx == 0 {
+            Some((NULL_W, NULL_H))
+        } else {
+            None
+        }
     }
 
     fn output_fb_phys(&self, idx: usize) -> Option<u64> {
-        if idx != 0 { return None; }
+        if idx != 0 {
+            return None;
+        }
         let mut guard = NULL_FB.lock();
-        if let Some(p) = *guard { return Some(p); }
+        if let Some(p) = *guard {
+            return Some(p);
+        }
         let pages = size_pages(NULL_W as usize * NULL_H as usize * 4);
-        let phys  = crate::mm::pmm::alloc_pages(pages)?.as_ptr() as u64;
+        let phys = crate::mm::pmm::alloc_pages(pages)?.as_ptr() as u64;
         *guard = Some(phys);
         Some(phys)
     }
 
     fn alloc(&self, w: u32, h: u32, fmt: PixelFormat) -> Result<GpuBuffer, isize> {
-        let pages  = size_pages(w as usize * h as usize * fmt.bpp() as usize);
-        let phys   = crate::mm::pmm::alloc_pages(pages)
+        let pages = size_pages(w as usize * h as usize * fmt.bpp() as usize);
+        let phys = crate::mm::pmm::alloc_pages(pages)
             .map(|p| p.as_ptr() as u64)
             .ok_or(-12isize)?;
         Ok(GpuBuffer {
-            phys, width: w, height: h,
+            phys,
+            width: w,
+            height: h,
             stride: w * fmt.bpp(),
-            format: fmt, handle: 0, backend: 3,
+            format: fmt,
+            handle: 0,
+            backend: 3,
         })
     }
 
@@ -616,12 +683,8 @@ impl GpuDevice for NullBackend {
 /// Stored as `&'static dyn GpuDevice` so no heap allocation is needed for
 /// the registry itself.  Each backend struct is a zero-sized type (ZST)
 /// placed in `.rodata`.
-static BACKENDS: &[&'static dyn GpuDevice] = &[
-    &VirtioGpuBackend,
-    &AmdGpuBackend,
-    &GopBackend,
-    &NullBackend,
-];
+static BACKENDS: &[&'static dyn GpuDevice] =
+    &[&VirtioGpuBackend, &AmdGpuBackend, &GopBackend, &NullBackend];
 
 /// Iterate registered backends.  Exposed for diagnostics.
 pub fn backends() -> impl Iterator<Item = &'static dyn GpuDevice> {
@@ -630,7 +693,11 @@ pub fn backends() -> impl Iterator<Item = &'static dyn GpuDevice> {
 
 /// Return the first available backend, or the NullBackend.
 fn primary() -> &'static dyn GpuDevice {
-    for b in BACKENDS { if b.is_available() { return *b; } }
+    for b in BACKENDS {
+        if b.is_available() {
+            return *b;
+        }
+    }
     &NullBackend
 }
 
@@ -640,9 +707,13 @@ fn backend_for_output(output_idx: usize) -> Option<(&'static dyn GpuDevice, usiz
     // across all registered backends.
     let mut remaining = output_idx;
     for b in BACKENDS {
-        if !b.is_available() { continue; }
+        if !b.is_available() {
+            continue;
+        }
         let n = b.num_outputs();
-        if remaining < n { return Some((*b, remaining)); }
+        if remaining < n {
+            return Some((*b, remaining));
+        }
         remaining -= n;
     }
     None
@@ -654,7 +725,11 @@ fn backend_for_output(output_idx: usize) -> Option<(&'static dyn GpuDevice, usiz
 
 /// Total number of display outputs across all backends.
 pub fn total_outputs() -> usize {
-    BACKENDS.iter().filter(|b| b.is_available()).map(|b| b.num_outputs()).sum()
+    BACKENDS
+        .iter()
+        .filter(|b| b.is_available())
+        .map(|b| b.num_outputs())
+        .sum()
 }
 
 /// Resolution of global output `idx`.
@@ -680,20 +755,26 @@ pub fn alloc_buffer(w: u32, h: u32, fmt: PixelFormat) -> Result<GpuBuffer, isize
 /// Allocate a pixel buffer using whichever backend owns global `output_idx`.
 pub fn alloc_for_output(output_idx: usize, fmt: PixelFormat) -> Result<GpuBuffer, isize> {
     let (b, local) = backend_for_output(output_idx).ok_or(-19isize)?;
-    let (w, h)     = b.output_size(local).ok_or(-6isize)?;
+    let (w, h) = b.output_size(local).ok_or(-6isize)?;
     b.alloc(w, h, fmt)
 }
 
 /// Free a buffer returned by `alloc_buffer` or `alloc_for_output`.
 pub fn free_buffer(buf: GpuBuffer) {
-    let b = BACKENDS.get(buf.backend as usize).copied().unwrap_or(&NullBackend);
+    let b = BACKENDS
+        .get(buf.backend as usize)
+        .copied()
+        .unwrap_or(&NullBackend);
     b.free(buf);
 }
 
 /// Flush `buf` dirty rect `(x, y, w, h)` to the physical display.
 /// Returns a fence that can be passed to `wait_fence`.
 pub fn flush(buf: &GpuBuffer, x: u32, y: u32, w: u32, h: u32) -> FenceId {
-    let b = BACKENDS.get(buf.backend as usize).copied().unwrap_or(&NullBackend);
+    let b = BACKENDS
+        .get(buf.backend as usize)
+        .copied()
+        .unwrap_or(&NullBackend);
     b.flush(buf, x, y, w, h)
 }
 
@@ -704,7 +785,10 @@ pub fn flush_all(buf: &GpuBuffer) -> FenceId {
 
 /// Spin-wait for a fence returned by `flush`.
 pub fn wait_fence(buf: &GpuBuffer, fence: FenceId) {
-    let b = BACKENDS.get(buf.backend as usize).copied().unwrap_or(&NullBackend);
+    let b = BACKENDS
+        .get(buf.backend as usize)
+        .copied()
+        .unwrap_or(&NullBackend);
     b.wait_fence(fence);
 }
 
@@ -729,11 +813,7 @@ pub fn cursor_move(output_idx: usize, x: i32, y: i32, visible: bool) {
 }
 
 /// Request a mode change.  Only supported by hardware KMS backends.
-pub fn set_mode(
-    output_idx: usize,
-    width: u32, height: u32,
-    refresh_hz: u32,
-) -> Result<(), isize> {
+pub fn set_mode(output_idx: usize, width: u32, height: u32, refresh_hz: u32) -> Result<(), isize> {
     let (b, local) = backend_for_output(output_idx).ok_or(-6isize)?;
     b.set_mode(local, width, height, refresh_hz)
 }
@@ -746,7 +826,10 @@ pub fn import_dmabuf(output_idx: usize, fd: i32) -> Result<(u64, u64), isize> {
 
 /// Export a buffer as a dma-buf FD.
 pub fn export_dmabuf(buf: &GpuBuffer) -> Result<i32, isize> {
-    let b = BACKENDS.get(buf.backend as usize).copied().unwrap_or(&NullBackend);
+    let b = BACKENDS
+        .get(buf.backend as usize)
+        .copied()
+        .unwrap_or(&NullBackend);
     b.export_dmabuf(buf)
 }
 

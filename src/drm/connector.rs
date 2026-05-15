@@ -42,7 +42,12 @@ impl Connector {
         status: ConnectionStatus,
         modes: &'static [DisplayMode],
     ) -> Self {
-        Self { id, connector_type, status, modes }
+        Self {
+            id,
+            connector_type,
+            status,
+            modes,
+        }
     }
 
     pub fn is_connected(&self) -> bool {

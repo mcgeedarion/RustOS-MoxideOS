@@ -29,18 +29,22 @@
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::_rdtsc;
-use core::sync::atomic::{AtomicU64, AtomicU32, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-static TSC_MUL:   AtomicU64  = AtomicU64::new(0);
-static TSC_SHIFT: AtomicU32  = AtomicU32::new(0);
-static TSC_BASE:  AtomicU64  = AtomicU64::new(0); // TSC value at boot
+static TSC_MUL: AtomicU64 = AtomicU64::new(0);
+static TSC_SHIFT: AtomicU32 = AtomicU32::new(0);
+static TSC_BASE: AtomicU64 = AtomicU64::new(0); // TSC value at boot
 static INVARIANT: AtomicBool = AtomicBool::new(false);
 
 /// Attempt TSC calibration.  Returns `true` if TSC is invariant and usable.
 pub fn calibrate() -> bool {
-    if !is_invariant() { return false; }
+    if !is_invariant() {
+        return false;
+    }
     let freq = detect_freq_hz();
-    if freq == 0 { return false; }
+    if freq == 0 {
+        return false;
+    }
     compute_mul_shift(freq);
     TSC_BASE.store(rdtsc(), Ordering::SeqCst);
     true
@@ -48,8 +52,8 @@ pub fn calibrate() -> bool {
 
 /// Read current time in nanoseconds since `calibrate()` was called.
 pub fn read_ns() -> u64 {
-    let tsc   = rdtsc().wrapping_sub(TSC_BASE.load(Ordering::Relaxed));
-    let mul   = TSC_MUL.load(Ordering::Relaxed);
+    let tsc = rdtsc().wrapping_sub(TSC_BASE.load(Ordering::Relaxed));
+    let mul = TSC_MUL.load(Ordering::Relaxed);
     let shift = TSC_SHIFT.load(Ordering::Relaxed);
     // 128-bit intermediate to avoid overflow:
     let hi = (tsc >> 32) * mul;
@@ -58,9 +62,11 @@ pub fn read_ns() -> u64 {
 }
 
 pub fn freq_hz() -> u64 {
-    let mul   = TSC_MUL.load(Ordering::Relaxed);
+    let mul = TSC_MUL.load(Ordering::Relaxed);
     let shift = TSC_SHIFT.load(Ordering::Relaxed);
-    if mul == 0 { return 0; }
+    if mul == 0 {
+        return 0;
+    }
     (1_000_000_000u64 << shift) / mul
 }
 
@@ -68,7 +74,9 @@ pub fn freq_hz() -> u64 {
 
 fn rdtsc() -> u64 {
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::x86_64::_rdtsc() }
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
     #[cfg(not(target_arch = "x86_64"))]
     0
 }
@@ -84,7 +92,9 @@ fn is_invariant() -> bool {
 /// CPUID leaf 0x15: TSC / Crystal ratio.
 fn cpuid15() -> Option<u64> {
     let (eax, ebx, ecx) = cpuid3(0x15);
-    if eax == 0 || ebx == 0 { return None; }
+    if eax == 0 || ebx == 0 {
+        return None;
+    }
     // freq = ecx * ebx / eax  (ecx = crystal Hz; 0 on some CPUs)
     if ecx != 0 {
         return Some(ecx as u64 * ebx as u64 / eax as u64);
@@ -96,13 +106,17 @@ fn cpuid15() -> Option<u64> {
 /// CPUID leaf 0x16: CPU base frequency (MHz).
 fn cpuid16() -> Option<u64> {
     let (eax, _, _) = cpuid3(0x16);
-    if eax == 0 { None } else { Some(eax as u64 * 1_000_000) }
+    if eax == 0 {
+        None
+    } else {
+        Some(eax as u64 * 1_000_000)
+    }
 }
 
 /// PIT-based calibration: gate TSC ticks over ~10 ms.
 fn pit_calibrate() -> u64 {
     // PIT channel 2, mode 0 (one-shot), 11932 ticks ≈ 10 ms.
-    const PIT_HZ:    u64 = 1_193_182;
+    const PIT_HZ: u64 = 1_193_182;
     const PIT_COUNT: u64 = 11_932; // ≈ 10 ms
     unsafe {
         // Enable gate, disable speaker.
@@ -113,9 +127,11 @@ fn pit_calibrate() -> u64 {
         outb(0x42, (PIT_COUNT & 0xFF) as u8);
         outb(0x42, ((PIT_COUNT >> 8) & 0xFF) as u8);
         // Reset gate to start count.
-        v = inb(0x61) & 0xFE; outb(0x61, v);
+        v = inb(0x61) & 0xFE;
+        outb(0x61, v);
         let t0 = rdtsc();
-        v |= 0x01; outb(0x61, v);
+        v |= 0x01;
+        outb(0x61, v);
         // Wait for OUT2 (bit 5 of 0x61) to go high.
         while inb(0x61) & 0x20 == 0 {}
         let t1 = rdtsc();
@@ -125,8 +141,12 @@ fn pit_calibrate() -> u64 {
 }
 
 fn detect_freq_hz() -> u64 {
-    if let Some(f) = cpuid15()  { return f; }
-    if let Some(f) = cpuid16()  { return f; }
+    if let Some(f) = cpuid15() {
+        return f;
+    }
+    if let Some(f) = cpuid16() {
+        return f;
+    }
     pit_calibrate()
 }
 
@@ -142,7 +162,9 @@ fn compute_mul_shift(freq_hz: u64) {
             return;
         }
         shift -= 1;
-        if shift == 0 { break; }
+        if shift == 0 {
+            break;
+        }
     }
 }
 
@@ -162,7 +184,10 @@ fn cpuid3(leaf: u32) -> (u32, u32, u32) {
         );
     }
     #[cfg(not(target_arch = "x86_64"))]
-    { let _ = leaf; (0, 0, 0) }
+    {
+        let _ = leaf;
+        (0, 0, 0)
+    }
     #[cfg(target_arch = "x86_64")]
     (eax, ebx, ecx)
 }
@@ -180,7 +205,10 @@ fn cpuid_edx(leaf: u32) -> u32 {
         );
     }
     #[cfg(not(target_arch = "x86_64"))]
-    { let _ = leaf; edx = 0; }
+    {
+        let _ = leaf;
+        edx = 0;
+    }
     edx
 }
 

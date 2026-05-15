@@ -7,24 +7,24 @@
 //!   memory.soft_limit_in_bytes — soft advisory limit (no enforcement)
 //!   memory.oom_control      — 0 = OOM-kill enabled (default), 1 = disable
 
-use core::sync::atomic::{AtomicI64, AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 pub struct MemCg {
-    pub limit_bytes:      AtomicI64,
+    pub limit_bytes: AtomicI64,
     pub soft_limit_bytes: AtomicI64,
-    pub usage_bytes:      AtomicI64,
-    pub failcnt:          AtomicU64,
-    pub oom_disabled:     AtomicBool,
+    pub usage_bytes: AtomicI64,
+    pub failcnt: AtomicU64,
+    pub oom_disabled: AtomicBool,
 }
 
 impl Default for MemCg {
     fn default() -> Self {
         MemCg {
-            limit_bytes:      AtomicI64::new(-1),
+            limit_bytes: AtomicI64::new(-1),
             soft_limit_bytes: AtomicI64::new(-1),
-            usage_bytes:      AtomicI64::new(0),
-            failcnt:          AtomicU64::new(0),
-            oom_disabled:     AtomicBool::new(false),
+            usage_bytes: AtomicI64::new(0),
+            failcnt: AtomicU64::new(0),
+            oom_disabled: AtomicBool::new(false),
         }
     }
 }
@@ -32,11 +32,11 @@ impl Default for MemCg {
 impl MemCg {
     pub fn read(&self, knob: &str) -> Result<i64, isize> {
         match knob {
-            "memory.limit_in_bytes"        => Ok(self.limit_bytes.load(Ordering::SeqCst)),
-            "memory.soft_limit_in_bytes"   => Ok(self.soft_limit_bytes.load(Ordering::SeqCst)),
-            "memory.usage_in_bytes"        => Ok(self.usage_bytes.load(Ordering::SeqCst)),
-            "memory.failcnt"               => Ok(self.failcnt.load(Ordering::SeqCst) as i64),
-            "memory.oom_control"           => Ok(self.oom_disabled.load(Ordering::SeqCst) as i64),
+            "memory.limit_in_bytes" => Ok(self.limit_bytes.load(Ordering::SeqCst)),
+            "memory.soft_limit_in_bytes" => Ok(self.soft_limit_bytes.load(Ordering::SeqCst)),
+            "memory.usage_in_bytes" => Ok(self.usage_bytes.load(Ordering::SeqCst)),
+            "memory.failcnt" => Ok(self.failcnt.load(Ordering::SeqCst) as i64),
+            "memory.oom_control" => Ok(self.oom_disabled.load(Ordering::SeqCst) as i64),
             _ => Err(-2),
         }
     }
@@ -45,7 +45,9 @@ impl MemCg {
         match knob {
             "memory.limit_in_bytes" => {
                 // -1 = unlimited, otherwise must be at least one page.
-                if val != -1 && val < 4096 { return Err(-22); }
+                if val != -1 && val < 4096 {
+                    return Err(-22);
+                }
                 self.limit_bytes.store(val, Ordering::SeqCst);
                 Ok(())
             }
@@ -82,5 +84,7 @@ impl MemCg {
     }
 
     /// Reset the fail counter (echo 0 > memory.failcnt).
-    pub fn reset_failcnt(&self) { self.failcnt.store(0, Ordering::SeqCst); }
+    pub fn reset_failcnt(&self) {
+        self.failcnt.store(0, Ordering::SeqCst);
+    }
 }

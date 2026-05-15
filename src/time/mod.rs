@@ -26,15 +26,15 @@
 //!
 //! The selected clocksource is recorded in `CLOCKSOURCE` at boot.
 
-pub mod clock;
-pub mod tsc;
-pub mod hpet;
 pub mod clint;
+pub mod clock;
+pub mod hpet;
 pub mod timer;
 pub mod timerfd;
+pub mod tsc;
 
 extern crate alloc;
-use core::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use spin::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -42,18 +42,27 @@ use spin::Mutex;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ClockSource { Tsc, Hpet, ClintMtime, ApicTimer }
+pub enum ClockSource {
+    Tsc,
+    Hpet,
+    ClintMtime,
+    ApicTimer,
+}
 
 static CLOCKSOURCE: Mutex<ClockSource> = Mutex::new(ClockSource::ApicTimer);
 
-pub fn set_clocksource(cs: ClockSource) { *CLOCKSOURCE.lock() = cs; }
-pub fn clocksource() -> ClockSource { *CLOCKSOURCE.lock() }
+pub fn set_clocksource(cs: ClockSource) {
+    *CLOCKSOURCE.lock() = cs;
+}
+pub fn clocksource() -> ClockSource {
+    *CLOCKSOURCE.lock()
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Core time primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub const NSEC_PER_SEC:  u64 = 1_000_000_000;
+pub const NSEC_PER_SEC: u64 = 1_000_000_000;
 pub const NSEC_PER_MSEC: u64 = 1_000_000;
 pub const NSEC_PER_USEC: u64 = 1_000;
 
@@ -61,16 +70,19 @@ pub const NSEC_PER_USEC: u64 = 1_000;
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Timespec {
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     pub tv_nsec: i64,
 }
 
 impl Timespec {
-    pub const ZERO: Self = Timespec { tv_sec: 0, tv_nsec: 0 };
+    pub const ZERO: Self = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
 
     pub fn from_ns(ns: u64) -> Self {
         Timespec {
-            tv_sec:  (ns / NSEC_PER_SEC) as i64,
+            tv_sec: (ns / NSEC_PER_SEC) as i64,
             tv_nsec: (ns % NSEC_PER_SEC) as i64,
         }
     }
@@ -85,17 +97,21 @@ impl Timespec {
 
     pub fn sub_ns(&self, ns: u64) -> Self {
         let total = self.to_ns();
-        if ns >= total { Self::ZERO } else { Self::from_ns(total - ns) }
+        if ns >= total {
+            Self::ZERO
+        } else {
+            Self::from_ns(total - ns)
+        }
     }
 
     /// Normalise: bring tv_nsec into [0, 1_000_000_000).
     pub fn normalise(mut self) -> Self {
         while self.tv_nsec >= NSEC_PER_SEC as i64 {
-            self.tv_sec  += 1;
+            self.tv_sec += 1;
             self.tv_nsec -= NSEC_PER_SEC as i64;
         }
         while self.tv_nsec < 0 {
-            self.tv_sec  -= 1;
+            self.tv_sec -= 1;
             self.tv_nsec += NSEC_PER_SEC as i64;
         }
         self
@@ -110,20 +126,20 @@ impl Timespec {
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Timeval {
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     pub tv_usec: i64,
 }
 
 impl Timeval {
     pub fn from_timespec(ts: Timespec) -> Self {
         Timeval {
-            tv_sec:  ts.tv_sec,
+            tv_sec: ts.tv_sec,
             tv_usec: ts.tv_nsec / 1000,
         }
     }
     pub fn to_timespec(&self) -> Timespec {
         Timespec {
-            tv_sec:  self.tv_sec,
+            tv_sec: self.tv_sec,
             tv_nsec: self.tv_usec * 1000,
         }
     }
@@ -178,27 +194,39 @@ pub fn read_monotonic_ns() -> u64 {
     MONO_NS.load(Ordering::Relaxed)
 }
 
-pub fn read_boottime_ns()  -> u64 { BOOT_NS.load(Ordering::Relaxed) }
+pub fn read_boottime_ns() -> u64 {
+    BOOT_NS.load(Ordering::Relaxed)
+}
 
-pub fn realtime_offset_ns() -> i64 { REALTIME_OFFSET_NS.load(Ordering::Relaxed) }
+pub fn realtime_offset_ns() -> i64 {
+    REALTIME_OFFSET_NS.load(Ordering::Relaxed)
+}
 
-pub fn set_realtime_offset_ns(offset: i64) { REALTIME_OFFSET_NS.store(offset, Ordering::SeqCst); }
+pub fn set_realtime_offset_ns(offset: i64) {
+    REALTIME_OFFSET_NS.store(offset, Ordering::SeqCst);
+}
 
-pub fn tai_offset_s() -> i64 { TAI_OFFSET_S.load(Ordering::Relaxed) }
+pub fn tai_offset_s() -> i64 {
+    TAI_OFFSET_S.load(Ordering::Relaxed)
+}
 
-pub fn set_tai_offset_s(s: i64) { TAI_OFFSET_S.store(s, Ordering::SeqCst); }
+pub fn set_tai_offset_s(s: i64) {
+    TAI_OFFSET_S.store(s, Ordering::SeqCst);
+}
 
 /// Initialise the timekeeping subsystem.
 /// Must be called after the APIC / CLINT interrupt source is configured.
 pub fn init() {
-    #[cfg(target_arch = "x86_64")] {
+    #[cfg(target_arch = "x86_64")]
+    {
         if tsc::calibrate() {
             set_clocksource(ClockSource::Tsc);
         } else if hpet::init() {
             set_clocksource(ClockSource::Hpet);
         }
     }
-    #[cfg(target_arch = "riscv64")] {
+    #[cfg(target_arch = "riscv64")]
+    {
         if clint::init() {
             set_clocksource(ClockSource::ClintMtime);
         }

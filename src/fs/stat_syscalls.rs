@@ -15,24 +15,28 @@
 //!   - sys_getcwd: copies the real per-process cwd instead of hardcoded "/".
 
 extern crate alloc;
-use alloc::string::String;
-use crate::uaccess::{copy_to_user, copy_from_user, validate_user_ptr, USER_SPACE_END};
 use crate::fs::vfs;
+use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr, USER_SPACE_END};
+use alloc::string::String;
 
 // AT_* dirfd constants
-const AT_FDCWD:             i32 = -100;
-const AT_EMPTY_PATH:        u32 = 0x1000;
-const AT_SYMLINK_NOFOLLOW:  u32 = 0x100;
+const AT_FDCWD: i32 = -100;
+const AT_EMPTY_PATH: u32 = 0x1000;
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 
 // ── helpers ────────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn read_path(va: usize) -> Option<String> {
-    if va == 0 || va >= USER_SPACE_END { return None; }
+    if va == 0 || va >= USER_SPACE_END {
+        return None;
+    }
     let mut buf = [0u8; 4096];
     copy_from_user(&mut buf, va).ok()?;
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    core::str::from_utf8(&buf[..end]).ok().map(|s| String::from(s))
+    core::str::from_utf8(&buf[..end])
+        .ok()
+        .map(|s| String::from(s))
 }
 
 /// Translate a user-visible fd to its kernel-internal backing fd.
@@ -40,14 +44,17 @@ fn read_path(va: usize) -> Option<String> {
 fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     let pid = crate::proc::scheduler::current_pid();
     let r = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
-    if r < 0 { None } else { Some(r as usize) }
+    if r < 0 {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 /// Return the current process's cwd string.
 fn current_cwd() -> String {
     let pid = crate::proc::scheduler::current_pid() as usize;
-    crate::proc::scheduler::with_proc(pid, |p| p.cwd.clone())
-        .unwrap_or_else(|| String::from("/"))
+    crate::proc::scheduler::with_proc(pid, |p| p.cwd.clone()).unwrap_or_else(|| String::from("/"))
 }
 
 /// Resolve `path` to an absolute path, collapsing "." and "..".
@@ -74,7 +81,9 @@ fn normalize_path(abs: &str) -> String {
     for seg in abs.split('/') {
         match seg {
             "" | "." => {}
-            ".." => { parts.pop(); }
+            ".." => {
+                parts.pop();
+            }
             s => parts.push(s),
         }
     }
@@ -93,21 +102,24 @@ fn normalize_path(abs: &str) -> String {
 // Linux x86-64 `struct stat` layout.
 #[repr(C)]
 struct Stat {
-    st_dev:     u64,
-    st_ino:     u64,
-    st_nlink:   u64,
-    st_mode:    u32,
-    st_uid:     u32,
-    st_gid:     u32,
-    _pad0:      u32,
-    st_rdev:    u64,
-    st_size:    i64,
+    st_dev: u64,
+    st_ino: u64,
+    st_nlink: u64,
+    st_mode: u32,
+    st_uid: u32,
+    st_gid: u32,
+    _pad0: u32,
+    st_rdev: u64,
+    st_size: i64,
     st_blksize: i64,
-    st_blocks:  i64,
-    st_atime:   i64, _atimensec: i64,
-    st_mtime:   i64, _mtimensec: i64,
-    st_ctime:   i64, _ctimensec: i64,
-    _reserved:  [i64; 3],
+    st_blocks: i64,
+    st_atime: i64,
+    _atimensec: i64,
+    st_mtime: i64,
+    _mtimensec: i64,
+    st_ctime: i64,
+    _ctimensec: i64,
+    _reserved: [i64; 3],
 }
 
 const S_IFREG: u32 = 0o100000;
@@ -121,14 +133,24 @@ const S_IFSOCK: u32 = 0o140000;
 // ── stat family ────────────────────────────────────────────────────────────────────
 
 pub fn sys_stat(path_va: usize, stat_va: usize) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if stat_va == 0 || stat_va >= USER_SPACE_END { return -14; }
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    if stat_va == 0 || stat_va >= USER_SPACE_END {
+        return -14;
+    }
     fill_stat(&path, stat_va, false)
 }
 
 pub fn sys_lstat(path_va: usize, stat_va: usize) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if stat_va == 0 || stat_va >= USER_SPACE_END { return -14; }
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    if stat_va == 0 || stat_va >= USER_SPACE_END {
+        return -14;
+    }
     fill_stat(&path, stat_va, true)
 }
 
@@ -137,57 +159,94 @@ pub fn sys_lstat(path_va: usize, stat_va: usize) -> isize {
 /// Translates the user-visible `fd` to its kernel backing fd before
 /// dispatching to the appropriate subsystem.
 pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
-    if stat_va == 0 || stat_va >= USER_SPACE_END { return -14; }
+    if stat_va == 0 || stat_va >= USER_SPACE_END {
+        return -14;
+    }
 
     let bfd = match user_fd_to_bfd(fd) {
         Some(b) => b,
-        None    => return -9,
+        None => return -9,
     };
 
     let write_stat = |s: Stat| -> isize {
-        let buf = unsafe { core::slice::from_raw_parts(
-            &s as *const _ as *const u8, core::mem::size_of::<Stat>()) };
-        if copy_to_user(stat_va, buf).is_err() { -14 } else { 0 }
+        let buf = unsafe {
+            core::slice::from_raw_parts(&s as *const _ as *const u8, core::mem::size_of::<Stat>())
+        };
+        if copy_to_user(stat_va, buf).is_err() {
+            -14
+        } else {
+            0
+        }
     };
 
     if crate::fs::pipe::is_pipe(bfd) {
         return write_stat(Stat {
-            st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
-            st_mode: S_IFIFO | 0o666, st_uid: 0, st_gid: 0,
-            _pad0: 0, st_rdev: 0, st_size: 0,
-            st_blksize: 4096, st_blocks: 0,
-            st_atime: 0, _atimensec: 0,
-            st_mtime: 0, _mtimensec: 0,
-            st_ctime: 0, _ctimensec: 0,
+            st_dev: 1,
+            st_ino: bfd as u64 + 1,
+            st_nlink: 1,
+            st_mode: S_IFIFO | 0o666,
+            st_uid: 0,
+            st_gid: 0,
+            _pad0: 0,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+            st_atime: 0,
+            _atimensec: 0,
+            st_mtime: 0,
+            _mtimensec: 0,
+            st_ctime: 0,
+            _ctimensec: 0,
             _reserved: [0; 3],
         });
     }
 
     if crate::net::socket::is_socket_fd(bfd) {
         return write_stat(Stat {
-            st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
-            st_mode: S_IFSOCK | 0o777, st_uid: 0, st_gid: 0,
-            _pad0: 0, st_rdev: 0, st_size: 0,
-            st_blksize: 4096, st_blocks: 0,
-            st_atime: 0, _atimensec: 0,
-            st_mtime: 0, _mtimensec: 0,
-            st_ctime: 0, _ctimensec: 0,
+            st_dev: 1,
+            st_ino: bfd as u64 + 1,
+            st_nlink: 1,
+            st_mode: S_IFSOCK | 0o777,
+            st_uid: 0,
+            st_gid: 0,
+            _pad0: 0,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+            st_atime: 0,
+            _atimensec: 0,
+            st_mtime: 0,
+            _mtimensec: 0,
+            st_ctime: 0,
+            _ctimensec: 0,
             _reserved: [0; 3],
         });
     }
 
     if crate::fs::eventfd::is_eventfd(bfd)
-       || crate::fs::timerfd::is_timerfd(bfd)
-       || crate::fs::signalfd::is_signalfd(bfd)
+        || crate::fs::timerfd::is_timerfd(bfd)
+        || crate::fs::signalfd::is_signalfd(bfd)
     {
         return write_stat(Stat {
-            st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
-            st_mode: S_IFCHR | 0o600, st_uid: 0, st_gid: 0,
-            _pad0: 0, st_rdev: 0, st_size: 0,
-            st_blksize: 4096, st_blocks: 0,
-            st_atime: 0, _atimensec: 0,
-            st_mtime: 0, _mtimensec: 0,
-            st_ctime: 0, _ctimensec: 0,
+            st_dev: 1,
+            st_ino: bfd as u64 + 1,
+            st_nlink: 1,
+            st_mode: S_IFCHR | 0o600,
+            st_uid: 0,
+            st_gid: 0,
+            _pad0: 0,
+            st_rdev: 0,
+            st_size: 0,
+            st_blksize: 4096,
+            st_blocks: 0,
+            st_atime: 0,
+            _atimensec: 0,
+            st_mtime: 0,
+            _mtimensec: 0,
+            st_ctime: 0,
+            _ctimensec: 0,
             _reserved: [0; 3],
         });
     }
@@ -198,28 +257,46 @@ pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
 
     let sz = vfs::file_size(bfd).unwrap_or(0);
     write_stat(Stat {
-        st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
-        st_mode: S_IFREG | 0o644, st_uid: 0, st_gid: 0,
-        _pad0: 0, st_rdev: 0,
+        st_dev: 1,
+        st_ino: bfd as u64 + 1,
+        st_nlink: 1,
+        st_mode: S_IFREG | 0o644,
+        st_uid: 0,
+        st_gid: 0,
+        _pad0: 0,
+        st_rdev: 0,
         st_size: sz as i64,
         st_blksize: 4096,
         st_blocks: sz.div_ceil(512) as i64,
-        st_atime: 0, _atimensec: 0,
-        st_mtime: 0, _mtimensec: 0,
-        st_ctime: 0, _ctimensec: 0,
+        st_atime: 0,
+        _atimensec: 0,
+        st_mtime: 0,
+        _mtimensec: 0,
+        st_ctime: 0,
+        _ctimensec: 0,
         _reserved: [0; 3],
     })
 }
 
 fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
     let mut s = Stat {
-        st_dev: 2, st_ino: 1, st_nlink: 1,
-        st_mode: S_IFREG | 0o644, st_uid: 0, st_gid: 0,
-        _pad0: 0, st_rdev: 0, st_size: 0,
-        st_blksize: 4096, st_blocks: 0,
-        st_atime: 0, _atimensec: 0,
-        st_mtime: 0, _mtimensec: 0,
-        st_ctime: 0, _ctimensec: 0,
+        st_dev: 2,
+        st_ino: 1,
+        st_nlink: 1,
+        st_mode: S_IFREG | 0o644,
+        st_uid: 0,
+        st_gid: 0,
+        _pad0: 0,
+        st_rdev: 0,
+        st_size: 0,
+        st_blksize: 4096,
+        st_blocks: 0,
+        st_atime: 0,
+        _atimensec: 0,
+        st_mtime: 0,
+        _mtimensec: 0,
+        st_ctime: 0,
+        _ctimensec: 0,
         _reserved: [0; 3],
     };
 
@@ -231,18 +308,24 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
         } else {
             S_IFREG | 0o444
         };
-        let buf = unsafe { core::slice::from_raw_parts(
-            &s as *const _ as *const u8, core::mem::size_of::<Stat>()) };
-        if copy_to_user(stat_va, buf).is_err() { return -14; }
+        let buf = unsafe {
+            core::slice::from_raw_parts(&s as *const _ as *const u8, core::mem::size_of::<Stat>())
+        };
+        if copy_to_user(stat_va, buf).is_err() {
+            return -14;
+        }
         return 0;
     }
 
     if path.starts_with("/dev/") {
         s.st_mode = S_IFCHR | 0o666;
         s.st_rdev = crate::fs::devfs::dev_rdev(path);
-        let buf = unsafe { core::slice::from_raw_parts(
-            &s as *const _ as *const u8, core::mem::size_of::<Stat>()) };
-        if copy_to_user(stat_va, buf).is_err() { return -14; }
+        let buf = unsafe {
+            core::slice::from_raw_parts(&s as *const _ as *const u8, core::mem::size_of::<Stat>())
+        };
+        if copy_to_user(stat_va, buf).is_err() {
+            return -14;
+        }
         return 0;
     }
 
@@ -255,20 +338,26 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
     match ks_result {
         Err(e) => e,
         Ok(ks) => {
-            s.st_ino     = ks.ino;
-            s.st_mode    = ks.mode as u32;
-            s.st_nlink   = ks.nlink as u64;
-            s.st_uid     = ks.uid;
-            s.st_gid     = ks.gid;
-            s.st_size    = ks.size    as i64;
+            s.st_ino = ks.ino;
+            s.st_mode = ks.mode as u32;
+            s.st_nlink = ks.nlink as u64;
+            s.st_uid = ks.uid;
+            s.st_gid = ks.gid;
+            s.st_size = ks.size as i64;
             s.st_blksize = ks.blksize as i64;
-            s.st_blocks  = ks.blocks  as i64;
-            s.st_atime   = ks.atime   as i64;
-            s.st_mtime   = ks.mtime   as i64;
-            s.st_ctime   = ks.ctime   as i64;
-            let buf = unsafe { core::slice::from_raw_parts(
-                &s as *const _ as *const u8, core::mem::size_of::<Stat>()) };
-            if copy_to_user(stat_va, buf).is_err() { return -14; }
+            s.st_blocks = ks.blocks as i64;
+            s.st_atime = ks.atime as i64;
+            s.st_mtime = ks.mtime as i64;
+            s.st_ctime = ks.ctime as i64;
+            let buf = unsafe {
+                core::slice::from_raw_parts(
+                    &s as *const _ as *const u8,
+                    core::mem::size_of::<Stat>(),
+                )
+            };
+            if copy_to_user(stat_va, buf).is_err() {
+                return -14;
+            }
             0
         }
     }
@@ -276,35 +365,32 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
 
 pub fn kstat_ext2(path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
     match vfs::stat(path) {
-        None     => Err(-2),
+        None => Err(-2),
         Some(vs) => Ok(crate::fs::vfs_ops::KStat {
-            ino:     vs.ino,
-            mode:    vs.mode,
-            nlink:   vs.nlink,
-            uid:     0,
-            gid:     0,
-            size:    vs.size,
-            atime:   0,
-            mtime:   0,
-            ctime:   0,
+            ino: vs.ino,
+            mode: vs.mode,
+            nlink: vs.nlink,
+            uid: 0,
+            gid: 0,
+            size: vs.size,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
             blksize: 4096,
-            blocks:  vs.size.div_ceil(512),
-            is_dir:  vs.is_dir,
+            blocks: vs.size.div_ceil(512),
+            is_dir: vs.is_dir,
         }),
     }
 }
 
 fn is_proc_symlink(path: &str) -> bool {
     path.ends_with("/exe")
-    || path == "/proc/self"
-    || (path.contains("/fd/") && !path.ends_with("/fd"))
+        || path == "/proc/self"
+        || (path.contains("/fd/") && !path.ends_with("/fd"))
 }
 
 fn is_proc_dir(path: &str) -> bool {
-    path == "/proc"
-    || path == "/proc/self"
-    || path.ends_with("/fd")
-    || {
+    path == "/proc" || path == "/proc/self" || path.ends_with("/fd") || {
         if let Some(rest) = path.strip_prefix("/proc/") {
             rest.parse::<usize>().is_ok()
         } else {
@@ -327,15 +413,21 @@ pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
 /// Returns ERANGE (-34) if `size` is too small.
 /// Returns the user buffer address on success (matches Linux).
 pub fn sys_getcwd(buf_va: usize, size: usize) -> isize {
-    if buf_va == 0 || size == 0 { return -22; }
+    if buf_va == 0 || size == 0 {
+        return -22;
+    }
     let pid = crate::proc::scheduler::current_pid() as usize;
     let cwd = crate::proc::scheduler::with_proc(pid, |p| p.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
     let needed = cwd.len() + 1; // +1 for NUL
-    if size < needed { return -34; } // ERANGE
+    if size < needed {
+        return -34;
+    } // ERANGE
     let mut kbuf = alloc::vec![0u8; needed];
     kbuf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    if copy_to_user(buf_va, &kbuf).is_err() { return -14; }
+    if copy_to_user(buf_va, &kbuf).is_err() {
+        return -14;
+    }
     buf_va as isize
 }
 
@@ -347,16 +439,23 @@ pub fn sys_getcwd(buf_va: usize, size: usize) -> isize {
 /// Pcb::cwd via with_proc_mut.  Handles relative paths by prepending
 /// the current cwd.
 pub fn sys_chdir(path_va: usize) -> isize {
-    let raw = match read_path(path_va) { Some(p) => p, None => return -14 };
+    let raw = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
     let path = resolve_path(&raw);
 
     // Virtual filesystems: treat any prefix as always-present dirs.
-    if is_virtual_dir(&path) { return commit_cwd(path); }
+    if is_virtual_dir(&path) {
+        return commit_cwd(path);
+    }
 
     match crate::fs::vfs_ops::stat(&path) {
         Err(e) => e,
         Ok(ks) => {
-            if !ks.is_dir { return -20; } // ENOTDIR
+            if !ks.is_dir {
+                return -20;
+            } // ENOTDIR
             commit_cwd(path)
         }
     }
@@ -367,15 +466,25 @@ pub fn sys_chdir(path_va: usize) -> isize {
 /// Resolves the fd to a VFS path, verifies it is a directory, then
 /// updates Pcb::cwd.
 pub fn sys_fchdir(fd: usize) -> isize {
-    let bfd = match user_fd_to_bfd(fd) { Some(b) => b, None => return -9 };
-    let path = match vfs::fd_path(bfd) { Some(p) => p, None => return -9 };
+    let bfd = match user_fd_to_bfd(fd) {
+        Some(b) => b,
+        None => return -9,
+    };
+    let path = match vfs::fd_path(bfd) {
+        Some(p) => p,
+        None => return -9,
+    };
 
-    if is_virtual_dir(&path) { return commit_cwd(path); }
+    if is_virtual_dir(&path) {
+        return commit_cwd(path);
+    }
 
     match crate::fs::vfs_ops::stat(&path) {
         Err(e) => e,
         Ok(ks) => {
-            if !ks.is_dir { return -20; }
+            if !ks.is_dir {
+                return -20;
+            }
             commit_cwd(path)
         }
     }
@@ -385,10 +494,12 @@ pub fn sys_fchdir(fd: usize) -> isize {
 /// a VFS entry (procfs, devfs, sysfs roots and sub-paths).
 #[inline]
 fn is_virtual_dir(p: &str) -> bool {
-    p == "/proc" || p == "/dev" || p == "/sys"
-    || p.starts_with("/proc/")
-    || p.starts_with("/dev/")
-    || p.starts_with("/sys/")
+    p == "/proc"
+        || p == "/dev"
+        || p == "/sys"
+        || p.starts_with("/proc/")
+        || p.starts_with("/dev/")
+        || p.starts_with("/sys/")
 }
 
 /// Atomically write `new_cwd` into the current process's Pcb::cwd.
@@ -404,11 +515,18 @@ fn commit_cwd(new_cwd: String) -> isize {
 // ── sys_access / sys_faccessat ──────────────────────────────────────────────────────
 
 pub fn sys_access(path_va: usize, _mode: u32) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
     if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
         return 0;
     }
-    if vfs::exists(&path) { 0 } else { -2 }
+    if vfs::exists(&path) {
+        0
+    } else {
+        -2
+    }
 }
 
 pub fn sys_faccessat(_dirfd: i32, path_va: usize, mode: u32) -> isize {
@@ -418,21 +536,32 @@ pub fn sys_faccessat(_dirfd: i32, path_va: usize, mode: u32) -> isize {
 // ── sys_readlink / sys_readlinkat ──────────────────────────────────────────────────────
 
 pub fn sys_readlink(path_va: usize, buf_va: usize, bufsz: usize) -> isize {
-    if buf_va == 0 || bufsz == 0 { return -14; }
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
+    if buf_va == 0 || bufsz == 0 {
+        return -14;
+    }
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
     let mut kbuf = alloc::vec![0u8; bufsz.min(4096)];
 
     if path.starts_with("/proc/") || path == "/proc/self" {
         let n = crate::fs::procfs::procfs_readlink(&path, &mut kbuf);
-        if n < 0 { return n; }
-        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
+        if n < 0 {
+            return n;
+        }
+        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() {
+            return -14;
+        }
         return n;
     }
 
     match vfs::readlink(&path) {
         Some(target) => {
             let n = target.len().min(bufsz);
-            if copy_to_user(buf_va, target[..n].as_bytes()).is_err() { return -14; }
+            if copy_to_user(buf_va, target[..n].as_bytes()).is_err() {
+                return -14;
+            }
             n as isize
         }
         None => -2,
@@ -446,69 +575,120 @@ pub fn sys_readlinkat(_dirfd: i32, path_va: usize, buf_va: usize, bufsz: usize) 
 // ── sys_rename / sys_mkdir / sys_unlink ────────────────────────────────────────────────
 
 pub fn sys_rename(old_va: usize, new_va: usize) -> isize {
-    let old = match read_path(old_va) { Some(p) => p, None => return -14 };
-    let new = match read_path(new_va) { Some(p) => p, None => return -14 };
-    if vfs::rename(&old, &new) { 0 } else { -2 }
+    let old = match read_path(old_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    let new = match read_path(new_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    if vfs::rename(&old, &new) {
+        0
+    } else {
+        -2
+    }
 }
 
 pub fn sys_rename_str(old: &str, new: &str) -> isize {
-    if vfs::rename(old, new) { 0 } else { -2 }
+    if vfs::rename(old, new) {
+        0
+    } else {
+        -2
+    }
 }
 
 pub fn sys_mkdir(path_va: usize, _mode: u32) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if vfs::mkdir(&path) { 0 } else { -17 }
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    if vfs::mkdir(&path) {
+        0
+    } else {
+        -17
+    }
 }
 
 pub fn sys_unlink(path_va: usize) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if vfs::unlink(&path) { 0 } else { -2 }
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    if vfs::unlink(&path) {
+        0
+    } else {
+        -2
+    }
 }
 
 // ── sys_truncate ───────────────────────────────────────────────────────────────────────────
 
 pub fn sys_truncate(path_va: usize, length: i64) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if length < 0 { return -22; }
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
+    if length < 0 {
+        return -22;
+    }
     match crate::fs::vfs_ops::truncate(&path, length as usize) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
 // ── sys_chmod / sys_fchmod / sys_chown / sys_fchown ──────────────────────────────
 
 pub fn sys_chmod(path_va: usize, mode: u32) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
     match crate::fs::vfs_ops::chmod(&path, mode as u16) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
 pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
-    let bfd = match user_fd_to_bfd(fd) { Some(b) => b, None => return -9 };
-    let path = match vfs::fd_path(bfd) { Some(p) => p, None => return -9 };
+    let bfd = match user_fd_to_bfd(fd) {
+        Some(b) => b,
+        None => return -9,
+    };
+    let path = match vfs::fd_path(bfd) {
+        Some(p) => p,
+        None => return -9,
+    };
     match crate::fs::vfs_ops::chmod(&path, mode as u16) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
 pub fn sys_chown(path_va: usize, uid: u32, gid: u32) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
+    let path = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
     match crate::fs::vfs_ops::chown(&path, uid, gid) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
 pub fn sys_fchown(fd: usize, uid: u32, gid: u32) -> isize {
-    let bfd = match user_fd_to_bfd(fd) { Some(b) => b, None => return -9 };
-    let path = match vfs::fd_path(bfd) { Some(p) => p, None => return -9 };
+    let bfd = match user_fd_to_bfd(fd) {
+        Some(b) => b,
+        None => return -9,
+    };
+    let path = match vfs::fd_path(bfd) {
+        Some(p) => p,
+        None => return -9,
+    };
     match crate::fs::vfs_ops::chown(&path, uid, gid) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
@@ -521,7 +701,10 @@ pub fn sys_newfstatat(dirfd: i32, path_va: usize, stat_va: usize, flags: u32) ->
         }
         return -14;
     }
-    let raw = match read_path(path_va) { Some(p) => p, None => return -14 };
+    let raw = match read_path(path_va) {
+        Some(p) => p,
+        None => return -14,
+    };
     let path = if raw.starts_with('/') || dirfd == AT_FDCWD {
         raw
     } else {

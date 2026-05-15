@@ -13,23 +13,26 @@
 //! All magic constants are imported from
 //! [`crate::arch::riscv64::mem_layout`].
 
+use super::mem_layout::{page as P, satp as SATP_MODE, sv39 as SV};
 use crate::arch::riscv64::csr::{get_satp, set_satp};
-use super::mem_layout::{page as P, sv39 as SV, satp as SATP_MODE};
 
 // Re-export PTE flags so existing consumers (trap.rs etc.) keep working.
-pub use SV::{PTE_V, PTE_R, PTE_W, PTE_X, PTE_U, PTE_G};
+pub use SV::{PTE_G, PTE_R, PTE_U, PTE_V, PTE_W, PTE_X};
 
 /// Build an identity-mapped Sv39 kernel page table, install it into SATP,
 /// and return the root PPN.
 pub fn paging_init(total_ram_bytes: usize) -> usize {
-    let root_pa = crate::mm::pmm::alloc_page()
-        .expect("OOM: no page for root PTE");
-    unsafe { core::ptr::write_bytes(root_pa as *mut u8, 0, P::SIZE); }
+    let root_pa = crate::mm::pmm::alloc_page().expect("OOM: no page for root PTE");
+    unsafe {
+        core::ptr::write_bytes(root_pa as *mut u8, 0, P::SIZE);
+    }
 
     let mut pa = 0usize;
     while pa < total_ram_bytes {
         let vpn2 = SV::vpn2(pa);
-        if vpn2 >= P::TABLE_ENTRIES { break; }
+        if vpn2 >= P::TABLE_ENTRIES {
+            break;
+        }
         unsafe {
             let pte = SV::pa_to_pte(pa, PTE_R | PTE_W | PTE_X | PTE_G);
             ((root_pa + vpn2 * 8) as *mut usize).write_volatile(pte);
@@ -39,7 +42,9 @@ pub fn paging_init(total_ram_bytes: usize) -> usize {
 
     let root_ppn = root_pa >> P::SHIFT;
     set_satp(SATP_MODE::MODE_SV39 | root_ppn);
-    unsafe { core::arch::asm!("sfence.vma zero, zero"); }
+    unsafe {
+        core::arch::asm!("sfence.vma zero, zero");
+    }
     root_ppn
 }
 
@@ -47,15 +52,16 @@ pub fn paging_init(total_ram_bytes: usize) -> usize {
 /// Returns the PPN (physical page number) of the allocated page.
 /// Does NOT install it into SATP — caller does that in jump_to_user.
 pub fn alloc_root_page_table() -> usize {
-    let pa = crate::mm::pmm::alloc_page()
-        .expect("OOM: alloc_root_page_table");
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, P::SIZE); }
+    let pa = crate::mm::pmm::alloc_page().expect("OOM: alloc_root_page_table");
+    unsafe {
+        core::ptr::write_bytes(pa as *mut u8, 0, P::SIZE);
+    }
     pa >> P::SHIFT
 }
 
 /// Map a 4 KiB page in the **current** SATP page table.
 pub fn map_page(va: usize, pa: usize, flags: usize) {
-    let satp    = get_satp();
+    let satp = get_satp();
     let root_pa = (satp & SV::SATP_PPN_MASK) << P::SHIFT;
     map_page_into(root_pa, va, pa, flags);
 }
@@ -70,10 +76,9 @@ pub fn map_page_into(root_pa: usize, va: usize, pa: usize, flags: usize) {
         let mut table = root_pa as *mut usize;
         for level in (1..=2).rev() {
             let slot = table.add(vpn[level]);
-            let pte  = slot.read_volatile();
+            let pte = slot.read_volatile();
             if pte & PTE_V == 0 {
-                let new_pa = crate::mm::pmm::alloc_page()
-                    .expect("OOM in map_page_into");
+                let new_pa = crate::mm::pmm::alloc_page().expect("OOM in map_page_into");
                 core::ptr::write_bytes(new_pa as *mut u8, 0, P::SIZE);
                 slot.write_volatile(((new_pa >> P::SHIFT) << SV::PPN_SHIFT) | PTE_V);
                 table = new_pa as *mut usize;
@@ -89,18 +94,20 @@ pub fn map_page_into(root_pa: usize, va: usize, pa: usize, flags: usize) {
 
 /// Unmap a single page and return its physical page to the PMM.
 pub fn unmap_page(va: usize) {
-    let satp  = get_satp();
-    let root  = (satp & SV::SATP_PPN_MASK) << P::SHIFT;
-    let vpn   = [SV::vpn0(va), SV::vpn1(va), SV::vpn2(va)];
+    let satp = get_satp();
+    let root = (satp & SV::SATP_PPN_MASK) << P::SHIFT;
+    let vpn = [SV::vpn0(va), SV::vpn1(va), SV::vpn2(va)];
     unsafe {
         let mut table = root as *mut usize;
         for level in (1..=2).rev() {
             let pte = table.add(vpn[level]).read_volatile();
-            if pte & PTE_V == 0 { return; }
+            if pte & PTE_V == 0 {
+                return;
+            }
             table = SV::pte_to_pa(pte) as *mut usize;
         }
         let leaf = table.add(vpn[0]);
-        let pte  = leaf.read_volatile();
+        let pte = leaf.read_volatile();
         if pte & PTE_V != 0 {
             let phys = SV::pte_to_pa(pte);
             leaf.write_volatile(0);
@@ -114,14 +121,18 @@ pub fn unmap_page(va: usize) {
 /// Returns `None` if unmapped.
 pub fn virt_to_phys(va: usize) -> Option<usize> {
     let satp = get_satp();
-    if satp >> 60 == 0 { return Some(va); } // bare mode: identity
+    if satp >> 60 == 0 {
+        return Some(va);
+    } // bare mode: identity
     let root = (satp & SV::SATP_PPN_MASK) << P::SHIFT;
-    let vpn  = [SV::vpn0(va), SV::vpn1(va), SV::vpn2(va)];
+    let vpn = [SV::vpn0(va), SV::vpn1(va), SV::vpn2(va)];
     unsafe {
         let mut table = root as *mut usize;
         for level in (1..=2).rev() {
             let pte = table.add(vpn[level]).read_volatile();
-            if pte & PTE_V == 0 { return None; }
+            if pte & PTE_V == 0 {
+                return None;
+            }
             // Leaf at this level (superpage)?
             if pte & (PTE_R | PTE_W | PTE_X) != 0 {
                 let ppn = SV::pte_to_pa(pte);
@@ -130,7 +141,9 @@ pub fn virt_to_phys(va: usize) -> Option<usize> {
             table = SV::pte_to_pa(pte) as *mut usize;
         }
         let pte = table.add(vpn[0]).read_volatile();
-        if pte & PTE_V == 0 { return None; }
+        if pte & PTE_V == 0 {
+            return None;
+        }
         Some(SV::pte_to_pa(pte) | (va & P::MASK))
     }
 }

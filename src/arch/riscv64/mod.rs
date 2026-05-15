@@ -7,7 +7,7 @@ pub mod paging;
 pub mod plic;
 pub mod smp;
 pub mod syscall;
-pub mod trap;
 pub mod trampoline;
+pub mod trap;
 pub mod uefi_entry;
 pub mod uentry;

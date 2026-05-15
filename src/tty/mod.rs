@@ -27,15 +27,15 @@
 //!   read(slave)   → canonical/raw cooked bytes for the application
 //!   write(slave)  → bytes echoed/processed and available on master
 
-pub mod termios;
 pub mod ldisc;
-pub mod pty;
 pub mod pts_fs;
+pub mod pty;
+pub mod termios;
 
 extern crate alloc;
 use alloc::{collections::BTreeMap, sync::Arc};
-use spin::Mutex;
 use core::sync::atomic::{AtomicU32, Ordering};
+use spin::Mutex;
 
 use pty::PtyPair;
 
@@ -53,7 +53,11 @@ struct PtyRegistry {
 }
 
 impl PtyRegistry {
-    fn new() -> Self { PtyRegistry { pairs: BTreeMap::new() } }
+    fn new() -> Self {
+        PtyRegistry {
+            pairs: BTreeMap::new(),
+        }
+    }
 }
 
 static REGISTRY: Mutex<Option<PtyRegistry>> = Mutex::new(None);
@@ -67,7 +71,9 @@ pub fn init() {
 /// Called from the `/dev/ptmx` open handler (posix_openpt).
 pub fn alloc_pty() -> Result<(u32, Arc<PtyPair>), isize> {
     let idx = NEXT_PTY.fetch_add(1, Ordering::SeqCst);
-    if idx >= PTY_MAX { return Err(-28); } // ENOSPC
+    if idx >= PTY_MAX {
+        return Err(-28);
+    } // ENOSPC
     let pair = Arc::new(PtyPair::new(idx));
     let mut reg = REGISTRY.lock();
     reg.as_mut().ok_or(-1isize)?.pairs.insert(idx, pair.clone());

@@ -8,11 +8,11 @@
 //!   Hart 0: kernel_main → smp::init() → sbi_hsm_hart_start() per hart
 //!   AP hart: ap_entry() → percpu_init() → scheduler::ap_idle()
 
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-pub mod percpu;
 pub mod ipi;
+pub mod percpu;
 
 /// Maximum CPUs this build supports.
 pub const MAX_CPUS: usize = 256;

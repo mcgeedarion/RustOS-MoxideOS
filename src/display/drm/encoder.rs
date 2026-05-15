@@ -24,7 +24,11 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(id: u32, encoder_type: EncoderType) -> Self {
-        Self { id, encoder_type, crtc_id: None }
+        Self {
+            id,
+            encoder_type,
+            crtc_id: None,
+        }
     }
 
     pub fn attach_crtc(&mut self, crtc_id: u32) {

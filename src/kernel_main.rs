@@ -91,11 +91,15 @@ pub fn kernel_main(fdt_ptr: usize) -> ! {
     use crate::arch::riscv64::{fdt, plic, trap};
 
     trap::trap_init();
-    unsafe { fdt::fdt_phase1(fdt_ptr); }  // PMM + PLIC base + initramfs + CPUs; no alloc
-    plic::init();                          // threshold=0; unmask all external IRQs
+    unsafe {
+        fdt::fdt_phase1(fdt_ptr);
+    } // PMM + PLIC base + initramfs + CPUs; no alloc
+    plic::init(); // threshold=0; unmask all external IRQs
     crate::heap::init();
     crate::mm::init();
-    unsafe { fdt::fdt_phase2(fdt_ptr); }  // virtio probe; alloc now safe
+    unsafe {
+        fdt::fdt_phase2(fdt_ptr);
+    } // virtio probe; alloc now safe
     crate::init::initramfs::mount();
     crate::namespace::init();
     crate::time::init();

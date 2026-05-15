@@ -27,21 +27,16 @@
 
 extern crate alloc;
 
-use alloc::{
-    collections::VecDeque,
-    string::String,
-    vec::Vec,
-};
+use alloc::{collections::VecDeque, string::String, vec::Vec};
 
 use scheme_api::{
-    DriverHandle, IpcEndpoint, IrqNotification,
-    OpenFlags, SchemeError, SchemeFileId,
+    DriverHandle, IpcEndpoint, IrqNotification, OpenFlags, SchemeError, SchemeFileId,
     SchemeRequest, SchemeResponse,
 };
 
 // ---------------------------------------------------------------------------
 // Kernel syscall stubs
-// 
+//
 // In a real build these are thin wrappers around `syscall` instructions.
 // We declare them as `extern "C"` here; the linker resolves them from the
 // syscall shim library built alongside the kernel.
@@ -64,31 +59,31 @@ extern "C" {
 // ---------------------------------------------------------------------------
 
 /// Magic value at offset 0x000: must equal 0x74726976 ("virt").
-const VIRTIO_MAGIC:           u32 = 0x74726976;
-const VIRTIO_MMIO_MAGIC:      usize = 0x000;
-const VIRTIO_MMIO_VERSION:    usize = 0x004;
-const VIRTIO_MMIO_DEVICE_ID:  usize = 0x008;  // 1 = net
-const VIRTIO_MMIO_STATUS:     usize = 0x070;
-const VIRTIO_MMIO_QUEUE_SEL:  usize = 0x030;
-const VIRTIO_MMIO_QUEUE_NUM:  usize = 0x038;
+const VIRTIO_MAGIC: u32 = 0x74726976;
+const VIRTIO_MMIO_MAGIC: usize = 0x000;
+const VIRTIO_MMIO_VERSION: usize = 0x004;
+const VIRTIO_MMIO_DEVICE_ID: usize = 0x008; // 1 = net
+const VIRTIO_MMIO_STATUS: usize = 0x070;
+const VIRTIO_MMIO_QUEUE_SEL: usize = 0x030;
+const VIRTIO_MMIO_QUEUE_NUM: usize = 0x038;
 const VIRTIO_MMIO_QUEUE_DESC: usize = 0x080;
-const VIRTIO_MMIO_QUEUE_AVAIL:usize = 0x090;
+const VIRTIO_MMIO_QUEUE_AVAIL: usize = 0x090;
 const VIRTIO_MMIO_QUEUE_USED: usize = 0x0a0;
-const VIRTIO_MMIO_QUEUE_READY:usize = 0x044;
-const VIRTIO_MMIO_QUEUE_NOTIFY:usize= 0x050;
+const VIRTIO_MMIO_QUEUE_READY: usize = 0x044;
+const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x050;
 const VIRTIO_MMIO_INT_STATUS: usize = 0x060;
-const VIRTIO_MMIO_INT_ACK:    usize = 0x064;
+const VIRTIO_MMIO_INT_ACK: usize = 0x064;
 
 /// Device status bits (virtio spec section 2.1).
 const STATUS_ACKNOWLEDGE: u32 = 1;
-const STATUS_DRIVER:      u32 = 2;
+const STATUS_DRIVER: u32 = 2;
 const STATUS_FEATURES_OK: u32 = 8;
-const STATUS_DRIVER_OK:   u32 = 4;
+const STATUS_DRIVER_OK: u32 = 4;
 
 /// Virtqueue sizes (must be a power of two).
-const RX_QUEUE_IDX:  u32 = 0;
-const TX_QUEUE_IDX:  u32 = 1;
-const QUEUE_SIZE:    u16 = 256;
+const RX_QUEUE_IDX: u32 = 0;
+const TX_QUEUE_IDX: u32 = 1;
+const QUEUE_SIZE: u16 = 256;
 const MAX_FRAME_LEN: usize = 1526; // 1500 + 14 (Ethernet) + 12 (virtio header)
 
 // ---------------------------------------------------------------------------
@@ -97,30 +92,30 @@ const MAX_FRAME_LEN: usize = 1526; // 1500 + 14 (Ethernet) + 12 (virtio header)
 
 #[repr(C)]
 struct VirtqDesc {
-    addr:  u64,   // physical address of buffer
-    len:   u32,
-    flags: u16,   // 0=read-only, VIRTQ_DESC_F_WRITE=2 for device-writable
-    next:  u16,
+    addr: u64, // physical address of buffer
+    len: u32,
+    flags: u16, // 0=read-only, VIRTQ_DESC_F_WRITE=2 for device-writable
+    next: u16,
 }
 
 #[repr(C)]
 struct VirtqAvail {
     flags: u16,
-    idx:   u16,
-    ring:  [u16; QUEUE_SIZE as usize],
+    idx: u16,
+    ring: [u16; QUEUE_SIZE as usize],
 }
 
 #[repr(C)]
 struct VirtqUsedElem {
-    id:  u32,
+    id: u32,
     len: u32,
 }
 
 #[repr(C)]
 struct VirtqUsed {
     flags: u16,
-    idx:   u16,
-    ring:  [VirtqUsedElem; QUEUE_SIZE as usize],
+    idx: u16,
+    ring: [VirtqUsedElem; QUEUE_SIZE as usize],
 }
 
 // ---------------------------------------------------------------------------
@@ -128,26 +123,26 @@ struct VirtqUsed {
 // ---------------------------------------------------------------------------
 
 struct NetDriver {
-    mmio_base:    *mut u8,
-    handle:       DriverHandle,
-    endpoint:     IpcEndpoint,
-    irq:          u32,
+    mmio_base: *mut u8,
+    handle: DriverHandle,
+    endpoint: IpcEndpoint,
+    irq: u32,
 
     // RX virtqueue
-    rx_desc:      *mut VirtqDesc,
-    rx_avail:     *mut VirtqAvail,
-    rx_used:      *mut VirtqUsed,
-    rx_bufs:      Vec<(*mut u8, u64)>,  // (virt, phys) per descriptor
+    rx_desc: *mut VirtqDesc,
+    rx_avail: *mut VirtqAvail,
+    rx_used: *mut VirtqUsed,
+    rx_bufs: Vec<(*mut u8, u64)>, // (virt, phys) per descriptor
     rx_last_used: u16,
 
     // TX virtqueue
-    tx_desc:      *mut VirtqDesc,
-    tx_avail:     *mut VirtqAvail,
-    tx_used:      *mut VirtqUsed,
-    tx_free:      VecDeque<u16>,         // free descriptor indices
+    tx_desc: *mut VirtqDesc,
+    tx_avail: *mut VirtqAvail,
+    tx_used: *mut VirtqUsed,
+    tx_free: VecDeque<u16>, // free descriptor indices
 
     // Pending received frames waiting to be read by scheme consumers.
-    rx_pending:   VecDeque<Vec<u8>>,
+    rx_pending: VecDeque<Vec<u8>>,
 }
 
 // SAFETY: this process is single-threaded; no concurrent access.
@@ -168,24 +163,31 @@ impl NetDriver {
 
         // Reset and set status.
         mmio_write32(mmio_base, VIRTIO_MMIO_STATUS, 0);
-        mmio_write32(mmio_base, VIRTIO_MMIO_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+        mmio_write32(
+            mmio_base,
+            VIRTIO_MMIO_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER,
+        );
 
         // Negotiate features (we keep it simple: no offloads).
-        mmio_write32(mmio_base, VIRTIO_MMIO_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
+        mmio_write32(
+            mmio_base,
+            VIRTIO_MMIO_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
+        );
 
         // Set up RX queue (index 0).
-        let (rx_desc, rx_avail, rx_used, rx_bufs) =
-            Self::setup_rx_queue(handle, mmio_base);
+        let (rx_desc, rx_avail, rx_used, rx_bufs) = Self::setup_rx_queue(handle, mmio_base);
 
         // Set up TX queue (index 1).
-        let (tx_desc, tx_avail, tx_used, tx_free) =
-            Self::setup_tx_queue(handle, mmio_base);
+        let (tx_desc, tx_avail, tx_used, tx_free) = Self::setup_tx_queue(handle, mmio_base);
 
         // Driver is ready.
-        mmio_write32(mmio_base, VIRTIO_MMIO_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
+        mmio_write32(
+            mmio_base,
+            VIRTIO_MMIO_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+        );
 
         // Create IPC endpoint for scheme requests + IRQ notifications.
         let endpoint = IpcEndpoint(sys_ipc_endpoint_create());
@@ -195,9 +197,15 @@ impl NetDriver {
             handle,
             endpoint,
             irq,
-            rx_desc, rx_avail, rx_used, rx_bufs,
+            rx_desc,
+            rx_avail,
+            rx_used,
+            rx_bufs,
             rx_last_used: 0,
-            tx_desc, tx_avail, tx_used, tx_free,
+            tx_desc,
+            tx_avail,
+            tx_used,
+            tx_free,
             rx_pending: VecDeque::new(),
         }
     }
@@ -205,14 +213,19 @@ impl NetDriver {
     unsafe fn setup_rx_queue(
         handle: DriverHandle,
         base: *mut u8,
-    ) -> (*mut VirtqDesc, *mut VirtqAvail, *mut VirtqUsed, Vec<(*mut u8, u64)>) {
+    ) -> (
+        *mut VirtqDesc,
+        *mut VirtqAvail,
+        *mut VirtqUsed,
+        Vec<(*mut u8, u64)>,
+    ) {
         mmio_write32(base, VIRTIO_MMIO_QUEUE_SEL, RX_QUEUE_IDX);
         mmio_write32(base, VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
 
         // Allocate descriptor table.
-        let desc_size  = core::mem::size_of::<VirtqDesc>()  * QUEUE_SIZE as usize;
+        let desc_size = core::mem::size_of::<VirtqDesc>() * QUEUE_SIZE as usize;
         let avail_size = core::mem::size_of::<VirtqAvail>();
-        let used_size  = core::mem::size_of::<VirtqUsed>();
+        let used_size = core::mem::size_of::<VirtqUsed>();
 
         let mut phys_desc: u64 = 0;
         let virt_desc = sys_dma_alloc(handle.0, desc_size, 4096, &mut phys_desc);
@@ -226,14 +239,14 @@ impl NetDriver {
         let virt_used = sys_dma_alloc(handle.0, used_size, 4, &mut phys_used);
         assert!(virt_used > 0);
 
-        mmio_write64(base, VIRTIO_MMIO_QUEUE_DESC,  phys_desc);
+        mmio_write64(base, VIRTIO_MMIO_QUEUE_DESC, phys_desc);
         mmio_write64(base, VIRTIO_MMIO_QUEUE_AVAIL, phys_avail);
-        mmio_write64(base, VIRTIO_MMIO_QUEUE_USED,  phys_used);
+        mmio_write64(base, VIRTIO_MMIO_QUEUE_USED, phys_used);
         mmio_write32(base, VIRTIO_MMIO_QUEUE_READY, 1);
 
-        let desc  = virt_desc  as *mut VirtqDesc;
+        let desc = virt_desc as *mut VirtqDesc;
         let avail = virt_avail as *mut VirtqAvail;
-        let used  = virt_used  as *mut VirtqUsed;
+        let used = virt_used as *mut VirtqUsed;
 
         // Pre-fill RX descriptors with receive buffers.
         let mut rx_bufs = Vec::with_capacity(QUEUE_SIZE as usize);
@@ -242,10 +255,10 @@ impl NetDriver {
             let virt_buf = sys_dma_alloc(handle.0, MAX_FRAME_LEN, 64, &mut phys_buf);
             assert!(virt_buf > 0);
             let d = &mut *desc.add(i);
-            d.addr  = phys_buf;
-            d.len   = MAX_FRAME_LEN as u32;
+            d.addr = phys_buf;
+            d.len = MAX_FRAME_LEN as u32;
             d.flags = 0x0002; // VIRTQ_DESC_F_WRITE (device writes into it)
-            d.next  = 0;
+            d.next = 0;
             (*avail).ring[i] = i as u16;
             rx_bufs.push((virt_buf as *mut u8, phys_buf));
         }
@@ -257,13 +270,18 @@ impl NetDriver {
     unsafe fn setup_tx_queue(
         handle: DriverHandle,
         base: *mut u8,
-    ) -> (*mut VirtqDesc, *mut VirtqAvail, *mut VirtqUsed, VecDeque<u16>) {
+    ) -> (
+        *mut VirtqDesc,
+        *mut VirtqAvail,
+        *mut VirtqUsed,
+        VecDeque<u16>,
+    ) {
         mmio_write32(base, VIRTIO_MMIO_QUEUE_SEL, TX_QUEUE_IDX);
         mmio_write32(base, VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
 
-        let desc_size  = core::mem::size_of::<VirtqDesc>()  * QUEUE_SIZE as usize;
+        let desc_size = core::mem::size_of::<VirtqDesc>() * QUEUE_SIZE as usize;
         let avail_size = core::mem::size_of::<VirtqAvail>();
-        let used_size  = core::mem::size_of::<VirtqUsed>();
+        let used_size = core::mem::size_of::<VirtqUsed>();
 
         let mut phys_desc: u64 = 0;
         let virt_desc = sys_dma_alloc(handle.0, desc_size, 4096, &mut phys_desc);
@@ -272,14 +290,14 @@ impl NetDriver {
         let mut phys_used: u64 = 0;
         let virt_used = sys_dma_alloc(handle.0, used_size, 4, &mut phys_used);
 
-        mmio_write64(base, VIRTIO_MMIO_QUEUE_DESC,  phys_desc);
+        mmio_write64(base, VIRTIO_MMIO_QUEUE_DESC, phys_desc);
         mmio_write64(base, VIRTIO_MMIO_QUEUE_AVAIL, phys_avail);
-        mmio_write64(base, VIRTIO_MMIO_QUEUE_USED,  phys_used);
+        mmio_write64(base, VIRTIO_MMIO_QUEUE_USED, phys_used);
         mmio_write32(base, VIRTIO_MMIO_QUEUE_READY, 1);
 
-        let desc  = virt_desc  as *mut VirtqDesc;
+        let desc = virt_desc as *mut VirtqDesc;
         let avail = virt_avail as *mut VirtqAvail;
-        let used  = virt_used  as *mut VirtqUsed;
+        let used = virt_used as *mut VirtqUsed;
 
         let tx_free: VecDeque<u16> = (0..QUEUE_SIZE).collect();
         (desc, avail, used, tx_free)
@@ -308,7 +326,7 @@ impl NetDriver {
     unsafe fn drain_rx(&mut self) {
         let used = &*self.rx_used;
         while self.rx_last_used != used.idx {
-            let idx  = (self.rx_last_used % QUEUE_SIZE) as usize;
+            let idx = (self.rx_last_used % QUEUE_SIZE) as usize;
             let elem = &used.ring[idx];
             let desc_idx = elem.id as usize;
             let len = elem.len as usize;
@@ -334,8 +352,8 @@ impl NetDriver {
     unsafe fn reclaim_tx(&mut self) {
         let used = &*self.tx_used;
         let mut last = self.tx_free.len() as u16; // proxy for last_used_tx
-        // Iterate over newly used TX descriptors and return them to the free pool.
-        // (We keep a simple linear scan here; a shadow index avoids redundant work.)
+                                                  // Iterate over newly used TX descriptors and return them to the free pool.
+                                                  // (We keep a simple linear scan here; a shadow index avoids redundant work.)
         let total_used = used.idx;
         for i in 0..total_used {
             let elem = &used.ring[(i % QUEUE_SIZE) as usize];
@@ -359,12 +377,13 @@ impl NetDriver {
         match tag {
             // open: tag(1) | flags(4) | path_len(4) | path_bytes
             1 => {
-                if rest.len() < 8 { return encode_err(SchemeError::InvalidArg); }
+                if rest.len() < 8 {
+                    return encode_err(SchemeError::InvalidArg);
+                }
                 let _flags = u32::from_le_bytes(rest[..4].try_into().unwrap());
                 let path_len = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
                 let path_bytes = &rest[8..8 + path_len];
-                let path = core::str::from_utf8(path_bytes)
-                    .unwrap_or("");
+                let path = core::str::from_utf8(path_bytes).unwrap_or("");
                 // We expose a single interface: "eth0".
                 if path == "eth0" || path.is_empty() {
                     // SchemeFileId = 1 (only one interface).
@@ -375,7 +394,7 @@ impl NetDriver {
             }
             // read: tag(1) | fd(8) | len(8)
             2 => {
-                let _fd = u64::from_le_bytes(rest[..8].try_into().unwrap_or([0;8]));
+                let _fd = u64::from_le_bytes(rest[..8].try_into().unwrap_or([0; 8]));
                 if let Some(frame) = self.rx_pending.pop_front() {
                     encode_data(&frame)
                 } else {
@@ -384,9 +403,9 @@ impl NetDriver {
             }
             // write: tag(1) | fd(8) | data_len(4) | data
             3 => {
-                let _fd   = u64::from_le_bytes(rest[..8].try_into().unwrap_or([0;8]));
-                let dlen  = u32::from_le_bytes(rest[8..12].try_into().unwrap_or([0;4])) as usize;
-                let data  = &rest[12..12 + dlen];
+                let _fd = u64::from_le_bytes(rest[..8].try_into().unwrap_or([0; 8]));
+                let dlen = u32::from_le_bytes(rest[8..12].try_into().unwrap_or([0; 4])) as usize;
+                let data = &rest[12..12 + dlen];
                 let n = self.transmit(data);
                 encode_count(n)
             }
@@ -405,16 +424,19 @@ impl NetDriver {
         // (In production you would use pre-allocated TX buffers.)
         let mut phys: u64 = 0;
         let virt = sys_dma_alloc(self.handle.0, MAX_FRAME_LEN, 64, &mut phys);
-        if virt <= 0 { self.tx_free.push_front(desc_idx); return 0; }
+        if virt <= 0 {
+            self.tx_free.push_front(desc_idx);
+            return 0;
+        }
 
         let n = data.len().min(MAX_FRAME_LEN);
         core::ptr::copy_nonoverlapping(data.as_ptr(), virt as *mut u8, n);
 
         let d = &mut *self.tx_desc.add(desc_idx as usize);
-        d.addr  = phys;
-        d.len   = n as u32;
+        d.addr = phys;
+        d.len = n as u32;
         d.flags = 0;
-        d.next  = 0;
+        d.next = 0;
 
         let avail = &mut *self.tx_avail;
         let slot = avail.idx % QUEUE_SIZE;
@@ -466,7 +488,9 @@ pub extern "C" fn _start() -> ! {
         let mut msg_buf = [0u8; 4096];
         loop {
             let n = sys_ipc_recv(drv.endpoint.0, msg_buf.as_mut_ptr(), msg_buf.len());
-            if n < 0 { continue; }
+            if n < 0 {
+                continue;
+            }
             let msg = &msg_buf[..n as usize];
 
             // Distinguish IRQ notification (first byte == 0xFF) from
@@ -517,7 +541,9 @@ fn encode_count(n: usize) -> Vec<u8> {
     v.extend_from_slice(&(n as u64).to_le_bytes());
     v
 }
-fn encode_ok() -> Vec<u8> { vec![0x84] }
+fn encode_ok() -> Vec<u8> {
+    vec![0x84]
+}
 fn encode_err(e: SchemeError) -> Vec<u8> {
     let mut v = vec![0xFFu8];
     v.extend_from_slice(&(e as u32).to_le_bytes());

@@ -52,8 +52,7 @@ pub struct RestartBlock {
     pub a5: usize,
 }
 
-static RESTART_BLOCKS: Mutex<BTreeMap<usize, RestartBlock>> =
-    Mutex::new(BTreeMap::new());
+static RESTART_BLOCKS: Mutex<BTreeMap<usize, RestartBlock>> = Mutex::new(BTreeMap::new());
 
 /// Store a restart block for `pid`.  Called by the syscall that returns -EINTR.
 /// Any previous block for this pid is overwritten.
@@ -88,13 +87,10 @@ pub fn clear_restart(pid: usize) {
 /// # Safety
 /// `frame` must be the live supervisor trap frame for `pid` on the current CPU.
 #[cfg(target_arch = "riscv64")]
-pub unsafe fn apply_restart(
-    pid:   usize,
-    frame: &mut crate::arch::riscv64::trap::TrapFrame,
-) -> bool {
+pub unsafe fn apply_restart(pid: usize, frame: &mut crate::arch::riscv64::trap::TrapFrame) -> bool {
     let rb = match take_restart(pid) {
         Some(rb) => rb,
-        None     => return false,
+        None => return false,
     };
     // Rewind PC to the ecall instruction so the CPU re-executes it on sret.
     frame.sepc = rb.sepc_ecall;

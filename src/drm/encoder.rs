@@ -8,12 +8,12 @@
 pub enum EncoderType {
     None,
     Dac,
-    Tmds,  // HDMI / DVI
+    Tmds, // HDMI / DVI
     Lvds,
     Tvdac,
     Virtual,
     Dsi,
-    Dp,    // DisplayPort
+    Dp, // DisplayPort
 }
 
 pub struct Encoder {
@@ -25,6 +25,10 @@ pub struct Encoder {
 
 impl Encoder {
     pub fn new(id: u32, encoder_type: EncoderType, possible_crtcs: u32) -> Self {
-        Self { id, encoder_type, possible_crtcs }
+        Self {
+            id,
+            encoder_type,
+            possible_crtcs,
+        }
     }
 }

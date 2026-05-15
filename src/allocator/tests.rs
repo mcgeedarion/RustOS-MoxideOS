@@ -9,7 +9,7 @@
 //! instances backed by on-stack memory, so they do not require the PMM or any
 //! kernel-specific infrastructure.
 
-use super::buddy::{BuddyAllocator, block_size, required_order, PAGE_SIZE, MAX_ORDER};
+use super::buddy::{block_size, required_order, BuddyAllocator, MAX_ORDER, PAGE_SIZE};
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
@@ -96,8 +96,8 @@ fn test_buddy_alloc_and_free_order0() {
 #[test]
 fn test_buddy_alloc_multiple_order0() {
     unsafe {
-        let mut b   = make_buddy();
-        let layout  = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let mut b = make_buddy();
+        let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
         let mut ptrs: [Option<NonNull<u8>>; 16] = [None; 16];
         for slot in ptrs.iter_mut() {
             *slot = Some(b.allocate(layout).expect("OOM"));
@@ -138,10 +138,7 @@ fn test_buddy_oom_returns_none() {
     unsafe {
         let mut b = make_buddy();
         // Request something larger than TEST_HEAP_BYTES — must return None.
-        let too_big = Layout::from_size_align(
-            TEST_HEAP_BYTES + PAGE_SIZE,
-            PAGE_SIZE,
-        ).unwrap();
+        let too_big = Layout::from_size_align(TEST_HEAP_BYTES + PAGE_SIZE, PAGE_SIZE).unwrap();
         assert!(b.allocate(too_big).is_none());
     }
 }
@@ -161,7 +158,7 @@ unsafe fn make_fixed() -> FixedSizeBlockAllocator {
 #[test]
 fn test_fixed_alloc_8() {
     unsafe {
-        let mut a  = make_fixed();
+        let mut a = make_fixed();
         let layout = Layout::from_size_align(8, 8).unwrap();
         // Directly call the inner alloc (not via GlobalAlloc, to avoid locks).
         let p = a.fallback_alloc_pub(layout);
@@ -175,13 +172,10 @@ fn test_fixed_alloc_dealloc_roundtrip() {
     // FixedSizeGlobalAlloc goes through FIXED_BLOCK_ALLOC; test its
     // dealloc path via the public GlobalAlloc impl.
     unsafe {
-        super::init(
-            TEST_HEAP.0.as_mut_ptr() as usize,
-            TEST_HEAP_BYTES,
-        );
-        let alloc  = super::fixed_size_block::FixedSizeGlobalAlloc;
+        super::init(TEST_HEAP.0.as_mut_ptr() as usize, TEST_HEAP_BYTES);
+        let alloc = super::fixed_size_block::FixedSizeGlobalAlloc;
         let layout = Layout::from_size_align(64, 64).unwrap();
-        let ptr    = alloc.alloc(layout);
+        let ptr = alloc.alloc(layout);
         assert!(!ptr.is_null());
         alloc.dealloc(ptr, layout);
         // After a dealloc the head of the 64-byte class list is non-None.
@@ -198,14 +192,11 @@ fn test_fixed_alloc_dealloc_roundtrip() {
 fn test_fixed_large_falls_through_to_buddy() {
     use core::alloc::GlobalAlloc;
     unsafe {
-        super::init(
-            TEST_HEAP.0.as_mut_ptr() as usize,
-            TEST_HEAP_BYTES,
-        );
-        let alloc  = super::fixed_size_block::FixedSizeGlobalAlloc;
+        super::init(TEST_HEAP.0.as_mut_ptr() as usize, TEST_HEAP_BYTES);
+        let alloc = super::fixed_size_block::FixedSizeGlobalAlloc;
         // 8 KiB > largest class (4096) — must fall through to buddy.
         let layout = Layout::from_size_align(8192, 8192).unwrap();
-        let ptr    = alloc.alloc(layout);
+        let ptr = alloc.alloc(layout);
         assert!(!ptr.is_null());
         alloc.dealloc(ptr, layout);
     }

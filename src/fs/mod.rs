@@ -29,7 +29,7 @@ pub mod proc_debug;
 pub mod process_fd;
 pub mod procfs;
 pub mod ramfs;
-pub mod scheme_fd;      // new: scheme backing-fd store + dispatch helpers
+pub mod scheme_fd; // new: scheme backing-fd store + dispatch helpers
 pub mod scheme_table;
 pub mod shm;
 pub mod splice;

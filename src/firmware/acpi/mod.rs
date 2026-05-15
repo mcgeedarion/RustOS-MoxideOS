@@ -85,7 +85,10 @@ pub unsafe fn init(rsdp_phys: usize) {
         println!("acpi: bad rsdp sig");
         return;
     }
-    if !checksum_ok(slice::from_raw_parts(rsdp_phys as *const u8, size_of::<RsdpV1>())) {
+    if !checksum_ok(slice::from_raw_parts(
+        rsdp_phys as *const u8,
+        size_of::<RsdpV1>(),
+    )) {
         println!("acpi: rsdp v1 checksum failed");
         return;
     }
@@ -171,6 +174,10 @@ pub fn pcie_ecam_base() -> Option<u64> {
         // MCFG body starts at offset 44 (SdtHeader=36 + 8 reserved bytes).
         let body = (mcfg as usize + 44) as *const u64;
         let base = body.read_unaligned();
-        if base == 0 { None } else { Some(base) }
+        if base == 0 {
+            None
+        } else {
+            Some(base)
+        }
     }
 }

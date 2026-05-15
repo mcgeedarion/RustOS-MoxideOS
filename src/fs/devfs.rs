@@ -20,9 +20,9 @@
 
 #![allow(dead_code)]
 
-use alloc::sync::Arc;
 use crate::fs::vfs_ops::FileOps;
-use crate::input::{EventNode, device_count};
+use crate::input::{device_count, EventNode};
+use alloc::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Dispatch table
@@ -57,8 +57,7 @@ impl DevfsTable {
         self.majors.get(major)?.as_ref()?.get(minor)?.clone()
     }
 
-    fn set(&mut self, major: usize, minor: usize,
-           ops: Arc<dyn FileOps + Send + Sync>) {
+    fn set(&mut self, major: usize, minor: usize, ops: Arc<dyn FileOps + Send + Sync>) {
         if self.majors[major].is_none() {
             // Allocate the minor table on first use for this major.
             let boxed: alloc::boxed::Box<[DevCell; MAX_MINOR]> =
@@ -84,11 +83,7 @@ static mut DEVFS_TABLE: DevfsTable = DevfsTable {
 ///
 /// Idempotent: registering the same (major, minor) twice replaces the old
 /// `FileOps` silently.
-pub fn register_char_device(
-    major: usize,
-    minor: usize,
-    ops: Arc<dyn FileOps + Send + Sync>,
-) {
+pub fn register_char_device(major: usize, minor: usize, ops: Arc<dyn FileOps + Send + Sync>) {
     // SAFETY: called during single-threaded init only.
     unsafe { DEVFS_TABLE.set(major, minor, ops) }
 }

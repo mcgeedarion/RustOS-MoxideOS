@@ -16,7 +16,7 @@
 #[derive(Clone)]
 pub struct SignalHandlers {
     pub handlers: [usize; 65],
-    pub flags:    [u32;   65],
+    pub flags: [u32; 65],
     pub restorer: usize,
 }
 
@@ -24,7 +24,7 @@ impl Default for SignalHandlers {
     fn default() -> Self {
         Self {
             handlers: [0usize; 65],
-            flags:    [0u32;   65],
+            flags: [0u32; 65],
             restorer: 0,
         }
     }
@@ -46,7 +46,7 @@ impl SignalHandlers {
             if self.handlers[i] == 1 {
                 // SIG_IGN survives.
                 new.handlers[i] = 1;
-                new.flags[i]    = 0;  // flags don't survive (restorer VA gone)
+                new.flags[i] = 0; // flags don't survive (restorer VA gone)
             }
             // SIG_DFL (0) is already default; user VAs become SIG_DFL.
         }

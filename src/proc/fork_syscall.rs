@@ -39,7 +39,9 @@ pub fn sys_fork() -> isize {
         let (soft, _hard) = crate::proc::rlimit::getrlimit_for(parent_pid, RLIMIT_NPROC);
         if soft != RLIM_INFINITY {
             let count = scheduler::proc_count() as u64;
-            if count >= soft { return -11; }
+            if count >= soft {
+                return -11;
+            }
         }
     }
 
@@ -55,7 +57,9 @@ pub fn sys_fork() -> isize {
         Some(k) => k,
         None => {
             if child_cr3 != 0 {
-                unsafe { crate::proc::exec::free_child_address_space(child_cr3); }
+                unsafe {
+                    crate::proc::exec::free_child_address_space(child_cr3);
+                }
             }
             return -12;
         }
@@ -84,34 +88,33 @@ pub fn sys_fork() -> isize {
         push_trap_frame_riscv(kstack_top, child_pcb.pc, child_pcb.sp, child_pcb.tls_base);
         let frame_sp = kstack_top - crate::arch::riscv64::trap::TRAP_FRAME_SIZE;
         Context {
-            ra:  crate::proc::context::task_entry_trampoline as usize,
-            sp:  frame_sp,
-            s0:  0,
+            ra: crate::proc::context::task_entry_trampoline as usize,
+            sp: frame_sp,
+            s0: 0,
             ..Context::zero()
         }
     };
 
-    child_pcb.pid              = child_pid;
-    child_pcb.ppid             = parent_pid;
-    child_pcb.tgid             = child_pid;
-    child_pcb.pgid             = scheduler::with_proc(parent_pid, |p| p.pgid)
-                                     .unwrap_or(child_pid);
-    child_pcb.state            = State::Ready;
-    child_pcb.exit_code        = 0;
-    child_pcb.user_satp        = child_cr3;
-    child_pcb.kstack_top       = kstack_top;
-    child_pcb.ctx              = child_ctx;
-    child_pcb.child_tid_va       = 0;
-    child_pcb.child_tid_val      = child_pid as u32;
+    child_pcb.pid = child_pid;
+    child_pcb.ppid = parent_pid;
+    child_pcb.tgid = child_pid;
+    child_pcb.pgid = scheduler::with_proc(parent_pid, |p| p.pgid).unwrap_or(child_pid);
+    child_pcb.state = State::Ready;
+    child_pcb.exit_code = 0;
+    child_pcb.user_satp = child_cr3;
+    child_pcb.kstack_top = kstack_top;
+    child_pcb.ctx = child_ctx;
+    child_pcb.child_tid_va = 0;
+    child_pcb.child_tid_val = child_pid as u32;
     child_pcb.clear_child_tid_va = 0;
-    child_pcb.exit_signal        = 17;
-    child_pcb.vfork_parent       = 0;
-    child_pcb.ptrace_state       = PtraceState::None;
-    child_pcb.ptrace_event       = 0;
-    child_pcb.robust_list_head   = 0;
-    child_pcb.robust_list_len    = 0;
-    child_pcb.cpu_time_ns        = 0;
-    child_pcb.rt_cpu_time_us     = 0;
+    child_pcb.exit_signal = 17;
+    child_pcb.vfork_parent = 0;
+    child_pcb.ptrace_state = PtraceState::None;
+    child_pcb.ptrace_event = 0;
+    child_pcb.robust_list_head = 0;
+    child_pcb.robust_list_len = 0;
+    child_pcb.cpu_time_ns = 0;
+    child_pcb.rt_cpu_time_us = 0;
 
     // Enqueue PCB into global table first, then enqueue the Task on the
     // least-loaded CPU runqueue.  Fork children always go through
@@ -133,12 +136,14 @@ pub fn sys_fork() -> isize {
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
     let base = kstack_top - FRAME_SZ;
-    let p    = base as *mut usize;
+    let p = base as *mut usize;
     unsafe {
-        for i in 0..17 { p.add(i).write(0); }
-        p.add(13).write(rip);      // RIP
-        p.add(14).write(USER_CS);  // CS
-        p.add(15).write(rflags);   // RFLAGS
+        for i in 0..17 {
+            p.add(i).write(0);
+        }
+        p.add(13).write(rip); // RIP
+        p.add(14).write(USER_CS); // CS
+        p.add(15).write(rflags); // RFLAGS
         p.add(16).write(user_rsp); // RSP
     }
 }
@@ -153,15 +158,15 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
 /// semantics.
 #[cfg(target_arch = "riscv64")]
 fn push_trap_frame_riscv(kstack_top: usize, entry_pc: usize, user_sp: usize, tls: usize) {
-    use crate::arch::riscv64::trap::{TrapFrame, TRAP_FRAME_SIZE, SSTATUS_SPIE, SSTATUS_SPP};
+    use crate::arch::riscv64::trap::{TrapFrame, SSTATUS_SPIE, SSTATUS_SPP, TRAP_FRAME_SIZE};
     let frame_va = kstack_top - TRAP_FRAME_SIZE;
     unsafe {
         core::ptr::write_bytes(frame_va as *mut u8, 0, TRAP_FRAME_SIZE);
         let f = frame_va as *mut TrapFrame;
-        (*f).sp      = user_sp;
-        (*f).tp      = tls;
-        (*f).a0      = 0;                          // child return value = 0
-        (*f).sepc    = entry_pc;
+        (*f).sp = user_sp;
+        (*f).tp = tls;
+        (*f).a0 = 0; // child return value = 0
+        (*f).sepc = entry_pc;
         (*f).sstatus = SSTATUS_SPIE & !SSTATUS_SPP;
     }
 }

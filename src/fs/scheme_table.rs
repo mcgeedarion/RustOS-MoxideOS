@@ -31,12 +31,7 @@
 //! This is consumed by `/proc/schemes` (see `procfs.rs`).
 
 extern crate alloc;
-use alloc::{
-    collections::BTreeMap,
-    string::String,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;
 
 use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
@@ -55,28 +50,16 @@ pub trait Scheme: Send + Sync {
     /// Open the resource at `path` (the part of the URL after the colon).
     ///
     /// Returns an opaque file-ID that is passed to every subsequent I/O call.
-    fn open(
-        &self,
-        path:  &str,
-        flags: OpenFlags,
-    ) -> Result<SchemeFileId, SchemeError>;
+    fn open(&self, path: &str, flags: OpenFlags) -> Result<SchemeFileId, SchemeError>;
 
     /// Read up to `buf.len()` bytes starting at the current seek position.
-    fn read(
-        &self,
-        fid: SchemeFileId,
-        buf: &mut [u8],
-    ) -> Result<usize, SchemeError> {
+    fn read(&self, fid: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
         let _ = (fid, buf);
         Err(SchemeError::InvalidArg)
     }
 
     /// Write `buf` at the current seek position.
-    fn write(
-        &self,
-        fid: SchemeFileId,
-        buf: &[u8],
-    ) -> Result<usize, SchemeError> {
+    fn write(&self, fid: SchemeFileId, buf: &[u8]) -> Result<usize, SchemeError> {
         let _ = (fid, buf);
         Err(SchemeError::InvalidArg)
     }
@@ -84,32 +67,19 @@ pub trait Scheme: Send + Sync {
     /// Reposition the file offset.
     ///
     /// `whence` follows POSIX semantics: 0 = SEEK_SET, 1 = SEEK_CUR, 2 = SEEK_END.
-    fn seek(
-        &self,
-        fid:    SchemeFileId,
-        offset: i64,
-        whence: u8,
-    ) -> Result<u64, SchemeError> {
+    fn seek(&self, fid: SchemeFileId, offset: i64, whence: u8) -> Result<u64, SchemeError> {
         let _ = (fid, offset, whence);
         Err(SchemeError::InvalidArg)
     }
 
     /// Perform a device-specific control operation.
-    fn ioctl(
-        &self,
-        fid: SchemeFileId,
-        cmd: u64,
-        arg: usize,
-    ) -> Result<usize, SchemeError> {
+    fn ioctl(&self, fid: SchemeFileId, cmd: u64, arg: usize) -> Result<usize, SchemeError> {
         let _ = (fid, cmd, arg);
         Err(SchemeError::InvalidArg)
     }
 
     /// Release resources associated with `fid`.
-    fn close(
-        &self,
-        fid: SchemeFileId,
-    ) -> Result<(), SchemeError>;
+    fn close(&self, fid: SchemeFileId) -> Result<(), SchemeError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +92,9 @@ pub struct SchemeTable {
 
 impl SchemeTable {
     pub const fn new() -> Self {
-        Self { inner: RwLock::new(BTreeMap::new()) }
+        Self {
+            inner: RwLock::new(BTreeMap::new()),
+        }
     }
 
     // ── Registration ────────────────────────────────────────────────────────────
@@ -181,13 +153,13 @@ impl SchemeTable {
     /// ```
     pub fn open_url(
         &self,
-        url:   &str,
+        url: &str,
         flags: OpenFlags,
     ) -> Result<(Arc<dyn Scheme>, SchemeFileId), SchemeError> {
         // Split at the first colon.  URLs must have the form `<scheme>:<rest>`.
         let colon = url.find(':').ok_or(SchemeError::NoSuchScheme)?;
         let scheme_name = &url[..colon];
-        let path        = &url[colon + 1..];
+        let path = &url[colon + 1..];
 
         // Clone the Arc while holding the read lock, then release it before
         // calling into the handler (which may block on IPC).
@@ -235,15 +207,17 @@ mod tests {
         fn open(&self, _: &str, _: OpenFlags) -> Result<SchemeFileId, SchemeError> {
             Ok(SchemeFileId(99))
         }
-        fn close(&self, _: SchemeFileId) -> Result<(), SchemeError> { Ok(()) }
+        fn close(&self, _: SchemeFileId) -> Result<(), SchemeError> {
+            Ok(())
+        }
     }
 
     #[test]
     fn register_and_list() {
         let t = SchemeTable::new();
-        t.register("blk",  Arc::new(EchoScheme));
+        t.register("blk", Arc::new(EchoScheme));
         t.register("file", Arc::new(EchoScheme));
-        t.register("tcp",  Arc::new(EchoScheme));
+        t.register("tcp", Arc::new(EchoScheme));
 
         let names = t.list();
         // BTreeMap iterates in sorted order.

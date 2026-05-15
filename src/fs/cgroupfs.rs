@@ -48,7 +48,7 @@ const KNOB_FILES: &[&str] = &[
 #[derive(Clone)]
 struct CgFd {
     content: Vec<u8>,
-    offset:  usize,
+    offset: usize,
 }
 
 static CGFS_FDS: Mutex<BTreeMap<usize, CgFd>> = Mutex::new(BTreeMap::new());
@@ -56,7 +56,9 @@ static CGFS_FDS: Mutex<BTreeMap<usize, CgFd>> = Mutex::new(BTreeMap::new());
 fn next_cgfs_fd() -> usize {
     let guard = CGFS_FDS.lock();
     for candidate in 600..700 {
-        if !guard.contains_key(&candidate) { return candidate; }
+        if !guard.contains_key(&candidate) {
+            return candidate;
+        }
     }
     600
 }
@@ -74,13 +76,13 @@ pub fn cgroupfs_open(path: &str) -> isize {
     // Split path into cgroup directory and knob filename.
     let (dir, file) = match path.rfind('/') {
         Some(idx) => (&path[..idx], &path[idx + 1..]),
-        None      => return -2,
+        None => return -2,
     };
 
     // Resolve the cgroup dir to a CgroupId.
     let cgid = match cgroup::path_to_cgid(dir) {
         Some(id) => id,
-        None     => return -2,
+        None => return -2,
     };
 
     // Read the knob content (or synthesise a directory listing).
@@ -90,7 +92,7 @@ pub fn cgroupfs_open(path: &str) -> isize {
     } else if KNOB_FILES.contains(&file) {
         match cgroup::read_knob(cgid, file) {
             Some(s) => s.into_bytes(),
-            None    => return -2,
+            None => return -2,
         }
     } else {
         return -2;
@@ -108,7 +110,7 @@ pub fn cgroupfs_read(fdno: usize, buf: &mut [u8]) -> isize {
     let mut guard = CGFS_FDS.lock();
     let fd = match guard.get_mut(&fdno) {
         Some(f) => f,
-        None    => return -9, // EBADF
+        None => return -9, // EBADF
     };
     let start = fd.offset.min(fd.content.len());
     let avail = &fd.content[start..];
@@ -131,9 +133,7 @@ pub fn cgroupfs_close(fdno: usize) {
 /// Returns `Some(true)` for directories, `Some(false)` for knob files,
 /// `None` if the path does not exist.
 pub fn cgroupfs_exists(path: &str) -> Option<bool> {
-    let stripped = path
-        .strip_prefix("/sys/fs/cgroup")
-        .unwrap_or(path);
+    let stripped = path.strip_prefix("/sys/fs/cgroup").unwrap_or(path);
 
     // Root mount point itself.
     if stripped.is_empty() || stripped == "/" {
@@ -155,7 +155,7 @@ pub fn cgroupfs_exists(path: &str) -> Option<bool> {
             Some(true)
         }
         Some(slash) => {
-            let dir  = &stripped[..stripped.rfind('/').unwrap()];
+            let dir = &stripped[..stripped.rfind('/').unwrap()];
             let file = &stripped[stripped.rfind('/').unwrap() + 1..];
             if KNOB_FILES.contains(&file) {
                 // Verify the parent cgroup exists.
@@ -176,7 +176,7 @@ pub fn cgroupfs_exists(path: &str) -> Option<bool> {
 
 /// A single directory entry returned by `cgroupfs_list_dir_by_path`.
 pub struct CgDirEntry {
-    pub name:   String,
+    pub name: String,
     pub is_dir: bool,
 }
 
@@ -187,18 +187,30 @@ pub fn cgroupfs_list_dir_by_path(path: &str) -> Option<Vec<CgDirEntry>> {
     let mut entries: Vec<CgDirEntry> = Vec::new();
 
     // Synthetic `.` and `..`.
-    entries.push(CgDirEntry { name: String::from("."),  is_dir: true });
-    entries.push(CgDirEntry { name: String::from(".."), is_dir: true });
+    entries.push(CgDirEntry {
+        name: String::from("."),
+        is_dir: true,
+    });
+    entries.push(CgDirEntry {
+        name: String::from(".."),
+        is_dir: true,
+    });
 
     // Child cgroup directories.
     let children = cgroup_children(cgid);
     for child_name in children {
-        entries.push(CgDirEntry { name: child_name, is_dir: true });
+        entries.push(CgDirEntry {
+            name: child_name,
+            is_dir: true,
+        });
     }
 
     // Knob files.
     for &knob in KNOB_FILES {
-        entries.push(CgDirEntry { name: String::from(knob), is_dir: false });
+        entries.push(CgDirEntry {
+            name: String::from(knob),
+            is_dir: false,
+        });
     }
 
     Some(entries)
@@ -215,17 +227,21 @@ pub fn cgroupfs_mkdir(path: &str) -> isize {
         _ => return -22, // EINVAL — trailing slash or no slash
     };
     let parent_path = &path[..idx];
-    let child_name  = &path[idx + 1..];
+    let child_name = &path[idx + 1..];
 
     // Resolve parent.
-    let parent_path = if parent_path.is_empty() { "/sys/fs/cgroup" } else { parent_path };
+    let parent_path = if parent_path.is_empty() {
+        "/sys/fs/cgroup"
+    } else {
+        parent_path
+    };
     let parent_cgid = match cgroup::path_to_cgid(parent_path) {
         Some(id) => id,
-        None     => return -2, // ENOENT
+        None => return -2, // ENOENT
     };
 
     match cgroup::create_cgroup(parent_cgid, child_name) {
-        Ok(_)  => 0,
+        Ok(_) => 0,
         Err(e) => e as isize,
     }
 }
@@ -237,7 +253,7 @@ pub fn cgroupfs_mkdir(path: &str) -> isize {
 pub fn cgroupfs_rmdir(path: &str) -> isize {
     let cgid = match cgroup::path_to_cgid(path) {
         Some(id) => id,
-        None     => return -2,
+        None => return -2,
     };
     cgroup::remove_cgroup(cgid)
 }
@@ -263,12 +279,13 @@ fn cgroup_children(cgid: cgroup::CgroupId) -> Vec<String> {
     // We can't hold the CGROUPS lock across a public call, so we snapshot.
     // cgroup::read_knob provides "cgroup.children" as a newline-separated
     // list of CgroupIds.  We convert those back to names via cgid_to_path.
-    let raw = cgroup::read_knob(cgid, "cgroup.children")
-        .unwrap_or_default();
+    let raw = cgroup::read_knob(cgid, "cgroup.children").unwrap_or_default();
     let mut names = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         if let Ok(child_id) = line.parse::<u32>() {
             let full = cgroup::cgid_to_path(child_id);
             // Extract just the last path component.

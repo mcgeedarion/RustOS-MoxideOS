@@ -16,7 +16,7 @@ extern crate alloc;
 use crate::uaccess::{copy_from_user, copy_to_user};
 
 // Nanosecond special values from <time.h>.
-const UTIME_NOW:  i64 = 0x3fff_ffff;
+const UTIME_NOW: i64 = 0x3fff_ffff;
 const UTIME_OMIT: i64 = 0x3fff_fffe;
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────────
@@ -24,10 +24,12 @@ const UTIME_OMIT: i64 = 0x3fff_fffe;
 /// Read a `struct timespec { i64 tv_sec; i64 tv_nsec; }` from userspace.
 #[inline]
 fn read_timespec(va: usize) -> Option<(i64, i64)> {
-    if va == 0 { return None; }
+    if va == 0 {
+        return None;
+    }
     let mut buf = [0u8; 16];
     copy_from_user(&mut buf, va).ok()?;
-    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
     Some((sec, nsec))
 }
@@ -35,11 +37,17 @@ fn read_timespec(va: usize) -> Option<(i64, i64)> {
 /// Write a `struct timespec` to userspace.
 #[inline]
 fn write_timespec(va: usize, sec: i64, nsec: i64) -> isize {
-    if va == 0 { return 0; }
+    if va == 0 {
+        return 0;
+    }
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
     buf[8..16].copy_from_slice(&nsec.to_le_bytes());
-    if copy_to_user(va, &buf).is_err() { -14 } else { 0 }
+    if copy_to_user(va, &buf).is_err() {
+        -14
+    } else {
+        0
+    }
 }
 
 /// Return the monotonic ns adjusted for the current process's time namespace.
@@ -47,8 +55,7 @@ fn mono_ns_for_current() -> u64 {
     let raw = crate::time::read_monotonic_ns();
     let pid = crate::proc::scheduler::current_pid();
     // Fetch the timens monotonic offset if one has been set.
-    let tns_off = crate::proc::scheduler::with_proc(pid, |p| p.timens_mono_off)
-        .unwrap_or(0i64);
+    let tns_off = crate::proc::scheduler::with_proc(pid, |p| p.timens_mono_off).unwrap_or(0i64);
     (raw as i64).wrapping_add(tns_off) as u64
 }
 
@@ -60,13 +67,15 @@ fn cpu_ns(pid: usize) -> u64 {
 // ── sys_clock_gettime ─────────────────────────────────────────────────────────────────────────
 
 pub fn sys_clock_gettime(clkid: u32, tp_va: usize) -> isize {
-    if tp_va == 0 { return -14; }
+    if tp_va == 0 {
+        return -14;
+    }
 
     let ns: u64 = match clkid {
         // CLOCK_REALTIME / CLOCK_REALTIME_COARSE / CLOCK_REALTIME_ALARM
         0 | 5 | 8 => {
             let mono = crate::time::read_monotonic_ns();
-            let off  = crate::time::realtime_offset_ns();
+            let off = crate::time::realtime_offset_ns();
             (mono as i64).wrapping_add(off) as u64
         }
 
@@ -94,7 +103,7 @@ pub fn sys_clock_gettime(clkid: u32, tp_va: usize) -> isize {
         _ => return -22, // EINVAL
     };
 
-    let sec  = (ns / 1_000_000_000) as i64;
+    let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     write_timespec(tp_va, sec, nsec)
 }
@@ -107,12 +116,14 @@ pub fn sys_clock_settime(clkid: u32, tp_va: usize) -> isize {
         0 => {
             let (sec, nsec) = match read_timespec(tp_va) {
                 Some(v) => v,
-                None    => return -14,
+                None => return -14,
             };
-            if nsec < 0 || nsec >= 1_000_000_000 { return -22; }
+            if nsec < 0 || nsec >= 1_000_000_000 {
+                return -22;
+            }
             let new_real_ns = sec as u64 * 1_000_000_000 + nsec as u64;
-            let mono_ns     = crate::time::read_monotonic_ns();
-            let offset      = new_real_ns as i64 - mono_ns as i64;
+            let mono_ns = crate::time::read_monotonic_ns();
+            let offset = new_real_ns as i64 - mono_ns as i64;
             crate::time::set_realtime_offset_ns(offset);
             0
         }
@@ -128,15 +139,21 @@ pub fn sys_clock_settime(clkid: u32, tp_va: usize) -> isize {
 /// Sets CLOCK_REALTIME by computing offset = new_real_ns - mono_ns.
 /// The timezone argument is accepted but ignored (Linux behaviour).
 pub fn sys_settimeofday(tv_va: usize, _tz_va: usize) -> isize {
-    if tv_va == 0 { return 0; }
+    if tv_va == 0 {
+        return 0;
+    }
     let mut buf = [0u8; 16];
-    if copy_from_user(&mut buf, tv_va).is_err() { return -14; }
-    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    if copy_from_user(&mut buf, tv_va).is_err() {
+        return -14;
+    }
+    let sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
     let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    if usec < 0 || usec >= 1_000_000 { return -22; }
+    if usec < 0 || usec >= 1_000_000 {
+        return -22;
+    }
     let new_real_ns = sec as u64 * 1_000_000_000 + usec as u64 * 1_000;
-    let mono_ns     = crate::time::read_monotonic_ns();
-    let offset      = new_real_ns as i64 - mono_ns as i64;
+    let mono_ns = crate::time::read_monotonic_ns();
+    let offset = new_real_ns as i64 - mono_ns as i64;
     crate::time::set_realtime_offset_ns(offset);
     0
 }
@@ -146,7 +163,7 @@ pub fn sys_settimeofday(tv_va: usize, _tz_va: usize) -> isize {
 /// Return current realtime in nanoseconds.
 fn now_real_ns() -> u64 {
     let mono = crate::time::read_monotonic_ns();
-    let off  = crate::time::realtime_offset_ns();
+    let off = crate::time::realtime_offset_ns();
     (mono as i64).wrapping_add(off) as u64
 }
 
@@ -154,10 +171,17 @@ fn now_real_ns() -> u64 {
 ///
 /// struct utimbuf { time_t actime; time_t modtime; } -- both are i64 seconds.
 pub fn sys_utime(path_va: usize, times_va: usize) -> isize {
-    if path_va == 0 { return -14; }
+    if path_va == 0 {
+        return -14;
+    }
     let mut path_buf = [0u8; 4096];
-    if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
-    let end  = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    if copy_from_user(&mut path_buf, path_va).is_err() {
+        return -14;
+    }
+    let end = path_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(path_buf.len());
     let path = match core::str::from_utf8(&path_buf[..end]) {
         Ok(s) => s,
         Err(_) => return -14,
@@ -168,15 +192,20 @@ pub fn sys_utime(path_va: usize, times_va: usize) -> isize {
         (now, now)
     } else {
         let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
-        let actime  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        if copy_from_user(&mut buf, times_va).is_err() {
+            return -14;
+        }
+        let actime = i64::from_le_bytes(buf[0..8].try_into().unwrap());
         let modtime = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-        (actime as u64 * 1_000_000_000, modtime as u64 * 1_000_000_000)
+        (
+            actime as u64 * 1_000_000_000,
+            modtime as u64 * 1_000_000_000,
+        )
     };
 
     match crate::fs::vfs_ops::utimens(path, atime_ns, mtime_ns) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
@@ -184,10 +213,17 @@ pub fn sys_utime(path_va: usize, times_va: usize) -> isize {
 ///
 /// struct timeval { i64 tv_sec; i64 tv_usec; }
 pub fn sys_utimes(path_va: usize, times_va: usize) -> isize {
-    if path_va == 0 { return -14; }
+    if path_va == 0 {
+        return -14;
+    }
     let mut path_buf = [0u8; 4096];
-    if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
-    let end  = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+    if copy_from_user(&mut path_buf, path_va).is_err() {
+        return -14;
+    }
+    let end = path_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(path_buf.len());
     let path = match core::str::from_utf8(&path_buf[..end]) {
         Ok(s) => s,
         Err(_) => return -14,
@@ -198,10 +234,12 @@ pub fn sys_utimes(path_va: usize, times_va: usize) -> isize {
         (now, now)
     } else {
         let mut buf = [0u8; 32];
-        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
-        let a_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        if copy_from_user(&mut buf, times_va).is_err() {
+            return -14;
+        }
+        let a_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
         let a_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let m_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let m_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
         let m_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
         (
             a_sec as u64 * 1_000_000_000 + a_usec as u64 * 1_000,
@@ -210,8 +248,8 @@ pub fn sys_utimes(path_va: usize, times_va: usize) -> isize {
     };
 
     match crate::fs::vfs_ops::utimens(path, atime_ns, mtime_ns) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
@@ -220,23 +258,23 @@ pub fn sys_utimes(path_va: usize, times_va: usize) -> isize {
 /// UTIME_NOW (0x3fffffff) and UTIME_OMIT (0x3ffffffe) are honoured.
 /// AT_FDCWD and absolute paths are handled; relative paths resolve via
 /// dirfd's path.
-pub fn sys_utimensat(
-    dirfd:    i32,
-    path_va:  usize,
-    times_va: usize,
-    _flags:   u32,
-) -> isize {
+pub fn sys_utimensat(dirfd: i32, path_va: usize, times_va: usize, _flags: u32) -> isize {
     // Build the full path string.
     let path: alloc::string::String = if path_va == 0 {
         // path_va==0 with AT_EMPTY_PATH applies to dirfd itself.
         match crate::fs::vfs::fd_path(dirfd as usize) {
             Some(p) => p,
-            None    => return -9, // EBADF
+            None => return -9, // EBADF
         }
     } else {
         let mut path_buf = [0u8; 4096];
-        if copy_from_user(&mut path_buf, path_va).is_err() { return -14; }
-        let end = path_buf.iter().position(|&b| b == 0).unwrap_or(path_buf.len());
+        if copy_from_user(&mut path_buf, path_va).is_err() {
+            return -14;
+        }
+        let end = path_buf
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(path_buf.len());
         let s = match core::str::from_utf8(&path_buf[..end]) {
             Ok(s) => s,
             Err(_) => return -14,
@@ -262,15 +300,21 @@ pub fn sys_utimensat(
         (now, now)
     } else {
         let mut buf = [0u8; 32];
-        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
-        let a_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+        if copy_from_user(&mut buf, times_va).is_err() {
+            return -14;
+        }
+        let a_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
         let a_nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let m_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap());
+        let m_sec = i64::from_le_bytes(buf[16..24].try_into().unwrap());
         let m_nsec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
 
         let resolve_ts = |sec: i64, nsec: i64| -> Option<u64> {
-            if nsec == UTIME_NOW  { return Some(now); }
-            if nsec == UTIME_OMIT { return None; }
+            if nsec == UTIME_NOW {
+                return Some(now);
+            }
+            if nsec == UTIME_OMIT {
+                return None;
+            }
             Some(sec as u64 * 1_000_000_000 + nsec as u64)
         };
 
@@ -278,7 +322,9 @@ pub fn sys_utimensat(
         let m = resolve_ts(m_sec, m_nsec);
 
         // If both are OMIT, nothing to do.
-        if a.is_none() && m.is_none() { return 0; }
+        if a.is_none() && m.is_none() {
+            return 0;
+        }
 
         // For OMIT fields, read the existing inode timestamp to preserve it.
         let (existing_atime, existing_mtime) =
@@ -288,7 +334,7 @@ pub fn sys_utimensat(
     };
 
     match crate::fs::vfs_ops::utimens(&path, atime_ns, mtime_ns) {
-        Ok(())  => 0,
-        Err(e)  => e,
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }

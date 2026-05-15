@@ -55,67 +55,72 @@
 #![allow(dead_code)]
 
 extern crate alloc;
-use crate::fs::process_fd::{proc_fd_backing, proc_fd_get, proc_fd_set_cloexec,
-                             proc_fd_set_nonblock};
+use crate::fs::process_fd::{
+    proc_fd_backing, proc_fd_get, proc_fd_set_cloexec, proc_fd_set_nonblock,
+};
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
 // ── Current pid shorthand ────────────────────────────────────────────────────
 #[inline(always)]
-fn cpid() -> usize { crate::proc::scheduler::current_pid() }
+fn cpid() -> usize {
+    crate::proc::scheduler::current_pid()
+}
 
 // ── fd resolver (user → backing) ────────────────────────────────────────────
 #[inline]
 fn resolve(fd: usize) -> isize {
-    if fd <= 2 { return fd as isize; }
+    if fd <= 2 {
+        return fd as isize;
+    }
     proc_fd_backing(cpid(), fd)
 }
 
 // ── POSIX ioctl command constants ────────────────────────────────────────────
 
 // Terminal
-const TCGETS:      u64 = 0x5401;
-const TCSETS:      u64 = 0x5402;
-const TCSETSW:     u64 = 0x5403;
-const TCSETSF:     u64 = 0x5404;
-const TCSBRK:      u64 = 0x5409;
-const TCXONC:      u64 = 0x540A;
-const TCFLSH:      u64 = 0x540B;
-const TIOCSCTTY:   u64 = 0x540E;
-const TIOCGPGRP:   u64 = 0x540F;
-const TIOCSPGRP:   u64 = 0x5410;
-const TIOCOUTQ:    u64 = 0x5411;
-const TIOCGWINSZ:  u64 = 0x5413;
-const TIOCSWINSZ:  u64 = 0x5414;
-const TIOCMGET:    u64 = 0x5415;
-const TIOCNOTTY:   u64 = 0x5422;
-const TIOCGSID:    u64 = 0x5429;
-const FIONBIO:     u64 = 0x5421;
-const FIONREAD:    u64 = 0x541B;
-const FIONCLEX:    u64 = 0x5450;
-const FIOCLEX:     u64 = 0x5451;
-const TIOCGPTN:    u64 = 0x8004_5430;
-const TIOCSPTLCK:  u64 = 0x4004_5431;
+const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
+const TCSBRK: u64 = 0x5409;
+const TCXONC: u64 = 0x540A;
+const TCFLSH: u64 = 0x540B;
+const TIOCSCTTY: u64 = 0x540E;
+const TIOCGPGRP: u64 = 0x540F;
+const TIOCSPGRP: u64 = 0x5410;
+const TIOCOUTQ: u64 = 0x5411;
+const TIOCGWINSZ: u64 = 0x5413;
+const TIOCSWINSZ: u64 = 0x5414;
+const TIOCMGET: u64 = 0x5415;
+const TIOCNOTTY: u64 = 0x5422;
+const TIOCGSID: u64 = 0x5429;
+const FIONBIO: u64 = 0x5421;
+const FIONREAD: u64 = 0x541B;
+const FIONCLEX: u64 = 0x5450;
+const FIOCLEX: u64 = 0x5451;
+const TIOCGPTN: u64 = 0x8004_5430;
+const TIOCSPTLCK: u64 = 0x4004_5431;
 
 // Block device
-const BLKGETSIZE:   u64 = 0x1260;
+const BLKGETSIZE: u64 = 0x1260;
 const BLKGETSIZE64: u64 = 0x8008_1272;
-const BLKSSZGET:    u64 = 0x1268;
-const BLKBSZGET:    u64 = 0x8008_1270;
+const BLKSSZGET: u64 = 0x1268;
+const BLKBSZGET: u64 = 0x8008_1270;
 
 // Network (SIOC*)
-const SIOCGIFNAME:   u64 = 0x8910;
-const SIOCGIFFLAGS:  u64 = 0x8913;
-const SIOCSIFFLAGS:  u64 = 0x8914;
-const SIOCGIFADDR:   u64 = 0x8915;
-const SIOCSIFADDR:   u64 = 0x8916;
-const SIOCGIFDSTADDR:u64 = 0x8917;
-const SIOCGIFBRDADDR:u64 = 0x8919;
-const SIOCGIFNETMASK:u64 = 0x891B;
-const SIOCGIFMTU:    u64 = 0x8921;
-const SIOCSIFMTU:    u64 = 0x8922;
+const SIOCGIFNAME: u64 = 0x8910;
+const SIOCGIFFLAGS: u64 = 0x8913;
+const SIOCSIFFLAGS: u64 = 0x8914;
+const SIOCGIFADDR: u64 = 0x8915;
+const SIOCSIFADDR: u64 = 0x8916;
+const SIOCGIFDSTADDR: u64 = 0x8917;
+const SIOCGIFBRDADDR: u64 = 0x8919;
+const SIOCGIFNETMASK: u64 = 0x891B;
+const SIOCGIFMTU: u64 = 0x8921;
+const SIOCSIFMTU: u64 = 0x8922;
 const SIOCGIFHWADDR: u64 = 0x8927;
-const SIOCGIFINDEX:  u64 = 0x8933;
-const SIOCGIFCONF:   u64 = 0x8912;
+const SIOCGIFINDEX: u64 = 0x8933;
+const SIOCGIFCONF: u64 = 0x8912;
 
 // ── ifreq layout (linux/if.h, x86_64) — 40-byte struct ─────────────────────
 //
@@ -131,9 +136,13 @@ const IFREQ_SIZE: usize = 40;
 
 /// Read a NUL-terminated interface name from the first IFNAMSIZ bytes of ifreq.
 fn read_ifname(ifreq_va: usize) -> Option<alloc::string::String> {
-    if !validate_user_ptr(ifreq_va, IFREQ_SIZE) { return None; }
+    if !validate_user_ptr(ifreq_va, IFREQ_SIZE) {
+        return None;
+    }
     let mut raw = [0u8; IFNAMSIZ];
-    if copy_from_user(&mut raw, ifreq_va).is_err() { return None; }
+    if copy_from_user(&mut raw, ifreq_va).is_err() {
+        return None;
+    }
     let end = raw.iter().position(|&b| b == 0).unwrap_or(IFNAMSIZ);
     Some(alloc::string::String::from_utf8_lossy(&raw[..end]).into_owned())
 }
@@ -168,9 +177,7 @@ fn pty_pair_from_bfd(bfd: usize) -> Option<alloc::sync::Arc<crate::tty::pty::Pty
         if name.contains("ptmx") || name.contains("ptymaster") {
             // Master: the debug name encodes the pair index as the last
             // component, e.g. "ptmx/3" or we stored the index directly.
-            if let Some(idx) = name.split('/').last()
-                .and_then(|s| s.parse::<u32>().ok())
-            {
+            if let Some(idx) = name.split('/').last().and_then(|s| s.parse::<u32>().ok()) {
                 return crate::tty::lookup_pty(idx);
             }
         }
@@ -197,8 +204,10 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
     match cmd {
         // ── TCGETS ────────────────────────────────────────────────────────────
         TCGETS => {
-            if !validate_user_ptr(arg, TERMIOS_SIZE) { return -14; } // EFAULT
-            // Try PTY pair first; fall back to the raw serial tty.
+            if !validate_user_ptr(arg, TERMIOS_SIZE) {
+                return -14;
+            } // EFAULT
+              // Try PTY pair first; fall back to the raw serial tty.
             let pair = pty_pair_from_bfd(bfd);
             let t = if let Some(ref p) = pair {
                 let pt = p.get_termios();
@@ -210,7 +219,7 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
                 buf[12..16].copy_from_slice(&pt.c_lflag.to_ne_bytes());
                 // c_line (1 byte) at offset 16
                 buf[16] = 0; // N_TTY
-                // c_cc[19] at offset 17 — copy first 19 elements of pt.c_cc
+                             // c_cc[19] at offset 17 — copy first 19 elements of pt.c_cc
                 for i in 0..19usize {
                     buf[17 + i] = pt.c_cc[i];
                 }
@@ -228,19 +237,25 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
                 }
                 buf
             };
-            if copy_to_user(arg, &t).is_err() { return -14; }
+            if copy_to_user(arg, &t).is_err() {
+                return -14;
+            }
             0
         }
 
         // ── TCSETS / TCSETSW / TCSETSF ───────────────────────────────────────
         TCSETS | TCSETSW | TCSETSF => {
-            if !validate_user_ptr(arg, TERMIOS_SIZE) { return -14; }
+            if !validate_user_ptr(arg, TERMIOS_SIZE) {
+                return -14;
+            }
             let mut buf = [0u8; TERMIOS_SIZE];
-            if copy_from_user(&mut buf, arg).is_err() { return -14; }
-            let c_iflag = u32::from_ne_bytes(buf[0..4].try_into().unwrap_or([0;4]));
-            let c_oflag = u32::from_ne_bytes(buf[4..8].try_into().unwrap_or([0;4]));
-            let c_cflag = u32::from_ne_bytes(buf[8..12].try_into().unwrap_or([0;4]));
-            let c_lflag = u32::from_ne_bytes(buf[12..16].try_into().unwrap_or([0;4]));
+            if copy_from_user(&mut buf, arg).is_err() {
+                return -14;
+            }
+            let c_iflag = u32::from_ne_bytes(buf[0..4].try_into().unwrap_or([0; 4]));
+            let c_oflag = u32::from_ne_bytes(buf[4..8].try_into().unwrap_or([0; 4]));
+            let c_cflag = u32::from_ne_bytes(buf[8..12].try_into().unwrap_or([0; 4]));
+            let c_lflag = u32::from_ne_bytes(buf[12..16].try_into().unwrap_or([0; 4]));
             let mut c_cc = [0u8; 32];
             for i in 0..19usize {
                 c_cc[i] = buf[17 + i];
@@ -248,11 +263,21 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
             if let Some(pair) = pty_pair_from_bfd(bfd) {
                 use crate::tty::termios::Termios as PtyTermios;
-                let new_t = PtyTermios { c_iflag, c_oflag, c_cflag, c_lflag, c_cc };
+                let new_t = PtyTermios {
+                    c_iflag,
+                    c_oflag,
+                    c_cflag,
+                    c_lflag,
+                    c_cc,
+                };
                 pair.set_termios(new_t);
             } else {
                 let new_t = crate::shell::tty::Termios {
-                    c_iflag, c_oflag, c_cflag, c_lflag, c_cc,
+                    c_iflag,
+                    c_oflag,
+                    c_cflag,
+                    c_lflag,
+                    c_cc,
                 };
                 crate::shell::tty::set_termios(new_t);
             }
@@ -261,7 +286,9 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
         // ── TIOCGWINSZ ────────────────────────────────────────────────────────
         TIOCGWINSZ => {
-            if !validate_user_ptr(arg, WINSIZE_SIZE) { return -14; }
+            if !validate_user_ptr(arg, WINSIZE_SIZE) {
+                return -14;
+            }
             let ws = if let Some(pair) = pty_pair_from_bfd(bfd) {
                 let p = pair.get_winsize();
                 [p.ws_row, p.ws_col, p.ws_xpixel, p.ws_ypixel]
@@ -274,27 +301,43 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
             buf[2..4].copy_from_slice(&ws[1].to_ne_bytes());
             buf[4..6].copy_from_slice(&ws[2].to_ne_bytes());
             buf[6..8].copy_from_slice(&ws[3].to_ne_bytes());
-            if copy_to_user(arg, &buf).is_err() { return -14; }
+            if copy_to_user(arg, &buf).is_err() {
+                return -14;
+            }
             0
         }
 
         // ── TIOCSWINSZ ────────────────────────────────────────────────────────
         TIOCSWINSZ => {
-            if !validate_user_ptr(arg, WINSIZE_SIZE) { return -14; }
+            if !validate_user_ptr(arg, WINSIZE_SIZE) {
+                return -14;
+            }
             let mut buf = [0u8; WINSIZE_SIZE];
-            if copy_from_user(&mut buf, arg).is_err() { return -14; }
-            let ws_row    = u16::from_ne_bytes(buf[0..2].try_into().unwrap_or([0;2]));
-            let ws_col    = u16::from_ne_bytes(buf[2..4].try_into().unwrap_or([0;2]));
-            let ws_xpixel = u16::from_ne_bytes(buf[4..6].try_into().unwrap_or([0;2]));
-            let ws_ypixel = u16::from_ne_bytes(buf[6..8].try_into().unwrap_or([0;2]));
+            if copy_from_user(&mut buf, arg).is_err() {
+                return -14;
+            }
+            let ws_row = u16::from_ne_bytes(buf[0..2].try_into().unwrap_or([0; 2]));
+            let ws_col = u16::from_ne_bytes(buf[2..4].try_into().unwrap_or([0; 2]));
+            let ws_xpixel = u16::from_ne_bytes(buf[4..6].try_into().unwrap_or([0; 2]));
+            let ws_ypixel = u16::from_ne_bytes(buf[6..8].try_into().unwrap_or([0; 2]));
 
             if let Some(pair) = pty_pair_from_bfd(bfd) {
                 use crate::tty::termios::Winsize;
-                pair.set_winsize(Winsize { ws_row, ws_col, ws_xpixel, ws_ypixel });
+                pair.set_winsize(Winsize {
+                    ws_row,
+                    ws_col,
+                    ws_xpixel,
+                    ws_ypixel,
+                });
                 // SIGWINCH is delivered by PtyPair::set_winsize.
             } else {
                 use crate::shell::tty::Winsize;
-                crate::shell::tty::set_winsize(Winsize { ws_row, ws_col, ws_xpixel, ws_ypixel });
+                crate::shell::tty::set_winsize(Winsize {
+                    ws_row,
+                    ws_col,
+                    ws_xpixel,
+                    ws_ypixel,
+                });
                 // Deliver SIGWINCH to the foreground process.
                 let pid = crate::shell::tty::foreground_pid();
                 if pid != 0 {
@@ -306,11 +349,15 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
         // ── TIOCGPTN — get PTY slave index ───────────────────────────────────
         TIOCGPTN => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             match pty_pair_from_bfd(bfd) {
                 Some(pair) => {
                     let idx = pair.index;
-                    if copy_to_user(arg, &idx.to_ne_bytes()).is_err() { return -14; }
+                    if copy_to_user(arg, &idx.to_ne_bytes()).is_err() {
+                        return -14;
+                    }
                     0
                 }
                 None => -25, // ENOTTY — not a PTY
@@ -319,13 +366,19 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
         // ── TIOCSPTLCK — lock/unlock PTY slave ───────────────────────────────
         TIOCSPTLCK => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             let mut val = [0u8; 4];
-            if copy_from_user(&mut val, arg).is_err() { return -14; }
+            if copy_from_user(&mut val, arg).is_err() {
+                return -14;
+            }
             let lock_val = i32::from_ne_bytes(val);
             match pty_pair_from_bfd(bfd) {
                 Some(pair) => {
-                    if lock_val == 0 { pair.unlock(); }
+                    if lock_val == 0 {
+                        pair.unlock();
+                    }
                     // Non-zero: lock — unlockpt(3) only ever passes 0.
                     0
                 }
@@ -335,17 +388,25 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
         // ── TIOCGPGRP — get foreground process group ──────────────────────────
         TIOCGPGRP => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             let pgid = crate::shell::tty::foreground_pid() as u32;
-            if copy_to_user(arg, &pgid.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg, &pgid.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
 
         // ── TIOCSPGRP — set foreground process group ──────────────────────────
         TIOCSPGRP => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             let mut val = [0u8; 4];
-            if copy_from_user(&mut val, arg).is_err() { return -14; }
+            if copy_from_user(&mut val, arg).is_err() {
+                return -14;
+            }
             let pgid = u32::from_ne_bytes(val) as usize;
             crate::shell::tty::set_foreground_pid(pgid);
             0
@@ -353,10 +414,14 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
         // ── TIOCGSID — get session ID ─────────────────────────────────────────
         TIOCGSID => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             // Return the session ID of the foreground process group.
             let pid = crate::shell::tty::foreground_pid() as u32;
-            if copy_to_user(arg, &pid.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg, &pid.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
 
@@ -385,18 +450,26 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 
         // ── TIOCOUTQ — bytes pending in output queue ──────────────────────────
         TIOCOUTQ => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             let zero: u32 = 0; // write-through serial; output queue is always empty
-            if copy_to_user(arg, &zero.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg, &zero.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
 
         // ── TIOCMGET — get modem control bits ────────────────────────────────
         TIOCMGET => {
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             // Report DCD + DSR + CTS + CAR asserted (typical for a virtual tty).
             let bits: u32 = 0x0020 | 0x0002 | 0x0040 | 0x0020; // TIOCM_CAR | TIOCM_DSR | TIOCM_CTS
-            if copy_to_user(arg, &bits.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg, &bits.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
 
@@ -404,8 +477,14 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
         FIONBIO => fionbio(fd, bfd, arg),
 
         // ── FIOCLEX / FIONCLEX ───────────────────────────────────────────────
-        FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-        FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+        FIOCLEX => {
+            proc_fd_set_cloexec(cpid(), fd, true);
+            0
+        }
+        FIONCLEX => {
+            proc_fd_set_cloexec(cpid(), fd, false);
+            0
+        }
 
         // ── FIONREAD — for a tty: 0 readable (non-blocking check) ────────────
         FIONREAD => fionread_tty(arg),
@@ -418,9 +497,13 @@ fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
 // ── FIONBIO helper ───────────────────────────────────────────────────────────
 
 fn fionbio(fd: usize, bfd: usize, arg: usize) -> isize {
-    if !validate_user_ptr(arg, 4) { return -14; }
+    if !validate_user_ptr(arg, 4) {
+        return -14;
+    }
     let mut val = [0u8; 4];
-    if copy_from_user(&mut val, arg).is_err() { return -14; }
+    if copy_from_user(&mut val, arg).is_err() {
+        return -14;
+    }
     let nonblock = i32::from_ne_bytes(val) != 0;
     proc_fd_set_nonblock(cpid(), fd, nonblock);
     // Also update fcntl FD_META so F_GETFL reflects the new flag.
@@ -436,9 +519,13 @@ fn fionbio(fd: usize, bfd: usize, arg: usize) -> isize {
 // ── FIONREAD for a tty (always 0 — canonical mode reads block) ──────────────
 
 fn fionread_tty(arg: usize) -> isize {
-    if !validate_user_ptr(arg, 4) { return -14; }
+    if !validate_user_ptr(arg, 4) {
+        return -14;
+    }
     let n: u32 = 0;
-    if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+    if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+        return -14;
+    }
     0
 }
 
@@ -448,7 +535,9 @@ fn fionread_tty(arg: usize) -> isize {
 // without consuming them.  The result is written as a u32 (int) to *arg.
 
 fn pipe_fionread(bfd: usize, arg: usize) -> isize {
-    if !validate_user_ptr(arg, 4) { return -14; }
+    if !validate_user_ptr(arg, 4) {
+        return -14;
+    }
     // Peek at the pipe's ring buffer length via a zero-byte read.
     // We use a 1-byte dummy buf with a non-blocking poll instead of
     // draining the pipe.
@@ -465,7 +554,7 @@ fn pipe_fionread(bfd: usize, arg: usize) -> isize {
     // A proper implementation requires a peek/len method on PipeTable.
     // We use the poll-based approach: POLLIN set → at least 1 byte, else 0.
     // This is sufficient for musl's stdio which only tests nonzero.
-    use crate::fs::poll::{POLLIN};
+    use crate::fs::poll::POLLIN;
     let ready = crate::fs::pipe::pipe_poll(bfd, POLLIN);
     let avail: u32 = if ready & POLLIN != 0 {
         // Read into a scratch buffer to find the exact byte count.
@@ -477,7 +566,9 @@ fn pipe_fionread(bfd: usize, arg: usize) -> isize {
     } else {
         0
     };
-    if copy_to_user(arg, &avail.to_ne_bytes()).is_err() { return -14; }
+    if copy_to_user(arg, &avail.to_ne_bytes()).is_err() {
+        return -14;
+    }
     0
 }
 
@@ -486,40 +577,49 @@ fn pipe_fionread(bfd: usize, arg: usize) -> isize {
 // Reports bytes between the current seek position and end of file.
 
 fn vfs_fionread(bfd: usize, arg: usize) -> isize {
-    if !validate_user_ptr(arg, 4) { return -14; }
+    if !validate_user_ptr(arg, 4) {
+        return -14;
+    }
     let avail: u32 = match crate::fs::vfs::file_size(bfd) {
         Some(sz) => {
             // Get current offset via a SEEK_CUR of 0.
-            let pos = crate::fs::vfs::seek(bfd, 0,
-                crate::fs::fcntl::SEEK_CUR);
+            let pos = crate::fs::vfs::seek(bfd, 0, crate::fs::fcntl::SEEK_CUR);
             if pos < 0 {
                 // fd is not seekable (e.g. devfs node) — report size as avail.
                 sz as u32
             } else {
                 let pos = pos as usize;
-                if pos >= sz { 0 } else { (sz - pos) as u32 }
+                if pos >= sz {
+                    0
+                } else {
+                    (sz - pos) as u32
+                }
             }
         }
         None => 0,
     };
-    if copy_to_user(arg, &avail.to_ne_bytes()).is_err() { return -14; }
+    if copy_to_user(arg, &avail.to_ne_bytes()).is_err() {
+        return -14;
+    }
     0
 }
 
 // ── Network interface ioctl helpers ─────────────────────────────────────────
 
 fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
-    if !validate_user_ptr(arg, IFREQ_SIZE) { return -14; }
+    if !validate_user_ptr(arg, IFREQ_SIZE) {
+        return -14;
+    }
 
     let ifname = match read_ifname(arg) {
         Some(n) => n,
-        None    => return -14,
+        None => return -14,
     };
 
     // Look up the interface by name.
     let iface = match crate::net::eth::find_interface(&ifname) {
         Some(i) => i,
-        None    => return -19, // ENODEV
+        None => return -19, // ENODEV
     };
 
     match cmd {
@@ -529,13 +629,17 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let flags: u16 = if iface.is_up() { 0x0001 | 0x0040 } else { 0 };
             let mut buf = [0u8; 2];
             buf.copy_from_slice(&flags.to_ne_bytes());
-            if copy_to_user(arg + IFNAMSIZ, &buf).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &buf).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCSIFFLAGS ─────────────────────────────────────────────────────
         SIOCSIFFLAGS => {
             let mut buf = [0u8; 2];
-            if copy_from_user(&mut buf, arg + IFNAMSIZ).is_err() { return -14; }
+            if copy_from_user(&mut buf, arg + IFNAMSIZ).is_err() {
+                return -14;
+            }
             let flags = u16::from_ne_bytes(buf);
             let up = flags & 0x0001 != 0;
             iface.set_up(up);
@@ -549,29 +653,39 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let mut sa = [0u8; 16];
             sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
             sa[4..8].copy_from_slice(&addr.to_be_bytes());
-            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCSIFADDR ──────────────────────────────────────────────────────
         SIOCSIFADDR => {
             let mut sa = [0u8; 16];
-            if copy_from_user(&mut sa, arg + IFNAMSIZ).is_err() { return -14; }
-            let addr = u32::from_be_bytes(sa[4..8].try_into().unwrap_or([0;4]));
+            if copy_from_user(&mut sa, arg + IFNAMSIZ).is_err() {
+                return -14;
+            }
+            let addr = u32::from_be_bytes(sa[4..8].try_into().unwrap_or([0; 4]));
             iface.set_ipv4_addr(addr);
             0
         }
         // ── SIOCGIFMTU ───────────────────────────────────────────────────────
         SIOCGIFMTU => {
             let mtu: i32 = iface.mtu() as i32;
-            if copy_to_user(arg + IFNAMSIZ, &mtu.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &mtu.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCSIFMTU ───────────────────────────────────────────────────────
         SIOCSIFMTU => {
             let mut buf = [0u8; 4];
-            if copy_from_user(&mut buf, arg + IFNAMSIZ).is_err() { return -14; }
+            if copy_from_user(&mut buf, arg + IFNAMSIZ).is_err() {
+                return -14;
+            }
             let mtu = i32::from_ne_bytes(buf) as usize;
-            if mtu < 68 || mtu > 65535 { return -22; } // EINVAL
+            if mtu < 68 || mtu > 65535 {
+                return -22;
+            } // EINVAL
             iface.set_mtu(mtu);
             0
         }
@@ -583,13 +697,17 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let mut sa = [0u8; 16];
             sa[0..2].copy_from_slice(&1u16.to_ne_bytes()); // ARPHRD_ETHER
             sa[2..8].copy_from_slice(&mac);
-            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCGIFINDEX ──────────────────────────────────────────────────────
         SIOCGIFINDEX => {
             let idx: i32 = iface.index() as i32;
-            if copy_to_user(arg + IFNAMSIZ, &idx.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &idx.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCGIFNETMASK ────────────────────────────────────────────────────
@@ -598,7 +716,9 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let mut sa = [0u8; 16];
             sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
             sa[4..8].copy_from_slice(&netmask.to_be_bytes());
-            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCGIFBRDADDR ────────────────────────────────────────────────────
@@ -607,7 +727,9 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let mut sa = [0u8; 16];
             sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET
             sa[4..8].copy_from_slice(&bcast.to_be_bytes());
-            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCGIFDSTADDR ────────────────────────────────────────────────────
@@ -617,7 +739,9 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let mut sa = [0u8; 16];
             sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
             sa[4..8].copy_from_slice(&addr.to_be_bytes());
-            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() { return -14; }
+            if copy_to_user(arg + IFNAMSIZ, &sa).is_err() {
+                return -14;
+            }
             0
         }
         // ── SIOCGIFNAME ───────────────────────────────────────────────────────
@@ -628,7 +752,9 @@ fn sioc_ioctl(cmd: u64, arg: usize) -> isize {
             let mut buf = [0u8; IFNAMSIZ];
             let len = name_bytes.len().min(IFNAMSIZ - 1);
             buf[..len].copy_from_slice(&name_bytes[..len]);
-            if copy_to_user(arg, &buf).is_err() { return -14; }
+            if copy_to_user(arg, &buf).is_err() {
+                return -14;
+            }
             0
         }
         _ => -22, // EINVAL — unknown SIOC command
@@ -641,12 +767,12 @@ fn blk_ioctl(bfd: usize, cmd: u64, arg: usize) -> isize {
     // Resolve the path for this fd to look up the block device.
     let path = match crate::fs::fcntl::fd_get_path(bfd) {
         Some(p) => p,
-        None    => return -9, // EBADF
+        None => return -9, // EBADF
     };
 
     // Resolve the mount point to find the block device size.
     let h = match crate::fs::mount::resolve(&path) {
-        Ok(h)  => h,
+        Ok(h) => h,
         Err(e) => return e,
     };
 
@@ -658,20 +784,32 @@ fn blk_ioctl(bfd: usize, cmd: u64, arg: usize) -> isize {
     match cmd {
         BLKGETSIZE => {
             // Returns u32 sector count (512-byte sectors).
-            if !validate_user_ptr(arg, 4) { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
             let count = (total_bytes / sector_size as u64) as u32;
-            if copy_to_user(arg, &count.to_ne_bytes()).is_err() { return -14; }
+            if copy_to_user(arg, &count.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
         BLKGETSIZE64 => {
             // Returns u64 total bytes.
-            if !validate_user_ptr(arg, 8) { return -14; }
-            if copy_to_user(arg, &total_bytes.to_ne_bytes()).is_err() { return -14; }
+            if !validate_user_ptr(arg, 8) {
+                return -14;
+            }
+            if copy_to_user(arg, &total_bytes.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
         BLKSSZGET | BLKBSZGET => {
-            if !validate_user_ptr(arg, 4) { return -14; }
-            if copy_to_user(arg, &sector_size.to_ne_bytes()).is_err() { return -14; }
+            if !validate_user_ptr(arg, 4) {
+                return -14;
+            }
+            if copy_to_user(arg, &sector_size.to_ne_bytes()).is_err() {
+                return -14;
+            }
             0
         }
         _ => -25, // ENOTTY
@@ -687,7 +825,7 @@ fn blk_ioctl(bfd: usize, cmd: u64, arg: usize) -> isize {
 pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     let bfd = match resolve(fd) {
         n if n < 0 => return n,
-        n          => n as usize,
+        n => n as usize,
     };
 
     // ── 1. stdin / stdout / stderr ─────────────────────────────────────────
@@ -713,10 +851,16 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     if crate::fs::pipe::is_pipe(bfd) {
         return match cmd {
             FIONREAD => pipe_fionread(bfd, arg),
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
-            _        => -25, // ENOTTY — pipes only support FIONREAD
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
+            _ => -25, // ENOTTY — pipes only support FIONREAD
         };
     }
 
@@ -725,22 +869,28 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
         return match cmd {
             FIONREAD => {
                 // Bytes available to read on the socket.
-                if !validate_user_ptr(arg, 4) { return -14; }
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
                 let n = crate::net::socket::socket_readable_bytes(bfd) as u32;
-                if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
                 0
             }
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
             // Network interface ioctls are valid on any socket.
-            SIOCGIFFLAGS  | SIOCSIFFLAGS  |
-            SIOCGIFADDR   | SIOCSIFADDR   |
-            SIOCGIFMTU    | SIOCSIFMTU    |
-            SIOCGIFHWADDR | SIOCGIFINDEX  |
-            SIOCGIFNETMASK| SIOCGIFBRDADDR|
-            SIOCGIFDSTADDR| SIOCGIFNAME   |
-            SIOCGIFCONF => sioc_ioctl(cmd, arg),
+            SIOCGIFFLAGS | SIOCSIFFLAGS | SIOCGIFADDR | SIOCSIFADDR | SIOCGIFMTU | SIOCSIFMTU
+            | SIOCGIFHWADDR | SIOCGIFINDEX | SIOCGIFNETMASK | SIOCGIFBRDADDR | SIOCGIFDSTADDR
+            | SIOCGIFNAME | SIOCGIFCONF => sioc_ioctl(cmd, arg),
             _ => -25, // ENOTTY
         };
     }
@@ -750,14 +900,24 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
         return match cmd {
             FIONREAD => {
                 // Character device: no buffered bytes by default.
-                if !validate_user_ptr(arg, 4) { return -14; }
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
                 let n: u32 = 0;
-                if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
                 0
             }
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
             // Input event devices respond to EVIOCGVERSION / EVIOCGID etc.
             // Those are handled by the FileOps implementation on EventNode;
             // forward through the devfs dispatch.
@@ -774,15 +934,29 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     if crate::fs::timerfd::is_timerfd(bfd) {
         return match cmd {
             FIONREAD => {
-                if !validate_user_ptr(arg, 4) { return -14; }
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
                 // timerfd: non-zero if timer has expired at least once.
-                let n: u32 = if crate::fs::timerfd::timerfd_has_expired(bfd) { 8 } else { 0 };
-                if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                let n: u32 = if crate::fs::timerfd::timerfd_has_expired(bfd) {
+                    8
+                } else {
+                    0
+                };
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
                 0
             }
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
             _ => -25,
         };
     }
@@ -790,15 +964,29 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     if crate::fs::eventfd::is_eventfd(bfd) {
         return match cmd {
             FIONREAD => {
-                if !validate_user_ptr(arg, 4) { return -14; }
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
                 // eventfd: 8 bytes available when counter > 0.
-                let n: u32 = if crate::fs::eventfd::eventfd_count(bfd) > 0 { 8 } else { 0 };
-                if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                let n: u32 = if crate::fs::eventfd::eventfd_count(bfd) > 0 {
+                    8
+                } else {
+                    0
+                };
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
                 0
             }
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
             _ => -25,
         };
     }
@@ -806,14 +994,28 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     if crate::fs::inotify::is_inotify_fd(bfd) {
         return match cmd {
             FIONREAD => {
-                if !validate_user_ptr(arg, 4) { return -14; }
-                let n: u32 = if crate::fs::inotify::inotify_has_events(bfd) { 1 } else { 0 };
-                if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
+                let n: u32 = if crate::fs::inotify::inotify_has_events(bfd) {
+                    1
+                } else {
+                    0
+                };
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
                 0
             }
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
             _ => -25,
         };
     }
@@ -821,14 +1023,28 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return match cmd {
             FIONREAD => {
-                if !validate_user_ptr(arg, 4) { return -14; }
-                let n: u32 = if crate::fs::fanotify::fanotify_has_events(bfd) { 1 } else { 0 };
-                if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
+                let n: u32 = if crate::fs::fanotify::fanotify_has_events(bfd) {
+                    1
+                } else {
+                    0
+                };
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
                 0
             }
-            FIONBIO  => fionbio(fd, bfd, arg),
-            FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-            FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+            FIONBIO => fionbio(fd, bfd, arg),
+            FIOCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, true);
+                0
+            }
+            FIONCLEX => {
+                proc_fd_set_cloexec(cpid(), fd, false);
+                0
+            }
             _ => -25,
         };
     }
@@ -836,45 +1052,59 @@ pub fn sys_ioctl(fd: usize, cmd: u64, arg: usize) -> isize {
     // ── 8. Plain VFS files (ext2, ext4, tmpfs, fat32, overlayfs, …) ───────
     match cmd {
         FIONREAD => vfs_fionread(bfd, arg),
-        FIONBIO  => fionbio(fd, bfd, arg),
-        FIOCLEX  => { proc_fd_set_cloexec(cpid(), fd, true);  0 }
-        FIONCLEX => { proc_fd_set_cloexec(cpid(), fd, false); 0 }
+        FIONBIO => fionbio(fd, bfd, arg),
+        FIOCLEX => {
+            proc_fd_set_cloexec(cpid(), fd, true);
+            0
+        }
+        FIONCLEX => {
+            proc_fd_set_cloexec(cpid(), fd, false);
+            0
+        }
         // Block device size queries on regular (block-device-backed) files.
         BLKGETSIZE | BLKGETSIZE64 | BLKSSZGET | BLKBSZGET => blk_ioctl(bfd, cmd, arg),
         // procfs / sysfs: FIONREAD reported as 0 (synthetic files).
         _ if crate::fs::procfs::is_procfs_fd(bfd) => {
             match cmd {
                 FIONREAD => {
-                    if !validate_user_ptr(arg, 4) { return -14; }
+                    if !validate_user_ptr(arg, 4) {
+                        return -14;
+                    }
                     let n: u32 = 0;
-                    if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
+                    if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                        return -14;
+                    }
                     0
                 }
                 _ => -25, // ENOTTY
             }
         }
-        _ if crate::fs::sysfs::is_sysfs_fd(bfd) => {
-            match cmd {
-                FIONREAD => {
-                    if !validate_user_ptr(arg, 4) { return -14; }
-                    let n: u32 = 0;
-                    if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
-                    0
+        _ if crate::fs::sysfs::is_sysfs_fd(bfd) => match cmd {
+            FIONREAD => {
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
                 }
-                _ => -25,
-            }
-        }
-        _ if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) => {
-            match cmd {
-                FIONREAD => {
-                    if !validate_user_ptr(arg, 4) { return -14; }
-                    let n: u32 = 0;
-                    if copy_to_user(arg, &n.to_ne_bytes()).is_err() { return -14; }
-                    0
+                let n: u32 = 0;
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
                 }
-                _ => -25,
+                0
             }
-        }
+            _ => -25,
+        },
+        _ if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) => match cmd {
+            FIONREAD => {
+                if !validate_user_ptr(arg, 4) {
+                    return -14;
+                }
+                let n: u32 = 0;
+                if copy_to_user(arg, &n.to_ne_bytes()).is_err() {
+                    return -14;
+                }
+                0
+            }
+            _ => -25,
+        },
         // Unknown command on a plain file.
         _ => -25, // ENOTTY
     }

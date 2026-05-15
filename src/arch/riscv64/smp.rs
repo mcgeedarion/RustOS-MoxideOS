@@ -3,10 +3,10 @@
 //! All SBI Extension IDs, Function IDs, and per-AP stack constants are
 //! imported from [`crate::arch::riscv64::mem_layout`].
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::mm::pmm;
 use crate::arch::riscv64::mem_layout::sbi as SBI;
 use crate::arch::riscv64::mem_layout::smp as SMP;
+use crate::mm::pmm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const MAX_APS: usize = crate::smp::MAX_CPUS - 1;
 
@@ -18,9 +18,7 @@ static AP_STACKS: [AtomicUsize; MAX_APS] = {
 // ── SBI call helper ─────────────────────────────────────────────────────────────────
 
 #[inline]
-unsafe fn sbi_call(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize)
-    -> (isize, usize)
-{
+unsafe fn sbi_call(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize) -> (isize, usize) {
     let err: isize;
     let val: usize;
     core::arch::asm!(
@@ -37,7 +35,14 @@ unsafe fn sbi_call(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize)
 
 pub fn sbi_hart_start(hart_id: usize, entry: usize, opaque: usize) -> isize {
     unsafe {
-        sbi_call(SBI::EID_HSM, SBI::FID_HSM_HART_START, hart_id, entry, opaque).0
+        sbi_call(
+            SBI::EID_HSM,
+            SBI::FID_HSM_HART_START,
+            hart_id,
+            entry,
+            opaque,
+        )
+        .0
     }
 }
 
@@ -53,20 +58,27 @@ pub fn sbi_hart_status(hart_id: usize) -> isize {
 pub fn send_ipi(target_hw_id: usize) {
     unsafe {
         let (rc, _) = sbi_call(
-            SBI::EID_IPI, SBI::FID_IPI_SEND,
-            1,             // hart_mask = 0b1
-            target_hw_id,  // hart_mask_base
+            SBI::EID_IPI,
+            SBI::FID_IPI_SEND,
+            1,            // hart_mask = 0b1
+            target_hw_id, // hart_mask_base
             0,
         );
         if rc != SBI::ERR_SUCCESS as isize {
-            crate::println!("smp: send_ipi to hart {} failed, SBI error {}", target_hw_id, rc);
+            crate::println!(
+                "smp: send_ipi to hart {} failed, SBI error {}",
+                target_hw_id,
+                rc
+            );
         }
     }
 }
 
 // ── AP naked entry stub ─────────────────────────────────────────────────────────────
 
-extern "C" { fn ap_entry(cpu_id: u32) -> !; }
+extern "C" {
+    fn ap_entry(cpu_id: u32) -> !;
+}
 
 #[naked]
 #[no_mangle]
@@ -93,10 +105,10 @@ pub fn start_all_harts() {
     for cpu_id in 1..total {
         let info = match crate::smp::cpu_info(cpu_id) {
             Some(i) => i,
-            None    => continue,
+            None => continue,
         };
-        let hw_id     = info.hw_id as usize;
-        let stack_pa  = alloc_ap_stack();
+        let hw_id = info.hw_id as usize;
+        let stack_pa = alloc_ap_stack();
         let stack_top = stack_pa + SMP::AP_STACK_SIZE;
         let idx = (cpu_id - 1) as usize;
         if idx < MAX_APS {
@@ -113,8 +125,12 @@ pub fn start_all_harts() {
 
 fn alloc_ap_stack() -> usize {
     let first = pmm::alloc_page().expect("smp: OOM allocating AP stack");
-    for _ in 1..SMP::AP_STACK_PAGES { pmm::alloc_page().expect("smp: OOM"); }
-    unsafe { core::ptr::write_bytes(first as *mut u8, 0, SMP::AP_STACK_SIZE); }
+    for _ in 1..SMP::AP_STACK_PAGES {
+        pmm::alloc_page().expect("smp: OOM");
+    }
+    unsafe {
+        core::ptr::write_bytes(first as *mut u8, 0, SMP::AP_STACK_SIZE);
+    }
     first
 }
 
@@ -123,7 +139,7 @@ fn alloc_ap_stack() -> usize {
 pub unsafe fn ap_init_plic() {
     use crate::arch::riscv64::mem_layout::plic;
     let cpu_id = crate::smp::percpu::current_cpu_id();
-    let hw_id  = crate::smp::cpu_info(cpu_id)
+    let hw_id = crate::smp::cpu_info(cpu_id)
         .map(|i| i.hw_id as usize)
         .unwrap_or(cpu_id as usize);
     let ctx = plic::s_mode_context(hw_id);
@@ -132,7 +148,7 @@ pub unsafe fn ap_init_plic() {
 
 pub unsafe fn init_hart() {
     crate::arch::riscv64::trap::trap_init();
-    let now  = crate::arch::api::Timer::read_ticks();
+    let now = crate::arch::api::Timer::read_ticks();
     let next = now + 10_000_000;
     core::arch::asm!(
         "li a7, {eid}",

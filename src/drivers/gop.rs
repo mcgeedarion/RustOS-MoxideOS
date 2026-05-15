@@ -36,22 +36,22 @@ pub enum PixelFormat {
 /// Everything the kernel needs from GOP, captured before ExitBootServices.
 #[derive(Clone, Copy)]
 pub struct GopInfo {
-    pub fb_phys:          u64,
-    pub fb_size:          usize,
-    pub width:            u32,
-    pub height:           u32,
-    pub pixels_per_line:  u32,
-    pub pixel_format:     PixelFormat,
+    pub fb_phys: u64,
+    pub fb_size: usize,
+    pub width: u32,
+    pub height: u32,
+    pub pixels_per_line: u32,
+    pub pixel_format: PixelFormat,
 }
 
 static GOP_VALID: AtomicBool = AtomicBool::new(false);
-static GOP_INFO:  Mutex<GopInfo> = Mutex::new(GopInfo {
-    fb_phys:         0,
-    fb_size:         0,
-    width:           0,
-    height:          0,
+static GOP_INFO: Mutex<GopInfo> = Mutex::new(GopInfo {
+    fb_phys: 0,
+    fb_size: 0,
+    width: 0,
+    height: 0,
     pixels_per_line: 0,
-    pixel_format:    PixelFormat::Bgrx,
+    pixel_format: PixelFormat::Bgrx,
 });
 
 /// Returns the captured GOP info, or None if GOP was not found / not available.
@@ -86,37 +86,37 @@ const EFI_SUCCESS: EfiStatus = 0;
 /// Offset of LocateProtocol in EFI_BOOT_SERVICES: header(24) + 43*8 = 0x170.
 const LOCATE_PROTOCOL_OFFSET: usize = 0x170;
 type LocateProtocolFn = unsafe extern "efiapi" fn(
-    protocol:     *const [u64; 2],
+    protocol: *const [u64; 2],
     registration: *mut core::ffi::c_void,
-    interface:    *mut *mut core::ffi::c_void,
+    interface: *mut *mut core::ffi::c_void,
 ) -> EfiStatus;
 
 #[repr(C)]
 struct GopProtocol {
     query_mode: *mut core::ffi::c_void,
-    set_mode:   *mut core::ffi::c_void,
-    blt:        *mut core::ffi::c_void,
-    mode:       *mut GopMode,
+    set_mode: *mut core::ffi::c_void,
+    blt: *mut core::ffi::c_void,
+    mode: *mut GopMode,
 }
 
 #[repr(C)]
 struct GopMode {
-    max_mode:     u32,
-    mode:         u32,
-    info:         *mut GopModeInfo,
+    max_mode: u32,
+    mode: u32,
+    info: *mut GopModeInfo,
     size_of_info: usize,
-    fb_base:      u64,
-    fb_size:      usize,
+    fb_base: u64,
+    fb_size: usize,
 }
 
 #[repr(C)]
 struct GopModeInfo {
-    version:               u32,
+    version: u32,
     horizontal_resolution: u32,
-    vertical_resolution:   u32,
-    pixel_format:          u32,
-    pixel_bitmask:         [u32; 4],
-    pixels_per_scan_line:  u32,
+    vertical_resolution: u32,
+    pixel_format: u32,
+    pixel_bitmask: [u32; 4],
+    pixels_per_scan_line: u32,
 }
 
 /// Query GOP via LocateProtocol and store the result in `GOP_INFO`.
@@ -131,8 +131,7 @@ struct GopModeInfo {
 /// `boot_services_ptr` must be a valid `*EFI_BOOT_SERVICES` pointer.
 pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_void) -> bool {
     let bs_base = boot_services_ptr as usize;
-    let locate: LocateProtocolFn =
-        *((bs_base + LOCATE_PROTOCOL_OFFSET) as *const LocateProtocolFn);
+    let locate: LocateProtocolFn = *((bs_base + LOCATE_PROTOCOL_OFFSET) as *const LocateProtocolFn);
 
     let mut gop_iface: *mut core::ffi::c_void = core::ptr::null_mut();
     let status = locate(
@@ -162,7 +161,9 @@ pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_vo
     }
     let info = &*info_ptr;
 
-    if mode.fb_base == 0 { return false; }
+    if mode.fb_base == 0 {
+        return false;
+    }
 
     let pixel_format = match info.pixel_format {
         0 => PixelFormat::Rgbx,
@@ -170,13 +171,15 @@ pub unsafe fn capture_from_boot_services(boot_services_ptr: *mut core::ffi::c_vo
         2 => PixelFormat::BitMask,
         _ => PixelFormat::BltOnly,
     };
-    if pixel_format == PixelFormat::BltOnly { return false; }
+    if pixel_format == PixelFormat::BltOnly {
+        return false;
+    }
 
     *GOP_INFO.lock() = GopInfo {
-        fb_phys:         mode.fb_base,
-        fb_size:         mode.fb_size,
-        width:           info.horizontal_resolution,
-        height:          info.vertical_resolution,
+        fb_phys: mode.fb_base,
+        fb_size: mode.fb_size,
+        width: info.horizontal_resolution,
+        height: info.vertical_resolution,
         pixels_per_line: info.pixels_per_scan_line,
         pixel_format,
     };

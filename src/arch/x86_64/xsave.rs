@@ -29,7 +29,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static XSAVE_SUPPORTED: AtomicBool = AtomicBool::new(false);
-static XSAVE_SIZE:      AtomicU32  = AtomicU32::new(512); // FXSAVE default
+static XSAVE_SIZE: AtomicU32 = AtomicU32::new(512); // FXSAVE default
 
 /// Detect XSAVE support and measure the required state area size.
 /// Call once during arch init, before any signal can be delivered.

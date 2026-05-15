@@ -25,22 +25,28 @@ use spin::Mutex;
 
 const COM1: u16 = 0x3F8;
 
-#[inline] fn serial_write(b: u8) {
+#[inline]
+fn serial_write(b: u8) {
     unsafe {
         loop {
             let lsr: u8;
             core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1+5, options(nostack));
-            if lsr & 0x20 != 0 { break; }
+            if lsr & 0x20 != 0 {
+                break;
+            }
         }
         core::arch::asm!("out dx, al", in("dx") COM1, in("al") b, options(nostack));
     }
 }
 
-#[inline] fn serial_read() -> Option<u8> {
+#[inline]
+fn serial_read() -> Option<u8> {
     unsafe {
         let lsr: u8;
         core::arch::asm!("in al, dx", out("al") lsr, in("dx") COM1+5, options(nostack));
-        if lsr & 0x01 == 0 { return None; }
+        if lsr & 0x01 == 0 {
+            return None;
+        }
         let d: u8;
         core::arch::asm!("in al, dx", out("al") d, in("dx") COM1, options(nostack));
         Some(d)
@@ -51,27 +57,27 @@ const COM1: u16 = 0x3F8;
 
 #[derive(Clone, Copy)]
 pub struct Termios {
-    pub c_iflag: u32,  // input flags
-    pub c_oflag: u32,  // output flags  
-    pub c_cflag: u32,  // control flags
-    pub c_lflag: u32,  // local flags
-    pub c_cc:    [u8; 32],
+    pub c_iflag: u32, // input flags
+    pub c_oflag: u32, // output flags
+    pub c_cflag: u32, // control flags
+    pub c_lflag: u32, // local flags
+    pub c_cc: [u8; 32],
 }
 
 impl Termios {
     pub const fn default() -> Self {
         let mut cc = [0u8; 32];
-        cc[3]  = 0x7F; // VERASE = DEL
-        cc[4]  = 28;   // VKILL  = \\
-        cc[5]  = 4;    // VEOF   = ^D
-        cc[6]  = 0;    // VTIME
-        cc[7]  = 1;    // VMIN
-        cc[8]  = 17;   // VSTART = ^Q
-        cc[9]  = 19;   // VSTOP  = ^S
-        cc[10] = 26;   // VSUSP  = ^Z
-        cc[11] = 0;    // VEOL
-        cc[1]  = 3;    // VINTR  = ^C
-        cc[2]  = 28;   // VQUIT  = ^|
+        cc[3] = 0x7F; // VERASE = DEL
+        cc[4] = 28; // VKILL  = \\
+        cc[5] = 4; // VEOF   = ^D
+        cc[6] = 0; // VTIME
+        cc[7] = 1; // VMIN
+        cc[8] = 17; // VSTART = ^Q
+        cc[9] = 19; // VSTOP  = ^S
+        cc[10] = 26; // VSUSP  = ^Z
+        cc[11] = 0; // VEOL
+        cc[1] = 3; // VINTR  = ^C
+        cc[2] = 28; // VQUIT  = ^|
         Self {
             c_iflag: 0x0500, // ICRNL | IXON
             c_oflag: 0x0005, // OPOST | ONLCR
@@ -81,8 +87,12 @@ impl Termios {
         }
     }
 
-    pub fn is_canonical(&self) -> bool { self.c_lflag & 0x0002 != 0 } // ICANON
-    pub fn echo_on(&self)    -> bool { self.c_lflag & 0x0008 != 0 } // ECHO
+    pub fn is_canonical(&self) -> bool {
+        self.c_lflag & 0x0002 != 0
+    } // ICANON
+    pub fn echo_on(&self) -> bool {
+        self.c_lflag & 0x0008 != 0
+    } // ECHO
 }
 
 // ── Winsize ───────────────────────────────────────────────────────────────
@@ -92,40 +102,48 @@ impl Termios {
 /// returns the last value set rather than a hardcoded constant.
 #[derive(Clone, Copy)]
 pub struct Winsize {
-    pub ws_row:    u16,  // terminal rows
-    pub ws_col:    u16,  // terminal columns
-    pub ws_xpixel: u16,  // pixel width  (0 = unknown)
-    pub ws_ypixel: u16,  // pixel height (0 = unknown)
+    pub ws_row: u16,    // terminal rows
+    pub ws_col: u16,    // terminal columns
+    pub ws_xpixel: u16, // pixel width  (0 = unknown)
+    pub ws_ypixel: u16, // pixel height (0 = unknown)
 }
 
 impl Winsize {
     pub const fn default() -> Self {
-        Self { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }
+        Self {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }
     }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
 
 struct TtyState {
-    line_buf:       Vec<u8>,
-    termios:        Termios,
+    line_buf: Vec<u8>,
+    termios: Termios,
     foreground_pid: usize,
-    winsize:        Winsize,
+    winsize: Winsize,
 }
 
 static TTY: Mutex<TtyState> = Mutex::new(TtyState {
-    line_buf:       Vec::new(),
-    termios:        Termios::default(),
+    line_buf: Vec::new(),
+    termios: Termios::default(),
     foreground_pid: 1,
-    winsize:        Winsize::default(),
+    winsize: Winsize::default(),
 });
 
 // ── Echo helpers ──────────────────────────────────────────────────────────
 
 fn echo(b: u8, tty: &Termios) {
-    if !tty.echo_on() { return; }
+    if !tty.echo_on() {
+        return;
+    }
     if b == b'\r' || b == b'\n' {
-        serial_write(b'\r'); serial_write(b'\n');
+        serial_write(b'\r');
+        serial_write(b'\n');
     } else if b < 0x20 {
         // Control character — print as ^X
         serial_write(b'^');
@@ -160,7 +178,9 @@ pub fn read_line(buf: &mut [u8]) -> isize {
         // Read bytes from serial until we have a complete line.
         loop {
             let byte = loop {
-                if let Some(b) = serial_read() { break b; }
+                if let Some(b) = serial_read() {
+                    break b;
+                }
                 core::hint::spin_loop();
             };
 
@@ -169,7 +189,9 @@ pub fn read_line(buf: &mut [u8]) -> isize {
 
             if !is_canon {
                 // Raw mode: return immediately.
-                if buf.is_empty() { return 0; }
+                if buf.is_empty() {
+                    return 0;
+                }
                 buf[0] = byte;
                 return 1;
             }
@@ -180,7 +202,10 @@ pub fn read_line(buf: &mut [u8]) -> isize {
                     let pid = tty.foreground_pid;
                     drop(tty);
                     crate::proc::signal::send_signal(pid, 2);
-                    serial_write(b'^'); serial_write(b'C'); serial_write(b'\r'); serial_write(b'\n');
+                    serial_write(b'^');
+                    serial_write(b'C');
+                    serial_write(b'\r');
+                    serial_write(b'\n');
                     return -4; // EINTR
                 }
                 // ^D → EOF
@@ -238,17 +263,23 @@ pub fn write(buf: &[u8]) -> isize {
     let onlcr = tty.termios.c_oflag & 0x0004 != 0; // ONLCR
     drop(tty);
     for &b in buf {
-        if onlcr && b == b'\n' { serial_write(b'\r'); }
+        if onlcr && b == b'\n' {
+            serial_write(b'\r');
+        }
         serial_write(b);
     }
     buf.len() as isize
 }
 
 /// Get a copy of the current termios struct.
-pub fn get_termios() -> Termios { TTY.lock().termios }
+pub fn get_termios() -> Termios {
+    TTY.lock().termios
+}
 
 /// Replace the termios struct (used by TCSETS ioctl).
-pub fn set_termios(t: Termios) { TTY.lock().termios = t; }
+pub fn set_termios(t: Termios) {
+    TTY.lock().termios = t;
+}
 
 /// Set/clear raw mode.
 pub fn set_raw(raw: bool) {
@@ -256,18 +287,26 @@ pub fn set_raw(raw: bool) {
     if raw {
         tty.termios.c_lflag &= !(0x0002 | 0x0008); // clear ICANON | ECHO
     } else {
-        tty.termios.c_lflag |= 0x0002 | 0x0008;    // set   ICANON | ECHO
+        tty.termios.c_lflag |= 0x0002 | 0x0008; // set   ICANON | ECHO
     }
 }
 
 /// Get the current window size (used by TIOCGWINSZ ioctl).
 /// Returns the last value set via TIOCSWINSZ, defaulting to 80x24.
-pub fn get_winsize() -> Winsize { TTY.lock().winsize }
+pub fn get_winsize() -> Winsize {
+    TTY.lock().winsize
+}
 
 /// Store a new window size (used by TIOCSWINSZ ioctl).
 /// Programmes that call tcgetwinsize/tcsetwinsize see a consistent value.
-pub fn set_winsize(ws: Winsize) { TTY.lock().winsize = ws; }
+pub fn set_winsize(ws: Winsize) {
+    TTY.lock().winsize = ws;
+}
 
 /// Set the foreground process group (for SIGINT/SIGTSTP delivery).
-pub fn set_foreground_pid(pid: usize) { TTY.lock().foreground_pid = pid; }
-pub fn foreground_pid() -> usize { TTY.lock().foreground_pid }
+pub fn set_foreground_pid(pid: usize) {
+    TTY.lock().foreground_pid = pid;
+}
+pub fn foreground_pid() -> usize {
+    TTY.lock().foreground_pid
+}

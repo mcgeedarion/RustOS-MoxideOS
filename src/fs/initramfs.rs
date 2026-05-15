@@ -17,8 +17,8 @@ extern crate alloc;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::initramfs;
 use crate::fs::vfs;
+use crate::initramfs;
 
 /// Set once `mount_initramfs()` completes successfully.
 static MOUNTED: AtomicBool = AtomicBool::new(false);
@@ -27,23 +27,29 @@ static MOUNTED: AtomicBool = AtomicBool::new(false);
 ///
 /// Idempotent: returns immediately if already mounted.
 pub fn mount_initramfs() {
-    if MOUNTED.load(Ordering::Acquire) { return; }
+    if MOUNTED.load(Ordering::Acquire) {
+        return;
+    }
 
     let handle = initramfs::load();
 
     for entry in handle.entries() {
         // Skip the end-of-archive marker.
-        if entry.name == "TRAILER!!!" { continue; }
+        if entry.name == "TRAILER!!!" {
+            continue;
+        }
         // Skip the synthetic "." root entry.
-        if entry.name == "." || entry.name.is_empty() { continue; }
+        if entry.name == "." || entry.name.is_empty() {
+            continue;
+        }
 
         // Normalise path: "./foo" → "/foo", "foo" → "/foo".
         let path: String = if entry.name.starts_with('/') {
             entry.name.into()
         } else if let Some(rest) = entry.name.strip_prefix("./") {
-            alloc::format!"/{rest}")
+            alloc::format!("/{rest}")
         } else {
-            alloc::format!"/{}", entry.name)
+            alloc::format!("/{}", entry.name)
         };
 
         // S_IFMT mask (Linux inode mode field upper 4 bits):
@@ -77,7 +83,9 @@ pub fn mount_initramfs() {
                 // The symlink target is stored in the file data as a
                 // NUL-terminated (or plain) string.
                 let target_bytes = entry.data;
-                let target_len   = target_bytes.iter().position(|&b| b == 0)
+                let target_len = target_bytes
+                    .iter()
+                    .position(|&b| b == 0)
                     .unwrap_or(target_bytes.len());
                 if let Ok(target) = core::str::from_utf8(&target_bytes[..target_len]) {
                     // vfs::symlink(target, linkpath) — best-effort.
@@ -96,7 +104,10 @@ pub fn mount_initramfs() {
     }
 
     MOUNTED.store(true, Ordering::Release);
-    crate::println!("initramfs: mounted {} entries into VFS", count_entries(&handle));
+    crate::println!(
+        "initramfs: mounted {} entries into VFS",
+        count_entries(&handle)
+    );
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
@@ -105,13 +116,16 @@ pub fn mount_initramfs() {
 fn parent_of(path: &str) -> Option<String> {
     let trimmed = path.trim_end_matches('/');
     let last_slash = trimmed.rfind('/')?;
-    if last_slash == 0 { return None; } // parent is root
+    if last_slash == 0 {
+        return None;
+    } // parent is root
     Some(trimmed[..last_slash].into())
 }
 
 /// Count non-trailer, non-dot entries in the archive (for the log message).
 fn count_entries(handle: &initramfs::InitramfsHandle<'_>) -> usize {
-    handle.entries()
+    handle
+        .entries()
         .filter(|e| e.name != "TRAILER!!!" && e.name != "." && !e.name.is_empty())
         .count()
 }

@@ -22,14 +22,17 @@ pub fn tgid_of(pid: usize) -> usize {
 
 pub fn threads_of(tgid: usize) -> alloc::vec::Vec<usize> {
     scheduler::with_procs_ro(|procs| {
-        procs.iter()
+        procs
+            .iter()
             .filter(|p| p.tgid == tgid)
             .map(|p| p.pid)
             .collect()
     })
 }
 
-pub fn vma_pid(pid: usize) -> u32 { tgid_of(pid) as u32 }
+pub fn vma_pid(pid: usize) -> u32 {
+    tgid_of(pid) as u32
+}
 
 pub fn sys_gettid() -> isize {
     scheduler::current_pid() as isize
@@ -39,18 +42,26 @@ pub fn sys_tkill(tid: usize, sig: u32) -> isize {
     if sig == 0 {
         return match scheduler::with_proc(tid, |_| ()) {
             Some(_) => 0,
-            None    => -3,
+            None => -3,
         };
     }
-    if sig > 64 { return -22; }
+    if sig > 64 {
+        return -22;
+    }
     crate::proc::signal::send_signal(tid, sig as i32)
 }
 
 pub fn sys_tgkill(tgid: usize, tid: usize, sig: u32) -> isize {
-    if sig > 64 { return -22; }
+    if sig > 64 {
+        return -22;
+    }
     let real_tgid = scheduler::tgid_of(tid);
-    if real_tgid == 0 || real_tgid != tgid { return -3; }
-    if sig == 0 { return 0; }
+    if real_tgid == 0 || real_tgid != tgid {
+        return -3;
+    }
+    if sig == 0 {
+        return 0;
+    }
     crate::proc::signal::send_signal(tid, sig as i32)
 }
 
@@ -74,7 +85,7 @@ pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
     match code {
         ARCH_SET_FS => {
             scheduler::with_proc_mut(pid, |p| {
-                p.tls_base    = addr;
+                p.tls_base = addr;
                 p.ctx.fs_base = addr;
             });
             unsafe {
@@ -93,7 +104,9 @@ pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
         ARCH_GET_FS => {
             let base = scheduler::with_proc(pid, |p| p.tls_base).unwrap_or(0);
             // FIX: copy_to_user returns bool, not Result. Was .is_err().
-            if !copy_to_user(addr, &base.to_ne_bytes()) { return -14; }
+            if !copy_to_user(addr, &base.to_ne_bytes()) {
+                return -14;
+            }
             0
         }
         ARCH_SET_GS => {
@@ -101,7 +114,9 @@ pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
         }
         ARCH_GET_GS => {
             // FIX: same bool vs Result mismatch.
-            if !copy_to_user(addr, &0usize.to_ne_bytes()) { return -14; }
+            if !copy_to_user(addr, &0usize.to_ne_bytes()) {
+                return -14;
+            }
             0
         }
         _ => -22,
@@ -109,4 +124,6 @@ pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn sys_arch_prctl(_code: usize, _addr: usize) -> isize { -38 }
+pub fn sys_arch_prctl(_code: usize, _addr: usize) -> isize {
+    -38
+}

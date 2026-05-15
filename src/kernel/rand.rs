@@ -22,27 +22,35 @@ macro_rules! rdrand_asm {
 }
 
 pub fn seed_from_hw() {
-    let raw  = hw_seed_raw();
+    let raw = hw_seed_raw();
     let seed = raw ^ 0xDEAD_BEEF_CAFE_BABE_u64;
-    let seed = if seed == 0 { 0xDEAD_BEEF_CAFE_BABE_u64 } else { seed };
+    let seed = if seed == 0 {
+        0xDEAD_BEEF_CAFE_BABE_u64
+    } else {
+        seed
+    };
     STATE.store(seed, Ordering::Relaxed);
 }
 
 #[deprecated(note = "renamed to seed_from_hw()")]
 #[inline]
-pub fn seed_from_tsc() { seed_from_hw(); }
+pub fn seed_from_tsc() {
+    seed_from_hw();
+}
 
 #[inline]
 fn hw_seed_raw() -> u64 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        let lo: u32; let hi: u32;
+        let lo: u32;
+        let hi: u32;
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem, preserves_flags));
         (hi as u64) << 32 | lo as u64
     }
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        let cycle: u64; let instret: u64;
+        let cycle: u64;
+        let instret: u64;
         core::arch::asm!("csrr {c}, mcycle", "csrr {i}, minstret", c = out(reg) cycle, i = out(reg) instret, options(nostack, nomem));
         cycle ^ instret
     }
@@ -52,12 +60,22 @@ fn hw_seed_raw() -> u64 {
 
 pub fn arch_entropy() -> u64 {
     #[cfg(target_arch = "x86_64")]
-    { let (r, ok) = rdrand_asm!(); if ok { return r; } crate::println!("WARN: rand: RDRAND failed 10\u{d7} \u{2014} falling back to xorshift entropy"); next_u64() }
+    {
+        let (r, ok) = rdrand_asm!();
+        if ok {
+            return r;
+        }
+        crate::println!(
+            "WARN: rand: RDRAND failed 10\u{d7} \u{2014} falling back to xorshift entropy"
+        );
+        next_u64()
+    }
     // V7 fix: mix mcycle^minstret into the xorshift state before sampling so
     // that the output is not linearly predictable from user-visible rdcycle.
     #[cfg(target_arch = "riscv64")]
     unsafe {
-        let cycle: u64; let instret: u64;
+        let cycle: u64;
+        let instret: u64;
         core::arch::asm!(
             "csrr {c}, mcycle", "csrr {i}, minstret",
             c = out(reg) cycle, i = out(reg) instret,
@@ -81,7 +99,9 @@ pub fn arch_entropy() -> u64 {
 pub fn next_u64() -> u64 {
     loop {
         let s = STATE.load(Ordering::Relaxed);
-        let s1 = s ^ (s << 13); let s1 = s1 ^ (s1 >> 7); let s1 = s1 ^ (s1 << 17);
+        let s1 = s ^ (s << 13);
+        let s1 = s1 ^ (s1 >> 7);
+        let s1 = s1 ^ (s1 << 17);
         match STATE.compare_exchange_weak(s, s1, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return s1,
             Err(_) => core::hint::spin_loop(),
@@ -90,7 +110,16 @@ pub fn next_u64() -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn rdrand64() -> u64 { let (r, ok) = rdrand_asm!(); if ok { r } else { next_u64() } }
+pub fn rdrand64() -> u64 {
+    let (r, ok) = rdrand_asm!();
+    if ok {
+        r
+    } else {
+        next_u64()
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
-pub fn rdrand_or_lfsr() -> u64 { rdrand64() }
+pub fn rdrand_or_lfsr() -> u64 {
+    rdrand64()
+}

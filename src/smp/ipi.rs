@@ -33,36 +33,39 @@
 //!   its current timeslice) and calls `schedule()`, which picks up the newly
 //!   enqueued task.
 
+use crate::smp::{cpu_info, num_online_cpus, MAX_CPUS};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use crate::smp::{MAX_CPUS, num_online_cpus, cpu_info};
 
 /// IPI vector base (x86_64).
 pub const IPI_TLB_SHOOTDOWN: u8 = 0xF0;
-pub const IPI_RESCHEDULE:    u8 = 0xF1;
-pub const IPI_FUNC_CALL:     u8 = 0xF2;
-pub const IPI_PANIC_HALT:    u8 = 0xFE;
+pub const IPI_RESCHEDULE: u8 = 0xF1;
+pub const IPI_FUNC_CALL: u8 = 0xF2;
+pub const IPI_PANIC_HALT: u8 = 0xFE;
 
 /// Bit positions in `PercpuBlock::ipi_pending`.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 pub enum IpiKind {
     TlbShootdown = 0,
-    Reschedule   = 1,
-    FuncCall     = 2,
-    PanicHalt    = 3,
+    Reschedule = 1,
+    FuncCall = 2,
+    PanicHalt = 3,
 }
 
 /// Per-CPU TLB shootdown request.
 #[derive(Clone, Copy, Default)]
 pub struct ShootdownReq {
     pub start: u64,
-    pub end:   u64,
-    pub asid:  u16,
-    pub done:  bool,
+    pub end: u64,
+    pub asid: u16,
+    pub done: bool,
 }
 
 static mut SHOOTDOWN_REQS: [ShootdownReq; MAX_CPUS] = [ShootdownReq {
-    start: 0, end: 0, asid: 0, done: false,
+    start: 0,
+    end: 0,
+    asid: 0,
+    done: false,
 }; MAX_CPUS];
 
 static SHOOTDOWN_ACK: AtomicU64 = AtomicU64::new(0);
@@ -92,9 +95,9 @@ pub fn send(target_cpu: u32, kind: IpiKind) {
         if let Some(info) = cpu_info(target_cpu) {
             let vec = match kind {
                 IpiKind::TlbShootdown => IPI_TLB_SHOOTDOWN,
-                IpiKind::Reschedule   => IPI_RESCHEDULE,
-                IpiKind::FuncCall     => IPI_FUNC_CALL,
-                IpiKind::PanicHalt    => IPI_PANIC_HALT,
+                IpiKind::Reschedule => IPI_RESCHEDULE,
+                IpiKind::FuncCall => IPI_FUNC_CALL,
+                IpiKind::PanicHalt => IPI_PANIC_HALT,
             };
             crate::arch::x86_64::apic::send_ipi(info.hw_id, vec);
         }
@@ -140,7 +143,9 @@ pub fn send_reschedule(target_cpu: u32) {
 
 /// Alias kept for backwards compatibility with `smp::ipi::reschedule`.
 #[inline]
-pub fn reschedule(target_cpu: u32) { send_reschedule(target_cpu); }
+pub fn reschedule(target_cpu: u32) {
+    send_reschedule(target_cpu);
+}
 
 // ── Receive dispatch ───────────────────────────────────────────────────────────────
 
@@ -150,7 +155,9 @@ pub fn reschedule(target_cpu: u32) { send_reschedule(target_cpu); }
 pub fn dispatch(cpu_id: u32) {
     let blk = unsafe { &crate::smp::percpu::PERCPU_BLOCKS[cpu_id as usize] };
     let pending = blk.ipi_pending.swap(0, Ordering::AcqRel);
-    if pending == 0 { return; } // spurious SSIP
+    if pending == 0 {
+        return;
+    } // spurious SSIP
 
     if pending & (1 << IpiKind::TlbShootdown as u8) != 0 {
         handle_tlb_shootdown(cpu_id);
@@ -165,9 +172,13 @@ pub fn dispatch(cpu_id: u32) {
         crate::println!("smp: cpu {} halted by IPI_PANIC_HALT", cpu_id);
         loop {
             #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("wfi",  options(nostack, nomem)); }
+            unsafe {
+                core::arch::asm!("wfi", options(nostack, nomem));
+            }
             #[cfg(target_arch = "x86_64")]
-            unsafe { core::arch::asm!("hlt",  options(nostack, nomem)); }
+            unsafe {
+                core::arch::asm!("hlt", options(nostack, nomem));
+            }
         }
     }
 }
@@ -178,8 +189,10 @@ pub fn dispatch(cpu_id: u32) {
 /// Blocks until all CPUs acknowledge via `SHOOTDOWN_ACK`.
 pub fn tlb_shootdown(start: u64, end: u64, asid: u16) {
     let me = crate::smp::percpu::current_cpu_id();
-    let n  = num_online_cpus();
-    if n <= 1 { return; }
+    let n = num_online_cpus();
+    if n <= 1 {
+        return;
+    }
 
     let mut ack_mask: u64 = 0;
     for cpu in 0..n {
@@ -187,7 +200,10 @@ pub fn tlb_shootdown(start: u64, end: u64, asid: u16) {
             ack_mask |= 1u64 << cpu;
             unsafe {
                 SHOOTDOWN_REQS[cpu as usize] = ShootdownReq {
-                    start, end, asid, done: false,
+                    start,
+                    end,
+                    asid,
+                    done: false,
                 };
             }
         }
@@ -219,7 +235,9 @@ fn local_tlb_flush(start: u64, end: u64) {
         }
     }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("sfence.vma", options(nostack)); }
+    unsafe {
+        core::arch::asm!("sfence.vma", options(nostack));
+    }
 }
 
 /// Halt all other CPUs (used by panic handler).

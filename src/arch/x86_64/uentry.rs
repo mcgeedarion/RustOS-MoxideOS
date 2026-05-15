@@ -23,8 +23,8 @@
 //!   - Interrupts are disabled on entry (sti happens via RFLAGS.IF in R11).
 //!   - This function never returns to the caller.
 
-use core::arch::asm;
 use crate::mm::pmm;
+use core::arch::asm;
 
 /// Size of the user stack allocated for init (16 KiB).
 const USER_STACK_PAGES: usize = 4;
@@ -46,11 +46,14 @@ pub fn alloc_user_stack(cr3: usize) -> Option<usize> {
     for i in 0..USER_STACK_PAGES {
         let pa = pmm::alloc_page()?;
         // Zero the page.
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
+        }
         let va = stack_virt_base + i * PAGE;
-        let flags = paging::PTE_PRESENT | paging::PTE_WRITABLE
-                  | paging::PTE_USER    | paging::PTE_NX;
-        unsafe { paging::map_page(cr3, va, pa, flags); }
+        let flags = paging::PTE_PRESENT | paging::PTE_WRITABLE | paging::PTE_USER | paging::PTE_NX;
+        unsafe {
+            paging::map_page(cr3, va, pa, flags);
+        }
     }
 
     // Stack top = highest mapped VA (stacks grow down).
