@@ -4,10 +4,11 @@
 //!
 //!  1. Advance the monotonic clock (`time::tick_advance`).
 //!  2. Fire due timer-wheel entries (`time::timer::expire_timers`).
-//!  3. Charge CPU time to the running process.
-//!  4. Enforce RLIMIT_CPU  (SIGXCPU / SIGKILL).
-//!  5. Enforce RLIMIT_RTTIME for SCHED_FIFO/SCHED_RR tasks.
-//!  6. Call the scheduler (`schedule()`) to potentially preempt.
+//!  3. Fire interval timers / POSIX timers (`proc::itimer::tick`).
+//!  4. Charge CPU time to the running process.
+//!  5. Enforce RLIMIT_CPU  (SIGXCPU / SIGKILL).
+//!  6. Enforce RLIMIT_RTTIME for SCHED_FIFO/SCHED_RR tasks.
+//!  7. Call the scheduler (`schedule()`) to potentially preempt.
 //!
 //! ## RLIMIT_CPU
 //!
@@ -47,10 +48,16 @@ pub extern "C" fn timer_irq_handler(frame: &mut crate::arch::x86_64::idt::Interr
     crate::time::tick_advance(TICK_NS);
     crate::time::timer::expire_timers();
 
+    // ── 2. Expire interval timers and POSIX per-process timers ───────────
+    // Delivers SIGALRM for ITIMER_REAL and per-timer signos for
+    // timer_create() timers.  Must run after tick_advance so that
+    // read_monotonic_ns() returns the updated value inside tick().
+    crate::proc::itimer::tick();
+
     let pid = crate::proc::scheduler::current_pid();
 
     if pid != 0 {
-        // ── 2. Charge tick and snapshot rlimit state ─────────────────────
+        // ── 3. Charge tick and snapshot rlimit state ─────────────────────
         let (soft_cpu, hard_cpu) = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_CPU);
         let (soft_rt,  hard_rt)  = crate::proc::rlimit::getrlimit_for(pid, RLIMIT_RTTIME);
 
@@ -73,7 +80,7 @@ pub extern "C" fn timer_irq_handler(frame: &mut crate::arch::x86_64::idt::Interr
                 )
             }).unwrap_or((0, 0, 0, SchedPolicy::Normal));
 
-        // ── 3. RLIMIT_CPU enforcement ────────────────────────────────────
+        // ── 4. RLIMIT_CPU enforcement ────────────────────────────────────
         if hard_cpu != crate::proc::rlimit::RLIM_INFINITY && cpu_secs >= hard_cpu {
             crate::proc::signal::send_signal(pid, SIGKILL);
         } else if soft_cpu != crate::proc::rlimit::RLIM_INFINITY && cpu_secs >= soft_cpu {
@@ -83,7 +90,7 @@ pub extern "C" fn timer_irq_handler(frame: &mut crate::arch::x86_64::idt::Interr
             }
         }
 
-        // ── 4. RLIMIT_RTTIME enforcement (SCHED_FIFO / SCHED_RR only) ────
+        // ── 5. RLIMIT_RTTIME enforcement (SCHED_FIFO / SCHED_RR only) ────
         if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
             if hard_rt != crate::proc::rlimit::RLIM_INFINITY && rt_us >= hard_rt {
                 crate::proc::signal::send_signal(pid, SIGKILL);
@@ -96,10 +103,10 @@ pub extern "C" fn timer_irq_handler(frame: &mut crate::arch::x86_64::idt::Interr
         }
     }
 
-    // ── 5. Send EOI before calling schedule() so the APIC is unblocked ───
+    // ── 6. Send EOI before calling schedule() so the APIC is unblocked ───
     // schedule() may switch to another task and not return for a long time.
     crate::arch::x86_64::apic::send_eoi();
 
-    // ── 6. Preemption point ──────────────────────────────────────────────
+    // ── 7. Preemption point ──────────────────────────────────────────────
     crate::proc::scheduler::schedule();
 }

@@ -248,6 +248,12 @@ pub struct Pcb {
     // Invariant: base_rt_priority <= sched.rt_priority at all times.
     /// Original (un-boosted) RT priority.  0 for non-RT tasks.
     pub base_rt_priority: u8,
+
+    // ── Supplemental groups ───────────────────────────────────────────────
+    //
+    // Populated by setgroups(2); read by getgroups(2).
+    // Inherited on fork (cloned); cleared on exec (execve sets to empty).
+    pub supp_groups: Vec<u32>,
 }
 
 // SAFETY: Pcb is accessed only under ProcLock::inner (spin::Mutex).
@@ -303,6 +309,7 @@ impl Pcb {
             cgroup_id:           ROOT_CGROUP,
             tg_id:               0,
             base_rt_priority:    0,
+            supp_groups:         Vec::new(),
         }
     }
 
