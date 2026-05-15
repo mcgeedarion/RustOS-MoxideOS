@@ -8,13 +8,17 @@
 // rustc will error on the duplicate.  Only add functions here that have
 // no counterpart in stubs.rs.
 
-// ── NR 93  lchown ──────────────────────────────────────────────────────────
+// ── NR 93  lchown ───────────────────────────────────────────────────────────────
 // lchown(2) changes ownership of the symlink itself, not its target.
-// No-op stub: ownership is not enforced in the single-user root kernel.
+// We run as root (uid 0) so there is never a permission error from the
+// caller's perspective; however pretending the ownership changed silently
+// is wrong — callers rely on lchown succeeding to set metadata.  Return
+// EPERM (-1) to match sys_chown behaviour: ownership changes are not
+// persisted but the caller learns they failed rather than silently no-op.
 #[allow(dead_code)]
-fn sys_lchown_impl(_path: usize, _uid: u32, _gid: u32) -> isize { 0 }
+fn sys_lchown_impl(_path: usize, _uid: u32, _gid: u32) -> isize { -1 }
 
-// ── NR 135  sched_setparam / NR 143  sched_getscheduler ───────────────────
+// ── NR 135  sched_setparam / NR 143  sched_getscheduler ──────────────────────
 // These share the same "not enforced" rationale as getpriority/setpriority.
 // They are wired in mod.rs implicitly through the _   => -38 fallback,
 // but placing them here avoids spurious ENOSYS logs from glibc's
