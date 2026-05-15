@@ -15,12 +15,9 @@
 
 extern crate alloc;
 
-use alloc::{
-    string::String,
-    vec::Vec,
-};
++use alloc::{string: :String, vec::Vec};
 
-use bitflags::bitflags;
+ use bitflags::bitflags;
 
 // ---------------------------------------------------------------------------
 // Primitive ID types
