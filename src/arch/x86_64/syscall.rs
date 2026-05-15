@@ -190,12 +190,26 @@ pub extern "C" fn rust_syscall_handler(frame: &mut SyscallFrame) {
         return;
     }
 
+    // Mark this CPU as inside a syscall so the scheduler tick charges stime_ns.
+    {
+        let cpu = crate::smp::percpu::current_cpu_id() as usize;
+        let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu] };
+        blk.in_syscall = blk.in_syscall.saturating_add(1);
+    }
+
     let ret = crate::syscall::dispatch(
         nr,
         frame.rdi, frame.rsi, frame.rdx,
         frame.r10, frame.r8,  frame.r9,
     );
     frame.rax = ret as usize;
+
+    // Decrement in_syscall before signal delivery (signal handlers run in user mode).
+    {
+        let cpu = crate::smp::percpu::current_cpu_id() as usize;
+        let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu] };
+        blk.in_syscall = blk.in_syscall.saturating_sub(1);
+    }
 
     // Deliver any pending signals before returning to userspace.
     crate::proc::signal::check_and_deliver(frame);
