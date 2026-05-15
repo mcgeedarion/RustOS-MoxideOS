@@ -64,6 +64,9 @@ pub struct PercpuBlock {
     pub ctx_switches: u64,
     /// IPI pending bitfield (one bit per `IpiKind`).
     pub ipi_pending: AtomicU32,
+    /// Incremented on syscall entry, decremented on exit.
+    /// When non-zero, scheduler ticks charge stime_ns instead of utime_ns.
+    pub in_syscall: u32,
 }
 
 impl PercpuBlock {
