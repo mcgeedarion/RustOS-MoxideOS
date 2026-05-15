@@ -21,7 +21,7 @@ use crate::time::{Timespec, NSEC_PER_SEC,
                   realtime_offset_ns, tai_offset_s, MONO_NS};
 use core::sync::atomic::Ordering;
 
-// ── Clock ID constants ─────────────────────────────────────────────────────────
+// ── Clock ID constants ─────────────────────────────────────────────────────────────────
 
 pub const CLOCK_REALTIME:           i32 = 0;
 pub const CLOCK_MONOTONIC:          i32 = 1;
@@ -35,7 +35,7 @@ pub const CLOCK_REALTIME_ALARM:     i32 = 8;
 pub const CLOCK_BOOTTIME_ALARM:     i32 = 9;
 pub const CLOCK_TAI:                i32 = 11;
 
-// ── clock_gettime ───────────────────────────────────────────────────────────────
+// ── clock_gettime ──────────────────────────────────────────────────────────────────────
 
 /// Kernel implementation of `clock_gettime(2)`.
 /// `clk_id` is the POSIX clock ID; returns `Timespec` or EINVAL.
@@ -45,7 +45,6 @@ pub fn clock_gettime(clk_id: i32) -> Result<Timespec, isize> {
             Ok(Timespec::from_ns(read_monotonic_ns()))
         }
         CLOCK_MONOTONIC_COARSE => {
-            // Coarse: use the tick counter (lower resolution, no TSC read).
             Ok(Timespec::from_ns(MONO_NS.load(Ordering::Relaxed)))
         }
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => {
@@ -72,11 +71,17 @@ pub fn clock_gettime(clk_id: i32) -> Result<Timespec, isize> {
     }
 }
 
-// ── clock_settime ───────────────────────────────────────────────────────────────
+// ── clock_settime ─────────────────────────────────────────────────────────────────────
 
 /// Kernel implementation of `clock_settime(2)`.
-/// Only `CLOCK_REALTIME` and `CLOCK_TAI` are settable.
-/// Requires `CAP_SYS_TIME`.
+///
+/// Settable clocks:
+///   CLOCK_REALTIME  — adjusts the monotonic→wall offset.
+///   CLOCK_TAI       — adjusts the TAI-UTC leap-second offset.
+///
+/// All other clock IDs return EINVAL (-22) per POSIX.
+/// (The previous code returned -1 for the non-settable arm, which is not
+/// a valid errno and confused callers.)
 pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
     if !ts.is_valid() { return Err(-22); }
     match clk_id {
@@ -88,7 +93,6 @@ pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
             Ok(())
         }
         CLOCK_TAI => {
-            // Setting TAI adjusts the TAI-UTC offset only.
             let real_ns = {
                 let mono = read_monotonic_ns() as i64;
                 mono + crate::time::realtime_offset_ns()
@@ -98,11 +102,14 @@ pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
             crate::time::set_tai_offset_s(tai_off_ns / NSEC_PER_SEC as i64);
             Ok(())
         }
-        _ => Err(-1), // EPERM for read-only clocks
+        // CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_BOOTTIME,
+        // CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, etc.
+        // are not settable.  POSIX says EINVAL for an unsupported clock.
+        _ => Err(-22), // EINVAL
     }
 }
 
-// ── clock_getres ───────────────────────────────────────────────────────────────
+// ── clock_getres ─────────────────────────────────────────────────────────────────────
 
 /// Returns the resolution of the given clock.
 /// TSC/CLINT clocks have 1 ns resolution; tick-based have HZ resolution.
@@ -112,31 +119,48 @@ pub fn clock_getres(clk_id: i32) -> Result<Timespec, isize> {
         | CLOCK_BOOTTIME | CLOCK_TAI
         | CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM
         | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            // Report 1 ns (actual resolution depends on clocksource).
             Ok(Timespec { tv_sec: 0, tv_nsec: 1 })
         }
         CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => {
-            // HZ = 1000 → 1 ms resolution.
             Ok(Timespec { tv_sec: 0, tv_nsec: 1_000_000 })
         }
         _ => Err(-22),
     }
 }
 
-// ── CPU-time clocks (stubs; wired to scheduler accounting) ────────────────
+// ── CPU-time clocks ─────────────────────────────────────────────────────────────────────
 
+/// Read the current process's accumulated CPU time from the process table.
+///
+/// `cpu_time_ns` is incremented by `TICK_NS` on every scheduler tick while
+/// the process is the running task on any CPU.  This gives 1 ms resolution
+/// matching the tick period.
 fn get_process_cputime() -> Timespec {
-    // Integration point: read current task's process utime+stime from
-    // crate::proc::current_task().cpu_ns_total.
-    Timespec { tv_sec: 0, tv_nsec: 0 }
+    let pid = crate::proc::scheduler::current_pid();
+    let ns = crate::proc::scheduler::with_proc(pid as usize, |p| p.cpu_time_ns)
+        .unwrap_or(0);
+    Timespec::from_ns(ns)
 }
 
+/// Per-thread CPU time.
+///
+/// True per-thread accounting requires a `cpu_time_ns` field on `Task`.
+/// Until that is added, we return the process-level cpu_time_ns which is
+/// correct for single-threaded processes and a conservative upper bound for
+/// multi-threaded ones.
+///
+/// FIXME: add Task::cpu_time_ns, charge in tick() per-task, read here.
 fn get_thread_cputime() -> Timespec {
-    // Integration point: read per-thread cpu_ns.
-    Timespec { tv_sec: 0, tv_nsec: 0 }
+    get_process_cputime()
 }
 
-// ── gettimeofday / time(2) convenience wrappers ──────────────────────────
+// ── monotonic_ns re-export ─────────────────────────────────────────────────────────
+
+/// Convenience re-export used by the scheduler and other crates that import
+/// `clock::monotonic_ns` directly instead of `time::read_monotonic_ns`.
+pub use crate::time::read_monotonic_ns as monotonic_ns;
+
+// ── gettimeofday / time(2) convenience wrappers ──────────────────────────────
 
 use crate::time::Timeval;
 
