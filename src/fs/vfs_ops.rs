@@ -30,7 +30,7 @@ use crate::fs::mount::{self, FsType, OverlayOpts};
 use crate::fs::overlayfs::OverlayMount;
 use crate::fs::dcache;
 
-// ── Stat result (kernel-internal) ─────────────────────────────────────────────────
+// ── Stat result (kernel-internal) ───────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct KStat {
@@ -48,7 +48,7 @@ pub struct KStat {
     pub is_dir:  bool,
 }
 
-// ── Statfs result (kernel-internal) ─────────────────────────────────────────────
+// ── Statfs result (kernel-internal) ───────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct KStatfs {
@@ -71,18 +71,17 @@ const FSTYPE_PROC:    u64 = 0x9fa0;
 const FSTYPE_SYSFS:   u64 = 0x6265_6572;
 const FSTYPE_CGROUP2: u64 = 0x6367_7270; // matches Linux CGROUP2_SUPER_MAGIC
 
-// ── Cgroupfs path prefix ───────────────────────────────────────────────────────────
+// ── Cgroupfs path prefix ──────────────────────────────────────────────────────
 
 #[inline(always)]
 fn is_cgroupfs_path(path: &str) -> bool {
     path.starts_with("/sys/fs/cgroup")
 }
 
-// ── read_all / write_all ───────────────────────────────────────────────────
+// ── read_all / write_all ─────────────────────────────────────────────────
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
     if is_cgroupfs_path(path) {
-        // Open + materialise content via cgroupfs.
         let fd = crate::fs::cgroupfs::cgroupfs_open(path);
         if fd < 0 { return Err(fd as isize); }
         let fd = fd as usize;
@@ -136,7 +135,6 @@ pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
 pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     if is_cgroupfs_path(path) {
         let s = core::str::from_utf8(data).map_err(|_| -22isize)?;
-        // Derive knob name from last path component.
         let knob = path.split('/').last().unwrap_or("");
         let cg_id = crate::proc::cgroup::path_to_cgid(path
             .strip_suffix(knob).unwrap_or(path)
@@ -176,7 +174,7 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     result
 }
 
-// ── pread / pwrite ───────────────────────────────────────────────────────────
+// ── pread / pwrite ─────────────────────────────────────────────────────────
 
 pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
@@ -211,7 +209,7 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     result
 }
 
-// ── truncate ──────────────────────────────────────────────────────────────────
+// ── truncate ──────────────────────────────────────────────────────────────
 
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -244,7 +242,7 @@ pub fn truncate_fd(bfd: usize, len: usize) -> Result<(), isize> {
     truncate(&path, len)
 }
 
-// ── create ────────────────────────────────────────────────────────────────────
+// ── create ────────────────────────────────────────────────────────────────
 
 pub fn create(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -271,7 +269,7 @@ pub fn create(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── link ──────────────────────────────────────────────────────────────────────
+// ── link ────────────────────────────────────────────────────────────────
 
 pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let h_e = mount::resolve(existing)?;
@@ -295,11 +293,9 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     result
 }
 
-// ── mkdir ────────────────────────────────────────────────────────────────────
+// ── mkdir ────────────────────────────────────────────────────────────────
 
 pub fn mkdir(path: &str) -> Result<(), isize> {
-    // cgroupfs mkdir is handled before reaching this function (io_syscalls).
-    // Guard here as a safety net for callers that go through vfs_ops directly.
     if is_cgroupfs_path(path) {
         let rc = crate::fs::cgroupfs::cgroupfs_mkdir(path);
         return if rc == 0 { Ok(()) } else { Err(rc) };
@@ -326,7 +322,7 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── rmdir ────────────────────────────────────────────────────────────────────
+// ── rmdir ────────────────────────────────────────────────────────────────
 
 pub fn rmdir(path: &str) -> Result<(), isize> {
     if is_cgroupfs_path(path) {
@@ -351,7 +347,7 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── unlink ───────────────────────────────────────────────────────────────────
+// ── unlink ───────────────────────────────────────────────────────────────
 
 pub fn unlink(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -376,7 +372,7 @@ pub fn unlink(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── rename ──────────────────────────────────────────────────────────────────
+// ── rename ──────────────────────────────────────────────────────────────
 
 pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_o = mount::resolve(old)?;
@@ -400,13 +396,12 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     result
 }
 
-// ── stat / lstat ────────────────────────────────────────────────────────────
+// ── stat / lstat ───────────────────────────────────────────────────────────
 
 pub fn stat(path: &str) -> Result<KStat, isize> { stat_impl(path, false) }
 pub fn lstat(path: &str) -> Result<KStat, isize> { stat_impl(path, true) }
 
 fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
-    // cgroupfs early-exit — bypass mount table entirely.
     if is_cgroupfs_path(path) {
         return match crate::fs::cgroupfs::cgroupfs_exists(path) {
             None        => Err(-2),
@@ -494,7 +489,78 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
     result
 }
 
-// ── statfs ───────────────────────────────────────────────────────────────────
+// ── utimens ──────────────────────────────────────────────────────────────
+//
+// Called by:
+//   time_ns::{sys_utime, sys_utimes, sys_utimensat}
+//   vfs::with_inode_mut (timestamp write-back)
+//
+// Sets atime_ns and mtime_ns on the file at `path`.
+// Returns Ok(()) on success, Err(errno) on failure.
+//
+// Per-filesystem behaviour:
+//   ext2      – writes timestamps into the on-disk inode via ext2::set_times.
+//   tmpfs     – updates the in-memory inode.
+//   ext4      – read-only mount; returns EROFS.
+//   fat32     – updates the directory-entry write timestamp (FAT has no
+//              atime in the standard format; atime is stored as a date only).
+//   overlayfs – copy-up if the file is on the lower layer, then update the
+//              upper tmpfs inode.
+//   devfs / procfs / sysfs / cgroupfs – no persistent metadata; silently
+//              return Ok(()) to match Linux behaviour on virtual filesystems.
+pub fn utimens(path: &str, atime_ns: u64, mtime_ns: u64) -> Result<(), isize> {
+    if is_cgroupfs_path(path) { return Ok(()); }
+
+    let h = mount::resolve(path)?;
+    if h.is_readonly() { return Err(-30); } // EROFS for ext4
+
+    let result = match h.fstype {
+        FsType::Ext2 => {
+            crate::fs::ext2::set_times(path, atime_ns, mtime_ns)
+                .map_err(|e| e as isize)
+        }
+        FsType::Tmpfs => {
+            crate::fs::tmpfs::tmpfs_set_times(path, atime_ns, mtime_ns)
+        }
+        FsType::Fat32 => {
+            // FAT32 stores mtime with 2-second granularity; atime is a date.
+            // set_mtime updates the directory entry on the block device.
+            let mp = mount_point_for(&h.subpath, path);
+            let mut mounts = crate::fs::fat32::FAT_MOUNTS.lock();
+            let fs = mounts.get_mut(&mp).ok_or(-2isize)?;
+            fs.set_mtime(&h.subpath, mtime_ns)
+        }
+        FsType::Overlayfs => {
+            let om = overlay_mount(&h)?;
+            // Ensure the file exists on the upper layer before mutating.
+            crate::fs::overlayfs::copy_up_if_needed(&om, &h.subpath)?;
+            // Upper layer is always tmpfs.
+            let upper_path = alloc::format!("{}/{}", om.upper, h.subpath);
+            crate::fs::tmpfs::tmpfs_set_times(&upper_path, atime_ns, mtime_ns)
+        }
+        // Virtual / read-only: no persistent metadata, treat as success.
+        FsType::Devfs | FsType::Procfs | FsType::Sysfs => Ok(()),
+        // Ext4 is caught by is_readonly() above; guard here for exhaustiveness.
+        FsType::Ext4 => Err(-30),
+    };
+
+    if result.is_ok() { dcache::invalidate(path); }
+    result
+}
+
+// ── get_times ─────────────────────────────────────────────────────────────
+//
+// Thin stat wrapper used by sys_utimensat to implement UTIME_OMIT correctly:
+// read the current timestamps before applying the update so only the
+// requested fields are changed.
+//
+// Returns (atime_ns, mtime_ns) or Err(errno) if the path does not exist.
+pub fn get_times(path: &str) -> Result<(u64, u64), isize> {
+    let st = stat(path)?;
+    Ok((st.atime, st.mtime))
+}
+
+// ── statfs ─────────────────────────────────────────────────────────────
 
 pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     if is_cgroupfs_path(path) {
@@ -571,7 +637,7 @@ pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     }
 }
 
-// ── readdir ─────────────────────────────────────────────────────────────────
+// ── readdir ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct DirEntry {
@@ -585,7 +651,7 @@ pub struct DirEntry {
 pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
     if is_cgroupfs_path(path) {
         return match crate::fs::cgroupfs::cgroupfs_list_dir_by_path(path) {
-            None => Err(-20), // ENOTDIR
+            None => Err(-20),
             Some(entries) => Ok(entries.into_iter().map(|e| DirEntry {
                 name:   e.name,
                 ino:    0,
@@ -671,7 +737,7 @@ pub fn readlink(path: &str) -> Result<String, isize> {
     }
 }
 
-// ── chmod / chown ───────────────────────────────────────────────────────────
+// ── chmod / chown ──────────────────────────────────────────────────────────
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -711,7 +777,7 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     result
 }
 
-// ── open (VFS-level) ──────────────────────────────────────────────────────────
+// ── open (VFS-level) ────────────────────────────────────────────────────────
 
 pub fn open(path: &str, flags: u32) -> Result<usize, isize> {
     crate::fs::fcntl::fd_open(path, flags as i32)
@@ -725,7 +791,7 @@ pub fn file_size(fd: usize) -> usize {
     crate::fs::fcntl::fd_size(fd).unwrap_or(0)
 }
 
-// ── mount / overlay helpers ──────────────────────────────────────────────────────
+// ── mount / overlay helpers ───────────────────────────────────────────────────────
 
 fn overlay_mount(h: &mount::FsHandle) -> Result<OverlayMount, isize> {
     let mounts = crate::fs::overlayfs::OVERLAY_MOUNTS.lock();
