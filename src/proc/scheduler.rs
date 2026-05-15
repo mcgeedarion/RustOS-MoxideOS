@@ -655,9 +655,13 @@ pub fn tick(cpu: u32) {
         if pid > 0 {
             if let Some(pl) = proc_table::find_proc_lock(pid as usize) {
                 if let Some(mut inner) = pl.inner.try_lock() {
-                    // Charge tick to user time. stime_ns will be split
-                    // once syscall entry/exit CPL tracking is added.
-                    inner.utime_ns    = inner.utime_ns.saturating_add(TICK_NS);
+                    // Route tick to utime or stime based on whether this CPU
+                    // is currently inside a syscall (in_syscall > 0 → kernel mode).
+                    if blk.in_syscall > 0 {
+                        inner.stime_ns = inner.stime_ns.saturating_add(TICK_NS);
+                    } else {
+                        inner.utime_ns = inner.utime_ns.saturating_add(TICK_NS);
+                    }
                     inner.cpu_time_ns = inner.utime_ns.saturating_add(inner.stime_ns);
                 }
             }
