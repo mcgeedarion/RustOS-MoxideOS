@@ -22,6 +22,17 @@
 //!   NR 27   mincore                          => openat2_mincore::sys_mincore
 //!   NR 437  openat2                          => openat2_mincore::sys_openat2_impl
 //!
+//! ## Push 5 — newly dispatched
+//!   NR 73   flock(fd, op)                    => fs::vfs_extras::sys_flock
+//!   NR 100  times(buf)                       => stubs::sys_times_impl  (was missing arm)
+//!   NR 139  getpriority(which, who)          => inline (returns 0)
+//!   NR 140  setpriority(which, who, prio)    => inline (returns 0)
+//!   NR 155  getpgid(pid)                     => inline (returns current pid)
+//!   NR 156  setpgid(pid, pgid)               => inline (returns 0)
+//!   NR 221  posix_fadvise(fd,off,len,advice) => fs::vfs_extras::sys_posix_fadvise
+//!   NR 260  fchownat(dirfd,path,uid,gid,fl)  => inline stub (ownership not enforced)
+//!   NR 268  fchmodat(dirfd,path,mode,flags)  => inline stub (permissions not enforced)
+//!
 //! ## NR 15  rt_sigreturn
 //!   Intercepted BEFORE dispatch() at the arch entry point:
 //!     x86_64: rust_syscall_handler in arch/x86_64/syscall.rs
@@ -187,16 +198,6 @@ fn copy_sembuf_from_user(sops_va: usize, nsops: usize)
 fn parse_shmid_ds(buf: &[u8]) -> Option<shm::ShmidDs> {
     use core::mem::size_of;
     if buf.len() < size_of::<shm::ShmidDs>() { return None; }
-    // ShmidDs field layout (x86-64, from linux/shm.h):
-    //   offset  0: ipc64_perm shm_perm   (48 bytes)
-    //   offset 48: size_t     shm_segsz  (8 bytes)
-    //   offset 56: i64        shm_atime  (8 bytes)
-    //   offset 64: i64        shm_dtime  (8 bytes)
-    //   offset 72: i64        shm_ctime  (8 bytes)
-    //   offset 80: i32        shm_cpid   (4 bytes)
-    //   offset 84: i32        shm_lpid   (4 bytes)
-    //   offset 88: u64        shm_nattch (8 bytes)
-    //   offset 96: padding to size_of::<ShmidDs>()
     Some(shm::ShmidDs {
         shm_perm:   parse_ipc64_perm(&buf[0..48])?,
         shm_segsz:  usize::from_ne_bytes(buf[48..56].try_into().ok()?),
@@ -227,17 +228,6 @@ fn serialize_shmid_ds(ds: &shm::ShmidDs) -> [u8; 96] {
 fn parse_msqid_ds(buf: &[u8]) -> Option<msg::MsqidDs> {
     use core::mem::size_of;
     if buf.len() < size_of::<msg::MsqidDs>() { return None; }
-    // MsqidDs field layout (x86-64, from linux/msg.h):
-    //   offset  0: ipc64_perm msg_perm   (48 bytes)
-    //   offset 48: i64        msg_stime  (8 bytes)
-    //   offset 56: i64        msg_rtime  (8 bytes)
-    //   offset 64: i64        msg_ctime  (8 bytes)
-    //   offset 72: u64        msg_cbytes (8 bytes)
-    //   offset 80: u64        msg_qnum   (8 bytes)
-    //   offset 88: u64        msg_qbytes (8 bytes)
-    //   offset 96: i32        msg_lspid  (4 bytes)
-    //   offset100: i32        msg_lrpid  (4 bytes)
-    //   offset104: padding
     Some(msg::MsqidDs {
         msg_perm:   parse_ipc64_perm(&buf[0..48])?,
         msg_stime:  i64::from_ne_bytes(buf[48..56].try_into().ok()?),
@@ -330,18 +320,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                          saved_rip: u64) -> isize {
 
     // ── seccomp pre-check ──────────────────────────────────────────────────────
-    //
-    // P1 fix: NR 317 (seccomp itself) is NO LONGER exempt from the filter.
-    // Linux runs the filter before allowing seccomp() to install a new
-    // filter, which means an existing filter can block the self-reinstall
-    // path.  The privilege check inside sys_seccomp() already prevents
-    // unprivileged processes from installing a first filter without nnp;
-    // the filter chain's most-restrictive-wins semantics ensure that
-    // stacking never loosens an existing sandbox.
-    //
-    // We still allow NR 60/231 (exit/exit_group) to fall through even if
-    // the verdict is Errno or Trap, matching Linux's behaviour that a
-    // process can always terminate.
     match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f], saved_rip) {
         crate::security::seccomp::SeccompVerdict::Allow  => {}
         crate::security::seccomp::SeccompVerdict::Errno(e) => {
@@ -373,9 +351,13 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         32  => crate::fs::vfs::dup(a),
         33  => crate::fs::fcntl::sys_dup2(a, b),
         40  => sys_sendfile_impl(a, b, c, d),
+        // NR 73  flock(fd, operation)
+        // Previously fell through to ENOSYS.  The full advisory lock
+        // table lives in vfs_extras::sys_flock.
+        73  => crate::fs::vfs_extras::sys_flock(a, b as i32),
         72  => crate::fs::fcntl::sys_fcntl(a, b as i32, c),
         74  => sys_fsync_impl(a),
-        75  => sys_fsync_impl(a),
+        75  => sys_fdatasync_impl(a),
         76  => sys_truncate_impl(a, b as i64),
         77  => sys_ftruncate_impl(a, b as i64),
         78  => crate::fs::getdents::sys_getdents(a, b, c),
@@ -390,14 +372,27 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         162 => sys_sync_impl(),
         217 => crate::fs::getdents::sys_getdents64(a, b, c),
         220 => crate::fs::getdents::sys_getdents64(a, b, c),
+        // NR 221  posix_fadvise(fd, offset, len, advice)
+        // Previously fell through to ENOSYS.  Implementation is in
+        // vfs_extras and currently accepts + ignores all advice values
+        // (no readahead/eviction policy yet).
+        221 => crate::fs::vfs_extras::sys_posix_fadvise(a, b as i64, c as i64, d as i32),
         235 => sys_utimes_impl(a, b),
         257 => sys_openat_impl(a as i32, b, c as i32, d as u32),
         258 => sys_mkdirat_impl(a as i32, b, c as u32),
         259 => sys_mknodat_impl(a as i32, b, c as u32, d as u64),
+        // NR 260  fchownat(dirfd, pathname, owner, group, flags)
+        // Single-user root kernel: ownership is not enforced.  Succeed
+        // silently so that install scripts and package managers don't fail.
+        260 => 0,
         262 => sys_newfstatat_impl(a as i32, b, c, d as u32),
         263 => sys_unlinkat_impl(a as i32, b, c as u32),
         264 => sys_renameat_impl(a as i32, b, c as i32, d),
         267 => sys_readlinkat_impl(a as i32, b, c, d),
+        // NR 268  fchmodat(dirfd, pathname, mode, flags)
+        // Single-user root kernel: permission bits are not enforced.
+        // Return 0 so that chmod calls in build systems don't break.
+        268 => 0,
         280 => sys_utimensat_impl(a as i32, b, c, d as i32),
         285 => sys_fallocate_impl(a, b as i32, c as i64, d as i64),
         290 => crate::fs::eventfd::sys_eventfd2(a as u32, b as u32),
@@ -438,14 +433,10 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         54  => crate::net::socket::sys_setsockopt(a, b as i32, c as i32, d, e as u32),
         55  => crate::net::socket::sys_getsockopt(a, b as i32, c as i32, d, e),
         // NR 288  accept4(sockfd, addr, addrlen, flags)
-        // P1 fix: the returned fd is a TCP socket (from sys_accept, which
-        // wraps TCP_SOCKETS).  Set O_NONBLOCK on the TCP socket table entry,
-        // NOT on UDP_SOCKETS, which was the previous (incorrect) target.
         288 => {
             let fd = crate::net::socket::sys_accept(a, b, c);
             if fd >= 0 {
                 if d & 0x800 != 0 {
-                    // SOCK_NONBLOCK: mark the accepted TCP socket non-blocking.
                     let mut t = crate::net::socket::TCP_SOCKETS.lock();
                     if let Some(Some(s)) = t.get_mut(fd as usize) { s.nonblocking = true; }
                 }
@@ -529,8 +520,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         31  => {
             let cmd = b as i32;
             if cmd == crate::ipc::IPC_SET {
-                // P0 fix: parse ShmidDs field-by-field from user bytes;
-                // no transmute, no UB risk if the struct gains new fields.
                 const SZ: usize = core::mem::size_of::<shm::ShmidDs>();
                 let mut buf = [0u8; SZ];
                 if crate::uaccess::copy_from_user(&mut buf, c).is_err() { return -14; }
@@ -613,7 +602,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         71  => {
             let cmd = b as i32;
             if cmd == crate::ipc::IPC_SET {
-                // P0 fix: parse MsqidDs field-by-field; no transmute.
                 const SZ: usize = core::mem::size_of::<msg::MsqidDs>();
                 let mut buf = [0u8; SZ];
                 if crate::uaccess::copy_from_user(&mut buf, c).is_err() { return -14; }
@@ -753,13 +741,12 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                    _ => -22,
                },
         63  => sys_uname_impl(a),
+        // NR 100  times(buf)
+        // The sys_times_impl function exists in stubs.rs but the dispatch
+        // arm was missing; libc's times(3) was hitting ENOSYS every call.
+        100 => sys_times_impl(a),
         98  => sys_getrusage_impl(a as i32, b),
         99  => sys_sysinfo_impl(a),
-        // NR 109 = getresuid
-        // P1 fix: return the real uid/gid from the process credential table
-        // instead of always writing 0.  Userspace daemons (sudo, dbus-daemon,
-        // etc.) use this to decide whether to drop privileges; lying about
-        // uid=0 causes them to skip setuid() calls and run as effective root.
         109 => {
             let pid = crate::proc::scheduler::current_pid();
             let uid = crate::proc::scheduler::with_proc(pid, |p| p.cred.uid)
@@ -789,7 +776,17 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         128 => crate::proc::signal::sys_rt_sigtimedwait(a, b, c, d),
         130 => crate::proc::signal::sys_rt_sigsuspend(a, b),
         131 => sys_sigaltstack_impl(a, b),
+        // NR 139  getpriority(which, who) → 0 (nice=0, no scheduler priority table yet)
+        // NR 140  setpriority(which, who, prio) → 0 (accepted, ignored)
+        // Previously ENOSYS; now returns success so that shells and daemons
+        // that call nice(2)/setpriority(2) on startup don't log spurious errors.
+        139 => 0,
+        140 => 0,
         147 => sys_getsid_impl(a as u32),
+        // NR 155  getpgid(pid) → returns current pid as the pgid
+        // NR 156  setpgid(pid, pgid) → accepted, ignored (no process groups yet)
+        155 => crate::proc::scheduler::current_pid() as isize,
+        156 => 0,
         158 => crate::arch::x86_64::syscall::sys_arch_prctl(a as i32, b),
         169 => sys_reboot_impl(a as u32, b as u32, c as u32, d),
         170 => sys_sethostname_impl(a, b),
@@ -848,8 +845,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         // ── uid / gid ─────────────────────────────────────────────────────────────────────────
         102 | 104 | 107 | 108 => 0,
         105 | 106             => 0,
-        // NR 118 = getresgid (old 32-bit), NR 119 = getresgid32
-        // P1 fix: return real gid, not 0.
         118 => {
             let pid = crate::proc::scheduler::current_pid();
             let gid = crate::proc::scheduler::with_proc(pid, |p| p.cred.gid)
