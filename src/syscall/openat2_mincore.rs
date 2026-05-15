@@ -32,7 +32,7 @@ fn sys_openat2_impl(dirfd: i32, path_va: usize, how_va: usize, size: usize) -> i
         if path.starts_with("/proc/") { return -40; }
     }
 
-    sys_openat(dirfd, path_va, flags as i32, mode as u32)
+    sys_openat_impl(dirfd, path_va, flags as i32, mode as u32)
 }
 
 fn sys_mincore(addr: usize, length: usize, vec_va: usize) -> isize {
