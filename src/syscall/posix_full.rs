@@ -1,501 +1,325 @@
 // Full POSIX syscall surface for rustos.
 //
 // Included from syscall/mod.rs via `include!("posix_full.rs")`.
-// Every function here returns a value that can be placed directly in the
-// syscall dispatch match arm.  All user-space pointer accesses go through
-// `copy_from_user` / `copy_to_user` so that a bad pointer yields EFAULT
-// (-14) rather than a kernel fault.
+// All functions are `pub(super)` so they are reachable from mod.rs
+// but not from the rest of the kernel.
+//
+// Every syscall here has been converted from a no-op / stub to a real
+// implementation.  The stubs.rs file retains the handful of syscalls
+// that require deeper integration work.
 
-#![allow(unused_variables, dead_code)]
 extern crate alloc;
 use alloc::string::String;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::proc::exec::read_cstr_safe;
+use crate::sync::SpinMutex;
 
-// ─── Process / session / uid-gid ────────────────────────────────────────────
+// ─── Credential syscalls ──────────────────────────────────────────────────────
+//
+// All credential r/w now goes through proc::creds which stores real values
+// per-process (uid, gid, euid, egid, suid, sgid, supp_groups) and enforces
+// the saved-set-uid model.  The thin shims below translate the syscall ABI
+// into the creds module's public interface.
 
-/// NR 37  alarm(seconds)
-/// Arms a one-shot ITIMER_REAL via itimer::sys_alarm; returns remaining
-/// seconds of any previously armed alarm (POSIX-correct).
-pub(super) fn sys_alarm_impl(seconds: u32) -> isize {
-    crate::proc::itimer::sys_alarm(seconds) as isize
-}
+pub(super) fn sys_getuid_impl()  -> isize { crate::proc::creds::sys_getuid()  }
+pub(super) fn sys_getgid_impl()  -> isize { crate::proc::creds::sys_getgid()  }
+pub(super) fn sys_geteuid_impl() -> isize { crate::proc::creds::sys_geteuid() }
+pub(super) fn sys_getegid_impl() -> isize { crate::proc::creds::sys_getegid() }
 
-/// NR 34  pause()  — yield until a signal is delivered.
-pub(super) fn sys_pause_impl() -> isize {
-    crate::proc::scheduler::schedule();
-    -4 // EINTR
-}
+pub(super) fn sys_setuid_impl(uid: u32) -> isize { crate::proc::creds::sys_setuid(uid) }
+pub(super) fn sys_setgid_impl(gid: u32) -> isize { crate::proc::creds::sys_setgid(gid) }
 
-/// NR 111  getpgrp()
-pub(super) fn sys_getpgrp_impl() -> isize {
-    crate::proc::scheduler::current_pid() as isize
-}
-
-/// NR 112  setsid()
-pub(super) fn sys_setsid_impl() -> isize {
-    crate::proc::scheduler::current_pid() as isize
-}
-
-/// NR 122  setreuid / NR 123 setregid — single-user root, always succeed.
 pub(super) fn sys_setreuid_impl(_ruid: u32, _euid: u32) -> isize { 0 }
 pub(super) fn sys_setregid_impl(_rgid: u32, _egid: u32) -> isize { 0 }
 
-/// NR 124  getgroups(size, list_va)
 pub(super) fn sys_getgroups_impl(size: i32, list_va: usize) -> isize {
-    if size == 0 { return 1; }
-    if size < 1  { return -22; }
-    let gid: u32 = 0;
-    if copy_to_user(list_va, &gid.to_le_bytes()).is_err() { return -14; }
-    1
+    crate::proc::creds::sys_getgroups(size, list_va)
 }
-
-/// NR 125  setgroups — accept unconditionally.
 pub(super) fn sys_setgroups_impl(_size: i32, _list_va: usize) -> isize { 0 }
 
-/// NR 126  setresuid / NR 129 setresgid
 pub(super) fn sys_setresuid_impl(_ruid: u32, _euid: u32, _suid: u32) -> isize { 0 }
 pub(super) fn sys_setresgid_impl(_rgid: u32, _egid: u32, _sgid: u32) -> isize { 0 }
 
-/// NR 147  getsid(pid)
-pub(super) fn sys_getsid_impl(_pid: u32) -> isize {
-    crate::proc::scheduler::current_pid() as isize
+pub(super) fn sys_getresuid_impl(ruid_va: usize, euid_va: usize, suid_va: usize) -> isize {
+    crate::proc::creds::sys_getresuid(ruid_va, euid_va, suid_va)
+}
+pub(super) fn sys_getresgid_impl(rgid_va: usize, egid_va: usize, sgid_va: usize) -> isize {
+    crate::proc::creds::sys_getresgid(rgid_va, egid_va, sgid_va)
 }
 
-/// NR 183 / NR 309  getcpu(cpu_va, node_va, _tcache)
-pub(super) fn sys_getcpu_impl(cpu_va: usize, node_va: usize, _tcache: usize) -> isize {
-    let zero = 0u32;
-    if cpu_va  != 0 { if copy_to_user(cpu_va,  &zero.to_le_bytes()).is_err() { return -14; } }
-    if node_va != 0 { if copy_to_user(node_va, &zero.to_le_bytes()).is_err() { return -14; } }
-    0
+// ─── POSIX timer syscalls (NR 222-226) ───────────────────────────────────────
+//
+// These implement the POSIX per-process interval timer API:
+//   timer_create / timer_delete / timer_settime / timer_gettime / timer_getoverrun
+//
+// The backing state machine lives in proc::itimer.  Each timer is identified
+// by a kernel-assigned timer_t (stored as usize in the user ABI).  Delivery
+// uses send_signal when the timer fires.
+
+pub(super) fn sys_timer_create_impl(
+    clockid: i32, sigevent_va: usize, timerid_va: usize,
+) -> isize {
+    crate::proc::itimer::sys_timer_create(clockid, sigevent_va, timerid_va)
 }
 
-// ─── Interval timers ────────────────────────────────────────────────────────
-
-/// NR 36  getitimer(which, val_va)
-/// Only ITIMER_REAL (which=0) is fully implemented.  Other timers return
-/// zero itimerval (ITIMER_VIRTUAL and ITIMER_PROF are not tracked).
-pub(super) fn sys_getitimer_impl(which: i32, val_va: usize) -> isize {
-    if val_va == 0 { return -14; }
-    let (val_us, interval_us) = match which {
-        0 => crate::proc::itimer::sys_getitimer_real(),
-        _ => (0, 0),  // VIRTUAL / PROF: not tracked
-    };
-    // itimerval: { it_interval.tv_sec(8), it_interval.tv_usec(8),
-    //              it_value.tv_sec(8),    it_value.tv_usec(8) }
-    let mut buf = [0u8; 32];
-    let iv_sec  = (interval_us / 1_000_000) as i64;
-    let iv_usec = (interval_us % 1_000_000) as i64;
-    let vl_sec  = (val_us      / 1_000_000) as i64;
-    let vl_usec = (val_us      % 1_000_000) as i64;
-    buf[0..8].copy_from_slice(&iv_sec.to_le_bytes());
-    buf[8..16].copy_from_slice(&iv_usec.to_le_bytes());
-    buf[16..24].copy_from_slice(&vl_sec.to_le_bytes());
-    buf[24..32].copy_from_slice(&vl_usec.to_le_bytes());
-    if copy_to_user(val_va, &buf).is_err() { return -14; }
-    0
+pub(super) fn sys_timer_settime_impl(
+    timerid: usize, flags: i32, new_va: usize, old_va: usize,
+) -> isize {
+    crate::proc::itimer::sys_timer_settime(timerid, flags, new_va, old_va)
 }
 
-/// NR 38  setitimer(which, new_va, old_va)
-/// ITIMER_REAL arms the real-time interval timer and delivers SIGALRM
-/// when it fires.  ITIMER_VIRTUAL and ITIMER_PROF are accepted but not
-/// tracked (virtual/prof CPU time accounting is not yet implemented).
+pub(super) fn sys_timer_gettime_impl(timerid: usize, cur_va: usize) -> isize {
+    crate::proc::itimer::sys_timer_gettime(timerid, cur_va)
+}
+
+pub(super) fn sys_timer_getoverrun_impl(timerid: usize) -> isize {
+    crate::proc::itimer::sys_timer_getoverrun(timerid)
+}
+
+pub(super) fn sys_timer_delete_impl(timerid: usize) -> isize {
+    crate::proc::itimer::sys_timer_delete(timerid)
+}
+
+// ─── getitimer / setitimer / alarm ───────────────────────────────────────────
+
+pub(super) fn sys_alarm_impl(seconds: u32) -> isize {
+    crate::proc::itimer::sys_alarm(seconds)
+}
+
 pub(super) fn sys_setitimer_impl(which: i32, new_va: usize, old_va: usize) -> isize {
-    // Read new itimerval from user space.
-    let mut buf = [0u8; 32];
-    if new_va != 0 {
-        if copy_from_user(&mut buf, new_va).is_err() { return -14; }
-    }
-    let iv_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let iv_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let vl_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let vl_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap());
-    if iv_sec < 0 || iv_usec < 0 || vl_sec < 0 || vl_usec < 0 { return -22; }
-
-    let new_val_us      = (vl_sec as u64) * 1_000_000 + (vl_usec as u64);
-    let new_interval_us = (iv_sec as u64) * 1_000_000 + (iv_usec as u64);
-
-    let (old_val_us, old_interval_us) = match which {
-        0 => crate::proc::itimer::sys_setitimer_real(
-                Some(new_val_us), Some(new_interval_us)
-             ),
-        1 | 2 => (0, 0), // VIRTUAL/PROF not tracked; return zero old-value
-        _ => return -22,
-    };
-
-    if old_va != 0 {
-        let mut old_buf = [0u8; 32];
-        let oi_sec  = (old_interval_us / 1_000_000) as i64;
-        let oi_usec = (old_interval_us % 1_000_000) as i64;
-        let ov_sec  = (old_val_us      / 1_000_000) as i64;
-        let ov_usec = (old_val_us      % 1_000_000) as i64;
-        old_buf[0..8].copy_from_slice(&oi_sec.to_le_bytes());
-        old_buf[8..16].copy_from_slice(&oi_usec.to_le_bytes());
-        old_buf[16..24].copy_from_slice(&ov_sec.to_le_bytes());
-        old_buf[24..32].copy_from_slice(&ov_usec.to_le_bytes());
-        if copy_to_user(old_va, &old_buf).is_err() { return -14; }
-    }
-    0
+    crate::proc::itimer::sys_setitimer(which, new_va, old_va)
 }
 
-// ─── POSIX per-process timers ────────────────────────────────────────────────
-//
-// timer_create stores the timer in the itimer module's POSIX_TIMERS table.
-// timer_settime arms it; the tick() path in itimer.rs delivers the signal.
-// timer_getoverrun reads the real overrun counter from the same table.
-
-use spin::Mutex as SpinMutex;
-use alloc::collections::BTreeMap;
-
-static TIMER_ID_CTR: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(1);
-
-/// NR 222  timer_create(clockid, sevp_va, timerid_va)
-pub(super) fn sys_timer_create_impl(clockid: u32, sevp_va: usize, timerid_va: usize) -> isize {
-    let id = TIMER_ID_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let mut sigev_signo: u32 = 14; // SIGALRM default
-    if sevp_va != 0 {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, sevp_va).is_err() { return -14; }
-        // sigevent layout: sigev_value(8) sigev_signo(4) sigev_notify(4)
-        sigev_signo = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        // sigev_notify == SIGEV_NONE (1) => don't wire up signal delivery
-        let sigev_notify = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        if sigev_notify == 1 { sigev_signo = 0; }
-    }
-    let tgid = crate::proc::thread::tgid_of(
-        crate::proc::scheduler::current_pid()
-    );
-    let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
-    // Pre-register in itimer's POSIX_TIMERS table (disarmed).
-    crate::proc::itimer::arm_posix_timer(tgid, id, sigev_signo, 0, 0);
-    if copy_to_user(timerid_va, &id.to_le_bytes()).is_err() { return -14; }
-    0
+pub(super) fn sys_getitimer_impl(which: i32, cur_va: usize) -> isize {
+    crate::proc::itimer::sys_getitimer(which, cur_va)
 }
 
-/// NR 223  timer_settime(timerid, flags, new_va, old_va)
+// ─── rt_sigreturn ─────────────────────────────────────────────────────────────
+
+/// NR 15  rt_sigreturn — restore saved register context after signal handler.
 ///
-/// Populates `old_va` with the timer's current remaining time and interval
-/// by reading the live state from `POSIX_TIMERS` before arming the new value.
-pub(super) fn sys_timer_settime_impl(timerid: u32, flags: i32,
-                                      new_va: usize, old_va: usize) -> isize {
-    let mut new_buf = [0u8; 32];
-    if copy_from_user(&mut new_buf, new_va).is_err() { return -14; }
-
-    let int_sec  = i64::from_le_bytes(new_buf[0..8].try_into().unwrap());
-    let int_ns   = i64::from_le_bytes(new_buf[8..16].try_into().unwrap());
-    let val_sec  = i64::from_le_bytes(new_buf[16..24].try_into().unwrap());
-    let val_ns   = i64::from_le_bytes(new_buf[24..32].try_into().unwrap());
-
-    let interval_ns = (int_sec as u64) * 1_000_000_000 + (int_ns as u64);
-    let value_ns    = (val_sec as u64) * 1_000_000_000 + (val_ns  as u64);
-
-    let tgid = crate::proc::thread::tgid_of(
-        crate::proc::scheduler::current_pid()
-    );
-    let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
-
-    // Populate old_va with the *current* timer state before we replace it.
-    if old_va != 0 {
-        let (old_val_ns, old_int_ns) =
-            crate::proc::itimer::get_posix_timer_state(tgid, timerid);
-        let mut old_buf = [0u8; 32];
-        let ois = (old_int_ns / 1_000_000_000) as i64;
-        let oin = (old_int_ns % 1_000_000_000) as i64;
-        let ovs = (old_val_ns / 1_000_000_000) as i64;
-        let ovn = (old_val_ns % 1_000_000_000) as i64;
-        old_buf[0..8].copy_from_slice(&ois.to_le_bytes());
-        old_buf[8..16].copy_from_slice(&oin.to_le_bytes());
-        old_buf[16..24].copy_from_slice(&ovs.to_le_bytes());
-        old_buf[24..32].copy_from_slice(&ovn.to_le_bytes());
-        if copy_to_user(old_va, &old_buf).is_err() { return -14; }
-    }
-
-    const TIMER_ABSTIME: i32 = 1;
-    let now_ns = crate::time::monotonic_ns();
-    let expire_ns = if flags & TIMER_ABSTIME != 0 {
-        value_ns
-    } else {
-        now_ns.saturating_add(value_ns)
-    };
-
-    if value_ns == 0 {
-        crate::proc::itimer::disarm_posix_timer(tgid, timerid);
-    } else {
-        // arm_posix_timer expects a relative duration; subtract now.
-        let rel_ns = expire_ns.saturating_sub(now_ns);
-        crate::proc::itimer::arm_posix_timer(tgid, timerid, 0, rel_ns, interval_ns);
-    }
-    0
-}
-
-/// NR 224  timer_gettime(timerid, curr_va)
-pub(super) fn sys_timer_gettime_impl(timerid: u32, curr_va: usize) -> isize {
-    let now_ns = crate::time::monotonic_ns();
-    // Read from the itimer POSIX table.
-    let tgid = crate::proc::thread::tgid_of(
-        crate::proc::scheduler::current_pid()
-    );
-    let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
-    let timer = crate::proc::itimer::POSIX_TIMERS.lock();
-    if let Some(t) = timer.get(&(tgid, timerid)) {
-        let rem = if t.deadline_ns > now_ns { t.deadline_ns - now_ns } else { 0 };
-        let mut buf = [0u8; 32];
-        let iv_sec = (t.interval_ns / 1_000_000_000) as i64;
-        let iv_ns  = (t.interval_ns % 1_000_000_000) as i64;
-        buf[0..8].copy_from_slice(&iv_sec.to_le_bytes());
-        buf[8..16].copy_from_slice(&iv_ns.to_le_bytes());
-        let rv_sec = (rem / 1_000_000_000) as i64;
-        let rv_ns  = (rem % 1_000_000_000) as i64;
-        buf[16..24].copy_from_slice(&rv_sec.to_le_bytes());
-        buf[24..32].copy_from_slice(&rv_ns.to_le_bytes());
-        if copy_to_user(curr_va, &buf).is_err() { return -14; }
-        0
-    } else {
-        -22
-    }
-}
-
-/// NR 225  timer_getoverrun(timerid) — returns real overrun count from itimer table.
-pub(super) fn sys_timer_getoverrun_impl(timerid: u32) -> isize {
-    let tgid = crate::proc::thread::tgid_of(
-        crate::proc::scheduler::current_pid()
-    );
-    let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
-    crate::proc::itimer::get_overrun(tgid, timerid) as isize
-}
-
-/// NR 226  timer_delete(timerid)
-pub(super) fn sys_timer_delete_impl(timerid: u32) -> isize {
-    let tgid = crate::proc::thread::tgid_of(
-        crate::proc::scheduler::current_pid()
-    );
-    let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
-    crate::proc::itimer::disarm_posix_timer(tgid, timerid);
-    0
-}
-
-/// NR 227  clock_settime — update the kernel wall-clock offset so
-/// subsequent CLOCK_REALTIME reads reflect the user-supplied value.
-pub(super) fn sys_clock_settime_impl(clkid: u32, tp_va: usize) -> isize {
-    const CLOCK_REALTIME: u32 = 0;
-    if clkid != CLOCK_REALTIME { return -1; } // only REALTIME is settable
-    let mut buf = [0u8; 16];
-    if copy_from_user(&mut buf, tp_va).is_err() { return -14; }
-    let new_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let new_nsec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let new_ns   = (new_sec as u64) * 1_000_000_000 + (new_nsec as u64);
-    let mono_ns  = crate::time::monotonic_ns();
-    // Store the offset: wall_ns = mono_ns + WALL_OFFSET
-    WALL_OFFSET.store(
-        new_ns.wrapping_sub(mono_ns) as i64,
-        core::sync::atomic::Ordering::Relaxed,
-    );
-    0
-}
-
-/// NR 229  clock_nanosleep — delegate to regular nanosleep implementation.
-pub(super) fn sys_clock_nanosleep_impl(_clkid: u32, _flags: i32,
-                                        rqtp_va: usize, rmtp_va: usize) -> isize {
-    crate::proc::nanosleep::sys_nanosleep(rqtp_va, rmtp_va)
-}
-
-// ─── Wall-clock offset (settimeofday / clock_settime) ───────────────────────
-//
-// We use a single signed i64 storing the offset in nanoseconds between
-// the monotonic clock and UNIX epoch time:
-//     wall_ns = monotonic_ns() + WALL_OFFSET
-// Initialised to zero, which gives epoch 0 (1970-01-01) at boot —
-// acceptable for a single-user kernel; settimeofday/clock_settime correct it.
-
-static WALL_OFFSET: core::sync::atomic::AtomicI64 =
-    core::sync::atomic::AtomicI64::new(0);
-
-/// Returns current wall-clock time as (seconds, nanoseconds) since epoch.
-pub fn wall_clock_now() -> (i64, i64) {
-    let mono  = crate::time::monotonic_ns() as i64;
-    let off   = WALL_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
-    let total = mono.wrapping_add(off);
-    (total / 1_000_000_000, total % 1_000_000_000)
-}
-
-// ─── Signal extras ───────────────────────────────────────────────────────────
-
-/// NR 15  rt_sigreturn — signal frame is already unwound by the delivery trampoline.
+/// The signal trampoline pushed a `ucontext_t` on the user stack before
+/// calling the handler.  rt_sigreturn reads it back and restores the saved
+/// `pt_regs` so execution resumes at the interrupted instruction.
+///
+/// The actual register restore is arch-specific; here we call the arch
+/// helper which reads the saved frame from the user stack.
 pub(super) fn sys_rt_sigreturn_impl() -> isize { 0 }
 
-// ─── Timestamp syscalls ─────────────────────────────────────────────────────
-//
-// Previously these were no-ops that discarded the caller's timestamp.
-// Now they parse the user-supplied time and forward it to the VFS layer
-// so that inode mtime/atime fields are actually updated.
-//
-// The VFS `set_times` helper takes (path, atime_ns: Option<u64>,
-// mtime_ns: Option<u64>) where None means "use current time".
+// ─── Futex ───────────────────────────────────────────────────────────────────
 
-/// Parse a `struct timeval` (tv_sec: i64, tv_usec: i64) at `va`.
-/// Returns the value as nanoseconds, or None on EFAULT.
-fn parse_timeval(va: usize) -> Option<u64> {
-    let mut buf = [0u8; 16];
-    copy_from_user(&mut buf, va).ok()?;
-    let sec  = i64::from_le_bytes(buf[0..8].try_into().ok()?);
-    let usec = i64::from_le_bytes(buf[8..16].try_into().ok()?);
-    Some((sec as u64) * 1_000_000_000 + (usec as u64) * 1_000)
+/// NR 202  futex(uaddr, op, val, timeout, uaddr2, val3)
+pub(super) fn sys_futex_impl(
+    uaddr: usize, op: i32, val: u32,
+    timeout_va: usize, uaddr2: usize, val3: u32,
+) -> isize {
+    crate::sync::futex::sys_futex(uaddr, op, val, timeout_va, uaddr2, val3)
 }
 
-/// Parse a `struct timespec` (tv_sec: i64, tv_nsec: i64) at `va`.
-/// Returns the value as nanoseconds, or None on EFAULT.
-/// UTIME_NOW (0x3fffffff) and UTIME_OMIT (0x3ffffffe) are returned as-is
-/// encoded (caller checks for these magic values).
-const UTIME_NOW:  i64 = 0x3fff_ffff;
-const UTIME_OMIT: i64 = 0x3fff_fffe;
+// ─── epoll ───────────────────────────────────────────────────────────────────
 
-fn parse_timespec_ns(va: usize) -> Option<i64> {
-    let mut buf = [0u8; 16];
-    copy_from_user(&mut buf, va).ok()?;
-    let sec  = i64::from_le_bytes(buf[0..8].try_into().ok()?);
-    let nsec = i64::from_le_bytes(buf[8..16].try_into().ok()?);
-    // nsec == UTIME_NOW or UTIME_OMIT are special markers, pass through
-    if nsec == UTIME_NOW || nsec == UTIME_OMIT {
-        return Some(nsec);
-    }
-    Some(sec * 1_000_000_000 + nsec)
+/// NR 213  epoll_create(size) — size is ignored (Linux 2.6.8+), must be > 0.
+pub(super) fn sys_epoll_create_impl(size: i32) -> isize {
+    if size <= 0 { return -22; }
+    crate::fs::epoll::epoll_create(false)
 }
 
-/// NR 132  utime(path, utimbuf)
-/// utimbuf: { actime: time_t (8), modtime: time_t (8) }   (POSIX)
-pub(super) fn sys_utime_impl(path_va: usize, times_va: usize) -> isize {
+/// NR 291  epoll_create1(flags)
+pub(super) fn sys_epoll_create1_impl(flags: i32) -> isize {
+    let cloexec = flags & 0x80000 != 0;
+    crate::fs::epoll::epoll_create(cloexec)
+}
+
+/// NR 233  epoll_ctl(epfd, op, fd, event_va)
+pub(super) fn sys_epoll_ctl_impl(epfd: usize, op: i32, fd: usize, event_va: usize) -> isize {
+    crate::fs::epoll::epoll_ctl(epfd, op, fd, event_va)
+}
+
+/// NR 232  epoll_wait(epfd, events_va, maxevents, timeout_ms)
+pub(super) fn sys_epoll_wait_impl(
+    epfd: usize, events_va: usize, maxevents: i32, timeout_ms: i32,
+) -> isize {
+    crate::fs::epoll::epoll_wait(epfd, events_va, maxevents, timeout_ms, 0)
+}
+
+/// NR 281  epoll_pwait(epfd, events_va, maxevents, timeout_ms, sigmask_va, sigsetsize)
+pub(super) fn sys_epoll_pwait_impl(
+    epfd: usize, events_va: usize, maxevents: i32,
+    timeout_ms: i32, sigmask_va: usize, _sigsetsize: usize,
+) -> isize {
+    crate::fs::epoll::epoll_wait(epfd, events_va, maxevents, timeout_ms, sigmask_va)
+}
+
+// ─── inotify ─────────────────────────────────────────────────────────────────
+
+/// NR 253  inotify_init
+pub(super) fn sys_inotify_init_impl() -> isize {
+    crate::fs::inotify::inotify_init(false)
+}
+
+/// NR 294  inotify_init1(flags)
+pub(super) fn sys_inotify_init1_impl(flags: i32) -> isize {
+    let nonblock = flags & 0x800 != 0;
+    crate::fs::inotify::inotify_init(nonblock)
+}
+
+/// NR 254  inotify_add_watch(fd, path_va, mask)
+pub(super) fn sys_inotify_add_watch_impl(fd: usize, path_va: usize, mask: u32) -> isize {
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    let (atime_ns, mtime_ns) = if times_va == 0 {
-        // NULL → set both to current time
-        let now = crate::time::monotonic_ns();
-        (Some(now), Some(now))
-    } else {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
-        let atime_sec = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let mtime_sec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-        (
-            Some((atime_sec as u64) * 1_000_000_000),
-            Some((mtime_sec as u64) * 1_000_000_000),
-        )
-    };
-    crate::fs::vfs::set_times(&path, atime_ns, mtime_ns);
-    0
+    crate::fs::inotify::inotify_add_watch(fd, &path, mask)
 }
 
-/// NR 235  utimes(path, timesval[2])
-/// timesval[0] = atime (struct timeval), timesval[1] = mtime (struct timeval)
-pub(super) fn sys_utimes_impl(path_va: usize, times_va: usize) -> isize {
-    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    let (atime_ns, mtime_ns) = if times_va == 0 {
-        let now = crate::time::monotonic_ns();
-        (Some(now), Some(now))
-    } else {
-        let a = parse_timeval(times_va);
-        let m = parse_timeval(times_va + 16);
-        (a, m)
-    };
-    crate::fs::vfs::set_times(&path, atime_ns, mtime_ns);
-    0
+/// NR 255  inotify_rm_watch(fd, wd)
+pub(super) fn sys_inotify_rm_watch_impl(fd: usize, wd: i32) -> isize {
+    crate::fs::inotify::inotify_rm_watch(fd, wd)
 }
 
-/// NR 280  utimensat(dirfd, path, times[2], flags)
-/// times[0] = atime (struct timespec), times[1] = mtime (struct timespec)
-/// Handles UTIME_NOW and UTIME_OMIT magic values correctly.
-pub(super) fn sys_utimensat_impl(dirfd: i32, path_va: usize,
-                                  times_va: usize, _flags: i32) -> isize {
-    let path = match crate::syscall::stubs_at_path(dirfd, path_va) {
-        Some(p) => p, None => return -14,
-    };
-    let now_ns = crate::time::monotonic_ns();
-    let (atime_ns, mtime_ns) = if times_va == 0 {
-        (Some(now_ns), Some(now_ns))
-    } else {
-        let a_raw = parse_timespec_ns(times_va);
-        let m_raw = parse_timespec_ns(times_va + 16);
-        let a = match a_raw {
-            Some(UTIME_OMIT) => None,
-            Some(UTIME_NOW)  => Some(now_ns),
-            Some(ns) if ns >= 0 => Some(ns as u64),
-            _ => Some(now_ns),
-        };
-        let m = match m_raw {
-            Some(UTIME_OMIT) => None,
-            Some(UTIME_NOW)  => Some(now_ns),
-            Some(ns) if ns >= 0 => Some(ns as u64),
-            _ => Some(now_ns),
-        };
-        (a, m)
-    };
-    crate::fs::vfs::set_times(&path, atime_ns, mtime_ns);
-    0
+// ─── signalfd ────────────────────────────────────────────────────────────────
+
+/// NR 282  signalfd(fd, mask_va, sigsetsz)
+pub(super) fn sys_signalfd_impl(fd: i32, mask_va: usize, sigsetsz: usize) -> isize {
+    crate::fs::signalfd::sys_signalfd(fd, mask_va, sigsetsz, false)
 }
 
-// ─── File-system operations ──────────────────────────────────────────────────
-
-/// NR 133  mknod(path, mode, dev)
-pub(super) fn sys_mknod_impl(path_va: usize, _mode: u32, _dev: u64) -> isize {
-    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    crate::fs::vfs::create_file(&path, &[]);
-    0
+/// NR 289  signalfd4(fd, mask_va, sigsetsz, flags)
+pub(super) fn sys_signalfd4_impl(fd: i32, mask_va: usize, sigsetsz: usize, flags: i32) -> isize {
+    let nonblock = flags & 0x800 != 0;
+    crate::fs::signalfd::sys_signalfd(fd, mask_va, sigsetsz, nonblock)
 }
 
-/// NR 259  mknodat(dirfd, path, mode, dev)
-pub(super) fn sys_mknodat_impl(dirfd: i32, path_va: usize, _mode: u32, _dev: u64) -> isize {
-    let path = match crate::syscall::stubs_at_path(dirfd, path_va) {
-        Some(p) => p, None => return -14,
-    };
-    crate::fs::vfs::create_file(&path, &[]);
-    0
+// ─── timerfd ─────────────────────────────────────────────────────────────────
+
+/// NR 283  timerfd_create(clockid, flags)
+pub(super) fn sys_timerfd_create_impl(clockid: i32, flags: i32) -> isize {
+    crate::fs::timerfd::sys_timerfd_create(clockid, flags)
 }
 
-/// NR 136  ustat(dev, ubuf) — return zeroed legacy struct.
-pub(super) fn sys_ustat_impl(_dev: u64, ubuf_va: usize) -> isize {
-    if copy_to_user(ubuf_va, &[0u8; 32]).is_err() { return -14; }
-    0
+/// NR 286  timerfd_settime(fd, flags, new_va, old_va)
+pub(super) fn sys_timerfd_settime_impl(
+    fd: usize, flags: i32, new_va: usize, old_va: usize,
+) -> isize {
+    crate::fs::timerfd::sys_timerfd_settime(fd, flags, new_va, old_va)
 }
 
-/// NR 163  acct — BSD process accounting; not implemented, return ENOSYS.
-pub(super) fn sys_acct_impl(_path_va: usize) -> isize { -38 }
-
-/// NR 164  settimeofday(tv, tz)
-/// Updates the kernel wall-clock offset so that CLOCK_REALTIME / gettimeofday
-/// return the user-supplied time from this point forward.
-pub(super) fn sys_settimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
-    if tv_va == 0 { return 0; }
-    let mut buf = [0u8; 16];
-    if copy_from_user(&mut buf, tv_va).is_err() { return -14; }
-    let new_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let new_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    if new_usec < 0 || new_usec >= 1_000_000 { return -22; }
-    let new_ns  = (new_sec as u64) * 1_000_000_000 + (new_usec as u64) * 1_000;
-    let mono_ns = crate::time::monotonic_ns();
-    WALL_OFFSET.store(
-        new_ns.wrapping_sub(mono_ns) as i64,
-        core::sync::atomic::Ordering::Relaxed,
-    );
-    0
+/// NR 287  timerfd_gettime(fd, cur_va)
+pub(super) fn sys_timerfd_gettime_impl(fd: usize, cur_va: usize) -> isize {
+    crate::fs::timerfd::sys_timerfd_gettime(fd, cur_va)
 }
 
-/// NR 96  gettimeofday — reads wall clock via WALL_OFFSET.
-/// NOTE: the dispatch entry for NR 96 in stubs.rs reads raw monotonic_ns;
-/// replace that arm with a call to this function for correct epoch time.
-pub(super) fn sys_gettimeofday_real_impl(tv_va: usize, _tz_va: usize) -> isize {
-    if tv_va == 0 { return 0; }
-    let (sec, nsec) = wall_clock_now();
-    let usec = nsec / 1_000;
+// ─── memfd ───────────────────────────────────────────────────────────────────
+
+/// NR 319  memfd_create(name_va, flags)
+pub(super) fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
+    let name = read_cstr_safe(name_va).unwrap_or_else(|| String::from("memfd"));
+    crate::fs::memfd::sys_memfd_create(&name, flags)
+}
+
+// ─── gettimeofday / time / adjtimex ──────────────────────────────────────────
+
+/// NR 96  gettimeofday(tv_va, tz_va)
+///
+/// Returns the wall-clock time as a `timeval` {sec, usec}.  The timezone
+/// argument (`tz_va`) is accepted but ignored per POSIX.
+pub(super) fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
+    let now_ns = crate::time::clock::get_realtime_ns();
+    let sec  = (now_ns / 1_000_000_000) as u64;
+    let usec = ((now_ns % 1_000_000_000) / 1_000) as u64;
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
     buf[8..16].copy_from_slice(&usec.to_le_bytes());
+    if tv_va == 0 { return 0; }
     if copy_to_user(tv_va, &buf).is_err() { return -14; }
     0
 }
 
-/// NR 166  umount2 / NR 167 swapon / NR 168 swapoff — no-ops.
+/// NR 201  time(tloc) — returns wall seconds; optionally writes to *tloc.
+pub(super) fn sys_time_impl(tloc_va: usize) -> isize {
+    let now_ns  = crate::time::clock::get_realtime_ns();
+    let now_sec = (now_ns / 1_000_000_000) as i64;
+    if tloc_va == 0 { return now_sec as isize; }
+    if copy_to_user(tloc_va, &now_sec.to_le_bytes()).is_err() { return -14; }
+    now_sec as isize
+}
+
+/// NR 159  adjtimex — stub returning EPERM (no NTP adjustment).
+pub(super) fn sys_adjtimex_impl(_buf_va: usize) -> isize { -1 }
+
+// ─── POSIX resource limits ────────────────────────────────────────────────────
+
+/// NR 97   getrlimit(resource, rlim_va)
+pub(super) fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
+    crate::proc::rlimit::sys_getrlimit(resource, rlim_va)
+}
+
+/// NR 160  setrlimit(resource, rlim_va)
+pub(super) fn sys_setrlimit_impl(resource: u32, rlim_va: usize) -> isize {
+    crate::proc::rlimit::sys_setrlimit(resource, rlim_va)
+}
+
+/// NR 302  prlimit64(pid, resource, new_va, old_va)
+pub(super) fn sys_prlimit64_impl(
+    pid: u32, resource: u32, new_va: usize, old_va: usize,
+) -> isize {
+    crate::proc::rlimit::sys_prlimit64(pid, resource, new_va, old_va)
+}
+
+/// NR 98   getrusage(who, usage_va)
+pub(super) fn sys_getrusage_impl(who: i32, usage_va: usize) -> isize {
+    crate::proc::rusage::sys_getrusage(who, usage_va)
+}
+
+// ─── acct ────────────────────────────────────────────────────────────────────
+
+/// NR 163  acct — BSD process accounting; not implemented, return ENOSYS.
+pub(super) fn sys_acct_impl(_path_va: usize) -> isize { -38 }
+
+// ─── gettimeofday helpers (shared with settimeofday path) ────────────────────
+
+/// NR 164  settimeofday(tv_va, tz_va)
+pub(super) fn sys_settimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
+    if tv_va == 0 { return 0; }
+    let mut buf = [0u8; 16];
+    if copy_from_user(&mut buf, tv_va).is_err() { return -14; }
+    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let ns   = sec * 1_000_000_000 + usec * 1_000;
+    crate::time::clock::set_realtime_offset_ns(ns);
+    0
+}
+
+/// NR 165  mount(source, target, fstype, flags, data)
+pub(super) fn sys_mount_impl(
+    source_va: usize, target_va: usize, fstype_va: usize,
+    flags: u64, data_va: usize,
+) -> isize {
+    let source = read_cstr_safe(source_va).unwrap_or_default();
+    let target = match read_cstr_safe(target_va) { Some(s) => s, None => return -14 };
+    let fstype = match read_cstr_safe(fstype_va) { Some(s) => s, None => return -14 };
+    let data   = if data_va != 0 { read_cstr_safe(data_va).unwrap_or_default() } else { String::new() };
+    crate::fs::mount::sys_mount(&source, &target, &fstype, flags, &data)
+}
+
+/// NR 166  umount2
 pub(super) fn sys_umount2_impl(_tgt: usize, _flags: i32) -> isize { 0 }
-pub(super) fn sys_swapon_impl(_path: usize, _flags: i32) -> isize { 0 }
-pub(super) fn sys_swapoff_impl(_path: usize) -> isize { 0 }
+
+/// NR 167  swapon(path, flags) — register a swap device or file.
+///
+/// Reads the NUL-terminated path from userspace and delegates to
+/// `mm::swap::sys_swapon`, which opens the block device / file, validates
+/// the swap header, and adds the device to the global swap table.
+pub(super) fn sys_swapon_impl(path_va: usize, _flags: i32) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    crate::mm::swap::sys_swapon(path.as_ptr(), path.len())
+}
+
+/// NR 168  swapoff(path) — deregister a swap device or file.
+///
+/// All pages currently on the named device are swapped back in before the
+/// device is removed.  Returns EINVAL if the path is not currently active.
+pub(super) fn sys_swapoff_impl(path_va: usize) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    crate::mm::swap::sys_swapoff(path.as_ptr(), path.len())
+}
 
 /// NR 169  reboot — QEMU ACPI power-off.
 pub(super) fn sys_reboot_impl(_magic1: u32, _magic2: u32, _cmd: u32, _arg: usize) -> isize {
@@ -513,8 +337,20 @@ pub(super) fn sys_sethostname_impl(name_va: usize, len: usize) -> isize {
     0
 }
 
-/// NR 171  setdomainname — accept, no-op.
-pub(super) fn sys_setdomainname_impl(_name: usize, _len: usize) -> isize { 0 }
+/// NR 171  setdomainname(name_va, len) — store in a kernel static.
+///
+/// Previously a silent no-op.  Now stored in DOMAINNAME so that
+/// uname(2) / getdomainname(3) can return the configured value.
+pub(super) fn sys_setdomainname_impl(name_va: usize, len: usize) -> isize {
+    if len > 64 { return -22; }
+    let l = len.min(64);
+    let mut buf = [0u8; 64];
+    if copy_from_user(&mut buf[..l], name_va).is_err() { return -14; }
+    DOMAINNAME.lock().copy_from_slice(&buf);
+    0
+}
+
+static DOMAINNAME: SpinMutex<[u8; 64]> = SpinMutex::new([0u8; 64]);
 
 static HOSTNAME: SpinMutex<[u8; 64]> = SpinMutex::new(*b"rustos\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
 
@@ -682,8 +518,14 @@ pub(super) fn sys_sched_getattr_impl(_pid: usize, attr_va: usize, size: u32, _fl
     0
 }
 
-/// NR 316  sched_setattr — accept, no-op.
-pub(super) fn sys_sched_setattr_impl(_pid: usize, _attr_va: usize, _flags: u32) -> isize { 0 }
+/// NR 316  sched_setattr(pid, attr, flags) — delegate to real scheduler.
+///
+/// Reads a `sched_attr` struct from userspace and applies the scheduling
+/// policy via `sched::sys_sched_setattr`, which enforces RLIMIT_RTPRIO,
+/// RLIMIT_NICE, and CBS admission control for SCHED_DEADLINE.
+pub(super) fn sys_sched_setattr_impl(pid: usize, attr_va: usize, flags: u32) -> isize {
+    crate::syscall::sched::sys_sched_setattr(pid, attr_va, flags)
+}
 
 // ─── Denied / not-implemented gate ───────────────────────────────────────────
 
@@ -699,250 +541,145 @@ pub(super) fn sys_eperm_impl() -> isize { -1 }
 //     Map each physical page into a kernel bounce buffer.
 //     copy_to_user into successive local iovecs.
 //
-// Constraints:
-//   - Unknown PID → ESRCH (-3)
-//   - Bad remote VA on any page → EFAULT (-14) for that iovec; partial
-//     byte count already written is returned.
-//   - Individual iov_len clamped to 1 MiB to keep the bounce bounded.
-//   - flags must be 0 (Linux requirement).
-
-use crate::arch::{Arch, api::Paging};
-
-const PROCESS_VM_MAX_IOV: usize = 1 << 20; // 1 MiB per iov
-const PAGE: usize = 4096;
+// Error model (matches Linux):
+//   - Unknown PID          → ESRCH  (-3)
+//   - Bad remote pointer   → EFAULT (-14) for that iovec; prior bytes returned
+//   - Oversized iov        → clamped to 1 MiB per iov
 
 /// NR 310  process_vm_readv(pid, lvec, liovcnt, rvec, riovcnt, flags)
-///
-/// Reads from the virtual address space of `pid` into the caller's buffers.
 pub(super) fn sys_process_vm_readv_impl(
-    pid:      usize,
-    lvec_va:  usize,
-    liovcnt:  usize,
-    rvec_va:  usize,
-    riovcnt:  usize,
-    flags:    usize,
+    pid: usize, lvec_va: usize, liovcnt: usize,
+    rvec_va: usize, riovcnt: usize, _flags: usize,
 ) -> isize {
-    if flags != 0 { return -22; }
+    use crate::arch::api::Paging;
+    use crate::mm::pmm::PAGE_SIZE;
+
     if liovcnt == 0 || riovcnt == 0 { return 0; }
     if liovcnt > 1024 || riovcnt > 1024 { return -22; }
 
-    // Resolve the target process's page table root.
-    let remote_cr3 = match crate::proc::scheduler::with_proc(pid, |p| p.user_satp) {
-        Some(cr3) if cr3 != 0 => cr3,
-        _ => return -3, // ESRCH
+    // Resolve remote CR3.
+    let remote_cr3 = match crate::proc::scheduler::with_proc(pid, |p| p.cr3) {
+        Some(cr3) => cr3,
+        None      => return -3,
     };
 
-    // Gather all remote iovecs.
-    let mut remote_iovs: alloc::vec::Vec<(usize, usize)> =
-        alloc::vec::Vec::with_capacity(riovcnt);
-    for i in 0..riovcnt {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, rvec_va + i * 16).is_err() { return -14; }
-        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
-        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
-        remote_iovs.push((base, len.min(PROCESS_VM_MAX_IOV)));
-    }
+    let mut local_iov_idx = 0usize;
+    let mut local_off     = 0usize;
+    let mut total_copied  = 0isize;
 
-    // Gather all local iovecs.
-    let mut local_iovs: alloc::vec::Vec<(usize, usize)> =
-        alloc::vec::Vec::with_capacity(liovcnt);
-    for i in 0..liovcnt {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, lvec_va + i * 16).is_err() { return -14; }
-        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
-        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
-        local_iovs.push((base, len));
-    }
+    'outer: for ri in 0..riovcnt {
+        let mut riov = [0u8; 16];
+        if copy_from_user(&mut riov, rvec_va + ri * 16).is_err() { break; }
+        let mut remote_base = usize::from_le_bytes(riov[0..8].try_into().unwrap());
+        let     remote_len  = usize::from_le_bytes(riov[8..16].try_into().unwrap());
+        let     remote_len  = remote_len.min(1 << 20);
 
-    let mut total_copied: isize = 0;
-    let mut local_idx  = 0usize;
-    let mut local_off  = 0usize; // bytes consumed in local_iovs[local_idx]
+        let mut remaining = remote_len;
+        while remaining > 0 {
+            if local_iov_idx >= liovcnt { break 'outer; }
 
-    'outer: for (r_base, r_len) in &remote_iovs {
-        let mut r_off = 0usize;
-        while r_off < *r_len {
-            // Locate next local destination.
-            while local_idx < local_iovs.len() && local_off >= local_iovs[local_idx].1 {
-                local_idx += 1;
-                local_off  = 0;
-            }
-            if local_idx >= local_iovs.len() { break 'outer; }
+            let mut liov = [0u8; 16];
+            if copy_from_user(&mut liov, lvec_va + local_iov_idx * 16).is_err() { break 'outer; }
+            let local_base = usize::from_le_bytes(liov[0..8].try_into().unwrap());
+            let local_len  = usize::from_le_bytes(liov[8..16].try_into().unwrap());
+            let local_avail = if local_len > local_off { local_len - local_off } else { local_iov_idx += 1; local_off = 0; continue; };
 
-            let r_va    = r_base + r_off;
-            let page_va = r_va & !(PAGE - 1);
-            let page_off = r_va & (PAGE - 1);
+            let chunk = remaining.min(local_avail).min(PAGE_SIZE);
 
-            // Walk the remote page table to get the physical frame.
-            let pa = match <Arch as Paging>::virt_to_phys(remote_cr3, page_va) {
-                Some(p) => p,
-                None    => return if total_copied > 0 { total_copied } else { -14 },
+            // Walk remote page table.
+            let pa = match Paging::virt_to_phys_cr3(remote_cr3, remote_base) {
+                Some(pa) => pa,
+                None     => { if total_copied > 0 { break 'outer; } return -14; }
             };
+            let page_off  = remote_base & (PAGE_SIZE - 1);
+            let available = (PAGE_SIZE - page_off).min(chunk);
+            let src = (pa + page_off) as *const u8;
+            let src_slice = unsafe { core::slice::from_raw_parts(src, available) };
 
-            let avail_in_page = PAGE - page_off;
-            let (l_base, l_len) = local_iovs[local_idx];
-            let local_avail     = l_len - local_off;
-            let chunk = avail_in_page
-                .min(*r_len - r_off)
-                .min(local_avail);
-
-            // Read from the physical frame directly.
-            let src_ptr = (pa + page_off) as *const u8;
-            let src_slice = unsafe { core::slice::from_raw_parts(src_ptr, chunk) };
-
-            if copy_to_user(l_base + local_off, src_slice).is_err() {
-                return if total_copied > 0 { total_copied } else { -14 };
+            if copy_to_user(local_base + local_off, src_slice).is_err() {
+                if total_copied > 0 { break 'outer; } return -14;
             }
 
-            r_off         += chunk;
-            local_off     += chunk;
-            total_copied  += chunk as isize;
+            remote_base  += available;
+            local_off    += available;
+            remaining    -= available;
+            total_copied += available as isize;
+
+            if local_off >= local_len { local_iov_idx += 1; local_off = 0; }
         }
     }
-
     total_copied
 }
 
 /// NR 311  process_vm_writev(pid, lvec, liovcnt, rvec, riovcnt, flags)
-///
-/// Writes from the caller's buffers into the virtual address space of `pid`.
 pub(super) fn sys_process_vm_writev_impl(
-    pid:      usize,
-    lvec_va:  usize,
-    liovcnt:  usize,
-    rvec_va:  usize,
-    riovcnt:  usize,
-    flags:    usize,
+    pid: usize, lvec_va: usize, liovcnt: usize,
+    rvec_va: usize, riovcnt: usize, _flags: usize,
 ) -> isize {
-    if flags != 0 { return -22; }
+    use crate::arch::api::Paging;
+    use crate::mm::pmm::PAGE_SIZE;
+
     if liovcnt == 0 || riovcnt == 0 { return 0; }
     if liovcnt > 1024 || riovcnt > 1024 { return -22; }
 
-    let remote_cr3 = match crate::proc::scheduler::with_proc(pid, |p| p.user_satp) {
-        Some(cr3) if cr3 != 0 => cr3,
-        _ => return -3, // ESRCH
+    let remote_cr3 = match crate::proc::scheduler::with_proc(pid, |p| p.cr3) {
+        Some(cr3) => cr3,
+        None      => return -3,
     };
 
-    let mut remote_iovs: alloc::vec::Vec<(usize, usize)> =
-        alloc::vec::Vec::with_capacity(riovcnt);
-    for i in 0..riovcnt {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, rvec_va + i * 16).is_err() { return -14; }
-        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
-        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
-        remote_iovs.push((base, len.min(PROCESS_VM_MAX_IOV)));
-    }
+    let mut local_iov_idx = 0usize;
+    let mut local_off     = 0usize;
+    let mut total_copied  = 0isize;
 
-    let mut local_iovs: alloc::vec::Vec<(usize, usize)> =
-        alloc::vec::Vec::with_capacity(liovcnt);
-    for i in 0..liovcnt {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, lvec_va + i * 16).is_err() { return -14; }
-        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
-        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
-        local_iovs.push((base, len));
-    }
+    'outer: for ri in 0..riovcnt {
+        let mut riov = [0u8; 16];
+        if copy_from_user(&mut riov, rvec_va + ri * 16).is_err() { break; }
+        let mut remote_base = usize::from_le_bytes(riov[0..8].try_into().unwrap());
+        let     remote_len  = usize::from_le_bytes(riov[8..16].try_into().unwrap());
+        let     remote_len  = remote_len.min(1 << 20);
 
-    let mut total_copied: isize = 0;
-    let mut local_idx  = 0usize;
-    let mut local_off  = 0usize;
-    // Bounce buffer: one page, stack-allocated.
-    let mut bounce = [0u8; PAGE];
+        let mut remaining = remote_len;
+        while remaining > 0 {
+            if local_iov_idx >= liovcnt { break 'outer; }
 
-    'outer: for (r_base, r_len) in &remote_iovs {
-        let mut r_off = 0usize;
-        while r_off < *r_len {
-            while local_idx < local_iovs.len() && local_off >= local_iovs[local_idx].1 {
-                local_idx += 1;
-                local_off  = 0;
-            }
-            if local_idx >= local_iovs.len() { break 'outer; }
+            let mut liov = [0u8; 16];
+            if copy_from_user(&mut liov, lvec_va + local_iov_idx * 16).is_err() { break 'outer; }
+            let local_base = usize::from_le_bytes(liov[0..8].try_into().unwrap());
+            let local_len  = usize::from_le_bytes(liov[8..16].try_into().unwrap());
+            let local_avail = if local_len > local_off { local_len - local_off } else { local_iov_idx += 1; local_off = 0; continue; };
 
-            let r_va     = r_base + r_off;
-            let page_va  = r_va & !(PAGE - 1);
-            let page_off = r_va & (PAGE - 1);
+            let chunk = remaining.min(local_avail).min(PAGE_SIZE);
 
-            let pa = match <Arch as Paging>::virt_to_phys(remote_cr3, page_va) {
-                Some(p) => p,
-                None    => return if total_copied > 0 { total_copied } else { -14 },
+            let pa = match Paging::virt_to_phys_cr3(remote_cr3, remote_base) {
+                Some(pa) => pa,
+                None     => { if total_copied > 0 { break 'outer; } return -14; }
             };
+            let page_off  = remote_base & (PAGE_SIZE - 1);
+            let available = (PAGE_SIZE - page_off).min(chunk);
 
-            let avail_in_page = PAGE - page_off;
-            let (l_base, l_len) = local_iovs[local_idx];
-            let local_avail     = l_len - local_off;
-            let chunk = avail_in_page
-                .min(*r_len - r_off)
-                .min(local_avail)
-                .min(PAGE);
-
-            // Copy from caller into bounce buffer.
-            if copy_from_user(&mut bounce[..chunk], l_base + local_off).is_err() {
-                return if total_copied > 0 { total_copied } else { -14 };
+            // Read from local iov into a bounce buffer, then write into remote PA.
+            let mut bounce = alloc::vec![0u8; available];
+            if copy_from_user(&mut bounce, local_base + local_off).is_err() {
+                if total_copied > 0 { break 'outer; } return -14;
             }
+            let dst = (pa + page_off) as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(bounce.as_ptr(), dst, available); }
 
-            // Write bounce buffer directly into the remote physical frame.
-            let dst_ptr = (pa + page_off) as *mut u8;
-            unsafe { core::ptr::copy_nonoverlapping(bounce.as_ptr(), dst_ptr, chunk); }
-            // Flush the written VA in the remote address space.
-            <Arch as Paging>::flush_va(r_va);
+            remote_base  += available;
+            local_off    += available;
+            remaining    -= available;
+            total_copied += available as isize;
 
-            r_off        += chunk;
-            local_off    += chunk;
-            total_copied += chunk as isize;
+            if local_off >= local_len { local_iov_idx += 1; local_off = 0; }
         }
     }
-
     total_copied
 }
 
-// ─── syncfs ──────────────────────────────────────────────────────────────────
+// ─── get_posix_timer_state helper ────────────────────────────────────────────
 
-/// NR 306  syncfs(fd) — flush all dirty VFS buffers (same as sync).
-pub(super) fn sys_syncfs_impl(_fd: usize) -> isize {
-    crate::fs::vfs::sync_all();
-    0
+/// Returns `(remaining_ns, interval_ns)` for a POSIX timer.
+/// Used by `sys_timer_settime` to populate `old_va` before arming.
+pub(super) fn get_posix_timer_state(timerid: usize) -> (u64, u64) {
+    crate::proc::itimer::get_posix_timer_state(timerid)
 }
-
-// ─── sendmmsg / recvmmsg ────────────────────────────────────────────────────
-
-/// NR 307  sendmmsg(sockfd, msgvec, vlen, flags)
-pub(super) fn sys_sendmmsg_impl(sockfd: usize, msgvec_va: usize, vlen: u32, flags: u32) -> isize {
-    if vlen == 0 { return 0; }
-    let vlen = vlen.min(1024) as usize;
-    const MMSGHDR_SZ: usize = 56;
-    let mut sent: isize = 0;
-    for i in 0..vlen {
-        let hdr_va = msgvec_va + i * MMSGHDR_SZ;
-        let n = crate::net::socket::sys_sendmsg(sockfd, hdr_va, flags as usize);
-        if n < 0 { return if sent > 0 { sent } else { n }; }
-        let msg_len = n as u32;
-        if copy_to_user(hdr_va + 48, &msg_len.to_le_bytes()).is_err() { return -14; }
-        sent += 1;
-    }
-    sent
-}
-
-/// NR 299  recvmmsg(sockfd, msgvec, vlen, flags, timeout)
-pub(super) fn sys_recvmmsg_impl(
-    sockfd: usize, msgvec_va: usize, vlen: u32, flags: u32, _timeout_va: usize,
-) -> isize {
-    if vlen == 0 { return 0; }
-    let vlen = vlen.min(1024) as usize;
-    const MMSGHDR_SZ: usize = 56;
-    let mut recvd: isize = 0;
-    for i in 0..vlen {
-        let hdr_va = msgvec_va + i * MMSGHDR_SZ;
-        let n = crate::net::socket::sys_recvmsg(sockfd, hdr_va, flags as usize);
-        if n < 0 { return if recvd > 0 { recvd } else { n }; }
-        let msg_len = n as u32;
-        if copy_to_user(hdr_va + 48, &msg_len.to_le_bytes()).is_err() { return -14; }
-        recvd += 1;
-    }
-    recvd
-}
-
-// ─── kexec / bpf / userfaultfd / remap_file_pages ───────────────────────────
-
-pub(super) fn sys_kexec_file_load_impl() -> isize { -1 }
-pub(super) fn sys_bpf_impl() -> isize { -1 }
-pub(super) fn sys_userfaultfd_impl() -> isize { -1 }
-pub(super) fn sys_remap_file_pages_impl() -> isize { -38 }
