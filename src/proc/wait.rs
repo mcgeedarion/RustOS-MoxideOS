@@ -49,13 +49,19 @@ pub const WNOWAIT:    u32 = 0x01000000;
 
 const RUSAGE_SIZE: usize = 144;
 
-fn write_rusage(va: usize, cpu_ns: u64) {
+fn write_rusage(va: usize, utime_ns: u64, stime_ns: u64) {
     if va == 0 { return; }
     let mut buf = [0u8; RUSAGE_SIZE];
-    let tv_sec  = cpu_ns / 1_000_000_000;
-    let tv_usec = (cpu_ns % 1_000_000_000) / 1_000;
-    buf[0..8].copy_from_slice(&tv_sec.to_ne_bytes());
-    buf[8..16].copy_from_slice(&tv_usec.to_ne_bytes());
+    // ru_utime (bytes 0..16)
+    let us  = utime_ns / 1_000_000_000;
+    let uus = (utime_ns % 1_000_000_000) / 1_000;
+    buf[0..8].copy_from_slice(&us.to_ne_bytes());
+    buf[8..16].copy_from_slice(&uus.to_ne_bytes());
+    // ru_stime (bytes 16..32)
+    let ss  = stime_ns / 1_000_000_000;
+    let sus = (stime_ns % 1_000_000_000) / 1_000;
+    buf[16..24].copy_from_slice(&ss.to_ne_bytes());
+    buf[24..32].copy_from_slice(&sus.to_ne_bytes());
     let _ = copy_to_user(va, &buf);
 }
 
@@ -136,7 +142,7 @@ fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
 // ── WaitHit: result of one scan pass ──────────────────────────────────────
 
 enum WaitHit {
-    Harvested { child_pid: usize, wstatus: i32, cpu_ns: u64 },
+    Harvested { child_pid: usize, wstatus: i32, utime_ns: u64, stime_ns: u64 },
     /// Matching children exist but none are in a waitable state yet.
     HasLiving,
     /// No child matches the requested pid/pgid at all.
@@ -184,21 +190,24 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                         return WaitHit::Harvested {
                             child_pid: p_pid,
                             wstatus:   inner.exit_code,
-                            cpu_ns:    inner.cpu_time_ns,
+                            utime_ns:  inner.utime_ns,
+                            stime_ns:  inner.stime_ns,
                         };
                     }
                     State::Stopped if wuntraced => {
                         return WaitHit::Harvested {
                             child_pid: p_pid,
                             wstatus:   inner.exit_code,
-                            cpu_ns:    inner.cpu_time_ns,
+                            utime_ns:  inner.utime_ns,
+                            stime_ns:  inner.stime_ns,
                         };
                     }
                     State::Continued if wcont => {
                         return WaitHit::Harvested {
                             child_pid: p_pid,
                             wstatus:   WSTATUS_CONTINUED,
-                            cpu_ns:    inner.cpu_time_ns,
+                            utime_ns:  inner.utime_ns,
+                            stime_ns:  inner.stime_ns,
                         };
                     }
                     _ => {}
@@ -211,7 +220,7 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
         });
 
         match hit {
-            WaitHit::Harvested { child_pid, wstatus, cpu_ns } => {
+            WaitHit::Harvested { child_pid, wstatus, utime_ns, stime_ns } => {
                 if !nowait {
                     scheduler::with_proc_mut(child_pid, |p, pl| {
                         match p.state {
@@ -244,7 +253,7 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                 if wstatus_va != 0 {
                     let _ = copy_to_user(wstatus_va, &wstatus.to_ne_bytes());
                 }
-                write_rusage(rusage_va, cpu_ns);
+                write_rusage(rusage_va, utime_ns, stime_ns);
                 return child_pid as isize;
             }
 
