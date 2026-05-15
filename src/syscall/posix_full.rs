@@ -142,7 +142,7 @@ pub(super) fn sys_setitimer_impl(which: i32, new_va: usize, old_va: usize) -> is
 //
 // timer_create stores the timer in the itimer module's POSIX_TIMERS table.
 // timer_settime arms it; the tick() path in itimer.rs delivers the signal.
-// timer_getoverrun now reads the real overrun counter from the same table.
+// timer_getoverrun reads the real overrun counter from the same table.
 
 use spin::Mutex as SpinMutex;
 use alloc::collections::BTreeMap;
@@ -174,6 +174,9 @@ pub(super) fn sys_timer_create_impl(clockid: u32, sevp_va: usize, timerid_va: us
 }
 
 /// NR 223  timer_settime(timerid, flags, new_va, old_va)
+///
+/// Populates `old_va` with the timer's current remaining time and interval
+/// by reading the live state from `POSIX_TIMERS` before arming the new value.
 pub(super) fn sys_timer_settime_impl(timerid: u32, flags: i32,
                                       new_va: usize, old_va: usize) -> isize {
     let mut new_buf = [0u8; 32];
@@ -187,26 +190,15 @@ pub(super) fn sys_timer_settime_impl(timerid: u32, flags: i32,
     let interval_ns = (int_sec as u64) * 1_000_000_000 + (int_ns as u64);
     let value_ns    = (val_sec as u64) * 1_000_000_000 + (val_ns  as u64);
 
-    const TIMER_ABSTIME: i32 = 1;
-    let now_ns = crate::time::monotonic_ns();
-    let expire_ns = if flags & TIMER_ABSTIME != 0 {
-        value_ns
-    } else {
-        now_ns.saturating_add(value_ns)
-    };
-
     let tgid = crate::proc::thread::tgid_of(
         crate::proc::scheduler::current_pid()
     );
     let tgid = if tgid != 0 { tgid } else { crate::proc::scheduler::current_pid() };
 
-    // Build old value for caller before arming new.
+    // Populate old_va with the *current* timer state before we replace it.
     if old_va != 0 {
-        let (old_val_ns, old_int_ns) = {
-            // We don't have a get helper yet; compute from the public module.
-            // Use remaining time approximation via monotonic.
-            (0u64, 0u64)  // best-effort: return zero old-value
-        };
+        let (old_val_ns, old_int_ns) =
+            crate::proc::itimer::get_posix_timer_state(tgid, timerid);
         let mut old_buf = [0u8; 32];
         let ois = (old_int_ns / 1_000_000_000) as i64;
         let oin = (old_int_ns % 1_000_000_000) as i64;
@@ -219,10 +211,20 @@ pub(super) fn sys_timer_settime_impl(timerid: u32, flags: i32,
         if copy_to_user(old_va, &old_buf).is_err() { return -14; }
     }
 
+    const TIMER_ABSTIME: i32 = 1;
+    let now_ns = crate::time::monotonic_ns();
+    let expire_ns = if flags & TIMER_ABSTIME != 0 {
+        value_ns
+    } else {
+        now_ns.saturating_add(value_ns)
+    };
+
     if value_ns == 0 {
         crate::proc::itimer::disarm_posix_timer(tgid, timerid);
     } else {
-        crate::proc::itimer::arm_posix_timer(tgid, timerid, 0, expire_ns - now_ns, interval_ns);
+        // arm_posix_timer expects a relative duration; subtract now.
+        let rel_ns = expire_ns.saturating_sub(now_ns);
+        crate::proc::itimer::arm_posix_timer(tgid, timerid, 0, rel_ns, interval_ns);
     }
     0
 }
@@ -687,15 +689,210 @@ pub(super) fn sys_sched_setattr_impl(_pid: usize, _attr_va: usize, _flags: u32) 
 
 pub(super) fn sys_eperm_impl() -> isize { -1 }
 
-pub(super) fn sys_process_vm_readv_impl(
-    _pid: usize, _lvec: usize, _liovcnt: usize,
-    _rvec: usize, _riovcnt: usize, _flags: usize,
-) -> isize { -1 }
+// ─── process_vm_readv / process_vm_writev ────────────────────────────────────
+//
+// Cross-process memory access using the target process's page table.
+//
+// Algorithm (readv — writev is symmetric):
+//   For each (remote_base, remote_len) in rvec:
+//     Walk the remote CR3 page-by-page via Paging::virt_to_phys.
+//     Map each physical page into a kernel bounce buffer.
+//     copy_to_user into successive local iovecs.
+//
+// Constraints:
+//   - Unknown PID → ESRCH (-3)
+//   - Bad remote VA on any page → EFAULT (-14) for that iovec; partial
+//     byte count already written is returned.
+//   - Individual iov_len clamped to 1 MiB to keep the bounce bounded.
+//   - flags must be 0 (Linux requirement).
 
+use crate::arch::{Arch, api::Paging};
+
+const PROCESS_VM_MAX_IOV: usize = 1 << 20; // 1 MiB per iov
+const PAGE: usize = 4096;
+
+/// NR 310  process_vm_readv(pid, lvec, liovcnt, rvec, riovcnt, flags)
+///
+/// Reads from the virtual address space of `pid` into the caller's buffers.
+pub(super) fn sys_process_vm_readv_impl(
+    pid:      usize,
+    lvec_va:  usize,
+    liovcnt:  usize,
+    rvec_va:  usize,
+    riovcnt:  usize,
+    flags:    usize,
+) -> isize {
+    if flags != 0 { return -22; }
+    if liovcnt == 0 || riovcnt == 0 { return 0; }
+    if liovcnt > 1024 || riovcnt > 1024 { return -22; }
+
+    // Resolve the target process's page table root.
+    let remote_cr3 = match crate::proc::scheduler::with_proc(pid, |p| p.user_satp) {
+        Some(cr3) if cr3 != 0 => cr3,
+        _ => return -3, // ESRCH
+    };
+
+    // Gather all remote iovecs.
+    let mut remote_iovs: alloc::vec::Vec<(usize, usize)> =
+        alloc::vec::Vec::with_capacity(riovcnt);
+    for i in 0..riovcnt {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, rvec_va + i * 16).is_err() { return -14; }
+        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        remote_iovs.push((base, len.min(PROCESS_VM_MAX_IOV)));
+    }
+
+    // Gather all local iovecs.
+    let mut local_iovs: alloc::vec::Vec<(usize, usize)> =
+        alloc::vec::Vec::with_capacity(liovcnt);
+    for i in 0..liovcnt {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, lvec_va + i * 16).is_err() { return -14; }
+        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        local_iovs.push((base, len));
+    }
+
+    let mut total_copied: isize = 0;
+    let mut local_idx  = 0usize;
+    let mut local_off  = 0usize; // bytes consumed in local_iovs[local_idx]
+
+    'outer: for (r_base, r_len) in &remote_iovs {
+        let mut r_off = 0usize;
+        while r_off < *r_len {
+            // Locate next local destination.
+            while local_idx < local_iovs.len() && local_off >= local_iovs[local_idx].1 {
+                local_idx += 1;
+                local_off  = 0;
+            }
+            if local_idx >= local_iovs.len() { break 'outer; }
+
+            let r_va    = r_base + r_off;
+            let page_va = r_va & !(PAGE - 1);
+            let page_off = r_va & (PAGE - 1);
+
+            // Walk the remote page table to get the physical frame.
+            let pa = match <Arch as Paging>::virt_to_phys(remote_cr3, page_va) {
+                Some(p) => p,
+                None    => return if total_copied > 0 { total_copied } else { -14 },
+            };
+
+            let avail_in_page = PAGE - page_off;
+            let (l_base, l_len) = local_iovs[local_idx];
+            let local_avail     = l_len - local_off;
+            let chunk = avail_in_page
+                .min(*r_len - r_off)
+                .min(local_avail);
+
+            // Read from the physical frame directly.
+            let src_ptr = (pa + page_off) as *const u8;
+            let src_slice = unsafe { core::slice::from_raw_parts(src_ptr, chunk) };
+
+            if copy_to_user(l_base + local_off, src_slice).is_err() {
+                return if total_copied > 0 { total_copied } else { -14 };
+            }
+
+            r_off         += chunk;
+            local_off     += chunk;
+            total_copied  += chunk as isize;
+        }
+    }
+
+    total_copied
+}
+
+/// NR 311  process_vm_writev(pid, lvec, liovcnt, rvec, riovcnt, flags)
+///
+/// Writes from the caller's buffers into the virtual address space of `pid`.
 pub(super) fn sys_process_vm_writev_impl(
-    _pid: usize, _lvec: usize, _liovcnt: usize,
-    _rvec: usize, _riovcnt: usize, _flags: usize,
-) -> isize { -1 }
+    pid:      usize,
+    lvec_va:  usize,
+    liovcnt:  usize,
+    rvec_va:  usize,
+    riovcnt:  usize,
+    flags:    usize,
+) -> isize {
+    if flags != 0 { return -22; }
+    if liovcnt == 0 || riovcnt == 0 { return 0; }
+    if liovcnt > 1024 || riovcnt > 1024 { return -22; }
+
+    let remote_cr3 = match crate::proc::scheduler::with_proc(pid, |p| p.user_satp) {
+        Some(cr3) if cr3 != 0 => cr3,
+        _ => return -3, // ESRCH
+    };
+
+    let mut remote_iovs: alloc::vec::Vec<(usize, usize)> =
+        alloc::vec::Vec::with_capacity(riovcnt);
+    for i in 0..riovcnt {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, rvec_va + i * 16).is_err() { return -14; }
+        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        remote_iovs.push((base, len.min(PROCESS_VM_MAX_IOV)));
+    }
+
+    let mut local_iovs: alloc::vec::Vec<(usize, usize)> =
+        alloc::vec::Vec::with_capacity(liovcnt);
+    for i in 0..liovcnt {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, lvec_va + i * 16).is_err() { return -14; }
+        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
+        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
+        local_iovs.push((base, len));
+    }
+
+    let mut total_copied: isize = 0;
+    let mut local_idx  = 0usize;
+    let mut local_off  = 0usize;
+    // Bounce buffer: one page, stack-allocated.
+    let mut bounce = [0u8; PAGE];
+
+    'outer: for (r_base, r_len) in &remote_iovs {
+        let mut r_off = 0usize;
+        while r_off < *r_len {
+            while local_idx < local_iovs.len() && local_off >= local_iovs[local_idx].1 {
+                local_idx += 1;
+                local_off  = 0;
+            }
+            if local_idx >= local_iovs.len() { break 'outer; }
+
+            let r_va     = r_base + r_off;
+            let page_va  = r_va & !(PAGE - 1);
+            let page_off = r_va & (PAGE - 1);
+
+            let pa = match <Arch as Paging>::virt_to_phys(remote_cr3, page_va) {
+                Some(p) => p,
+                None    => return if total_copied > 0 { total_copied } else { -14 },
+            };
+
+            let avail_in_page = PAGE - page_off;
+            let (l_base, l_len) = local_iovs[local_idx];
+            let local_avail     = l_len - local_off;
+            let chunk = avail_in_page
+                .min(*r_len - r_off)
+                .min(local_avail)
+                .min(PAGE);
+
+            // Copy from caller into bounce buffer.
+            if copy_from_user(&mut bounce[..chunk], l_base + local_off).is_err() {
+                return if total_copied > 0 { total_copied } else { -14 };
+            }
+
+            // Write bounce buffer directly into the remote physical frame.
+            let dst_ptr = (pa + page_off) as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(bounce.as_ptr(), dst_ptr, chunk); }
+            // Flush the written VA in the remote address space.
+            <Arch as Paging>::flush_va(r_va);
+
+            r_off        += chunk;
+            local_off    += chunk;
+            total_copied += chunk as isize;
+        }
+    }
+
+    total_copied
+}
 
 // ─── syncfs ──────────────────────────────────────────────────────────────────
 

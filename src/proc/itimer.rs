@@ -169,6 +169,23 @@ pub fn get_overrun(tgid: usize, timer_id: u32) -> u32 {
     }
 }
 
+/// Return `(remaining_ns, interval_ns)` for a POSIX timer without
+/// disturbing its state.  Used by `timer_settime` to populate `old_va`
+/// before installing a new value.
+///
+/// Returns `(0, 0)` if the timer does not exist or is disarmed.
+pub fn get_posix_timer_state(tgid: usize, timer_id: u32) -> (u64, u64) {
+    let now = crate::time::monotonic_ns();
+    let lock = POSIX_TIMERS.lock();
+    match lock.get(&(tgid, timer_id)) {
+        Some(e) if e.armed => {
+            let rem = if e.deadline_ns > now { e.deadline_ns - now } else { 0 };
+            (rem, e.interval_ns)
+        }
+        _ => (0, 0),
+    }
+}
+
 // ── Tick ─────────────────────────────────────────────────────────────────────
 //
 // Called from the hardware timer IRQ path (e.g. HPET / APIC tick on x86_64,
