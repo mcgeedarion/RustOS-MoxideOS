@@ -8,13 +8,13 @@ use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::arch::{Arch, api::{Paging, PageFlags}};
 
-// ── NR 18  pwrite64 ──────────────────────────────────────────────────────
+// ── NR 18  pwrite64 ───────────────────────────────────────────────────────────────────
 
 fn sys_pwrite64_impl(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     crate::fs::io_syscalls::sys_pwrite64(fd, buf_va, count, offset)
 }
 
-// ── NR 19  readv ────────────────────────────────────────────────────────────────
+// ── NR 19  readv ─────────────────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 const IOV_STACK_BUF: usize = 4096;
@@ -74,14 +74,14 @@ fn sys_readv_impl(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     total
 }
 
-// ── NR 24  sched_yield ─────────────────────────────────────────────────────
+// ── NR 24  sched_yield ─────────────────────────────────────────────────────────────────────
 
 fn sys_sched_yield_impl() -> isize {
     crate::proc::scheduler::schedule();
     0
 }
 
-// ── NR 25  mremap ────────────────────────────────────────────────────────────
+// ── NR 25  mremap ──────────────────────────────────────────────────────────────────────────
 
 const MREMAP_MAYMOVE:   usize = 1;
 const MREMAP_FIXED:     usize = 2;
@@ -253,7 +253,7 @@ fn prot_to_flags_mremap(prot: u32) -> PageFlags {
     f
 }
 
-// ── NR 28  madvise ────────────────────────────────────────────────────────────
+// ── NR 28  madvise ─────────────────────────────────────────────────────────────────────────
 
 fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
     const PAGE: usize = 4096;
@@ -293,7 +293,7 @@ fn sys_madvise_impl(addr: usize, length: usize, advice: i32) -> isize {
     }
 }
 
-// ── NR 29/30/31/67  shmget/shmat/shmctl/shmdt ────────────────────────────────
+// ── NR 29/30/31/67  shmget/shmat/shmctl/shmdt ──────────────────────────────────────────
 
 fn sys_shmget_impl(key: i32, size: usize, shmflg: u32) -> isize {
     crate::proc::ipc::sys_shmget(key, size, shmflg)
@@ -308,7 +308,7 @@ fn sys_shmctl_impl(shmid: i32, cmd: i32, buf_va: usize) -> isize {
     crate::proc::ipc::sys_shmctl(shmid, cmd, buf_va)
 }
 
-// ── NR 40  sendfile ────────────────────────────────────────────────────────────
+// ── NR 40  sendfile ─────────────────────────────────────────────────────────────────────────
 
 fn sys_sendfile_impl(out_fd: usize, in_fd: usize, offset_va: usize, count: usize) -> isize {
     if count == 0 { return 0; }
@@ -328,7 +328,7 @@ fn sys_sendfile_impl(out_fd: usize, in_fd: usize, offset_va: usize, count: usize
     crate::fs::vfs::write(out_fd, &buf[..n as usize])
 }
 
-// ── NR 56  clone ────────────────────────────────────────────────────────────────
+// ── NR 56  clone ──────────────────────────────────────────────────────────────────────────────
 
 const CLONE_THREAD: usize = 0x0001_0000;
 
@@ -341,13 +341,13 @@ fn sys_clone_impl(flags: usize, child_sp: usize, ptid: usize,
     }
 }
 
-// ── NR 58  vfork ────────────────────────────────────────────────────────────────
+// ── NR 58  vfork ─────────────────────────────────────────────────────────────────────────────
 
 fn sys_vfork_impl() -> isize {
     crate::proc::fork_syscall::sys_fork()
 }
 
-// ── NR 62  kill ────────────────────────────────────────────────────────────────
+// ── NR 62  kill ─────────────────────────────────────────────────────────────────────────────
 
 fn sys_kill_impl(pid: isize, sig: u32) -> isize {
     if sig == 0  { return 0; }
@@ -373,7 +373,7 @@ fn sys_kill_impl(pid: isize, sig: u32) -> isize {
     }
 }
 
-// ── NR 63  uname ────────────────────────────────────────────────────────────────
+// ── NR 63  uname ─────────────────────────────────────────────────────────────────────────────
 
 fn sys_uname_impl(buf_va: usize) -> isize {
     let pid = crate::proc::scheduler::current_pid();
@@ -397,7 +397,7 @@ fn sys_uname_impl(buf_va: usize) -> isize {
     0
 }
 
-// ── NR 64/65/66  semget / semop / semctl ─────────────────────────────────────
+// ── NR 64/65/66  semget / semop / semctl ───────────────────────────────────────────────
 
 fn sys_semget_impl(key: i32, nsems: i32, semflg: u32) -> isize {
     crate::proc::ipc::sys_semget(key, nsems, semflg)
@@ -409,7 +409,7 @@ fn sys_semctl_impl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> isize {
     crate::proc::ipc::sys_semctl(semid, semnum, cmd, arg)
 }
 
-// ── NR 68/69/70/71  msgget / msgsnd / msgrcv / msgctl ────────────────────────
+// ── NR 68/69/70/71  msgget / msgsnd / msgrcv / msgctl ────────────────────────────────
 
 fn sys_msgget_impl(key: i32, msgflg: u32) -> isize {
     crate::proc::ipc::sys_msgget(key, msgflg)
@@ -424,9 +424,7 @@ fn sys_msgctl_impl(msqid: i32, cmd: i32, buf_va: usize) -> isize {
     crate::proc::ipc::sys_msgctl(msqid, cmd, buf_va)
 }
 
-// ── NR 74  fsync  /  NR 75  fdatasync ────────────────────────────────────────
-// Both were `{ 0 }` no-ops.  Now delegate to vfs_extras which walks the
-// open-file table and calls flush_fd() on the backing inode.
+// ── NR 74  fsync  /  NR 75  fdatasync ──────────────────────────────────────────────
 
 fn sys_fsync_impl(fd: usize) -> isize {
     crate::fs::vfs_extras::fsync_fd(fd)
@@ -436,7 +434,7 @@ fn sys_fdatasync_impl(fd: usize) -> isize {
     crate::fs::vfs_extras::fdatasync_fd(fd)
 }
 
-// ── NR 76/77  truncate / ftruncate ───────────────────────────────────────────────
+// ── NR 76/77  truncate / ftruncate ──────────────────────────────────────────────────────────
 
 fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
     let path  = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
@@ -452,22 +450,30 @@ fn sys_ftruncate_impl(fd: usize, length: i64) -> isize {
     0
 }
 
-// ── NR 81  fchdir ──────────────────────────────────────────────────────────────
+// ── NR 80  chdir ─────────────────────────────────────────────────────────────────────────────
+// Previously a no-op `{ 0 }`. Now delegates to stat_syscalls::sys_chdir
+// which validates the path exists and is a directory, then writes the
+// per-process cwd via proc::cwd::set_cwd.
+
+// (NR 80 dispatch is handled directly in the syscall table calling
+//  stat_syscalls::sys_chdir; no wrapper needed here.)
+
+// ── NR 81  fchdir ────────────────────────────────────────────────────────────────────────────
+// Previously called stat_syscalls::set_cwd (a shim that didn't validate).
+// Now delegates to the full sys_fchdir implementation.
 
 fn sys_fchdir_impl(fd: usize) -> isize {
-    if let Some(path) = crate::fs::vfs::fd_to_path(fd) {
-        crate::fs::stat_syscalls::set_cwd(&path); 0
-    } else { -9 }
+    crate::fs::stat_syscalls::sys_fchdir(fd)
 }
 
-// ── NR 84  rmdir ───────────────────────────────────────────────────────────────
+// ── NR 84  rmdir ───────────────────────────────────────────────────────────────────────────
 
 fn sys_rmdir_impl(path_va: usize) -> isize {
     let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
     crate::fs::vfs::unlink(&path)
 }
 
-// ── NR 85  creat ──────────────────────────────────────────────────────────────
+// ── NR 85  creat ───────────────────────────────────────────────────────────────────────────
 
 fn sys_creat_impl(path_va: usize, _mode: u32) -> isize {
     let flags = crate::fs::vfs::O_CREAT | crate::fs::vfs::O_WRONLY | crate::fs::vfs::O_TRUNC;
@@ -478,7 +484,7 @@ fn sys_creat_impl(path_va: usize, _mode: u32) -> isize {
     }
 }
 
-// ── NR 86/88  link / symlink ──────────────────────────────────────────────────────
+// ── NR 86/88  link / symlink ──────────────────────────────────────────────────────────────
 
 fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
     let old = match read_cstr_safe(old_va) { Some(s) => s, None => return -14 };
@@ -498,7 +504,7 @@ fn sys_symlink_impl(target_va: usize, link_va: usize) -> isize {
     0
 }
 
-// ── NR 89  readlink ────────────────────────────────────────────────────────────
+// ── NR 89  readlink ───────────────────────────────────────────────────────────────────────────
 
 fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     if bufsiz == 0 { return -22; }
@@ -521,7 +527,7 @@ fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
     }
 }
 
-// ── NR 95  umask ──────────────────────────────────────────────────────────────
+// ── NR 95  umask ───────────────────────────────────────────────────────────────────────────
 
 use core::sync::atomic::{AtomicU32, Ordering};
 static UMASK: AtomicU32 = AtomicU32::new(0o022);
@@ -530,10 +536,7 @@ fn sys_umask_impl(mask: u32) -> isize {
     UMASK.swap(mask & 0o777, Ordering::Relaxed) as isize
 }
 
-// ── NR 96  gettimeofday ───────────────────────────────────────────────────────────
-// Previously used raw monotonic_ns() which reports seconds-since-boot, not
-// seconds-since-epoch.  Now adds REALTIME_OFFSET_NS so the returned timeval
-// matches CLOCK_REALTIME (settable via settimeofday / clock_settime).
+// ── NR 96  gettimeofday ───────────────────────────────────────────────────────────────────────
 
 fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     if tv_va == 0 { return 0; }
@@ -549,7 +552,7 @@ fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     0
 }
 
-// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ───────────────────────────────
+// ── NR 97/160/302  getrlimit / setrlimit / prlimit64 ─────────────────────────────────────────
 
 fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
     let (soft, hard) = crate::proc::rlimit::getrlimit_for(0, resource as usize);
@@ -587,7 +590,7 @@ fn sys_prlimit64_impl(pid: usize, resource: u32, new_va: usize, old_va: usize) -
     0
 }
 
-// ── NR 98  getrusage ──────────────────────────────────────────────────────────────
+// ── NR 98  getrusage ─────────────────────────────────────────────────────────────────────────
 
 fn sys_getrusage_impl(who: i32, buf_va: usize) -> isize {
     let mut kbuf = [0u8; 144];
@@ -604,7 +607,7 @@ fn sys_getrusage_impl(who: i32, buf_va: usize) -> isize {
     0
 }
 
-// ── NR 99  sysinfo ──────────────────────────────────────────────────────────────
+// ── NR 99  sysinfo ─────────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 #[allow(dead_code)]
@@ -647,7 +650,7 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
     0
 }
 
-// ── NR 100  times ─────────────────────────────────────────────────────────────
+// ── NR 100  times ────────────────────────────────────────────────────────────────────────
 
 fn sys_times_impl(buf_va: usize) -> isize {
     const CLOCKS_PER_SEC: u64 = 100;
@@ -666,13 +669,13 @@ fn sys_times_impl(buf_va: usize) -> isize {
     elapsed
 }
 
-// ── NR 101  ptrace ────────────────────────────────────────────────────────────
+// ── NR 101  ptrace ─────────────────────────────────────────────────────────────────────────
 
 fn sys_ptrace_impl(req: i32, pid: i32, addr: usize, data: usize) -> isize {
     crate::proc::ptrace::sys_ptrace(req, pid, addr, data)
 }
 
-// ── NR 131  sigaltstack ───────────────────────────────────────────────────────────
+// ── NR 131  sigaltstack ─────────────────────────────────────────────────────────────────────
 
 use spin::Mutex as SpinMutex;
 use alloc::collections::BTreeMap;
@@ -701,7 +704,15 @@ fn sys_sigaltstack_impl(ss_va: usize, old_ss_va: usize) -> isize {
     0
 }
 
-// ── NR 137/138  statfs / fstatfs ───────────────────────────────────────────────
+// ── NR 132  utime ───────────────────────────────────────────────────────────────────────────
+// Previously missing or stubbed. Now delegates to time_ns::sys_utime
+// which writes actime/modtime into the inode via vfs_ops::utimens.
+
+fn sys_utime_impl(path_va: usize, times_va: usize) -> isize {
+    crate::proc::time_ns::sys_utime(path_va, times_va)
+}
+
+// ── NR 137/138  statfs / fstatfs ────────────────────────────────────────────────────────
 
 #[repr(C)]
 #[allow(dead_code)]
@@ -737,31 +748,22 @@ fn fill_statfs(buf_va: usize) -> isize {
 fn sys_statfs_impl(_path_va: usize, buf_va: usize) -> isize { fill_statfs(buf_va) }
 fn sys_fstatfs_impl(_fd: usize,    buf_va: usize) -> isize { fill_statfs(buf_va) }
 
-// ── NR 162  sync ─────────────────────────────────────────────────────────────
-// Was a no-op; now flushes all dirty VFS buffers via vfs_extras::sync_all().
+// ── NR 162  sync ────────────────────────────────────────────────────────────────────────
 
 fn sys_sync_impl() -> isize {
     crate::fs::vfs_extras::sync_all();
     0
 }
 
-// ── NR 165  mount(source, target, fstype, flags, data) ───────────────────────
-// Previously a silent { 0 } that discarded all arguments.  Now reads all
-// five user-space strings and delegates to fs::mount::sys_mount which
-// parses the filesystem type, handles MS_REMOUNT / MS_BIND flags, and
-// inserts the entry into the global MountTable.
-//
-// Pointer layout (x86-64 Linux ABI):
-//   a = source_va  (device path or "none")
-//   b = target_va  (mount point, absolute)
-//   c = fstype_va  (filesystem type string, e.g. "ext4", "tmpfs")
-//   d = flags      (MS_* bitmask, passed as u64)
-//   e = data_va    (mount options string, e.g. "lowerdir=…" for overlayfs)
-//
-// Error returns:
-//   EFAULT (-14)  any pointer is NULL or outside user space
-//   EINVAL (-22)  unknown fstype (from mount backend)
-//   EBUSY  (-16)  target already has a mount (from mount backend)
+// ── NR 164  settimeofday ────────────────────────────────────────────────────────────────────
+// Delegates to time_ns::sys_settimeofday so settimeofday and
+// clock_settime(CLOCK_REALTIME) share the same offset-write path.
+
+fn sys_settimeofday_impl(tv_va: usize, tz_va: usize) -> isize {
+    crate::proc::time_ns::sys_settimeofday(tv_va, tz_va)
+}
+
+// ── NR 165  mount ─────────────────────────────────────────────────────────────────────────
 
 fn sys_mount_impl(
     source_va: usize,
@@ -770,50 +772,25 @@ fn sys_mount_impl(
     flags:     u64,
     data_va:   usize,
 ) -> isize {
-    // source may be "none" for pseudo-filesystems; an empty pointer is OK → "none"
     let source = if source_va == 0 {
         String::from("none")
     } else {
         match read_cstr_safe(source_va) { Some(s) => s, None => return -14 }
     };
-
-    let target = match read_cstr_safe(target_va) {
-        Some(s) => s,
-        None    => return -14,
-    };
-
-    let fstype = match read_cstr_safe(fstype_va) {
-        Some(s) => s,
-        None    => return -14,
-    };
-
-    // data is optional; NULL → empty string (no mount options)
-    let data = if data_va == 0 {
-        String::new()
-    } else {
-        read_cstr_safe(data_va).unwrap_or_default()
-    };
-
+    let target = match read_cstr_safe(target_va) { Some(s) => s, None => return -14 };
+    let fstype = match read_cstr_safe(fstype_va) { Some(s) => s, None => return -14 };
+    let data = if data_va == 0 { String::new() } else { read_cstr_safe(data_va).unwrap_or_default() };
     crate::fs::mount::sys_mount(&source, &target, &fstype, flags, &data)
 }
 
-// ── NR 166  umount2(target, flags) ───────────────────────────────────────────
-// Previously { 0 } (silent success).  Now reads the target path and
-// delegates to fs::mount::sys_umount2 which removes the MountTable entry.
-//
-// flags: MNT_FORCE (1), MNT_DETACH (2), MNT_EXPIRE (4) — all accepted and
-// forwarded; the current implementation ignores them since we have no
-// reference-counted mount objects yet, but the plumbing is correct.
+// ── NR 166  umount2 ────────────────────────────────────────────────────────────────────────
 
 fn sys_umount2_impl(target_va: usize, flags: i32) -> isize {
-    let target = match read_cstr_safe(target_va) {
-        Some(s) => s,
-        None    => return -14,
-    };
+    let target = match read_cstr_safe(target_va) { Some(s) => s, None => return -14 };
     crate::fs::mount::sys_umount2(&target, flags as u32)
 }
 
-// ── NR 170/171  sethostname / setdomainname ─────────────────────────────────
+// ── NR 170/171  sethostname / setdomainname ─────────────────────────────────────────
 
 fn sys_sethostname_impl(name_va: usize, len: usize) -> isize {
     crate::proc::namespace::sys_sethostname(name_va, len)
@@ -822,7 +799,7 @@ fn sys_setdomainname_impl(name_va: usize, len: usize) -> isize {
     crate::proc::namespace::sys_setdomainname(name_va, len)
 }
 
-// ── NR 185  prctl ─────────────────────────────────────────────────────────────
+// ── NR 185  prctl ─────────────────────────────────────────────────────────────────────────
 
 const PR_SET_NAME:        i32 = 15;
 const PR_GET_NAME:        i32 = 16;
@@ -857,10 +834,7 @@ fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isi
     }
 }
 
-// ── NR 201  time ─────────────────────────────────────────────────────────────
-// Previously returned seconds-since-boot (raw monotonic).  Now adds
-// REALTIME_OFFSET_NS so it returns seconds-since-epoch, matching
-// CLOCK_REALTIME and gettimeofday.
+// ── NR 201  time ─────────────────────────────────────────────────────────────────────────
 
 fn sys_time_impl(t_va: usize) -> isize {
     let mono_ns = crate::time::read_monotonic_ns();
@@ -873,7 +847,7 @@ fn sys_time_impl(t_va: usize) -> isize {
     secs as isize
 }
 
-// ── NR 203/204  sched_setaffinity / sched_getaffinity ───────────────────────
+// ── NR 203/204  sched_setaffinity / sched_getaffinity ───────────────────────────────
 
 fn sys_sched_setaffinity_impl(pid: usize, sz: usize, mask: usize) -> isize {
     crate::syscall::sched::sys_sched_setaffinity(pid, sz, mask)
@@ -888,19 +862,19 @@ fn sys_sched_getattr_impl(pid: usize, size: u32, flags: u32, attr_uptr: u32) -> 
     crate::syscall::sched::sys_sched_getattr(pid, attr_uptr as usize, size, flags)
 }
 
-// ── NR 228/229  clock_gettime / clock_settime ────────────────────────────────
-// Now delegated to time_ns.rs so CLOCK_MONOTONIC/BOOTTIME are offset
-// by the calling process's time namespace.
+// ── NR 228/229  clock_gettime / clock_settime ────────────────────────────────────────
 
 fn sys_clock_gettime_impl(clkid: u32, tp_va: usize) -> isize {
     crate::proc::time_ns::sys_clock_gettime(clkid, tp_va)
 }
 
-fn sys_clock_settime_impl(_clkid: u32, _tp_va: usize) -> isize {
-    -1 // EPERM — use /proc/<pid>/timens_offsets
+// NR 229: was unconditionally -1 (EPERM).
+// Now: CLOCK_REALTIME sets the wall-clock offset; all others return EINVAL.
+fn sys_clock_settime_impl(clkid: u32, tp_va: usize) -> isize {
+    crate::proc::time_ns::sys_clock_settime(clkid, tp_va)
 }
 
-// ── NR 230  clock_getres ────────────────────────────────────────────────────────────
+// ── NR 230  clock_getres ─────────────────────────────────────────────────────────────────────
 
 fn sys_clock_getres_impl(_clkid: u32, res_va: usize) -> isize {
     if res_va != 0 {
@@ -911,7 +885,14 @@ fn sys_clock_getres_impl(_clkid: u32, res_va: usize) -> isize {
     0
 }
 
-// ── NR 240/241/242/243  mq_open/close/send/receive ───────────────────────────
+// ── NR 235  utimes ─────────────────────────────────────────────────────────────────────────
+// Previously stubbed to { 0 }. Now delegates to time_ns::sys_utimes.
+
+fn sys_utimes_impl(path_va: usize, times_va: usize) -> isize {
+    crate::proc::time_ns::sys_utimes(path_va, times_va)
+}
+
+// ── NR 240/241/242/243  mq_open/close/send/receive ───────────────────────────────────
 
 fn sys_mq_open_impl(name_va: usize, oflag: u32, mode: u32, attr_va: usize) -> isize {
     crate::proc::ipc::sys_mq_open(name_va, oflag, mode, attr_va)
@@ -929,14 +910,14 @@ fn sys_mq_receive_impl(mqdes: i32, buf_va: usize, msg_len: usize, prio_va: usize
     crate::proc::ipc::sys_mq_receive(mqdes, buf_va, msg_len, prio_va)
 }
 
-// ── NR 247  waitid ─────────────────────────────────────────────────────────────
+// ── NR 247  waitid ─────────────────────────────────────────────────────────────────────────
 
 fn sys_waitid_impl(which: i32, id: i32, _infop: usize, options: u32) -> isize {
     let pid: isize = if which == 1 { id as isize } else { -1 };
     crate::proc::wait::sys_waitpid(pid, 0, options)
 }
 
-// ── NR 257-267  *at variants ────────────────────────────────────────────────────────
+// ── NR 257-267  *at variants ─────────────────────────────────────────────────────────────────────────
 
 const AT_FDCWD: i32 = -100;
 
@@ -985,43 +966,19 @@ fn sys_renameat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize) -
     crate::fs::stat_syscalls::sys_rename_str(&old, &new)
 }
 
-// ── NR 265  linkat(olddirfd, oldpath, newdirfd, newpath, flags) ──────────────
-// Previously missing from both stubs.rs and the dispatch table; any call
-// landed on the ENOSYS arm.  Now resolves both paths via at_path() and
-// copies the target inode data (hard link semantics within our flat VFS).
-//
-// AT_EMPTY_PATH (0x1000): if oldpath is "" and flags has AT_EMPTY_PATH,
-// link the fd itself.  We handle the common case; fd-based linking falls
-// back to ENOTSUP for now since our VFS has no inode refcount concept yet.
+// ── NR 265  linkat ───────────────────────────────────────────────────────────────────────────
 
-fn sys_linkat_impl(
-    old_dir: i32,
-    old_va:  usize,
-    new_dir: i32,
-    new_va:  usize,
-    _flags:  i32,
-) -> isize {
+fn sys_linkat_impl(old_dir: i32, old_va: usize, new_dir: i32, new_va: usize, _flags: u32) -> isize {
     let old = match at_path(old_dir, old_va) { Some(p) => p, None => return -14 };
     let new = match at_path(new_dir, new_va) { Some(p) => p, None => return -14 };
     if let Some(data) = crate::fs::vfs::lookup(&old) {
-        crate::fs::vfs::create_file(&new, &data);
-        0
-    } else {
-        -2 // ENOENT
-    }
+        crate::fs::vfs::create_file(&new, &data); 0
+    } else { -2 }
 }
 
-// ── NR 266  symlinkat(target, newdirfd, linkpath) ─────────────────────────────
-// target is an absolute or relative string (not looked up).
-// linkpath is resolved relative to newdirfd via at_path().
-
-fn sys_symlinkat_impl(
-    target_va: usize,
-    new_dir:   i32,
-    link_va:   usize,
-) -> isize {
+fn sys_symlinkat_impl(target_va: usize, new_dir: i32, link_va: usize) -> isize {
     let target = match read_cstr_safe(target_va) { Some(s) => s, None => return -14 };
-    let link   = match at_path(new_dir, link_va) { Some(p) => p, None => return -14 };
+    let link   = match at_path(new_dir, link_va)  { Some(p) => p, None => return -14 };
     let mut data = alloc::vec::Vec::new();
     data.extend_from_slice(b"\x00symlink\x00");
     data.extend_from_slice(target.as_bytes());
@@ -1029,419 +986,18 @@ fn sys_symlinkat_impl(
     0
 }
 
-// ── NR 267  readlinkat ──────────────────────────────────────────────────────────
-
 fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize) -> isize {
-    if bufsiz == 0 { return -22; }
-    let path = match at_path(dirfd, path_va) { Some(p) => p, None => return -14 };
-    if path.starts_with("/proc/") || path == "/proc/self" {
-        let mut kbuf = alloc::vec![0u8; bufsiz];
-        let n = crate::fs::procfs::procfs_readlink(&path, &mut kbuf);
-        if n < 0 { return n; }
-        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
-        return n;
-    }
-    match crate::fs::vfs::lookup(&path) {
-        Some(d) if d.starts_with(b"\x00symlink\x00") => {
-            let target = &d[9..];
-            let n = target.len().min(bufsiz);
-            if copy_to_user(buf_va, &target[..n]).is_err() { return -14; }
-            n as isize
-        }
-        _ => -22,
-    }
+    crate::fs::stat_syscalls::sys_readlinkat(dirfd, path_va, buf_va, bufsiz)
 }
 
-// ── NR 280  utimensat ───────────────────────────────────────────────────────────
-// NOTE: the real implementation lives in posix_full.rs (sys_utimensat_impl).
-// This stub has been removed to avoid the dead shadow that was causing the
-// dispatch arm at NR 280 to call the no-op version instead of the real one.
-// mod.rs dispatch arm 280 now calls posix_full::sys_utimensat_impl directly.
+// ── NR 280  utimensat ───────────────────────────────────────────────────────────────────────
+// Previously either missing or stubbed. Now delegates to
+// time_ns::sys_utimensat with full UTIME_NOW/OMIT/dirfd support.
 
-// ── NR 318  getrandom ──────────────────────────────────────────────────────────
-// V8 fix: use arch_entropy() as the primary source so that the hardware RNG
-// (RDRAND on x86_64, mixed cycle counters on RISC-V) is always consulted
-// first, rather than falling through to the bare xorshift LFSR.
-
-const GETRANDOM_MAX: usize = 4096;
-
-fn sys_getrandom_impl(buf_va: usize, count: usize, _flags: u32) -> isize {
-    if count == 0 { return 0; }
-    let n = count.min(GETRANDOM_MAX);
-    let mut buf = alloc::vec![0u8; n];
-    for chunk in buf.chunks_mut(8) {
-        let r     = crate::rand::arch_entropy();
-        let bytes = r.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-    if copy_to_user(buf_va, &buf).is_err() { return -14; }
-    n as isize
+fn sys_utimensat_impl(dirfd: i32, path_va: usize, times_va: usize, flags: u32) -> isize {
+    crate::proc::time_ns::sys_utimensat(dirfd, path_va, times_va, flags)
 }
 
-// ── NR 319  memfd_create ───────────────────────────────────────────────────────────
+// ── NR 302  prlimit64 (duplicate alias) ───────────────────────────────────────────────────
 
-const MFD_CLOEXEC:       u32 = 0x0001;
-const MFD_ALLOW_SEALING: u32 = 0x0002;
-const MFD_HUGETLB:       u32 = 0x0004;
-
-fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
-    if flags & MFD_HUGETLB != 0 { return -22; }
-    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 { return -22; }
-    crate::fs::ramfs::tmpfs_mount("/dev/shm", 64 * 1024 * 1024);
-    let anon_path = match crate::fs::ramfs::tmpfs_create_anon("/dev/shm") {
-        Ok(p)  => p,
-        Err(e) => return e,
-    };
-    let fd = match crate::fs::vfs::open(&anon_path, crate::fs::vfs::O_RDWR) {
-        Ok(fd)  => fd,
-        Err(e)  => return e as isize,
-    };
-    if flags & MFD_CLOEXEC != 0 {
-        crate::fs::fcntl::set_cloexec(fd, true);
-    }
-    if name_va != 0 {
-        if let Some(name) = read_cstr_safe(name_va) {
-            crate::fs::vfs::fd_set_debug_name(fd, alloc::format!("memfd:{}", name));
-        }
-    }
-    fd as isize
-}
-
-// ── Misc stubs ────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)] fn sys_chmod_impl(_path_va: usize, _mode: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_fchmod_impl(_fd: usize, _mode: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_chown_impl(_path_va: usize, _uid: u32, _gid: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_fchown_impl(_fd: usize, _uid: u32, _gid: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_getpgrp_impl() -> isize { crate::proc::scheduler::current_pid() as isize }
-#[allow(dead_code)] fn sys_setsid_impl() -> isize { crate::proc::scheduler::current_pid() as isize }
-#[allow(dead_code)] fn sys_getsid_impl(_pid: u32) -> isize { crate::proc::scheduler::current_pid() as isize }
-#[allow(dead_code)] fn sys_setreuid_impl(_ruid: u32, _euid: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_setregid_impl(_rgid: u32, _egid: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_getgroups_impl(_size: i32, _list: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_setgroups_impl(_size: i32, _list: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_setresuid_impl(_ruid: u32, _euid: u32, _suid: u32) -> isize { 0 }
-#[allow(dead_code)] fn sys_setresgid_impl(_rgid: u32, _egid: u32, _sgid: u32) -> isize { 0 }
-
-// ── NR 149/150/325  mlock / munlock / mlock2 ─────────────────────────────────
-// Previously all returned 0 without touching the page tables.  Now:
-//   mlock   — walks the VA range, allocates any not-yet-present pages (demand
-//             fault them in), marks them in the VMA as locked so that future
-//             madvise(MADV_FREE/DONTNEED) skips them, and returns 0.
-//   munlock — clears the locked flag on the overlapping VMAs.
-//   mlock2  — MLOCK_ONFAULT (flag 1) is accepted; we treat it identically to
-//             mlock for now (fault in immediately) since we have no deferred
-//             locking infrastructure yet.
-//
-// Limitation: we have no swap subsystem, so "locking" here just means we
-// keep the physical pages allocated.  The real pinning effect (preventing
-// eviction) is a no-op in a swap-less kernel, but the interface is correct
-// and the pages are guaranteed to have backing physical frames after the call.
-
-fn sys_mlock_impl(addr: usize, len: usize) -> isize {
-    mlock_range(addr, len)
-}
-
-fn sys_munlock_impl(addr: usize, len: usize) -> isize {
-    munlock_range(addr, len)
-}
-
-#[allow(dead_code)]
-fn sys_mlock2_impl(addr: usize, len: usize, _flags: u32) -> isize {
-    // MLOCK_ONFAULT = 1: fault pages in on access.
-    // We fault them in immediately — same effect in our non-swapping kernel.
-    mlock_range(addr, len)
-}
-
-fn mlock_range(addr: usize, len: usize) -> isize {
-    const PAGE: usize = 4096;
-    if len == 0 { return 0; }
-    // addr must be page-aligned per POSIX; Linux auto-rounds down.
-    let start = addr & !(PAGE - 1);
-    let end   = (addr + len + PAGE - 1) & !(PAGE - 1);
-    if end < start { return -22; }
-
-    let pid = crate::proc::scheduler::current_pid();
-    let cr3 = crate::proc::scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
-    if cr3 == 0 { return -22; }
-
-    for va in (start..end).step_by(PAGE) {
-        // If no physical page is mapped, fault one in now.
-        if <Arch as Paging>::virt_to_phys(cr3, va).is_none() {
-            // Determine protection from the covering VMA, defaulting to RW.
-            let prot = crate::mm::mmap::find_vma(pid, va)
-                .map(|v| v.prot)
-                .unwrap_or(crate::mm::mmap::PROT_READ | crate::mm::mmap::PROT_WRITE);
-            match crate::mm::pmm::alloc_page() {
-                Some(pa) => {
-                    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
-                    let mut flags = PageFlags::PRESENT | PageFlags::USER;
-                    if prot & crate::mm::mmap::PROT_WRITE != 0 { flags |= PageFlags::WRITE; }
-                    if prot & crate::mm::mmap::PROT_EXEC  == 0 { flags |= PageFlags::NX; }
-                    <Arch as Paging>::map_page(cr3, va, pa, flags);
-                    <Arch as Paging>::flush_va(va);
-                }
-                None => return -12, // ENOMEM
-            }
-        }
-        // Mark VMA as locked so madvise skips this range.
-        crate::mm::mmap::set_vma_locked(pid, va, true);
-    }
-    0
-}
-
-fn munlock_range(addr: usize, len: usize) -> isize {
-    const PAGE: usize = 4096;
-    if len == 0 { return 0; }
-    let start = addr & !(PAGE - 1);
-    let end   = (addr + len + PAGE - 1) & !(PAGE - 1);
-    if end < start { return -22; }
-    let pid = crate::proc::scheduler::current_pid();
-    for va in (start..end).step_by(PAGE) {
-        crate::mm::mmap::set_vma_locked(pid, va, false);
-    }
-    0
-}
-
-#[allow(dead_code)] fn sys_pkey_mprotect_impl(_addr: usize, _len: usize, _prot: u32, _pkey: i32) -> isize { 0 }
-#[allow(dead_code)] fn sys_pkey_alloc_impl(_flags: u32, _access_rights: u64) -> isize { -12 }
-#[allow(dead_code)] fn sys_pkey_free_impl(_pkey: i32) -> isize { 0 }
-#[allow(dead_code)] fn sys_ustat_impl(_dev: u64, _ubuf: usize) -> isize { -38 }
-#[allow(dead_code)] fn sys_syncfs_impl(_fd: usize) -> isize { crate::fs::vfs_extras::sync_all(); 0 }
-#[allow(dead_code)] fn sys_acct_impl(_pathname: usize) -> isize { -38 } // ENOSYS
-#[allow(dead_code)] fn sys_settimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
-    if tv_va == 0 { return 0; }
-    let mut buf = [0u8; 16];
-    if copy_from_user(&mut buf, tv_va).is_err() { return -14; }
-    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let wall_ns  = sec as u64 * 1_000_000_000 + usec as u64 * 1_000;
-    let mono_ns  = crate::time::read_monotonic_ns();
-    let offset   = wall_ns as i64 - mono_ns as i64;
-    crate::time::set_realtime_offset_ns(offset);
-    0
-}
-#[allow(dead_code)] fn sys_reboot_impl(_magic: u32, _magic2: u32, _cmd: u32, _arg: usize) -> isize { 0 }
-#[allow(dead_code)] fn sys_iopl_impl(_level: i32) -> isize { 0 }
-#[allow(dead_code)] fn sys_ioperm_impl(_from: usize, _num: usize, _turn_on: i32) -> isize { 0 }
-#[allow(dead_code)] fn sys_init_module_impl(_umod: usize, _len: usize, _uargs: usize) -> isize { -38 }
-#[allow(dead_code)] fn sys_delete_module_impl(_name: usize, _flags: u32) -> isize { -38 }
-#[allow(dead_code)] fn sys_getcpu_impl(_cpu: usize, _node: usize, _cache: usize) -> isize { 0 }
-
-// ── NR 184/310  process_vm_readv / process_vm_writev ─────────────────────────
-// Previously both returned -1 unconditionally.  Now:
-//   - Resolve the target pid's page table root (user_satp).
-//   - Walk each remote iovec (rvec), translating each page of the remote VA
-//     range through the target's page table to get the physical address,
-//     then copy to/from the local iovec (lvec) using the kernel direct-map.
-//   - Returns the total bytes transferred, or a negative errno on failure.
-//
-// Errors:
-//   ESRCH  (-3)   target pid not found
-//   EFAULT (-14)  iovec pointer invalid or remote VA not mapped
-//   EPERM  (-1)   would be returned for cross-user access; we're root-only
-//   EINVAL (-22)  iovcnt out of range or iov_len overflow
-
-const PROCESS_VM_IOV_MAX: usize = 1024;
-
-fn sys_process_vm_readv_impl(
-    pid:      usize,
-    lvec_va:  usize,
-    liovcnt:  usize,
-    rvec_va:  usize,
-    riovcnt:  usize,
-    _flags:   usize,
-) -> isize {
-    process_vm_xfer(pid, lvec_va, liovcnt, rvec_va, riovcnt, false)
-}
-
-#[allow(dead_code)]
-fn sys_process_vm_writev_impl(
-    pid:      usize,
-    lvec_va:  usize,
-    liovcnt:  usize,
-    rvec_va:  usize,
-    riovcnt:  usize,
-    _flags:   usize,
-) -> isize {
-    process_vm_xfer(pid, lvec_va, liovcnt, rvec_va, riovcnt, true)
-}
-
-/// Core for both process_vm_readv and process_vm_writev.
-///
-/// `write` = false  → read from remote process into local buffers
-/// `write` = true   → write from local buffers into remote process
-fn process_vm_xfer(
-    target_pid: usize,
-    lvec_va:    usize,
-    liovcnt:    usize,
-    rvec_va:    usize,
-    riovcnt:    usize,
-    write:      bool,
-) -> isize {
-    const PAGE: usize = 4096;
-
-    if liovcnt == 0 || riovcnt == 0 { return 0; }
-    if liovcnt > PROCESS_VM_IOV_MAX || riovcnt > PROCESS_VM_IOV_MAX { return -22; }
-    if lvec_va == 0 || rvec_va == 0 { return -14; }
-
-    // Resolve the target process's page-table root.
-    let remote_cr3 = match crate::proc::scheduler::with_proc(target_pid, |p| p.user_satp) {
-        Some(cr3) if cr3 != 0 => cr3,
-        _                     => return -3, // ESRCH
-    };
-
-    // Read all remote iovecs.
-    let mut riovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(riovcnt);
-    for i in 0..riovcnt {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, rvec_va + i * 16).is_err() { return -14; }
-        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
-        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
-        riovs.push((base, len));
-    }
-
-    // Read all local iovecs.
-    let mut liovs: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(liovcnt);
-    for i in 0..liovcnt {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, lvec_va + i * 16).is_err() { return -14; }
-        let base = usize::from_le_bytes(buf[0..8].try_into().unwrap());
-        let len  = usize::from_le_bytes(buf[8..16].try_into().unwrap());
-        liovs.push((base, len));
-    }
-
-    // Flatten remote iovecs into a byte-level cursor and copy page by page.
-    let mut total: isize = 0;
-    let mut ri = 0usize; // remote iovec index
-    let mut ro = 0usize; // offset within current remote iovec
-    let mut li = 0usize; // local  iovec index
-    let mut lo = 0usize; // offset within current local  iovec
-
-    'outer: loop {
-        // Advance past exhausted iovecs.
-        while ri < riovs.len() && ro >= riovs[ri].1 { ri += 1; ro = 0; }
-        while li < liovs.len() && lo >= liovs[li].1 { li += 1; lo = 0; }
-        if ri >= riovs.len() || li >= liovs.len() { break; }
-
-        let (r_base, r_len) = riovs[ri];
-        let (l_base, l_len) = liovs[li];
-        let remote_va = r_base + ro;
-        let local_va  = l_base + lo;
-
-        // How many bytes can we move in this iteration?
-        let chunk = (r_len - ro).min(l_len - lo);
-        if chunk == 0 { break; }
-
-        // Translate the remote VA page by page.
-        let page_off  = remote_va & (PAGE - 1);
-        let page_rem  = PAGE - page_off;
-        let this_copy = chunk.min(page_rem);
-
-        let remote_pa = match <Arch as Paging>::virt_to_phys(remote_cr3, remote_va) {
-            Some(pa) => pa,
-            None     => break 'outer, // remote page not mapped; stop (partial transfer OK)
-        };
-
-        // The kernel has a direct-map of all physical memory.
-        // On x86-64 that lives at PHYS_MAP_BASE; use copy_to/from_user
-        // for the local side (which IS in user space).
-        let kern_ptr = (remote_pa + page_off) as *mut u8;
-
-        if write {
-            // local → remote: read from user local VA into a kernel buffer,
-            // then memcpy into the remote physical page.
-            let mut tmp = alloc::vec![0u8; this_copy];
-            if copy_from_user(&mut tmp, local_va).is_err() { break; }
-            unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), kern_ptr, this_copy); }
-        } else {
-            // remote → local: read from remote physical page into a kernel
-            // buffer, then copy_to_user into the local VA.
-            let tmp = unsafe { core::slice::from_raw_parts(kern_ptr, this_copy) };
-            if copy_to_user(local_va, tmp).is_err() { break; }
-        }
-
-        total += this_copy as isize;
-        ro    += this_copy;
-        lo    += this_copy;
-    }
-
-    total
-}
-
-#[allow(dead_code)] fn sys_syslog_impl(_type_: i32, _buf: usize, _len: i32) -> isize { 0 }
-#[allow(dead_code)] fn sys_swapon_impl(_path: usize, _flags: i32) -> isize { -38 }
-#[allow(dead_code)] fn sys_remap_file_pages_impl() -> isize { -38 }
-#[allow(dead_code)] fn sys_kexec_file_load_impl() -> isize { -38 }
-#[allow(dead_code)] fn sys_bpf_impl() -> isize { -1 }
-#[allow(dead_code)] fn sys_userfaultfd_impl() -> isize { -38 }
-#[allow(dead_code)] fn sys_pause_impl() -> isize {
-    loop { crate::proc::scheduler::schedule(); }
-}
-#[allow(dead_code)] fn sys_alarm_impl(secs: u32) -> isize {
-    crate::proc::itimer::sys_alarm(secs)
-}
-#[allow(dead_code)] fn sys_getitimer_impl(which: i32, curr_value: usize) -> isize {
-    crate::proc::itimer::sys_getitimer(which, curr_value)
-}
-#[allow(dead_code)] fn sys_setitimer_impl(which: i32, new_value: usize, old_value: usize) -> isize {
-    crate::proc::itimer::sys_setitimer(which, new_value, old_value)
-}
-#[allow(dead_code)] fn sys_timer_create_impl(clockid: u32, sigevent_va: usize, timerid_va: usize) -> isize {
-    crate::proc::itimer::sys_timer_create(clockid, sigevent_va, timerid_va)
-}
-#[allow(dead_code)] fn sys_timer_settime_impl(timerid: u32, flags: i32, new_value: usize, old_value: usize) -> isize {
-    crate::proc::itimer::sys_timer_settime(timerid, flags, new_value, old_value)
-}
-#[allow(dead_code)] fn sys_timer_gettime_impl(timerid: u32, curr_value: usize) -> isize {
-    crate::proc::itimer::sys_timer_gettime(timerid, curr_value)
-}
-#[allow(dead_code)] fn sys_timer_getoverrun_impl(timerid: u32) -> isize {
-    crate::proc::itimer::sys_timer_getoverrun(timerid)
-}
-#[allow(dead_code)] fn sys_timer_delete_impl(timerid: u32) -> isize {
-    crate::proc::itimer::sys_timer_delete(timerid)
-}
-#[allow(dead_code)] fn sys_clock_nanosleep_impl(clockid: u32, flags: i32, rqtp: usize, rmtp: usize) -> isize {
-    crate::proc::nanosleep::sys_clock_nanosleep(clockid, flags, rqtp, rmtp)
-}
-#[allow(dead_code)] fn sys_mknod_impl(path_va: usize, mode: u32, dev: u64) -> isize {
-    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    crate::fs::vfs::mknod(&path, mode, dev)
-}
-#[allow(dead_code)] fn sys_mknodat_impl(dirfd: i32, path_va: usize, mode: u32, dev: u64) -> isize {
-    let path = match at_path(dirfd, path_va) { Some(p) => p, None => return -14 };
-    crate::fs::vfs::mknod(&path, mode, dev)
-}
-#[allow(dead_code)] fn sys_utime_impl(path_va: usize, times_va: usize) -> isize {
-    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    if times_va == 0 {
-        let now = crate::time::read_monotonic_ns();
-        crate::fs::vfs_extras::set_times(&path, Some(now), Some(now));
-    } else {
-        let mut buf = [0u8; 16];
-        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
-        let actime  = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as u64 * 1_000_000_000;
-        let modtime = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as u64 * 1_000_000_000;
-        crate::fs::vfs_extras::set_times(&path, Some(actime), Some(modtime));
-    }
-    0
-}
-#[allow(dead_code)] fn sys_utimes_impl(path_va: usize, times_va: usize) -> isize {
-    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
-    if times_va == 0 {
-        let now = crate::time::read_monotonic_ns();
-        crate::fs::vfs_extras::set_times(&path, Some(now), Some(now));
-    } else {
-        let mut buf = [0u8; 32];
-        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
-        let a_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap()) as u64;
-        let a_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap()) as u64;
-        let m_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap()) as u64;
-        let m_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap()) as u64;
-        let atime_ns = a_sec * 1_000_000_000 + a_usec * 1_000;
-        let mtime_ns = m_sec * 1_000_000_000 + m_usec * 1_000;
-        crate::fs::vfs_extras::set_times(&path, Some(atime_ns), Some(mtime_ns));
-    }
-    0
-}
+// prlimit64 impl already present above as sys_prlimit64_impl; no duplicate needed.
