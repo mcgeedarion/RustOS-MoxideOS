@@ -424,9 +424,17 @@ fn sys_msgctl_impl(msqid: i32, cmd: i32, buf_va: usize) -> isize {
     crate::proc::ipc::sys_msgctl(msqid, cmd, buf_va)
 }
 
-// ── NR 74/75  fsync / fdatasync ───────────────────────────────────────────────
-#[allow(dead_code)]
-fn sys_fsync_impl(_fd: usize) -> isize { 0 }
+// ── NR 74  fsync  /  NR 75  fdatasync ────────────────────────────────────────
+// Both were `{ 0 }` no-ops.  Now delegate to vfs_extras which walks the
+// open-file table and calls flush_fd() on the backing inode.
+
+fn sys_fsync_impl(fd: usize) -> isize {
+    crate::fs::vfs_extras::fsync_fd(fd)
+}
+
+fn sys_fdatasync_impl(fd: usize) -> isize {
+    crate::fs::vfs_extras::fdatasync_fd(fd)
+}
 
 // ── NR 76/77  truncate / ftruncate ───────────────────────────────────────────────
 
@@ -523,13 +531,18 @@ fn sys_umask_impl(mask: u32) -> isize {
 }
 
 // ── NR 96  gettimeofday ───────────────────────────────────────────────────────────
+// Previously used raw monotonic_ns() which reports seconds-since-boot, not
+// seconds-since-epoch.  Now adds REALTIME_OFFSET_NS so the returned timeval
+// matches CLOCK_REALTIME (settable via settimeofday / clock_settime).
 
 fn sys_gettimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
     if tv_va == 0 { return 0; }
-    let ns   = crate::time::monotonic_ns();
-    let sec  = (ns / 1_000_000_000) as i64;
-    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
-    let mut buf = [0u8; 16];
+    let mono_ns  = crate::time::read_monotonic_ns();
+    let offset   = crate::time::realtime_offset_ns();
+    let real_ns  = (mono_ns as i64).wrapping_add(offset) as u64;
+    let sec      = (real_ns / 1_000_000_000) as i64;
+    let usec     = ((real_ns % 1_000_000_000) / 1_000) as i64;
+    let mut buf  = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
     buf[8..16].copy_from_slice(&usec.to_le_bytes());
     if copy_to_user(tv_va, &buf).is_err() { return -14; }
@@ -615,7 +628,7 @@ struct SysInfo {
 fn sys_sysinfo_impl(info_va: usize) -> isize {
     let total    = crate::mm::pmm::total_pages() as u64 * 4096;
     let free     = crate::mm::pmm::free_pages()  as u64 * 4096;
-    let uptime_s = (crate::time::monotonic_ns() / 1_000_000_000) as i64;
+    let uptime_s = (crate::time::read_monotonic_ns() / 1_000_000_000) as i64;
     let nprocs   = crate::proc::scheduler::proc_count().min(u16::MAX as usize) as u16;
     let info = SysInfo {
         uptime: uptime_s, loads: [0; 3],
@@ -639,7 +652,7 @@ fn sys_sysinfo_impl(info_va: usize) -> isize {
 fn sys_times_impl(buf_va: usize) -> isize {
     const CLOCKS_PER_SEC: u64 = 100;
     const NS_PER_TICK:    u64 = 1_000_000_000 / CLOCKS_PER_SEC;
-    let now_ns   = crate::time::monotonic_ns();
+    let now_ns   = crate::time::read_monotonic_ns();
     let elapsed  = (now_ns / NS_PER_TICK) as i64;
     if buf_va != 0 {
         let pid    = crate::proc::scheduler::current_pid();
@@ -725,8 +738,12 @@ fn sys_statfs_impl(_path_va: usize, buf_va: usize) -> isize { fill_statfs(buf_va
 fn sys_fstatfs_impl(_fd: usize,    buf_va: usize) -> isize { fill_statfs(buf_va) }
 
 // ── NR 162  sync ─────────────────────────────────────────────────────────────
-#[allow(dead_code)]
-fn sys_sync_impl() -> isize { 0 }
+// Was a no-op; now flushes all dirty VFS buffers via vfs_extras::sync_all().
+
+fn sys_sync_impl() -> isize {
+    crate::fs::vfs_extras::sync_all();
+    0
+}
 
 // ── NR 170/171  sethostname / setdomainname ─────────────────────────────────
 
@@ -773,9 +790,15 @@ fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isi
 }
 
 // ── NR 201  time ─────────────────────────────────────────────────────────────
+// Previously returned seconds-since-boot (raw monotonic).  Now adds
+// REALTIME_OFFSET_NS so it returns seconds-since-epoch, matching
+// CLOCK_REALTIME and gettimeofday.
 
 fn sys_time_impl(t_va: usize) -> isize {
-    let secs = (crate::time::monotonic_ns() / 1_000_000_000) as i64;
+    let mono_ns = crate::time::read_monotonic_ns();
+    let offset  = crate::time::realtime_offset_ns();
+    let real_ns = (mono_ns as i64).wrapping_add(offset) as u64;
+    let secs    = (real_ns / 1_000_000_000) as i64;
     if t_va != 0 {
         if copy_to_user(t_va, &secs.to_le_bytes()).is_err() { return -14; }
     }
@@ -918,8 +941,10 @@ fn sys_readlinkat_impl(dirfd: i32, path_va: usize, buf_va: usize, bufsiz: usize)
 }
 
 // ── NR 280  utimensat ───────────────────────────────────────────────────────────
-
-fn sys_utimensat_impl(_dirfd: i32, _path_va: usize, _times_va: usize, _flags: i32) -> isize { 0 }
+// NOTE: the real implementation lives in posix_full.rs (sys_utimensat_impl).
+// This stub has been removed to avoid the dead shadow that was causing the
+// dispatch arm at NR 280 to call the no-op version instead of the real one.
+// mod.rs dispatch arm 280 now calls posix_full::sys_utimensat_impl directly.
 
 // ── NR 318  getrandom ──────────────────────────────────────────────────────────
 // V8 fix: use arch_entropy() as the primary source so that the hardware RNG
@@ -972,4 +997,123 @@ fn sys_memfd_create_impl(name_va: usize, flags: u32) -> isize {
 
 // ── Misc stubs ────────────────────────────────────────────────────────────────
 
-#[allow(dead_code)] fn sys_chmod_impl(_path_va: usize, _mode: u32) 
+#[allow(dead_code)] fn sys_chmod_impl(_path_va: usize, _mode: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_fchmod_impl(_fd: usize, _mode: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_chown_impl(_path_va: usize, _uid: u32, _gid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_fchown_impl(_fd: usize, _uid: u32, _gid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_getpgrp_impl() -> isize { crate::proc::scheduler::current_pid() as isize }
+#[allow(dead_code)] fn sys_setsid_impl() -> isize { crate::proc::scheduler::current_pid() as isize }
+#[allow(dead_code)] fn sys_getsid_impl(_pid: u32) -> isize { crate::proc::scheduler::current_pid() as isize }
+#[allow(dead_code)] fn sys_setreuid_impl(_ruid: u32, _euid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_setregid_impl(_rgid: u32, _egid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_getgroups_impl(_size: i32, _list: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_setgroups_impl(_size: i32, _list: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_setresuid_impl(_ruid: u32, _euid: u32, _suid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_setresgid_impl(_rgid: u32, _egid: u32, _sgid: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_mlock2_impl(_addr: usize, _len: usize, _flags: u32) -> isize { 0 }
+#[allow(dead_code)] fn sys_pkey_mprotect_impl(_addr: usize, _len: usize, _prot: u32, _pkey: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_pkey_alloc_impl(_flags: u32, _access_rights: u64) -> isize { -12 }
+#[allow(dead_code)] fn sys_pkey_free_impl(_pkey: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_ustat_impl(_dev: u64, _ubuf: usize) -> isize { -38 }
+#[allow(dead_code)] fn sys_syncfs_impl(_fd: usize) -> isize { crate::fs::vfs_extras::sync_all(); 0 }
+#[allow(dead_code)] fn sys_acct_impl(_pathname: usize) -> isize { -38 } // ENOSYS
+#[allow(dead_code)] fn sys_settimeofday_impl(tv_va: usize, _tz_va: usize) -> isize {
+    if tv_va == 0 { return 0; }
+    let mut buf = [0u8; 16];
+    if copy_from_user(&mut buf, tv_va).is_err() { return -14; }
+    let sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let usec = i64::from_le_bytes(buf[8..16].try_into().unwrap());
+    let wall_ns  = sec as u64 * 1_000_000_000 + usec as u64 * 1_000;
+    let mono_ns  = crate::time::read_monotonic_ns();
+    let offset   = wall_ns as i64 - mono_ns as i64;
+    crate::time::set_realtime_offset_ns(offset);
+    0
+}
+#[allow(dead_code)] fn sys_reboot_impl(_magic: u32, _magic2: u32, _cmd: u32, _arg: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_iopl_impl(_level: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_ioperm_impl(_from: usize, _num: usize, _turn_on: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_init_module_impl(_umod: usize, _len: usize, _uargs: usize) -> isize { -38 }
+#[allow(dead_code)] fn sys_delete_module_impl(_name: usize, _flags: u32) -> isize { -38 }
+#[allow(dead_code)] fn sys_getcpu_impl(_cpu: usize, _node: usize, _cache: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_process_vm_readv_impl(_pid: usize, _lvec: usize, _liovcnt: usize, _rvec: usize, _riovcnt: usize, _flags: usize) -> isize { -1 }
+#[allow(dead_code)] fn sys_process_vm_writev_impl(_pid: usize, _lvec: usize, _liovcnt: usize, _rvec: usize, _riovcnt: usize, _flags: usize) -> isize { -1 }
+#[allow(dead_code)] fn sys_syslog_impl(_type_: i32, _buf: usize, _len: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_mount_impl(_src: usize, _tgt: usize, _fs: usize, _flags: u64, _data: usize) -> isize { 0 }
+#[allow(dead_code)] fn sys_umount2_impl(_tgt: usize, _flags: i32) -> isize { 0 }
+#[allow(dead_code)] fn sys_swapon_impl(_path: usize, _flags: i32) -> isize { -38 }
+#[allow(dead_code)] fn sys_remap_file_pages_impl() -> isize { -38 }
+#[allow(dead_code)] fn sys_kexec_file_load_impl() -> isize { -38 }
+#[allow(dead_code)] fn sys_bpf_impl() -> isize { -1 }
+#[allow(dead_code)] fn sys_userfaultfd_impl() -> isize { -38 }
+#[allow(dead_code)] fn sys_pause_impl() -> isize {
+    loop { crate::proc::scheduler::schedule(); }
+}
+#[allow(dead_code)] fn sys_alarm_impl(secs: u32) -> isize {
+    crate::proc::itimer::sys_alarm(secs)
+}
+#[allow(dead_code)] fn sys_getitimer_impl(which: i32, curr_value: usize) -> isize {
+    crate::proc::itimer::sys_getitimer(which, curr_value)
+}
+#[allow(dead_code)] fn sys_setitimer_impl(which: i32, new_value: usize, old_value: usize) -> isize {
+    crate::proc::itimer::sys_setitimer(which, new_value, old_value)
+}
+#[allow(dead_code)] fn sys_timer_create_impl(clockid: u32, sigevent_va: usize, timerid_va: usize) -> isize {
+    crate::proc::itimer::sys_timer_create(clockid, sigevent_va, timerid_va)
+}
+#[allow(dead_code)] fn sys_timer_settime_impl(timerid: u32, flags: i32, new_value: usize, old_value: usize) -> isize {
+    crate::proc::itimer::sys_timer_settime(timerid, flags, new_value, old_value)
+}
+#[allow(dead_code)] fn sys_timer_gettime_impl(timerid: u32, curr_value: usize) -> isize {
+    crate::proc::itimer::sys_timer_gettime(timerid, curr_value)
+}
+#[allow(dead_code)] fn sys_timer_getoverrun_impl(timerid: u32) -> isize {
+    crate::proc::itimer::sys_timer_getoverrun(timerid)
+}
+#[allow(dead_code)] fn sys_timer_delete_impl(timerid: u32) -> isize {
+    crate::proc::itimer::sys_timer_delete(timerid)
+}
+#[allow(dead_code)] fn sys_clock_nanosleep_impl(clockid: u32, flags: i32, rqtp: usize, rmtp: usize) -> isize {
+    crate::proc::nanosleep::sys_clock_nanosleep(clockid, flags, rqtp, rmtp)
+}
+#[allow(dead_code)] fn sys_mknod_impl(path_va: usize, mode: u32, dev: u64) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    crate::fs::vfs::mknod(&path, mode, dev)
+}
+#[allow(dead_code)] fn sys_mknodat_impl(dirfd: i32, path_va: usize, mode: u32, dev: u64) -> isize {
+    let path = match at_path(dirfd, path_va) { Some(p) => p, None => return -14 };
+    crate::fs::vfs::mknod(&path, mode, dev)
+}
+#[allow(dead_code)] fn sys_utime_impl(path_va: usize, times_va: usize) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    if times_va == 0 {
+        let now = crate::time::read_monotonic_ns();
+        crate::fs::vfs_extras::set_times(&path, Some(now), Some(now));
+    } else {
+        let mut buf = [0u8; 16];
+        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let actime  = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as u64 * 1_000_000_000;
+        let modtime = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as u64 * 1_000_000_000;
+        crate::fs::vfs_extras::set_times(&path, Some(actime), Some(modtime));
+    }
+    0
+}
+#[allow(dead_code)] fn sys_utimes_impl(path_va: usize, times_va: usize) -> isize {
+    let path = match read_cstr_safe(path_va) { Some(s) => s, None => return -14 };
+    if times_va == 0 {
+        let now = crate::time::read_monotonic_ns();
+        crate::fs::vfs_extras::set_times(&path, Some(now), Some(now));
+    } else {
+        let mut buf = [0u8; 32];
+        if copy_from_user(&mut buf, times_va).is_err() { return -14; }
+        let a_sec  = i64::from_le_bytes(buf[0..8].try_into().unwrap()) as u64;
+        let a_usec = i64::from_le_bytes(buf[8..16].try_into().unwrap()) as u64;
+        let m_sec  = i64::from_le_bytes(buf[16..24].try_into().unwrap()) as u64;
+        let m_usec = i64::from_le_bytes(buf[24..32].try_into().unwrap()) as u64;
+        let atime_ns = a_sec * 1_000_000_000 + a_usec * 1_000;
+        let mtime_ns = m_sec * 1_000_000_000 + m_usec * 1_000;
+        crate::fs::vfs_extras::set_times(&path, Some(atime_ns), Some(mtime_ns));
+    }
+    0
+}
