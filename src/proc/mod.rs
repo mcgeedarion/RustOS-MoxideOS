@@ -18,3 +18,4 @@ pub mod ptrace;
 pub mod ipc;
 pub mod cgroup;
 pub mod seccomp_filter;
+pub mod rusage;

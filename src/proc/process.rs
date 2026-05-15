@@ -63,7 +63,7 @@ use crate::security::seccomp::FilterChain;
 use crate::proc::cgroup::CgroupId;
 use crate::proc::cgroup::ROOT_CGROUP;
 
-// ── State ──────────────────────────────────────────────────────────────────────────
+// ── State ──────────────────────────────────────────────────────────────────────
 
 /// Process lifecycle state.
 ///
@@ -107,7 +107,7 @@ impl State {
     }
 }
 
-// ── ProcLock — per-process locking unit ──────────────────────────────────────────
+// ── ProcLock — per-process locking unit ──────────────────────────────────────
 
 /// The entry stored in the global process table.
 ///
@@ -149,7 +149,7 @@ impl ProcLock {
     }
 }
 
-// ── Pcb — per-process kernel control block ─────────────────────────────────────────
+// ── Pcb — per-process kernel control block ────────────────────────────────────
 
 /// Full process kernel state.  Always accessed through `ProcLock::inner`.
 #[derive(Clone)]
@@ -165,7 +165,7 @@ pub struct Pcb {
     pub exit_code: i32,
     pub caps:      CapSet,
 
-    // ── Credentials ─────────────────────────────────────────────────────────
+    // ── Credentials ─────────────────────────────────────────────────────
     pub uid:  u32,
     pub gid:  u32,
     pub euid: u32,
@@ -229,15 +229,23 @@ pub struct Pcb {
 
     // CPU time accounting
     pub cpu_time_ns:       u64,
+    /// User-mode CPU time in nanoseconds — charged by tick() while ring-3 runs.
+    pub utime_ns:          u64,
+    /// Kernel-mode CPU time in nanoseconds — charged by tick() while in syscall.
+    pub stime_ns:          u64,
     pub rt_cpu_time_us:    u64,
     pub sleep_deadline_ns: u64,
     pub sleep_timer_id:    u64,
+
+    // Execution domain — personality(2).
+    // PER_LINUX (0) is the correct default for all new processes.
+    pub personality: u32,
 
     // Scheduler fields
     pub task:  *mut Task,
     pub sched: SchedEntity,
 
-    // ── cgroup membership ─────────────────────────────────────────────────
+    // ── cgroup membership ────────────────────────────────────────────────
     pub cgroup_id: CgroupId,
 
     // ── Group scheduling ─────────────────────────────────────────────────
@@ -303,9 +311,12 @@ impl Pcb {
             ptrace_event:        0,
             rlimits:             RlimitSet::default(),
             cpu_time_ns:         0,
+            utime_ns:            0,
+            stime_ns:            0,
             rt_cpu_time_us:      0,
             sleep_deadline_ns:   0,
             sleep_timer_id:      0,
+            personality:         0,
             task:                core::ptr::null_mut(),
             sched:               SchedEntity::new(0),
             cgroup_id:           ROOT_CGROUP,
