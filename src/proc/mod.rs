@@ -2,6 +2,7 @@ pub mod cgroup;
 pub mod clone;
 pub mod context;
 pub mod cow_fault;
+pub mod creds;
 pub mod cwd;
 pub mod dynlink;
 pub mod exec;

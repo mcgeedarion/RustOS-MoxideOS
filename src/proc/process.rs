@@ -159,9 +159,27 @@ pub struct Pcb {
     pub ppid:      usize,
     pub tgid:      usize,
     pub pgid:      usize,
+    /// Session ID: pid of the session leader.  0 = not yet set (init).
+    pub sid:       usize,
     pub state:     State,
     pub exit_code: i32,
     pub caps:      CapSet,
+
+    // ── Credentials ─────────────────────────────────────────────────────────
+    //
+    // Linux saved-set-uid model.
+    //   uid  / gid  — real IDs
+    //   euid / egid — effective IDs (used for permission checks)
+    //   suid / sgid — saved set-IDs (allows dropping and re-gaining privs)
+    //
+    // All fields are inherited on fork.  execve resets from binary suid bits
+    // (not yet implemented; starts at 0/root).
+    pub uid:  u32,
+    pub gid:  u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub suid: u32,
+    pub sgid: u32,
 
     // Saved user-mode PC / SP
     pub pc: usize,
@@ -224,35 +242,15 @@ pub struct Pcb {
     pub sched: SchedEntity,
 
     // ── cgroup membership ─────────────────────────────────────────────────
-    //
-    // Which cgroup v2 node this process belongs to.  Inherited on fork;
-    // updated via `cgroup.procs` writes.  Read on the hot scheduler path
-    // without locking (only the PCB lock guards writes).
     pub cgroup_id: CgroupId,
 
     // ── Group scheduling ─────────────────────────────────────────────────
-    //
-    // `tg_id == 0` means this process is ungrouped (root cgroup).
-    /// Task group id.  0 = ungrouped / root.
     pub tg_id: usize,
 
     // ── Priority inheritance ──────────────────────────────────────────────
-    //
-    // `base_rt_priority` stores the process's original rt_priority before
-    // any PI boost.  When a PI-mutex owner is boosted by a higher-priority
-    // waiter, `sched.rt_priority` is raised to the waiter's level while
-    // `base_rt_priority` is left untouched.  On FUTEX_UNLOCK_PI the
-    // scheduler restores `sched.rt_priority` to `base_rt_priority` once no
-    // further PI waiters remain.
-    //
-    // Invariant: base_rt_priority <= sched.rt_priority at all times.
-    /// Original (un-boosted) RT priority.  0 for non-RT tasks.
     pub base_rt_priority: u8,
 
     // ── Supplemental groups ───────────────────────────────────────────────
-    //
-    // Populated by setgroups(2); read by getgroups(2).
-    // Inherited on fork (cloned); cleared on exec (execve sets to empty).
     pub supp_groups: Vec<u32>,
 }
 
@@ -271,9 +269,16 @@ impl Pcb {
             ppid:                0,
             tgid:                0,
             pgid:                0,
+            sid:                 0,
             state:               State::Ready,
             exit_code:           0,
             caps:                CapSet::empty(),
+            uid:                 0,
+            gid:                 0,
+            euid:                0,
+            egid:                0,
+            suid:                0,
+            sgid:                0,
             pc:                  0,
             sp:                  0,
             user_satp:           0,
