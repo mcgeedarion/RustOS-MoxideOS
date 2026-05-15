@@ -254,3 +254,21 @@ fn sys_recvmsg_impl(sockfd: usize, msg_va: usize, flags: u32) -> isize {
 fn sys_sendmmsg_impl(sockfd: usize, msgvec_va: usize, vlen: u32, flags: u32) -> isize {
     crate::net::socket::sys_sendmmsg(sockfd, msgvec_va, vlen, flags)
 }
+
+// ── NR 74  fsync / NR 75  fdatasync / NR 306  syncfs ──────────────────────────
+// Forward to vfs_extras which calls vfs::flush_fd.  The include_metadata flag
+// distinguishes fsync (full inode + data) from fdatasync (data only).
+pub(super) fn sys_fsync_impl(fd: usize) -> isize {
+    crate::fs::vfs_extras::fsync_fd(fd)
+}
+
+pub(super) fn sys_fdatasync_impl(fd: usize) -> isize {
+    crate::fs::vfs_extras::fdatasync_fd(fd)
+}
+
+pub(super) fn sys_syncfs_impl(_fd: usize) -> isize {
+    // syncfs(2): flush all dirty buffers for the filesystem containing fd.
+    // We have a single unified buffer pool, so flush everything.
+    crate::fs::vfs_extras::sync_all();
+    0
+}
