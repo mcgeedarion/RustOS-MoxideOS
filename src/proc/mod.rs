@@ -1,7 +1,7 @@
+pub mod cgroup;
 pub mod clone;
 pub mod context;
 pub mod cow_fault;
-pub mod cgroup;
 pub mod cwd;
 pub mod dynlink;
 pub mod exec;
@@ -10,6 +10,7 @@ pub mod fork;
 pub mod fork_syscall;
 pub mod futex;
 pub mod ipc;
+pub mod itimer;
 pub mod namespace;
 pub mod nanosleep;
 pub mod net_ns;
