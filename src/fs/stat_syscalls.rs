@@ -10,7 +10,10 @@
 //!     S_IFSOCK / S_IFCHR synthetic stats.
 //!   - fill_stat: call vfs_ops::lstat (follow=false) when lstat=true so
 //!     symlinks are reported as S_IFLNK instead of the target S_IFREG.
-//!   - sys_chdir / sys_fchdir / sys_getcwd: now backed by proc::cwd table.
+//!   - sys_chdir / sys_fchdir / sys_getcwd: fully implemented.
+//!     chdir: validate path exists and is a directory, then set cwd.
+//!     fchdir: resolve fd to path, validate directory, then set cwd.
+//!     getcwd: copy real per-process cwd to user buffer.
 
 extern crate alloc;
 use alloc::string::String;
@@ -22,7 +25,7 @@ const AT_FDCWD:             i32 = -100;
 const AT_EMPTY_PATH:        u32 = 0x1000;
 const AT_SYMLINK_NOFOLLOW:  u32 = 0x100;
 
-// ── helpers ─────────────────────────────────────────────────────────────────────────────────────
+// ── helpers ────────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn read_path(va: usize) -> Option<String> {
@@ -34,26 +37,12 @@ fn read_path(va: usize) -> Option<String> {
 }
 
 /// Translate a user-visible fd to its kernel-internal backing fd.
+/// Returns None if the fd is not open for the current process.
 #[inline]
 fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     let pid = crate::proc::scheduler::current_pid();
     let r = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
     if r < 0 { None } else { Some(r as usize) }
-}
-
-/// Resolve `path` against the current process's cwd if it is relative.
-fn resolve_path(path: &str) -> String {
-    if path.starts_with('/') {
-        String::from(path)
-    } else {
-        let pid = crate::proc::scheduler::current_pid();
-        let cwd = crate::proc::cwd::get_cwd(pid);
-        if cwd == "/" {
-            alloc::format!("/{}", path)
-        } else {
-            alloc::format!("{}/{}", cwd, path)
-        }
-    }
 }
 
 // Linux x86-64 `struct stat` layout.
@@ -84,37 +73,42 @@ const S_IFBLK: u32 = 0o060000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFSOCK: u32 = 0o140000;
 
-// ── stat family ─────────────────────────────────────────────────────────────────────────────────
+// ── stat family ────────────────────────────────────────────────────────────────────
 
 pub fn sys_stat(path_va: usize, stat_va: usize) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
     if stat_va == 0 || stat_va >= USER_SPACE_END { return -14; }
-    let resolved = resolve_path(&path);
-    fill_stat(&resolved, stat_va, false)
+    fill_stat(&path, stat_va, false)
 }
 
 pub fn sys_lstat(path_va: usize, stat_va: usize) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
     if stat_va == 0 || stat_va >= USER_SPACE_END { return -14; }
-    let resolved = resolve_path(&path);
-    fill_stat(&resolved, stat_va, true)
+    fill_stat(&path, stat_va, true)
 }
 
 /// sys_fstat(fd, stat_va)  [NR 5]
+///
+/// Translates the user-visible `fd` to its kernel backing fd before
+/// dispatching to the appropriate subsystem.  This is the fix for the
+/// original bug where `fd` was used directly as a backing fd.
 pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
     if stat_va == 0 || stat_va >= USER_SPACE_END { return -14; }
 
+    // Translate user fd → backing fd.
     let bfd = match user_fd_to_bfd(fd) {
         Some(b) => b,
-        None    => return -9,
+        None    => return -9, // EBADF
     };
 
+    // Helper to write a synthetic Stat to user-space.
     let write_stat = |s: Stat| -> isize {
         let buf = unsafe { core::slice::from_raw_parts(
             &s as *const _ as *const u8, core::mem::size_of::<Stat>()) };
         if copy_to_user(stat_va, buf).is_err() { -14 } else { 0 }
     };
 
+    // ─ Pipe end ───────────────────────────────────────────────────────────────
     if crate::fs::pipe::is_pipe(bfd) {
         return write_stat(Stat {
             st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
@@ -128,6 +122,7 @@ pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
         });
     }
 
+    // ─ Socket ──────────────────────────────────────────────────────────────
     if crate::net::socket::is_socket_fd(bfd) {
         return write_stat(Stat {
             st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
@@ -141,6 +136,7 @@ pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
         });
     }
 
+    // ─ eventfd / timerfd / signalfd (character-device-like) ───────────────
     if crate::fs::eventfd::is_eventfd(bfd)
        || crate::fs::timerfd::is_timerfd(bfd)
        || crate::fs::signalfd::is_signalfd(bfd)
@@ -157,10 +153,13 @@ pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
         });
     }
 
+    // ─ Path-backed VFS / devfs / procfs / sysfs fd ───────────────────────
+    // Use bfd (not user fd) for fd_path and file_size.
     if let Some(path) = vfs::fd_path(bfd) {
         return fill_stat(&path, stat_va, false);
     }
 
+    // ─ Anonymous / synthetic fd fallback ──────────────────────────────
     let sz = vfs::file_size(bfd).unwrap_or(0);
     write_stat(Stat {
         st_dev: 1, st_ino: bfd as u64 + 1, st_nlink: 1,
@@ -188,6 +187,7 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
         _reserved: [0; 3],
     };
 
+    // /proc/* paths.
     if path.starts_with("/proc/") || path == "/proc" {
         s.st_mode = if lstat && is_proc_symlink(path) {
             S_IFLNK | 0o777
@@ -202,6 +202,7 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
         return 0;
     }
 
+    // /dev/* paths.
     if path.starts_with("/dev/") {
         s.st_mode = S_IFCHR | 0o666;
         s.st_rdev = crate::fs::devfs::dev_rdev(path);
@@ -211,6 +212,7 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
         return 0;
     }
 
+    // Real VFS path.
     let ks_result = if lstat {
         crate::fs::vfs_ops::lstat(path)
     } else {
@@ -279,73 +281,112 @@ fn is_proc_dir(path: &str) -> bool {
     }
 }
 
-// ── sys_lseek ─────────────────────────────────────────────────────────────────────────────────────
+// ── sys_lseek ───────────────────────────────────────────────────────────────────────
 
 pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     vfs::lseek(fd, offset, whence)
 }
 
-// ── sys_getcwd ──────────────────────────────────────────────────────────────────────────────────
-
+// ── sys_getcwd ──────────────────────────────────────────────────────────────────────
+/// NR 79  getcwd(buf, size)
+///
+/// Copies the current process's real cwd string into user space.
+/// Returns the user-space buffer address on success (Linux ABI), or a
+/// negative errno on failure.
 pub fn sys_getcwd(buf_va: usize, size: usize) -> isize {
-    if buf_va == 0 || size == 0 { return -22; }
+    if buf_va == 0 || size == 0 { return -22; } // EINVAL
     let pid = crate::proc::scheduler::current_pid();
-    let cwd = crate::proc::cwd::get_cwd(pid);
-    // Need room for the string plus a NUL terminator.
+    let cwd = crate::proc::cwd::get_cwd(pid as usize);
+    // Need room for the string + NUL terminator.
     let needed = cwd.len() + 1;
     if size < needed { return -34; } // ERANGE
     let mut kbuf = alloc::vec![0u8; needed];
     kbuf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    if copy_to_user(buf_va, &kbuf).is_err() { return -14; }
+    // kbuf[cwd.len()] is already 0 (NUL).
+    if copy_to_user(buf_va, &kbuf).is_err() { return -14; } // EFAULT
     buf_va as isize
 }
 
-// ── sys_chdir / sys_fchdir ────────────────────────────────────────────────────────────────────
-
-/// sys_chdir(path_va)  [NR 80]
+// ── sys_chdir / sys_fchdir ────────────────────────────────────────────────────────────
+/// NR 80  chdir(path)
 ///
-/// Resolves relative paths against the current cwd, validates the target
-/// exists and is a directory, then updates the per-process cwd table.
+/// Validate that `path` exists and is a directory, then update the
+/// current process's cwd.  Returns 0 or a negative errno.
 pub fn sys_chdir(path_va: usize) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    let resolved = resolve_path(&path);
+    let raw = match read_path(path_va) { Some(p) => p, None => return -14 };
     let pid = crate::proc::scheduler::current_pid();
-    crate::proc::cwd::set_cwd(pid, &resolved)
+    // Resolve relative paths against the current cwd.
+    let path = crate::proc::cwd::resolve(pid as usize, &raw);
+    // Synthetic directories that always exist.
+    let is_synthetic_dir = path == "/"
+        || path == "/proc"
+        || path == "/dev"
+        || path == "/sys"
+        || path == "/tmp";
+    if !is_synthetic_dir {
+        // Verify via VFS: must exist and be a directory.
+        match crate::fs::vfs_ops::stat(&path) {
+            Err(e)  => return e,
+            Ok(ks)  => {
+                // S_IFDIR = 0o040000; mode top bits.
+                let ifmt = ks.mode as u32 & 0o170000;
+                if ifmt != 0o040000 { return -20; } // ENOTDIR
+            }
+        }
+    }
+    crate::proc::cwd::set_cwd(pid as usize, &path);
+    0
 }
 
-/// sys_fchdir(fd)  [NR 81]
+/// NR 81  fchdir(fd)
 ///
-/// Resolves the fd to its VFS path then delegates to set_cwd.
+/// Resolve `fd` to a path, verify it is a directory, then update cwd.
 pub fn sys_fchdir(fd: usize) -> isize {
-    let bfd = match user_fd_to_bfd(fd) { Some(b) => b, None => return -9 };
-    let path = match vfs::fd_path(bfd) { Some(p) => p, None => return -9 };
+    // Translate user fd → backing fd.
+    let bfd = match user_fd_to_bfd(fd) {
+        Some(b) => b,
+        None    => return -9, // EBADF
+    };
+    // Resolve the backing fd to an absolute path.
+    let path = match vfs::fd_path(bfd) {
+        Some(p) => p,
+        None    => return -9, // EBADF — fd not path-backed
+    };
+    // Verify it is a directory.
+    let is_synthetic_dir = path == "/"
+        || path == "/proc"
+        || path == "/dev"
+        || path == "/sys"
+        || path == "/tmp";
+    if !is_synthetic_dir {
+        match crate::fs::vfs_ops::stat(&path) {
+            Err(e) => return e,
+            Ok(ks) => {
+                let ifmt = ks.mode as u32 & 0o170000;
+                if ifmt != 0o040000 { return -20; } // ENOTDIR
+            }
+        }
+    }
     let pid = crate::proc::scheduler::current_pid();
-    crate::proc::cwd::set_cwd(pid, &path)
+    crate::proc::cwd::set_cwd(pid as usize, &path);
+    0
 }
 
-// Keep the old set_cwd shim so stubs.rs NR-81 impl still compiles.
-// It now just calls the real fchdir logic.
-pub fn set_cwd(path: &str) -> isize {
-    let pid = crate::proc::scheduler::current_pid();
-    crate::proc::cwd::set_cwd(pid, path)
-}
-
-// ── sys_access / sys_faccessat ──────────────────────────────────────────────────────────────────
+// ── sys_access / sys_faccessat ──────────────────────────────────────────────────────
 
 pub fn sys_access(path_va: usize, _mode: u32) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
     if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
         return 0;
     }
-    let resolved = resolve_path(&path);
-    if vfs::exists(&resolved) { 0 } else { -2 }
+    if vfs::exists(&path) { 0 } else { -2 }
 }
 
 pub fn sys_faccessat(_dirfd: i32, path_va: usize, mode: u32) -> isize {
     sys_access(path_va, mode)
 }
 
-// ── sys_readlink / sys_readlinkat ─────────────────────────────────────────────────────────────────────
+// ── sys_readlink / sys_readlinkat ──────────────────────────────────────────────────────
 
 pub fn sys_readlink(path_va: usize, buf_va: usize, bufsz: usize) -> isize {
     if buf_va == 0 || bufsz == 0 { return -14; }
@@ -373,7 +414,7 @@ pub fn sys_readlinkat(_dirfd: i32, path_va: usize, buf_va: usize, bufsz: usize) 
     sys_readlink(path_va, buf_va, bufsz)
 }
 
-// ── sys_rename / sys_mkdir / sys_unlink ───────────────────────────────────────────────────────────────────
+// ── sys_rename / sys_mkdir / sys_unlink ────────────────────────────────────────────────
 
 pub fn sys_rename(old_va: usize, new_va: usize) -> isize {
     let old = match read_path(old_va) { Some(p) => p, None => return -14 };
@@ -381,79 +422,12 @@ pub fn sys_rename(old_va: usize, new_va: usize) -> isize {
     if vfs::rename(&old, &new) { 0 } else { -2 }
 }
 
+/// Called by renameat dispatch in stubs.rs.
 pub fn sys_rename_str(old: &str, new: &str) -> isize {
     if vfs::rename(old, new) { 0 } else { -2 }
 }
 
-pub fn sys_mkdir(path_va: usize, _mode: u32) -> isize {
+pub fn sys_mkdir(path_va: usize, mode: u32) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if vfs::mkdir(&path) { 0 } else { -17 }
-}
-
-pub fn sys_unlink(path_va: usize) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if vfs::unlink(&path) { 0 } else { -2 }
-}
-
-// ── sys_truncate ──────────────────────────────────────────────────────────────────────────────────────
-
-pub fn sys_truncate(path_va: usize, length: i64) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    if length < 0 { return -22; }
-    match crate::fs::vfs_ops::truncate(&path, length as usize) {
-        Ok(())  => 0,
-        Err(e)  => e,
-    }
-}
-
-// ── sys_chmod / sys_fchmod / sys_chown / sys_fchown ────────────────────────────────
-
-pub fn sys_chmod(path_va: usize, mode: u32) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    match crate::fs::vfs_ops::chmod(&path, mode as u16) {
-        Ok(())  => 0,
-        Err(e)  => e,
-    }
-}
-
-pub fn sys_fchmod(fd: usize, mode: u32) -> isize {
-    let bfd = match user_fd_to_bfd(fd) { Some(b) => b, None => return -9 };
-    let path = match vfs::fd_path(bfd) { Some(p) => p, None => return -9 };
-    match crate::fs::vfs_ops::chmod(&path, mode as u16) {
-        Ok(())  => 0,
-        Err(e)  => e,
-    }
-}
-
-pub fn sys_chown(path_va: usize, uid: u32, gid: u32) -> isize {
-    let path = match read_path(path_va) { Some(p) => p, None => return -14 };
-    match crate::fs::vfs_ops::chown(&path, uid, gid) {
-        Ok(())  => 0,
-        Err(e)  => e,
-    }
-}
-
-pub fn sys_fchown(fd: usize, uid: u32, gid: u32) -> isize {
-    let bfd = match user_fd_to_bfd(fd) { Some(b) => b, None => return -9 };
-    let path = match vfs::fd_path(bfd) { Some(p) => p, None => return -9 };
-    match crate::fs::vfs_ops::chown(&path, uid, gid) {
-        Ok(())  => 0,
-        Err(e)  => e,
-    }
-}
-
-// ── sys_newfstatat ──────────────────────────────────────────────────────────────────────────────────
-
-pub fn sys_newfstatat(dirfd: i32, path_va: usize, stat_va: usize, flags: u32) -> isize {
-    if path_va == 0 {
-        if flags & AT_EMPTY_PATH != 0 && dirfd != AT_FDCWD {
-            return sys_fstat(dirfd as usize, stat_va);
-        }
-        return -14;
-    }
-    if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        sys_lstat(path_va, stat_va)
-    } else {
-        sys_stat(path_va, stat_va)
-    }
+    vfs::mkdir(&path, mode)
 }

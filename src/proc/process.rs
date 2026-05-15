@@ -35,7 +35,7 @@
 //!     take the read side across the entire validate+copy sequence.
 //!
 //! This closes the TOCTOU window where a concurrent `munmap` could unmap
-//! pages between `pages_mapped` and the actual memory copy.
+//! pages between the `pages_mapped` and the actual memory copy.
 //!
 //! ### Deadlock-free ordering
 //!
@@ -166,14 +166,6 @@ pub struct Pcb {
     pub caps:      CapSet,
 
     // ── Credentials ─────────────────────────────────────────────────────────
-    //
-    // Linux saved-set-uid model.
-    //   uid  / gid  — real IDs
-    //   euid / egid — effective IDs (used for permission checks)
-    //   suid / sgid — saved set-IDs (allows dropping and re-gaining privs)
-    //
-    // All fields are inherited on fork.  execve resets from binary suid bits
-    // (not yet implemented; starts at 0/root).
     pub uid:  u32,
     pub gid:  u32,
     pub euid: u32,
@@ -215,6 +207,10 @@ pub struct Pcb {
 
     // Filesystem
     pub exe_path: Option<String>,
+    /// Current working directory — absolute, canonical path.
+    /// Inherited by fork/clone; updated by chdir/fchdir.
+    /// Default: "/".
+    pub cwd: String,
 
     // Namespaces / security
     pub ns:      NsSet,
@@ -298,6 +294,7 @@ impl Pcb {
             signal_handlers:     Arc::new(Mutex::new(SignalHandlers::default())),
             pending_signals:     alloc::collections::VecDeque::new(),
             exe_path:            None,
+            cwd:                 String::from("/"),
             ns:                  NsSet::default(),
             seccomp:             FilterChain::default(),
             robust_list_head:    0,
