@@ -72,6 +72,7 @@ pub struct LsmCtx {
     pub euid:  u32,
     pub egid:  u32,
     pub caps:  u64,
+    pub supp_groups: Vec<u32>,
 
     // ── inode identity ───────────────────────────────────────────────────
     pub inode_uid:  u32,
@@ -95,15 +96,15 @@ pub struct LsmCtx {
 impl LsmCtx {
     pub fn for_current_task(path: &'static str, inode_uid: u32, inode_mode: Mode) -> Self {
         let pid = crate::proc::scheduler::current_pid();
-        let (euid, egid, caps) = if pid != 0 {
+        let (euid, egid, caps, supp_groups) = if pid != 0 {
             crate::proc::scheduler::with_proc(pid, |p| {
-                (p.creds.euid, p.creds.egid, p.creds.caps_effective)
-            }).unwrap_or((0, 0, u64::MAX))
+                (p.euid, p.egid, p.caps.effective, p.supp_groups.clone())
+            }).unwrap_or((0, 0, u64::MAX, Vec::new()))
         } else {
-            (0, 0, u64::MAX)
+            (0, 0, u64::MAX, Vec::new())
         };
         Self {
-            pid, euid, egid, caps,
+            pid, euid, egid, caps, supp_groups,
             inode_uid,
             inode_gid: 0,
             inode_mode,
@@ -119,7 +120,7 @@ impl LsmCtx {
         inode_uid: u32, inode_gid: u32, inode_mode: Mode,
     ) -> Self {
         Self {
-            pid, euid, egid, caps,
+            pid, euid, egid, caps, supp_groups: Vec::new(),
             inode_uid, inode_gid, inode_mode,
             path: "",
             signo: 0, arg0: 0, arg1: 0,

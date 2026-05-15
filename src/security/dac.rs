@@ -46,12 +46,17 @@ const PROT_EXEC: u32 = 0x4;
 #[inline]
 fn has_cap(caps: u64, cap: u64) -> bool { caps & cap != 0 }
 
+#[inline]
+fn in_group(ctx: &LsmCtx, gid: u32) -> bool {
+    ctx.egid == gid || ctx.supp_groups.iter().any(|&g| g == gid)
+}
+
 fn check_read(ctx: &LsmCtx) -> LsmVerdict {
     if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) { return LsmVerdict::Allow; }
     if has_cap(ctx.caps, CAP_DAC_READ_SEARCH)               { return LsmVerdict::Allow; }
     let ok = if ctx.euid == ctx.inode_uid {
         ctx.inode_mode & S_IRUSR != 0
-    } else if ctx.egid == ctx.inode_gid {
+    } else if in_group(ctx, ctx.inode_gid) {
         ctx.inode_mode & S_IRGRP != 0
     } else {
         ctx.inode_mode & S_IROTH != 0
@@ -63,7 +68,7 @@ fn check_write(ctx: &LsmCtx) -> LsmVerdict {
     if ctx.euid == 0 || has_cap(ctx.caps, CAP_DAC_OVERRIDE) { return LsmVerdict::Allow; }
     let ok = if ctx.euid == ctx.inode_uid {
         ctx.inode_mode & S_IWUSR != 0
-    } else if ctx.egid == ctx.inode_gid {
+    } else if in_group(ctx, ctx.inode_gid) {
         ctx.inode_mode & S_IWGRP != 0
     } else {
         ctx.inode_mode & S_IWOTH != 0
@@ -78,7 +83,7 @@ fn check_exec(ctx: &LsmCtx) -> LsmVerdict {
     }
     let ok = if ctx.euid == ctx.inode_uid {
         ctx.inode_mode & S_IXUSR != 0
-    } else if ctx.egid == ctx.inode_gid {
+    } else if in_group(ctx, ctx.inode_gid) {
         ctx.inode_mode & S_IXGRP != 0
     } else {
         ctx.inode_mode & S_IXOTH != 0
@@ -184,7 +189,7 @@ impl LsmHooks for DacModule {
         // branch to never match and every process to fall through to 'other').
         let ok = if ctx.euid == ctx.ipc_uid {
             ctx.ipc_mode & S_IRUSR != 0
-        } else if ctx.egid == ctx.ipc_gid {
+        } else if in_group(ctx, ctx.ipc_gid) {
             ctx.ipc_mode & S_IRGRP != 0
         } else {
             ctx.ipc_mode & S_IROTH != 0
