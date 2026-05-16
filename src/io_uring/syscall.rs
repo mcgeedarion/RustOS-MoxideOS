@@ -108,7 +108,7 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
             core::mem::size_of::<IoUringParams>(),
         )
     };
-    if copy_to_user(params_va, params_bytes).is_err() {
+    if !copy_to_user(params_va, params_bytes) {
         ring::free_ring(ring_idx);
         crate::fs::vfs::close_fd(fd);
         return -14;
@@ -175,7 +175,7 @@ pub fn sys_io_uring_register(
             if arg_va == 0 || nr == 0 { return -22; }
             let iovec_size  = 2 * core::mem::size_of::<usize>();
             let mut buf     = alloc::vec![0u8; nr * iovec_size];
-            if copy_from_user(arg_va, &mut buf).is_err() { return -14; }
+            if copy_from_user(&mut buf, arg_va).is_err() { return -14; }
             ring::with_ring_mut(ring_idx, |r| {
                 r.reg_bufs.clear();
                 for i in 0..nr {
@@ -198,7 +198,7 @@ pub fn sys_io_uring_register(
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, nr * 4)
             };
-            if copy_from_user(arg_va, bytes).is_err() { return -14; }
+            if copy_from_user(bytes, arg_va).is_err() { return -14; }
             ring::with_ring_mut(ring_idx, |r| { r.reg_fds = fds.clone(); 0isize }).unwrap_or(-9)
         }
 
@@ -209,7 +209,7 @@ pub fn sys_io_uring_register(
         IORING_REGISTER_EVENTFD => {
             if arg_va == 0 { return -22; }
             let mut efd_bytes = [0u8; 4];
-            if copy_from_user(arg_va, &mut efd_bytes).is_err() { return -14; }
+            if copy_from_user(&mut efd_bytes, arg_va).is_err() { return -14; }
             let _efd = i32::from_ne_bytes(efd_bytes);
             // Stored for future CQE-post notification; no-op for now.
             0
@@ -220,7 +220,7 @@ pub fn sys_io_uring_register(
         IORING_REGISTER_FILES_UPDATE => {
             if arg_va == 0 || nr == 0 { return -22; }
             let mut raw = alloc::vec![0u8; 8 + nr * 4];
-            if copy_from_user(arg_va, &mut raw).is_err() { return -14; }
+            if copy_from_user(&mut raw, arg_va).is_err() { return -14; }
             let offset = u32::from_ne_bytes(raw[0..4].try_into().unwrap_or([0;4])) as usize;
             ring::with_ring_mut(ring_idx, |r| {
                 for i in 0..nr {

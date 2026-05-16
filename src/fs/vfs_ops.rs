@@ -780,7 +780,7 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
 // ── open (VFS-level) ────────────────────────────────────────────────────────
 
 pub fn open(path: &str, flags: u32) -> Result<usize, isize> {
-    crate::fs::fcntl::fd_open(path, flags as i32)
+    crate::fs::vfs::open_raw(path, flags)
 }
 
 pub fn fd_path(fd: usize) -> Option<String> {

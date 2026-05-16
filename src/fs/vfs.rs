@@ -7,35 +7,174 @@
 //! user-space copy paths.
 
 extern crate alloc;
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeMap, string::{String, ToString}, vec::Vec};
+use spin::Mutex;
 
 // Re-export the seek constants used by callers.
 pub use crate::fs::fcntl::{SEEK_SET, SEEK_CUR, SEEK_END};
+
+
+// ── raw VFS backing fd table ───────────────────────────────────────────────
+
+const RAW_FD_BASE: usize = 1024;
+const RAW_FD_END:  usize = 4096;
+const O_WRONLY: u32 = 1;
+const O_RDWR:   u32 = 2;
+const O_CREAT:  u32 = 0o100;
+
+#[derive(Clone)]
+struct RawFd {
+    path:   String,
+    offset: usize,
+    flags:  u32,
+}
+
+static RAW_FDS: Mutex<BTreeMap<usize, RawFd>> = Mutex::new(BTreeMap::new());
+
+fn alloc_raw_fd() -> Option<usize> {
+    let fds = RAW_FDS.lock();
+    (RAW_FD_BASE..RAW_FD_END).find(|fd| !fds.contains_key(fd))
+}
+
+fn lsm_ctx_for_stat(st: &crate::fs::vfs_ops::KStat) -> crate::security::lsm::LsmCtx {
+    let pid = crate::proc::scheduler::current_pid();
+    let (euid, egid, caps, supp_groups) = crate::proc::scheduler::with_proc(pid, |p| {
+        (p.euid, p.egid, p.caps.effective, p.supp_groups.clone())
+    }).unwrap_or((0, 0, u64::MAX, Vec::new()));
+    let mut ctx = crate::security::lsm::LsmCtx::with_creds(
+        pid, euid, egid, caps, st.uid, st.gid, st.mode,
+    );
+    ctx.supp_groups = supp_groups;
+    ctx
+}
+
+fn lsm_check_existing(path: &str, flags: u32) -> Result<(), isize> {
+    let st = crate::fs::vfs_ops::stat(path)?;
+    let ctx = lsm_ctx_for_stat(&st);
+    crate::security::lsm::lsm_dispatch(crate::security::lsm::Hook::FileOpen, &ctx)
+        .map_err(|e| e as isize)?;
+    if flags & (O_WRONLY | O_RDWR) != 0 {
+        crate::security::lsm::lsm_dispatch(crate::security::lsm::Hook::FileWrite, &ctx)
+            .map_err(|e| e as isize)?;
+    }
+    Ok(())
+}
+
+pub fn open_raw(path: &str, flags: u32) -> Result<usize, isize> {
+    match lsm_check_existing(path, flags) {
+        Ok(()) => {}
+        Err(-2) if flags & O_CREAT != 0 => {
+            let ctx = crate::security::lsm::LsmCtx::for_current_task("", 0, 0o666);
+            crate::security::lsm::lsm_dispatch(crate::security::lsm::Hook::InodeCreate, &ctx)
+                .map_err(|e| e as isize)?;
+            crate::fs::vfs_ops::create(path)?;
+        }
+        Err(e) => return Err(e),
+    }
+
+    let fd = alloc_raw_fd().ok_or(-24isize)?;
+    RAW_FDS.lock().insert(fd, RawFd { path: path.to_string(), offset: 0, flags });
+    Ok(fd)
+}
+
+pub fn close_raw(fd: usize) -> isize {
+    if RAW_FDS.lock().remove(&fd).is_some() { 0 } else { -9 }
+}
+
+pub fn path_of_raw(fd: usize) -> Option<String> {
+    RAW_FDS.lock().get(&fd).map(|r| r.path.clone())
+}
+
+pub fn read_raw(fd: usize, buf: &mut [u8]) -> isize {
+    let (path, off) = match RAW_FDS.lock().get(&fd) {
+        Some(r) => (r.path.clone(), r.offset),
+        None => return -9,
+    };
+    let st = match crate::fs::vfs_ops::stat(&path) { Ok(s) => s, Err(e) => return e };
+    let ctx = lsm_ctx_for_stat(&st);
+    if let Err(e) = crate::security::lsm::lsm_dispatch(crate::security::lsm::Hook::FileRead, &ctx) {
+        return e as isize;
+    }
+    let data = match crate::fs::vfs_ops::read_all(&path) { Ok(d) => d, Err(e) => return e };
+    let n = buf.len().min(data.len().saturating_sub(off));
+    if n > 0 { buf[..n].copy_from_slice(&data[off..off + n]); }
+    if let Some(r) = RAW_FDS.lock().get_mut(&fd) { r.offset = r.offset.saturating_add(n); }
+    n as isize
+}
+
+pub fn write_raw(fd: usize, buf: &[u8]) -> isize {
+    let (path, off) = match RAW_FDS.lock().get(&fd) {
+        Some(r) => (r.path.clone(), r.offset),
+        None => return -9,
+    };
+    let st = match crate::fs::vfs_ops::stat(&path) { Ok(s) => s, Err(e) => return e };
+    let ctx = lsm_ctx_for_stat(&st);
+    if let Err(e) = crate::security::lsm::lsm_dispatch(crate::security::lsm::Hook::FileWrite, &ctx) {
+        return e as isize;
+    }
+    let mut data = crate::fs::vfs_ops::read_all(&path).unwrap_or_default();
+    if off > data.len() { data.resize(off, 0); }
+    if off + buf.len() > data.len() { data.resize(off + buf.len(), 0); }
+    data[off..off + buf.len()].copy_from_slice(buf);
+    if let Err(e) = crate::fs::vfs_ops::write_all(&path, &data) { return e; }
+    if let Some(r) = RAW_FDS.lock().get_mut(&fd) { r.offset = r.offset.saturating_add(buf.len()); }
+    buf.len() as isize
+}
+
+
+pub fn size_of_raw(fd: usize) -> Option<usize> {
+    let path = path_of_raw(fd)?;
+    crate::fs::vfs_ops::stat(&path).ok().map(|s| s.size as usize)
+}
+
+pub fn dup_as_raw(old_fd: usize, new_fd: usize) -> isize {
+    let raw = match RAW_FDS.lock().get(&old_fd).cloned() {
+        Some(r) => r,
+        None => return -9,
+    };
+    RAW_FDS.lock().insert(new_fd, raw);
+    new_fd as isize
+}
+
+pub fn dup_from_raw(fd: usize, min_fd: usize) -> isize {
+    let raw = match RAW_FDS.lock().get(&fd).cloned() {
+        Some(r) => r,
+        None => return -9,
+    };
+    let mut fds = RAW_FDS.lock();
+    let new_fd = (min_fd.max(RAW_FD_BASE)..RAW_FD_END)
+        .find(|candidate| !fds.contains_key(candidate));
+    match new_fd {
+        Some(n) => { fds.insert(n, raw); n as isize }
+        None => -24,
+    }
+}
+
+pub fn seek_raw(fd: usize, offset: i64, whence: i32) -> isize {
+    let (path, cur) = match RAW_FDS.lock().get(&fd) {
+        Some(r) => (r.path.clone(), r.offset as i64),
+        None => return -9,
+    };
+    let size = crate::fs::vfs_ops::stat(&path).map(|s| s.size as i64).unwrap_or(0);
+    let new = match whence { SEEK_SET => offset, SEEK_CUR => cur + offset, SEEK_END => size + offset, _ => return -22 };
+    if new < 0 { return -22; }
+    if let Some(r) = RAW_FDS.lock().get_mut(&fd) { r.offset = new as usize; }
+    new as isize
+}
 
 // ── fd-table dispatch stubs ───────────────────────────────────────────────
 // These are thin forwarders into fcntl's fd table. They exist so callers
 // can write `vfs::read(fd, buf)` without importing fcntl directly.
 
-pub fn read(fd: usize, buf: &mut [u8]) -> isize {
-    crate::fs::fcntl::fd_read(fd, buf)
-}
+pub fn read(fd: usize, buf: &mut [u8]) -> isize { read_raw(fd, buf) }
 
-pub fn write(fd: usize, buf: &[u8]) -> isize {
-    crate::fs::fcntl::fd_write(fd, buf)
-}
+pub fn write(fd: usize, buf: &[u8]) -> isize { write_raw(fd, buf) }
 
-pub fn open(path: &str, flags: u32) -> Result<usize, isize> {
-    crate::fs::fcntl::fd_open(path, flags as i32)
-}
+pub fn open(path: &str, flags: u32) -> Result<usize, isize> { open_raw(path, flags) }
 
-pub fn close(fd: usize) -> isize {
-    crate::fs::fcntl::fd_close(fd);
-    0
-}
+pub fn close(fd: usize) -> isize { close_raw(fd) }
 
-pub fn seek(fd: usize, offset: i64, whence: i32) -> isize {
-    crate::fs::fcntl::fd_seek(fd, offset, whence)
-}
+pub fn seek(fd: usize, offset: i64, whence: i32) -> isize { seek_raw(fd, offset, whence) }
 
 // ── file_size ─────────────────────────────────────────────────────────────
 //
@@ -71,34 +210,22 @@ pub fn fd_get_debug_name(fd: usize) -> Option<String> {
 }
 
 /// Duplicate `old_fd` as `new_fd`.
-pub fn dup_as(old_fd: usize, new_fd: usize) -> isize {
-    crate::fs::fcntl::dup_as_raw(old_fd, new_fd)
-}
+pub fn dup_as(old_fd: usize, new_fd: usize) -> isize { dup_as_raw(old_fd, new_fd) }
 
 /// Duplicate `fd` using the lowest available fd >= `min_fd`.
-pub fn dup_from(fd: usize, min_fd: usize) -> isize {
-    crate::fs::fcntl::dup_from_raw(fd, min_fd)
-}
+pub fn dup_from(fd: usize, min_fd: usize) -> isize { dup_from_raw(fd, min_fd) }
 
 /// Create a new file at `path`.
-pub fn create(path: &str) -> Result<(), isize> {
-    crate::fs::fcntl::fd_create(path)
-}
+pub fn create(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::create(path) }
 
 /// Remove a file.
-pub fn unlink(path: &str) -> Result<(), isize> {
-    crate::fs::fcntl::fd_unlink(path)
-}
+pub fn unlink(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::unlink(path) }
 
 /// Create a hard link.
-pub fn link(old: &str, new: &str) -> Result<(), isize> {
-    crate::fs::fcntl::fd_link(old, new)
-}
+pub fn link(old: &str, new: &str) -> Result<(), isize> { crate::fs::vfs_ops::link(old, new) }
 
 /// Remove a directory.
-pub fn rmdir(path: &str) -> Result<(), isize> {
-    crate::fs::fcntl::fd_rmdir(path)
-}
+pub fn rmdir(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::rmdir(path) }
 
 // ── inode_id_of_fd ───────────────────────────────────────────────────────────
 //

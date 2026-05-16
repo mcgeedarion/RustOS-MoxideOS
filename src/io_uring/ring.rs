@@ -213,6 +213,13 @@ impl IoUringRing {
         let tail  = hdr.tail.load(Ordering::Acquire);
         let count = tail.wrapping_sub(head) as usize;
         if count == 0 { return Vec::new(); }
+        if count > self.entries as usize {
+            // Userspace owns tail, so treat impossible queue depth as a malformed
+            // ring instead of allocating/iterating an attacker-controlled count.
+            hdr.dropped.fetch_add(1, Ordering::Relaxed);
+            hdr.head.store(tail, Ordering::Release);
+            return Vec::new();
+        }
 
         let sq_arr = self.sq_array();
         let sqes   = self.sqe_array();

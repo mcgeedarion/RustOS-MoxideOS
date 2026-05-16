@@ -420,18 +420,37 @@ pub fn seccomp_check(nr: usize, args: &[usize; 6], saved_rip: u64) -> SeccompVer
     let bytes = data.as_bytes();
 
     // Linux semantics: evaluate filters from most-recently-installed to oldest.
-    // The most restrictive action wins across the whole chain.
+    // The most restrictive action wins across the whole chain.  Do not compare
+    // raw action values: SECCOMP_RET_KILL_PROCESS (0x8000_0000) is numerically
+    // larger than ALLOW (0x7fff_0000), so a simple "lower value wins" test
+    // silently lets KILL_PROCESS filters be bypassed.
     let mut worst: u32 = SECCOMP_RET_ALLOW;
+    let mut worst_rank = seccomp_action_rank(SECCOMP_RET_ALLOW);
     for filter in chain.filters.iter().rev() {
         let ret = bpf_run(&filter.insns, bytes);
-        let action = ret & SECCOMP_RET_ACTION_FULL;
-        // Lower action value = more restrictive (KILL=0 < TRAP < ERRNO < ALLOW).
-        if action < (worst & SECCOMP_RET_ACTION_FULL) {
+        let rank = seccomp_action_rank(ret & SECCOMP_RET_ACTION_FULL);
+        if rank < worst_rank {
             worst = ret;
+            worst_rank = rank;
         }
     }
 
     action_to_verdict(worst)
+}
+
+#[inline]
+fn seccomp_action_rank(action: u32) -> u8 {
+    match action {
+        SECCOMP_RET_KILL_PROCESS => 0,
+        SECCOMP_RET_KILL_THREAD  => 1,
+        SECCOMP_RET_TRAP         => 2,
+        SECCOMP_RET_ERRNO        => 3,
+        SECCOMP_RET_USER_NOTIF   => 4,
+        SECCOMP_RET_TRACE        => 5,
+        SECCOMP_RET_LOG          => 6,
+        SECCOMP_RET_ALLOW        => 7,
+        _                        => 0, // unknown actions fail closed
+    }
 }
 
 fn action_to_verdict(ret: u32) -> SeccompVerdict {
@@ -448,8 +467,8 @@ fn action_to_verdict(ret: u32) -> SeccompVerdict {
         a if a == SECCOMP_RET_TRACE => SeccompVerdict::Errno(EPERM),
         // V11 fix: USER_NOTIF — no listener installed → deny with ENOSYS.
         a if a == SECCOMP_RET_USER_NOTIF => SeccompVerdict::Errno(ENOSYS),
-        // LOG / ALLOW
-        _ => SeccompVerdict::Allow,
+        a if a == SECCOMP_RET_LOG || a == SECCOMP_RET_ALLOW => SeccompVerdict::Allow,
+        _ => SeccompVerdict::Kill,
     }
 }
 
