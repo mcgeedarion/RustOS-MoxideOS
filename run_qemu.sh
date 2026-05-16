@@ -10,6 +10,10 @@
 #   --gpu         Add virtio-gpu-pci and open an SDL/GTK display window
 #   --gdb         Halt at entry, wait for GDB on :1234
 #   --no-net      Disable virtio-net
+#   --smoke       Run headless, capture serial, and require a boot marker
+#   --timeout N   Smoke-test timeout in seconds (default: 20)
+#   --smoke-marker TEXT
+#                Marker required in serial output (default: TEST PASS: uart_smoke)
 #
 # Boot modes:
 #   UEFI (default) — OVMF pflash + vvfat ESP; identical to real hardware.
@@ -45,18 +49,63 @@ GPU_MODE=0
 NET_MODE=1
 MULTIBOOT_MODE=0
 RELEASE_MODE=0
+SMOKE_MODE=0
+SMOKE_TIMEOUT=20
+SMOKE_MARKER="TEST PASS: uart_smoke"
 DISK=""
 
-for arg in "$@"; do
-  case "$arg" in
-    --gdb)       GDB_MODE=1 ;;
-    --gpu)       GPU_MODE=1 ;;
-    --no-net)    NET_MODE=0 ;;
-    --multiboot) MULTIBOOT_MODE=1 ;;
-    --release)   RELEASE_MODE=1 ;;
-    *)           DISK="$arg" ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gdb)       GDB_MODE=1; shift ;;
+    --gpu)       GPU_MODE=1; shift ;;
+    --no-net)    NET_MODE=0; shift ;;
+    --multiboot) MULTIBOOT_MODE=1; shift ;;
+    --release)   RELEASE_MODE=1; shift ;;
+    --smoke)     SMOKE_MODE=1; NET_MODE=0; GPU_MODE=0; shift ;;
+    --timeout)
+      if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ || "$2" -eq 0 ]]; then
+        echo "[!] --timeout requires a positive integer number of seconds" >&2
+        exit 2
+      fi
+      SMOKE_TIMEOUT="$2"
+      shift 2
+      ;;
+    --timeout=*)
+      SMOKE_TIMEOUT="${1#--timeout=}"
+      if [[ ! "$SMOKE_TIMEOUT" =~ ^[0-9]+$ || "$SMOKE_TIMEOUT" -eq 0 ]]; then
+        echo "[!] --timeout requires a positive integer number of seconds" >&2
+        exit 2
+      fi
+      shift
+      ;;
+    --smoke-marker)
+      if [[ $# -lt 2 ]]; then
+        echo "[!] --smoke-marker requires a marker string" >&2
+        exit 2
+      fi
+      SMOKE_MARKER="$2"
+      shift 2
+      ;;
+    --smoke-marker=*) SMOKE_MARKER="${1#--smoke-marker=}"; shift ;;
+    --*)
+      echo "[!] Unknown option: $1" >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$DISK" ]]; then
+        echo "[!] Multiple disk images specified: '$DISK' and '$1'" >&2
+        exit 2
+      fi
+      DISK="$1"
+      shift
+      ;;
   esac
 done
+
+if [[ "$SMOKE_MODE" -eq 1 && "$GDB_MODE" -eq 1 ]]; then
+  echo "[!] --smoke cannot be combined with --gdb" >&2
+  exit 2
+fi
 
 PROFILE=$([ "$RELEASE_MODE" -eq 1 ] && echo release || echo debug)
 
@@ -170,6 +219,38 @@ if [[ "$GDB_MODE" -eq 1 ]]; then
   └─────────────────────────────────────────────┘
 
 GDB
+fi
+
+if [[ "$SMOKE_MODE" -eq 1 ]]; then
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[!] --smoke requires the 'timeout' command" >&2
+    exit 1
+  fi
+
+  LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/rustos-smoke.XXXXXX.log")
+  trap 'rm -f "$LOG_FILE"' EXIT
+
+  echo "[*] Starting QEMU smoke test (${SMOKE_TIMEOUT}s timeout)..."
+  echo "[*] Waiting for serial marker: ${SMOKE_MARKER}"
+  echo
+
+  set +e
+  timeout "${SMOKE_TIMEOUT}" qemu-system-x86_64 "${QEMU_ARGS[@]}" >"$LOG_FILE" 2>&1
+  QEMU_STATUS=$?
+  set -e
+
+  cat "$LOG_FILE"
+
+  if grep -Fq "$SMOKE_MARKER" "$LOG_FILE"; then
+    echo "[*] Smoke marker found: ${SMOKE_MARKER}"
+    exit 0
+  fi
+
+  echo "[!] Smoke marker not found before timeout: ${SMOKE_MARKER}" >&2
+  if [[ "$QEMU_STATUS" -ne 124 ]]; then
+    echo "[!] QEMU exited with status ${QEMU_STATUS}" >&2
+  fi
+  exit 1
 fi
 
 echo "[*] Starting QEMU..."

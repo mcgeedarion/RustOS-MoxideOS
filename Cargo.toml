@@ -1,5 +1,5 @@
 [workspace]
-members  = [".", "xtask"]
+members  = [".", "xtask", "crates/scheme-api", "userspace/drivers/virtio_net"]
 resolver = "2"
 
 [package]
@@ -53,7 +53,7 @@ sysv_ipc   = []  # SysV IPC + POSIX message queues (NR 29-31, 64-71, 240-245)
 namespaces = []  # Linux-compatible ns isolation (NEWNS/PID/NET/UTS/IPC/USER)
 
 # Optional / WIP subsystems
-gdbstub      = []  # Complete: GDB RSP over UART (x86_64) / SBI console (RISC-V)
-cgroups      = []  # Complete: cgroups v2 hierarchy + cgroupfs VFS mount
+gdbstub      = []  # Experimental: GDB RSP over UART (x86_64) / SBI console (RISC-V)
+cgroups      = []  # Experimental: cgroups v2 hierarchy + cgroupfs VFS mount
 input_events = []  # WIP stub: /dev/input evdev routing not yet wired
 wayland      = []  # WIP stub: directory scaffolded, no protocol implementation
