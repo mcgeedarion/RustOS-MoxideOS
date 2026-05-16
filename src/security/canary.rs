@@ -39,7 +39,7 @@ pub fn init_kernel_canary() {
     // H4 fix: persist expected value in the *separate* static so the audit
     // function has a ground truth that is distinct from the live guard.
     CANARY_EXPECTED.0.store(canary, Ordering::Relaxed);
-    log::info!("canary: kernel __stack_chk_guard initialised ({:#018x})", canary);
+    log::info!("canary: kernel __stack_chk_guard initialised");
 }
 
 pub fn new_task_canary() -> u64 {

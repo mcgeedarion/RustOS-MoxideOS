@@ -308,7 +308,7 @@ fn copy_mq_attr_to_user(va: usize, attr: &mq::MqAttr) -> bool {
     buf[8..16].copy_from_slice(&attr.mq_maxmsg.to_ne_bytes());
     buf[16..24].copy_from_slice(&attr.mq_msgsize.to_ne_bytes());
     buf[24..32].copy_from_slice(&attr.mq_curmsgs.to_ne_bytes());
-    crate::uaccess::copy_to_user(va, &buf).is_ok()
+    crate::uaccess::copy_to_user(va, &buf)
 }
 
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
@@ -743,7 +743,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         99  => sys_sysinfo_impl(a),
         109 => {
             let pid = crate::proc::scheduler::current_pid();
-            let uid = crate::proc::scheduler::with_proc(pid, |p| p.cred.uid)
+            let uid = crate::proc::scheduler::with_proc(pid, |p| p.uid)
                 .unwrap_or(0);
             let bytes = uid.to_le_bytes();
             if a != 0 { let _ = crate::uaccess::copy_to_user(a, &bytes); }

@@ -221,6 +221,16 @@ pub fn fd_size(fd: usize) -> Option<usize> {
     vfs::size_of_raw(fd)
 }
 
+
+// ── VFS mutation compatibility wrappers ───────────────────────────────────
+
+pub fn fd_create(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::create(path) }
+pub fn fd_unlink(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::unlink(path) }
+pub fn fd_link(old: &str, new: &str) -> Result<(), isize> { crate::fs::vfs_ops::link(old, new) }
+pub fn fd_rmdir(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::rmdir(path) }
+pub fn dup_as_raw(old_fd: usize, new_fd: usize) -> isize { vfs::dup_as_raw(old_fd, new_fd) }
+pub fn dup_from_raw(fd: usize, min_fd: usize) -> isize { vfs::dup_from_raw(fd, min_fd) }
+
 // ── sys_fcntl ────────────────────────────────────────────────────────────────
 
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
@@ -264,7 +274,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             if !validate_user_ptr(arg, 32) { return -14; }
             let mut buf = [0u8; 32];
             buf[0..2].copy_from_slice(&F_UNLCK.to_le_bytes());
-            if copy_to_user(arg, &buf).is_err() { return -14; }
+            if !copy_to_user(arg, &buf) { return -14; }
             0
         }
         F_SETLK | F_SETLKW => 0,

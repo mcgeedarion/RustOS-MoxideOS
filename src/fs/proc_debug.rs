@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use spin::Mutex;
 
-use crate::arch::api::{Paging, PageFlags};
+use crate::arch::api::Paging;
 use crate::arch::Arch;
 use crate::proc::scheduler;
 use crate::proc::ptrace::{UREG_COUNT, build_user_regs_pub, apply_user_regs_pub};
@@ -36,7 +36,8 @@ pub enum ProcDebugKind {
 
 #[derive(Clone)]
 struct DebugFd {
-    kind: ProcDebugKind,
+    opener: usize,
+    kind:   ProcDebugKind,
 }
 
 static PROC_DEBUG_FDS: Mutex<BTreeMap<usize, DebugFd>> =
@@ -58,10 +59,35 @@ fn alloc_fd() -> Option<usize> {
 }
 
 fn may_debug(opener: usize, target: usize) -> bool {
-    scheduler::with_proc(target, |p| p.ppid == opener).unwrap_or(false)
-        || scheduler::with_proc(opener, |p| {
-            p.caps.has_cap(crate::security::CAP_SYS_PTRACE)
-        }).unwrap_or(false)
+    if opener == target { return scheduler::with_proc(target, |_| ()).is_some(); }
+    let can_parent_debug = scheduler::with_proc(target, |p| p.ppid == opener).unwrap_or(false);
+    let has_ptrace = scheduler::with_proc(opener, |p| {
+        p.caps.has(crate::security::capset::cap::SYS_PTRACE)
+    }).unwrap_or(false);
+    can_parent_debug || has_ptrace
+}
+
+fn fd_kind_for_current(fdno: usize) -> Result<ProcDebugKind, isize> {
+    let fd = PROC_DEBUG_FDS.lock().get(&fdno).cloned().ok_or(-9isize)?;
+    let target = match fd.kind {
+        ProcDebugKind::Mem { pid } | ProcDebugKind::Regs { pid } | ProcDebugKind::Ctl { pid } => pid,
+    };
+    let caller = scheduler::current_pid();
+    // Revalidate on every operation so stale fds cannot outlive credential,
+    // parentage, or namespace transitions.  Also pin use to the opener to avoid
+    // a leaked synthetic backing fd becoming a confused-deputy capability.
+    if caller != fd.opener || !may_debug(caller, target) { return Err(-1); }
+    Ok(fd.kind)
+}
+
+fn may_mutate_debuggee(caller: usize, target: usize) -> bool {
+    use crate::proc::ptrace::PtraceState;
+    scheduler::with_proc(target, |p| match p.ptrace_state {
+        PtraceState::Stopped { tracer, .. } => tracer == caller,
+        _ => false,
+    }).unwrap_or(false) || scheduler::with_proc(caller, |p| {
+        p.caps.has(crate::security::capset::cap::SYS_PTRACE)
+    }).unwrap_or(false)
 }
 
 // ── open ─────────────────────────────────────────────────────────────────
@@ -85,7 +111,7 @@ pub fn proc_debug_open(opener: usize, path: &str) -> isize {
         Some(f) => f,
         None    => return -24, // EMFILE
     };
-    PROC_DEBUG_FDS.lock().insert(fdno, DebugFd { kind });
+    PROC_DEBUG_FDS.lock().insert(fdno, DebugFd { opener, kind });
     fdno as isize
 }
 
@@ -98,9 +124,9 @@ pub fn proc_debug_close(fdno: usize) {
 /// pread64-style: `offset` is the virtual address for Mem fds;
 /// ignored (treated as 0) for Regs and Ctl fds.
 pub fn proc_debug_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
-    let kind = match PROC_DEBUG_FDS.lock().get(&fdno).map(|f| f.kind) {
-        Some(k) => k,
-        None    => return -9, // EBADF
+    let kind = match fd_kind_for_current(fdno) {
+        Ok(k) => k,
+        Err(e) => return e,
     };
     match kind {
         ProcDebugKind::Mem { pid } => read_mem(pid, buf, offset),
@@ -110,6 +136,7 @@ pub fn proc_debug_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
 }
 
 fn read_mem(pid: usize, buf: &mut [u8], vaddr: usize) -> isize {
+    if vaddr >= crate::uaccess::USER_SPACE_END { return -14; }
     let cr3 = match scheduler::with_proc(pid, |p| p.user_satp) {
         Some(c) if c != 0 => c,
         _ => return -3, // ESRCH
@@ -121,8 +148,8 @@ fn read_mem(pid: usize, buf: &mut [u8], vaddr: usize) -> isize {
             Some(pa) => { *chunk = unsafe { *(pa as *const u8) }; }
             None     => break,
         }
-        va += 1;
         written += 1;
+        va = match va.checked_add(1) { Some(n) if n < crate::uaccess::USER_SPACE_END => n, _ => break };
     }
     written as isize
 }
@@ -171,9 +198,9 @@ fn read_ctl(pid: usize, buf: &mut [u8]) -> isize {
 
 /// pwrite64-style: `offset` is the target virtual address for Mem fds.
 pub fn proc_debug_write(fdno: usize, data: &[u8], offset: usize) -> isize {
-    let kind = match PROC_DEBUG_FDS.lock().get(&fdno).map(|f| f.kind) {
-        Some(k) => k,
-        None    => return -9,
+    let kind = match fd_kind_for_current(fdno) {
+        Ok(k) => k,
+        Err(e) => return e,
     };
     match kind {
         ProcDebugKind::Mem { pid } => write_mem(pid, data, offset),
@@ -183,6 +210,9 @@ pub fn proc_debug_write(fdno: usize, data: &[u8], offset: usize) -> isize {
 }
 
 fn write_mem(pid: usize, data: &[u8], vaddr: usize) -> isize {
+    if vaddr >= crate::uaccess::USER_SPACE_END { return -14; }
+    let caller = scheduler::current_pid();
+    if !may_mutate_debuggee(caller, pid) { return -1; }
     let cr3 = match scheduler::with_proc(pid, |p| p.user_satp) {
         Some(c) if c != 0 => c,
         _ => return -3,
@@ -194,13 +224,15 @@ fn write_mem(pid: usize, data: &[u8], vaddr: usize) -> isize {
             Some(pa) => { unsafe { *(pa as *mut u8) = byte; } }
             None     => break,
         }
-        va += 1;
         written += 1;
+        va = match va.checked_add(1) { Some(n) if n < crate::uaccess::USER_SPACE_END => n, _ => break };
     }
     written as isize
 }
 
 fn write_regs(pid: usize, data: &[u8]) -> isize {
+    let caller = scheduler::current_pid();
+    if !may_mutate_debuggee(caller, pid) { return -1; }
     let needed = UREG_COUNT * 8;
     if data.len() < needed { return -22; }
     let mut regs = [0u64; UREG_COUNT];
@@ -227,6 +259,8 @@ fn write_ctl(pid: usize, data: &[u8]) -> isize {
     use crate::proc::signal::send_signal;
     match cmd {
         "stop" => {
+            let caller = scheduler::current_pid();
+            if !may_debug(caller, pid) { return -1; }
             send_signal(pid, 19); // SIGSTOP
             data.len() as isize
         }
