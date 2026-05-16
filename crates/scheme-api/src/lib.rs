@@ -1,7 +1,7 @@
 //! `scheme-api` — types shared between the kernel and userspace driver processes.
 //!
-//! This crate is `#![no_std]` by default so it can be linked into the kernel.
-//! Enable the `std` feature for userspace consumers.
+//! This crate is `no_std` by default so it can be linked into the kernel.
+//! Enable the `std` feature for userspace consumers and host-side tests.
 //!
 //! # Overview
 //!
@@ -11,13 +11,13 @@
 //! native Rust struct; for userspace drivers it is an `IpcProxyScheme` that
 //! forwards these `SchemeRequest` messages over an `IpcEndpoint`.
 
-#![no_std]
+#![cfg_attr(not(any(test, feature = "std")), no_std)]
 
 extern crate alloc;
 
-+use alloc::{string: :String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 
- use bitflags::bitflags;
+use bitflags::bitflags;
 
 // ---------------------------------------------------------------------------
 // Primitive ID types
@@ -68,11 +68,11 @@ bitflags! {
 #[repr(u8)]
 pub enum SeekWhence {
     /// Seek from the start of the resource.
-    Start   = 0,
+    Start = 0,
     /// Seek relative to the current position.
     Current = 1,
     /// Seek from the end.
-    End     = 2,
+    End = 2,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,35 +85,35 @@ pub enum SeekWhence {
 #[repr(u32)]
 pub enum SchemeError {
     /// No scheme registered under this name.
-    NoSuchScheme    = 1,
+    NoSuchScheme = 1,
     /// The requested path does not exist within the scheme.
-    NotFound        = 2,
+    NotFound = 2,
     /// Caller lacks permission.
     PermissionDenied = 3,
     /// An argument was invalid (bad offset, null pointer, etc.).
-    InvalidArg      = 4,
+    InvalidArg = 4,
     /// The operation would block and `O_NONBLOCK` was set.
-    WouldBlock      = 5,
+    WouldBlock = 5,
     /// Generic I/O error.
-    Io              = 6,
+    Io = 6,
     /// The driver process has exited or is unreachable.
-    Unreachable     = 7,
+    Unreachable = 7,
     /// Any other unclassified error.
-    Other           = 0xFF,
+    Other = 0xFF,
 }
 
 impl SchemeError {
     /// Convert to a POSIX-compatible negative errno value.
     pub fn to_errno(self) -> i64 {
         match self {
-            SchemeError::NoSuchScheme     => -2,   // ENOENT
-            SchemeError::NotFound         => -2,   // ENOENT
-            SchemeError::PermissionDenied => -13,  // EACCES
-            SchemeError::InvalidArg       => -22,  // EINVAL
-            SchemeError::WouldBlock       => -11,  // EAGAIN
-            SchemeError::Io               => -5,   // EIO
-            SchemeError::Unreachable      => -111, // ECONNREFUSED
-            SchemeError::Other            => -1,   // EPERM
+            SchemeError::NoSuchScheme => -2,      // ENOENT
+            SchemeError::NotFound => -2,          // ENOENT
+            SchemeError::PermissionDenied => -13, // EACCES
+            SchemeError::InvalidArg => -22,       // EINVAL
+            SchemeError::WouldBlock => -11,       // EAGAIN
+            SchemeError::Io => -5,                // EIO
+            SchemeError::Unreachable => -111,     // ECONNREFUSED
+            SchemeError::Other => -1,             // EPERM
         }
     }
 }
@@ -125,12 +125,31 @@ impl SchemeError {
 /// A request sent *from* the kernel proxy *to* a userspace driver scheme.
 #[derive(Debug)]
 pub enum SchemeRequest {
-    Open  { path: String, flags: OpenFlags },
-    Read  { fd: SchemeFileId, len: usize },
-    Write { fd: SchemeFileId, data: Vec<u8> },
-    Ioctl { fd: SchemeFileId, cmd: u64, arg: usize },
-    Seek  { fd: SchemeFileId, offset: i64, whence: SeekWhence },
-    Close { fd: SchemeFileId },
+    Open {
+        path: String,
+        flags: OpenFlags,
+    },
+    Read {
+        fd: SchemeFileId,
+        len: usize,
+    },
+    Write {
+        fd: SchemeFileId,
+        data: Vec<u8>,
+    },
+    Ioctl {
+        fd: SchemeFileId,
+        cmd: u64,
+        arg: usize,
+    },
+    Seek {
+        fd: SchemeFileId,
+        offset: i64,
+        whence: SeekWhence,
+    },
+    Close {
+        fd: SchemeFileId,
+    },
 }
 
 /// A response sent *from* the userspace driver *to* the kernel proxy.
@@ -160,8 +179,8 @@ pub enum SchemeResponse {
 pub struct IrqNotification {
     /// Sentinel byte `0xFF` distinguishing IRQ notifications from scheme
     /// requests (whose first byte is always < `0x80`).
-    pub tag:          u8,
-    pub irq:          u32,
+    pub tag: u8,
+    pub irq: u32,
     pub timestamp_ns: u64,
 }
 
@@ -187,7 +206,9 @@ pub fn parse_scheme_url(url: &str) -> Option<(&str, &str)> {
     }
     let (scheme, path) = url.split_once(':')?;
     if scheme.is_empty()
-        || !scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return None;
     }
@@ -201,9 +222,9 @@ mod tests {
     #[test]
     fn parse_round_trip() {
         assert_eq!(parse_scheme_url("file:/etc"), Some(("file", "/etc")));
-        assert_eq!(parse_scheme_url("blk:"),      Some(("blk", "")));
+        assert_eq!(parse_scheme_url("blk:"), Some(("blk", "")));
         assert_eq!(parse_scheme_url("/dev/null"), None);
-        assert_eq!(parse_scheme_url(""),           None);
+        assert_eq!(parse_scheme_url(""), None);
     }
 
     #[test]

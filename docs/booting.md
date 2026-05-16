@@ -65,7 +65,17 @@ default boot entry.
 
 # Legacy multiboot2 (no OVMF needed):
 ./run_qemu.sh --multiboot
+
+# Headless smoke test: wait up to 20 seconds for the early UART marker.
+./run_qemu.sh --smoke --timeout 20
+
+# Userspace smoke test: require PID 1 to print its pass marker.
+./run_qemu.sh --smoke --smoke-marker '[init] TEST PASS: userspace_init' --timeout 30
 ```
+
+`run_qemu.sh --smoke` disables networking and graphics, captures serial output,
+and exits successfully only when the configured marker appears.  See
+`docs/status.md` for the current vertical-slice checklist.
 
 `run_qemu.sh` searches for OVMF in the following paths:
 
