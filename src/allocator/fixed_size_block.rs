@@ -1,1 +1,0 @@
-$(python3 -c "import json; d=json.load(open('/tmp/push_batches.json')); print(d[0][1]['content'])")
