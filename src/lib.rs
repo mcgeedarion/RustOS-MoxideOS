@@ -61,52 +61,5 @@ pub mod syscall;
 pub mod time;
 pub mod tty;
 
-// ── Legacy top-level aliases (backward compat) ───────────────────────────────
-//
-// Kept so that existing `crate::foo` references compile unchanged.
-// Migrate call-sites to the canonical paths and delete these.
-//
-//   Old path            Canonical path
-//   crate::allocator →  crate::mm::allocator
-//   crate::crt       →  crate::init::crt
-//   crate::drm       →  crate::display::drm
-//   crate::dt        →  crate::firmware::dt
-//   crate::elf       →  crate::exec::elf
-//   crate::gdbstub   →  crate::debug::gdbstub
-//   crate::initramfs →  crate::init::initramfs
-//   crate::loader    →  crate::init::loader
-//   crate::panic     →  crate::kernel::panic
-//   crate::rand      →  crate::kernel::rand
-//   crate::uaccess   →  crate::kernel::uaccess
-//   crate::utils     →  crate::kernel::utils
-//   crate::wayland   →  crate::display::wayland
-
-#[deprecated(since = "0.1.0", note = "use `crate::mm::allocator`")]
-pub mod allocator;
-#[deprecated(since = "0.1.0", note = "use `crate::init::crt`")]
-pub mod crt;
-#[deprecated(since = "0.1.0", note = "use `crate::display::drm`")]
-pub mod drm;
-#[deprecated(since = "0.1.0", note = "use `crate::firmware::dt`")]
-pub mod dt;
-#[deprecated(since = "0.1.0", note = "use `crate::exec::elf`")]
-pub mod elf;
-#[deprecated(since = "0.1.0", note = "use `crate::debug::gdbstub`")]
-pub mod gdbstub;
-#[deprecated(since = "0.1.0", note = "use `crate::init::initramfs`")]
-pub mod initramfs;
-#[deprecated(since = "0.1.0", note = "use `crate::init::loader`")]
-pub mod loader;
-#[deprecated(since = "0.1.0", note = "use `crate::kernel::panic`")]
-pub mod panic;
-#[deprecated(since = "0.1.0", note = "use `crate::kernel::rand`")]
-pub mod rand;
-#[deprecated(since = "0.1.0", note = "use `crate::kernel::uaccess`")]
-pub mod uaccess;
-#[deprecated(since = "0.1.0", note = "use `crate::kernel::utils`")]
-pub mod utils;
-#[deprecated(since = "0.1.0", note = "use `crate::display::wayland`")]
-pub mod wayland;
-
 pub use kernel_main::kernel_main;
 mod kernel_main;
