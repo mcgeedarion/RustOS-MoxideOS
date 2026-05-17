@@ -7,8 +7,18 @@
 //! other tables we may want later.
 //!
 //! Power management tables (FADT, DSDT) are parsed by the `power` sub-module.
+//! S3 sleep / resume is handled by `sleep`.
+//! CPU frequency scaling (`_PSS`/`_PPC`) is in `cpufreq`.
+//! Battery information (`_BIF`/`_BST`) is in `battery`.
+//! PCIe ACPI-mediated hot-plug (GPE + Notify) is in `hotplug`.
+//! NUMA topology (SRAT + SLIT) is in `numa`.
 
 pub mod power;
+pub mod sleep;
+pub mod cpufreq;
+pub mod battery;
+pub mod hotplug;
+pub mod numa;
 
 use core::mem::size_of;
 use core::slice;
@@ -173,4 +183,24 @@ pub fn pcie_ecam_base() -> Option<u64> {
         let base = body.read_unaligned();
         if base == 0 { None } else { Some(base) }
     }
+}
+
+/// Convenience: initialise all ACPI sub-systems after the RSDP has been found.
+///
+/// Call order:
+/// 1. `init(rsdp_phys)`       — root table discovery
+/// 2. `power::init()`         — FADT/DSDT, SCI IRQ
+/// 3. `sleep::init()`         — FACS, S3 wakeup vector
+/// 4. `cpufreq::init()`       — _PSS / _PPC P-state table
+/// 5. `battery::init()`       — _BIF / _BST battery info
+/// 6. `hotplug::init()`       — GPE hot-plug handler
+/// 7. `numa::init()`          — SRAT + SLIT topology
+pub unsafe fn init_all(rsdp_phys: usize) {
+    init(rsdp_phys);
+    power::init();
+    sleep::init();
+    cpufreq::init();
+    battery::init();
+    hotplug::init();
+    numa::init();
 }
