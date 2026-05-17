@@ -16,6 +16,7 @@
 pub mod cqe;
 pub mod ops;
 pub mod ring;
+pub mod ring_pub
 pub mod ring_buf;
 pub mod sqe;
 pub mod waker;
