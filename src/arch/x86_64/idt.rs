@@ -57,6 +57,19 @@
 //! | 32     | IRQ0     | —   | APIC timer |
 //! | 33–255 | IRQ1+    | —   | dynamically registered drivers |
 //!
+//! ## IPI vectors (registered by apic::apic_init)
+//!
+//! | Vector | Name              |
+//! |--------|-------------------|
+//! | 0xF0   | TLB shootdown     |
+//! | 0xF1   | Reschedule        |
+//! | 0xF2   | Function call     |
+//! | 0xFE   | Panic halt        |
+//! | 0xFF   | Spurious (LAPIC)  |
+//!
+//! IPI vectors use the `generic_irq_asm<N>` const-generic stub so that
+//! `generic_irq_dispatch` receives the correct vector in `rsi`.
+//!
 //! ## Dynamic IRQ registration
 //!
 //! Drivers call `register_irq(vector, handler)` after `idt_init()`.  The
@@ -250,11 +263,236 @@ pub fn idt_init() {
             IDT[v as usize].set(exc_noerr_asm::<255> as usize, GATE_INT, 0);
         }
 
-        // ── IRQ vectors 32–255 ──────────────────────────────────────────
-        IDT[32].set(timer_irq_asm as usize, GATE_INT, 0); // APIC timer
-        for v in 33u8..=255 {
-            IDT[v as usize].set(generic_irq_asm_stub as usize, GATE_INT, 0);
-        }
+        // ── IRQ vectors 32–239: generic per-vector stubs ─────────────────
+        // Each stub bakes N into `mov rsi, N` so generic_irq_dispatch
+        // receives the correct vector number.  The IPI range (0xF0–0xFE)
+        // benefits from this: apic::register_ipi_handlers() uses
+        // register_irq() to install Rust closures into IRQ_HANDLERS[N].
+        IDT[32].set(timer_irq_asm as usize, GATE_INT, 0); // APIC timer (fast path)
+        IDT[ 33].set(generic_irq_asm::<  33> as usize, GATE_INT, 0);
+        IDT[ 34].set(generic_irq_asm::<  34> as usize, GATE_INT, 0);
+        IDT[ 35].set(generic_irq_asm::<  35> as usize, GATE_INT, 0);
+        IDT[ 36].set(generic_irq_asm::<  36> as usize, GATE_INT, 0);
+        IDT[ 37].set(generic_irq_asm::<  37> as usize, GATE_INT, 0);
+        IDT[ 38].set(generic_irq_asm::<  38> as usize, GATE_INT, 0);
+        IDT[ 39].set(generic_irq_asm::<  39> as usize, GATE_INT, 0);
+        IDT[ 40].set(generic_irq_asm::<  40> as usize, GATE_INT, 0);
+        IDT[ 41].set(generic_irq_asm::<  41> as usize, GATE_INT, 0);
+        IDT[ 42].set(generic_irq_asm::<  42> as usize, GATE_INT, 0);
+        IDT[ 43].set(generic_irq_asm::<  43> as usize, GATE_INT, 0);
+        IDT[ 44].set(generic_irq_asm::<  44> as usize, GATE_INT, 0);
+        IDT[ 45].set(generic_irq_asm::<  45> as usize, GATE_INT, 0);
+        IDT[ 46].set(generic_irq_asm::<  46> as usize, GATE_INT, 0);
+        IDT[ 47].set(generic_irq_asm::<  47> as usize, GATE_INT, 0);
+        IDT[ 48].set(generic_irq_asm::<  48> as usize, GATE_INT, 0);
+        IDT[ 49].set(generic_irq_asm::<  49> as usize, GATE_INT, 0);
+        IDT[ 50].set(generic_irq_asm::<  50> as usize, GATE_INT, 0);
+        IDT[ 51].set(generic_irq_asm::<  51> as usize, GATE_INT, 0);
+        IDT[ 52].set(generic_irq_asm::<  52> as usize, GATE_INT, 0);
+        IDT[ 53].set(generic_irq_asm::<  53> as usize, GATE_INT, 0);
+        IDT[ 54].set(generic_irq_asm::<  54> as usize, GATE_INT, 0);
+        IDT[ 55].set(generic_irq_asm::<  55> as usize, GATE_INT, 0);
+        IDT[ 56].set(generic_irq_asm::<  56> as usize, GATE_INT, 0);
+        IDT[ 57].set(generic_irq_asm::<  57> as usize, GATE_INT, 0);
+        IDT[ 58].set(generic_irq_asm::<  58> as usize, GATE_INT, 0);
+        IDT[ 59].set(generic_irq_asm::<  59> as usize, GATE_INT, 0);
+        IDT[ 60].set(generic_irq_asm::<  60> as usize, GATE_INT, 0);
+        IDT[ 61].set(generic_irq_asm::<  61> as usize, GATE_INT, 0);
+        IDT[ 62].set(generic_irq_asm::<  62> as usize, GATE_INT, 0);
+        IDT[ 63].set(generic_irq_asm::<  63> as usize, GATE_INT, 0);
+        IDT[ 64].set(generic_irq_asm::<  64> as usize, GATE_INT, 0);
+        IDT[ 65].set(generic_irq_asm::<  65> as usize, GATE_INT, 0);
+        IDT[ 66].set(generic_irq_asm::<  66> as usize, GATE_INT, 0);
+        IDT[ 67].set(generic_irq_asm::<  67> as usize, GATE_INT, 0);
+        IDT[ 68].set(generic_irq_asm::<  68> as usize, GATE_INT, 0);
+        IDT[ 69].set(generic_irq_asm::<  69> as usize, GATE_INT, 0);
+        IDT[ 70].set(generic_irq_asm::<  70> as usize, GATE_INT, 0);
+        IDT[ 71].set(generic_irq_asm::<  71> as usize, GATE_INT, 0);
+        IDT[ 72].set(generic_irq_asm::<  72> as usize, GATE_INT, 0);
+        IDT[ 73].set(generic_irq_asm::<  73> as usize, GATE_INT, 0);
+        IDT[ 74].set(generic_irq_asm::<  74> as usize, GATE_INT, 0);
+        IDT[ 75].set(generic_irq_asm::<  75> as usize, GATE_INT, 0);
+        IDT[ 76].set(generic_irq_asm::<  76> as usize, GATE_INT, 0);
+        IDT[ 77].set(generic_irq_asm::<  77> as usize, GATE_INT, 0);
+        IDT[ 78].set(generic_irq_asm::<  78> as usize, GATE_INT, 0);
+        IDT[ 79].set(generic_irq_asm::<  79> as usize, GATE_INT, 0);
+        IDT[ 80].set(generic_irq_asm::<  80> as usize, GATE_INT, 0);
+        IDT[ 81].set(generic_irq_asm::<  81> as usize, GATE_INT, 0);
+        IDT[ 82].set(generic_irq_asm::<  82> as usize, GATE_INT, 0);
+        IDT[ 83].set(generic_irq_asm::<  83> as usize, GATE_INT, 0);
+        IDT[ 84].set(generic_irq_asm::<  84> as usize, GATE_INT, 0);
+        IDT[ 85].set(generic_irq_asm::<  85> as usize, GATE_INT, 0);
+        IDT[ 86].set(generic_irq_asm::<  86> as usize, GATE_INT, 0);
+        IDT[ 87].set(generic_irq_asm::<  87> as usize, GATE_INT, 0);
+        IDT[ 88].set(generic_irq_asm::<  88> as usize, GATE_INT, 0);
+        IDT[ 89].set(generic_irq_asm::<  89> as usize, GATE_INT, 0);
+        IDT[ 90].set(generic_irq_asm::<  90> as usize, GATE_INT, 0);
+        IDT[ 91].set(generic_irq_asm::<  91> as usize, GATE_INT, 0);
+        IDT[ 92].set(generic_irq_asm::<  92> as usize, GATE_INT, 0);
+        IDT[ 93].set(generic_irq_asm::<  93> as usize, GATE_INT, 0);
+        IDT[ 94].set(generic_irq_asm::<  94> as usize, GATE_INT, 0);
+        IDT[ 95].set(generic_irq_asm::<  95> as usize, GATE_INT, 0);
+        IDT[ 96].set(generic_irq_asm::<  96> as usize, GATE_INT, 0);
+        IDT[ 97].set(generic_irq_asm::<  97> as usize, GATE_INT, 0);
+        IDT[ 98].set(generic_irq_asm::<  98> as usize, GATE_INT, 0);
+        IDT[ 99].set(generic_irq_asm::<  99> as usize, GATE_INT, 0);
+        IDT[100].set(generic_irq_asm::< 100> as usize, GATE_INT, 0);
+        IDT[101].set(generic_irq_asm::< 101> as usize, GATE_INT, 0);
+        IDT[102].set(generic_irq_asm::< 102> as usize, GATE_INT, 0);
+        IDT[103].set(generic_irq_asm::< 103> as usize, GATE_INT, 0);
+        IDT[104].set(generic_irq_asm::< 104> as usize, GATE_INT, 0);
+        IDT[105].set(generic_irq_asm::< 105> as usize, GATE_INT, 0);
+        IDT[106].set(generic_irq_asm::< 106> as usize, GATE_INT, 0);
+        IDT[107].set(generic_irq_asm::< 107> as usize, GATE_INT, 0);
+        IDT[108].set(generic_irq_asm::< 108> as usize, GATE_INT, 0);
+        IDT[109].set(generic_irq_asm::< 109> as usize, GATE_INT, 0);
+        IDT[110].set(generic_irq_asm::< 110> as usize, GATE_INT, 0);
+        IDT[111].set(generic_irq_asm::< 111> as usize, GATE_INT, 0);
+        IDT[112].set(generic_irq_asm::< 112> as usize, GATE_INT, 0);
+        IDT[113].set(generic_irq_asm::< 113> as usize, GATE_INT, 0);
+        IDT[114].set(generic_irq_asm::< 114> as usize, GATE_INT, 0);
+        IDT[115].set(generic_irq_asm::< 115> as usize, GATE_INT, 0);
+        IDT[116].set(generic_irq_asm::< 116> as usize, GATE_INT, 0);
+        IDT[117].set(generic_irq_asm::< 117> as usize, GATE_INT, 0);
+        IDT[118].set(generic_irq_asm::< 118> as usize, GATE_INT, 0);
+        IDT[119].set(generic_irq_asm::< 119> as usize, GATE_INT, 0);
+        IDT[120].set(generic_irq_asm::< 120> as usize, GATE_INT, 0);
+        IDT[121].set(generic_irq_asm::< 121> as usize, GATE_INT, 0);
+        IDT[122].set(generic_irq_asm::< 122> as usize, GATE_INT, 0);
+        IDT[123].set(generic_irq_asm::< 123> as usize, GATE_INT, 0);
+        IDT[124].set(generic_irq_asm::< 124> as usize, GATE_INT, 0);
+        IDT[125].set(generic_irq_asm::< 125> as usize, GATE_INT, 0);
+        IDT[126].set(generic_irq_asm::< 126> as usize, GATE_INT, 0);
+        IDT[127].set(generic_irq_asm::< 127> as usize, GATE_INT, 0);
+        IDT[128].set(generic_irq_asm::< 128> as usize, GATE_INT, 0);
+        IDT[129].set(generic_irq_asm::< 129> as usize, GATE_INT, 0);
+        IDT[130].set(generic_irq_asm::< 130> as usize, GATE_INT, 0);
+        IDT[131].set(generic_irq_asm::< 131> as usize, GATE_INT, 0);
+        IDT[132].set(generic_irq_asm::< 132> as usize, GATE_INT, 0);
+        IDT[133].set(generic_irq_asm::< 133> as usize, GATE_INT, 0);
+        IDT[134].set(generic_irq_asm::< 134> as usize, GATE_INT, 0);
+        IDT[135].set(generic_irq_asm::< 135> as usize, GATE_INT, 0);
+        IDT[136].set(generic_irq_asm::< 136> as usize, GATE_INT, 0);
+        IDT[137].set(generic_irq_asm::< 137> as usize, GATE_INT, 0);
+        IDT[138].set(generic_irq_asm::< 138> as usize, GATE_INT, 0);
+        IDT[139].set(generic_irq_asm::< 139> as usize, GATE_INT, 0);
+        IDT[140].set(generic_irq_asm::< 140> as usize, GATE_INT, 0);
+        IDT[141].set(generic_irq_asm::< 141> as usize, GATE_INT, 0);
+        IDT[142].set(generic_irq_asm::< 142> as usize, GATE_INT, 0);
+        IDT[143].set(generic_irq_asm::< 143> as usize, GATE_INT, 0);
+        IDT[144].set(generic_irq_asm::< 144> as usize, GATE_INT, 0);
+        IDT[145].set(generic_irq_asm::< 145> as usize, GATE_INT, 0);
+        IDT[146].set(generic_irq_asm::< 146> as usize, GATE_INT, 0);
+        IDT[147].set(generic_irq_asm::< 147> as usize, GATE_INT, 0);
+        IDT[148].set(generic_irq_asm::< 148> as usize, GATE_INT, 0);
+        IDT[149].set(generic_irq_asm::< 149> as usize, GATE_INT, 0);
+        IDT[150].set(generic_irq_asm::< 150> as usize, GATE_INT, 0);
+        IDT[151].set(generic_irq_asm::< 151> as usize, GATE_INT, 0);
+        IDT[152].set(generic_irq_asm::< 152> as usize, GATE_INT, 0);
+        IDT[153].set(generic_irq_asm::< 153> as usize, GATE_INT, 0);
+        IDT[154].set(generic_irq_asm::< 154> as usize, GATE_INT, 0);
+        IDT[155].set(generic_irq_asm::< 155> as usize, GATE_INT, 0);
+        IDT[156].set(generic_irq_asm::< 156> as usize, GATE_INT, 0);
+        IDT[157].set(generic_irq_asm::< 157> as usize, GATE_INT, 0);
+        IDT[158].set(generic_irq_asm::< 158> as usize, GATE_INT, 0);
+        IDT[159].set(generic_irq_asm::< 159> as usize, GATE_INT, 0);
+        IDT[160].set(generic_irq_asm::< 160> as usize, GATE_INT, 0);
+        IDT[161].set(generic_irq_asm::< 161> as usize, GATE_INT, 0);
+        IDT[162].set(generic_irq_asm::< 162> as usize, GATE_INT, 0);
+        IDT[163].set(generic_irq_asm::< 163> as usize, GATE_INT, 0);
+        IDT[164].set(generic_irq_asm::< 164> as usize, GATE_INT, 0);
+        IDT[165].set(generic_irq_asm::< 165> as usize, GATE_INT, 0);
+        IDT[166].set(generic_irq_asm::< 166> as usize, GATE_INT, 0);
+        IDT[167].set(generic_irq_asm::< 167> as usize, GATE_INT, 0);
+        IDT[168].set(generic_irq_asm::< 168> as usize, GATE_INT, 0);
+        IDT[169].set(generic_irq_asm::< 169> as usize, GATE_INT, 0);
+        IDT[170].set(generic_irq_asm::< 170> as usize, GATE_INT, 0);
+        IDT[171].set(generic_irq_asm::< 171> as usize, GATE_INT, 0);
+        IDT[172].set(generic_irq_asm::< 172> as usize, GATE_INT, 0);
+        IDT[173].set(generic_irq_asm::< 173> as usize, GATE_INT, 0);
+        IDT[174].set(generic_irq_asm::< 174> as usize, GATE_INT, 0);
+        IDT[175].set(generic_irq_asm::< 175> as usize, GATE_INT, 0);
+        IDT[176].set(generic_irq_asm::< 176> as usize, GATE_INT, 0);
+        IDT[177].set(generic_irq_asm::< 177> as usize, GATE_INT, 0);
+        IDT[178].set(generic_irq_asm::< 178> as usize, GATE_INT, 0);
+        IDT[179].set(generic_irq_asm::< 179> as usize, GATE_INT, 0);
+        IDT[180].set(generic_irq_asm::< 180> as usize, GATE_INT, 0);
+        IDT[181].set(generic_irq_asm::< 181> as usize, GATE_INT, 0);
+        IDT[182].set(generic_irq_asm::< 182> as usize, GATE_INT, 0);
+        IDT[183].set(generic_irq_asm::< 183> as usize, GATE_INT, 0);
+        IDT[184].set(generic_irq_asm::< 184> as usize, GATE_INT, 0);
+        IDT[185].set(generic_irq_asm::< 185> as usize, GATE_INT, 0);
+        IDT[186].set(generic_irq_asm::< 186> as usize, GATE_INT, 0);
+        IDT[187].set(generic_irq_asm::< 187> as usize, GATE_INT, 0);
+        IDT[188].set(generic_irq_asm::< 188> as usize, GATE_INT, 0);
+        IDT[189].set(generic_irq_asm::< 189> as usize, GATE_INT, 0);
+        IDT[190].set(generic_irq_asm::< 190> as usize, GATE_INT, 0);
+        IDT[191].set(generic_irq_asm::< 191> as usize, GATE_INT, 0);
+        IDT[192].set(generic_irq_asm::< 192> as usize, GATE_INT, 0);
+        IDT[193].set(generic_irq_asm::< 193> as usize, GATE_INT, 0);
+        IDT[194].set(generic_irq_asm::< 194> as usize, GATE_INT, 0);
+        IDT[195].set(generic_irq_asm::< 195> as usize, GATE_INT, 0);
+        IDT[196].set(generic_irq_asm::< 196> as usize, GATE_INT, 0);
+        IDT[197].set(generic_irq_asm::< 197> as usize, GATE_INT, 0);
+        IDT[198].set(generic_irq_asm::< 198> as usize, GATE_INT, 0);
+        IDT[199].set(generic_irq_asm::< 199> as usize, GATE_INT, 0);
+        IDT[200].set(generic_irq_asm::< 200> as usize, GATE_INT, 0);
+        IDT[201].set(generic_irq_asm::< 201> as usize, GATE_INT, 0);
+        IDT[202].set(generic_irq_asm::< 202> as usize, GATE_INT, 0);
+        IDT[203].set(generic_irq_asm::< 203> as usize, GATE_INT, 0);
+        IDT[204].set(generic_irq_asm::< 204> as usize, GATE_INT, 0);
+        IDT[205].set(generic_irq_asm::< 205> as usize, GATE_INT, 0);
+        IDT[206].set(generic_irq_asm::< 206> as usize, GATE_INT, 0);
+        IDT[207].set(generic_irq_asm::< 207> as usize, GATE_INT, 0);
+        IDT[208].set(generic_irq_asm::< 208> as usize, GATE_INT, 0);
+        IDT[209].set(generic_irq_asm::< 209> as usize, GATE_INT, 0);
+        IDT[210].set(generic_irq_asm::< 210> as usize, GATE_INT, 0);
+        IDT[211].set(generic_irq_asm::< 211> as usize, GATE_INT, 0);
+        IDT[212].set(generic_irq_asm::< 212> as usize, GATE_INT, 0);
+        IDT[213].set(generic_irq_asm::< 213> as usize, GATE_INT, 0);
+        IDT[214].set(generic_irq_asm::< 214> as usize, GATE_INT, 0);
+        IDT[215].set(generic_irq_asm::< 215> as usize, GATE_INT, 0);
+        IDT[216].set(generic_irq_asm::< 216> as usize, GATE_INT, 0);
+        IDT[217].set(generic_irq_asm::< 217> as usize, GATE_INT, 0);
+        IDT[218].set(generic_irq_asm::< 218> as usize, GATE_INT, 0);
+        IDT[219].set(generic_irq_asm::< 219> as usize, GATE_INT, 0);
+        IDT[220].set(generic_irq_asm::< 220> as usize, GATE_INT, 0);
+        IDT[221].set(generic_irq_asm::< 221> as usize, GATE_INT, 0);
+        IDT[222].set(generic_irq_asm::< 222> as usize, GATE_INT, 0);
+        IDT[223].set(generic_irq_asm::< 223> as usize, GATE_INT, 0);
+        IDT[224].set(generic_irq_asm::< 224> as usize, GATE_INT, 0);
+        IDT[225].set(generic_irq_asm::< 225> as usize, GATE_INT, 0);
+        IDT[226].set(generic_irq_asm::< 226> as usize, GATE_INT, 0);
+        IDT[227].set(generic_irq_asm::< 227> as usize, GATE_INT, 0);
+        IDT[228].set(generic_irq_asm::< 228> as usize, GATE_INT, 0);
+        IDT[229].set(generic_irq_asm::< 229> as usize, GATE_INT, 0);
+        IDT[230].set(generic_irq_asm::< 230> as usize, GATE_INT, 0);
+        IDT[231].set(generic_irq_asm::< 231> as usize, GATE_INT, 0);
+        IDT[232].set(generic_irq_asm::< 232> as usize, GATE_INT, 0);
+        IDT[233].set(generic_irq_asm::< 233> as usize, GATE_INT, 0);
+        IDT[234].set(generic_irq_asm::< 234> as usize, GATE_INT, 0);
+        IDT[235].set(generic_irq_asm::< 235> as usize, GATE_INT, 0);
+        IDT[236].set(generic_irq_asm::< 236> as usize, GATE_INT, 0);
+        IDT[237].set(generic_irq_asm::< 237> as usize, GATE_INT, 0);
+        IDT[238].set(generic_irq_asm::< 238> as usize, GATE_INT, 0);
+        IDT[239].set(generic_irq_asm::< 239> as usize, GATE_INT, 0);
+        // IPI vectors 0xF0–0xFE — must pass correct N so dispatch works.
+        IDT[0xF0].set(generic_irq_asm::<0xF0> as usize, GATE_INT, 0); // TLB shootdown
+        IDT[0xF1].set(generic_irq_asm::<0xF1> as usize, GATE_INT, 0); // Reschedule
+        IDT[0xF2].set(generic_irq_asm::<0xF2> as usize, GATE_INT, 0); // Func call
+        IDT[0xF3].set(generic_irq_asm::<0xF3> as usize, GATE_INT, 0);
+        IDT[0xF4].set(generic_irq_asm::<0xF4> as usize, GATE_INT, 0);
+        IDT[0xF5].set(generic_irq_asm::<0xF5> as usize, GATE_INT, 0);
+        IDT[0xF6].set(generic_irq_asm::<0xF6> as usize, GATE_INT, 0);
+        IDT[0xF7].set(generic_irq_asm::<0xF7> as usize, GATE_INT, 0);
+        IDT[0xF8].set(generic_irq_asm::<0xF8> as usize, GATE_INT, 0);
+        IDT[0xF9].set(generic_irq_asm::<0xF9> as usize, GATE_INT, 0);
+        IDT[0xFA].set(generic_irq_asm::<0xFA> as usize, GATE_INT, 0);
+        IDT[0xFB].set(generic_irq_asm::<0xFB> as usize, GATE_INT, 0);
+        IDT[0xFC].set(generic_irq_asm::<0xFC> as usize, GATE_INT, 0);
+        IDT[0xFD].set(generic_irq_asm::<0xFD> as usize, GATE_INT, 0);
+        IDT[0xFE].set(generic_irq_asm::<0xFE> as usize, GATE_INT, 0); // Panic halt
+        IDT[0xFF].set(generic_irq_asm::<0xFF> as usize, GATE_INT, 0); // LAPIC spurious
 
         load();
     }
@@ -435,6 +673,25 @@ unsafe extern "C" fn exc_err_asm<const N: u64>() {
     );
 }
 
+/// Per-vector IRQ stub.  Encodes the vector number N as an immediate into
+/// `rsi` so `generic_irq_dispatch` always receives the correct vector.
+/// This replaces the old single `generic_irq_asm_stub` that passed rsi=0.
+#[naked]
+unsafe extern "C" fn generic_irq_asm<const N: u64>() {
+    core::arch::asm!(
+        "push 0",
+        push_all!(),
+        "mov rdi, rsp",
+        "mov rsi, {N}",
+        "call generic_irq_dispatch",
+        pop_all!(),
+        "add rsp, 8",
+        "iretq",
+        N = const N,
+        options(noreturn)
+    );
+}
+
 #[naked]
 unsafe extern "C" fn db_asm() {
     core::arch::asm!(
@@ -498,21 +755,6 @@ unsafe extern "C" fn timer_irq_asm() {
         push_all!(),
         "mov rdi, rsp",
         "call timer_irq_handler",
-        pop_all!(),
-        "add rsp, 8",
-        "iretq",
-        options(noreturn)
-    );
-}
-
-#[naked]
-unsafe extern "C" fn generic_irq_asm_stub() {
-    core::arch::asm!(
-        "push 0",
-        push_all!(),
-        "mov rdi, rsp",
-        "xor rsi, rsi",
-        "call generic_irq_dispatch",
         pop_all!(),
         "add rsp, 8",
         "iretq",
