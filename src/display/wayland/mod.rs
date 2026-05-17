@@ -1,13 +1,16 @@
 //! In-kernel Wayland compositor and server.
 //!
 //! Surfaces are presented to the display via `crate::display::drm`.
+//!
+//! ## Kernel responsibilities
+//!
+//! This module is intentionally thin. The Wayland compositor runs as a
+//! privileged userspace process (`/usr/bin/rustos-compositor`). The kernel
+//! retains only:
+//!
+//!   - `compositor::vblank_notify` — vblank ISR pass-through to the compositor
+//!     process via `crate::drivers::drm::deliver_vblank_event`.
+//!   - `server` — architecture documentation; no public API.
 
-pub use crate::wayland::{compositor, server};
-
-pub mod compositor {
-    pub use crate::wayland::compositor::*;
-}
-
-pub mod server {
-    pub use crate::wayland::server::*;
-}
+pub mod compositor;
+pub mod server;

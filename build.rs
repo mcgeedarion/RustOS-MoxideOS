@@ -6,6 +6,9 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
+    // Always compile the freestanding C runtime stubs.
+    compile_crt();
+
     if target_arch == "riscv64" {
         assemble_riscv_uentry(&out);
     }
@@ -13,6 +16,46 @@ fn main() {
     if target_arch == "x86_64" && std::env::var("CARGO_FEATURE_UEFI_BOOT").is_ok() {
         produce_uefi_image(&out);
     }
+}
+
+// Compile src/init/crt/*.c into a static archive `librustos_crt.a` and
+// instruct Cargo to link it into the kernel binary.
+//
+// Flags:
+//   -ffreestanding   — no host libc assumptions
+//   -nostdlib        — do not link the standard library
+//   -O2              — light optimisation (safe for freestanding)
+//   -fno-stack-protector — the stubs *define* __stack_chk_fail; avoid recursion
+fn compile_crt() {
+    let crt_dir = "src/init/crt";
+    let sources = [
+        "compiler_rt.c",
+        "crt0.c",
+        "memcpy.c",
+        "memmove.c",
+        "memset.c",
+    ];
+
+    for src in &sources {
+        println!("cargo:rerun-if-changed={crt_dir}/{src}");
+    }
+
+    let mut build = cc::Build::new();
+    build
+        .flag("-ffreestanding")
+        .flag("-nostdlib")
+        .flag("-O2")
+        .flag("-fno-stack-protector")
+        .flag("-fno-builtin")
+        // Suppress warnings that are expected in freestanding C
+        .flag("-Wno-builtin-declaration-mismatch")
+        .static_flag(true);
+
+    for src in &sources {
+        build.file(format!("{crt_dir}/{src}"));
+    }
+
+    build.compile("rustos_crt");
 }
 
 // Assemble the RISC-V uentry trampoline and archive it as a static lib.

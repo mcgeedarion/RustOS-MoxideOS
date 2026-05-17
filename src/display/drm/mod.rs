@@ -7,8 +7,8 @@
 //! - GEM (Graphics Execution Manager) buffer objects
 //! - Synchronization primitives for GPU work (fences, dma-buf)
 //!
-//! The Wayland compositor (`crate::wayland`) interfaces with this subsystem
-//! to perform display output and buffer presentation.
+//! The Wayland compositor (`crate::display::wayland`) interfaces with this
+//! subsystem to perform display output and buffer presentation.
 
 pub mod crtc;
 pub mod encoder;
