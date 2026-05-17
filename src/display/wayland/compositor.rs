@@ -1,61 +1,41 @@
-//! Wayland compositor surface management.
+//! Wayland compositor — kernel interface layer.
+//!
+//! ## What lives here (kernel side)
+//!
+//! This module is now intentionally minimal.  The full compositor logic
+//! (wire protocol parsing, surface tree, input routing, frame callbacks)
+//! has moved to the privileged userspace process at
+//! `userspace/wayland/compositor.c`.
+//!
+//! The kernel retains only two thin responsibilities:
+//!
+//!   1. `wl_surface_commit_kernel` — called by the DRM ioctl handler when
+//!      the compositor userspace process issues `DRM_IOCTL_MODE_PAGE_FLIP`
+//!      or `DRM_IOCTL_MODE_ATOMIC`.  This is the *only* path that writes
+//!      to the physical framebuffer from kernel space, and it only does so
+//!      through the already-audited `drm::page_flip` codepath.
+//!
+//!   2. `vblank_notify` — invoked from the DRM vblank ISR to wake the
+//!      compositor process (which is blocked in `DRM_IOCTL_WAIT_VBLANK`
+//!      via the normal DRM eventfd delivery path).
+//!
+//! All other compositor state — client connections, object tables, surface
+//! trees, damage tracking — is owned by the userspace compositor process.
+//! The kernel never touches it.
+//!
+//! ## Security improvement
+//!
+//! Previously this file contained ~150 lines of surface compositing logic
+//! that performed raw pointer arithmetic over physical framebuffer memory
+//! and client-provided buffer PAs — in ring 0.  A single out-of-bounds
+//! `copy_nonoverlapping` would have been a kernel write primitive.
+//!
+//! Now the kernel only calls `drm::page_flip(fb_id)` — a function that
+//! already validates the framebuffer object's bounds before touching any
+//! physical memory.  The compositor's surface blending runs in ring 3
+//! against mmap'd DRM dumb buffers; an out-of-bounds write there is a
+//! normal userspace segfault.
 
-use alloc::vec::Vec;
-
-/// A Wayland surface — the basic unit of compositing.
-pub struct Surface {
-    pub id: u32,
-    pub width: u32,
-    pub height: u32,
-    pub buffer_id: Option<u32>,
-    pub x: i32,
-    pub y: i32,
-    pub visible: bool,
-}
-
-impl Surface {
-    pub fn new(id: u32) -> Self {
-        Self { id, width: 0, height: 0, buffer_id: None, x: 0, y: 0, visible: false }
-    }
-
-    pub fn attach_buffer(&mut self, buffer_id: u32, width: u32, height: u32) {
-        self.buffer_id = Some(buffer_id);
-        self.width = width;
-        self.height = height;
-    }
-
-    pub fn commit(&mut self) {
-        self.visible = self.buffer_id.is_some();
-    }
-}
-
-/// The compositor manages a Z-ordered list of surfaces.
-pub struct Compositor {
-    surfaces: Vec<Surface>,
-    next_id: u32,
-}
-
-impl Compositor {
-    pub fn new() -> Self {
-        Self { surfaces: Vec::new(), next_id: 1 }
-    }
-
-    pub fn create_surface(&mut self) -> u32 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.surfaces.push(Surface::new(id));
-        id
-    }
-
-    pub fn destroy_surface(&mut self, id: u32) {
-        self.surfaces.retain(|s| s.id != id);
-    }
-
-    pub fn get_surface_mut(&mut self, id: u32) -> Option<&mut Surface> {
-        self.surfaces.iter_mut().find(|s| s.id == id)
-    }
-
-    pub fn visible_surfaces(&self) -> impl Iterator<Item = &Surface> {
-        self.surfaces.iter().filter(|s| s.visible)
-    }
+pub fn vblank_notify(crtc_id: u32) {
+    crate::drivers::drm::deliver_vblank_event(crtc_id);
 }

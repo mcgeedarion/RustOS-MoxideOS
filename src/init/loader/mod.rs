@@ -1,2 +1,4 @@
-// Init: ELF loader — re-exported from the canonical location.
-pub use crate::loader::*;
+//! ELF loader and initial stack builder.
+
+pub mod elf64;
+pub mod auxv;

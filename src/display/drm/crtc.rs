@@ -1,30 +1,38 @@
-//! CRTC (Cathode Ray Tube Controller) management.
+//! CRTC (CRT Controller) management.
 //!
-//! A CRTC scans out a framebuffer to one or more encoders. It controls
-//! the display timing and resolution.
+//! A CRTC scans out a framebuffer to one or more encoders. Each active
+//! display pipeline requires exactly one CRTC.
 
-use super::DisplayMode;
+use super::{DisplayMode, DrmError};
 
+/// Represents a single CRTC instance.
 pub struct Crtc {
     pub id: u32,
-    pub mode: Option<DisplayMode>,
-    pub enabled: bool,
-    pub x: u32,
-    pub y: u32,
+    pub active: bool,
+    pub current_mode: Option<DisplayMode>,
+    pub current_fb: Option<u32>,
 }
 
 impl Crtc {
     pub fn new(id: u32) -> Self {
-        Self { id, mode: None, enabled: false, x: 0, y: 0 }
+        Self {
+            id,
+            active: false,
+            current_mode: None,
+            current_fb: None,
+        }
     }
 
-    pub fn set_mode(&mut self, mode: DisplayMode) {
-        self.mode = Some(mode);
-        self.enabled = true;
+    pub fn set_mode(&mut self, mode: DisplayMode, fb_id: u32) -> Result<(), DrmError> {
+        self.current_mode = Some(mode);
+        self.current_fb = Some(fb_id);
+        self.active = true;
+        Ok(())
     }
 
     pub fn disable(&mut self) {
-        self.mode = None;
-        self.enabled = false;
+        self.active = false;
+        self.current_mode = None;
+        self.current_fb = None;
     }
 }

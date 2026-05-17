@@ -1,33 +1,30 @@
 //! Encoder management.
 //!
-//! An encoder converts pixel data from a CRTC to the format required
-//! by a connector (e.g., TMDS for HDMI, LVDS for panels).
+//! Encoders convert the pixel data from a CRTC into a signal suitable
+//! for a particular connector type (HDMI, DisplayPort, LVDS, etc.).
 
+/// Encoder output type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderType {
     None,
     Dac,
-    Tmds,
+    Tmds,  // HDMI / DVI
     Lvds,
-    TvDac,
+    Tvdac,
     Virtual,
     Dsi,
-    Dpmst,
-    Dp,
+    Dp,    // DisplayPort
 }
 
 pub struct Encoder {
     pub id: u32,
     pub encoder_type: EncoderType,
-    pub crtc_id: Option<u32>,
+    /// Bitmask of CRTC indices this encoder can be driven by.
+    pub possible_crtcs: u32,
 }
 
 impl Encoder {
-    pub fn new(id: u32, encoder_type: EncoderType) -> Self {
-        Self { id, encoder_type, crtc_id: None }
-    }
-
-    pub fn attach_crtc(&mut self, crtc_id: u32) {
-        self.crtc_id = Some(crtc_id);
+    pub fn new(id: u32, encoder_type: EncoderType, possible_crtcs: u32) -> Self {
+        Self { id, encoder_type, possible_crtcs }
     }
 }
