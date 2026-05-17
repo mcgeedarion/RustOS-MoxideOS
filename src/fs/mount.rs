@@ -22,6 +22,7 @@
 //! | Procfs     | fs::procfs           | /proc                     |
 //! | Sysfs      | fs::sysfs            | /sys                      |
 //! | Cgroupfs   | fs::cgroupfs         | /sys/fs/cgroup            |
+//! | Btrfs      | fs::btrfs            | /  (rw, CoW B-tree)       |
 
 extern crate alloc;
 use alloc::{
@@ -43,6 +44,7 @@ pub enum FsType {
     Procfs,
     Sysfs,
     Cgroupfs,
+    Btrfs,
 }
 
 impl FsType {
@@ -58,6 +60,7 @@ impl FsType {
             "proc"                   => Some(FsType::Procfs),
             "sysfs"                  => Some(FsType::Sysfs),
             "cgroup2" | "cgroup"     => Some(FsType::Cgroupfs),
+            "btrfs"                  => Some(FsType::Btrfs),
             _                        => None,
         }
     }
@@ -73,6 +76,7 @@ impl FsType {
             FsType::Procfs    => "proc",
             FsType::Sysfs     => "sysfs",
             FsType::Cgroupfs  => "cgroup2",
+            FsType::Btrfs     => "btrfs",
         }
     }
 }
@@ -262,9 +266,11 @@ pub fn list_mounts() -> Vec<MountEntry> {
 pub fn init_mounts() {
     let mut tbl = MOUNT_TABLE.lock();
 
-    // Root filesystem: try ext2 (read-write) first; if the image uses ext4
-    // features that ext2.rs refuses, fall back to ext4 (read-only).
-    let root_fstype = if crate::fs::ext2::mount() {
+    // Root filesystem: try btrfs first, then ext2 (rw), then ext4 (ro).
+    let root_fstype = if crate::fs::btrfs::mount() {
+        log::info!("mount: root filesystem: btrfs (rw)");
+        FsType::Btrfs
+    } else if crate::fs::ext2::mount() {
         log::info!("mount: root filesystem: ext2/ext3 (rw)");
         FsType::Ext2
     } else if crate::fs::ext4::mount() {
@@ -272,7 +278,6 @@ pub fn init_mounts() {
         FsType::Ext4
     } else {
         log::warn!("mount: no recognised filesystem on virtio-blk; root will be unavailable");
-        // Still register a placeholder so path resolution doesn't panic.
         FsType::Ext2
     };
     let root_flags = if root_fstype == FsType::Ext4 { MS_RDONLY } else { 0 };
@@ -291,8 +296,7 @@ pub fn init_mounts() {
     let _ = tbl.mount("proc",     "/proc", FsType::Procfs, MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
     let _ = tbl.mount("sysfs",    "/sys",  FsType::Sysfs,  MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
 
-    // cgroup v2 unified hierarchy — must follow sysfs since the mount point
-    // /sys/fs/cgroup lives under /sys.
+    // cgroup v2 unified hierarchy.
     let _ = tbl.mount("cgroup2", "/sys/fs/cgroup", FsType::Cgroupfs,
                       MS_NOSUID | MS_NODEV | MS_NOEXEC, None);
 
