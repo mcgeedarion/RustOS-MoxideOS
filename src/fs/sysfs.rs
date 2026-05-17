@@ -261,6 +261,6 @@ fn static_children(path: &str) -> Option<Vec<DirEntry>> {
 
 fn cpu_count() -> usize {
     let mut n = 0usize;
-    crate::acpi::with_cpus(|_| { n += 1; });
+    crate::firmware::acpi::with_cpus(|_| { n += 1; });
     if n == 0 { 1 } else { n }
 }

@@ -67,7 +67,6 @@ pub mod tty;
 // Migrate call-sites to the canonical paths and delete these.
 //
 //   Old path            Canonical path
-//   crate::acpi      →  crate::firmware::acpi
 //   crate::allocator →  crate::mm::allocator
 //   crate::crt       →  crate::init::crt
 //   crate::drm       →  crate::display::drm
@@ -82,8 +81,6 @@ pub mod tty;
 //   crate::utils     →  crate::kernel::utils
 //   crate::wayland   →  crate::display::wayland
 
-#[deprecated(since = "0.1.0", note = "use `crate::firmware::acpi`")]
-pub mod acpi;
 #[deprecated(since = "0.1.0", note = "use `crate::mm::allocator`")]
 pub mod allocator;
 #[deprecated(since = "0.1.0", note = "use `crate::init::crt`")]

@@ -140,8 +140,8 @@ pub extern "C" fn kernel_main() -> ! {
     // 7. ACPI — RSDP comes from uefi_entry::RSDP_PHYS (UEFI) or from
     //    multiboot2 ACPI tag (legacy).  Either way it is in RSDP_PHYS.
     let rsdp_pa = unsafe { crate::arch::x86_64::uefi_entry::RSDP_PHYS };
-    crate::acpi::acpi_init(rsdp_pa);
-    serial_println!("acpi: {} CPU(s)", crate::acpi::cpu_count());
+    crate::firmware::acpi::acpi_init(rsdp_pa);
+    serial_println!("acpi: {} CPU(s)", crate::firmware::acpi::cpu_count());
 
     // 8. PCIe enumeration.
     crate::drivers::pcie::pcie_init();

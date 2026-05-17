@@ -7,7 +7,7 @@
 //! ## Discovery
 //!
 //! The HPET base address is found in the ACPI HPET table (signature `"HPET"`).
-//! `init()` reads the ACPI HPET table via `crate::acpi::find_table`,
+//! `init()` reads the ACPI HPET table via `crate::firmware::acpi::find_table`,
 //! maps the MMIO region, and reads the capabilities register to obtain the
 //! clock period in femtoseconds (HPET spec § 2.3.7).
 //!
@@ -89,7 +89,7 @@ fn acpi_hpet_base() -> Option<u64> {
     //   [4..8]   length
     //   ...
     //   [36..44] Base Address (GAS: space_id u8 + ... + address u64)
-    let table = crate::acpi::find_table(b"HPET")?;
+    let table = crate::firmware::acpi::find_table(b"HPET")?;
     if table.len() < 52 { return None; }
     // GAS.address is at offset 44 within the table body (after 36-byte SDTH).
     let addr_bytes: [u8; 8] = table[44..52].try_into().ok()?;
