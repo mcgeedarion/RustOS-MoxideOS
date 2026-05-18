@@ -16,7 +16,9 @@
 //!                                       catchable over the serial/JTAG GDB port.
 //!  3. gdt::init()                    — GDT + TSS (must precede any fault/NMI)
 //!  4. idt::init()                    — IDT / exception vectors (must precede PMM)
-//!  5. pmm::init()                    — physical memory manager
+//!  5. pmm::init()                    — physical memory manager (x86_64: no-op shim;
+//!                                       real work done by pmm_add_efi_map / parse_mbi
+//!                                       called from the multiboot2/UEFI entry points)
 //!  6. heap::init()                   — linked-list allocator over PMM
 //!  7. mm::init()                     — slab cache pre-warm (8 size classes)
 //!  8. security::init()               — ASLR entropy, stack canaries, seccomp tables;
@@ -54,31 +56,34 @@
 //!
 //! ```text
 //!  1. trap_init()                    — install stvec; enable SSIE/STIE/SEIE (must be first)
-//!  2. fdt_phase1(fdt_ptr)            — PMM regions, PLIC base, initramfs bounds, CPU table
-//!                                       NO heap allocations; safe before heap::init()
-//!  3. plic::init()                   — write S-mode context threshold=0; unmask all IRQ prio≥1
-//!  4. heap::init()                   — linked-list allocator over PMM
-//!  5. mm::init()                     — slab cache pre-warm
-//!  6. security::init()               — ASLR, stack canaries, seccomp tables
-//!  7. debug::init()                  — GDB RSP stub (conditional)
-//!  8. display::framebuffer::init()   — virtio-gpu framebuffer → kernel console
-//!  9. display::drm::init()           — DRM/KMS object model
-//! 10. display::wayland::init()       — Wayland compositor
-//! 11. fdt_phase2(fdt_ptr)            — virtio-net + virtio-blk MMIO probe (alloc now safe)
-//! 12. block::virtio_blk::init()      — virtio-blk MMIO variant
-//! 13. drivers::keyboard::init()      — USB-HID / virtio keyboard
-//! 14. drivers::mouse::init()         — USB-HID / virtio mouse
-//! 15. drivers::evdev::init()         — evdev event layer
-//! 16. input::init()                  — input event subsystem
-//! 17. initramfs::mount()             — populate VFS from CPIO archive
-//! 18. namespace::init()              — seed INIT_NS + UTS namespace tables
-//! 19. time::init()                   — RISC-V timer (mtime/mtimecmp via SBI)
-//! 20. drivers::nic::init()           — virtio-net MMIO
-//! 21. init::schemes::init()          — register built-in schemes
-//! 22. dhcp::init()                   — DORA handshake
-//! 23. cgroup::init()                 — seed ROOT_CGROUP
-//! 24. shell::init()                  — built-in debug shell
-//! 25. proc::spawn_init()             — spawn pid 1; scheduler takes over
+//!  2. fdt_phase1(fdt_ptr)            — PLIC base, initramfs bounds, CPU table.
+//!                                       NO heap or PMM calls; safe before both.
+//!  3. pmm::init(fdt_ptr)             — seed buddy allocator from FDT memory nodes
+//!                                       (calls init_from_fdt internally; symmetric
+//!                                       with the x86_64 pmm::init() call at step 5)
+//!  4. plic::init()                   — write S-mode context threshold=0; unmask all IRQ prio≥1
+//!  5. heap::init()                   — linked-list allocator over PMM
+//!  6. mm::init()                     — slab cache pre-warm
+//!  7. security::init()               — ASLR, stack canaries, seccomp tables
+//!  8. debug::init()                  — GDB RSP stub (conditional)
+//!  9. display::framebuffer::init()   — virtio-gpu framebuffer → kernel console
+//! 10. display::drm::init()           — DRM/KMS object model
+//! 11. display::wayland::init()       — Wayland compositor
+//! 12. fdt_phase2(fdt_ptr)            — virtio-net + virtio-blk MMIO probe (alloc now safe)
+//! 13. block::virtio_blk::init()      — virtio-blk MMIO variant
+//! 14. drivers::keyboard::init()      — USB-HID / virtio keyboard
+//! 15. drivers::mouse::init()         — USB-HID / virtio mouse
+//! 16. drivers::evdev::init()         — evdev event layer
+//! 17. input::init()                  — input event subsystem
+//! 18. initramfs::mount()             — populate VFS from CPIO archive
+//! 19. namespace::init()              — seed INIT_NS + UTS namespace tables
+//! 20. time::init()                   — RISC-V timer (mtime/mtimecmp via SBI)
+//! 21. drivers::nic::init()           — virtio-net MMIO
+//! 22. init::schemes::init()          — register built-in schemes
+//! 23. dhcp::init()                   — DORA handshake
+//! 24. cgroup::init()                 — seed ROOT_CGROUP
+//! 25. shell::init()                  — built-in debug shell
+//! 26. proc::spawn_init()             — spawn pid 1; scheduler takes over
 //! ```
 
 // ── x86_64 ───────────────────────────────────────────────────────────────────
@@ -166,45 +171,56 @@ pub fn kernel_main(fdt_ptr: usize) -> ! {
 
     // ── Stage 1: trap / interrupt routing ────────────────────────────────────
     trap::trap_init();                          // install stvec; enable S-mode interrupts
-    unsafe { fdt::fdt_phase1(fdt_ptr); }        // PMM + PLIC base + initramfs + CPUs; no alloc
+
+    // Phase 1 FDT scan: discover PLIC base, initramfs bounds, and CPU table.
+    // Deliberately does NOT seed the PMM — that is pmm::init()'s job below,
+    // keeping the two boot paths structurally symmetric.
+    unsafe { fdt::fdt_phase1(fdt_ptr); }
+
+    // ── Stage 2: physical memory manager ─────────────────────────────────────
+    // Explicit call mirrors x86_64's pmm::init() at stage 3.  Internally
+    // this calls pmm::init_from_fdt(fdt_ptr) to walk the FDT memory nodes
+    // and seed the buddy allocator before any heap allocation can occur.
+    crate::pmm::init(fdt_ptr);
+
     plic::init();                               // threshold=0; unmask all external IRQs
 
-    // ── Stage 2: memory ───────────────────────────────────────────────────────
+    // ── Stage 3: heap + slab ─────────────────────────────────────────────────
     crate::heap::init();
     crate::mm::init();
 
-    // ── Stage 3: security + debug ─────────────────────────────────────────────
+    // ── Stage 4: security + debug ─────────────────────────────────────────────
     crate::security::init();
 
     #[cfg(feature = "debug_stub")]
     crate::debug::init();
 
-    // ── Stage 4: display stack ────────────────────────────────────────────────
+    // ── Stage 5: display stack ────────────────────────────────────────────────
     crate::display::framebuffer::init();
     crate::display::drm::init();
     crate::display::wayland::init();
 
-    // ── Stage 5: virtio device probe (alloc now safe) ────────────────────────
+    // ── Stage 6: virtio device probe (alloc now safe) ────────────────────────
     unsafe { fdt::fdt_phase2(fdt_ptr); }        // virtio-net + virtio-blk MMIO probe
     crate::block::virtio_blk::init();           // virtio-blk MMIO variant
 
-    // ── Stage 6: HID input ────────────────────────────────────────────────────
+    // ── Stage 7: HID input ────────────────────────────────────────────────────
     crate::drivers::keyboard::init();
     crate::drivers::mouse::init();
     crate::drivers::evdev::init();
     crate::input::init();
 
-    // ── Stage 7: filesystem / namespace ──────────────────────────────────────
+    // ── Stage 8: filesystem / namespace ──────────────────────────────────────
     crate::init::initramfs::mount();
     crate::namespace::init();
 
-    // ── Stage 8: timers + networking ─────────────────────────────────────────
+    // ── Stage 9: timers + networking ─────────────────────────────────────────
     crate::time::init();
     crate::drivers::nic::init();
     crate::init::schemes::init();
     crate::dhcp::init();
 
-    // ── Stage 9: process management + shell ──────────────────────────────────
+    // ── Stage 10: process management + shell ─────────────────────────────────
     crate::proc::cgroup::init();
     crate::shell::init();
     crate::proc::spawn_init();           // pid 1; does not return
