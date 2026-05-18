@@ -1,7 +1,12 @@
+//! ext2 on-disk structures, inode types, and all Ext2Fs impl methods.
+//! Merged from inode.rs + structs.rs + impl_a.rs + impl_b.rs
 extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use spin::Mutex;
-use super::superblock::{Ext2Fs, Ext2Stat};
-
-pub fn lookup(fs: &Ext2Fs, path: &str) -> Option<u32> { fs.lookup_path(path) }
+use alloc::vec;
+use super::superblock::*;
+use super::block::*;
+use super::bitmap::*;
+use super::directory::*;
+use super::symlink::*;
+use crate::fs::vfs_ops::{KStat, KStatfs, DirEntry};
