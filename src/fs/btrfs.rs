@@ -1,1 +1,1 @@
-{{BTRFS_CONTENT}}
+placeholder_replaced_by_actual
