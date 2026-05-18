@@ -1,8 +1,12 @@
 [alias]
-xtask = "run --manifest-path xtask/Cargo.toml --"
+extask = "run --manifest-path xtask/Cargo.toml --"
 
+# Default target is overridden per-invocation by xtask via --target.
+# This fallback keeps `cargo build` (without xtask) pointing at the
+# riscv64 UEFI loader so accidental bare builds don't silently use the
+# host triple.  Change to whichever arch you're actively working on.
 [build]
-target = "riscv64-uefi.json"
+target = "targets/riscv64-uefi-loader.json"
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
