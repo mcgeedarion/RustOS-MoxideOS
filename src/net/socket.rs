@@ -1,1 +1,1 @@
-placeholder_socket
+{{SOCKET_CONTENT}}

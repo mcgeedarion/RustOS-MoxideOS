@@ -1,1 +1,1 @@
-placeholder_ext2
+{{EXT2_CONTENT}}

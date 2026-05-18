@@ -1,1 +1,1 @@
-placeholder_mmap
+{{MMAP_CONTENT}}
