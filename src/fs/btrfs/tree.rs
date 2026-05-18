@@ -6,9 +6,9 @@ use alloc::{
     vec::Vec,
 };
 use spin::Mutex;
-use super::superblock::{BtrfsSuperblock, BtrfsChunkItem, BTRFS_MOUNTS};
+use super::superblock::{BtrfsSuperblock, BtrfsChunkItem};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BtrfsKey {
     pub objectid: u64,
     pub ty:       u8,
@@ -19,57 +19,47 @@ impl BtrfsKey {
     pub fn new(objectid: u64, ty: u8, offset: u64) -> Self {
         BtrfsKey { objectid, ty, offset }
     }
-    pub fn from_bytes(b: &[u8]) -> Self {
-        BtrfsKey {
-            objectid: u64::from_le_bytes(b[0..8].try_into().unwrap()),
-            ty:       b[8],
-            offset:   u64::from_le_bytes(b[9..17].try_into().unwrap()),
-        }
-    }
-    pub fn to_bytes(&self) -> [u8; 17] {
-        let mut out = [0u8; 17];
-        out[0..8].copy_from_slice(&self.objectid.to_le_bytes());
-        out[8] = self.ty;
-        out[9..17].copy_from_slice(&self.offset.to_le_bytes());
-        out
-    }
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct BtrfsHeader {
-    csum:       [u8; 32],
-    fsid:       [u8; 16],
-    bytenr:     u64,
-    flags:      u64,
-    chunk_tree_uuid: [u8; 16],
-    generation: u64,
-    owner:      u64,
-    nritems:    u32,
-    level:      u8,
+#[derive(Clone, Debug)]
+pub struct BtrfsHeader {
+    pub csum:       [u8; 32],
+    pub fsid:       [u8; 16],
+    pub bytenr:     u64,
+    pub flags:      u64,
+    pub chunk_tree_uuid: [u8; 16],
+    pub generation: u64,
+    pub owner:      u64,
+    pub nritems:    u32,
+    pub level:      u8,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct BtrfsItem {
-    key:    [u8; 17],
-    offset: u32,
-    size:   u32,
+#[derive(Clone, Debug)]
+pub struct BtrfsItem {
+    pub key:    BtrfsKey,
+    pub offset: u32,
+    pub size:   u32,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct BtrfsKeyPtr {
-    key:        [u8; 17],
-    blockptr:   u64,
-    generation: u64,
+#[derive(Clone, Debug)]
+pub struct BtrfsKeyPtr {
+    pub key:        BtrfsKey,
+    pub blockptr:   u64,
+    pub generation: u64,
 }
 
+#[derive(Clone, Debug)]
 pub struct BtrfsFs {
-    pub superblock:   BtrfsSuperblock,
-    pub chunk_map:    Vec<(u64, u64, BtrfsChunkItem)>,
+    /// Parsed superblock.
+    pub superblock: BtrfsSuperblock,
+    /// Logical → physical byte translation table built from chunk tree.
+    pub chunk_map: Vec<(u64, u64, BtrfsChunkItem)>,
+    /// Root-tree root node logical byte offset.
     pub root_tree_root: u64,
-    pub fs_tree_root:   u64,
-    pub path_cache:   BTreeMap<String, u64>,
+    /// FS-tree root node logical byte offset (default subvolume).
+    pub fs_tree_root: u64,
+    /// Cache: path → inode number.
+    pub path_cache: BTreeMap<String, u64>,
+    /// Next logical byte offset for CoW allocation (monotonically increasing).
     pub alloc_cursor: u64,
 }
