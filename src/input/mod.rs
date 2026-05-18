@@ -1,5 +1,16 @@
 //! Linux-compatible evdev input layer for RustOS.
 //!
+//! # Feature gate
+//!
+//! This module is compiled only when `--features input_events` is passed.
+//! The gate is applied at `src/lib.rs` (`#[cfg(feature = "input_events")] pub mod input`).
+//! When `kernel-drivers` is split into its own crate this becomes a native
+//! feature of that crate, re-exported from the root as:
+//!
+//! ```toml
+//! input_events = ["kernel-drivers/input_events"]
+//! ```
+//!
 //! # Architecture
 //!
 //! ```text

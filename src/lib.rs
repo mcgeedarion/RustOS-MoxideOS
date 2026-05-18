@@ -21,7 +21,7 @@ extern crate alloc;
 //   net         — Network stack (TCP/UDP/IP, DHCP, DNS, sockets)
 //   block       — Block layer (I/O scheduler, bio abstraction)
 //   tty         — TTY/PTY subsystem (ldisc, termios, pts)
-//   input       — Input event subsystem
+//   input       — Input event subsystem  [cfg(feature = "input_events")]
 //   console     — Kernel console (printk destination)
 //   proc        — Process management (scheduler, exec, wait, signals, namespaces)
 //   syscall     — Syscall dispatch table
@@ -29,24 +29,22 @@ extern crate alloc;
 //   io_uring    — io_uring async I/O ring
 //   time        — Timekeeping (clocksource, timerfd, itimers)
 //   smp         — SMP / multi-core bringup
-//   security    — Security hardening (ASLR, stack canaries, seccomp)
+//   security    — Security hardening (ASLR, stack canaries, seccomp, cgroups)
 //   shell       — Built-in kernel debug shell
 //   init        — Early-boot: initramfs, ELF loader, crt0
 //   exec        — Executable format parsers (ELF-64)
-//   debug       — Debugging infrastructure (GDB stub)
+//   debug       — Debugging infrastructure  [cfg(feature = "gdbstub")]
 //   kernel      — Core kernel utilities (panic, rand, uaccess, utils)
 
 pub mod arch;
 pub mod block;
 pub mod console;
-pub mod debug;
 pub mod display;
 pub mod drivers;
 pub mod exec;
 pub mod firmware;
 pub mod fs;
 pub mod init;
-pub mod input;
 pub mod io_uring;
 pub mod ipc;
 pub mod kernel;
@@ -60,6 +58,13 @@ pub mod sync;
 pub mod syscall;
 pub mod time;
 pub mod tty;
+
+// Feature-gated subsystems — only compiled when the matching flag is set.
+#[cfg(feature = "input_events")]
+pub mod input;
+
+#[cfg(feature = "gdbstub")]
+pub mod debug;
 
 pub use kernel_main::kernel_main;
 mod kernel_main;

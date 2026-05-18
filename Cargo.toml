@@ -36,10 +36,17 @@ cc = "1"
 #     --features multiboot2_boot,sysv_ipc,namespaces  → multiboot2 / GRUB2
 #
 # Optional subsystems:
-#   --features cgroups       → cgroups v2 cgroupfs
-#   --features gdbstub       → GDB RSP stub (UART/SBI)
-#   --features input_events  → /dev/input evdev layer (WIP)
-#   --features wayland       → Wayland compositor scaffold (WIP)
+#   --features cgroups       → cgroups v2 cgroupfs        (owning module: src/security)
+#   --features gdbstub       → GDB RSP stub (UART/SBI)    (owning module: src/debug)
+#   --features input_events  → /dev/input evdev layer     (owning module: src/input)
+#   --features wayland       → Wayland compositor scaffold (owning module: src/display)
+#
+# When kernel-security / kernel-drivers crates are split out, these become
+# pass-through re-exports, e.g.:
+#   gdbstub      = ["kernel-hal/gdbstub"]
+#   cgroups      = ["kernel-security/cgroups"]
+#   wayland      = ["kernel-drivers/wayland"]
+#   input_events = ["kernel-drivers/input_events"]
 
 [features]
 default = ["uefi_boot", "sysv_ipc", "namespaces"]
@@ -53,7 +60,8 @@ sysv_ipc   = []  # SysV IPC + POSIX message queues (NR 29-31, 64-71, 240-245)
 namespaces = []  # Linux-compatible ns isolation (NEWNS/PID/NET/UTS/IPC/USER)
 
 # Optional / WIP subsystems
+# Each flag is consumed by cfg(feature = "...") gates in the owning module.
 gdbstub      = []  # Experimental: GDB RSP over UART (x86_64) / SBI console (RISC-V)
 cgroups      = []  # Experimental: cgroups v2 hierarchy + cgroupfs VFS mount
-input_events = []  # WIP stub: /dev/input evdev routing not yet wired
-wayland      = []  # WIP stub: directory scaffolded, no protocol implementation
+input_events = []  # /dev/input evdev layer (keyboard + mouse ring buffers)
+wayland      = []  # WIP stub: in-kernel Wayland compositor scaffold
