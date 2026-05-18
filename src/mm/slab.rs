@@ -47,6 +47,26 @@
 //!                   empty slab  ← partial  (all slots freed)
 //!   PMM free_page  ← empty slab  (via slab_shrink)
 //!
+//! ## Zero-fill invariant
+//!
+//! Every slot handed to a caller is guaranteed to contain only zero bytes.
+//! This invariant is maintained by two complementary policies — NOT by
+//! zeroing in `Cache::alloc`:
+//!
+//!   1. **Fresh slots** (carved by `Cache::grow`): the PMM zeroes the entire
+//!      page before returning it from `alloc_page()`, so all slots on a
+//!      newly-grown slab are already zero.
+//!
+//!   2. **Recycled slots** (returned by `Cache::free`): `free` scrubs the
+//!      slot with `ptr::write_bytes(ptr, 0, obj_size)` *before* writing the
+//!      free-list next-pointer into its first word.  The next-pointer is
+//!      overwritten by `Cache::alloc` when the slot is popped, restoring the
+//!      first word to zero.  The remainder of the slot is therefore zero from
+//!      the scrub in `free`.
+//!
+//! Consequence: `Cache::alloc` does **not** need to zero the slot — doing so
+//! would be a redundant `obj_size`-byte store on every allocation.
+//!
 //! ## SMP safety
 //!
 //! Each `Cache` is wrapped in its own `spin::Mutex`.  Allocations from
@@ -189,6 +209,8 @@ impl Cache {
         let hdr  = page as *mut SlabHdr;
 
         // Build the intrusive free list through all slots.
+        // The PMM guarantees the page is zeroed, so only the free-list
+        // next-pointer word needs to be written per slot.
         let obj_sz    = self.obj_size;
         let cap       = self.capacity;
         let slot0_off = hdr_offset(obj_sz);
@@ -246,8 +268,14 @@ impl Cache {
             Self::list_push(&mut self.full, slab);
         }
 
-        // Zero the slot before handing it out (matches PMM contract).
-        ptr::write_bytes(slot, 0, self.obj_size);
+        // No explicit zero-fill here.  The zero-fill invariant is maintained
+        // by the PMM (fresh pages) and by Cache::free (recycled slots).
+        // See the "Zero-fill invariant" section in the module-level doc.
+        //
+        // Overwrite the free-list next-pointer word that was stored in this
+        // slot so the caller receives a fully-zeroed object.
+        *(slot as *mut *mut u8) = ptr::null_mut();
+
         Some(slot)
     }
 
@@ -264,6 +292,7 @@ impl Cache {
         let was_partial = !was_full && (*slab).in_use > 0;
 
         // Scrub the slot before relinking (security: no stale data).
+        // This also maintains the zero-fill invariant for future alloc calls.
         ptr::write_bytes(ptr, 0, self.obj_size);
 
         // Push onto the slab's free list.
