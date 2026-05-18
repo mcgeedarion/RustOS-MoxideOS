@@ -1,73 +1,64 @@
-extern crate alloc;
-use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
-use crate::fs::process_fd::{proc_fd_set_cloexec, proc_fd_set_nonblock};
+//! TTY / termios ioctl handlers.
+use crate::uaccess::{copy_from_user, copy_to_user};
 use super::consts::*;
 
-fn pty_pair_from_bfd(bfd: usize)
-    -> Option<alloc::sync::Arc<crate::tty::pty::Pty>>
-{
-    crate::tty::pty::get_pty(bfd)
-}
-
-pub fn tty_ioctl(fd: usize, bfd: usize, cmd: u64, arg: usize) -> isize {
-    match cmd {
+pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
+    match req {
         TCGETS => {
-            let termios = [0u8; TERMIOS_SIZE];
-            copy_to_user(arg, &termios); 0
+            // Return a sane default termios: ICRNL | OPOST | CS8 | CREAD | ISIG | ICANON | ECHO
+            let mut t = [0u8; 60];
+            // c_iflag = ICRNL (0x0100)
+            t[0..4].copy_from_slice(&0x0100u32.to_ne_bytes());
+            // c_oflag = OPOST (0x0001)
+            t[4..8].copy_from_slice(&0x0001u32.to_ne_bytes());
+            // c_cflag = CS8|CREAD|HUPCL (0x0B00)
+            t[8..12].copy_from_slice(&0x0B00u32.to_ne_bytes());
+            // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK (0x8A3B)
+            t[12..16].copy_from_slice(&0x8A3Bu32.to_ne_bytes());
+            // c_cc[VMIN]=1, c_cc[VTIME]=0 at offsets 22, 23 within c_cc array (base 17)
+            t[22] = 1;
+            copy_to_user(arg, &t);
+            0
         }
         TCSETS | TCSETSW | TCSETSF => 0,
-        TCSBRK | TCXONC | TCFLSH  => 0,
-        TIOCSCTTY => {
-            let pid = crate::proc::scheduler::current_pid();
-            crate::tty::set_ctty(pid, bfd); 0
-        }
-        TIOCNOTTY => {
-            let pid = crate::proc::scheduler::current_pid();
-            crate::tty::clear_ctty(pid); 0
-        }
         TIOCGPGRP => {
-            let pg = crate::proc::scheduler::current_pgrp() as i32;
-            copy_to_user(arg, &pg.to_ne_bytes()); 0
+            let pgid: u32 = crate::proc::scheduler::current_pid() as u32;
+            copy_to_user(arg, &pgid.to_ne_bytes());
+            0
         }
-        TIOCSPGRP => {
-            let mut buf = [0u8; 4];
-            copy_from_user(arg, &mut buf);
-            let _pg = i32::from_ne_bytes(buf); 0
-        }
-        TIOCGSID => {
-            let sid = crate::proc::scheduler::current_sid() as i32;
-            copy_to_user(arg, &sid.to_ne_bytes()); 0
-        }
-        TIOCOUTQ => { let n: i32 = 0; copy_to_user(arg, &n.to_ne_bytes()); 0 }
+        TIOCSPGRP => 0,
         TIOCGWINSZ => {
-            let ws = [0u8; WINSIZE_SIZE];
-            copy_to_user(arg, &ws); 0
+            // struct winsize: ws_row(u16), ws_col(u16), ws_xpixel(u16), ws_ypixel(u16)
+            let ws = [
+                25u16.to_ne_bytes(),
+                80u16.to_ne_bytes(),
+                0u16.to_ne_bytes(),
+                0u16.to_ne_bytes(),
+            ].concat();
+            copy_to_user(arg, &ws);
+            0
         }
         TIOCSWINSZ => 0,
-        TIOCMGET => { let flags: u32 = 0; copy_to_user(arg, &flags.to_ne_bytes()); 0 }
-        TIOCGPTN => {
-            let pty = pty_pair_from_bfd(bfd);
-            let n: u32 = pty.map(|p| p.index()).unwrap_or(0);
-            copy_to_user(arg, &n.to_ne_bytes()); 0
-        }
-        TIOCSPTLCK => 0,
-        FIONREAD   => fionread_tty(arg),
-        FIONBIO    => fionbio(fd, bfd, arg),
-        FIOCLEX    => { proc_fd_set_cloexec(crate::proc::scheduler::current_pid(), fd, true);  0 }
-        FIONCLEX   => { proc_fd_set_cloexec(crate::proc::scheduler::current_pid(), fd, false); 0 }
-        _          => -25,
+        TIOCGPTPEER  => -1,
+        TIOCSPTLCK   => 0,
+        TIOCGPTN     => { copy_to_user(arg, &0u32.to_ne_bytes()); 0 }
+        TIOCNOTTY    => 0,
+        TIOCSCTTY    => 0,
+        TIOCEXCL     => 0,
+        TIOCNXCL     => 0,
+        TIOCOUTQ     => { copy_to_user(arg, &0u32.to_ne_bytes()); 0 }
+        TIOCSTI      => 0,
+        FIONBIO      => 0,
+        FIOCLEX      => 0,
+        FIONCLEX     => 0,
+        FIOASYNC     => 0,
+        FIONREAD     => vfs_fionread(fd, arg),
+        _            => -25, // ENOTTY
     }
 }
 
-pub fn fionbio(fd: usize, bfd: usize, arg: usize) -> isize {
-    let mut buf = [0u8; 4];
-    copy_from_user(arg, &mut buf);
-    let v = i32::from_ne_bytes(buf);
-    proc_fd_set_nonblock(crate::proc::scheduler::current_pid(), fd, v != 0);
+fn vfs_fionread(fd: usize, arg: usize) -> isize {
+    let n: u32 = crate::fs::vfs::vfs_fionread(fd).unwrap_or(0) as u32;
+    copy_to_user(arg, &n.to_ne_bytes());
     0
-}
-
-pub fn fionread_tty(arg: usize) -> isize {
-    let n: i32 = 0;
-    copy_to_user(arg, &n.to_ne_bytes()); 0
 }

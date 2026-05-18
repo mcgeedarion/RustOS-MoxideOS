@@ -1,9 +1,7 @@
-//! TCP socket sub-driver.
-
+//! TCP socket submodule.
 pub mod state;
 pub mod connect;
 pub mod listen;
 
-pub use state::TcpState;
 pub use connect::tcp_connect;
-pub use listen::{tcp_listen, tcp_accept};
+pub use listen::tcp_listen;

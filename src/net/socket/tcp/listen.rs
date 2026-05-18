@@ -1,12 +1,12 @@
-use super::state::TcpState;
-use crate::net::socket::types::Socket;
+//! TCP listen/accept path.
+use crate::net::tcp;
+use super::super::types::{SockAddr, SocketState, AF_INET, SOCK_STREAM};
+use super::super::core::SOCKETS;
 
-pub fn tcp_listen(s: &mut Socket, backlog: usize) -> isize {
-    s.state = TcpState::Listen;
-    s.backlog = backlog;
-    0
-}
-
-pub fn tcp_accept(s: &mut Socket) -> Option<Socket> {
-    s.accept_queue.pop_front()
+pub fn tcp_listen(fd: usize, port: u16) {
+    tcp::listen(fd, port);
+    let mut sockets = SOCKETS.lock();
+    if let Some(Some(s)) = sockets.get_mut(fd) {
+        s.state = SocketState::Listening;
+    }
 }

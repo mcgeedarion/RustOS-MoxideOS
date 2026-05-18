@@ -1,15 +1,28 @@
-use crate::uaccess::{copy_to_user, validate_user_ptr};
-use super::consts::{BLKGETSIZE, BLKGETSIZE64, BLKSSZGET, BLKBSZGET};
+//! Block device ioctl handlers (BLK*).
+use crate::uaccess::copy_to_user;
+use super::consts::*;
 
-pub fn blk_ioctl(bfd: usize, cmd: u64, arg: usize) -> isize {
-    let blk = match crate::fs::vfs_ops::bfd_to_block(bfd) {
-        Some(b) => b, None => return -9,
-    };
-    match cmd {
-        BLKGETSIZE   => { let secs = blk.sectors() as u32; copy_to_user(arg, &secs.to_ne_bytes()); 0 }
-        BLKGETSIZE64 => { let b    = blk.sectors() * 512;  copy_to_user(arg, &b.to_ne_bytes());   0 }
-        BLKSSZGET    => { let ss: u32 = 512; copy_to_user(arg, &ss.to_ne_bytes()); 0 }
-        BLKBSZGET    => { let bs: u64 = 512; copy_to_user(arg, &bs.to_ne_bytes()); 0 }
-        _ => -25,
+pub fn blk_ioctl(fd: usize, req: usize, arg: usize) -> isize {
+    let sector_count: u64 = crate::drivers::virtio_blk::sector_count();
+    match req {
+        BLKGETSIZE => {
+            let sectors: u32 = sector_count.min(u32::MAX as u64) as u32;
+            copy_to_user(arg, &sectors.to_ne_bytes());
+            0
+        }
+        BLKGETSIZE64 => {
+            let bytes: u64 = sector_count * 512;
+            copy_to_user(arg, &bytes.to_ne_bytes());
+            0
+        }
+        BLKBSZGET => {
+            let bsz: u32 = 512;
+            copy_to_user(arg, &bsz.to_ne_bytes());
+            0
+        }
+        BLKFLSBUF => 0,
+        BLKROGET  => { copy_to_user(arg, &0u32.to_ne_bytes()); 0 }
+        BLKROSET  => 0,
+        _         => -25,
     }
 }

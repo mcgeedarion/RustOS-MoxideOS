@@ -1,21 +1,23 @@
-use crate::uaccess::{copy_to_user, validate_user_ptr};
+//! Generic file-descriptor ioctl helpers.
+use crate::uaccess::copy_to_user;
+use super::consts::{FIONREAD, FIONBIO};
 
-pub fn fionread_tty(arg: usize) -> isize {
-    let n: i32 = 0;
+pub fn vfs_fionread(fd: usize, arg: usize) -> isize {
+    let n: u32 = crate::fs::vfs::vfs_fionread(fd).unwrap_or(0) as u32;
     copy_to_user(arg, &n.to_ne_bytes());
     0
 }
 
-pub fn pipe_fionread(bfd: usize, arg: usize) -> isize {
-    let n: i32 = crate::ipc::pipe::readable_bytes(bfd) as i32;
+pub fn pipe_fionread(fd: usize, arg: usize) -> isize {
+    let n: u32 = crate::ipc::pipe::pipe_bytes_available(fd) as u32;
     copy_to_user(arg, &n.to_ne_bytes());
     0
 }
 
-pub fn vfs_fionread(bfd: usize, arg: usize) -> isize {
-    let n: i32 = match crate::fs::vfs_ops::vfs_readable_bytes(bfd) {
-        Some(b) => b as i32, None => 0,
-    };
-    copy_to_user(arg, &n.to_ne_bytes());
+pub fn set_nonblock(fd: usize, arg: usize) -> isize {
+    let mut buf = [0u8; 4];
+    crate::uaccess::copy_from_user(arg, &mut buf);
+    let v = u32::from_ne_bytes(buf);
+    crate::fs::vfs::vfs_set_nonblock(fd, v != 0);
     0
 }
