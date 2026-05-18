@@ -1,133 +1,92 @@
-//! Stub implementations for syscalls that have no full implementation yet,
-//! plus AT-variant helpers used by multiple syscall files.
-//!
-//! Functions here are `pub(super)` and called directly from `mod.rs`.
+//! Syscall stubs — thin wrappers and minor implementations that do not
+//! warrant their own module.
 
 extern crate alloc;
 use alloc::string::String;
 
+use crate::fs::path::resolve_path;
 use crate::proc::scheduler;
 
-// ── AT_FDCWD sentinel used in this file ──────────────────────────────────────
-const AT_FDCWD_STUBS: i32 = -100;
+pub(super) const AT_FDCWD_STUBS: i32 = -100;
 
-// ── resolve_at_path_for_stubs ─────────────────────────────────────────────────
-/// Resolve a (dirfd, path_va) pair into an absolute path string.
-/// Returns Err(errno) on failure.
+// ─── path resolution helper ──────────────────────────────────────────────────
+
 pub(super) fn resolve_at_path_for_stubs(dirfd: i32, path_va: usize) -> Result<String, isize> {
-    crate::fs::path::resolve_at(dirfd, path_va).map_err(|e| e as isize)
+    crate::fs::at_path::resolve_at(dirfd, path_va)
 }
 
-// ── copy_to_user / copy_from_user helpers ─────────────────────────────────────
-/// Copy bytes from kernel to a user-space virtual address.
-/// Returns Err(()) on fault.
-pub(super) fn copy_to_user(dst_va: usize, src: &[u8]) -> Result<(), ()> {
-    crate::mm::user_copy::copy_to_user(dst_va, src)
+// copy helpers used by ptrace
+fn copy_to_user(dst_va: usize, src: &[u8]) -> Result<(), ()> {
+    crate::mm::uaccess::copy_to_user(dst_va, src)
+}
+fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
+    crate::mm::uaccess::copy_from_user(dst, src_va)
 }
 
-/// Copy bytes from a user-space virtual address into a kernel slice.
-/// Returns Err(()) on fault.
-pub(super) fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
-    crate::mm::user_copy::copy_from_user(dst, src_va)
+// ─── getcwd ──────────────────────────────────────────────────────────────────
+
+/// NR 79  getcwd(buf_va, size)
+pub(super) fn sys_getcwd_impl(buf_va: usize, size: usize) -> isize {
+    let pid = scheduler::current_pid();
+    let cwd = match scheduler::with_proc(pid, |p| p.cwd.clone()) {
+        Some(s) => s,
+        None    => return -22,
+    };
+    let bytes = cwd.as_bytes();
+    if bytes.len() + 1 > size { return -34; } // ERANGE
+    if copy_to_user(buf_va, bytes).is_err() { return -14; }
+    if copy_to_user(buf_va + bytes.len(), &[0u8]).is_err() { return -14; }
+    buf_va as isize
 }
 
-// ── getdents64 ────────────────────────────────────────────────────────────────
+// ─── chdir / fchdir ──────────────────────────────────────────────────────────
 
-pub(super) fn sys_getdents64_impl(fd: usize, buf_va: usize, count: usize) -> isize {
-    crate::fs::io_syscalls::sys_getdents64(fd, buf_va, count)
+/// NR 80  chdir(path_va)
+pub(super) fn sys_chdir_impl(path_va: usize) -> isize {
+    crate::fs::io_syscalls::sys_chdir(path_va)
 }
 
-// ── mmap / munmap / mprotect / madvise / msync / mlock* ─────────────────────
+/// NR 81  fchdir(fd)
+pub(super) fn sys_fchdir_impl(fd: usize) -> isize {
+    crate::fs::io_syscalls::sys_fchdir(fd)
+}
 
-pub(super) fn sys_mmap_impl(
-    addr: usize, len: usize, prot: i32, flags: i32, fd: i32, off: i64,
+// ─── rename / renameat ───────────────────────────────────────────────────────
+
+/// NR 82  rename(old_va, new_va) — delegates to renameat with AT_FDCWD.
+pub(super) fn sys_rename_impl(old_va: usize, new_va: usize) -> isize {
+    sys_renameat_impl(AT_FDCWD_STUBS, old_va, AT_FDCWD_STUBS, new_va)
+}
+
+/// NR 264  renameat(old_dirfd, old_va, new_dirfd, new_va)
+pub(super) fn sys_renameat_impl(
+    old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize,
 ) -> isize {
-    crate::mm::mmap::sys_mmap(addr, len, prot, flags, fd, off)
-}
-
-pub(super) fn sys_munmap_impl(addr: usize, len: usize) -> isize {
-    crate::mm::mmap::sys_munmap(addr, len)
-}
-
-pub(super) fn sys_mprotect_impl(addr: usize, len: usize, prot: i32) -> isize {
-    crate::mm::mmap::sys_mprotect(addr, len, prot)
-}
-
-pub(super) fn sys_madvise_impl(_addr: usize, _len: usize, _advice: i32) -> isize { 0 }
-pub(super) fn sys_msync_impl(_addr: usize, _len: usize, _flags: i32) -> isize { 0 }
-pub(super) fn sys_mlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-pub(super) fn sys_munlock_impl(_addr: usize, _len: usize) -> isize { 0 }
-pub(super) fn sys_mlockall_impl(_flags: i32) -> isize { 0 }
-pub(super) fn sys_munlockall_impl() -> isize { 0 }
-
-// ── mremap ────────────────────────────────────────────────────────────────────
-
-pub(super) fn sys_mremap_impl(
-    old_addr: usize, old_len: usize, new_len: usize, flags: i32, new_addr: usize,
-) -> isize {
-    crate::mm::mmap::sys_mremap(old_addr, old_len, new_len, flags, new_addr)
-}
-
-// ── brk ───────────────────────────────────────────────────────────────────────
-
-pub(super) fn sys_brk_impl(addr: usize) -> isize {
-    crate::mm::brk::sys_brk(addr)
-}
-
-// ── access / faccessat ────────────────────────────────────────────────────────
-
-pub(super) fn sys_access_impl(path_va: usize, mode: u32) -> isize {
-    sys_faccessat_impl(AT_FDCWD_STUBS, path_va, mode, 0)
-}
-
-pub(super) fn sys_faccessat_impl(dirfd: i32, path_va: usize, mode: u32, _flags: i32) -> isize {
-    let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p) => p,
+    let old = match resolve_at_path_for_stubs(old_dirfd, old_va) {
+        Ok(p)  => p,
         Err(e) => return e,
     };
-    crate::fs::vfs_ops::access(&path, mode)
+    let new = match resolve_at_path_for_stubs(new_dirfd, new_va) {
+        Ok(p)  => p,
+        Err(e) => return e,
+    };
+    crate::fs::vfs_ops::rename(&old, &new)
 }
 
-// ── chdir / fchdir / getcwd ───────────────────────────────────────────────────
-
-pub(super) fn sys_chdir_impl(path_va: usize) -> isize {
-    crate::fs::cwd::sys_chdir(path_va)
-}
-
-pub(super) fn sys_fchdir_impl(fd: usize) -> isize {
-    crate::fs::cwd::sys_fchdir(fd)
-}
-
-pub(super) fn sys_getcwd_impl(buf_va: usize, size: usize) -> isize {
-    crate::fs::cwd::sys_getcwd(buf_va, size)
-}
-
-// ── rename / renameat / renameat2 ─────────────────────────────────────────────
-
-pub(super) fn sys_rename_impl(old_va: usize, new_va: usize) -> isize {
-    sys_renameat2_impl(AT_FDCWD_STUBS, old_va, AT_FDCWD_STUBS, new_va, 0)
-}
-
-pub(super) fn sys_renameat_impl(
-    old_dir: i32, old_va: usize, new_dir: i32, new_va: usize,
-) -> isize {
-    sys_renameat2_impl(old_dir, old_va, new_dir, new_va, 0)
-}
-
+/// NR 316  renameat2(old_dirfd, old_va, new_dirfd, new_va, flags)
 pub(super) fn sys_renameat2_impl(
-    old_dir: i32, old_va: usize, new_dir: i32, new_va: usize, flags: u32,
+    old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize, flags: u32,
 ) -> isize {
-    let old = match resolve_at_path_for_stubs(old_dir, old_va) {
-        Ok(p) => p, Err(e) => return e,
-    };
-    let new = match resolve_at_path_for_stubs(new_dir, new_va) {
-        Ok(p) => p, Err(e) => return e,
-    };
-    crate::fs::vfs_ops::rename(&old, &new, flags)
+    if flags != 0 {
+        // RENAME_NOREPLACE / RENAME_EXCHANGE / RENAME_WHITEOUT not yet
+        return -38; // ENOSYS
+    }
+    sys_renameat_impl(old_dirfd, old_va, new_dirfd, new_va)
 }
 
-// ── mkdir / mkdirat ───────────────────────────────────────────────────────────
+// ─── mkdir / mkdirat ─────────────────────────────────────────────────────────
 
+/// NR 83  mkdir(path_va, mode)
 pub(super) fn sys_mkdir_impl(path_va: usize, mode: u32) -> isize {
     sys_mkdirat_impl(AT_FDCWD_STUBS, path_va, mode)
 }
@@ -198,7 +157,8 @@ pub(super) fn sys_unlinkat_impl(dirfd: i32, path_va: usize, flags: u32) -> isize
     const AT_REMOVEDIR: u32 = 0x200;
     if flags & !AT_REMOVEDIR != 0 { return -22; }
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
     if flags & AT_REMOVEDIR != 0 {
         crate::fs::vfs_ops::rmdir(&path)
@@ -207,99 +167,143 @@ pub(super) fn sys_unlinkat_impl(dirfd: i32, path_va: usize, flags: u32) -> isize
     }
 }
 
+pub(super) fn sys_rmdir_impl(path_va: usize) -> isize {
+    let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
+        Ok(p)  => p,
+        Err(e) => return e,
+    };
+    crate::fs::vfs_ops::rmdir(&path)
+}
+
 pub(super) fn sys_unlink_impl(path_va: usize) -> isize {
     sys_unlinkat_impl(AT_FDCWD_STUBS, path_va, 0)
 }
 
-pub(super) fn sys_rmdir_impl(path_va: usize) -> isize {
-    sys_unlinkat_impl(AT_FDCWD_STUBS, path_va, 0x200)
-}
+// ─── symlink / readlink ───────────────────────────────────────────────────────
 
-// ── symlink / symlinkat / readlink / readlinkat ───────────────────────────────
-
-pub(super) fn sys_symlinkat_impl(target_va: usize, new_dir: i32, link_va: usize) -> isize {
-    let target = match crate::mm::user_copy::read_user_cstr(target_va, 4096) {
-        Ok(s) => s, Err(_) => return -14,
+pub(super) fn sys_symlinkat_impl(target_va: usize, new_dirfd: i32, linkpath_va: usize) -> isize {
+    let target = match crate::mm::uaccess::read_user_str(target_va, 4096) {
+        Ok(s)  => s,
+        Err(_) => return -14,
     };
-    let link = match resolve_at_path_for_stubs(new_dir, link_va) {
-        Ok(p) => p, Err(e) => return e,
+    let link = match resolve_at_path_for_stubs(new_dirfd, linkpath_va) {
+        Ok(p)  => p,
+        Err(e) => return e,
     };
     crate::fs::vfs_ops::symlink(&target, &link)
 }
 
-pub(super) fn sys_symlink_impl(target_va: usize, link_va: usize) -> isize {
-    sys_symlinkat_impl(target_va, AT_FDCWD_STUBS, link_va)
+pub(super) fn sys_symlink_impl(target_va: usize, linkpath_va: usize) -> isize {
+    sys_symlinkat_impl(target_va, AT_FDCWD_STUBS, linkpath_va)
 }
 
 pub(super) fn sys_readlinkat_impl(
     dirfd: i32, path_va: usize, buf_va: usize, bufsz: usize,
 ) -> isize {
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
-    crate::fs::vfs_ops::readlink(&path, buf_va, bufsz)
+    let target = match crate::fs::vfs_ops::readlink(&path) {
+        Ok(s)  => s,
+        Err(e) => return e,
+    };
+    let bytes = target.as_bytes();
+    let n = bytes.len().min(bufsz);
+    if copy_to_user(buf_va, &bytes[..n]).is_err() { return -14; }
+    n as isize
 }
 
 pub(super) fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsz: usize) -> isize {
     sys_readlinkat_impl(AT_FDCWD_STUBS, path_va, buf_va, bufsz)
 }
 
-// ── link / linkat ─────────────────────────────────────────────────────────────
+// ─── link / linkat ───────────────────────────────────────────────────────────
 
 pub(super) fn sys_linkat_impl(
-    old_dir: i32, old_va: usize, new_dir: i32, new_va: usize, flags: i32,
+    old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize, _flags: i32,
 ) -> isize {
-    let old = match resolve_at_path_for_stubs(old_dir, old_va) {
-        Ok(p) => p, Err(e) => return e,
+    let old = match resolve_at_path_for_stubs(old_dirfd, old_va) {
+        Ok(p)  => p,
+        Err(e) => return e,
     };
-    let new = match resolve_at_path_for_stubs(new_dir, new_va) {
-        Ok(p) => p, Err(e) => return e,
+    let new = match resolve_at_path_for_stubs(new_dirfd, new_va) {
+        Ok(p)  => p,
+        Err(e) => return e,
     };
-    crate::fs::vfs_ops::link(&old, &new, flags)
+    crate::fs::vfs_ops::link(&old, &new)
 }
 
 pub(super) fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
     sys_linkat_impl(AT_FDCWD_STUBS, old_va, AT_FDCWD_STUBS, new_va, 0)
 }
 
-// ── chmod / chown (scalar path forms) ────────────────────────────────────────
+// ─── chmod / chown ───────────────────────────────────────────────────────────
 
 pub(super) fn sys_chmod_impl(path_va: usize, mode: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
     crate::fs::vfs_ops::chmod(&path, mode & 0o7777)
 }
 
 pub(super) fn sys_chown_impl(path_va: usize, uid: u32, gid: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
     crate::fs::vfs_ops::chown(&path, uid, gid)
 }
 
 pub(super) fn sys_lchown_impl(path_va: usize, uid: u32, gid: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
     crate::fs::vfs_ops::lchown(&path, uid, gid)
 }
 
-// ── truncate ─────────────────────────────────────────────────────────────────
+// ─── umask ───────────────────────────────────────────────────────────────────
+
+pub(super) fn sys_umask_impl(mask: u32) -> isize {
+    let pid = scheduler::current_pid();
+    let old = scheduler::with_proc(pid, |p| p.umask).unwrap_or(0o022);
+    scheduler::with_proc_mut(pid, |p, _| p.umask = mask & 0o777).unwrap_or(());
+    old as isize
+}
+
+// ─── access / faccessat ──────────────────────────────────────────────────────
+
+pub(super) fn sys_faccessat_impl(dirfd: i32, path_va: usize, mode: i32, _flags: i32) -> isize {
+    let path = match resolve_at_path_for_stubs(dirfd, path_va) {
+        Ok(p)  => p,
+        Err(e) => return e,
+    };
+    crate::fs::vfs_ops::access(&path, mode)
+}
+
+pub(super) fn sys_access_impl(path_va: usize, mode: i32) -> isize {
+    sys_faccessat_impl(AT_FDCWD_STUBS, path_va, mode, 0)
+}
+
+// ─── truncate ────────────────────────────────────────────────────────────────
 
 pub(super) fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
     if length < 0 { return -22; }
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
-    crate::fs::vfs_ops::truncate_by_path(&path, length as u64)
+    crate::fs::vfs_ops::truncate_path(&path, length as u64)
 }
 
-// ── statfs / fstatfs ──────────────────────────────────────────────────────────
+// ─── statfs / fstatfs ────────────────────────────────────────────────────────
 
 pub(super) fn sys_statfs_impl(path_va: usize, buf_va: usize) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p) => p, Err(e) => return e,
+        Ok(p)  => p,
+        Err(e) => return e,
     };
     crate::fs::stat_syscalls::sys_statfs_path(&path, buf_va)
 }
@@ -308,101 +312,13 @@ pub(super) fn sys_fstatfs_impl(fd: usize, buf_va: usize) -> isize {
     crate::fs::stat_syscalls::sys_fstatfs(fd, buf_va)
 }
 
-// ── utimensat / futimesat / utimes / utime ────────────────────────────────────
+// ─── getdents64 ──────────────────────────────────────────────────────────────
 
-pub(super) fn sys_utimensat_impl(
-    dirfd: i32, path_va: usize, times_va: usize, flags: i32,
-) -> isize {
-    crate::fs::stat_syscalls::sys_utimensat(dirfd, path_va, times_va, flags)
+pub(super) fn sys_getdents64_impl(fd: usize, buf_va: usize, count: usize) -> isize {
+    crate::fs::io_syscalls::sys_getdents64(fd, buf_va, count)
 }
 
-pub(super) fn sys_futimesat_impl(dirfd: i32, path_va: usize, tv_va: usize) -> isize {
-    crate::fs::stat_syscalls::sys_futimesat(dirfd, path_va, tv_va)
-}
-
-pub(super) fn sys_utimes_impl(path_va: usize, tv_va: usize) -> isize {
-    sys_futimesat_impl(AT_FDCWD_STUBS, path_va, tv_va)
-}
-
-pub(super) fn sys_utime_impl(path_va: usize, buf_va: usize) -> isize {
-    crate::fs::stat_syscalls::sys_utime(path_va, buf_va)
-}
-
-// ── chroot ────────────────────────────────────────────────────────────────────
-
-pub(super) fn sys_chroot_impl(path_va: usize) -> isize {
-    let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p) => p, Err(e) => return e,
-    };
-    crate::fs::cwd::sys_chroot(&path)
-}
-
-// ── mount / umount2 ───────────────────────────────────────────────────────────
-
-pub(super) fn sys_mount_impl(
-    src_va: usize, dst_va: usize, fs_va: usize, flags: usize, data_va: usize,
-) -> isize {
-    crate::fs::mount::sys_mount(src_va, dst_va, fs_va, flags, data_va)
-}
-
-pub(super) fn sys_umount2_impl(target_va: usize, flags: i32) -> isize {
-    crate::fs::mount::sys_umount2(target_va, flags)
-}
-
-// ── ioctl ─────────────────────────────────────────────────────────────────────
-
-pub(super) fn sys_ioctl_impl(fd: usize, req: usize, arg: usize) -> isize {
-    crate::fs::ioctl::sys_ioctl(fd, req, arg)
-}
-
-// ── sendfile ─────────────────────────────────────────────────────────────────
-
-pub(super) fn sys_sendfile_impl(
-    out_fd: usize, in_fd: usize, offset_va: usize, count: usize,
-) -> isize {
-    crate::fs::io_syscalls::sys_sendfile(out_fd, in_fd, offset_va, count)
-}
-
-// ── splice / tee / vmsplice ───────────────────────────────────────────────────
-
-pub(super) fn sys_splice_impl(
-    fd_in: usize, off_in: usize, fd_out: usize, off_out: usize,
-    len: usize, flags: u32,
-) -> isize {
-    crate::fs::io_syscalls::sys_splice(fd_in, off_in, fd_out, off_out, len, flags)
-}
-
-pub(super) fn sys_tee_impl(
-    fd_in: usize, fd_out: usize, len: usize, flags: u32,
-) -> isize {
-    crate::fs::io_syscalls::sys_tee(fd_in, fd_out, len, flags)
-}
-
-pub(super) fn sys_vmsplice_impl(
-    fd: usize, iov_va: usize, nr_segs: usize, flags: u32,
-) -> isize {
-    crate::fs::io_syscalls::sys_vmsplice(fd, iov_va, nr_segs, flags)
-}
-
-// ── inotify ───────────────────────────────────────────────────────────────────
-
-pub(super) fn sys_inotify_init_impl() -> isize {
-    crate::fs::inotify::sys_inotify_init()
-}
-
-pub(super) fn sys_inotify_init1_impl(flags: i32) -> isize {
-    crate::fs::inotify::sys_inotify_init1(flags)
-}
-
-pub(super) fn sys_inotify_add_watch_impl(fd: usize, path_va: usize, mask: u32) -> isize {
-    crate::fs::inotify::sys_inotify_add_watch(fd, path_va, mask)
-}
-
-pub(super) fn sys_inotify_rm_watch_impl(fd: usize, wd: i32) -> isize {
-    crate::fs::inotify::sys_inotify_rm_watch(fd, wd)
-}
-
-// ── fchownat / fchown ────────────────────────────────────────────────────────
+// ─── fchownat / fchown ───────────────────────────────────────────────────────
 
 /// NR 260  fchownat(dirfd, path_va, uid, gid, flags)
 ///
@@ -445,7 +361,7 @@ pub(super) fn sys_fchown_impl(fd: usize, uid: u32, gid: u32) -> isize {
     }
 }
 
-// ── fchmodat / fchmod ────────────────────────────────────────────────────────
+// ─── fchmodat / fchmod ───────────────────────────────────────────────────────
 
 /// NR 268  fchmodat(dirfd, path_va, mode, flags)
 ///
@@ -472,14 +388,14 @@ pub(super) fn sys_fchmod_impl(fd: usize, mode: u32) -> isize {
     }
 }
 
-// ── remap_file_pages ────────────────────────────────────────────────────────
+// ─── remap_file_pages ────────────────────────────────────────────────────────
 
 /// NR 216  remap_file_pages — deprecated since Linux 3.16, non-linear file
 /// mappings removed in Linux 4.0.  Return ENOSYS so callers fall back to
 /// standard mmap(2).
 pub(super) fn sys_remap_file_pages_impl() -> isize { -38 }
 
-// ── kexec_file_load / bpf / userfaultfd ──────────────────────────────────────
+// ─── kexec_file_load / bpf / userfaultfd ─────────────────────────────────────
 
 /// NR 320  kexec_file_load — booting a second kernel image is not applicable
 /// to RustOS.  ENOSYS causes kexec-tools to abort gracefully.
@@ -499,7 +415,7 @@ pub(super) fn sys_bpf_impl() -> isize { -38 }
 /// feature exists but is permission-denied.
 pub(super) fn sys_userfaultfd_impl() -> isize { -38 }
 
-// ── ptrace ────────────────────────────────────────────────────────────────────
+// ─── ptrace ──────────────────────────────────────────────────────────────────
 
 /// NR 101  ptrace(request, pid, addr, data)
 ///
@@ -635,6 +551,8 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
 
         // ── PTRACE_PEEKTEXT / PTRACE_PEEKDATA ────────────────────────────────
         // Both read one machine word from the tracee's virtual address space.
+        // The word is returned as the syscall result; *data is also written for
+        // old-ABI compat.
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
             if addr & (core::mem::size_of::<usize>() - 1) != 0 { return -22; }
             let remote_cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
