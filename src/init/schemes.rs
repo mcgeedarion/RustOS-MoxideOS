@@ -30,13 +30,46 @@ pub fn init() {
     // ── TTY ───────────────────────────────────────────────────────────────────
     SCHEME_TABLE.register("tty",  Arc::new(crate::tty::TtyScheme::new()));
 
+    // ── Virtual / synthetic filesystems ───────────────────────────────────────
+    // devfs must come before procfs/sysfs because /proc and /sys may emit
+    // references to devices that userspace resolves through /dev.
+    SCHEME_TABLE.register("dev",  Arc::new(crate::fs::devfs::DevFs::new()));
+    SCHEME_TABLE.register("proc", Arc::new(crate::fs::procfs::ProcFs::new()));
+    SCHEME_TABLE.register("sys",  Arc::new(crate::fs::sysfs::SysFs::new()));
+
+    // ── RAM-backed filesystems ────────────────────────────────────────────────
+    // ramfs is the simpler, unbounded variant used as an early-boot root overlay
+    // or initrd scratch space; tmpfs adds size limits and swap backing.
+    SCHEME_TABLE.register("ram", Arc::new(crate::fs::ramfs::RamFs::new()));
+    SCHEME_TABLE.register("tmp", Arc::new(crate::fs::tmpfs::TmpFs::new()));
+
     // ── Networking ────────────────────────────────────────────────────────────
     SCHEME_TABLE.register("net",  Arc::new(crate::net::NetScheme::new()));
     SCHEME_TABLE.register("tcp",  Arc::new(crate::net::tcp::TcpScheme::new()));
     SCHEME_TABLE.register("udp",  Arc::new(crate::net::udp::UdpScheme::new()));
 
+    // ── Network filesystem ────────────────────────────────────────────────────
+    // NFS client: registered after the network stack is online so that the
+    // scheme constructor can probe the default NIC/route if needed.
+    SCHEME_TABLE.register("nfs",  Arc::new(crate::fs::nfs::NfsScheme::new()));
+
     // ── IPC ───────────────────────────────────────────────────────────────────
+    // ipc_proxy_scheme provides the kernel-side endpoint for cross-process
+    // message-passing; pipe is the simpler, anonymous half-duplex variant.
+    SCHEME_TABLE.register("ipc",  Arc::new(crate::fs::ipc_proxy_scheme::IpcProxyScheme::new()));
     SCHEME_TABLE.register("pipe", Arc::new(crate::ipc::pipe_scheme::PipeScheme));
+
+    // ── Control-group filesystem ──────────────────────────────────────────────
+    // Registered after IPC because cgroup controllers may publish their state
+    // via the IPC bus (e.g. memory-pressure notifications to userspace daemons).
+    SCHEME_TABLE.register("cgroup", Arc::new(crate::fs::cgroupfs::CgroupFs::new()));
+
+    // ── Union / overlay mount ─────────────────────────────────────────────────
+    // overlayfs requires at least one lower layer already registered in the VFS
+    // before it is useful; registering last ensures all lower-layer schemes are
+    // in place so an early open_url("overlay:…") fails cleanly rather than
+    // silently missing a dependency.
+    SCHEME_TABLE.register("overlay", Arc::new(crate::fs::overlayfs::OverlayFs::new()));
 
     log::info!("[schemes] registered: {:?}", SCHEME_TABLE.list());
 }
