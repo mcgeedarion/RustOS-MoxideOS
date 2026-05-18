@@ -4,11 +4,11 @@
 //! ## Architecture overview
 //!
 //! ```text
-//!  ┌──────────────────────────────────────────────────────────────────────────┐
+//!  ┌────────────────────────────────────────────────────────────────────────────┐
 //!  │  Tier 0 — Static bootstrap pool  (64 MiB, bump + free-list)            │
 //!  │    Used for every allocation before pmm_add_region() is first called.  │
-//!  │    page_info table does NOT exist for bootstrap pages.                  │
-//!  ├──────────────────────────────────────────────────────────────────────────┤
+//!  │    PageInfo table storage is carved from here at first region add.      │
+//!  ├────────────────────────────────────────────────────────────────────────────┤
 //!  │  Tier 1 — Per-NUMA buddy allocator                                      │
 //!  │    One BuddyNode per NUMA node (up to MAX_NODES).                       │
 //!  │    11 free-lists: order 0 (4 KiB) … order 10 (4 MiB).                 │
@@ -17,12 +17,14 @@
 //!  │               is empty.                                                 │
 //!  │    Coalescing: free_page() checks the buddy address and merges if both  │
 //!  │               blocks are free and of the same order.                    │
-//!  ├──────────────────────────────────────────────────────────────────────────┤
+//!  ├────────────────────────────────────────────────────────────────────────────┤
 //!  │  PageInfo table  (one entry per physical page frame)                    │
-//!  │    Stored in the static PAGE_INFO array, indexed by PFN.               │
+//!  │    Late-initialised: storage carved from the bootstrap pool at the      │
+//!  │    first pmm_add_region_node() call, sized to cover only the physical   │
+//!  │    address range that will actually be managed.                         │
 //!  │    Fields: refcount (AtomicU32), flags (AtomicU8), order (u8),         │
 //!  │            numa_node (u8), free_next (AtomicPtr for buddy free-list).   │
-//!  └──────────────────────────────────────────────────────────────────//────┘
+//!  └────────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! ## Buddy invariants
@@ -79,19 +81,24 @@ use core::sync::atomic::{
     AtomicU32, AtomicU8, AtomicUsize, AtomicPtr, AtomicBool, Ordering,
 };
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Constants ───────────────────────────────────────────────────────────────────
 
 pub const PAGE_SIZE:   usize = 4096;
 pub const MAX_ORDER:   usize = 11;  // orders 0..=10, max block = 4 MiB
 pub const MAX_NODES:   usize = 8;   // NUMA nodes
 
-/// Hard ceiling on the physical address space the PFN table can describe.
-/// 1 TiB → 256 M PFNs; that's 256 M × 16 B ≈ 4 GiB of table.  We keep
-/// this small (16 GiB) for the static array to stay within reason.
-pub const MAX_PA:      usize = 16 * 1024 * 1024 * 1024; // 16 GiB
-const    MAX_FRAMES:   usize = MAX_PA / PAGE_SIZE;        // 4 M entries
+/// Hard ceiling on the physical address space the late-init PageInfo table
+/// can describe.  The table is *not* statically allocated to this size;
+/// it is carved from the bootstrap pool at runtime and sized to cover only
+/// the highest registered physical address.
+pub const MAX_PA: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
 
-// ── Bootstrap pool (Tier 0) ──────────────────────────────────────────────────
+// MAX_FRAMES is kept for code that still wants a compile-time upper bound
+// (e.g. assertions, index range guards).  It is no longer used to size any
+// static array.
+const MAX_FRAMES: usize = MAX_PA / PAGE_SIZE; // 4 M entries
+
+// ── Bootstrap pool (Tier 0) ──────────────────────────────────────────────────────
 //
 // 64 MiB static bump allocator used during early boot before the EFI/FDT
 // memory map is parsed.  Freed bootstrap pages go to a tiny intrusive
@@ -165,9 +172,14 @@ fn boot_pop() -> usize {
     }
 }
 
-// ── PageInfo table ────────────────────────────────────────────────────────────
+// ── PageInfo table ──────────────────────────────────────────────────────────────────────
 //
 // One PageInfo per physical page frame.  Index = pa / PAGE_SIZE.
+//
+// Storage is carved from the bootstrap pool during the first
+// pmm_add_region_node() call, sized to cover only the highest managed PFN.
+// PAGE_INFO_PTR and PAGE_INFO_LEN are null/0 before that point; any call
+// to page_info() before first region registration returns None.
 
 /// Bit flags stored in `PageInfo::flags`.
 pub mod page_flags {
@@ -180,7 +192,7 @@ use page_flags::*;
 
 /// Per-physical-page metadata.
 ///
-/// 16 bytes per entry → 64 MiB for a 4-GiB physical address space.
+/// 16 bytes per entry → 16 MiB for a 4-GiB physical address space.
 /// Aligned to 8 bytes so `free_next` is naturally aligned.
 #[repr(C, align(8))]
 pub struct PageInfo {
@@ -211,25 +223,105 @@ impl PageInfo {
     }
 }
 
-// Static PageInfo table.  The compiler zero-initialises the BSS; we don't
-// need a constructor loop.  4_194_304 × 16 B = 64 MiB reserved in BSS.
-static PAGE_INFO: [PageInfo; MAX_FRAMES] = {
+// ── Late-initialised PageInfo storage ───────────────────────────────────────────────
+//
+// Instead of a BSS array sized to MAX_FRAMES (4 M × 16 B = 64 MiB),
+// we carve the exact number of PageInfo entries from the bootstrap pool
+// after the physical memory map is known.  This saves ~62 MiB on a
+// machine with 512 MiB of RAM.
+//
+// Locking: PAGE_INFO_PTR is written exactly once (inside the spin::Once
+// guard in ensure_page_info_table).  After that point it is read-only and
+// indexing is wait-free.
+
+/// Base pointer of the carved PageInfo region.  Null until the first
+/// pmm_add_region_node() call initialises the table.
+static PAGE_INFO_PTR: AtomicPtr<PageInfo> = AtomicPtr::new(core::ptr::null_mut());
+/// Number of valid PageInfo entries (== highest_pfn + 1).
+static PAGE_INFO_LEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Emergency fallback: a small static array that covers the first 1 GiB.
+/// Used only when the bootstrap pool cannot satisfy the carved allocation
+/// (e.g. if someone sets POOL_PAGES too small).
+const EMERGENCY_FRAMES: usize = (1 * 1024 * 1024 * 1024) / PAGE_SIZE; // 256 K entries = 4 MiB
+static EMERGENCY_TABLE: [PageInfo; EMERGENCY_FRAMES] = {
     const Z: PageInfo = PageInfo::zero();
-    [Z; MAX_FRAMES]
+    [Z; EMERGENCY_FRAMES]
 };
+
+/// Carve PageInfo storage from the bootstrap pool to cover PFNs 0..=max_pfn.
+///
+/// Called once from pmm_add_region_node() under a spin::Once guard.
+/// Panics if the bootstrap pool is too full to satisfy the allocation AND
+/// max_pfn also exceeds the emergency table's range.
+fn ensure_page_info_table(max_pfn: usize) {
+    use spin::Once;
+    static INIT: Once<()> = Once::new();
+    INIT.call_once(|| {
+        let needed = max_pfn + 1;
+        let bytes  = needed * core::mem::size_of::<PageInfo>();
+        let pages  = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // Try to carve `pages` consecutive pages from the bootstrap bump.
+        let bump_before = BUMP.load(Ordering::Relaxed);
+        let new_bump    = bump_before + pages;
+        if new_bump <= POOL_PAGES
+            && BUMP.compare_exchange(
+                bump_before, new_bump,
+                Ordering::AcqRel, Ordering::Relaxed,
+            ).is_ok()
+        {
+            let base = pool_base() + bump_before * PAGE_SIZE;
+            // Zero-initialise the carved region (PMM contract: zero = free).
+            unsafe { core::ptr::write_bytes(base as *mut u8, 0, pages * PAGE_SIZE); }
+            // Mark these bootstrap pages as reserved so they are never returned
+            // to the buddy allocator even if a caller tries to free them.
+            for i in 0..pages {
+                if let Some(idx) = pool_index(base + i * PAGE_SIZE) {
+                    pool_bit_set_free(idx); // mark occupied in the double-free bitmap
+                }
+            }
+            PAGE_INFO_PTR.store(base as *mut PageInfo, Ordering::Release);
+            PAGE_INFO_LEN.store(needed, Ordering::Release);
+            return;
+        }
+
+        // Bootstrap pool exhausted — fall back to the emergency static table.
+        if needed <= EMERGENCY_FRAMES {
+            log::warn!("pmm: bootstrap pool full; using emergency PageInfo table \
+                        (covers first 1 GiB only)");
+            PAGE_INFO_PTR.store(
+                EMERGENCY_TABLE.as_ptr() as *mut PageInfo,
+                Ordering::Release,
+            );
+            PAGE_INFO_LEN.store(EMERGENCY_FRAMES, Ordering::Release);
+        } else {
+            panic!("pmm: cannot allocate PageInfo table: \
+                    bootstrap pool full and max_pfn {} > EMERGENCY_FRAMES {}",
+                   max_pfn, EMERGENCY_FRAMES);
+        }
+    });
+}
 
 #[inline]
 fn pfn(pa: usize) -> usize { pa / PAGE_SIZE }
 
-/// Return the `PageInfo` for `pa`, or `None` if `pa` is out of range.
+/// Return the `PageInfo` for `pa`, or `None` if `pa` is out of range or
+/// the table has not been initialised yet.
 #[inline]
 pub fn page_info(pa: usize) -> Option<&'static PageInfo> {
     if pa == 0 || pa & (PAGE_SIZE - 1) != 0 { return None; }
+    let ptr = PAGE_INFO_PTR.load(Ordering::Acquire);
+    if ptr.is_null() { return None; }
     let idx = pfn(pa);
-    if idx < MAX_FRAMES { Some(&PAGE_INFO[idx]) } else { None }
+    let len = PAGE_INFO_LEN.load(Ordering::Relaxed);
+    if idx >= len { return None; }
+    // SAFETY: ptr is valid for `len` entries (carved from bootstrap pool or
+    // pointing to the static EMERGENCY_TABLE), both of which outlive 'static.
+    Some(unsafe { &*ptr.add(idx) })
 }
 
-// ── NUMA node table ───────────────────────────────────────────────────────────
+// ── NUMA node table ─────────────────────────────────────────────────────────────────────
 
 /// Describes one NUMA node's physical address ranges for the buddy.
 #[derive(Copy, Clone)]
@@ -271,11 +363,12 @@ pub fn node_of(pa: usize) -> u8 {
     0
 }
 
-// ── Per-NUMA buddy allocator ──────────────────────────────────────────────────
+// ── Per-NUMA buddy allocator ──────────────────────────────────────────────────────────────
 //
 // Each NUMA node has MAX_ORDER free-lists, one per buddy order.
 // A free-list is a lock-free Treiber stack of PageInfo pointers.
-// The physical address of a PageInfo at &PAGE_INFO[i] is i * PAGE_SIZE.
+// The physical address of a PageInfo at table[i] is i * PAGE_SIZE,
+// where table = PAGE_INFO_PTR.
 
 struct BuddyNode {
     /// free_lists[k] = head of the Treiber stack for order-k blocks.
@@ -305,7 +398,22 @@ static BUDDY: [BuddyNode; MAX_NODES] = {
 // Whether Tier 1 has been seeded at all.
 static BUDDY_LIVE: AtomicBool = AtomicBool::new(false);
 
-// ── Buddy helpers ─────────────────────────────────────────────────────────────
+// ── PageInfo address ↔ physical address translation ──────────────────────────────
+
+/// Convert a `*PageInfo` to its physical address.
+///
+/// Used by buddy_pop to reconstruct the physical address from a PageInfo
+/// pointer without keeping a separate inverse map.
+///
+/// SAFETY: `pi` must point into the live PAGE_INFO table.
+#[inline]
+unsafe fn pi_to_pa(pi: *const PageInfo) -> usize {
+    let base = PAGE_INFO_PTR.load(Ordering::Relaxed);
+    let idx  = (pi as usize - base as usize) / core::mem::size_of::<PageInfo>();
+    idx * PAGE_SIZE
+}
+
+// ── Buddy helpers ──────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn order_size(order: usize) -> usize { PAGE_SIZE << order }
@@ -323,10 +431,10 @@ fn is_aligned(pa: usize, order: usize) -> bool {
 /// Push a block onto the free-list for `(node, order)`.
 /// Sets FLAG_FREE and records the order in the PageInfo.
 unsafe fn buddy_push(node: u8, pa: usize, order: usize) {
-    let n   = node as usize;
-    let pi  = &PAGE_INFO[pfn(pa)];
+    let pi = match page_info(pa) { Some(p) => p, None => return };
     pi.flags.fetch_or(FLAG_FREE, Ordering::Release);
     pi.order.store(order as u8, Ordering::Relaxed);
+    let n    = node as usize;
     let list = &BUDDY[n].free_lists[order];
     loop {
         let head = list.load(Ordering::Acquire);
@@ -337,7 +445,6 @@ unsafe fn buddy_push(node: u8, pa: usize, order: usize) {
             Ordering::Release,
             Ordering::Relaxed,
         ).is_ok() {
-            // Count: every order-k block covers 2^k pages.
             BUDDY[n].free_pages.fetch_add(1 << order, Ordering::Relaxed);
             return;
         }
@@ -362,8 +469,7 @@ unsafe fn buddy_pop(node: u8, order: usize) -> usize {
         ).is_ok() {
             (*head_ptr).flags.fetch_and(!FLAG_FREE, Ordering::Release);
             BUDDY[n].free_pages.fetch_sub(1 << order, Ordering::Relaxed);
-            return (head_ptr as usize - PAGE_INFO.as_ptr() as usize)
-                / core::mem::size_of::<PageInfo>() * PAGE_SIZE;
+            return pi_to_pa(head_ptr);
         }
         core::hint::spin_loop();
     }
@@ -375,15 +481,15 @@ unsafe fn buddy_pop(node: u8, order: usize) -> usize {
 unsafe fn buddy_remove(node: u8, pa: usize, order: usize) -> bool {
     let n    = node as usize;
     let list = &BUDDY[n].free_lists[order];
-    let target = &PAGE_INFO[pfn(pa)] as *const PageInfo as *mut PageInfo;
+    let target = match page_info(pa) {
+        Some(p) => p as *const PageInfo as *mut PageInfo,
+        None    => return false,
+    };
 
     // We need to splice `target` out of the singly-linked list.
     // Use a compare-exchange on the head; if it's not the head we must
     // walk — which requires a temporary spin lock for the coalesce path.
-    // For simplicity (and correctness) we use a per-order spin-lock
-    // embedded in a static array.
-    //
-    // Rather than adding another static, we use a short bounded-retry
+    // For simplicity (and correctness) we use a short bounded-retry
     // approach: try to pop until we either find target or exhaust the list,
     // collecting popped items and re-pushing non-matching ones.  This is
     // O(n) in list length but coalescing is rare and lists are short.
@@ -415,7 +521,6 @@ unsafe fn buddy_remove(node: u8, pa: usize, order: usize) -> bool {
             // List is unexpectedly long; re-push and give up.
             (*head_ptr).flags.fetch_or(FLAG_FREE, Ordering::Relaxed);
             BUDDY[n].free_pages.fetch_add(1 << order, Ordering::Relaxed);
-            // Re-push what we popped so far.
             for &p in &popped[..count] {
                 (*p).flags.fetch_or(FLAG_FREE, Ordering::Release);
                 BUDDY[n].free_pages.fetch_add(1 << order, Ordering::Relaxed);
@@ -438,7 +543,7 @@ unsafe fn buddy_remove(node: u8, pa: usize, order: usize) -> bool {
     found
 }
 
-// ── Kernel image reservation ──────────────────────────────────────────────────
+// ── Kernel image reservation ──────────────────────────────────────────────────────────────
 
 extern "C" {
     static _kernel_start: u8;
@@ -454,12 +559,11 @@ fn is_kernel_page(pa: usize) -> bool {
     pa >= kernel_start_pa() && pa < kernel_end_pa()
 }
 
-// ── Core Tier-1 allocation ────────────────────────────────────────────────────
+// ── Core Tier-1 allocation ──────────────────────────────────────────────────────────────
 
 /// Allocate one page from `node` at order 0, splitting higher-order blocks
 /// as needed.  Returns the physical address or 0 on failure.
 unsafe fn buddy_alloc_node(node: u8) -> usize {
-    let n = node as usize;
     // Walk from order 0 upward looking for a free block.
     for order in 0..MAX_ORDER {
         let pa = buddy_pop(node, order);
@@ -471,16 +575,18 @@ unsafe fn buddy_alloc_node(node: u8) -> usize {
             current_order -= 1;
             let buddy_half = current_pa + order_size(current_order);
             // Mark the split-off buddy as free at the lower order.
-            let bpi = &PAGE_INFO[pfn(buddy_half)];
-            bpi.numa_node.store(node, Ordering::Relaxed);
+            if let Some(bpi) = page_info(buddy_half) {
+                bpi.numa_node.store(node, Ordering::Relaxed);
+            }
             buddy_push(node, buddy_half, current_order);
         }
         // Initialise the returned page.
-        let pi = &PAGE_INFO[pfn(current_pa)];
-        pi.refcount.store(1, Ordering::Release);
-        pi.order.store(0, Ordering::Relaxed);
-        pi.flags.store(FLAG_BUDDY, Ordering::Release);
-        pi.numa_node.store(node, Ordering::Relaxed);
+        if let Some(pi) = page_info(current_pa) {
+            pi.refcount.store(1, Ordering::Release);
+            pi.order.store(0, Ordering::Relaxed);
+            pi.flags.store(FLAG_BUDDY, Ordering::Release);
+            pi.numa_node.store(node, Ordering::Relaxed);
+        }
         // Zero-fill for security.
         core::ptr::write_bytes(current_pa as *mut u8, 0, PAGE_SIZE);
         return current_pa;
@@ -492,29 +598,28 @@ unsafe fn buddy_alloc_node(node: u8) -> usize {
 /// Returns base physical address or 0 on failure.
 unsafe fn buddy_alloc_order_node(node: u8, order: usize) -> usize {
     if order >= MAX_ORDER { return 0; }
-    // Try to pop a block of exactly `order`.
     for try_order in order..MAX_ORDER {
         let pa = buddy_pop(node, try_order);
         if pa == 0 { continue; }
         let mut current_pa    = pa;
         let mut current_order = try_order;
-        // Split down to the requested order.
         while current_order > order {
             current_order -= 1;
             let split_off = current_pa + order_size(current_order);
-            let bpi = &PAGE_INFO[pfn(split_off)];
-            bpi.numa_node.store(node, Ordering::Relaxed);
+            if let Some(bpi) = page_info(split_off) {
+                bpi.numa_node.store(node, Ordering::Relaxed);
+            }
             buddy_push(node, split_off, current_order);
         }
-        // Initialise all pages in the block.
         let block_pages = 1usize << order;
         for i in 0..block_pages {
             let ppa = current_pa + i * PAGE_SIZE;
-            let pi  = &PAGE_INFO[pfn(ppa)];
-            pi.refcount.store(1, Ordering::Release);
-            pi.order.store(order as u8, Ordering::Relaxed);
-            pi.flags.store(FLAG_BUDDY, Ordering::Release);
-            pi.numa_node.store(node, Ordering::Relaxed);
+            if let Some(pi) = page_info(ppa) {
+                pi.refcount.store(1, Ordering::Release);
+                pi.order.store(order as u8, Ordering::Relaxed);
+                pi.flags.store(FLAG_BUDDY, Ordering::Release);
+                pi.numa_node.store(node, Ordering::Relaxed);
+            }
         }
         core::ptr::write_bytes(current_pa as *mut u8, 0, block_pages * PAGE_SIZE);
         return current_pa;
@@ -542,31 +647,27 @@ unsafe fn buddy_free_page(pa: usize) {
     // Coalesce loop.
     while current_order + 1 < MAX_ORDER {
         let bpa = buddy_pa(current_pa, current_order);
-        // Buddy must be within max physical address space.
         if bpa >= MAX_PA { break; }
-        let bpi = &PAGE_INFO[pfn(bpa)];
-        // Buddy must be: free, same order, same NUMA node, buddy-managed.
+        let bpi = match page_info(bpa) { Some(p) => p, None => break };
         let bflags = bpi.flags.load(Ordering::Acquire);
         if bflags & (FLAG_FREE | FLAG_BUDDY) != (FLAG_FREE | FLAG_BUDDY) { break; }
         if bpi.order.load(Ordering::Relaxed) as usize != current_order  { break; }
         if bpi.numa_node.load(Ordering::Relaxed) != node                { break; }
-        // Alignment check: the merged block must be naturally aligned.
         let merged = current_pa.min(bpa);
         if !is_aligned(merged, current_order + 1)                       { break; }
-        // Remove the buddy from the free-list.
         if !buddy_remove(node, bpa, current_order) { break; }
-        // Merge: move to the lower address.
         current_pa    = merged;
         current_order += 1;
     }
 
     // Push the (possibly merged) block onto the free-list.
-    let cpi = &PAGE_INFO[pfn(current_pa)];
-    cpi.flags.store(FLAG_FREE | FLAG_BUDDY, Ordering::Relaxed);
+    if let Some(cpi) = page_info(current_pa) {
+        cpi.flags.store(FLAG_FREE | FLAG_BUDDY, Ordering::Relaxed);
+    }
     buddy_push(node, current_pa, current_order);
 }
 
-// ── NUMA-local allocation helper ─────────────────────────────────────────────
+// ── NUMA-local allocation helper ─────────────────────────────────────────────────────
 
 /// Return the NUMA node of the calling CPU.
 /// Falls back to 0 if called before GSBASE is set or on RISC-V.
@@ -582,7 +683,7 @@ fn local_node() -> u8 {
     0
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────────────
 
 /// Allocate a single 4 KiB page.
 ///
@@ -591,7 +692,6 @@ fn local_node() -> u8 {
 /// The returned page is zero-filled and has refcount = 1.
 pub fn alloc_page() -> Option<usize> {
     if BUDDY_LIVE.load(Ordering::Relaxed) {
-        // Tier 1: buddy allocator.
         let preferred = local_node();
         let n_nodes   = NODE_COUNT.load(Ordering::Relaxed).max(1);
         for i in 0..n_nodes {
@@ -599,7 +699,6 @@ pub fn alloc_page() -> Option<usize> {
             let pa = unsafe { buddy_alloc_node(node) };
             if pa != 0 { return Some(pa); }
         }
-        // All buddy nodes exhausted — fall through to bootstrap.
     }
     // Tier 0: bootstrap pool.
     let pa = boot_pop();
@@ -627,28 +726,17 @@ pub fn alloc_page_on_node(node: u8) -> Option<usize> {
 }
 
 /// Allocate `n` physically contiguous pages.
-///
-/// Finds the smallest buddy order k where `2^k >= n`, allocates a block of
-/// that order from the local NUMA node (falling back to others), and returns
-/// the base physical address.  The entire block is zero-filled.
-///
-/// If `n` is not a power of two, the tail pages of the block are freed back
-/// to the buddy so there is no internal fragmentation.
 pub fn alloc_pages_contig(n: usize) -> Option<usize> {
     if n == 0 { return None; }
     if n == 1 { return alloc_page(); }
 
     if !BUDDY_LIVE.load(Ordering::Relaxed) {
-        // Bootstrap fallback: plain sequential allocation.
         let mut pages = [0usize; 1 << (MAX_ORDER - 1)];
         let cap = pages.len().min(n);
-        for i in 0..cap {
-            pages[i] = alloc_page()?;
-        }
-        return Some(pages[0]); // not truly contiguous but best effort
+        for i in 0..cap { pages[i] = alloc_page()?; }
+        return Some(pages[0]);
     }
 
-    // Find the smallest order >= n pages.
     let mut order = 0usize;
     while (1 << order) < n { order += 1; }
     if order >= MAX_ORDER { return None; }
@@ -659,7 +747,6 @@ pub fn alloc_pages_contig(n: usize) -> Option<usize> {
         let node = ((preferred as usize + i) % n_nodes) as u8;
         let pa   = unsafe { buddy_alloc_order_node(node, order) };
         if pa == 0 { continue; }
-        // Free back the tail pages if n is not a power of two.
         let block_pages = 1usize << order;
         for j in n..block_pages {
             let tail_pa = pa + j * PAGE_SIZE;
@@ -676,21 +763,11 @@ pub fn free_pages_contig(base_pa: usize, n: usize) {
 }
 
 /// Release a physical page.
-///
-/// For Tier-1 (buddy) pages the function decrements the refcount and only
-/// returns the page to the buddy free-list when it reaches zero, enabling
-/// correct COW / shared-mapping semantics.
-///
-/// For Tier-0 (bootstrap) pages the refcount is not tracked; the page is
-/// returned to the bootstrap free-list immediately.
-///
-/// Panics on double-free of bootstrap pages (detected via bitmap).
 pub fn free_page(pa: usize) {
     if pa == 0 { return; }
     assert_eq!(pa & (PAGE_SIZE - 1), 0, "free_page: PA {:#x} not page-aligned", pa);
     assert!(!is_kernel_page(pa), "free_page: attempt to free kernel page {:#x}", pa);
 
-    // Bootstrap page?
     if let Some(idx) = pool_index(pa) {
         let ok = pool_bit_set_free(idx);
         assert!(ok, "free_page: double-free of bootstrap page {:#x}", pa);
@@ -699,24 +776,17 @@ pub fn free_page(pa: usize) {
         return;
     }
 
-    // Buddy page.
     if let Some(pi) = page_info(pa) {
         let old = pi.refcount.fetch_sub(1, Ordering::AcqRel);
         assert!(old > 0, "free_page: refcount underflow at PA {:#x}", pa);
         if old == 1 {
             unsafe { buddy_free_page(pa); }
         }
-        // else: still referenced — do not return to buddy.
         return;
     }
-
-    // PA is outside both bootstrap pool and page_info range — ignore.
 }
 
 /// Increment the reference count of `pa`.
-///
-/// Call this when a page is shared (COW fork, shared mapping, DMA buffer).
-/// Panics if `pa` is not tracked by the page_info table.
 pub fn get_page(pa: usize) {
     if let Some(pi) = page_info(pa) {
         pi.refcount.fetch_add(1, Ordering::Relaxed);
@@ -724,7 +794,6 @@ pub fn get_page(pa: usize) {
 }
 
 /// Decrement the reference count of `pa` and free it if it reaches zero.
-/// Equivalent to `free_page` but documents intent at the call site.
 #[inline]
 pub fn put_page(pa: usize) { free_page(pa); }
 
@@ -735,49 +804,49 @@ pub fn page_refcount(pa: usize) -> u32 {
 }
 
 /// Register a physical memory region as available to the buddy allocator.
-/// Called by `memmap_init()` / `pmm_add_efi_map()` / FDT walker.
 ///
-/// `node` = NUMA node this region belongs to.  Pass 0 if unknown (UMA).
+/// Ensures the PageInfo table is large enough to cover all registered PFNs
+/// (carving storage from the bootstrap pool if this is the first call),
+/// then initialises each page's PageInfo and adds it to the buddy free-list.
 pub fn pmm_add_region_node(base: usize, size: usize, node: u8) {
     let start = (base + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     let end   = base + size;
     if start >= end { return; }
+
+    // Ensure the PageInfo table covers the highest PFN in this region.
+    let max_pfn = pfn(end - 1);
+    if max_pfn < MAX_FRAMES {
+        ensure_page_info_table(max_pfn);
+    }
 
     register_node_range(node, start, end);
     BUDDY_LIVE.store(true, Ordering::Relaxed);
 
     let mut pa = start;
     while pa + PAGE_SIZE <= end {
-        if pa == 0 || is_kernel_page(pa) || pfn(pa) >= MAX_FRAMES {
+        if pa == 0 || is_kernel_page(pa) || pfn(pa) >= PAGE_INFO_LEN.load(Ordering::Relaxed) {
             pa += PAGE_SIZE;
             continue;
         }
-        // Initialise PageInfo.
-        let pi = &PAGE_INFO[pfn(pa)];
-        pi.refcount.store(0, Ordering::Relaxed);
-        pi.flags.store(FLAG_FREE | FLAG_BUDDY, Ordering::Relaxed);
-        pi.order.store(0, Ordering::Relaxed);
-        pi.numa_node.store(node, Ordering::Relaxed);
-
-        unsafe { zero_page(pa); }
-
-        // Add to order-0 free-list; the allocator will coalesce on first use.
-        // (We could add in max-order chunks here for speed, but simplicity wins
-        //  at init time; there's no performance critical path here.)
-        unsafe { buddy_push(node, pa, 0); }
-        BUDDY[node as usize].total_pages.fetch_add(1, Ordering::Relaxed);
+        if let Some(pi) = page_info(pa) {
+            pi.refcount.store(0, Ordering::Relaxed);
+            pi.flags.store(FLAG_FREE | FLAG_BUDDY, Ordering::Relaxed);
+            pi.order.store(0, Ordering::Relaxed);
+            pi.numa_node.store(node, Ordering::Relaxed);
+            unsafe { zero_page(pa); }
+            unsafe { buddy_push(node, pa, 0); }
+            BUDDY[node as usize].total_pages.fetch_add(1, Ordering::Relaxed);
+        }
         pa += PAGE_SIZE;
     }
 }
 
 /// Register a physical memory region on NUMA node 0.
-/// Backwards-compatible shim for `memmap.rs` and EFI/FDT callers that do
-/// not yet have NUMA topology information.
 pub fn pmm_add_region(base: usize, size: usize) {
     pmm_add_region_node(base, size, 0);
 }
 
-// ── EFI memory map ────────────────────────────────────────────────────────────
+// ── EFI memory map ────────────────────────────────────────────────────────────────────────
 
 pub use crate::arch::x86_64::uefi_entry::EfiMemDescriptor;
 
@@ -790,8 +859,6 @@ fn efi_mem_type_is_usable(t: u32) -> bool {
 }
 
 /// Walk the EFI memory map and register usable regions with the buddy.
-/// `node` allows ACPI SRAT / NUMA callers to pass the correct node id;
-/// plain UEFI boot passes 0.
 pub unsafe fn pmm_add_efi_map(
     map_ptr:   usize,
     map_size:  usize,
@@ -820,7 +887,7 @@ pub unsafe fn pmm_add_efi_map_node(
     }
 }
 
-// ── RISC-V FDT walker ────────────────────────────────────────────────────────
+// ── RISC-V FDT walker ──────────────────────────────────────────────────────────────────────
 
 /// Initialise the PMM from an FDT blob (RISC-V / OpenSBI path).
 pub fn init_from_fdt(fdt_ptr: usize) {
@@ -828,8 +895,24 @@ pub fn init_from_fdt(fdt_ptr: usize) {
     unsafe { fdt_walk_memory(fdt_ptr); }
 }
 
-/// x86_64 shim — real work done by `pmm_add_efi_map` / `parse_mbi`.
+// ── Arch-dispatching pmm::init() ─────────────────────────────────────────────────────────
+//
+// kernel_main calls `crate::pmm::init()` on both architectures.  The two
+// cfg-gated variants below make the arch difference invisible at the call
+// site while keeping all the dispatch logic here in pmm.rs.
+
+/// x86_64: PMM is seeded by `pmm_add_efi_map` / `parse_mbi` from the boot
+/// entry point before kernel_main runs.  Nothing to do here.
+#[cfg(target_arch = "x86_64")]
 pub fn init() {}
+
+/// RISC-V: seed the buddy allocator from the FDT memory nodes now.
+/// Must be called before `heap::init()` so the linked-list allocator
+/// has pages to carve from.
+#[cfg(target_arch = "riscv64")]
+pub fn init(fdt_ptr: usize) {
+    init_from_fdt(fdt_ptr);
+}
 
 const FDT_MAGIC:      u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
@@ -904,7 +987,7 @@ unsafe fn fdt_walk_memory(fdt_ptr: usize) {
     }
 }
 
-// ── Diagnostics ──────────────────────────────────────────────────────────────
+// ── Diagnostics ────────────────────────────────────────────────────────────────────────
 
 /// Total free pages across all NUMA nodes (buddy tier only).
 pub fn free_pages() -> usize {
@@ -946,7 +1029,7 @@ pub fn dump_stats() {
     }
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ── Internal helpers ──────────────────────────────────────────────────────────────────────
 
 #[inline]
 unsafe fn zero_page(pa: usize) {
