@@ -1,7 +1,11 @@
-//! BSD socket layer: socket(), bind(), listen(), accept(), connect(),
-//! send(), recv(), sendto(), recvfrom(), socketpair(), shutdown().
+//! BSD socket layer — submodule tree.
+//!
+//! See individual submodules for details.
 
 extern crate alloc;
+use alloc::string::String;
+use alloc::vec::Vec;
+use spin::Mutex;
 
 pub mod types;
 pub mod address;
@@ -14,29 +18,16 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
-pub use types::{SockAddr, Socket, SocketState, AF_INET, AF_INET6, AF_UNIX,
-               SOCK_STREAM, SOCK_DGRAM, SOCK_RAW,
-               SHUT_RD, SHUT_WR, SHUT_RDWR};
-pub use self::core::{sys_socket, sys_bind, sys_listen, sys_accept,
-                     sys_accept4, sys_connect, alloc_slot};
-pub use traits::{sys_setsockopt, sys_getsockopt, sys_shutdown,
-                  sys_getpeername, sys_getsockname};
+pub use types::{Socket, SockAddr, SocketState, AF_INET, AF_INET6, AF_UNIX,
+                SOCK_STREAM, SOCK_DGRAM, SOCK_RAW,
+                SOL_SOCKET, SO_REUSEADDR, SO_KEEPALIVE, SO_ERROR,
+                IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, MSG_DONTWAIT,
+                SHUT_RD, SHUT_WR, SHUT_RDWR, MAX_SOCKETS};
+
+pub use core::{sys_socket, sys_bind, sys_listen, sys_accept, sys_connect,
+               sys_getsockname, sys_getpeername, alloc_slot, SOCKETS};
+pub use traits::{sys_setsockopt, sys_getsockopt, sys_shutdown};
 pub use poll::{socket_poll, socket_read, socket_write, is_socket_fd};
-pub use syscalls::{sys_sendmsg, sys_recvmsg, sys_socketpair, sys_close_socket};
-
-use alloc::sync::Arc;
-use spin::Mutex;
-
-pub static SOCKETS: Mutex<alloc::vec::Vec<Option<Arc<Mutex<Socket>>>>> =
-    Mutex::new(alloc::vec![]);
-
-pub fn alloc_slot(s: Socket) -> Option<usize> {
-    let arc = Arc::new(Mutex::new(s));
-    let mut socks = SOCKETS.lock();
-    for (i, slot) in socks.iter_mut().enumerate() {
-        if slot.is_none() { *slot = Some(arc); return Some(i); }
-    }
-    let idx = socks.len();
-    socks.push(Some(arc));
-    Some(idx)
-}
+pub use syscalls::{sys_sendmsg, sys_recvmsg, sys_socketpair, socket_close};
+pub use address::{read_sockaddr_in, read_sockaddr_in6,
+                  write_sockaddr_in, write_sockaddr_in6, next_ephemeral};

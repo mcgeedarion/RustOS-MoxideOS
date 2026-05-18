@@ -1,38 +1,82 @@
-use super::SOCKETS;
+use super::types::{SocketState, SockAddr, MSG_PEEK};
+use super::core::SOCKETS;
 
 pub fn is_socket_fd(fd: usize) -> bool {
-    SOCKETS.lock().get(fd).map(|s| s.is_some()).unwrap_or(false)
+    SOCKETS.lock().get(fd).map_or(false, |s| s.is_some())
 }
 
-pub fn socket_poll(fd: usize, events: u32) -> u32 {
-    let socks = SOCKETS.lock();
-    let sock  = match socks.get(fd).and_then(|s| s.as_ref()) {
-        Some(s) => s.lock(), None => return 0,
+pub fn socket_poll(fd: usize) -> u32 {
+    let sockets = SOCKETS.lock();
+    let Some(Some(sock)) = sockets.get(fd) else { return 0; };
+    let mut events = 0u32;
+    // POLLIN
+    let readable = match &sock.state {
+        SocketState::Connected => {
+            if let Some(id) = sock.tcp_id {
+                crate::net::tcp::bytes_available(id) > 0
+            } else if let Some(conn) = &sock.unix_conn {
+                conn.is_readable()
+            } else {
+                !sock.udp_rx.is_empty()
+            }
+        }
+        SocketState::Listening => {
+            if let Some(ul) = &sock.unix_listener {
+                !ul.lock().backlog.is_empty()
+            } else {
+                crate::net::tcp::has_pending_accept(fd)
+            }
+        }
+        _ => false,
     };
-    let mut revents = 0u32;
-    if events & 0x01 != 0 && sock.rx_buf.len() > 0 { revents |= 0x01; } // POLLIN
-    if events & 0x04 != 0 { revents |= 0x04; } // POLLOUT
-    revents
+    if readable  { events |= 1; }  // POLLIN
+    if sock.state == SocketState::Connected { events |= 4; } // POLLOUT
+    if sock.so_error != 0 { events |= 8; } // POLLERR
+    events
 }
 
-pub fn socket_read(fd: usize, buf: &mut [u8]) -> isize {
-    let mut socks = SOCKETS.lock();
-    let sock = match socks.get_mut(fd).and_then(|s| s.as_mut()) {
-        Some(s) => s, None => return -9,
-    };
-    let mut s = sock.lock();
-    let n = s.rx_buf.len().min(buf.len());
-    buf[..n].copy_from_slice(&s.rx_buf[..n]);
-    s.rx_buf.drain(..n);
-    n as isize
+pub fn socket_read(fd: usize, buf: &mut [u8], flags: u32) -> isize {
+    let peek = flags & MSG_PEEK != 0;
+    let mut sockets = SOCKETS.lock();
+    let Some(Some(sock)) = sockets.get_mut(fd) else { return -9; };
+    if let Some(id) = sock.tcp_id {
+        drop(sockets);
+        if peek {
+            return crate::net::tcp::peek(id, buf);
+        }
+        return crate::net::tcp::recv(id, buf);
+    }
+    if let Some(conn) = sock.unix_conn.clone() {
+        drop(sockets);
+        let data = conn.read(buf.len());
+        let n = data.len();
+        buf[..n].copy_from_slice(&data);
+        return n as isize;
+    }
+    // UDP: pull next datagram
+    if let Some((src_ip, src_port, data)) = if peek {
+        sock.udp_rx.front().cloned()
+    } else {
+        sock.udp_rx.pop_front()
+    } {
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        return n as isize;
+    }
+    -11  // EAGAIN
 }
 
 pub fn socket_write(fd: usize, buf: &[u8]) -> isize {
-    let socks = SOCKETS.lock();
-    let sock  = match socks.get(fd).and_then(|s| s.as_ref()) {
-        Some(s) => s, None => return -9,
-    };
-    let s = sock.lock();
-    crate::net::send_raw(&s, buf);
-    buf.len() as isize
+    let sockets = SOCKETS.lock();
+    let Some(Some(sock)) = sockets.get(fd) else { return -9; };
+    if let Some(id) = sock.tcp_id {
+        drop(sockets);
+        return crate::net::tcp::send(id, buf);
+    }
+    if let Some(conn) = sock.unix_conn.clone() {
+        drop(sockets);
+        conn.write(buf);
+        return buf.len() as isize;
+    }
+    -9  // EBADF — unconnected UDP should use sendto
 }
