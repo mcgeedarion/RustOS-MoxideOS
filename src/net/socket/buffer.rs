@@ -1,27 +1,43 @@
 extern crate alloc;
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+use alloc::sync::Arc;
 use spin::Mutex;
 
 pub struct UnixPipe {
-    pub buf: VecDeque<u8>,
-    pub closed_write: bool,
-    pub closed_read:  bool,
+    pub buf:    VecDeque<u8>,
+    pub closed: bool,
 }
 
-impl UnixPipe {
-    pub fn new() -> Self {
-        UnixPipe { buf: VecDeque::new(), closed_write: false, closed_read: false }
-    }
-    pub fn readable_bytes(&self) -> usize { self.buf.len() }
-    pub fn write(&mut self, data: &[u8]) -> usize {
-        for &b in data { self.buf.push_back(b); }
-        data.len()
-    }
-    pub fn read(&mut self, into: &mut [u8]) -> usize {
-        let n = into.len().min(self.buf.len());
-        for b in &mut into[..n] { *b = self.buf.pop_front().unwrap(); }
-        n
-    }
+pub struct UnixConn {
+    pub rx: Arc<Mutex<UnixPipe>>,
+    pub tx: Arc<Mutex<UnixPipe>>,
 }
 
-pub type SharedPipe = Arc<Mutex<UnixPipe>>;
+impl UnixConn {
+    pub fn new_pair() -> (UnixConn, UnixConn) {
+        let a_to_b = Arc::new(Mutex::new(UnixPipe { buf: VecDeque::new(), closed: false }));
+        let b_to_a = Arc::new(Mutex::new(UnixPipe { buf: VecDeque::new(), closed: false }));
+        let a = UnixConn { rx: b_to_a.clone(), tx: a_to_b.clone() };
+        let b = UnixConn { rx: a_to_b,         tx: b_to_a };
+        (a, b)
+    }
+    pub fn write(&self, data: &[u8]) { self.tx.lock().buf.extend(data.iter().copied()); }
+    pub fn read(&self, len: usize) -> Vec<u8> {
+        let mut p = self.rx.lock();
+        let n = len.min(p.buf.len());
+        p.buf.drain(..n).collect()
+    }
+    pub fn is_readable(&self) -> bool {
+        let p = self.rx.lock();
+        !p.buf.is_empty() || p.closed
+    }
+    pub fn close_tx(&self) { self.tx.lock().closed = true; }
+}
+
+pub struct PendingUnix { pub server_conn: UnixConn }
+
+pub struct UnixListener {
+    pub backlog:     VecDeque<PendingUnix>,
+    pub max_backlog: usize,
+}
