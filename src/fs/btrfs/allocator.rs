@@ -1,2 +1,4 @@
-//! Logical space bump allocator re-export. Lives inside BtrfsFs::alloc_logical.
-pub use super::tree::BtrfsFs;
+//! Btrfs logical space allocator.
+//! BtrfsFs uses a bump allocator for CoW block allocation (see tree_impl.rs).
+
+pub use super::superblock::BtrfsFs;
