@@ -1,64 +1,69 @@
 //! I/O multiplexing: select(2), pselect6(2), poll(2), ppoll(2),
 //! epoll_create(2), epoll_ctl(2), epoll_wait(2).
 //!
-//! ## Fixes in this revision
+//! ## Blocking model
 //!
-//!   - fd_ready: translate user fd → backing fd before checking eventfd,
-//!     timerfd, devfs, and VFS readiness.  Previously those checks used the
-//!     user fd directly as a backing fd, causing POLLNVAL for valid fds.
-//!   - select / pselect6: exceptfds membership now derived from efds_va
-//!     instead of accidentally reusing rfds/wfds membership.
-//!   - epoll_wait: re-reads the interest list from EPOLL_TABLE each scan
-//!     so EPOLL_CTL_MOD/DEL while a waiter is blocked become visible.
-//!   - EPOLLONESHOT: a ready one-shot entry is disarmed after reporting;
-//!     must be re-armed with EPOLL_CTL_MOD (matches Linux).
+//! All four interfaces share a two-phase loop:
 //!
-//! ## Architecture
+//! ```text
+//! loop {
+//!     ready = check all fds via PollSource::poll()   // lock-free
+//!     if ready > 0 || deadline elapsed => return
+//!     wait_any(sources, cancel, deadline)             // ONE scheduler sleep
+//! }
+//! ```
 //!
-//!   All four interfaces share a single underlying readiness oracle:
-//!   `fd_ready(fdno, events) -> u32`.
+//! `wait_any` registers a forwarder on every source's `WaitQueue`, then
+//! calls `block_current()` once.  When any source fires, the aggregate
+//! queue is woken, the task unblocks, and the loop re-checks all fds.
 //!
-//!   | Backing        | POLLIN ready when            | POLLOUT ready when          |
-//!   |----------------|------------------------------|------------------------------|
-//!   | stdin (fd 0)   | TTY ring buffer non-empty    | always                      |
-//!   | stdout/stderr  | always                       | always                      |
-//!   | Pipe read-end  | pipe ring buffer non-empty   | N/A                         |
-//!   | Pipe write-end | N/A                          | pipe buffer not full        |
-//!   | Pipe (closed)  | POLLHUP                      |                             |
-//!   | Socket         | recv-buf non-empty           | send-buf not full           |
-//!   | eventfd        | counter > 0                  | always (counter < MAX)      |
-//!   | timerfd        | expirations > 0              | N/A                         |
-//!   | devfs / file   | always                       | always                      |
-//!   | unknown fd     | POLLNVAL                     |                             |
+//! No `core::hint::spin_loop()` exists anywhere in this file.
+//!
+//! ## Readiness oracle
+//!
+//! `fd_poll_source(fdno)` is the canonical dispatch function.  It returns
+//! an `Arc<dyn PollSource>` for any known fd type.  `fd_ready()` is kept
+//! as a thin wrapper for callers that only need a synchronous snapshot.
+//!
+//! | Backing        | POLLIN ready when            | POLLOUT ready when          |
+//! |----------------|------------------------------|------------------------------|
+//! | stdin (fd 0)   | TTY ring buffer non-empty    | always                      |
+//! | stdout/stderr  | always                       | always                      |
+//! | Pipe read-end  | pipe ring buffer non-empty   | N/A                         |
+//! | Pipe write-end | N/A                          | pipe buffer not full        |
+//! | Pipe (closed)  | POLLHUP                      |                             |
+//! | Socket         | recv-buf non-empty           | send-buf not full           |
+//! | eventfd        | counter > 0                  | counter < MAX               |
+//! | timerfd        | expirations > 0              | N/A                         |
+//! | devfs / file   | always                       | always                      |
+//! | unknown fd     | POLLNVAL                     |                             |
 //!
 //! ## select / pselect6 differences
 //!
 //!   `select`  uses `struct timeval`  (seconds + microseconds, 2×i64 on x86-64).
 //!   `pselect6` uses `struct timespec` (seconds + nanoseconds,  2×i64 on x86-64).
-//!
-//!   `pselect6` 6th argument is NOT a raw sigset_t pointer.  It is a pointer to
-//!   a two-word struct  `{ const sigset_t *ss; size_t ss_len; }`.
+//!   `pselect6` 6th argument is `{ const sigset_t *ss; size_t ss_len; }`.
 //!
 //! ## Timeout writeback
 //!
 //!   `select`   writes back the remaining timeval on return (POSIX §2.10.16).
-//!   `pselect6` does NOT write back the timespec (Linux-compatible behaviour).
-//!
-//! ## Timeout handling
-//!
-//!   `timeout == 0` means poll once and return immediately.
-//!   `timeout < 0` (NULL pointer) means wait indefinitely — capped at 5 s.
+//!   `pselect6` does NOT write back the timespec (Linux-compatible).
 //!
 //! ## epoll
 //!
 //!   Epoll instance fds live in EPOLL_TABLE in [EPOLL_FD_BASE, EPOLL_FD_BASE+MAX_EPOLLS).
+//!   EPOLLONESHOT entries are disarmed after firing; re-arm with EPOLL_CTL_MOD.
 
 extern crate alloc;
 use alloc::vec::Vec;
+use alloc::sync::Arc;
 use spin::Mutex;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
+use crate::sync::wait_queue::{WaitQueue, WakeReason, CancellationToken, ReadyMask};
+use crate::sync::poll_source::{PollSource, wait_any, AlwaysReady};
 
-// ── poll event flags ──────────────────────────────────────────────────────────
+// ── Poll event flags ────────────────────────────────────────────────────────────
+
 pub const POLLIN:       u32 = 0x0001;
 pub const POLLPRI:      u32 = 0x0002;
 pub const POLLOUT:      u32 = 0x0004;
@@ -69,9 +74,8 @@ pub const POLLRDNORM:   u32 = 0x0040;
 pub const POLLWRNORM:   u32 = 0x0100;
 pub const EPOLLONESHOT: u32 = 0x4000_0000;
 
-// ── fd namespace helper ───────────────────────────────────────────────────────
+// ── fd namespace helper ─────────────────────────────────────────────────────────
 
-/// Translate a process-local user fd to its kernel backing fd.
 #[inline]
 fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     let pid = crate::proc::scheduler::current_pid();
@@ -79,59 +83,98 @@ fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     if r < 0 { None } else { Some(r as usize) }
 }
 
-// ── readiness oracle ──────────────────────────────────────────────────────────
+// ── Stdio PollSource impls ────────────────────────────────────────────────────────
+//
+// stdin is backed by the TTY ring; reads from the actual tty WaitQueue
+// will be wired in the tty migration.  For now poll() checks the ring
+// synchronously and the WaitQueue is a never-slept-on sentinel.
 
-/// Return the subset of `events` that are currently ready on `fdno`
-/// (a user-visible fd), plus POLLERR / POLLHUP / POLLNVAL as appropriate.
-pub fn fd_ready(fdno: usize, events: u32) -> u32 {
-    // stdin
-    if fdno == 0 {
-        let readable = crate::shell::tty::bytes_available() > 0;
-        let mut r = if readable { POLLIN | POLLRDNORM } else { 0 };
-        if events & POLLOUT != 0 { r |= POLLOUT | POLLWRNORM; }
-        return r & (events | POLLERR | POLLHUP);
-    }
-    // stdout / stderr — always writable
-    if fdno == 1 || fdno == 2 {
-        return (POLLOUT | POLLWRNORM | POLLIN) & (events | POLLERR | POLLHUP);
-    }
-    // Pipes: is_pipe_fd / pipe_poll translate user fd → bfd internally.
-    if crate::fs::pipe::is_pipe_fd(fdno) {
-        return crate::fs::pipe::pipe_poll(fdno, events);
-    }
-    // Sockets: socket_poll translates internally.
-    if let Some(ready) = crate::net::socket::socket_poll(fdno, events) {
-        return ready;
-    }
-
-    // All remaining subsystems operate on backing fds — translate once here.
-    let bfd = match user_fd_to_bfd(fdno) {
-        Some(b) => b,
-        None    => return POLLNVAL,
-    };
-
-    if crate::fs::eventfd::is_eventfd(bfd) {
-        return crate::fs::eventfd::eventfd_poll(bfd, events);
-    }
-    if crate::fs::timerfd::is_timerfd(bfd) {
-        return crate::fs::timerfd::timerfd_poll(bfd, events);
-    }
-    if crate::fs::devfs::get_dev_fd(bfd).is_some() {
-        let mut r = 0u32;
-        if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
-        if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
-        return r;
-    }
-    if crate::fs::vfs::fd_exists(bfd) {
-        let mut r = 0u32;
-        if events & POLLIN  != 0 { r |= POLLIN  | POLLRDNORM; }
-        if events & POLLOUT != 0 { r |= POLLOUT  | POLLWRNORM; }
-        return r;
-    }
-    POLLNVAL
+struct StdinSource {
+    wq: WaitQueue,
 }
 
-// ── time helpers ──────────────────────────────────────────────────────────────
+impl StdinSource {
+    fn new() -> Self { Self { wq: WaitQueue::new() } }
+}
+
+impl PollSource for StdinSource {
+    fn poll(&self, interest: ReadyMask) -> ReadyMask {
+        let mut r = 0u32;
+        if interest & (POLLIN | POLLRDNORM) != 0
+            && crate::shell::tty::bytes_available() > 0
+        {
+            r |= POLLIN | POLLRDNORM;
+        }
+        if interest & (POLLOUT | POLLWRNORM) != 0 {
+            r |= POLLOUT | POLLWRNORM;
+        }
+        r
+    }
+    fn wait_queue(&self) -> &WaitQueue { &self.wq }
+}
+
+// ── PollSource dispatch ───────────────────────────────────────────────────────────
+
+/// Return an `Arc<dyn PollSource>` for any user-visible fd.
+///
+/// This is the canonical dispatch function replacing the old if/else chain
+/// in `fd_ready()`.  Returns `None` only if the fd does not exist at all
+/// (POLLNVAL territory).
+pub fn fd_poll_source(fdno: usize) -> Option<Arc<dyn PollSource>> {
+    // fd 0 — stdin
+    if fdno == 0 {
+        return Some(Arc::new(StdinSource::new()));
+    }
+    // fd 1/2 — stdout/stderr: always ready
+    if fdno == 1 || fdno == 2 {
+        return Some(Arc::new(AlwaysReady::new()));
+    }
+    // Pipes
+    if crate::fs::pipe::is_pipe_fd(fdno) {
+        let pid = crate::proc::scheduler::current_pid();
+        let bfd = crate::fs::process_fd::proc_fd_backing(pid, fdno);
+        if bfd >= 0 {
+            return crate::fs::pipe::pipe_poll_source(bfd as usize);
+        }
+    }
+    // Sockets
+    if let Some(src) = crate::net::socket::socket_poll_source(fdno) {
+        return Some(src);
+    }
+    // Remaining subsystems need backing fd translation.
+    let bfd = user_fd_to_bfd(fdno)?;
+
+    if crate::fs::eventfd::is_eventfd(bfd) {
+        return crate::fs::eventfd::eventfd_poll_source(bfd);
+    }
+    if crate::fs::timerfd::is_timerfd(bfd) {
+        return crate::fs::timerfd::timerfd_poll_source(bfd);
+    }
+    // devfs and regular VFS files: always ready.
+    if crate::fs::devfs::get_dev_fd(bfd).is_some() || crate::fs::vfs::fd_exists(bfd) {
+        return Some(Arc::new(AlwaysReady::new()));
+    }
+    None // POLLNVAL
+}
+
+/// Synchronous readiness snapshot.  Kept for legacy callers.
+/// Prefer `fd_poll_source` for anything that may block.
+pub fn fd_ready(fdno: usize, events: u32) -> u32 {
+    match fd_poll_source(fdno) {
+        Some(src) => src.poll(events),
+        None      => POLLNVAL,
+    }
+}
+
+// ── Cancellation helper ───────────────────────────────────────────────────────────
+
+#[inline]
+fn current_cancel() -> Option<Arc<CancellationToken>> {
+    let pid = crate::proc::scheduler::current_pid();
+    crate::proc::scheduler::task_cancel_token(pid)
+}
+
+// ── Time helpers ─────────────────────────────────────────────────────────────
 
 #[inline]
 fn now_ns() -> u64 { crate::time::monotonic_ns() }
@@ -159,11 +202,11 @@ fn read_timeval(va: usize) -> Result<(i64, i64), isize> {
 
 fn write_timeval_remaining(va: usize, deadline_ns: u64) {
     if va == 0 { return; }
-    let now = now_ns();
+    let now      = now_ns();
     let rem_ns   = if deadline_ns > now { deadline_ns - now } else { 0 };
     let rem_sec  = rem_ns / 1_000_000_000;
     let rem_usec = (rem_ns % 1_000_000_000) / 1_000;
-    let mut buf = [0u8; 16];
+    let mut buf  = [0u8; 16];
     buf[0..8].copy_from_slice(&(rem_sec  as i64).to_le_bytes());
     buf[8..16].copy_from_slice(&(rem_usec as i64).to_le_bytes());
     let _ = copy_to_user(va, &buf);
@@ -175,7 +218,7 @@ fn ms_to_deadline_ns(ms: i32) -> u64 {
     now_ns() + wait_ns
 }
 
-// ── fd_set bitmap helpers ─────────────────────────────────────────────────────
+// ── fd_set bitmap helpers ─────────────────────────────────────────────────────────
 
 fn read_fdset(va: usize, words: usize) -> Result<Vec<u64>, isize> {
     if va == 0 { return Ok(alloc::vec![0u64; words]); }
@@ -196,18 +239,7 @@ fn write_fdset(va: usize, src: &[u64]) {
     }
 }
 
-// ── signal mask helpers (pselect6) ────────────────────────────────────────────
-//
-// pselect6's 6th argument is a pointer to:
-//   struct { const sigset_t *ss; size_t ss_len; }   (16 bytes on x86-64)
-// We dereference ss_ptr, atomically swap the task's signal mask, and restore
-// it on exit.
-
-#[repr(C)]
-struct Pselect6SigArg {
-    ss_ptr: u64,
-    ss_len: u64,
-}
+// ── Signal mask helpers (pselect6) ──────────────────────────────────────────────
 
 fn pselect_swap_sigmask(ss_va: usize) -> Option<u64> {
     if ss_va == 0 { return None; }
@@ -229,17 +261,12 @@ fn pselect_swap_sigmask(ss_va: usize) -> Option<u64> {
 
 fn pselect_restore_sigmask(old: Option<u64>) {
     if let Some(m) = old {
-        let pid = crate::proc::scheduler::current_pid();
-        crate::proc::signal::set_sigmask(pid, m);
+        crate::proc::signal::set_sigmask(
+            crate::proc::scheduler::current_pid(), m);
     }
 }
 
-// ── sys_select  [NR 23] ───────────────────────────────────────────────────────
-//
-// select(int nfds, fd_set *r, fd_set *w, fd_set *e, struct timeval *tv)
-//
-// On return *tv is updated with remaining time (POSIX §2.10.16).
-// exceptfds bits are set for fds with POLLERR | POLLHUP | POLLNVAL.
+// ── sys_select  [NR 23] ─────────────────────────────────────────────────────────
 
 pub fn sys_select(
     nfds:    usize,
@@ -252,7 +279,6 @@ pub fn sys_select(
 
     let words     = (nfds + 63) / 64;
     let bmap_size = words * 8;
-
     for va in [rfds_va, wfds_va, efds_va] {
         if va != 0 && !validate_user_ptr(va, bmap_size) { return -14; }
     }
@@ -274,48 +300,56 @@ pub fn sys_select(
 
     let rfds_k = match read_fdset(rfds_va, words) { Ok(v) => v, Err(e) => return e };
     let wfds_k = match read_fdset(wfds_va, words) { Ok(v) => v, Err(e) => return e };
-    // FIX: read efds from efds_va, not derived from rfds/wfds.
     let efds_k = match read_fdset(efds_va, words) { Ok(v) => v, Err(e) => return e };
+
+    // Build source list once — (Arc<dyn PollSource>, interest_mask, fd_index).
+    struct SelectEntry {
+        src:    Arc<dyn PollSource>,
+        events: u32,
+        fd:     usize,
+        want_r: bool,
+        want_w: bool,
+        want_e: bool,
+    }
+    let mut entries: Vec<SelectEntry> = Vec::new();
+    for fd in 0..nfds {
+        let word   = fd / 64;
+        let bit    = 1u64 << (fd % 64);
+        let want_r = rfds_va != 0 && rfds_k[word] & bit != 0;
+        let want_w = wfds_va != 0 && wfds_k[word] & bit != 0;
+        let want_e = efds_va != 0 && efds_k[word] & bit != 0;
+        if !want_r && !want_w && !want_e { continue; }
+        let mut events = 0u32;
+        if want_r { events |= POLLIN; }
+        if want_w { events |= POLLOUT; }
+        if want_e { events |= POLLIN | POLLOUT; }
+        if let Some(src) = fd_poll_source(fd) {
+            entries.push(SelectEntry { src, events, fd, want_r, want_w, want_e });
+        }
+    }
+    let cancel = current_cancel();
+    let cancel_ref = cancel.as_deref();
 
     let mut out_r = alloc::vec![0u64; words];
     let mut out_w = alloc::vec![0u64; words];
     let mut out_e = alloc::vec![0u64; words];
 
     loop {
-        out_r.fill(0);
-        out_w.fill(0);
-        out_e.fill(0);
+        out_r.fill(0); out_w.fill(0); out_e.fill(0);
         let mut total = 0i32;
 
-        for fd in 0..nfds {
-            let word = fd / 64;
-            let bit  = 1u64 << (fd % 64);
-
-            let want_r = rfds_va != 0 && (rfds_k[word] & bit != 0);
-            let want_w = wfds_va != 0 && (wfds_k[word] & bit != 0);
-            // FIX: want_e based solely on efds_k.
-            let want_e = efds_va != 0 && (efds_k[word] & bit != 0);
-
-            if !want_r && !want_w && !want_e { continue; }
-
-            let mut events = 0u32;
-            if want_r { events |= POLLIN; }
-            if want_w { events |= POLLOUT; }
-            if want_e { events |= POLLIN | POLLOUT; }
-
-            let ready = fd_ready(fd, events);
-
-            if ready & (POLLIN | POLLRDNORM) != 0 && want_r {
-                out_r[word] |= bit;
-                total += 1;
+        for e in &entries {
+            let ready = e.src.poll(e.events);
+            let word  = e.fd / 64;
+            let bit   = 1u64 << (e.fd % 64);
+            if ready & (POLLIN | POLLRDNORM) != 0 && e.want_r {
+                out_r[word] |= bit; total += 1;
             }
-            if ready & (POLLOUT | POLLWRNORM) != 0 && want_w {
-                out_w[word] |= bit;
-                total += 1;
+            if ready & (POLLOUT | POLLWRNORM) != 0 && e.want_w {
+                out_w[word] |= bit; total += 1;
             }
-            if ready & (POLLERR | POLLHUP | POLLNVAL) != 0 && want_e {
-                out_e[word] |= bit;
-                total += 1;
+            if ready & (POLLERR | POLLHUP | POLLNVAL) != 0 && e.want_e {
+                out_e[word] |= bit; total += 1;
             }
         }
 
@@ -326,7 +360,15 @@ pub fn sys_select(
             write_timeval_remaining(tv_va, deadline_ns);
             return total as isize;
         }
-        core::hint::spin_loop();
+
+        // Sleep until any source fires, deadline, or signal.
+        let sources: Vec<(Arc<dyn PollSource>, ReadyMask)> =
+            entries.iter().map(|e| (e.src.clone(), e.events)).collect();
+        let reason = wait_any(&sources, cancel_ref, Some(deadline_ns));
+        if reason == WakeReason::Cancelled {
+            write_timeval_remaining(tv_va, deadline_ns);
+            return -4; // EINTR
+        }
     }
 }
 
@@ -344,7 +386,6 @@ pub fn sys_pselect6(
 
     let words     = (nfds + 63) / 64;
     let bmap_size = words * 8;
-
     for va in [rfds_va, wfds_va, efds_va] {
         if va != 0 && !validate_user_ptr(va, bmap_size) { return -14; }
     }
@@ -368,46 +409,55 @@ pub fn sys_pselect6(
     let wfds_k = match read_fdset(wfds_va, words) { Ok(v) => v, Err(e) => return e };
     let efds_k = match read_fdset(efds_va, words) { Ok(v) => v, Err(e) => return e };
 
+    struct SelectEntry {
+        src:    Arc<dyn PollSource>,
+        events: u32,
+        fd:     usize,
+        want_r: bool,
+        want_w: bool,
+        want_e: bool,
+    }
+    let mut entries: Vec<SelectEntry> = Vec::new();
+    for fd in 0..nfds {
+        let word   = fd / 64;
+        let bit    = 1u64 << (fd % 64);
+        let want_r = rfds_va != 0 && rfds_k[word] & bit != 0;
+        let want_w = wfds_va != 0 && wfds_k[word] & bit != 0;
+        let want_e = efds_va != 0 && efds_k[word] & bit != 0;
+        if !want_r && !want_w && !want_e { continue; }
+        let mut events = 0u32;
+        if want_r { events |= POLLIN; }
+        if want_w { events |= POLLOUT; }
+        if want_e { events |= POLLIN | POLLOUT; }
+        if let Some(src) = fd_poll_source(fd) {
+            entries.push(SelectEntry { src, events, fd, want_r, want_w, want_e });
+        }
+    }
+
     let old_mask = pselect_swap_sigmask(sigarg_va);
+    let cancel   = current_cancel();
+    let cancel_ref = cancel.as_deref();
 
     let mut out_r = alloc::vec![0u64; words];
     let mut out_w = alloc::vec![0u64; words];
     let mut out_e = alloc::vec![0u64; words];
 
     let ret = loop {
-        out_r.fill(0);
-        out_w.fill(0);
-        out_e.fill(0);
+        out_r.fill(0); out_w.fill(0); out_e.fill(0);
         let mut total = 0i32;
 
-        for fd in 0..nfds {
-            let word = fd / 64;
-            let bit  = 1u64 << (fd % 64);
-
-            let want_r = rfds_va != 0 && (rfds_k[word] & bit != 0);
-            let want_w = wfds_va != 0 && (wfds_k[word] & bit != 0);
-            let want_e = efds_va != 0 && (efds_k[word] & bit != 0);
-
-            if !want_r && !want_w && !want_e { continue; }
-
-            let mut events = 0u32;
-            if want_r { events |= POLLIN; }
-            if want_w { events |= POLLOUT; }
-            if want_e { events |= POLLIN | POLLOUT; }
-
-            let ready = fd_ready(fd, events);
-
-            if ready & (POLLIN | POLLRDNORM) != 0 && want_r {
-                out_r[word] |= bit;
-                total += 1;
+        for e in &entries {
+            let ready = e.src.poll(e.events);
+            let word  = e.fd / 64;
+            let bit   = 1u64 << (e.fd % 64);
+            if ready & (POLLIN | POLLRDNORM) != 0 && e.want_r {
+                out_r[word] |= bit; total += 1;
             }
-            if ready & (POLLOUT | POLLWRNORM) != 0 && want_w {
-                out_w[word] |= bit;
-                total += 1;
+            if ready & (POLLOUT | POLLWRNORM) != 0 && e.want_w {
+                out_w[word] |= bit; total += 1;
             }
-            if ready & (POLLERR | POLLHUP | POLLNVAL) != 0 && want_e {
-                out_e[word] |= bit;
-                total += 1;
+            if ready & (POLLERR | POLLHUP | POLLNVAL) != 0 && e.want_e {
+                out_e[word] |= bit; total += 1;
             }
         }
 
@@ -417,14 +467,23 @@ pub fn sys_pselect6(
             write_fdset(efds_va, &out_e);
             break total as isize;
         }
-        core::hint::spin_loop();
+
+        let sources: Vec<(Arc<dyn PollSource>, ReadyMask)> =
+            entries.iter().map(|e| (e.src.clone(), e.events)).collect();
+        let reason = wait_any(&sources, cancel_ref, Some(deadline_ns));
+        if reason == WakeReason::Cancelled {
+            write_fdset(rfds_va, &out_r);
+            write_fdset(wfds_va, &out_w);
+            write_fdset(efds_va, &out_e);
+            break -4; // EINTR
+        }
     };
 
     pselect_restore_sigmask(old_mask);
     ret
 }
 
-// ── sys_poll  [NR 7] ──────────────────────────────────────────────────────────
+// ── sys_poll  [NR 7] ────────────────────────────────────────────────────────────
 
 #[repr(C)]
 struct PollFd {
@@ -434,48 +493,72 @@ struct PollFd {
 }
 
 struct PollFdCopy {
-    fd:     i32,
-    events: i16,
+    idx:    usize,  // index into the user pollfd array (for revents write-back)
+    fd:     usize,
+    events: u32,
+    src:    Arc<dyn PollSource>,
 }
 
 pub fn sys_poll(fds_va: usize, nfds: usize, timeout_ms: i32) -> isize {
+    let deadline_ns = ms_to_deadline_ns(timeout_ms);
+    let zero_poll   = timeout_ms == 0;
+    let cancel      = current_cancel();
+    let cancel_ref  = cancel.as_deref();
+
+    // nfds == 0: pure timeout sleep — no spin loop.
     if nfds == 0 {
-        let deadline = ms_to_deadline_ns(timeout_ms);
-        while before_deadline(deadline) { core::hint::spin_loop(); }
+        if !zero_poll {
+            let wq     = WaitQueue::new();
+            let reason = wq.wait(0, cancel_ref, Some(deadline_ns));
+            if reason == WakeReason::Cancelled { return -4; }
+        }
         return 0;
     }
+
     if nfds > 1024 { return -22; }
     let struct_size = core::mem::size_of::<PollFd>();
     if !validate_user_ptr(fds_va, nfds * struct_size) { return -14; }
 
+    // Parse pollfd array and resolve PollSource for each fd once.
     let mut pfds: Vec<PollFdCopy> = Vec::with_capacity(nfds);
     for i in 0..nfds {
         let pfd_va = fds_va + i * struct_size;
         let mut raw = [0u8; 8];
         if copy_from_user(&mut raw, pfd_va).is_err() { return -14; }
-        pfds.push(PollFdCopy {
-            fd:     i32::from_le_bytes(raw[0..4].try_into().unwrap()),
-            events: i16::from_le_bytes(raw[4..6].try_into().unwrap()),
-        });
+        let fd_i    = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+        let events  = i16::from_le_bytes(raw[4..6].try_into().unwrap()) as u32;
+        if fd_i < 0 { continue; }
+        let fd = fd_i as usize;
+        if let Some(src) = fd_poll_source(fd) {
+            pfds.push(PollFdCopy { idx: i, fd, events, src });
+        } else {
+            // Unknown fd — write POLLNVAL immediately.
+            let rev = POLLNVAL as i16;
+            let va  = fds_va + i * struct_size + 6;
+            let _   = copy_to_user(va, &rev.to_le_bytes());
+        }
     }
-
-    let deadline_ns = ms_to_deadline_ns(timeout_ms);
-    let zero_poll   = timeout_ms == 0;
 
     loop {
         let mut total = 0i32;
-        for (i, pfc) in pfds.iter().enumerate() {
-            if pfc.fd < 0 { continue; }
-            let ready = fd_ready(pfc.fd as usize, pfc.events as u32);
-            let rev   = ready as i16;
-            let revents_va = fds_va + i * struct_size + 6;
-            if copy_to_user(revents_va, &rev.to_le_bytes()).is_err() { return -14; }
+        for pfc in &pfds {
+            let ready  = pfc.src.poll(pfc.events);
+            let rev    = ready as i16;
+            let rev_va = fds_va + pfc.idx * struct_size + 6;
+            if copy_to_user(rev_va, &rev.to_le_bytes()).is_err() { return -14; }
             if rev != 0 { total += 1; }
         }
+
         if total > 0 || zero_poll || !before_deadline(deadline_ns) {
             return total as isize;
         }
-        core::hint::spin_loop();
+
+        // ONE scheduler sleep for all fds.
+        let sources: Vec<(Arc<dyn PollSource>, ReadyMask)> =
+            pfds.iter().map(|p| (p.src.clone(), p.events)).collect();
+        let reason = wait_any(&sources, cancel_ref, Some(deadline_ns));
+        if reason == WakeReason::Cancelled { return -4; } // EINTR
+        // WakeReason::Timeout -> re-enter loop, deadline check will exit.
     }
 }
 
@@ -499,7 +582,7 @@ pub fn sys_ppoll(
     sys_poll(fds_va, nfds, timeout_ms)
 }
 
-// ── epoll ─────────────────────────────────────────────────────────────────────
+// ── epoll ────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct EpollEntry {
@@ -578,9 +661,9 @@ pub fn sys_epoll_ctl(epfd: usize, op: i32, target_fd: i32, event_va: usize) -> i
 
 /// sys_epoll_wait  [NR 232]
 ///
-/// FIX 1: re-reads the interest list from EPOLL_TABLE on every scan so
-///         concurrent EPOLL_CTL_MOD/DEL are immediately visible.
-/// FIX 2: disarms EPOLLONESHOT entries after they fire.
+/// Re-reads interest list from EPOLL_TABLE on each wakeup so concurrent
+/// EPOLL_CTL_MOD/DEL are immediately visible.
+/// EPOLLONESHOT entries are disarmed after they fire.
 pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms: i32) -> isize {
     let idx = match epoll_idx(epfd) { Some(i) => i, None => return -9 };
     if maxevents <= 0 { return -22; }
@@ -588,48 +671,51 @@ pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms:
 
     let deadline_ns = ms_to_deadline_ns(timeout_ms);
     let zero_poll   = timeout_ms == 0;
+    let cancel      = current_cancel();
+    let cancel_ref  = cancel.as_deref();
 
     loop {
-        let mut found = 0i32;
+        let mut found        = 0i32;
         let mut oneshot_fds: Vec<i32> = Vec::new();
+        let mut sources:     Vec<(Arc<dyn PollSource>, ReadyMask)> = Vec::new();
 
         {
-            // Re-read live interest list each iteration (fixes stale snapshot).
+            // Re-read live interest list each iteration.
             let tbl = EPOLL_TABLE.lock();
-            let ep = match tbl[idx].as_ref() {
-                Some(ep) => ep,
-                None     => return -9,
-            };
+            let ep  = match tbl[idx].as_ref() { Some(e) => e, None => return -9 };
 
             for entry in &ep.entries {
                 if found >= maxevents { break; }
-                // Strip EPOLLONESHOT bookkeeping bit before checking readiness.
                 let armed = entry.events & !EPOLLONESHOT;
-                if armed == 0 { continue; } // disarmed one-shot — skip
-                let ready = fd_ready(entry.fd as usize, armed);
-                if ready == 0 { continue; }
+                if armed == 0 { continue; } // disarmed one-shot
 
-                let mut rec = [0u8; 12];
-                rec[0..4].copy_from_slice(&ready.to_le_bytes());
-                rec[4..12].copy_from_slice(&entry.data.to_le_bytes());
-                let out_va = events_va + found as usize * 12;
-                if copy_to_user(out_va, &rec).is_err() { return -14; }
-                found += 1;
+                // Collect PollSource for sleep even if not currently ready.
+                if let Some(src) = fd_poll_source(entry.fd as usize) {
+                    sources.push((src.clone(), armed));
+                    let ready = src.poll(armed);
+                    if ready == 0 { continue; }
 
-                if entry.events & EPOLLONESHOT != 0 {
-                    oneshot_fds.push(entry.fd);
+                    let mut rec = [0u8; 12];
+                    rec[0..4].copy_from_slice(&ready.to_le_bytes());
+                    rec[4..12].copy_from_slice(&entry.data.to_le_bytes());
+                    let out_va = events_va + found as usize * 12;
+                    if copy_to_user(out_va, &rec).is_err() { return -14; }
+                    found += 1;
+
+                    if entry.events & EPOLLONESHOT != 0 {
+                        oneshot_fds.push(entry.fd);
+                    }
                 }
             }
-        } // table lock released
+        } // EPOLL_TABLE lock released
 
-        // Disarm fired one-shot entries: zero interest bits, keep EPOLLONESHOT
-        // marker so the entry is not confused with a deleted one.
+        // Disarm fired one-shot entries.
         if !oneshot_fds.is_empty() {
             let mut tbl = EPOLL_TABLE.lock();
             if let Some(ep) = tbl[idx].as_mut() {
                 for fd in &oneshot_fds {
                     if let Some(e) = ep.entries.iter_mut().find(|e| e.fd == *fd) {
-                        e.events = EPOLLONESHOT; // silent until EPOLL_CTL_MOD re-arms
+                        e.events = EPOLLONESHOT;
                     }
                 }
             }
@@ -638,7 +724,10 @@ pub fn sys_epoll_wait(epfd: usize, events_va: usize, maxevents: i32, timeout_ms:
         if found > 0 || zero_poll || !before_deadline(deadline_ns) {
             return found as isize;
         }
-        core::hint::spin_loop();
+
+        // ONE scheduler sleep across all watched fds.
+        let reason = wait_any(&sources, cancel_ref, Some(deadline_ns));
+        if reason == WakeReason::Cancelled { return -4; } // EINTR
     }
 }
 
