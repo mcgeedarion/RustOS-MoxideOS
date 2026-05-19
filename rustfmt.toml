@@ -1,0 +1,26 @@
+# rustfmt configuration for RustOS
+# Apply with: cargo fmt
+# Check only:  cargo fmt --check
+
+edition       = "2021"
+max_width     = 100
+tab_spaces    = 4
+hard_tabs     = false
+
+# Imports
+imports_granularity = "Crate"
+group_imports       = "StdExternalCrate"
+
+# Trailing commas in multi-line constructs
+trailing_comma          = "Vertical"
+trailing_semicolon      = true
+
+# Comments
+wrap_comments     = false
+format_code_in_doc_comments = false
+
+# Match blocks
+match_block_trailing_comma = true
+
+# Function calls / args
+fn_call_width = 80

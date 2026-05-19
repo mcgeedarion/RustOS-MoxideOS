@@ -4,6 +4,30 @@
 #![feature(alloc_error_handler)]
 #![feature(naked_functions)]
 #![feature(asm_const)]
+// ── Clippy complexity gates ──────────────────────────────────────────────────
+//
+// These lints are intentionally set at the crate root so they apply
+// globally.  They will surface the known high-complexity functions
+// (dispatch_with_rip, sys_ptrace_impl, sys_clone3, bpf_run) during
+// normal `cargo clippy` runs, making complexity regressions visible
+// in CI before they are merged.
+//
+// Rationale per lint:
+//   cognitive_complexity  — catches functions with deeply nested
+//                           conditionals / match arms (the primary issue
+//                           in the syscall dispatcher).
+//   too_many_arguments    — flags functions with more than 7 parameters;
+//                           dispatch_with_rip (8 params) is the first
+//                           violation.
+//   match_same_arms       — warns when two match arms have identical
+//                           bodies (NR 118 / NR 119 duplication).
+//   large_enum_variant    — prevents accidentally large enum variants
+//                           from inflating stack usage in the hot dispatch
+//                           path.
+#![deny(clippy::cognitive_complexity)]
+#![deny(clippy::too_many_arguments)]
+#![warn(clippy::match_same_arms)]
+#![warn(clippy::large_enum_variant)]
 
 extern crate alloc;
 
