@@ -5,15 +5,23 @@
  *   1. wl_display socket at /run/wayland-0  (AF_UNIX stream)
  *   2. Wayland wire protocol: fixed 8-byte header + typed payload
  *   3. Core globals: wl_compositor, wl_shm, wl_seat, wl_output,
- *                    xdg_wm_base
+ *                    xdg_wm_base, wl_subcompositor, zwlr_layer_shell_v1
  *   4. wl_shm buffer sharing (SCM_RIGHTS fd → mmap pool → wl_buffer)
  *   5. xdg_shell: xdg_wm_base / xdg_surface / xdg_toplevel
  *      — full configure/ack_configure handshake
  *      — xdg_wm_base.ping → pong keepalive
  *   6. wl_keyboard.keymap — minimal XKB keymap in a memfd, delivered
  *      via SCM_RIGHTS so GTK/Qt/SDL2 do not stall on keyboard init
- *   7. Scanout: composite all surfaces (Z-order) into DRM back buffer,
- *      then page-flip; wl_surface.enter sent on first commit
+ *   7. Damage-region partial scanout: only dirty rectangles are repainted
+ *      into the DRM back buffer before page-flip.
+ *   8. wl_subsurface — sub-surface positioning, sync/desync, Z-order
+ *      (place_above / place_below relative to parent).
+ *   9. zwlr_layer_shell_v1 — BACKGROUND / BOTTOM / TOP / OVERLAY layers
+ *      with anchor bitfield, exclusive-zone, margin; surfaces are
+ *      composited in layer order below and above regular windows.
+ *  10. Server-side decorations (SSD) — title-bar + border painted
+ *      directly into the DRM back buffer for xdg_toplevel windows that
+ *      have not opted into client-side decorations.
  *
  * Build:
  *   musl-gcc -static -O2 -D_GNU_SOURCE -fstack-protector-strong \
@@ -46,6 +54,8 @@
 /* ── Limits ────────────────────────────────────────────────────────────── */
 #define MAX_CLIENTS         64
 #define MAX_SURFACES        32
+#define MAX_SUBSURFACES     32
+#define MAX_LAYER_SURFACES  32
 #define MAX_XDG_SURFACES    32
 #define MAX_XDG_TOPLEVELS   32
 #define MAX_BUFFERS         64
@@ -53,6 +63,13 @@
 #define MAX_DAMAGE_RECTS    32
 #define RX_BUF_SIZE         (64 * 1024)
 #define WAYLAND_SOCKET_PATH "/run/wayland-0"
+
+/* SSD geometry */
+#define SSD_TITLEBAR_H      24
+#define SSD_BORDER_W        2
+#define SSD_TITLEBAR_COLOR  0xFF404040u  /* dark grey, ARGB */
+#define SSD_BORDER_COLOR    0xFF606060u
+#define SSD_FOCUSED_COLOR   0xFF2255AAu  /* blue titlebar when focused */
 
 /* ── DRM globals ───────────────────────────────────────────────────────── */
 static int      drm_fd          = -1;
@@ -75,12 +92,46 @@ typedef struct {
 static DrmBuf fb[2];
 static int    back_idx = 1;
 
-/* ── Keymap ────────────────────────────────────────────────────────────── */
 /*
- * Minimal XKB keymap for pc105 / us layout.  All major toolkits (GTK,
- * Qt, SDL2) require a valid keymap before they process keyboard input.
- * We provide the smallest well-formed XKB string that xkbcommon accepts.
+ * Damage accumulator for the back buffer.
+ * Each rect: [x, y, w, h] in screen-space pixels.
+ * full_damage=1 means skip rect tracking and repaint everything.
  */
+#define MAX_SCREEN_DAMAGE 64
+typedef struct { int32_t x, y, w, h; } Rect;
+static Rect   screen_damage[MAX_SCREEN_DAMAGE];
+static int    n_screen_damage = 0;
+static int    full_damage     = 1;   /* start with full repaint */
+
+static inline void damage_add(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (full_damage) return;
+    /* clamp to screen */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int32_t)screen_width)  w = (int32_t)screen_width  - x;
+    if (y + h > (int32_t)screen_height) h = (int32_t)screen_height - y;
+    if (w <= 0 || h <= 0) return;
+    if (n_screen_damage >= MAX_SCREEN_DAMAGE) { full_damage = 1; return; }
+    screen_damage[n_screen_damage++] = (Rect){x, y, w, h};
+}
+
+static inline void damage_clear(void) {
+    n_screen_damage = 0;
+    full_damage     = 0;
+}
+
+/*
+ * rect_intersects — true if the blit area [bx,by,bw,bh] overlaps
+ * damage rect d.  Used for partial-repaint culling.
+ */
+static inline int rect_intersects(const Rect *d,
+                                   int32_t bx, int32_t by,
+                                   int32_t bw, int32_t bh) {
+    return !(bx >= d->x + d->w || bx + bw <= d->x ||
+             by >= d->y + d->h || by + bh <= d->y);
+}
+
+/* ── Keymap ────────────────────────────────────────────────────────────── */
 static const char KEYMAP_STRING[] =
     "xkb_keymap {\n"
     "  xkb_keycodes  \"evdev+aliases(qwerty)\" {};\n"
@@ -90,17 +141,11 @@ static const char KEYMAP_STRING[] =
     "  xkb_geometry  \"pc(pc105)\" {};\n"
     "};\n";
 
-/*
- * keymap_create_memfd — write KEYMAP_STRING into a memfd and return the fd.
- * The fd is sealed read-only so clients cannot modify the mapping.
- * Returns -1 on failure (compositor proceeds without keymap delivery).
- */
 static int keymap_create_memfd(void) {
-    int fd = (int)syscall(SYS_memfd_create, "xkb-keymap", 1u /* MFD_CLOEXEC */);
+    int fd = (int)syscall(SYS_memfd_create, "xkb-keymap", 1u);
     if (fd < 0) return -1;
-    size_t len = sizeof(KEYMAP_STRING); /* includes NUL — Wayland keymap size must include it */
+    size_t len = sizeof(KEYMAP_STRING);
     if (write(fd, KEYMAP_STRING, len) != (ssize_t)len) { close(fd); return -1; }
-    /* Seal: no further writes.  F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE = 7 */
     fcntl(fd, 1033 /* F_ADD_SEALS */, 7);
     return fd;
 }
@@ -108,7 +153,7 @@ static int keymap_create_memfd(void) {
 /* ── Object tables ─────────────────────────────────────────────────────── */
 
 typedef struct {
-    uint32_t id;        /* 0 = slot free */
+    uint32_t id;
     int      shm_fd;
     void    *shm_map;
     int32_t  offset;
@@ -119,7 +164,7 @@ typedef struct {
 } WlBuffer;
 
 typedef struct {
-    uint32_t id;        /* 0 = slot free */
+    uint32_t id;
     int      shm_fd;
     void    *map;
     int32_t  size;
@@ -128,37 +173,65 @@ typedef struct {
 typedef struct {
     uint32_t  id;                    /* wl_surface id, 0 = free */
     uint32_t  attached_buffer_id;
-    int32_t   x, y;
+    int32_t   x, y;                  /* screen position (root surfaces) */
     int32_t   blit_w, blit_h;
-    uint32_t  damage[MAX_DAMAGE_RECTS][4];
+    uint32_t  damage[MAX_DAMAGE_RECTS][4]; /* pending surface-space damage */
     int       n_damage;
     uint32_t  frame_cb_id;
     int       committed;
-    int       enter_sent;            /* wl_surface.enter delivered */
+    int       enter_sent;
+    /* subsurface link: 0 if this is a root surface */
+    uint32_t  parent_surface_id;
 } Surface;
 
 /*
- * XdgSurface — wraps a wl_surface with an xdg_surface role.
- * Tracks whether ack_configure has been received.
+ * Subsurface — a wl_subsurface object binding a child surface to a parent.
+ * Position is relative to the parent's top-left corner.
+ * sync=1 means pending state is committed together with the parent;
+ * sync=0 (desync) means commits take effect immediately.
  */
 typedef struct {
-    uint32_t id;           /* xdg_surface object id, 0 = free */
-    uint32_t wl_surface_id;
-    uint32_t pending_configure_serial;
-    int      configured;   /* ack_configure received */
-} XdgSurface;
+    uint32_t id;               /* wl_subsurface object id, 0 = free */
+    uint32_t surface_id;       /* child wl_surface */
+    uint32_t parent_id;        /* parent wl_surface */
+    int32_t  rel_x, rel_y;     /* position relative to parent */
+    int      sync;             /* 1 = sync, 0 = desync */
+    int      above;            /* 1 = above parent in Z; 0 = below */
+} Subsurface;
 
 /*
- * XdgToplevel — the window role assigned to an xdg_surface.
+ * LayerSurface — zwlr_layer_surface_v1 binding a wl_surface to a layer.
  */
 typedef struct {
-    uint32_t id;               /* xdg_toplevel object id, 0 = free */
+    uint32_t id;               /* zwlr_layer_surface_v1 object id */
+    uint32_t surface_id;       /* associated wl_surface */
+    uint32_t layer;            /* ZWL_LAYER_* */
+    uint32_t anchor;           /* ZWL_ANCHOR_* bitfield */
+    int32_t  exclusive_zone;   /* pixels to reserve from screen edge */
+    int32_t  margin_top, margin_right, margin_bottom, margin_left;
+    int32_t  req_width, req_height;  /* 0 = stretch to anchored edges */
+    /* computed geometry after layout */
+    int32_t  x, y, w, h;
+    uint32_t pending_serial;
+    int      configured;       /* ack_configure received */
+} LayerSurface;
+
+typedef struct {
+    uint32_t id;               /* xdg_surface object id */
+    uint32_t wl_surface_id;
+    uint32_t pending_configure_serial;
+    int      configured;
+} XdgSurface;
+
+typedef struct {
+    uint32_t id;
     uint32_t xdg_surface_id;
     char     title[128];
     char     app_id[128];
     int32_t  min_w, min_h;
     int32_t  max_w, max_h;
     int      closed;
+    int      has_csd;          /* client declared client-side decorations */
 } XdgToplevel;
 
 typedef struct {
@@ -174,23 +247,26 @@ typedef struct {
     /* Core object ids */
     uint32_t  registry_id;
     uint32_t  compositor_id;
+    uint32_t  subcompositor_id;
     uint32_t  shm_id;
     uint32_t  seat_id;
     uint32_t  pointer_id;
     uint32_t  keyboard_id;
     uint32_t  output_id;
     uint32_t  xdg_wm_base_id;
+    uint32_t  layer_shell_id;
 
-    /* Object tables */
-    WlPool       pools[MAX_POOLS];
-    WlBuffer     buffers[MAX_BUFFERS];
-    Surface      surfaces[MAX_SURFACES];
-    XdgSurface   xdg_surfaces[MAX_XDG_SURFACES];
-    XdgToplevel  xdg_toplevels[MAX_XDG_TOPLEVELS];
+    WlPool        pools[MAX_POOLS];
+    WlBuffer      buffers[MAX_BUFFERS];
+    Surface       surfaces[MAX_SURFACES];
+    Subsurface    subsurfaces[MAX_SUBSURFACES];
+    LayerSurface  layer_surfaces[MAX_LAYER_SURFACES];
+    XdgSurface    xdg_surfaces[MAX_XDG_SURFACES];
+    XdgToplevel   xdg_toplevels[MAX_XDG_TOPLEVELS];
 } Client;
 
 static Client clients[MAX_CLIENTS];
-static int    n_clients     = 0;
+static int    n_clients      = 0;
 static int    focused_client = -1;
 
 static uint32_t serial_counter = 1;
@@ -273,6 +349,53 @@ static void drm_flip(void) {
         back_idx ^= 1;
 }
 
+/* ── Layer layout ──────────────────────────────────────────────────────── */
+/*
+ * Compute the screen-space geometry for a layer surface from its anchor
+ * bitfield, requested size, exclusive-zone and margins.
+ * Results are written back into ls->x/y/w/h.
+ */
+static void layer_surface_layout(LayerSurface *ls) {
+    int32_t sw = (int32_t)screen_width;
+    int32_t sh = (int32_t)screen_height;
+    int32_t x = ls->margin_left;
+    int32_t y = ls->margin_top;
+    int32_t w = ls->req_width  ? ls->req_width  : sw - ls->margin_left - ls->margin_right;
+    int32_t h = ls->req_height ? ls->req_height : sh - ls->margin_top  - ls->margin_bottom;
+
+    uint32_t a = ls->anchor;
+    int anchored_h = (a & ZWL_ANCHOR_LEFT) && (a & ZWL_ANCHOR_RIGHT);
+    int anchored_v = (a & ZWL_ANCHOR_TOP)  && (a & ZWL_ANCHOR_BOTTOM);
+
+    if (anchored_h) w = sw - ls->margin_left - ls->margin_right;
+    if (anchored_v) h = sh - ls->margin_top  - ls->margin_bottom;
+
+    /* Single-edge anchors: pin to that edge */
+    if ((a & ZWL_ANCHOR_RIGHT) && !(a & ZWL_ANCHOR_LEFT))
+        x = sw - w - ls->margin_right;
+    if ((a & ZWL_ANCHOR_BOTTOM) && !(a & ZWL_ANCHOR_TOP))
+        y = sh - h - ls->margin_bottom;
+
+    ls->x = x; ls->y = y; ls->w = w; ls->h = h;
+}
+
+/*
+ * layer_surface_configure — send zwlr_layer_surface_v1.configure(serial, w, h)
+ */
+static void layer_surface_configure(Client *c, LayerSurface *ls) {
+    layer_surface_layout(ls);
+    uint8_t payload[12];
+    uint32_t serial = next_serial();
+    uint32_t w = (uint32_t)ls->w;
+    uint32_t h = (uint32_t)ls->h;
+    memcpy(payload,   &serial, 4);
+    memcpy(payload+4, &w,      4);
+    memcpy(payload+8, &h,      4);
+    ls->pending_serial = serial;
+    ls->configured     = 0;
+    wl_send(c->fd, ls->id, ZWL_LAYER_SURFACE_EVT_CONFIGURE, payload, 12);
+}
+
 /* ── Registry helpers ──────────────────────────────────────────────────── */
 
 static void registry_global_send(Client *c, uint32_t name,
@@ -288,11 +411,13 @@ static void registry_global_send(Client *c, uint32_t name,
 }
 
 static void send_registry_globals(Client *c) {
-    registry_global_send(c, WL_GLOBAL_NAME_COMPOSITOR,  "wl_compositor",  WL_COMPOSITOR_VERSION);
-    registry_global_send(c, WL_GLOBAL_NAME_SHM,         "wl_shm",         WL_SHM_VERSION);
-    registry_global_send(c, WL_GLOBAL_NAME_SEAT,        "wl_seat",        WL_SEAT_VERSION);
-    registry_global_send(c, WL_GLOBAL_NAME_OUTPUT,      "wl_output",      WL_OUTPUT_VERSION);
-    registry_global_send(c, WL_GLOBAL_NAME_XDG_WM_BASE, "xdg_wm_base",   XDG_WM_BASE_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_COMPOSITOR,    "wl_compositor",             WL_COMPOSITOR_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_SHM,           "wl_shm",                    WL_SHM_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_SEAT,          "wl_seat",                   WL_SEAT_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_OUTPUT,        "wl_output",                 WL_OUTPUT_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_XDG_WM_BASE,  "xdg_wm_base",               XDG_WM_BASE_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_SUBCOMPOSITOR, "wl_subcompositor",          WL_SUBCOMPOSITOR_VERSION);
+    registry_global_send(c, WL_GLOBAL_NAME_LAYER_SHELL,   "zwlr_layer_shell_v1",       ZWL_LAYER_SHELL_VERSION);
 }
 
 static void send_output_info(Client *c) {
@@ -326,30 +451,16 @@ static void send_output_info(Client *c) {
 
 /* ── xdg_shell helpers ─────────────────────────────────────────────────── */
 
-/*
- * send_xdg_configure — emit the full configure sequence that xdg-shell
- * requires before a client may commit its first buffer:
- *
- *   xdg_toplevel.configure(width=0, height=0, states=[])
- *     width/height = 0 means "compositor doesn't constrain; choose freely"
- *     states = empty wl_array (4-byte length field = 0)
- *
- *   xdg_surface.configure(serial)
- *     The client must ack this serial before committing.
- */
 static void send_xdg_configure(Client *c, XdgSurface *xs, XdgToplevel *xt) {
-    /* xdg_toplevel.configure(width, height, states: wl_array) */
     uint8_t tl_payload[16];
     int32_t  zero_dim   = 0;
-    uint32_t array_len  = 0;   /* empty states array */
-    memcpy(tl_payload,    &zero_dim,  4);  /* width  */
-    memcpy(tl_payload+4,  &zero_dim,  4);  /* height */
-    memcpy(tl_payload+8,  &array_len, 4);  /* wl_array.size */
-    /* wl_array also has a .alloc field on the wire — send 4 more zero bytes */
+    uint32_t array_len  = 0;
+    memcpy(tl_payload,    &zero_dim,  4);
+    memcpy(tl_payload+4,  &zero_dim,  4);
+    memcpy(tl_payload+8,  &array_len, 4);
     memcpy(tl_payload+12, &array_len, 4);
     wl_send(c->fd, xt->id, XDG_TOPLEVEL_EVT_CONFIGURE, tl_payload, 16);
 
-    /* xdg_surface.configure(serial) */
     uint32_t serial = next_serial();
     xs->pending_configure_serial = serial;
     xs->configured = 0;
@@ -358,17 +469,6 @@ static void send_xdg_configure(Client *c, XdgSurface *xs, XdgToplevel *xt) {
 
 /* ── Keymap delivery ───────────────────────────────────────────────────── */
 
-/*
- * send_keymap — deliver the XKB keymap to a freshly created wl_keyboard.
- *
- * Wire format for wl_keyboard.keymap:
- *   uint32 format   — WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 (1)
- *   fd              — sent as SCM_RIGHTS ancdata alongside the message
- *   uint32 size     — byte count INCLUDING the NUL terminator
- *
- * The fd is a memfd containing KEYMAP_STRING.  It is closed here after
- * sendmsg because the client receives its own dup via SCM_RIGHTS.
- */
 static void send_keymap(Client *c) {
     if (!c->keyboard_id) return;
     int kfd = keymap_create_memfd();
@@ -379,77 +479,319 @@ static void send_keymap(Client *c) {
     uint32_t size = (uint32_t)sizeof(KEYMAP_STRING);
     memcpy(payload,   &fmt,  4);
     memcpy(payload+4, &size, 4);
-    /* fd travels as SCM_RIGHTS; its slot in the wire payload is implicit
-     * (Wayland protocol encodes fd arguments as if they are in-band uint32,
-     * but they are always out-of-band via SCM_RIGHTS). */
     wl_send_with_fd(c->fd, c->keyboard_id,
                     WL_KEYBOARD_EVT_KEYMAP,
                     payload, 8, kfd);
     close(kfd);
 }
 
+/* ── SSD helpers ───────────────────────────────────────────────────────── */
+
+/*
+ * ssd_fill_rect — paint a solid color rectangle into the DRM back buffer.
+ * Clips to screen bounds automatically.
+ */
+static void ssd_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
+                           uint32_t color) {
+    if (!fb[back_idx].map) return;
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < 0) { rh += ry; ry = 0; }
+    if (rx + rw > (int32_t)screen_width)  rw = (int32_t)screen_width  - rx;
+    if (ry + rh > (int32_t)screen_height) rh = (int32_t)screen_height - ry;
+    if (rw <= 0 || rh <= 0) return;
+
+    uint32_t *dst = (uint32_t *)fb[back_idx].map;
+    for (int32_t row = 0; row < rh; row++) {
+        uint32_t *line = dst + (uint32_t)(ry + row) * (screen_stride / 4) + (uint32_t)rx;
+        for (int32_t col = 0; col < rw; col++)
+            line[col] = color;
+    }
+}
+
+/*
+ * ssd_draw_decorations — paint title bar + borders for an xdg_toplevel
+ * surface at (sx, sy) with content size (sw, sh).
+ * focused=1 uses the highlight title-bar colour.
+ */
+static void ssd_draw_decorations(int32_t sx, int32_t sy, int32_t sw, int32_t sh,
+                                  int focused) {
+    uint32_t tbar_col = focused ? SSD_FOCUSED_COLOR : SSD_TITLEBAR_COLOR;
+    int32_t  full_x   = sx - SSD_BORDER_W;
+    int32_t  full_y   = sy - SSD_TITLEBAR_H - SSD_BORDER_W;
+    int32_t  full_w   = sw + SSD_BORDER_W * 2;
+
+    /* Top border + title bar */
+    ssd_fill_rect(full_x, full_y, full_w, SSD_BORDER_W,    SSD_BORDER_COLOR);
+    ssd_fill_rect(full_x, full_y + SSD_BORDER_W, full_w,
+                  SSD_TITLEBAR_H, tbar_col);
+    /* Left border */
+    ssd_fill_rect(full_x, sy, SSD_BORDER_W, sh, SSD_BORDER_COLOR);
+    /* Right border */
+    ssd_fill_rect(sx + sw, sy, SSD_BORDER_W, sh, SSD_BORDER_COLOR);
+    /* Bottom border */
+    ssd_fill_rect(full_x, sy + sh, full_w, SSD_BORDER_W, SSD_BORDER_COLOR);
+}
+
+/* ── Blit helper ───────────────────────────────────────────────────────── */
+
+/*
+ * blit_buffer — copy pixels from a wl_buffer into the DRM back buffer
+ * at screen position (dx, dy).  Only rows/columns that intersect at
+ * least one of the active damage rectangles (or the entire screen when
+ * full_damage is set) are written.  Returns 1 if any pixels were copied.
+ */
+static int blit_buffer(const WlBuffer *wb, int32_t dx, int32_t dy) {
+    if (!fb[back_idx].map || !wb || !wb->shm_map) return 0;
+
+    const uint8_t *src_base = (const uint8_t *)wb->shm_map + wb->offset;
+    uint8_t       *dst_base = (uint8_t *)fb[back_idx].map;
+
+    int32_t bw = wb->width, bh = wb->height, bs = wb->stride;
+    int32_t src_col = 0, src_row = 0;
+    if (dx < 0) { src_col = -dx; dx = 0; }
+    if (dy < 0) { src_row = -dy; dy = 0; }
+    int32_t copy_w = bw - src_col;
+    int32_t copy_h = bh - src_row;
+    if (dx + copy_w > (int32_t)screen_width)  copy_w = (int32_t)screen_width  - dx;
+    if (dy + copy_h > (int32_t)screen_height) copy_h = (int32_t)screen_height - dy;
+    if (copy_w <= 0 || copy_h <= 0) return 0;
+
+    int copied = 0;
+    for (int32_t row = 0; row < copy_h; row++) {
+        int32_t screen_row = dy + row;
+        /* Row culling: skip if no damage rect covers this row */
+        if (!full_damage) {
+            int hit = 0;
+            for (int di = 0; di < n_screen_damage; di++) {
+                const Rect *d = &screen_damage[di];
+                if (screen_row >= d->y && screen_row < d->y + d->h &&
+                    rect_intersects(d, dx, dy, copy_w, copy_h)) {
+                    hit = 1; break;
+                }
+            }
+            if (!hit) continue;
+        }
+        const uint8_t *src = src_base + (src_row + row) * bs + src_col * 4;
+        uint8_t       *dst = dst_base
+            + (uint32_t)screen_row * screen_stride
+            + (uint32_t)dx * 4;
+        memcpy(dst, src, (size_t)copy_w * 4);
+        copied = 1;
+    }
+    return copied;
+}
+
+/* ── Surface lookup ────────────────────────────────────────────────────── */
+
+static Surface *find_surface(Client *c, uint32_t id) {
+    for (int i = 0; i < MAX_SURFACES; i++)
+        if (c->surfaces[i].id == id) return &c->surfaces[i];
+    return NULL;
+}
+
+static WlBuffer *find_buffer(Client *c, uint32_t id) {
+    for (int i = 0; i < MAX_BUFFERS; i++)
+        if (c->buffers[i].id == id) return &c->buffers[i];
+    return NULL;
+}
+
 /* ── Compositing ───────────────────────────────────────────────────────── */
 
 /*
- * composite_and_flip — clear the back buffer, blit all committed surfaces
- * in Z-order (insertion order = bottom to top), then page-flip.
+ * blit_surface_tree — blit a root surface and then all desync subsurfaces
+ * that are children of it (respecting above/below Z ordering).
+ * Returns the number of subsurfaces that have their own damage and were
+ * blitted; also merges their surface-space damage into the screen damage
+ * accumulator.
+ */
+static void blit_surface_tree(Client *c, Surface *s, int ci) {
+    WlBuffer *wb = find_buffer(c, s->attached_buffer_id);
+
+    /* Blit children that should appear BELOW the parent */
+    for (int si = 0; si < MAX_SUBSURFACES; si++) {
+        Subsurface *sub = &c->subsurfaces[si];
+        if (!sub->id || sub->parent_id != s->id || sub->above) continue;
+        Surface *csub = find_surface(c, sub->surface_id);
+        if (!csub || !csub->committed) continue;
+        int32_t abs_x = s->x + sub->rel_x;
+        int32_t abs_y = s->y + sub->rel_y;
+        WlBuffer *cwb = find_buffer(c, csub->attached_buffer_id);
+        if (cwb) {
+            for (int di = 0; di < csub->n_damage; di++)
+                damage_add(abs_x + (int32_t)csub->damage[di][0],
+                           abs_y + (int32_t)csub->damage[di][1],
+                           (int32_t)csub->damage[di][2],
+                           (int32_t)csub->damage[di][3]);
+            blit_buffer(cwb, abs_x, abs_y);
+            csub->n_damage = 0;
+        }
+    }
+
+    /* Blit parent surface */
+    if (wb) blit_buffer(wb, s->x, s->y);
+
+    /* Blit children that should appear ABOVE the parent */
+    for (int si = 0; si < MAX_SUBSURFACES; si++) {
+        Subsurface *sub = &c->subsurfaces[si];
+        if (!sub->id || sub->parent_id != s->id || !sub->above) continue;
+        Surface *csub = find_surface(c, sub->surface_id);
+        if (!csub || !csub->committed) continue;
+        int32_t abs_x = s->x + sub->rel_x;
+        int32_t abs_y = s->y + sub->rel_y;
+        WlBuffer *cwb = find_buffer(c, csub->attached_buffer_id);
+        if (cwb) {
+            for (int di = 0; di < csub->n_damage; di++)
+                damage_add(abs_x + (int32_t)csub->damage[di][0],
+                           abs_y + (int32_t)csub->damage[di][1],
+                           (int32_t)csub->damage[di][2],
+                           (int32_t)csub->damage[di][3]);
+            blit_buffer(cwb, abs_x, abs_y);
+            csub->n_damage = 0;
+        }
+    }
+
+    /* Send wl_buffer.release for the parent buffer */
+    if (wb)
+        wl_send(c->fd, wb->id, WL_BUFFER_EVT_RELEASE, NULL, 0);
+
+    /* Send wl_surface.enter on first commit */
+    if (!s->enter_sent && c->output_id) {
+        wl_send(c->fd, s->id, WL_SURFACE_EVT_ENTER, &c->output_id, 4);
+        s->enter_sent = 1;
+    }
+    s->n_damage = 0;
+    (void)ci;
+}
+
+/*
+ * composite_and_flip — damage-aware repaint.
+ *
+ * Pipeline:
+ *   1. Collect all pending surface damage into the screen damage accumulator.
+ *   2. If full_damage, clear the back buffer to black first.
+ *      Otherwise skip the clear — only damaged regions will be overwritten.
+ *   3. Paint layer surfaces in order: BACKGROUND → BOTTOM.
+ *   4. Paint regular xdg_toplevel surfaces (with SSD if applicable).
+ *   5. Paint layer surfaces: TOP → OVERLAY.
+ *   6. Page-flip.
+ *   7. Reset damage accumulator.
  */
 static void composite_and_flip(void) {
     if (!fb[back_idx].map) return;
 
-    /* Clear back buffer to black */
-    memset(fb[back_idx].map, 0, (size_t)fb[back_idx].size);
-
+    /* ── Step 1: collect surface damage into screen damage ── */
     for (int ci = 0; ci < n_clients; ci++) {
         Client *c = &clients[ci];
         if (!c->alive) continue;
         for (int si = 0; si < MAX_SURFACES; si++) {
             Surface *s = &c->surfaces[si];
-            if (!s->id || !s->committed) continue;
-
-            /* wl_surface.enter: tell client which output it is on */
-            if (!s->enter_sent && c->output_id) {
-                wl_send(c->fd, s->id, WL_SURFACE_EVT_ENTER,
-                        &c->output_id, 4);
-                s->enter_sent = 1;
-            }
-
-            /* Blit */
-            WlBuffer *wb = NULL;
-            for (int bi = 0; bi < MAX_BUFFERS; bi++) {
-                if (c->buffers[bi].id == s->attached_buffer_id) {
-                    wb = &c->buffers[bi]; break;
-                }
-            }
-            if (!wb || !wb->shm_map) continue;
-
-            const uint8_t *src_base = (const uint8_t *)wb->shm_map + wb->offset;
-            uint8_t       *dst_base = (uint8_t *)fb[back_idx].map;
-
-            int32_t bw = wb->width, bh = wb->height, bs = wb->stride;
-            int32_t dx = s->x, dy = s->y;
-            int32_t src_col = 0, src_row = 0;
-            if (dx < 0) { src_col = -dx; dx = 0; }
-            if (dy < 0) { src_row = -dy; dy = 0; }
-            int32_t copy_w = bw - src_col;
-            int32_t copy_h = bh - src_row;
-            if (dx + copy_w > (int32_t)screen_width)  copy_w = (int32_t)screen_width  - dx;
-            if (dy + copy_h > (int32_t)screen_height) copy_h = (int32_t)screen_height - dy;
-            if (copy_w <= 0 || copy_h <= 0) continue;
-
-            for (int32_t row = 0; row < copy_h; row++) {
-                const uint8_t *src = src_base + (src_row + row) * bs + src_col * 4;
-                uint8_t       *dst = dst_base
-                    + (uint32_t)(dy + row) * screen_stride
-                    + (uint32_t)dx * 4;
-                memcpy(dst, src, (size_t)copy_w * 4);
-            }
-
-            wl_send(c->fd, wb->id, WL_BUFFER_EVT_RELEASE, NULL, 0);
-            s->n_damage = 0;
+            if (!s->id || !s->committed || s->parent_surface_id) continue;
+            for (int di = 0; di < s->n_damage; di++)
+                damage_add(s->x + (int32_t)s->damage[di][0],
+                           s->y + (int32_t)s->damage[di][1],
+                           (int32_t)s->damage[di][2],
+                           (int32_t)s->damage[di][3]);
+        }
+        /* layer surfaces always mark their whole area dirty on commit */
+        for (int li = 0; li < MAX_LAYER_SURFACES; li++) {
+            LayerSurface *ls = &c->layer_surfaces[li];
+            if (!ls->id || !ls->configured) continue;
+            Surface *s = find_surface(c, ls->surface_id);
+            if (s && s->committed && s->n_damage)
+                damage_add(ls->x, ls->y, ls->w, ls->h);
         }
     }
+
+    if (n_screen_damage == 0 && !full_damage) return; /* nothing to do */
+
+    /* ── Step 2: clear only damaged regions (or full buffer) ── */
+    if (full_damage) {
+        memset(fb[back_idx].map, 0, (size_t)fb[back_idx].size);
+    } else {
+        uint8_t *base = (uint8_t *)fb[back_idx].map;
+        for (int di = 0; di < n_screen_damage; di++) {
+            const Rect *d = &screen_damage[di];
+            for (int32_t row = 0; row < d->h; row++) {
+                uint8_t *line = base
+                    + (uint32_t)(d->y + row) * screen_stride
+                    + (uint32_t)d->x * 4;
+                memset(line, 0, (size_t)d->w * 4);
+            }
+        }
+    }
+
+    /* ── Macro: blit a layer at the given ZWL_LAYER_* enum value ── */
+#define BLIT_LAYER(layer_enum) \
+    for (int ci = 0; ci < n_clients; ci++) { \
+        Client *c = &clients[ci]; \
+        if (!c->alive) continue; \
+        for (int li = 0; li < MAX_LAYER_SURFACES; li++) { \
+            LayerSurface *ls = &c->layer_surfaces[li]; \
+            if (!ls->id || ls->layer != (layer_enum) || !ls->configured) continue; \
+            Surface *s = find_surface(c, ls->surface_id); \
+            if (!s || !s->committed) continue; \
+            s->x = ls->x; s->y = ls->y; \
+            blit_surface_tree(c, s, ci); \
+        } \
+    }
+
+    /* ── Steps 3-5: paint in Z order ── */
+    BLIT_LAYER(ZWL_LAYER_BACKGROUND)
+    BLIT_LAYER(ZWL_LAYER_BOTTOM)
+
+    /* Regular xdg_toplevel surfaces */
+    for (int ci = 0; ci < n_clients; ci++) {
+        Client *c = &clients[ci];
+        if (!c->alive) continue;
+        for (int si = 0; si < MAX_SURFACES; si++) {
+            Surface *s = &c->surfaces[si];
+            if (!s->id || !s->committed || s->parent_surface_id) continue;
+            /* Skip surfaces owned by a layer shell */
+            int is_layer = 0;
+            for (int li = 0; li < MAX_LAYER_SURFACES; li++)
+                if (c->layer_surfaces[li].id &&
+                    c->layer_surfaces[li].surface_id == s->id) { is_layer = 1; break; }
+            if (is_layer) continue;
+
+            /* Identify the xdg_toplevel for SSD */
+            XdgToplevel *xt = NULL;
+            for (int xi = 0; xi < MAX_XDG_SURFACES; xi++) {
+                XdgSurface *xs = &c->xdg_surfaces[xi];
+                if (!xs->id || xs->wl_surface_id != s->id) continue;
+                for (int ti = 0; ti < MAX_XDG_TOPLEVELS; ti++) {
+                    if (c->xdg_toplevels[ti].xdg_surface_id == xs->id) {
+                        xt = &c->xdg_toplevels[ti]; break;
+                    }
+                }
+            }
+
+            WlBuffer *wb = find_buffer(c, s->attached_buffer_id);
+            if (xt && !xt->has_csd) {
+                /* Draw SSD — must happen before blitting client content
+                 * so the titlebar doesn't overdraw the client pixels. */
+                int is_focused = (focused_client == ci);
+                int32_t cw = wb ? wb->width  : 0;
+                int32_t ch = wb ? wb->height : 0;
+                /* Mark SSD area dirty */
+                damage_add(s->x - SSD_BORDER_W,
+                           s->y - SSD_TITLEBAR_H - SSD_BORDER_W,
+                           cw + SSD_BORDER_W * 2,
+                           ch + SSD_TITLEBAR_H + SSD_BORDER_W * 2);
+                ssd_draw_decorations(s->x, s->y, cw, ch, is_focused);
+            }
+            blit_surface_tree(c, s, ci);
+        }
+    }
+
+    BLIT_LAYER(ZWL_LAYER_TOP)
+    BLIT_LAYER(ZWL_LAYER_OVERLAY)
+#undef BLIT_LAYER
+
+    /* ── Step 6: flip ── */
     drm_flip();
+
+    /* ── Step 7: reset damage ── */
+    damage_clear();
 }
 
 /* ── Message dispatcher ─────────────────────────────────────────────────── */
@@ -478,11 +820,12 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             uint32_t name    = wl_read_u32(data, 0);
             uint32_t ilen    = wl_read_u32(data, 4);
             uint32_t ipadded = (ilen + 3u) & ~3u;
-            /* version is at offset 4+4+ipadded; new_id follows */
             uint32_t new_id  = wl_read_u32(data, 4 + 4 + ipadded + 4);
 
             if (name == WL_GLOBAL_NAME_COMPOSITOR) {
                 c->compositor_id = new_id;
+            } else if (name == WL_GLOBAL_NAME_SUBCOMPOSITOR) {
+                c->subcompositor_id = new_id;
             } else if (name == WL_GLOBAL_NAME_SHM) {
                 c->shm_id = new_id;
                 uint32_t fmt;
@@ -502,6 +845,8 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
                 send_output_info(c);
             } else if (name == WL_GLOBAL_NAME_XDG_WM_BASE) {
                 c->xdg_wm_base_id = new_id;
+            } else if (name == WL_GLOBAL_NAME_LAYER_SHELL) {
+                c->layer_shell_id = new_id;
             }
         }
         return;
@@ -522,29 +867,28 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         return;
     }
 
-    /* ── wl_shm ──────────────────────────────────────────────────────── */
-    if (obj == c->shm_id) {
-        if (op == WL_SHM_REQ_CREATE_POOL) {
-            uint32_t pool_id  = wl_read_u32(data, 0);
-            int32_t  shm_size = wl_read_i32(data, 4);
-            int shm_fd = -1;
-            if (c->n_pending_fds > 0) {
-                shm_fd = c->pending_fds[0];
-                memmove(c->pending_fds, c->pending_fds + 1,
-                        (size_t)(c->n_pending_fds - 1) * sizeof(int));
-                c->n_pending_fds--;
-            }
-            for (int i = 0; i < MAX_POOLS; i++) {
-                if (c->pools[i].id == 0) {
-                    c->pools[i].id     = pool_id;
-                    c->pools[i].shm_fd = shm_fd;
-                    c->pools[i].size   = shm_size;
-                    if (shm_fd >= 0 && shm_size > 0) {
-                        c->pools[i].map = mmap(NULL, (size_t)shm_size,
-                                               PROT_READ, MAP_SHARED, shm_fd, 0);
-                        if (c->pools[i].map == MAP_FAILED)
-                            c->pools[i].map = NULL;
-                    }
+    /* ── wl_subcompositor ────────────────────────────────────────────── */
+    if (obj == c->subcompositor_id) {
+        if (op == WL_SUBCOMPOSITOR_REQ_GET_SUBSURFACE) {
+            /*
+             * get_subsurface(id: new_id, surface: wl_surface,
+             *                parent: wl_surface)
+             */
+            uint32_t new_id    = wl_read_u32(data, 0);
+            uint32_t surf_id   = wl_read_u32(data, 4);
+            uint32_t parent_id = wl_read_u32(data, 8);
+            for (int i = 0; i < MAX_SUBSURFACES; i++) {
+                if (c->subsurfaces[i].id == 0) {
+                    c->subsurfaces[i].id        = new_id;
+                    c->subsurfaces[i].surface_id = surf_id;
+                    c->subsurfaces[i].parent_id  = parent_id;
+                    c->subsurfaces[i].rel_x      = 0;
+                    c->subsurfaces[i].rel_y      = 0;
+                    c->subsurfaces[i].sync        = 1; /* default: sync */
+                    c->subsurfaces[i].above       = 1; /* default: above parent */
+                    /* Mark the child surface as owned by a parent */
+                    Surface *cs = find_surface(c, surf_id);
+                    if (cs) cs->parent_surface_id = parent_id;
                     break;
                 }
             }
@@ -552,462 +896,111 @@ static void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         return;
     }
 
-    /* ── wl_seat sub-objects ─────────────────────────────────────────── */
-    if (obj == c->seat_id) {
-        if (op == WL_SEAT_REQ_GET_POINTER) {
-            c->pointer_id = wl_read_u32(data, 0);
-        } else if (op == WL_SEAT_REQ_GET_KEYBOARD) {
-            c->keyboard_id = wl_read_u32(data, 0);
-            send_keymap(c);
+    /* ── wl_subsurface ───────────────────────────────────────────────── */
+    for (int si = 0; si < MAX_SUBSURFACES; si++) {
+        Subsurface *sub = &c->subsurfaces[si];
+        if (sub->id != obj) continue;
+        switch (op) {
+        case WL_SUBSURFACE_REQ_DESTROY:
+            /* Unlink the child surface from its parent */
+            {
+                Surface *cs = find_surface(c, sub->surface_id);
+                if (cs) cs->parent_surface_id = 0;
+            }
+            sub->id = 0;
+            break;
+        case WL_SUBSURFACE_REQ_SET_POSITION:
+            sub->rel_x = wl_read_i32(data, 0);
+            sub->rel_y = wl_read_i32(data, 4);
+            /* Mark the parent surface damaged so the subsurface moves */
+            {
+                Surface *ps = find_surface(c, sub->parent_id);
+                if (ps) full_damage = 1;
+            }
+            break;
+        case WL_SUBSURFACE_REQ_PLACE_ABOVE:
+            /*
+             * place_above(sibling: wl_surface)
+             * For MVP: if the sibling IS the parent, treat as above=1.
+             * A full implementation would maintain an ordered Z-list.
+             */
+            sub->above = 1;
+            break;
+        case WL_SUBSURFACE_REQ_PLACE_BELOW:
+            sub->above = 0;
+            break;
+        case WL_SUBSURFACE_REQ_SET_SYNC:
+            sub->sync = 1;
+            break;
+        case WL_SUBSURFACE_REQ_SET_DESYNC:
+            sub->sync = 0;
+            break;
         }
         return;
     }
 
-    /* ── xdg_wm_base ─────────────────────────────────────────────────── */
-    if (obj == c->xdg_wm_base_id) {
-        if (op == XDG_WM_BASE_REQ_GET_XDG_SURFACE) {
-            /* get_xdg_surface(id: new_id, surface: wl_surface) */
+    /* ── zwlr_layer_shell_v1 ─────────────────────────────────────────── */
+    if (obj == c->layer_shell_id) {
+        if (op == ZWL_LAYER_SHELL_REQ_GET_LAYER_SURFACE) {
+            /*
+             * get_layer_surface(id: new_id, surface: wl_surface,
+             *                   output: wl_output | 0,
+             *                   layer: uint32, namespace: string)
+             */
             uint32_t new_id  = wl_read_u32(data, 0);
             uint32_t surf_id = wl_read_u32(data, 4);
-            for (int i = 0; i < MAX_XDG_SURFACES; i++) {
-                if (c->xdg_surfaces[i].id == 0) {
-                    memset(&c->xdg_surfaces[i], 0, sizeof(c->xdg_surfaces[i]));
-                    c->xdg_surfaces[i].id           = new_id;
-                    c->xdg_surfaces[i].wl_surface_id = surf_id;
+            /* output (4 bytes) — ignored: we have only one output */
+            uint32_t layer   = wl_read_u32(data, 12);
+            /* namespace string follows at offset 16 — not stored */
+            for (int li = 0; li < MAX_LAYER_SURFACES; li++) {
+                if (c->layer_surfaces[li].id == 0) {
+                    LayerSurface *ls = &c->layer_surfaces[li];
+                    memset(ls, 0, sizeof(*ls));
+                    ls->id         = new_id;
+                    ls->surface_id = surf_id;
+                    ls->layer      = layer < 4u ? layer : ZWL_LAYER_TOP;
+                    /* Send initial configure so the client knows the size */
+                    layer_surface_configure(c, ls);
                     break;
                 }
             }
-        } else if (op == XDG_WM_BASE_REQ_PONG) {
-            /* pong(serial) — keepalive reply, nothing to do */
-            (void)wl_read_u32(data, 0);
-        } else if (op == XDG_WM_BASE_REQ_DESTROY) {
-            c->xdg_wm_base_id = 0;
         }
         return;
     }
 
-    /* ── xdg_surface ─────────────────────────────────────────────────── */
-    for (int xi = 0; xi < MAX_XDG_SURFACES; xi++) {
-        XdgSurface *xs = &c->xdg_surfaces[xi];
-        if (xs->id != obj) continue;
-
-        if (op == XDG_SURFACE_REQ_GET_TOPLEVEL) {
-            uint32_t new_id = wl_read_u32(data, 0);
-            for (int ti = 0; ti < MAX_XDG_TOPLEVELS; ti++) {
-                if (c->xdg_toplevels[ti].id == 0) {
-                    memset(&c->xdg_toplevels[ti], 0,
-                           sizeof(c->xdg_toplevels[ti]));
-                    c->xdg_toplevels[ti].id             = new_id;
-                    c->xdg_toplevels[ti].xdg_surface_id = xs->id;
-                    /* Send initial configure immediately */
-                    send_xdg_configure(c, xs, &c->xdg_toplevels[ti]);
-                    break;
-                }
-            }
-        } else if (op == XDG_SURFACE_REQ_ACK_CONFIGURE) {
-            uint32_t serial = wl_read_u32(data, 0);
-            if (serial == xs->pending_configure_serial)
-                xs->configured = 1;
-        } else if (op == XDG_SURFACE_REQ_SET_WINDOW_GEOMETRY) {
-            /* x, y, width, height — noted but not enforced at MVP level */
-        } else if (op == XDG_SURFACE_REQ_DESTROY) {
-            xs->id = 0;
-        }
-        return;
-    }
-
-    /* ── xdg_toplevel ────────────────────────────────────────────────── */
-    for (int ti = 0; ti < MAX_XDG_TOPLEVELS; ti++) {
-        XdgToplevel *xt = &c->xdg_toplevels[ti];
-        if (xt->id != obj) continue;
-
+    /* ── zwlr_layer_surface_v1 ───────────────────────────────────────── */
+    for (int li = 0; li < MAX_LAYER_SURFACES; li++) {
+        LayerSurface *ls = &c->layer_surfaces[li];
+        if (ls->id != obj) continue;
         switch (op) {
-        case XDG_TOPLEVEL_REQ_DESTROY:
-            xt->id = 0;
+        case ZWL_LAYER_SURFACE_REQ_SET_SIZE:
+            ls->req_width  = wl_read_i32(data, 0);
+            ls->req_height = wl_read_i32(data, 4);
             break;
-        case XDG_TOPLEVEL_REQ_SET_TITLE: {
-            uint32_t slen = wl_read_u32(data, 0);
-            if (slen > 127) slen = 127;
-            memcpy(xt->title, data + 4, slen);
-            xt->title[slen] = '\0';
+        case ZWL_LAYER_SURFACE_REQ_SET_ANCHOR:
+            ls->anchor = wl_read_u32(data, 0);
             break;
-        }
-        case XDG_TOPLEVEL_REQ_SET_APP_ID: {
-            uint32_t slen = wl_read_u32(data, 0);
-            if (slen > 127) slen = 127;
-            memcpy(xt->app_id, data + 4, slen);
-            xt->app_id[slen] = '\0';
+        case ZWL_LAYER_SURFACE_REQ_SET_EXCLUSIVE_ZONE:
+            ls->exclusive_zone = wl_read_i32(data, 0);
             break;
-        }
-        case XDG_TOPLEVEL_REQ_SET_MIN_SIZE:
-            xt->min_w = wl_read_i32(data, 0);
-            xt->min_h = wl_read_i32(data, 4);
+        case ZWL_LAYER_SURFACE_REQ_SET_MARGIN:
+            ls->margin_top    = wl_read_i32(data,  0);
+            ls->margin_right  = wl_read_i32(data,  4);
+            ls->margin_bottom = wl_read_i32(data,  8);
+            ls->margin_left   = wl_read_i32(data, 12);
             break;
-        case XDG_TOPLEVEL_REQ_SET_MAX_SIZE:
-            xt->max_w = wl_read_i32(data, 0);
-            xt->max_h = wl_read_i32(data, 4);
+        case ZWL_LAYER_SURFACE_REQ_SET_KEYBOARD_INTERACTIVITY:
+            /* Noted but keyboard routing is unchanged for now */
             break;
-        case XDG_TOPLEVEL_REQ_SET_FULLSCREEN:
-            /* Honour by re-configuring at screen resolution */
-            for (int xi2 = 0; xi2 < MAX_XDG_SURFACES; xi2++) {
-                if (c->xdg_surfaces[xi2].id == xt->xdg_surface_id) {
-                    send_xdg_configure(c, &c->xdg_surfaces[xi2], xt);
-                    break;
-                }
-            }
+        case ZWL_LAYER_SURFACE_REQ_ACK_CONFIGURE:
+            if (wl_read_u32(data, 0) == ls->pending_serial)
+                ls->configured = 1;
             break;
-        case XDG_TOPLEVEL_REQ_UNSET_FULLSCREEN:
-        case XDG_TOPLEVEL_REQ_SET_MAXIMIZED:
-        case XDG_TOPLEVEL_REQ_UNSET_MAXIMIZED:
-            /* Re-send configure with no constraints */
-            for (int xi2 = 0; xi2 < MAX_XDG_SURFACES; xi2++) {
-                if (c->xdg_surfaces[xi2].id == xt->xdg_surface_id) {
-                    send_xdg_configure(c, &c->xdg_surfaces[xi2], xt);
-                    break;
-                }
-            }
+        case ZWL_LAYER_SURFACE_REQ_SET_LAYER:
+            ls->layer = wl_read_u32(data, 0);
+            layer_surface_configure(c, ls);
             break;
-        default: break;
-        }
-        return;
-    }
-
-    /* ── wl_shm_pool ─────────────────────────────────────────────────── */
-    for (int pi = 0; pi < MAX_POOLS; pi++) {
-        WlPool *p = &c->pools[pi];
-        if (p->id != obj) continue;
-
-        if (op == WL_SHM_POOL_REQ_CREATE_BUFFER) {
-            uint32_t buf_id = wl_read_u32(data, 0);
-            int32_t  offset = wl_read_i32(data, 4);
-            int32_t  width  = wl_read_i32(data, 8);
-            int32_t  height = wl_read_i32(data, 12);
-            int32_t  stride = wl_read_i32(data, 16);
-            uint32_t format = wl_read_u32(data, 20);
-            for (int bi = 0; bi < MAX_BUFFERS; bi++) {
-                if (c->buffers[bi].id == 0) {
-                    c->buffers[bi].id      = buf_id;
-                    c->buffers[bi].shm_fd  = p->shm_fd;
-                    c->buffers[bi].shm_map = p->map;
-                    c->buffers[bi].offset  = offset;
-                    c->buffers[bi].width   = width;
-                    c->buffers[bi].height  = height;
-                    c->buffers[bi].stride  = stride;
-                    c->buffers[bi].format  = format;
-                    break;
-                }
-            }
-        } else if (op == WL_SHM_POOL_REQ_DESTROY) {
-            if (p->map) { munmap(p->map, (size_t)p->size); p->map = NULL; }
-            if (p->shm_fd >= 0) { close(p->shm_fd); p->shm_fd = -1; }
-            p->id = 0;
-        } else if (op == WL_SHM_POOL_REQ_RESIZE) {
-            int32_t new_size = wl_read_i32(data, 0);
-            if (p->map) munmap(p->map, (size_t)p->size);
-            p->size = new_size;
-            if (p->shm_fd >= 0 && new_size > 0) {
-                p->map = mmap(NULL, (size_t)new_size, PROT_READ, MAP_SHARED,
-                              p->shm_fd, 0);
-                if (p->map == MAP_FAILED) p->map = NULL;
-            }
-        }
-        return;
-    }
-
-    /* ── wl_buffer ───────────────────────────────────────────────────── */
-    for (int bi = 0; bi < MAX_BUFFERS; bi++) {
-        WlBuffer *b = &c->buffers[bi];
-        if (b->id != obj) continue;
-        if (op == WL_BUFFER_REQ_DESTROY) b->id = 0;
-        return;
-    }
-
-    /* ── wl_surface ──────────────────────────────────────────────────── */
-    for (int si = 0; si < MAX_SURFACES; si++) {
-        Surface *s = &c->surfaces[si];
-        if (s->id != obj) continue;
-
-        switch (op) {
-        case WL_SURFACE_REQ_DESTROY:
-            s->id = 0;
-            break;
-        case WL_SURFACE_REQ_ATTACH: {
-            uint32_t buf_id = wl_read_u32(data, 0);
-            s->attached_buffer_id = buf_id;
-            s->x += wl_read_i32(data, 4);
-            s->y += wl_read_i32(data, 8);
-            for (int bi = 0; bi < MAX_BUFFERS; bi++) {
-                if (c->buffers[bi].id == buf_id) {
-                    s->blit_w = c->buffers[bi].width;
-                    s->blit_h = c->buffers[bi].height;
-                    break;
-                }
-            }
+        case ZWL_LAYER_SURFACE_REQ_DESTROY:
+            ls->id = 0;
             break;
         }
-        case WL_SURFACE_REQ_DAMAGE:
-        case WL_SURFACE_REQ_DAMAGE_BUFFER:
-            if (s->n_damage < MAX_DAMAGE_RECTS) {
-                uint32_t *r = s->damage[s->n_damage++];
-                r[0] = (uint32_t)wl_read_i32(data, 0);
-                r[1] = (uint32_t)wl_read_i32(data, 4);
-                r[2] = (uint32_t)wl_read_i32(data, 8);
-                r[3] = (uint32_t)wl_read_i32(data, 12);
-            }
-            break;
-        case WL_SURFACE_REQ_FRAME:
-            s->frame_cb_id = wl_read_u32(data, 0);
-            break;
-        case WL_SURFACE_REQ_COMMIT:
-            s->committed = 1;
-            composite_and_flip();
-            break;
-        default: break;
-        }
-        return;
-    }
-}
-
-/* ── RX loop ────────────────────────────────────────────────────────────── */
-
-static void process_rx(Client *c) {
-    size_t off = 0;
-    while (off + 8 <= c->rx_len) {
-        uint32_t obj = wl_read_u32(c->rx, off);
-        uint16_t op, msz;
-        memcpy(&op,  c->rx + off + 4, 2);
-        memcpy(&msz, c->rx + off + 6, 2);
-        if (msz < 8 || off + msz > c->rx_len) break;
-        dispatch_message(c, obj, op,
-                         c->rx + off + 8, (uint16_t)(msz - 8));
-        off += msz;
-    }
-    if (off > 0 && off < c->rx_len)
-        memmove(c->rx, c->rx + off, c->rx_len - off);
-    c->rx_len -= off;
-}
-
-/* ── Input routing ──────────────────────────────────────────────────────── */
-
-struct input_event {
-    long     tv_sec;
-    long     tv_usec;
-    uint16_t type;
-    uint16_t code;
-    int32_t  value;
-};
-#define EV_KEY 0x01
-#define EV_REL 0x02
-#define REL_X  0x00
-#define REL_Y  0x01
-
-static void forward_input(void) {
-    struct input_event ev;
-    ssize_t n = read(input_fd, &ev, sizeof(ev));
-    if (n != (ssize_t)sizeof(ev)) return;
-    if (focused_client < 0 || focused_client >= n_clients) return;
-    Client *c = &clients[focused_client];
-    if (!c->alive) return;
-
-    if (ev.type == EV_KEY && c->keyboard_id) {
-        uint8_t  payload[16];
-        uint32_t serial  = next_serial();
-        uint32_t time_ms = 0;
-        uint32_t key     = (uint32_t)ev.code;
-        uint32_t state   = (ev.value == 0) ? 0u : 1u;
-        memcpy(payload,    &serial,  4);
-        memcpy(payload+4,  &time_ms, 4);
-        memcpy(payload+8,  &key,     4);
-        memcpy(payload+12, &state,   4);
-        wl_send(c->fd, c->keyboard_id, WL_KEYBOARD_EVT_KEY, payload, 16);
-    } else if (ev.type == EV_REL && c->pointer_id) {
-        uint8_t  payload[12];
-        uint32_t time_ms = 0;
-        int32_t  zero    = 0;
-        int32_t  fp      = wl_fixed_from_int(ev.value);
-        memcpy(payload, &time_ms, 4);
-        if (ev.code == REL_X) {
-            memcpy(payload+4, &fp,   4);
-            memcpy(payload+8, &zero, 4);
-        } else {
-            memcpy(payload+4, &zero, 4);
-            memcpy(payload+8, &fp,   4);
-        }
-        wl_send(c->fd, c->pointer_id, WL_POINTER_EVT_MOTION, payload, 12);
-    }
-}
-
-/* ── Seccomp sandbox ────────────────────────────────────────────────────── */
-
-static void install_seccomp(void) {
-#ifndef AUDIT_ARCH_X86_64
-    return;
-#else
-    /*
-     * Whitelist (syscall numbers, x86_64):
-     *   0  read          1  write        3  close
-     *   9  mmap          11 munmap       15 rt_sigreturn
-     *  16  ioctl         46 sendmsg      47 recvmsg
-     *  60  exit          228 clock_gettime
-     *  231 exit_group    232 epoll_wait  233 epoll_ctl
-     *  242 epoll_create1 288 accept4     319 memfd_create
-     */
-    struct sock_filter filter[] = {
-        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, arch)),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, AUDIT_ARCH_X86_64, 1, 0),
-        BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
-        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, nr)),
-#define ALLOW(nr) BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,(nr),0,1), \
-                  BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)
-        ALLOW(0),   ALLOW(1),   ALLOW(3),   ALLOW(9),   ALLOW(11),
-        ALLOW(15),  ALLOW(16),  ALLOW(46),  ALLOW(47),  ALLOW(60),
-        ALLOW(228), ALLOW(231), ALLOW(232), ALLOW(233), ALLOW(242),
-        ALLOW(288), ALLOW(319),
-#undef ALLOW
-        BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
-    };
-    struct sock_fprog prog = {
-        .len    = (unsigned short)(sizeof(filter)/sizeof(filter[0])),
-        .filter = filter,
-    };
-    syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
-#endif
-}
-
-static void log_msg(const char *s) { write(1, s, strlen(s)); write(1, "\n", 1); }
-
-/* ── main ───────────────────────────────────────────────────────────────── */
-
-int main(void) {
-    const char *drm_env   = getenv("WAYLAND_DRM_FD");
-    const char *input_env = getenv("WAYLAND_INPUT_FD");
-    drm_fd   = drm_env   ? atoi(drm_env)   : open("/dev/dri/card0",   O_RDWR);
-    input_fd = input_env ? atoi(input_env) : open("/dev/input/event0",
-                                                    O_RDONLY | O_NONBLOCK);
-    if (drm_fd < 0) { log_msg("[compositor] no DRM device"); _exit(1); }
-
-    if (drm_setup() < 0)
-        log_msg("[compositor] DRM setup failed — display output unavailable");
-    else
-        log_msg("[compositor] DRM double-buffer ready");
-
-    listen_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (listen_fd < 0) { log_msg("[compositor] socket() failed"); _exit(1); }
-    unlink(WAYLAND_SOCKET_PATH);
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, WAYLAND_SOCKET_PATH, sizeof(addr.sun_path) - 1);
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_msg("[compositor] bind() failed"); _exit(1);
-    }
-    if (listen(listen_fd, 128) < 0) {
-        log_msg("[compositor] listen() failed"); _exit(1);
-    }
-    log_msg("[compositor] listening on " WAYLAND_SOCKET_PATH);
-
-    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    struct epoll_event ev;
-    ev.events  = EPOLLIN;
-    ev.data.fd = listen_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
-    if (drm_fd   >= 0) { ev.data.fd = drm_fd;   epoll_ctl(epoll_fd, EPOLL_CTL_ADD, drm_fd,   &ev); }
-    if (input_fd >= 0) { ev.data.fd = input_fd; epoll_ctl(epoll_fd, EPOLL_CTL_ADD, input_fd, &ev); }
-
-    install_seccomp();
-    log_msg("[compositor] seccomp filter installed");
-    log_msg("[compositor] event loop started");
-
-    struct epoll_event events[32];
-    for (;;) {
-        int nev = epoll_wait(epoll_fd, events, 32, 16);
-
-        for (int i = 0; i < nev; i++) {
-            int efd = events[i].data.fd;
-
-            /* ── New client ────────────────────────────────────────── */
-            if (efd == listen_fd) {
-                int cfd = accept4(listen_fd, NULL, NULL,
-                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
-                if (cfd >= 0 && n_clients < MAX_CLIENTS) {
-                    Client *c = &clients[n_clients];
-                    memset(c, 0, sizeof(*c));
-                    c->fd    = cfd;
-                    c->alive = 1;
-                    for (int pi = 0; pi < MAX_POOLS;   pi++) c->pools[pi].shm_fd   = -1;
-                    for (int bi = 0; bi < MAX_BUFFERS; bi++) c->buffers[bi].shm_fd = -1;
-                    if (focused_client < 0) focused_client = n_clients;
-                    n_clients++;
-                    ev.events  = EPOLLIN | EPOLLET;
-                    ev.data.fd = cfd;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cfd, &ev);
-                } else if (cfd >= 0) {
-                    close(cfd);
-                }
-                continue;
-            }
-
-            /* ── DRM vblank / page-flip ────────────────────────────── */
-            if (efd == drm_fd) {
-                uint8_t drmev[64];
-                read(drm_fd, drmev, sizeof(drmev));
-                for (int ci = 0; ci < n_clients; ci++) {
-                    Client *c = &clients[ci];
-                    if (!c->alive) continue;
-                    for (int si = 0; si < MAX_SURFACES; si++) {
-                        Surface *s = &c->surfaces[si];
-                        if (!s->id || !s->frame_cb_id) continue;
-                        uint32_t serial = next_serial();
-                        wl_send(c->fd, s->frame_cb_id,
-                                WL_CALLBACK_EVT_DONE, &serial, 4);
-                        wl_send(c->fd, WL_DISPLAY_ID,
-                                WL_DISPLAY_EVT_DELETE_ID,
-                                &s->frame_cb_id, 4);
-                        s->frame_cb_id = 0;
-                    }
-                }
-                continue;
-            }
-
-            /* ── Input ─────────────────────────────────────────────── */
-            if (efd == input_fd) { forward_input(); continue; }
-
-            /* ── Client data ───────────────────────────────────────── */
-            for (int ci = 0; ci < n_clients; ci++) {
-                Client *c = &clients[ci];
-                if (!c->alive || c->fd != efd) continue;
-
-                int     recv_fds[8];
-                int     n_recv_fds = 0;
-                ssize_t n = recv_with_fd(c->fd,
-                                          c->rx + c->rx_len,
-                                          RX_BUF_SIZE - c->rx_len,
-                                          recv_fds, 8, &n_recv_fds);
-                if (n <= 0) {
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, c->fd, NULL);
-                    close(c->fd);
-                    for (int pi = 0; pi < MAX_POOLS; pi++) {
-                        if (c->pools[pi].map)
-                            munmap(c->pools[pi].map, (size_t)c->pools[pi].size);
-                        if (c->pools[pi].shm_fd >= 0)
-                            close(c->pools[pi].shm_fd);
-                    }
-                    c->alive = 0;
-                    if (focused_client == ci) focused_client = -1;
-                    for (int ci2 = 0; ci2 < n_clients; ci2++) {
-                        if (clients[ci2].alive) { focused_client = ci2; break; }
-                    }
-                } else {
-                    int slots = 8 - c->n_pending_fds;
-                    if (n_recv_fds > slots) n_recv_fds = slots;
-                    memcpy(c->pending_fds + c->n_pending_fds,
-                           recv_fds, (size_t)n_recv_fds * sizeof(int));
-                    c->n_pending_fds += n_recv_fds;
-                    c->rx_len += (size_t)n;
-                    process_rx(c);
-                }
-                break;
-            }
-        }
-    }
-}

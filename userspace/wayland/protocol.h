@@ -11,6 +11,7 @@
  *   WL_<INTERFACE>_REQ_<NAME>    — request opcode (client → compositor)
  *   XDG_<INTERFACE>_EVT_<NAME>   — xdg-shell event
  *   XDG_<INTERFACE>_REQ_<NAME>   — xdg-shell request
+ *   ZWL_LAYER_*                  — wlr-layer-shell-unstable-v1
  *   WL_<INTERFACE>_VERSION       — maximum advertised version
  *
  * All opcodes are uint16_t; they start at 0 for each interface.
@@ -74,6 +75,21 @@
 #define WL_SURFACE_REQ_DAMAGE_BUFFER    9u
 #define WL_SURFACE_EVT_ENTER            0u
 #define WL_SURFACE_EVT_LEAVE            1u
+
+/* ── wl_subcompositor ────────────────────────────────────────────────────── */
+#define WL_SUBCOMPOSITOR_VERSION        1u
+#define WL_GLOBAL_NAME_SUBCOMPOSITOR    6u
+#define WL_SUBCOMPOSITOR_REQ_DESTROY    0u
+#define WL_SUBCOMPOSITOR_REQ_GET_SUBSURFACE 1u
+
+/* ── wl_subsurface ───────────────────────────────────────────────────────── */
+#define WL_SUBSURFACE_VERSION           1u
+#define WL_SUBSURFACE_REQ_DESTROY       0u
+#define WL_SUBSURFACE_REQ_SET_POSITION  1u
+#define WL_SUBSURFACE_REQ_PLACE_ABOVE   2u
+#define WL_SUBSURFACE_REQ_PLACE_BELOW   3u
+#define WL_SUBSURFACE_REQ_SET_SYNC      4u
+#define WL_SUBSURFACE_REQ_SET_DESYNC    5u
 
 /* ── wl_seat ─────────────────────────────────────────────────────────────── */
 #define WL_SEAT_VERSION                 7u
@@ -152,12 +168,45 @@
 #define XDG_TOPLEVEL_STATE_RESIZING     3u
 #define XDG_TOPLEVEL_STATE_ACTIVATED    4u
 
+/* ── zwlr_layer_shell_v1 (wlr-layer-shell-unstable-v1) ──────────────────── */
+#define ZWL_LAYER_SHELL_VERSION         4u
+#define WL_GLOBAL_NAME_LAYER_SHELL      7u
+#define ZWL_LAYER_SHELL_REQ_GET_LAYER_SURFACE  0u
+#define ZWL_LAYER_SHELL_REQ_DESTROY            1u
+
+/* layer_surface requests */
+#define ZWL_LAYER_SURFACE_REQ_SET_SIZE          0u
+#define ZWL_LAYER_SURFACE_REQ_SET_ANCHOR        1u
+#define ZWL_LAYER_SURFACE_REQ_SET_EXCLUSIVE_ZONE 2u
+#define ZWL_LAYER_SURFACE_REQ_SET_MARGIN        3u
+#define ZWL_LAYER_SURFACE_REQ_SET_KEYBOARD_INTERACTIVITY 4u
+#define ZWL_LAYER_SURFACE_REQ_GET_POPUP         5u
+#define ZWL_LAYER_SURFACE_REQ_ACK_CONFIGURE     6u
+#define ZWL_LAYER_SURFACE_REQ_DESTROY           7u
+#define ZWL_LAYER_SURFACE_REQ_SET_LAYER         8u
+/* layer_surface events */
+#define ZWL_LAYER_SURFACE_EVT_CONFIGURE         0u
+#define ZWL_LAYER_SURFACE_EVT_CLOSED            1u
+
+/* Layer enum */
+#define ZWL_LAYER_BACKGROUND    0u
+#define ZWL_LAYER_BOTTOM        1u
+#define ZWL_LAYER_TOP           2u
+#define ZWL_LAYER_OVERLAY       3u
+
+/* Anchor bitfield */
+#define ZWL_ANCHOR_TOP          1u
+#define ZWL_ANCHOR_BOTTOM       2u
+#define ZWL_ANCHOR_LEFT         4u
+#define ZWL_ANCHOR_RIGHT        8u
+
 /* ── Well-known global registry names (uint32, 1-based) ─────────────────── */
 #define WL_GLOBAL_NAME_COMPOSITOR       1u
 #define WL_GLOBAL_NAME_SHM              2u
 #define WL_GLOBAL_NAME_SEAT             3u
 #define WL_GLOBAL_NAME_OUTPUT           4u
 #define WL_GLOBAL_NAME_XDG_WM_BASE      5u
+/* 6 = WL_GLOBAL_NAME_SUBCOMPOSITOR, 7 = WL_GLOBAL_NAME_LAYER_SHELL */
 
 /* ── Wire format helpers ─────────────────────────────────────────────────── */
 
