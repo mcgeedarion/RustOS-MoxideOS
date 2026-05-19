@@ -2,10 +2,24 @@
 //!
 //! ## Contents
 //!
-//! - `futex`:    sleep/wake wait-queue table backing the `futex(2)` syscall.
-//! - `mutex`:    simple kernel mutex (placeholder).
-//! - `spinlock`: raw spinlock (placeholder).
+//! - `futex`:      sleep/wake wait-queue table backing the `futex(2)` syscall.
+//! - `mutex`:      simple kernel mutex (placeholder).
+//! - `spinlock`:   raw spinlock.
+//! - `wait_queue`: universal blocking primitive — the ONE wait/wake substrate.
+//! - `poll_source`: PollSource trait — the ONE readiness abstraction.
+//!
+//! ## Invariant
+//!
+//! **Subsystems MUST NOT call `scheduler::wake_pid()` directly.**
+//! Subsystems publish readiness via `WaitQueue::wake(mask)`.
+//! The scheduler exclusively owns task state transitions.
+//! Every violation is findable with `grep -r 'wake_pid' src/`.
 
 pub mod futex;
 pub mod mutex;
 pub mod spinlock;
+pub mod wait_queue;
+pub mod poll_source;
+
+pub use wait_queue::{WaitQueue, WakeReason, CancellationToken, CancelReason, ReadyMask};
+pub use poll_source::{PollSource, wait_on, wait_any};
