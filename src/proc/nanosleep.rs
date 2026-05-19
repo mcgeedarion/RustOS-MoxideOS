@@ -12,10 +12,22 @@
 //!   └─ sleep_until_ns(deadline)
 //! ```
 //!
-//! `sleep_until_ns` arms a one-shot timer wheel entry that transitions
-//! the task Blocked → Ready and calls `wake_pid`.  `block_current()`
-//! yields to the scheduler.  EINTR is detected via `sleep_deadline_ns ≠ 0`
-//! (timer clears it on normal completion; signals leave it non-zero).
+//! ## Blocking model
+//!
+//! `sleep_until_ns` allocates a one-shot `WaitQueue`, stores the deadline
+//! in `Pcb::sleep_deadline_ns` (for the rem calculation on EINTR), then
+//! calls `wq.wait(0, cancel_token, Some(deadline_ns))`:
+//!
+//!   - `WakeReason::Timeout`   → 0   (deadline elapsed normally)
+//!   - `WakeReason::Cancelled` → -4  (EINTR — signal arrived)
+//!   - `WakeReason::Ready`     → 0   (early wakeup, treated as success)
+//!
+//! Signal interruptibility is immediate: `CancellationToken::cancel()`
+//! fires `wq.wake()` which unblocks the task in O(1) regardless of the
+//! remaining deadline.
+//!
+//! No timer wheel entries are created for the blocking itself.  The
+//! deadline is enforced by WaitQueue’s internal hrtimer.
 //!
 //! ## Clock support
 //!
@@ -29,18 +41,19 @@
 //!   - Returns -4 (EINTR).
 //!   - If `rem_va != 0` and the sleep was *relative*, writes the remaining
 //!     time to userspace (Linux-compatible: absolute sleeps never write rem).
-//!   - Cancels the pending timer so the wheel doesn't fire a stale wakeup.
 
 use crate::uaccess::{copy_from_user, copy_to_user};
 use crate::proc::scheduler;
-use crate::proc::process::State;
 use crate::time::{Timespec, read_monotonic_ns};
-use crate::time::timer::{add_oneshot, cancel_timer};
 use crate::time::clock::{self, CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID};
+use crate::sync::wait_queue::{WaitQueue, WakeReason};
+use alloc::sync::Arc;
+
+extern crate alloc;
 
 pub fn now_ns() -> u64 { read_monotonic_ns() }
 
-// ── sys_nanosleep ─────────────────────────────────────────────────────────────
+// ── sys_nanosleep ───────────────────────────────────────────────────────────────
 
 /// sys_nanosleep(req_va, rem_va)  [NR 35]
 ///
@@ -57,32 +70,23 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
     let delta_ns = sec as u64 * 1_000_000_000 + nsec as u64;
     if delta_ns == 0 { return 0; }
 
-    let ret = sleep_ns_internal(delta_ns);
+    let deadline = read_monotonic_ns().saturating_add(delta_ns);
+    let ret = sleep_until_ns(deadline);
 
     if ret == -4 && rem_va != 0 {
-        write_remaining(rem_va);
+        write_remaining(rem_va, deadline);
         return -4;
     }
     if rem_va != 0 { let _ = copy_to_user(rem_va, &[0u8; 16]); }
     ret
 }
 
-// ── sys_clock_nanosleep ────────────────────────────────────────────────────
+// ── sys_clock_nanosleep ────────────────────────────────────────────────
 
 /// sys_clock_nanosleep(clockid, flags, req_va, rem_va)  [NR 230]
 ///
 /// flags == 0          → relative sleep (same as nanosleep but clock-aware).
 /// flags & TIMER_ABSTIME → absolute sleep on the given clock.
-///
-/// For *relative* sleeps the clock ID only matters for the rem calculation
-/// (we always block on the monotonic timer wheel), so all relative paths
-/// are functionally clock-agnostic.
-///
-/// For *absolute* sleeps the deadline is read on the given clock and
-/// converted to a monotonic deadline via:
-///   deadline_mono = mono_now + (req_clock - clock_now)
-/// which correctly handles wall-clock offsets for CLOCK_REALTIME /
-/// CLOCK_TAI without depending on the realtime offset being stable.
 pub fn sys_clock_nanosleep(
     clockid: u32, flags: i32, req_va: usize, rem_va: usize,
 ) -> isize {
@@ -99,28 +103,21 @@ pub fn sys_clock_nanosleep(
     let absolute = flags & TIMER_ABSTIME != 0;
 
     if absolute {
-        // Convert the requested absolute time on `clockid` to a monotonic
-        // deadline so the timer wheel (which is always monotonic) fires at
-        // the right wall-clock instant.
         let clk_now_ns = match clock::clock_gettime(clockid as i32) {
             Ok(ts)  => ts.to_ns(),
             Err(e)  => return e as isize,
         };
-        if req_ns <= clk_now_ns {
-            // Deadline already elapsed — return immediately (POSIX).
-            return 0;
-        }
+        if req_ns <= clk_now_ns { return 0; }
         let delta   = req_ns - clk_now_ns;
         let mono_dl = read_monotonic_ns() + delta;
-        let ret     = sleep_until_ns(mono_dl);
         // POSIX: absolute clock_nanosleep does NOT write rem on EINTR.
-        ret
+        sleep_until_ns(mono_dl)
     } else {
-        // Relative sleep: delta is clock-independent.
         if req_ns == 0 { return 0; }
-        let ret = sleep_ns_internal(req_ns);
+        let deadline = read_monotonic_ns().saturating_add(req_ns);
+        let ret = sleep_until_ns(deadline);
         if ret == -4 && rem_va != 0 {
-            write_remaining(rem_va);
+            write_remaining(rem_va, deadline);
             return -4;
         }
         if rem_va != 0 { let _ = copy_to_user(rem_va, &[0u8; 16]); }
@@ -128,25 +125,17 @@ pub fn sys_clock_nanosleep(
     }
 }
 
-// ── sys_clock_gettime ──────────────────────────────────────────────────────
+// ── sys_clock_gettime ───────────────────────────────────────────────────
 
 /// sys_clock_gettime(clockid, timespec_va)  [NR 228]
-///
-/// Dispatches to time::clock::clock_gettime which handles all 11 POSIX
-/// clock IDs.  CLOCK_PROCESS_CPUTIME_ID and CLOCK_THREAD_CPUTIME_ID are
-/// patched here with real per-process CPU time from the PCB before the
-/// result is written to userspace.
 pub fn sys_clock_gettime(clockid: u32, timespec_va: usize) -> isize {
     let pid = scheduler::current_pid();
 
     let ts = match clockid as i32 {
-        // CPU-time clocks: read directly from PCB for accuracy.
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            let cpu_ns = scheduler::with_proc(pid, |p| p.cpu_time_ns)
-                .unwrap_or(0);
+            let cpu_ns = scheduler::with_proc(pid, |p| p.cpu_time_ns).unwrap_or(0);
             Timespec::from_ns(cpu_ns)
         }
-        // All other clocks delegate to the clock layer.
         cid => match clock::clock_gettime(cid) {
             Ok(ts)  => ts,
             Err(e)  => return e as isize,
@@ -160,10 +149,9 @@ pub fn sys_clock_gettime(clockid: u32, timespec_va: usize) -> isize {
     0
 }
 
+// ── sys_clock_getres ────────────────────────────────────────────────────
+
 /// sys_clock_getres(clockid, timespec_va)  [NR 229]
-///
-/// Returns the resolution of the given clock.  Writes a Timespec to
-/// userspace (null timespec_va is valid and means "just validate clockid").
 pub fn sys_clock_getres(clockid: u32, timespec_va: usize) -> isize {
     let res = match clock::clock_getres(clockid as i32) {
         Ok(ts)  => ts,
@@ -177,11 +165,10 @@ pub fn sys_clock_getres(clockid: u32, timespec_va: usize) -> isize {
     0
 }
 
-// ── Internal blocking primitives ─────────────────────────────────────────────
+// ── Internal blocking primitive ──────────────────────────────────────────────
 
 /// Block the current task for `delta_ns` nanoseconds.
-/// Converts to an absolute monotonic deadline and calls `sleep_until_ns`.
-/// Returns 0 on normal completion, -4 (EINTR) if woken by a signal.
+#[inline]
 pub fn sleep_ns_internal(delta_ns: u64) -> isize {
     let deadline = read_monotonic_ns().saturating_add(delta_ns);
     sleep_until_ns(deadline)
@@ -189,81 +176,48 @@ pub fn sleep_ns_internal(delta_ns: u64) -> isize {
 
 /// Block the current task until the absolute monotonic deadline `deadline_ns`.
 ///
-/// This is the single real blocking primitive.  All nanosleep paths funnel
-/// here.  The protocol:
+/// Uses `WaitQueue::wait` so the task is unblocked immediately on signal
+/// delivery (`CancellationToken::cancel()` → `wq.wake()`).
 ///
-///   1. Record `deadline_ns` in `Pcb::sleep_deadline_ns` (read by rem logic).
-///   2. Arm a one-shot timer wheel entry.  The callback:
-///        a. Clears `sleep_deadline_ns` (marks normal completion).
-///        b. Transitions the task Blocked → Ready.
-///        c. Calls `wake_pid` to re-enqueue in the run queue.
-///   3. Store the timer ID in `Pcb::sleep_timer_id`.
-///   4. Call `block_current()` which calls `schedule()` internally.
-///      (Do NOT call schedule() again after block_current.)
-///   5. After wakeup: if `sleep_deadline_ns` is still non-zero, a signal
-///      interrupted the sleep.  Cancel the stale timer and return -EINTR.
-///
-/// ## Spurious wakeup guard
-/// If the deadline has already passed by the time we arm the timer, the
-/// wheel fires immediately on the next `expire_timers()` tick, which is
-/// correct and avoids sleeping past the deadline.
+/// Return values:
+///   0   — deadline elapsed or early wakeup (success)
+///  -4   — EINTR (signal delivered while sleeping)
 pub fn sleep_until_ns(deadline_ns: u64) -> isize {
-    let pid = scheduler::current_pid();
-
-    // Check if the deadline has already passed.
     if read_monotonic_ns() >= deadline_ns { return 0; }
 
-    // Step 1: record deadline before arming (prevents lost-wakeup race).
+    let pid    = scheduler::current_pid();
+    let cancel = scheduler::task_cancel_token(pid);
+
+    // Record deadline for write_remaining() on the EINTR path.
     scheduler::with_proc_mut(pid, |p, _pl| {
         p.sleep_deadline_ns = deadline_ns;
     });
 
-    // Step 2: arm one-shot timer.
-    let timer_id = add_oneshot(deadline_ns, move |_| {
-        scheduler::with_proc_mut(pid, |p, pl| {
-            p.sleep_deadline_ns = 0; // mark normal completion
-            p.sleep_timer_id    = 0;
-            if p.state == State::Blocked {
-                pl.set_state(p, State::Ready);
-            }
-        });
-        scheduler::wake_pid(pid);
-    });
+    // One-shot WaitQueue: nothing will ever call wq.wake() to signal
+    // normal completion — we rely entirely on the timeout path.
+    // Signal wakeup arrives via CancellationToken → wq.wake_cancelled().
+    let wq = Arc::new(WaitQueue::new());
+    let reason = wq.wait(0, cancel.as_deref(), Some(deadline_ns));
 
-    // Step 3: persist the timer ID for cancellation on EINTR.
+    // Clear the deadline so callers / rem logic can distinguish normal exit.
     scheduler::with_proc_mut(pid, |p, _pl| {
-        p.sleep_timer_id = timer_id;
+        p.sleep_deadline_ns = 0;
+        p.sleep_timer_id    = 0;
     });
 
-    // Step 4: yield to scheduler. block_current() calls schedule() internally;
-    // no extra schedule() call must follow.
-    scheduler::block_current();
-
-    // Step 5: EINTR detection.
-    // Normal completion: timer callback cleared sleep_deadline_ns to 0.
-    // Signal interruption: sleep_deadline_ns is still non-zero.
-    let interrupted = scheduler::with_proc(pid, |p| p.sleep_deadline_ns != 0)
-        .unwrap_or(false);
-
-    if interrupted {
-        // Cancel the stale timer so it doesn't fire a spurious wakeup later.
-        let tid = scheduler::with_proc(pid, |p| p.sleep_timer_id).unwrap_or(0);
-        if tid != 0 { cancel_timer(tid); }
-        scheduler::with_proc_mut(pid, |p, _pl| p.sleep_timer_id = 0);
-        return -4; // EINTR
+    match reason {
+        WakeReason::Timeout | WakeReason::Ready(_) => 0,
+        WakeReason::Cancelled => -4, // EINTR
     }
-    0
 }
 
-// ── Remainder helper ────────────────────────────────────────────────────────────
+// ── Remainder helper ─────────────────────────────────────────────────────────────
 
 /// Write the remaining sleep time to `rem_va` for EINTR paths.
-/// Called only when rem_va != 0 and the sleep was relative.
-fn write_remaining(rem_va: usize) {
-    let pid = scheduler::current_pid();
-    let rem = scheduler::with_proc(pid, |p| {
-        p.sleep_deadline_ns.saturating_sub(read_monotonic_ns())
-    }).unwrap_or(0);
+/// `deadline_ns` is the absolute monotonic deadline that was passed to
+/// `sleep_until_ns`; we subtract `now` to get the remaining duration.
+fn write_remaining(rem_va: usize, deadline_ns: u64) {
+    let rem = deadline_ns.saturating_sub(read_monotonic_ns());
     let mut rbuf = [0u8; 16];
     rbuf[0..8].copy_from_slice(&(rem / 1_000_000_000).to_le_bytes());
     rbuf[8..16].copy_from_slice(&(rem % 1_000_000_000).to_le_bytes());
