@@ -57,6 +57,7 @@ use crate::security::CapSet;
 use crate::proc::namespace::NsSet;
 use crate::security::seccomp::FilterChain;
 use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
+use crate::syscall::errno::{efault, einval, enomem};
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::syscall::sysret_trampoline;
@@ -87,6 +88,10 @@ pub const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 pub const CLONE_DETACHED:       u64 = 0x0040_0000;
 pub const CLONE_CHILD_SETTID:   u64 = 0x0100_0000;
 
+// Wire layout of `struct clone_args` as defined by Linux.
+// All fields are u64; total size is 88 bytes for the 11-field form.
+// The kernel accepts any size >= CLONE_ARGS_SIZE_VER0 (64 bytes);
+// fields beyond what the caller provides are zero-filled.
 #[repr(C)]
 pub struct CloneArgs {
     pub flags:        u64,
@@ -102,21 +107,63 @@ pub struct CloneArgs {
     pub cgroup:       u64,
 }
 
+/// Minimum accepted `args_size`: the 8-field v0 struct (64 bytes).
+const CLONE_ARGS_SIZE_VER0: usize = 64;
+/// Full 11-field struct size (88 bytes).
+const CLONE_ARGS_SIZE_FULL: usize = core::mem::size_of::<CloneArgs>();
+
+// ── Safe user-space parser for clone_args ──────────────────────────────────
+//
+// Replaces the previous `unsafe { core::mem::transmute(kbuf) }` cast.
+// All fields are u64 at fixed offsets; parsing them explicitly:
+//   (a) is safe regardless of padding or future field additions;
+//   (b) allows the kernel to zero-fill fields the caller did not supply
+//       (callers using the v0 struct omit set_tid, set_tid_size, cgroup);
+//   (c) makes the wire layout self-documenting.
+fn parse_clone_args(buf: &[u8]) -> CloneArgs {
+    // Helper: read a u64 at byte offset `off`; return 0 if out of range.
+    let u64_at = |off: usize| -> u64 {
+        buf.get(off..off + 8)
+            .and_then(|s| s.try_into().ok())
+            .map(u64::from_ne_bytes)
+            .unwrap_or(0)
+    };
+    CloneArgs {
+        flags:        u64_at(0),
+        pidfd:        u64_at(8),
+        child_tid:    u64_at(16),
+        parent_tid:   u64_at(24),
+        exit_signal:  u64_at(32),
+        stack:        u64_at(40),
+        stack_size:   u64_at(48),
+        tls:          u64_at(56),
+        // v1+ fields — zero if caller passed a smaller struct
+        set_tid:      u64_at(64),
+        set_tid_size: u64_at(72),
+        cgroup:       u64_at(80),
+    }
+}
+
 // ── sys_clone3 ─────────────────────────────────────────────────────────────────
 
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
-    let clone_args_sz = core::mem::size_of::<CloneArgs>();
+    // Validate the user pointer and reported size.
     if args_va == 0
         || args_va >= USER_SPACE_END
-        || args_va.saturating_add(clone_args_sz) > USER_SPACE_END
+        || args_va.saturating_add(CLONE_ARGS_SIZE_FULL) > USER_SPACE_END
     {
-        return -14;
+        return efault();
     }
-    if args_size < clone_args_sz { return -22; }
+    // Linux rejects anything smaller than the v0 struct.
+    if args_size < CLONE_ARGS_SIZE_VER0 { return einval(); }
 
-    let mut kbuf = [0u8; core::mem::size_of::<CloneArgs>()];
-    if copy_from_user(&mut kbuf, args_va).is_err() { return -14; }
-    let ca: CloneArgs = unsafe { core::mem::transmute(kbuf) };
+    // Copy at most CLONE_ARGS_SIZE_FULL bytes; zero-fill the rest so that
+    // parse_clone_args() can safely read all 11 fields regardless of what
+    // the caller provided.
+    let copy_len = args_size.min(CLONE_ARGS_SIZE_FULL);
+    let mut kbuf = [0u8; CLONE_ARGS_SIZE_FULL];
+    if copy_from_user(&mut kbuf[..copy_len], args_va).is_err() { return efault(); }
+    let ca = parse_clone_args(&kbuf);
 
     let flags       = ca.flags;
     let is_vm_clone = flags & CLONE_VM != 0;
@@ -125,7 +172,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
 
     let kstack_top = match alloc_kstack() {
         Some(k) => k,
-        None    => return -12,
+        None    => return enomem(),
     };
     let child_pid  = scheduler::next_pid();
     let child_tgid = if is_vm_clone { parent_tgid } else { child_pid };
@@ -166,8 +213,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
             fs_base: child_tls,
             ..Context::zero()
         };
-        // first-entry pc/sp for TaskRunState::Cold: the user-mode values
-        // that will be in the iretq frame when the child first runs.
         let first_pc = parent_pc;
         let first_sp = if user_sp != 0 { user_sp } else { kstack_top };
         (ctx, first_pc, first_sp)
@@ -214,6 +259,9 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         .unwrap_or_else(make_blank_pcb);
 
     // ── Signal handler table ───────────────────────────────────────────────────
+    //
+    // CLONE_SIGHAND: share the Arc — all threads see sigaction() changes instantly.
+    // Otherwise: deep-copy so parent and child have independent dispositions.
     child_pcb.signal_handlers = if flags & CLONE_SIGHAND != 0 {
         scheduler::with_proc(parent_pid, |p| p.signal_handlers.clone())
             .unwrap_or_else(|| Arc::new(spin::Mutex::new(
@@ -225,6 +273,10 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     };
 
     // ── mm_lock sharing ─────────────────────────────────────────────────────────
+    //
+    // CLONE_VM: reuse parent's Arc so all threads in the group block together
+    // on the same RwLock during uaccess validate+copy (see module doc).
+    // Otherwise: independent lock — the child's address space is its own.
     child_pcb.mm_lock = if is_vm_clone {
         scheduler::with_proc(parent_pid, |p| p.share_mm_lock())
             .unwrap_or_else(|| Arc::new(spin::RwLock::new(())))
@@ -242,7 +294,7 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pcb.user_satp  = child_satp;
     child_pcb.kstack_top = kstack_top;
     child_pcb.ctx        = child_ctx;
-    // ── pc / sp MUST be set before enqueue() so Task::new() captures them ──
+    // pc / sp MUST be set before enqueue() so Task::new() captures them.
     child_pcb.pc         = child_first_pc;
     child_pcb.sp         = child_first_sp;
     child_pcb.exit_signal        = ca.exit_signal as u32;
