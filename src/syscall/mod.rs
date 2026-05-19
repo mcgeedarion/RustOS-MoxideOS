@@ -84,7 +84,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use crate::ipc::{msg, sem, shm, mq};
 
-// ── Named constant sub-modules ──────────────────────────────────────────────────
+// ── Named constant sub-modules ──────────────────────────────────────────────────────
 pub mod nr;
 pub mod errno;
 pub mod signal_nr;
@@ -121,6 +121,16 @@ pub(crate) fn stubs_at_path(dirfd: i32, path_va: usize) -> Option<String> {
 
 const EPOLL_CLOEXEC: u32 = 0x0008_0000;
 
+// ── accept4 flag bits (socket(7) ABI) ──────────────────────────────────────────────
+//
+// accept4(2) extends accept(2) with a flags argument.  The two defined
+// bits are applied post-accept to the newly created socket fd:
+//   SOCK_NONBLOCK — set O_NONBLOCK on the fd (avoids a separate fcntl call)
+//   SOCK_CLOEXEC  — set FD_CLOEXEC on the fd (close-on-exec across execve)
+// Values match <bits/socket_type.h> on Linux x86-64.
+const SOCK_NONBLOCK: usize = 0x800;    // O_NONBLOCK
+const SOCK_CLOEXEC:  usize = 0x80000;  // O_CLOEXEC / FD_CLOEXEC
+
 #[inline(always)]
 fn arg_u32(v: usize) -> Option<u32> {
     if v > u32::MAX as usize { None } else { Some(v as u32) }
@@ -154,7 +164,7 @@ fn sys_epoll_create1(flags: u32) -> isize {
     fd
 }
 
-// ── NR 118 / 119: getresgid / getresgid32 ────────────────────────────────────────
+// ── NR 118 / 119: getresgid / getresgid32 ────────────────────────────────────────────────
 //
 // Both NRs had byte-for-byte identical bodies: look up the current GID
 // and copy it into up to three user-space pointers (rgid, egid, sgid).
@@ -171,7 +181,7 @@ fn copy_gid_to_user(a: usize, b: usize, c: usize) -> isize {
     0
 }
 
-// ── IPC helpers ────────────────────────────────────────────────────────────────
+// ── IPC helpers ──────────────────────────────────────────────────────────────────
 fn copy_msgbuf_from_user(msgp_va: usize, msgsz: usize)
     -> Option<(i64, Vec<u8>)>
 {
@@ -210,7 +220,7 @@ fn copy_sembuf_from_user(sops_va: usize, nsops: usize)
     Some(ops)
 }
 
-// ── Safe field-by-field IPC struct parsers ───────────────────────────────────────────────
+// ── Safe field-by-field IPC struct parsers ───────────────────────────────────────────────────────
 //
 // P0 fix: these replace the previous `unsafe { core::mem::transmute(buf) }`
 // calls on the IPC_SET paths for shmctl and msgctl.  Parsing each field
@@ -309,7 +319,7 @@ fn serialize_ipc64_perm(p: &crate::ipc::Ipc64Perm, buf: &mut [u8]) {
     // bytes 24..48 are padding; already zeroed by the caller
 }
 
-// ── Safe mq_attr user-copy helpers ────────────────────────────────────────────────────────────
+// ── Safe mq_attr user-copy helpers ───────────────────────────────────────────────────────────────────────────────────
 fn copy_mq_attr_from_user(va: usize) -> Option<mq::MqAttr> {
     if va == 0 { return None; }
     const SZ: usize = core::mem::size_of::<mq::MqAttr>();
@@ -346,7 +356,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                          d: usize, e: usize, f: usize,
                          saved_rip: u64) -> isize {
 
-    // ── seccomp pre-check ──────────────────────────────────────────────────────────
+    // ── seccomp pre-check ─────────────────────────────────────────────────────────────────
     let is_exit = nr == SYS_EXIT || nr == SYS_EXIT_GROUP;
     match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f], saved_rip) {
         crate::security::seccomp::SeccompVerdict::Allow  => {}
@@ -364,7 +374,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         }
     }
 
-    // ── Subsystem routers ──────────────────────────────────────────────────────────
+    // ── Subsystem routers ───────────────────────────────────────────────────────────────
     //
     // Each router handles one logical subsystem.  A None return means
     // the nr is not in that group; execution falls through to the
@@ -379,7 +389,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
     if let Some(ret) = routers::dispatch_time(&ctx)       { return ret; }
 
     match nr {
-        // ── filesystem I/O ─────────────────────────────────────────────────────────────
+        // ── filesystem I/O ──────────────────────────────────────────────────────────────────
         0   => crate::fs::io_syscalls::sys_read(a, b, c),
         1   => crate::fs::io_syscalls::sys_write(a, b, c),
         2   => crate::fs::io_syscalls::sys_open(a, b as u32, c as u32),
@@ -444,11 +454,11 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                        crate::fs::close_range::sys_close_range(first, last, flags),
                    _ => einval(),
                },
-        // ── io_uring ──────────────────────────────────────────────────────────────
+        // ── io_uring ──────────────────────────────────────────────────────────────────────
         425 => crate::io_uring::syscall::sys_io_uring_setup(a as u32, b),
         426 => crate::io_uring::syscall::sys_io_uring_enter(a, b as u32, c as u32, d as u32, e, f),
         427 => crate::io_uring::syscall::sys_io_uring_register(a, b as u32, c, d as u32),
-        // ── socket syscalls (NR 41-55, 288) ────────────────────────────────────────────
+        // ── socket syscalls (NR 41-55, 288) ────────────────────────────────────────────────────────
         41  => crate::net::socket::sys_socket(a as i32, b as i32, c as i32),
         42  => crate::net::socket::sys_connect(a, b, c as u32),
         43  => crate::net::socket::sys_accept(a, b, c),
@@ -464,36 +474,38 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         53  => crate::net::socket::sys_socketpair(a as i32, b as i32, c as i32, d),
         54  => crate::net::socket::sys_setsockopt(a, b as i32, c as i32, d, e as u32),
         55  => crate::net::socket::sys_getsockopt(a, b as i32, c as i32, d, e),
+        // accept4: extends accept(2) with flags; SOCK_NONBLOCK and SOCK_CLOEXEC
+        // are applied post-accept to the returned fd to match Linux ABI.
         288 => {
             let fd = crate::net::socket::sys_accept(a, b, c);
             if fd >= 0 {
-                if d & 0x800 != 0 {
+                if d & SOCK_NONBLOCK != 0 {
                     let mut t = crate::net::socket::TCP_SOCKETS.lock();
                     if let Some(Some(s)) = t.get_mut(fd as usize) { s.nonblocking = true; }
                 }
-                if d & 0x80000 != 0 {
+                if d & SOCK_CLOEXEC != 0 {
                     crate::fs::fcntl::set_cloexec(fd as usize, true);
                 }
             }
             fd
         }
-        // ── timerfd ───────────────────────────────────────────────────────────────────
+        // ── timerfd ───────────────────────────────────────────────────────────────────────────
         283 => crate::fs::timerfd::sys_timerfd_create(a as u32, b as u32),
         286 => crate::fs::timerfd::sys_timerfd_settime(a, b as i32, c, d),
         287 => crate::fs::timerfd::sys_timerfd_gettime(a, b),
-        // ── inotify ─────────────────────────────────────────────────────────────────
+        // ── inotify ──────────────────────────────────────────────────────────────────────────
         253 => crate::fs::inotify::sys_inotify_init1(0),
         254 => crate::fs::inotify::sys_inotify_add_watch(a, b, c as u32),
         255 => crate::fs::inotify::sys_inotify_rm_watch(a, b as i32),
         292 => crate::fs::inotify::sys_inotify_init1(a as u32),
-        // ── fanotify ─────────────────────────────────────────────────────────────────
+        // ── fanotify ─────────────────────────────────────────────────────────────────────────
         300 => crate::fs::fanotify::sys_fanotify_init(a as u32, b as u32),
         301 => crate::fs::fanotify::sys_fanotify_mark(a, b as u32, c as u64, d as i32, e),
-        // ── seccomp + namespaces ────────────────────────────────────────────────────
+        // ── seccomp + namespaces ───────────────────────────────────────────────────────────
         272 => crate::proc::namespace::sys_unshare(a),
         308 => crate::proc::namespace::sys_setns(a, b as u32),
         317 => crate::security::seccomp::sys_seccomp(a as u32, b as u32, c),
-        // ── I/O multiplexing ─────────────────────────────────────────────────────────
+        // ── I/O multiplexing ─────────────────────────────────────────────────────────────────
         7   => crate::fs::poll::sys_poll(a, b, c as i32),
         23  => crate::fs::poll::sys_select(a, b, c, d, e),
         168 => crate::fs::poll::sys_poll(a, b, c as i32),
@@ -504,7 +516,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         271 => crate::fs::poll::sys_ppoll(a, b, c, d, e),
         281 => crate::fs::poll::sys_epoll_pwait(a, b, c as i32, d as i32, e, f),
         291 => sys_epoll_create1(a as u32),
-        // ── stat / path ops ─────────────────────────────────────────────────────────────
+        // ── stat / path ops ────────────────────────────────────────────────────────────────────────
         4   => crate::fs::stat_syscalls::sys_stat(a, b),
         5   => crate::fs::stat_syscalls::sys_fstat(a, b),
         6   => crate::fs::stat_syscalls::sys_lstat(a, b),
@@ -527,7 +539,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         167 => sys_swapon_impl(a, b as i32),
         216 => sys_remap_file_pages_impl(),
         269 => crate::fs::stat_syscalls::sys_faccessat(a as i32, b, c as u32),
-        // ── memory ──────────────────────────────────────────────────────────────────
+        // ── memory ──────────────────────────────────────────────────────────────────────────
         9   => crate::mm::mmap::sys_mmap(a, b, c as u32, d as u32, e, f),
         10  => crate::mm::mmap::sys_mprotect(a, b, c as u32),
         11  => crate::mm::mmap::sys_munmap(a, b),
@@ -540,7 +552,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         329 => sys_pkey_mprotect_impl(a, b, c as u32, d as i32),
         330 => sys_pkey_alloc_impl(a as u32, b as u64),
         331 => sys_pkey_free_impl(a as i32),
-        // ── System V IPC: shared memory ──────────────────────────────────────────────
+        // ── System V IPC: shared memory ──────────────────────────────────────────────────────
         29  => match shm::shmget(a as i32, b, c as i32) {
                    Ok(id)  => id as isize,
                    Err(e)  => e,
@@ -576,7 +588,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // ── System V IPC: semaphores ───────────────────────────────────────────────
+        // ── System V IPC: semaphores ───────────────────────────────────────────────────────────
         64  => match sem::semget(a as i32, b as i32, c as i32) {
                    Ok(id) => id as isize,
                    Err(e) => e,
@@ -607,7 +619,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                    Ok(())  => 0,
                    Err(e)  => e,
                },
-        // ── System V IPC: message queues ────────────────────────────────────────────
+        // ── System V IPC: message queues ──────────────────────────────────────────────────────────
         68  => match msg::msgget(a as i32, b as i32) {
                    Ok(id) => id as isize,
                    Err(e) => e,
@@ -658,7 +670,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // ── POSIX message queues ──────────────────────────────────────────────────────────
+        // ── POSIX message queues ────────────────────────────────────────────────────────────────────────────
         240 => {
             let name = match crate::proc::exec::read_cstr_safe(a) {
                 Some(s) => s,
@@ -745,7 +757,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                 }
             }
         },
-        // ── process / signals ─────────────────────────────────────────────────────────────
+        // ── process / signals ────────────────────────────────────────────────────────────────────────
         13  => match arg_u32(a) {
                    Some(sig) if sig >= 1 && sig <= 64 =>
                        crate::proc::signal::sys_rt_sigaction(sig, b, c, d),
@@ -822,7 +834,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         184 => sys_process_vm_readv_impl(a, b, c, d, e, f),
         185 => sys_prctl_impl(a as i32, b, c, d, e),
         186 => crate::proc::thread::sys_gettid(),
-        // ── NPTL threading ─────────────────────────────────────────────────────────────
+        // ── NPTL threading ───────────────────────────────────────────────────────────────────────
         200 => match arg_u32(b) {
                    Some(sig) if sig <= 64 => crate::proc::thread::sys_tkill(a, sig),
                    _ => einval(),
@@ -842,7 +854,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                },
         273 => crate::proc::futex::sys_set_robust_list(a, b),
         274 => crate::proc::futex::sys_get_robust_list(a, b, c),
-        // ── time ──────────────────────────────────────────────────────────────────
+        // ── time ──────────────────────────────────────────────────────────────────────────────
         36  => sys_getitimer_impl(a as i32, b),
         38  => sys_setitimer_impl(a as i32, b, c),
         96  => sys_gettimeofday_impl(a, b),
@@ -865,27 +877,27 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                        sys_waitid_impl(idtype, id, c, opts),
                    _ => einval(),
                },
-        // ── uid / gid ───────────────────────────────────────────────────────────────
+        // ── uid / gid ──────────────────────────────────────────────────────────────────────────
         102 | 104 | 107 | 108 => 0,
         105 | 106             => 0,
         // NR 118 getresgid / NR 119 getresgid32: deduplicated into shared helper.
         118 => copy_gid_to_user(a, b, c),
         119 => copy_gid_to_user(a, b, c),
         117 | 120 => 0,
-        // ── scheduler attrs ────────────────────────────────────────────────────────────
+        // ── scheduler attrs ───────────────────────────────────────────────────────────────────────
         309 => sys_getcpu_impl(a, b, c),
         310 => sys_process_vm_writev_impl(a, b, c, d, e, f),
         315 => sys_sched_getattr_impl(a, b as u32, c as u32, d as u32),
         316 => sys_sched_setattr_impl(a, b, c as u32),
-        // ── random ──────────────────────────────────────────────────────────────────
+        // ── random ──────────────────────────────────────────────────────────────────────────
         318 => match arg_u32(c) {
                    Some(flags) => sys_getrandom_impl(a, b, flags),
                    None        => einval(),
                },
-        // ── sendmmsg / recvmmsg ──────────────────────────────────────────────────────
+        // ── sendmmsg / recvmmsg ───────────────────────────────────────────────────────────────────
         299 => sys_recvmmsg_impl(a, b, c as u32, d as u32, e),
         307 => sys_sendmmsg_impl(a, b, c as u32, d as u32),
-        // ── pidfd ───────────────────────────────────────────────────────────────────
+        // ── pidfd ──────────────────────────────────────────────────────────────────────────────
         302 => sys_prlimit64_impl(a, b as u32, c, d),
         320 => sys_kexec_file_load_impl(),
         321 => sys_bpf_impl(),
@@ -894,7 +906,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         434 => crate::fs::pidfd::sys_pidfd_open(a, b as u32),
         435 => crate::proc::clone::sys_clone3(a, b),
         438 => crate::fs::pidfd::sys_pidfd_getfd(a, b, c as u32),
-        // ── permission / attribute stubs ──────────────────────────────────────────────
+        // ── permission / attribute stubs ─────────────────────────────────────────────────────────────
         90  => sys_chmod_impl(a, b as u32),
         91  => sys_fchmod_impl(a, b as u32),
         92  => sys_chown_impl(a, b as u32, c as u32),
@@ -907,7 +919,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
     }
 }
 
-// ── Syscall-side side-table cleanup (called from do_exit) ────────────────────────────────
+// ── Syscall-side side-table cleanup (called from do_exit) ───────────────────────────────────────────
 
 pub fn altstack_clear_pid(pid: usize) {
     crate::proc::signal::altstack_clear_pid(pid);
