@@ -87,6 +87,15 @@ pub const SYS_GETTID:          usize = 186;
 pub const SYS_CLONE3:          usize = 435;
 pub const SYS_EXIT_GROUP:      usize = 231;
 
+// ── uid / gid ─────────────────────────────────────────────────────────
+pub const SYS_GETUID:          usize = 102;
+pub const SYS_GETGID:          usize = 104;
+pub const SYS_GETEUID:         usize = 107;
+pub const SYS_GETEGID:         usize = 108;
+pub const SYS_SETUID:          usize = 105;
+pub const SYS_SETGID:          usize = 106;
+pub const SYS_SETRESGID:       usize = 119;
+
 // ── Threading (NPTL) ─────────────────────────────────────────────────
 pub const SYS_FUTEX:           usize = 202;
 pub const SYS_TKILL:           usize = 200;

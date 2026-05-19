@@ -262,20 +262,18 @@ pub fn dispatch_process(ctx: &SyscallContext) -> Option<isize> {
         SYS_FUTEX           => Some(crate::proc::futex::sys_futex(a, b as u32, c as u32, d, e, f as u32)),
         SYS_SET_ROBUST_LIST => Some(crate::proc::futex::sys_set_robust_list(a, b)),
         SYS_GET_ROBUST_LIST => Some(crate::proc::futex::sys_get_robust_list(a, b, c)),
-        // ── uid / gid ────────────────────────────────────────────────────────
-        102 | 104 | 107 | 108 => Some(0),
-        105 | 106             => Some(0),
-        117 | 120             => Some(0),
-        SYS_GETRESGID | SYS_GETRESGID32 => Some(crate::syscall::copy_gid_to_user(a, b, c)),
-        SYS_GETRESUID => {
+        // ── uid / gid — read-only queries always succeed; writes are no-ops ──
+        SYS_GETUID | SYS_GETEUID => {
             let pid = crate::proc::scheduler::current_pid();
-            let uid = crate::proc::scheduler::with_proc(pid, |p| p.uid).unwrap_or(0);
-            let bytes = uid.to_le_bytes();
-            if a != 0 { let _ = crate::uaccess::copy_to_user(a, &bytes); }
-            if b != 0 { let _ = crate::uaccess::copy_to_user(b, &bytes); }
-            if c != 0 { let _ = crate::uaccess::copy_to_user(c, &bytes); }
-            Some(0)
+            Some(crate::proc::scheduler::with_proc(pid, |p| p.uid).unwrap_or(0) as isize)
         }
+        SYS_GETGID | SYS_GETEGID => {
+            let pid = crate::proc::scheduler::current_pid();
+            Some(crate::proc::scheduler::with_proc(pid, |p| p.cred.gid).unwrap_or(0) as isize)
+        }
+        SYS_SETUID | SYS_SETGID | SYS_SETRESGID => Some(0),
+        SYS_GETRESGID | SYS_GETRESGID32 => Some(crate::syscall::copy_gid_to_user(a, b, c)),
+        SYS_GETRESUID => Some(crate::syscall::copy_uid_to_user(a, b, c)),
         SYS_SETREUID  => Some(crate::syscall::sys_setreuid_impl(a as u32, b as u32)),
         SYS_SETREGID  => Some(crate::syscall::sys_setregid_impl(a as u32, b as u32)),
         SYS_GETGROUPS => Some(crate::syscall::sys_getgroups_impl(a as i32, b)),
@@ -401,7 +399,7 @@ pub fn dispatch_time(ctx: &SyscallContext) -> Option<isize> {
         }
         SYS_CLOCK_NANOSLEEP => {
             match super::arg_u32(a) {
-                Some(clk) => Some(crate::syscall::sys_clock_getres_impl(clk, b)),
+                Some(clk) => Some(crate::syscall::sys_clock_nanosleep_impl(clk, b as i32, c, d)),
                 None      => Some(einval()),
             }
         }

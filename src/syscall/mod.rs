@@ -118,6 +118,19 @@ pub(crate) fn copy_gid_to_user(a: usize, b: usize, c: usize) -> isize {
     0
 }
 
+// ── NR 165: getresuid ────────────────────────────────────────────────────────
+// Mirrors copy_gid_to_user; extracted from the inline arm in dispatch_process.
+#[inline]
+pub(crate) fn copy_uid_to_user(a: usize, b: usize, c: usize) -> isize {
+    let pid  = crate::proc::scheduler::current_pid();
+    let uid  = crate::proc::scheduler::with_proc(pid, |p| p.uid).unwrap_or(0);
+    let bytes = uid.to_le_bytes();
+    if a != 0 { let _ = crate::uaccess::copy_to_user(a, &bytes); }
+    if b != 0 { let _ = crate::uaccess::copy_to_user(b, &bytes); }
+    if c != 0 { let _ = crate::uaccess::copy_to_user(c, &bytes); }
+    0
+}
+
 // ── IPC user-copy helpers ────────────────────────────────────────────────────
 
 fn copy_msgbuf_from_user(msgp_va: usize, msgsz: usize) -> Option<(i64, Vec<u8>)> {
