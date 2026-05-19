@@ -41,23 +41,20 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-// ─── Operation codes ────────────────────────────────────────────────────────
-
+// ── Operation codes ─────────────────────────────────────────────────────────
 pub const SECCOMP_SET_MODE_STRICT:  u32 = 0;
 pub const SECCOMP_SET_MODE_FILTER:  u32 = 1;
 pub const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 pub const SECCOMP_GET_NOTIF_FD:     u32 = 3;
 
-// ─── Flags for SET_MODE_FILTER ──────────────────────────────────────────────
+// ── Flags for SET_MODE_FILTER ─────────────────────────────────────────────
+pub const SECCOMP_FILTER_FLAG_TSYNC:        u32 = 1;
+pub const SECCOMP_FILTER_FLAG_LOG:          u32 = 2;
+pub const SECCOMP_FILTER_FLAG_SPEC_ALLOW:   u32 = 4;
+pub const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 8;
+pub const SECCOMP_FILTER_FLAG_TSYNC_ESRCH:  u32 = 16;
 
-pub const SECCOMP_FILTER_FLAG_TSYNC:           u32 = 1;
-pub const SECCOMP_FILTER_FLAG_LOG:             u32 = 2;
-pub const SECCOMP_FILTER_FLAG_SPEC_ALLOW:      u32 = 4;
-pub const SECCOMP_FILTER_FLAG_NEW_LISTENER:    u32 = 8;
-pub const SECCOMP_FILTER_FLAG_TSYNC_ESRCH:     u32 = 16;
-
-// ─── Return action codes ────────────────────────────────────────────────────
-
+// ── Return action codes ────────────────────────────────────────────────────
 pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 pub const SECCOMP_RET_KILL_THREAD:  u32 = 0x0000_0000;
 pub const SECCOMP_RET_TRAP:         u32 = 0x0003_0000;
@@ -72,11 +69,13 @@ pub const SECCOMP_RET_DATA:         u32 = 0x0000_FFFF;
 // Architecture constant written into seccomp_data.arch
 pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 
-// ─── Errno literals (no_std; avoid libc dep) ────────────────────────────────
+// ── Errno constants (no_std; avoid libc dep) ──────────────────────────────
 const EPERM:  i32 = 1;
+const EFAULT: i32 = 14;
+const EINVAL: i32 = 22;
 const ENOSYS: i32 = 38;
 
-// ─── seccomp_data (fed to BPF program as packet bytes) ──────────────────────
+// ── seccomp_data (fed to BPF program as packet bytes) ──────────────────────
 
 #[repr(C)]
 pub struct SeccompData {
@@ -98,7 +97,7 @@ impl SeccompData {
     }
 }
 
-// ─── cBPF instruction (sock_filter) ─────────────────────────────────────────
+// ── cBPF instruction (sock_filter) ──────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -120,9 +119,9 @@ const BPF_RET:  u16 = 0x06;
 const BPF_MISC: u16 = 0x07;
 
 // BPF size bits
-const BPF_W:  u16 = 0x00; // 32-bit word
-const BPF_H:  u16 = 0x08; // 16-bit half-word
-const BPF_B:  u16 = 0x10; // 8-bit byte
+const BPF_W: u16 = 0x00; // 32-bit word
+const BPF_H: u16 = 0x08; // 16-bit half-word
+const BPF_B: u16 = 0x10; // 8-bit byte
 
 // BPF addressing mode bits
 const BPF_IMM: u16 = 0x00;
@@ -134,17 +133,17 @@ const BPF_X:   u16 = 0x08;
 const BPF_A:   u16 = 0x10;
 
 // BPF ALU ops
-const BPF_ADD:  u16 = 0x00;
-const BPF_SUB:  u16 = 0x10;
-const BPF_MUL:  u16 = 0x20;
-const BPF_DIV:  u16 = 0x30;
-const BPF_OR:   u16 = 0x40;
-const BPF_AND:  u16 = 0x50;
-const BPF_LSH:  u16 = 0x60;
-const BPF_RSH:  u16 = 0x70;
-const BPF_NEG:  u16 = 0x80;
-const BPF_MOD:  u16 = 0x90;
-const BPF_XOR:  u16 = 0xa0;
+const BPF_ADD: u16 = 0x00;
+const BPF_SUB: u16 = 0x10;
+const BPF_MUL: u16 = 0x20;
+const BPF_DIV: u16 = 0x30;
+const BPF_OR:  u16 = 0x40;
+const BPF_AND: u16 = 0x50;
+const BPF_LSH: u16 = 0x60;
+const BPF_RSH: u16 = 0x70;
+const BPF_NEG: u16 = 0x80;
+const BPF_MOD: u16 = 0x90;
+const BPF_XOR: u16 = 0xa0;
 
 // BPF JMP ops
 const BPF_JA:   u16 = 0x00;
@@ -154,8 +153,8 @@ const BPF_JGE:  u16 = 0x30;
 const BPF_JSET: u16 = 0x40;
 
 // BPF RET sources
-const BPF_RETK: u16 = BPF_RET | BPF_K;  // return K
-const BPF_RETA: u16 = BPF_RET | BPF_A;  // return A
+const BPF_RETK: u16 = BPF_RET | BPF_K; // return K
+const BPF_RETA: u16 = BPF_RET | BPF_A; // return A
 
 // BPF_MISC: TAX / TXA
 const BPF_TAX: u16 = BPF_MISC | 0x00;
@@ -168,7 +167,7 @@ const BPF_MAX_STEPS: usize = 65_536;
 /// Working memory for BPF programs (M[0..16])
 const BPF_MEMWORDS: usize = 16;
 
-// ─── Verdict returned to dispatch ───────────────────────────────────────────
+// ── Verdict returned to dispatch ────────────────────────────────────────────
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SeccompVerdict {
@@ -181,7 +180,7 @@ pub enum SeccompVerdict {
     Kill,
 }
 
-// ─── Stored filter (a compiled + validated BPF program) ──────────────────────
+// ── Stored filter (a compiled + validated BPF program) ──────────────────────────
 
 #[derive(Clone)]
 pub struct SeccompFilter {
@@ -195,10 +194,10 @@ pub struct SeccompFilter {
 #[derive(Clone, Default)]
 pub struct FilterChain {
     pub filters: Vec<SeccompFilter>,
-    pub strict:  bool,  // SECCOMP_SET_MODE_STRICT active
+    pub strict:  bool, // SECCOMP_SET_MODE_STRICT active
 }
 
-// ─── cBPF evaluator ─────────────────────────────────────────────────────────
+// ── cBPF evaluator ──────────────────────────────────────────────────────────
 
 /// Evaluate a single cBPF program against `data` bytes.
 /// Returns the u32 action code produced by BPF_RET.
@@ -218,12 +217,12 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
         if pc >= insns.len() { return SECCOMP_RET_KILL_PROCESS; }
         steps += 1;
         if steps > BPF_MAX_STEPS { return SECCOMP_RET_KILL_PROCESS; }
-        let ins = insns[pc];
+        let ins  = insns[pc];
         let code = ins.code;
         let k    = ins.k;
 
         match code {
-            // ── Load word from packet (seccomp_data) at offset k ──────────
+            // ── Load word from packet (seccomp_data) at offset k ───────────────
             c if c == BPF_LD | BPF_W | BPF_ABS => {
                 a = load_u32(data, k as usize).unwrap_or(return SECCOMP_RET_KILL_PROCESS);
             }
@@ -237,22 +236,18 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
                 let off = x.wrapping_add(k) as usize;
                 a = load_u32(data, off).unwrap_or(return SECCOMP_RET_KILL_PROCESS);
             }
-            // ── Load immediate ─────────────────────────────────────────────
-            c if c == BPF_LD | BPF_IMM => {
-                a = k;
-            }
-            c if c == BPF_LDX | BPF_W | BPF_IMM => {
-                x = k;
-            }
-            // ── Load from memory ──────────────────────────────────────────
-            c if c == BPF_LD | BPF_MEM => {
+            // ── Load immediate ──────────────────────────────────────────────────
+            c if c == BPF_LD  | BPF_IMM => { a = k; }
+            c if c == BPF_LDX | BPF_W | BPF_IMM => { x = k; }
+            // ── Load from memory ───────────────────────────────────────────────
+            c if c == BPF_LD  | BPF_MEM => {
                 a = *m.get(k as usize).unwrap_or(return SECCOMP_RET_KILL_PROCESS);
             }
             c if c == BPF_LDX | BPF_MEM => {
                 x = *m.get(k as usize).unwrap_or(return SECCOMP_RET_KILL_PROCESS);
             }
-            // ── Store to memory ───────────────────────────────────────────
-            c if c == BPF_ST => {
+            // ── Store to memory ───────────────────────────────────────────────
+            c if c == BPF_ST  => {
                 let slot = m.get_mut(k as usize).unwrap_or(return SECCOMP_RET_KILL_PROCESS);
                 *slot = a;
             }
@@ -260,7 +255,7 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
                 let slot = m.get_mut(k as usize).unwrap_or(return SECCOMP_RET_KILL_PROCESS);
                 *slot = x;
             }
-            // ── ALU ───────────────────────────────────────────────────────
+            // ── ALU ──────────────────────────────────────────────────────────────
             c if c == BPF_ALU | BPF_ADD | BPF_K => { a = a.wrapping_add(k); }
             c if c == BPF_ALU | BPF_ADD | BPF_X => { a = a.wrapping_add(x); }
             c if c == BPF_ALU | BPF_SUB | BPF_K => { a = a.wrapping_sub(k); }
@@ -293,11 +288,11 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
             c if c == BPF_ALU | BPF_RSH | BPF_X => { a = a.wrapping_shr(x & 31); }
             c if c == BPF_ALU | BPF_XOR | BPF_K => { a ^= k; }
             c if c == BPF_ALU | BPF_XOR | BPF_X => { a ^= x; }
-            c if c == BPF_ALU | BPF_NEG => { a = (!a).wrapping_add(1); }
-            // ── MISC: register copy ───────────────────────────────────────
+            c if c == BPF_ALU | BPF_NEG           => { a = (!a).wrapping_add(1); }
+            // ── MISC: register copy ──────────────────────────────────────────────
             c if c == BPF_TAX => { x = a; }
             c if c == BPF_TXA => { a = x; }
-            // ── JMP ───────────────────────────────────────────────────────
+            // ── JMP ──────────────────────────────────────────────────────────────
             c if c == BPF_JMP | BPF_JA => {
                 // P2 fix: clamp the jump offset so pc cannot wrap to near
                 // usize::MAX when k = 0xFFFF_FFFF.  An out-of-bounds jump
@@ -315,10 +310,10 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
                 pc += if a == x { ins.jt as usize } else { ins.jf as usize };
             }
             c if c == BPF_JMP | BPF_JGT | BPF_K => {
-                pc += if a > k  { ins.jt as usize } else { ins.jf as usize };
+                pc += if a > k { ins.jt as usize } else { ins.jf as usize };
             }
             c if c == BPF_JMP | BPF_JGT | BPF_X => {
-                pc += if a > x  { ins.jt as usize } else { ins.jf as usize };
+                pc += if a > x { ins.jt as usize } else { ins.jf as usize };
             }
             c if c == BPF_JMP | BPF_JGE | BPF_K => {
                 pc += if a >= k { ins.jt as usize } else { ins.jf as usize };
@@ -332,17 +327,17 @@ fn bpf_run(insns: &[SockFilter], data: &[u8]) -> u32 {
             c if c == BPF_JMP | BPF_JSET | BPF_X => {
                 pc += if a & x != 0 { ins.jt as usize } else { ins.jf as usize };
             }
-            // ── RET ───────────────────────────────────────────────────────
+            // ── RET ──────────────────────────────────────────────────────────────
             c if c == BPF_RETK => { return k; }
             c if c == BPF_RETA => { return a; }
-            // ── Unknown instruction → kill ────────────────────────────────
+            // ── Unknown instruction → kill ────────────────────────────────────
             _ => { return SECCOMP_RET_KILL_PROCESS; }
         }
         pc += 1;
     }
 }
 
-// ─── Packet load helpers ─────────────────────────────────────────────────────
+// ── Packet load helpers ───────────────────────────────────────────────────
 
 #[inline]
 fn load_u32(data: &[u8], off: usize) -> Option<u32> {
@@ -359,7 +354,7 @@ fn load_u8(data: &[u8], off: usize) -> Option<u8> {
     data.get(off).copied()
 }
 
-// ─── Architecture-check validator ────────────────────────────────────────────
+// ── Architecture-check validator ─────────────────────────────────────────────
 
 /// P2 fix: warn if a filter omits a VALIDATE_ARCHITECTURE guard.
 /// A well-written filter should contain at least one BPF_LD [arch] +
@@ -373,12 +368,14 @@ fn warn_if_no_arch_check(insns: &[SockFilter]) {
         ins.code == (BPF_LD | BPF_W | BPF_ABS) && ins.k == ARCH_OFFSET
     });
     if !has_arch_load {
-        log::warn!("seccomp: filter installed without VALIDATE_ARCHITECTURE check; \
-                   cross-arch syscall spoofing may be possible");
+        log::warn!(
+            "seccomp: filter installed without VALIDATE_ARCHITECTURE check; \
+             cross-arch syscall spoofing may be possible"
+        );
     }
 }
 
-// ─── Public: check a syscall through the current process's filter chain ───────
+// ── Public: check a syscall through the current process's filter chain ───────
 
 /// Called at the top of the syscall dispatch path.
 /// `args` is `[a, b, c, d, e, f]` from the register file.
@@ -390,7 +387,6 @@ pub fn seccomp_check(nr: usize, args: &[usize; 6], saved_rip: u64) -> SeccompVer
     let pid = crate::proc::scheduler::current_pid();
     if pid == 0 { return SeccompVerdict::Allow; }
 
-    // Read the filter chain out of the PCB.
     let chain = match crate::proc::scheduler::with_proc(pid, |p| p.seccomp.clone()) {
         Some(c) => c,
         None    => return SeccompVerdict::Allow,
@@ -427,10 +423,10 @@ pub fn seccomp_check(nr: usize, args: &[usize; 6], saved_rip: u64) -> SeccompVer
     let mut worst: u32 = SECCOMP_RET_ALLOW;
     let mut worst_rank = seccomp_action_rank(SECCOMP_RET_ALLOW);
     for filter in chain.filters.iter().rev() {
-        let ret = bpf_run(&filter.insns, bytes);
+        let ret  = bpf_run(&filter.insns, bytes);
         let rank = seccomp_action_rank(ret & SECCOMP_RET_ACTION_FULL);
         if rank < worst_rank {
-            worst = ret;
+            worst      = ret;
             worst_rank = rank;
         }
     }
@@ -472,7 +468,7 @@ fn action_to_verdict(ret: u32) -> SeccompVerdict {
     }
 }
 
-// ─── sys_seccomp ─────────────────────────────────────────────────────────────
+// ── sys_seccomp ──────────────────────────────────────────────────────────
 
 /// seccomp(operation, flags, args_va)  [NR 317]
 ///
@@ -497,9 +493,8 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
     //   - If the process has no filter yet, it must hold CAP_SYS_ADMIN or
     //     have called prctl(PR_SET_NO_NEW_PRIVS, 1) (nnp flag on Pcb).
     let pid = crate::proc::scheduler::current_pid();
-    if pid == 0 { return -1; } // kernel threads
+    if pid == 0 { return -(EPERM as isize); } // kernel threads
 
-    // Check privilege for first-filter installation.
     let has_existing_filter = crate::proc::scheduler::with_proc(pid, |p| {
         p.seccomp.strict || !p.seccomp.filters.is_empty()
     }).unwrap_or(false);
@@ -508,20 +503,16 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
         p.caps.has(crate::security::capset::cap::SYS_ADMIN)
     }).unwrap_or(false);
 
-    let has_nnp = crate::proc::scheduler::with_proc(pid, |p| {
-        p.no_new_privs
-    }).unwrap_or(false);
+    let has_nnp = crate::proc::scheduler::with_proc(pid, |p| p.no_new_privs)
+        .unwrap_or(false);
 
-    // A process may install its first filter only if privileged or nnp is set.
-    // A process that already has a filter may always add more (stacking only
-    // makes the sandbox stricter, never looser).
     if !has_existing_filter && !has_cap_sys_admin && !has_nnp {
-        return -1; // EPERM
+        return -(EPERM as isize);
     }
 
     match operation {
         SECCOMP_SET_MODE_STRICT => {
-            if flags != 0 { return -22; } // EINVAL
+            if flags != 0 { return -(EINVAL as isize); }
             crate::proc::scheduler::with_proc_mut(pid, |p| {
                 p.seccomp.strict  = true;
                 p.seccomp.filters.clear();
@@ -530,24 +521,21 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
         }
 
         SECCOMP_SET_MODE_FILTER => {
-            if args_va == 0 { return -14; } // EFAULT
-            // Read sock_fprog: u16 len at offset 0, u64 filter_ptr at offset 8.
-            // copy_from_user signature: (dst: &mut [u8], src_va: usize)
+            if args_va == 0 { return -(EFAULT as isize); }
             let mut fprog = [0u8; 16];
             if crate::uaccess::copy_from_user(&mut fprog, args_va).is_err() {
-                return -14;
+                return -(EFAULT as isize);
             }
             let len        = u16::from_le_bytes([fprog[0], fprog[1]]) as usize;
             let filter_ptr = usize::from_le_bytes(fprog[8..16].try_into().unwrap());
 
-            if len == 0 || len > BPF_MAXINSNS { return -22; } // EINVAL
-            if filter_ptr == 0 { return -14; } // EFAULT
+            if len == 0 || len > BPF_MAXINSNS { return -(EINVAL as isize); }
+            if filter_ptr == 0 { return -(EFAULT as isize); }
 
-            // Read the BPF instruction array.
             let insn_sz = core::mem::size_of::<SockFilter>(); // 8 bytes
             let mut raw = alloc::vec![0u8; len * insn_sz];
             if crate::uaccess::copy_from_user(&mut raw, filter_ptr).is_err() {
-                return -14;
+                return -(EFAULT as isize);
             }
             let mut insns = Vec::with_capacity(len);
             for i in 0..len {
@@ -560,19 +548,16 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
                 });
             }
 
-            // P2 fix: warn if the filter omits an architecture guard.
             warn_if_no_arch_check(&insns);
 
-            let log = flags & SECCOMP_FILTER_FLAG_LOG != 0;
+            let log    = flags & SECCOMP_FILTER_FLAG_LOG != 0;
+            let tsync  = flags & SECCOMP_FILTER_FLAG_TSYNC != 0;
             let filter = SeccompFilter { insns, log };
-
-            let tsync = flags & SECCOMP_FILTER_FLAG_TSYNC != 0;
 
             crate::proc::scheduler::with_proc_mut(pid, |p| {
                 p.seccomp.filters.push(filter.clone());
             });
 
-            // TSYNC: push the same filter to every thread in the thread group.
             if tsync {
                 let tgid = crate::proc::thread::tgid_of(pid);
                 for tid in crate::proc::thread::threads_of(tgid) {
@@ -587,28 +572,30 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
         }
 
         SECCOMP_GET_ACTION_AVAIL => {
-            // args_va is a pointer to a u32 action code to probe.
             let mut buf = [0u8; 4];
             if crate::uaccess::copy_from_user(&mut buf, args_va).is_err() {
-                return -14;
+                return -(EFAULT as isize);
             }
             let action = u32::from_le_bytes(buf) & SECCOMP_RET_ACTION_FULL;
             let avail = matches!(
                 action,
-                SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD |
-                SECCOMP_RET_TRAP | SECCOMP_RET_ERRNO |
-                SECCOMP_RET_LOG | SECCOMP_RET_ALLOW
+                SECCOMP_RET_KILL_PROCESS | SECCOMP_RET_KILL_THREAD
+                    | SECCOMP_RET_TRAP
+                    | SECCOMP_RET_ERRNO
+                    | SECCOMP_RET_LOG
+                    | SECCOMP_RET_ALLOW
             );
-            if avail { 0 } else { -22 }
+            if avail { 0 } else { -(EINVAL as isize) }
         }
 
-        SECCOMP_GET_NOTIF_FD => -38, // ENOSYS — notif fd not yet implemented
+        // SECCOMP_GET_NOTIF_FD: notification fd not yet implemented.
+        SECCOMP_GET_NOTIF_FD => -(ENOSYS as isize),
 
-        _ => -22, // EINVAL
+        _ => -(EINVAL as isize),
     }
 }
 
-// ─── Inheritance helper ───────────────────────────────────────────────────────
+// ── Inheritance helper ────────────────────────────────────────────────────────
 
 /// Returns a clone of the current process's seccomp filter chain for
 /// inheritance into a fork/clone child.  Must be called while holding
