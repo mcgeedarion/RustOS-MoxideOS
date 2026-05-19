@@ -41,6 +41,13 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
+// ── Shared errno and syscall-nr constants ───────────────────────────────────
+//
+// Import from the single canonical source-of-truth modules rather than
+// redeclaring local copies that can drift out of sync.
+use crate::syscall::errno::{EPERM, EFAULT, EINVAL, ENOSYS};
+use crate::syscall::nr::STRICT_ALLOWLIST;
+
 // ── Operation codes ─────────────────────────────────────────────────────────
 pub const SECCOMP_SET_MODE_STRICT:  u32 = 0;
 pub const SECCOMP_SET_MODE_FILTER:  u32 = 1;
@@ -68,12 +75,6 @@ pub const SECCOMP_RET_DATA:         u32 = 0x0000_FFFF;
 
 // Architecture constant written into seccomp_data.arch
 pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
-
-// ── Errno constants (no_std; avoid libc dep) ──────────────────────────────
-const EPERM:  i32 = 1;
-const EFAULT: i32 = 14;
-const EINVAL: i32 = 22;
-const ENOSYS: i32 = 38;
 
 // ── seccomp_data (fed to BPF program as packet bytes) ──────────────────────
 
@@ -392,11 +393,13 @@ pub fn seccomp_check(nr: usize, args: &[usize; 6], saved_rip: u64) -> SeccompVer
         None    => return SeccompVerdict::Allow,
     };
 
-    // SECCOMP_SET_MODE_STRICT: only allow read(0)/write(1)/exit(60)/exit_group(231)/rt_sigreturn(15).
+    // SECCOMP_SET_MODE_STRICT: only allow the syscalls in STRICT_ALLOWLIST
+    // (read, write, exit, exit_group, rt_sigreturn — matches Linux behaviour).
     if chain.strict {
-        return match nr {
-            0 | 1 | 15 | 60 | 231 => SeccompVerdict::Allow,
-            _ => SeccompVerdict::Kill,
+        return if STRICT_ALLOWLIST.contains(&nr) {
+            SeccompVerdict::Allow
+        } else {
+            SeccompVerdict::Kill
         };
     }
 
