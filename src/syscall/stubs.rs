@@ -7,24 +7,11 @@ use alloc::string::String;
 use crate::fs::path::resolve_path;
 use crate::proc::scheduler;
 
-// Named errno helpers (defined in syscall::errno, visible via super::).
-use super::errno::{ebadf, efault, einval, enosys, erange};
+// Named errno helpers — all sourced from the shared errno module.
+use super::errno::{ebadf, efault, einval, enosys, enotsup, erange, esrch};
 
 // Named signal numbers.
 use super::signal_nr::{SIGKILL, SIGSTOP};
-
-/// ENOTSUP (-95): operation not supported on socket (fchmodat + AT_SYMLINK_NOFOLLOW).
-/// Not in the shared errno module yet, so defined locally until it is added.
-#[inline(always)]
-fn enotsup() -> isize { -95 }
-
-/// ESRCH (-3): no such process.
-#[inline(always)]
-fn esrch() -> isize { -3 }
-
-/// ERANGE (-34): result too large (getcwd buffer too small).
-#[inline(always)]
-fn erange() -> isize { -34 }
 
 pub(super) const AT_FDCWD_STUBS: i32 = -100;
 
@@ -138,28 +125,20 @@ pub(super) fn sys_mknodat_impl(dirfd: i32, path_va: usize, mode: u32, dev: u64) 
 
     match mode & S_IFMT {
         S_IFIFO => {
-            // Named pipe: place a FIFO inode in the VFS so open(O_RDONLY) can
-            // rendezvous with a future open(O_WRONLY) on the same path.
             crate::fs::pipe::create_named_pipe(&path, mode & !S_IFMT)
         }
         S_IFSOCK => {
-            // Socket node: used by AF_UNIX bind(2).  The kernel socket itself
-            // is not created here; we only anchor the path token in the VFS.
             crate::fs::vfs_ops::create_socket_node(&path, mode & !S_IFMT)
         }
         S_IFREG if dev == 0 => {
-            // mknod(path, S_IFREG, 0) == creat(path, mode) per POSIX.
             crate::fs::vfs_ops::create_regular(&path, mode & !S_IFMT)
         }
         S_IFCHR | S_IFBLK => {
-            // Device node: decode the dev_t encoding used by Linux x86-64:
-            //   major = bits[19:8]  (12 bits)
-            //   minor = bits[7:0] | bits[31:20]  (20 bits)
             let major = ((dev >> 8) & 0xfff) as u32;
             let minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
             crate::fs::vfs_ops::mknod(&path, mode, major, minor)
         }
-        _ => einval(), // S_IFDIR or reserved type bits
+        _ => einval(),
     }
 }
 
@@ -340,11 +319,6 @@ pub(super) fn sys_getdents64_impl(fd: usize, buf_va: usize, count: usize) -> isi
 // ─── fchownat / fchown ───────────────────────────────────────────────────────
 
 /// NR 260  fchownat(dirfd, path_va, uid, gid, flags)
-///
-/// AT_EMPTY_PATH (0x1000) + empty path: operate on dirfd inode directly.
-/// AT_SYMLINK_NOFOLLOW (0x100): lchown semantics — stop at final symlink.
-/// uid/gid == u32::MAX is the POSIX "don't change" sentinel; passed through
-/// to the VFS which handles it.
 pub(super) fn sys_fchownat_impl(
     dirfd: i32, path_va: usize, uid: u32, gid: u32, flags: i32,
 ) -> isize {
@@ -383,13 +357,9 @@ pub(super) fn sys_fchown_impl(fd: usize, uid: u32, gid: u32) -> isize {
 // ─── fchmodat / fchmod ───────────────────────────────────────────────────────
 
 /// NR 268  fchmodat(dirfd, path_va, mode, flags)
-///
-/// AT_SYMLINK_NOFOLLOW is not supported for chmod on Linux (returns ENOTSUP).
-/// Only flags == 0 is accepted.
 pub(super) fn sys_fchmodat_impl(dirfd: i32, path_va: usize, mode: u32, flags: i32) -> isize {
     const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
     if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        // Mirrors Linux fchmodat(2) + NOFOLLOW behaviour: ENOTSUP.
         return enotsup();
     }
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
@@ -408,48 +378,16 @@ pub(super) fn sys_fchmod_impl(fd: usize, mode: u32) -> isize {
     }
 }
 
-// ─── remap_file_pages ────────────────────────────────────────────────────────
+// ─── remap_file_pages / kexec / bpf / userfaultfd ─────────────────────────────────────────────
 
-/// NR 216  remap_file_pages — deprecated since Linux 3.16, non-linear file
-/// mappings removed in Linux 4.0.  Return ENOSYS so callers fall back to
-/// standard mmap(2).
 pub(super) fn sys_remap_file_pages_impl() -> isize { enosys() }
-
-// ─── kexec_file_load / bpf / userfaultfd ─────────────────────────────────────
-
-/// NR 320  kexec_file_load — booting a second kernel image is not applicable
-/// to RustOS.  ENOSYS causes kexec-tools to abort gracefully.
-pub(super) fn sys_kexec_file_load_impl() -> isize { enosys() }
-
-/// NR 321  bpf(cmd, attr, size) — BPF subsystem not implemented.
-///
-/// ENOSYS is intentional: it causes glibc/libseccomp to skip BPF-based
-/// seccomp and fall back to classic mode.  EPERM would be misread as
-/// "kernel has BPF but caller lacks CAP_BPF".
-pub(super) fn sys_bpf_impl() -> isize { enosys() }
-
-/// NR 323  userfaultfd(flags) — user-space page-fault handling not implemented.
-///
-/// ENOSYS causes liburing / Go runtime to detect absence and skip the UFFD
-/// code path.  EPERM would cause confusion as the runtime would think the
-/// feature exists but is permission-denied.
-pub(super) fn sys_userfaultfd_impl() -> isize { enosys() }
+pub(super) fn sys_kexec_file_load_impl()  -> isize { enosys() }
+pub(super) fn sys_bpf_impl()              -> isize { enosys() }
+pub(super) fn sys_userfaultfd_impl()      -> isize { enosys() }
 
 // ─── ptrace ──────────────────────────────────────────────────────────────────
 
 /// NR 101  ptrace(request, pid, addr, data)
-///
-/// Full implementation covering:
-///   PTRACE_TRACEME, PTRACE_ATTACH, PTRACE_DETACH, PTRACE_CONT,
-///   PTRACE_SINGLESTEP, PTRACE_SYSCALL, PTRACE_KILL,
-///   PTRACE_PEEKTEXT/DATA/USER, PTRACE_POKETEXT/DATA/USER,
-///   PTRACE_GETREGS, PTRACE_SETREGS,
-///   PTRACE_SETOPTIONS, PTRACE_GETEVENTMSG, PTRACE_GETSIGINFO.
-///
-/// Cross-process memory access uses Paging::virt_to_phys_cr3, the same
-/// mechanism as process_vm_readv/writev.  Register access uses
-/// proc::ptrace::{build_user_regs_pub, apply_user_regs_pub} which operate
-/// on the saved kernel stack frame.
 pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
     use crate::arch::api::Paging;
     use crate::mm::pmm::PAGE_SIZE;
@@ -470,7 +408,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
     let caller = crate::proc::scheduler::current_pid();
 
     match request {
-        // ── PTRACE_TRACEME ───────────────────────────────────────────────────
         PTRACE_TRACEME => {
             let ppid = crate::proc::scheduler::current_ppid();
             crate::proc::scheduler::with_proc_mut(caller, |p, _| {
@@ -481,7 +418,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_ATTACH ────────────────────────────────────────────────────
         PTRACE_ATTACH => {
             let target = pid as usize;
             if crate::proc::scheduler::with_proc(target, |_| ()).is_none() {
@@ -496,7 +432,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_DETACH ────────────────────────────────────────────────────
         PTRACE_DETACH => {
             let target = pid as usize;
             crate::proc::scheduler::with_proc_mut(target, |p, _| {
@@ -509,7 +444,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_CONT / PTRACE_SYSCALL ─────────────────────────────────────
         PTRACE_CONT | PTRACE_SYSCALL => {
             let target = pid as usize;
             crate::proc::scheduler::with_proc_mut(target, |p, _| {
@@ -522,14 +456,13 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
                 p.ptrace_state = PtraceState::Tracee {
                     tracer, options, in_syscall_stop: in_syscall,
                 };
-                // Clear TF (trap flag) on resume unless we need single-step.
                 #[cfg(target_arch = "x86_64")]
                 if let Some(kstack) = p.kstack_top {
                     let f = unsafe {
                         core::slice::from_raw_parts_mut(
                             (kstack - FRAME_SZ) as *mut usize, 17)
                     };
-                    f[14] &= !(1usize << 8); // F_R11 = EFLAGS on SYSRET path
+                    f[14] &= !(1usize << 8);
                 }
             }).unwrap_or(());
             if data != 0 { crate::proc::signal::send_signal(pid as usize, data as i32); }
@@ -537,7 +470,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_SINGLESTEP ────────────────────────────────────────────────
         PTRACE_SINGLESTEP => {
             let target = pid as usize;
             crate::proc::scheduler::with_proc_mut(target, |p, _| {
@@ -547,7 +479,7 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
                         core::slice::from_raw_parts_mut(
                             (kstack - FRAME_SZ) as *mut usize, 17)
                     };
-                    f[14] |= 1usize << 8; // set TF in EFLAGS
+                    f[14] |= 1usize << 8;
                 }
                 let (tracer, options) = match p.ptrace_state {
                     PtraceState::Stopped { tracer, options, .. } => (tracer, options),
@@ -563,16 +495,11 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_KILL ──────────────────────────────────────────────────────
         PTRACE_KILL => {
             crate::proc::signal::send_signal(pid as usize, SIGKILL);
             0
         }
 
-        // ── PTRACE_PEEKTEXT / PTRACE_PEEKDATA ────────────────────────────────
-        // Both read one machine word from the tracee's virtual address space.
-        // The word is returned as the syscall result; *data is also written for
-        // old-ABI compat.
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
             if addr & (core::mem::size_of::<usize>() - 1) != 0 { return einval(); }
             let remote_cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
@@ -592,7 +519,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             word as isize
         }
 
-        // ── PTRACE_POKETEXT / PTRACE_POKEDATA ────────────────────────────────
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
             if addr & (core::mem::size_of::<usize>() - 1) != 0 { return einval(); }
             let remote_cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
@@ -610,8 +536,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_PEEKUSER ──────────────────────────────────────────────────
-        // Read one 8-byte slot from the tracee's user_regs_struct by byte offset.
         PTRACE_PEEKUSER => {
             if addr & 7 != 0 || addr + 8 > USER_REGS_BYTES { return einval(); }
             let slot = addr / 8;
@@ -627,7 +551,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             val as isize
         }
 
-        // ── PTRACE_POKEUSER ──────────────────────────────────────────────────
         PTRACE_POKEUSER => {
             if addr & 7 != 0 || addr + 8 > USER_REGS_BYTES { return einval(); }
             let slot = addr / 8;
@@ -644,15 +567,22 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         }
 
         // ── PTRACE_GETREGS ───────────────────────────────────────────────────
+        //
+        // Previously: `core::mem::transmute(regs)` to get [u8; UREG_COUNT*8].
+        // Replaced with a safe loop: iterate the [u64; UREG_COUNT] array and
+        // copy each element's to_ne_bytes() into the stack buffer.  Identical
+        // result, no UB risk, no transmute.
         PTRACE_GETREGS => {
             let regs_opt = crate::proc::scheduler::with_proc(pid as usize, |p| {
                 p.kstack_top.map(|ks| build_user_regs_pub(ks, p.fs_base))
             });
             match regs_opt {
                 Some(Some(regs)) => {
-                    let bytes: [u8; UREG_COUNT * 8] = unsafe {
-                        core::mem::transmute(regs)
-                    };
+                    let mut bytes = [0u8; UREG_COUNT * 8];
+                    for (i, &reg) in regs.iter().enumerate() {
+                        let off = i * 8;
+                        bytes[off..off + 8].copy_from_slice(&reg.to_ne_bytes());
+                    }
                     if copy_to_user(data, &bytes).is_err() { return efault(); }
                     0
                 }
@@ -661,10 +591,20 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         }
 
         // ── PTRACE_SETREGS ───────────────────────────────────────────────────
+        //
+        // Previously: `core::mem::transmute(bytes)` to get [u64; UREG_COUNT].
+        // Replaced with a safe loop: read UREG_COUNT * 8 bytes from user space,
+        // then reconstruct each u64 from its 8-byte chunk via from_ne_bytes.
         PTRACE_SETREGS => {
             let mut bytes = [0u8; UREG_COUNT * 8];
             if copy_from_user(&mut bytes, data).is_err() { return efault(); }
-            let regs: [u64; UREG_COUNT] = unsafe { core::mem::transmute(bytes) };
+            let mut regs = [0u64; UREG_COUNT];
+            for i in 0..UREG_COUNT {
+                let off = i * 8;
+                regs[i] = u64::from_ne_bytes(
+                    bytes[off..off + 8].try_into().unwrap_or([0u8; 8])
+                );
+            }
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
                 if let Some(ks) = p.kstack_top {
                     apply_user_regs_pub(ks, &regs);
@@ -673,7 +613,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_SETOPTIONS ────────────────────────────────────────────────
         PTRACE_SETOPTIONS => {
             let opts = (data as u64) & PTRACE_O_MASK;
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
@@ -684,7 +623,6 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_GETEVENTMSG ───────────────────────────────────────────────
         PTRACE_GETEVENTMSG => {
             let msg = crate::proc::scheduler::with_proc(pid as usize, |p| {
                 p.ptrace_event_msg
@@ -693,13 +631,12 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_GETSIGINFO ────────────────────────────────────────────────
         PTRACE_GETSIGINFO => {
             let si = crate::proc::signal::get_pending_siginfo(pid as usize);
             if copy_to_user(data, &si).is_err() { return efault(); }
             0
         }
 
-        _ => einval(), // unrecognized ptrace request
+        _ => einval(),
     }
 }
