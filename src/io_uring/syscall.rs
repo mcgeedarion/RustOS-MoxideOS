@@ -6,6 +6,18 @@
 //! | 426 | `io_uring_enter`   | Submit SQEs, optionally wait for CQEs        |
 //! | 427 | `io_uring_register`| Register/unregister buffers, fds, eventfd    |
 //!
+//! ## Blocking model (`io_uring_enter` + GETEVENTS)
+//!
+//! When `min_complete > 0` and `IORING_ENTER_GETEVENTS` is set, the task
+//! sleeps on `ring.cq_wq` until enough CQEs are available.  Each call to
+//! `ring.post_cqe()` wakes the queue, so the task unblocks with O(1) latency
+//! instead of burning CPU in a spin loop.
+//!
+//! Wakeup sources:
+//!   - A CQE is posted (`post_cqe` → `cq_wq.wake(CQ_READY)`)
+//!   - Deadline elapsed (`WaitQueue::wait` returns `WakeReason::Timeout`)
+//!   - Signal delivered (`WakeReason::Cancelled`) → returns `-EINTR`
+//!
 //! ## `io_uring_register` opcodes
 //!
 //! | Value | Name                           |
@@ -26,7 +38,9 @@ use crate::io_uring::ops;
 use crate::io_uring::ring::{self, IoUringParams};
 use crate::mm::mmap;
 use crate::proc::scheduler;
+use crate::sync::wait_queue::{WakeReason, CancellationToken};
 use crate::uaccess::{copy_from_user, copy_to_user};
+use alloc::sync::Arc;
 
 // ── IORING_REGISTER opcodes ───────────────────────────────────────────────────
 
@@ -41,13 +55,16 @@ const IORING_REGISTER_IOWQ_AFF:          u32 = 7;
 const IORING_UNREGISTER_IOWQ_AFF:        u32 = 8;
 const IORING_REGISTER_IOWQ_MAX_WORKERS:  u32 = 9;
 
+#[inline]
+fn current_cancel() -> Option<Arc<CancellationToken>> {
+    let pid = scheduler::current_pid();
+    scheduler::task_cancel_token(pid)
+}
+
 /// `io_uring_setup(entries, params_va)` → fd
-///
-/// Allocates ring memory, maps it into the calling process, and writes
-/// `IoUringParams` back to userspace.
 pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
-    if entries == 0 || entries > ring::MAX_ENTRIES { return -22; } // EINVAL
-    if params_va == 0 { return -14; }                              // EFAULT
+    if entries == 0 || entries > ring::MAX_ENTRIES { return -22; }
+    if params_va == 0 { return -14; }
 
     let mut params = IoUringParams::default();
     if copy_from_user(params_va, unsafe {
@@ -68,7 +85,7 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
         Some(fd) => fd,
         None => {
             ring::free_ring(ring_idx);
-            return -24; // EMFILE
+            return -24;
         }
     };
 
@@ -118,6 +135,11 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
 }
 
 /// `io_uring_enter(fd, to_submit, min_complete, flags, sig_va, sig_sz)` → submitted
+///
+/// Phase 1: drain and execute SQEs.
+/// Phase 2 (GETEVENTS): sleep on `cq_wq` until `min_complete` CQEs are ready.
+///   - Wakes on each `post_cqe()` call; re-checks count; sleeps again if needed.
+///   - Returns `-EINTR` (-4) if a signal cancels the wait.
 pub fn sys_io_uring_enter(
     fd:           usize,
     to_submit:    u32,
@@ -129,30 +151,43 @@ pub fn sys_io_uring_enter(
     let pid = scheduler::current_pid() as u32;
     let Some(ring_idx) = ring::ring_idx_for_fd(pid, fd) else { return -9; };
 
-    // ── 1. Drain and execute SQEs ─────────────────────────────────────────────
-    let sqes         = ring::with_ring(ring_idx, |r| r.drain_sq()).unwrap_or_default();
-    let submit_count = (to_submit as usize).min(sqes.len());
+    // ── Phase 1: submit SQEs ──────────────────────────────────────────────────
+    let sqes          = ring::with_ring(ring_idx, |r| r.drain_sq()).unwrap_or_default();
+    let submit_count  = (to_submit as usize).min(sqes.len());
     let mut submitted = 0u32;
 
     for sqe in sqes.iter().take(submit_count) {
         let (res, cqe_flags) = ops::dispatch(sqe, ring_idx);
+        // post_cqe wakes cq_wq internally — no extra wake() needed here.
         ring::with_ring(ring_idx, |r| r.post_cqe(sqe.user_data, res, cqe_flags));
         submitted += 1;
     }
 
-    // ── 2. Wait for min_complete CQEs (GETEVENTS) ─────────────────────────────
+    // ── Phase 2: wait for completions (GETEVENTS) ─────────────────────────────
     if flags & ops::IORING_ENTER_GETEVENTS != 0 && min_complete > 0 {
-        let mut spins = 0u32;
+        // Clone the wait queue Arc before entering the wait so we never hold
+        // the RING_TABLE lock while sleeping.
+        let cq_wq = match ring::cq_wq_for(ring_idx) {
+            Some(wq) => wq,
+            None     => return -9,
+        };
+        let cancel = current_cancel();
+        let cancel_ref = cancel.as_deref();
+        // 5-second ceiling matches the rest of the poll subsystem.
+        let deadline_ns = crate::time::monotonic_ns() + 5_000_000_000;
+
         loop {
-            let available = ring::with_ring(ring_idx, |r| {
-                let hdr = unsafe { &*(r.cq_pa as *const super::ring_pub::CqRingHdrPub) };
-                hdr.tail.load(core::sync::atomic::Ordering::Acquire)
-                    .wrapping_sub(hdr.head.load(core::sync::atomic::Ordering::Acquire))
-            }).unwrap_or(0);
+            let available = ring::with_ring(ring_idx, |r| r.cq_available())
+                .unwrap_or(0);
             if available >= min_complete { break; }
-            spins += 1;
-            if spins > 1_000_000 { break; }
-            core::hint::spin_loop();
+
+            // Sleep until a CQE is posted, deadline fires, or signal arrives.
+            let reason = cq_wq.wait(0x0001 /*CQ_READY*/, cancel_ref, Some(deadline_ns));
+            match reason {
+                WakeReason::Cancelled => return -4, // EINTR
+                WakeReason::Timeout   => break,     // deadline — return what we have
+                WakeReason::Ready(_)  => {}          // re-check count
+            }
         }
     }
 
@@ -194,7 +229,7 @@ pub fn sys_io_uring_register(
 
         IORING_REGISTER_FILES => {
             if arg_va == 0 || nr == 0 { return -22; }
-            let mut fds   = alloc::vec![0i32; nr];
+            let mut fds = alloc::vec![0i32; nr];
             let bytes = unsafe {
                 core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, nr * 4)
             };
@@ -211,7 +246,6 @@ pub fn sys_io_uring_register(
             let mut efd_bytes = [0u8; 4];
             if copy_from_user(&mut efd_bytes, arg_va).is_err() { return -14; }
             let _efd = i32::from_ne_bytes(efd_bytes);
-            // Stored for future CQE-post notification; no-op for now.
             0
         }
 
@@ -239,11 +273,10 @@ pub fn sys_io_uring_register(
             }).unwrap_or(-9)
         }
 
-        // I/O-worker affinity / max-workers — no-op stubs.
         IORING_REGISTER_IOWQ_AFF | IORING_UNREGISTER_IOWQ_AFF
         | IORING_REGISTER_IOWQ_MAX_WORKERS => 0,
 
-        _ => -22, // EINVAL
+        _ => -22,
     }
 }
 
