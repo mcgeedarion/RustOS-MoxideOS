@@ -45,36 +45,40 @@ struct FdtHeader {
     _version:          u32,
     _last_comp:        u32,
     _boot_cpuid:       u32,
-    _size_dt_strings:  u32,
-    _size_dt_struct:   u32,
+    size_dt_strings:   u32,
+    size_dt_struct:    u32,
 }
 
 impl FdtHeader {
     unsafe fn from_ptr(ptr: usize) -> &'static FdtHeader {
         &*(ptr as *const FdtHeader)
     }
-    fn magic(&self)          -> u32 { u32::from_be(self.magic)          }
-    fn totalsize(&self)      -> u32 { u32::from_be(self.totalsize)      }
-    fn off_dt_struct(&self)  -> u32 { u32::from_be(self.off_dt_struct)  }
-    fn off_dt_strings(&self) -> u32 { u32::from_be(self.off_dt_strings) }
+    fn magic(&self)           -> u32 { u32::from_be(self.magic)           }
+    fn totalsize(&self)       -> u32 { u32::from_be(self.totalsize)       }
+    fn off_dt_struct(&self)   -> u32 { u32::from_be(self.off_dt_struct)   }
+    fn off_dt_strings(&self)  -> u32 { u32::from_be(self.off_dt_strings)  }
+    fn size_dt_struct(&self)  -> u32 { u32::from_be(self.size_dt_struct)  }
+    fn size_dt_strings(&self) -> u32 { u32::from_be(self.size_dt_strings) }
 }
 
 // ── Big-endian integer helpers ───────────────────────────────────────────────
 
 #[inline]
-fn be32(b: &[u8], off: usize) -> u32 {
-    u32::from_be_bytes([b[off], b[off+1], b[off+2], b[off+3]])
+fn be32(b: &[u8], off: usize) -> Option<u32> {
+    let s = b.get(off..off + 4)?;
+    Some(u32::from_be_bytes(s.try_into().unwrap()))
 }
+
 fn cstr(bytes: &[u8], off: usize) -> &str {
-    let end = bytes[off..].iter().position(|&c| c == 0).unwrap_or(0);
+    if off >= bytes.len() { return ""; }
+    let end = bytes[off..].iter().position(|&c| c == 0).unwrap_or(bytes.len() - off);
     core::str::from_utf8(&bytes[off..off + end]).unwrap_or("")
 }
+
 #[inline]
-fn be64(b: &[u8], off: usize) -> u64 {
-    u64::from_be_bytes([
-        b[off],b[off+1],b[off+2],b[off+3],
-        b[off+4],b[off+5],b[off+6],b[off+7],
-    ])
+fn be64(b: &[u8], off: usize) -> Option<u64> {
+    let s = b.get(off..off + 8)?;
+    Some(u64::from_be_bytes(s.try_into().unwrap()))
 }
 
 // ── Kernel end symbol ────────────────────────────────────────────────────────
@@ -98,20 +102,48 @@ enum CpusChild { None, Cpu }
 
 // ── Shared walker primitive ───────────────────────────────────────────────────
 
-/// Validate FDT magic and return (blob slice, structs offset, strings offset).
+/// Validate FDT magic, bounds-check all header offsets, and return
+/// (blob slice, structs slice, strings slice).
 /// Returns `None` and prints a diagnostic if the blob is invalid.
-unsafe fn open_fdt(fdt_ptr: usize) -> Option<(&'static [u8], usize, usize)> {
+unsafe fn open_fdt(fdt_ptr: usize) -> Option<(&'static [u8], &'static [u8], &'static [u8])> {
     if fdt_ptr == 0 { return None; }
     let hdr = FdtHeader::from_ptr(fdt_ptr);
     if hdr.magic() != FDT_MAGIC {
         crate::println!("fdt: invalid magic {:#010x} at {:#x}", hdr.magic(), fdt_ptr);
         return None;
     }
-    let total   = hdr.totalsize() as usize;
+    let total = hdr.totalsize() as usize;
+    if total < core::mem::size_of::<FdtHeader>() {
+        crate::println!("fdt: totalsize {} smaller than header", total);
+        return None;
+    }
+    let s_off    = hdr.off_dt_struct()   as usize;
+    let str_off  = hdr.off_dt_strings()  as usize;
+    let s_size   = hdr.size_dt_struct()  as usize;
+    let str_size = hdr.size_dt_strings() as usize;
+    // Alignment: struct section must be 4-byte aligned
+    if s_off & 3 != 0 {
+        crate::println!("fdt: struct offset misaligned: {:#x}", s_off);
+        return None;
+    }
+    // Both sections must fit within the blob
+    if s_off.saturating_add(s_size) > total {
+        crate::println!("fdt: struct section [{:#x}..+{:#x}] exceeds totalsize {}", s_off, s_size, total);
+        return None;
+    }
+    if str_off.saturating_add(str_size) > total {
+        crate::println!("fdt: strings section [{:#x}..+{:#x}] exceeds totalsize {}", str_off, str_size, total);
+        return None;
+    }
+    // Struct section must hold at least one token
+    if s_size < 4 {
+        crate::println!("fdt: struct section too small: {} bytes", s_size);
+        return None;
+    }
     let blob    = core::slice::from_raw_parts(fdt_ptr as *const u8, total);
-    let s_off   = hdr.off_dt_struct()  as usize;
-    let str_off = hdr.off_dt_strings() as usize;
-    Some((blob, s_off, str_off))
+    let structs = &blob[s_off .. s_off + s_size];
+    let strings = &blob[str_off .. str_off + str_size];
+    Some((blob, structs, strings))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -130,13 +162,11 @@ unsafe fn open_fdt(fdt_ptr: usize) -> Option<(&'static [u8], usize, usize)> {
 /// # Safety
 /// `fdt_ptr` must be the physical address of a valid DTB as passed by OpenSBI.
 pub unsafe fn fdt_phase1(fdt_ptr: usize) {
-    let (blob, s_off, str_off) = match open_fdt(fdt_ptr) {
+    let (blob, structs, strings) = match open_fdt(fdt_ptr) {
         Some(v) => v,
         None    => return,
     };
-    let total   = blob.len();
-    let structs = &blob[s_off..];
-    let strings = &blob[str_off..];
+    let total = blob.len();
     crate::println!("fdt: phase1 blob at {:#x}, {} bytes", fdt_ptr, total);
 
     let mut pos:           usize = 0;
@@ -160,16 +190,20 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
 
     loop {
         if pos + 4 > structs.len() { break; }
-        let token = be32(structs, pos); pos += 4;
+        let token = match be32(structs, pos) { Some(t) => t, None => break };
+        pos += 4;
 
         match token {
             FDT_BEGIN_NODE => {
                 let name_start = pos;
-                let name_end   = structs[pos..].iter().position(|&c| c == 0)
-                                     .unwrap_or(0) + pos + 1;
-                let padded     = (name_end + 3) & !3;
-                let node_name  = core::str::from_utf8(&structs[name_start..name_end - 1])
-                                     .unwrap_or("");
+                let rel = match structs[pos..].iter().position(|&c| c == 0) {
+                    Some(r) => r,
+                    None    => break, // malformed: no null terminator
+                };
+                let name_end = pos + rel + 1;
+                let padded   = (name_end + 3) & !3;
+                let node_name = core::str::from_utf8(&structs[name_start..name_start + rel])
+                                    .unwrap_or("");
                 pos = padded;
 
                 match depth {
@@ -238,8 +272,12 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
 
             FDT_PROP => {
                 if pos + 8 > structs.len() { break; }
-                let prop_len  = be32(structs, pos) as usize; pos += 4;
-                let name_off  = be32(structs, pos) as usize; pos += 4;
+                let prop_len = match be32(structs, pos) { Some(v) => v as usize, None => break };
+                pos += 4;
+                let name_off = match be32(structs, pos) { Some(v) => v as usize, None => break };
+                pos += 4;
+                // Reject out-of-bounds string offsets before calling cstr
+                if name_off >= strings.len() { break; }
                 let prop_name = cstr(strings, name_off);
                 let prop_data = if pos + prop_len <= structs.len() {
                     &structs[pos..pos + prop_len]
@@ -250,8 +288,8 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
                 if in_memory && prop_name == "reg" {
                     let mut i = 0usize;
                     while i + 16 <= prop_data.len() {
-                        let base = be64(prop_data, i)     as usize;
-                        let size = be64(prop_data, i + 8) as usize;
+                        let base = match be64(prop_data, i)     { Some(v) => v as usize, None => break };
+                        let size = match be64(prop_data, i + 8) { Some(v) => v as usize, None => break };
                         i += 16;
                         if size == 0 { continue; }
                         let free_start = if base < kernel_end_pa { kernel_end_pa } else { base };
@@ -282,14 +320,18 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
                 if in_chosen {
                     match prop_name {
                         "linux,initrd-start" => {
-                            initrd_start = if prop_data.len() == 8 { be64(prop_data, 0) }
-                                           else if prop_data.len() == 4 { be32(prop_data, 0) as u64 }
-                                           else { 0 };
+                            initrd_start = if prop_data.len() == 8 {
+                                be64(prop_data, 0).unwrap_or(0)
+                            } else if prop_data.len() == 4 {
+                                be32(prop_data, 0).unwrap_or(0) as u64
+                            } else { 0 };
                         }
                         "linux,initrd-end" => {
-                            initrd_end = if prop_data.len() == 8 { be64(prop_data, 0) }
-                                         else if prop_data.len() == 4 { be32(prop_data, 0) as u64 }
-                                         else { 0 };
+                            initrd_end = if prop_data.len() == 8 {
+                                be64(prop_data, 0).unwrap_or(0)
+                            } else if prop_data.len() == 4 {
+                                be32(prop_data, 0).unwrap_or(0) as u64
+                            } else { 0 };
                         }
                         _ => {}
                     }
@@ -298,15 +340,15 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
                 // /soc/plic reg
                 if soc_child == SocChild::Plic && prop_name == "reg" {
                     if prop_data.len() >= 16 {
-                        let addr_hi = be32(prop_data, 0) as usize;
-                        let addr_lo = be32(prop_data, 4) as usize;
+                        let addr_hi = be32(prop_data, 0).unwrap_or(0) as usize;
+                        let addr_lo = be32(prop_data, 4).unwrap_or(0) as usize;
                         let addr    = (addr_hi << 32) | addr_lo;
                         if addr != 0 { plic_base = addr; }
                     } else if prop_data.len() >= 8 {
-                        let addr = be64(prop_data, 0) as usize;
+                        let addr = be64(prop_data, 0).unwrap_or(0) as usize;
                         if addr != 0 { plic_base = addr; }
                     } else if prop_data.len() >= 4 {
-                        let addr = be32(prop_data, 0) as usize;
+                        let addr = be32(prop_data, 0).unwrap_or(0) as usize;
                         if addr != 0 { plic_base = addr; }
                     }
                 }
@@ -315,7 +357,7 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
                 if cpus_child == CpusChild::Cpu {
                     match prop_name {
                         "reg" => {
-                            if prop_data.len() >= 4 { cpu_reg = be32(prop_data, 0); }
+                            if let Some(v) = be32(prop_data, 0) { cpu_reg = v; }
                         }
                         "status" => {
                             let s = core::str::from_utf8(
@@ -359,31 +401,33 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
 /// # Safety
 /// Same requirements as `fdt_phase1`.
 pub unsafe fn fdt_phase2(fdt_ptr: usize) {
-    let (blob, s_off, str_off) = match open_fdt(fdt_ptr) {
+    let (_blob, structs, strings) = match open_fdt(fdt_ptr) {
         Some(v) => v,
         None    => return,
     };
-    let structs = &blob[s_off..];
-    let strings = &blob[str_off..];
     crate::println!("fdt: phase2 probing virtio-mmio devices");
 
-    let mut pos:      usize = 0;
-    let mut depth:    usize = 0;
-    let mut in_virtio:bool  = false;
+    let mut pos:       usize = 0;
+    let mut depth:     usize = 0;
+    let mut in_virtio: bool  = false;
     let mut vmmio: VirtioMmioNode = VirtioMmioNode { base: 0, irq: 0, is_virtio: false };
 
     loop {
         if pos + 4 > structs.len() { break; }
-        let token = be32(structs, pos); pos += 4;
+        let token = match be32(structs, pos) { Some(t) => t, None => break };
+        pos += 4;
 
         match token {
             FDT_BEGIN_NODE => {
                 let name_start = pos;
-                let name_end   = structs[pos..].iter().position(|&c| c == 0)
-                                     .unwrap_or(0) + pos + 1;
-                let padded     = (name_end + 3) & !3;
-                let node_name  = core::str::from_utf8(&structs[name_start..name_end - 1])
-                                     .unwrap_or("");
+                let rel = match structs[pos..].iter().position(|&c| c == 0) {
+                    Some(r) => r,
+                    None    => break, // malformed: no null terminator
+                };
+                let name_end = pos + rel + 1;
+                let padded   = (name_end + 3) & !3;
+                let node_name = core::str::from_utf8(&structs[name_start..name_start + rel])
+                                    .unwrap_or("");
                 pos = padded;
 
                 if depth == 1 && node_name.starts_with("virtio_mmio@") {
@@ -410,8 +454,12 @@ pub unsafe fn fdt_phase2(fdt_ptr: usize) {
 
             FDT_PROP => {
                 if pos + 8 > structs.len() { break; }
-                let prop_len  = be32(structs, pos) as usize; pos += 4;
-                let name_off  = be32(structs, pos) as usize; pos += 4;
+                let prop_len = match be32(structs, pos) { Some(v) => v as usize, None => break };
+                pos += 4;
+                let name_off = match be32(structs, pos) { Some(v) => v as usize, None => break };
+                pos += 4;
+                // Reject out-of-bounds string offsets before calling cstr
+                if name_off >= strings.len() { break; }
                 let prop_name = cstr(strings, name_off);
                 let prop_data = if pos + prop_len <= structs.len() {
                     &structs[pos..pos + prop_len]
@@ -427,13 +475,12 @@ pub unsafe fn fdt_phase2(fdt_ptr: usize) {
                             vmmio.is_virtio = s == "virtio,mmio";
                         }
                         "reg" => {
-                            if prop_data.len() >= 8 {
-                                let addr = be64(prop_data, 0) as usize;
-                                if addr != 0 { vmmio.base = addr; }
+                            if let Some(addr) = be64(prop_data, 0) {
+                                if addr != 0 { vmmio.base = addr as usize; }
                             }
                         }
                         "interrupts" => {
-                            if prop_data.len() >= 4 { vmmio.irq = be32(prop_data, 0); }
+                            if let Some(irq) = be32(prop_data, 0) { vmmio.irq = irq; }
                         }
                         _ => {}
                     }
