@@ -385,11 +385,87 @@ pub(super) fn sys_kexec_file_load_impl()  -> isize { enosys() }
 pub(super) fn sys_bpf_impl()              -> isize { enosys() }
 pub(super) fn sys_userfaultfd_impl()      -> isize { enosys() }
 
+// ─── ptrace helpers ──────────────────────────────────────────────────────────
+
+/// Validate that `addr` is naturally aligned for a `usize` read/write.
+#[inline]
+fn ptrace_validate_word_addr(addr: usize) -> Result<(), isize> {
+    if addr & (core::mem::size_of::<usize>() - 1) != 0 {
+        Err(einval())
+    } else {
+        Ok(())
+    }
+}
+
+/// Validate that `addr` is 8-byte-aligned and fits within the user_regs block.
+#[inline]
+fn ptrace_validate_ureg_slot(addr: usize, user_regs_bytes: usize) -> Result<usize, isize> {
+    if addr & 7 != 0 || addr + 8 > user_regs_bytes {
+        return Err(einval());
+    }
+    Ok(addr / 8)
+}
+
+/// Resolve the page-table physical address for `addr` in the target process's
+/// address space.  Returns `Err(ESRCH)` if the process is not found,
+/// `Err(EFAULT)` if the virtual address is not mapped.
+#[inline]
+fn ptrace_resolve_remote_pa(pid: i32, addr: usize) -> Result<usize, isize> {
+    use crate::arch::api::Paging;
+    use crate::mm::pmm::PAGE_SIZE;
+    let cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
+        Some(cr3) => cr3,
+        None      => return Err(esrch()),
+    };
+    match Paging::virt_to_phys_cr3(cr3, addr) {
+        Some(pa) => Ok(pa + (addr & (PAGE_SIZE - 1))),
+        None     => Err(efault()),
+    }
+}
+
+/// Check that the caller is permitted to trace `target_pid`.
+/// Currently enforces: process must exist; the caller may not trace itself.
+/// Returns `Err(ESRCH)` if the target does not exist,
+/// `Err(EPERM)`  if the caller attempts to trace itself.
+#[inline]
+fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> {
+    use super::errno::eperm;
+    if target_pid as usize == caller { return Err(eperm()); }
+    match crate::proc::scheduler::with_proc(target_pid as usize, |_| ()) {
+        Some(_) => Ok(()),
+        None    => Err(esrch()),
+    }
+}
+
+/// Read `UREG_COUNT` u64 register values from userspace at `va`.
+#[inline]
+fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isize> {
+    let mut bytes = [0u8; N * 8];  // stack-allocates; N is a const
+    if copy_from_user(&mut bytes, va).is_err() { return Err(efault()); }
+    let mut regs = [0u64; N];
+    for i in 0..N {
+        let off = i * 8;
+        regs[i] = u64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap_or([0u8; 8]));
+    }
+    Ok(regs)
+}
+
+/// Write `UREG_COUNT` u64 register values to userspace at `va`.
+#[inline]
+fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Result<(), isize> {
+    let mut bytes = [0u8; N * 8];
+    for (i, &reg) in regs.iter().enumerate() {
+        let off = i * 8;
+        bytes[off..off + 8].copy_from_slice(&reg.to_ne_bytes());
+    }
+    if copy_to_user(va, &bytes).is_err() { return Err(efault()); }
+    Ok(())
+}
+
 // ─── ptrace ──────────────────────────────────────────────────────────────────
 
 /// NR 101  ptrace(request, pid, addr, data)
 pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
-    use crate::arch::api::Paging;
     use crate::mm::pmm::PAGE_SIZE;
     use crate::proc::ptrace::{
         PtraceState,
@@ -403,7 +479,7 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         build_user_regs_pub, apply_user_regs_pub,
     };
     const PTRACE_GETSIGINFO: i32 = 0x4202;
-    const USER_REGS_BYTES: usize = UREG_COUNT * 8;
+    const USER_REGS_BYTES:  usize = UREG_COUNT * 8;
 
     let caller = crate::proc::scheduler::current_pid();
 
@@ -419,16 +495,13 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         }
 
         PTRACE_ATTACH => {
-            let target = pid as usize;
-            if crate::proc::scheduler::with_proc(target, |_| ()).is_none() {
-                return esrch();
-            }
-            crate::proc::scheduler::with_proc_mut(target, |p, _| {
+            if let Err(e) = ptrace_check_permission(caller, pid) { return e; }
+            crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
                 p.ptrace_state = PtraceState::Tracee {
                     tracer: caller, options: 0, in_syscall_stop: false,
                 };
             }).unwrap_or(());
-            crate::proc::signal::send_signal(target, SIGSTOP);
+            crate::proc::signal::send_signal(pid as usize, SIGSTOP);
             0
         }
 
@@ -501,18 +574,12 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         }
 
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
-            if addr & (core::mem::size_of::<usize>() - 1) != 0 { return einval(); }
-            let remote_cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
-                Some(cr3) => cr3,
-                None      => return esrch(),
+            if let Err(e) = ptrace_validate_word_addr(addr) { return e; }
+            let phys = match ptrace_resolve_remote_pa(pid, addr) {
+                Ok(pa)  => pa,
+                Err(e)  => return e,
             };
-            let pa = match Paging::virt_to_phys_cr3(remote_cr3, addr) {
-                Some(pa) => pa,
-                None     => return efault(),
-            };
-            let word: usize = unsafe {
-                core::ptr::read((pa + (addr & (PAGE_SIZE - 1))) as *const usize)
-            };
+            let word: usize = unsafe { core::ptr::read(phys as *const usize) };
             if data != 0 {
                 if copy_to_user(data, &word.to_le_bytes()).is_err() { return efault(); }
             }
@@ -520,25 +587,20 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         }
 
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
-            if addr & (core::mem::size_of::<usize>() - 1) != 0 { return einval(); }
-            let remote_cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
-                Some(cr3) => cr3,
-                None      => return esrch(),
+            if let Err(e) = ptrace_validate_word_addr(addr) { return e; }
+            let phys = match ptrace_resolve_remote_pa(pid, addr) {
+                Ok(pa)  => pa,
+                Err(e)  => return e,
             };
-            let pa = match Paging::virt_to_phys_cr3(remote_cr3, addr) {
-                Some(pa) => pa,
-                None     => return efault(),
-            };
-            unsafe {
-                core::ptr::write(
-                    (pa + (addr & (PAGE_SIZE - 1))) as *mut usize, data)
-            };
+            unsafe { core::ptr::write(phys as *mut usize, data) };
             0
         }
 
         PTRACE_PEEKUSER => {
-            if addr & 7 != 0 || addr + 8 > USER_REGS_BYTES { return einval(); }
-            let slot = addr / 8;
+            let slot = match ptrace_validate_ureg_slot(addr, USER_REGS_BYTES) {
+                Ok(s)  => s,
+                Err(e) => return e,
+            };
             let val = crate::proc::scheduler::with_proc(pid as usize, |p| {
                 p.kstack_top.map(|ks| {
                     let regs = build_user_regs_pub(ks, p.fs_base);
@@ -552,8 +614,10 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         }
 
         PTRACE_POKEUSER => {
-            if addr & 7 != 0 || addr + 8 > USER_REGS_BYTES { return einval(); }
-            let slot = addr / 8;
+            let slot = match ptrace_validate_ureg_slot(addr, USER_REGS_BYTES) {
+                Ok(s)  => s,
+                Err(e) => return e,
+            };
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
                 if let Some(ks) = p.kstack_top {
                     let mut regs = build_user_regs_pub(ks, p.fs_base);
@@ -566,45 +630,26 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             0
         }
 
-        // ── PTRACE_GETREGS ───────────────────────────────────────────────────
-        //
-        // Previously: `core::mem::transmute(regs)` to get [u8; UREG_COUNT*8].
-        // Replaced with a safe loop: iterate the [u64; UREG_COUNT] array and
-        // copy each element's to_ne_bytes() into the stack buffer.  Identical
-        // result, no UB risk, no transmute.
         PTRACE_GETREGS => {
             let regs_opt = crate::proc::scheduler::with_proc(pid as usize, |p| {
                 p.kstack_top.map(|ks| build_user_regs_pub(ks, p.fs_base))
             });
             match regs_opt {
                 Some(Some(regs)) => {
-                    let mut bytes = [0u8; UREG_COUNT * 8];
-                    for (i, &reg) in regs.iter().enumerate() {
-                        let off = i * 8;
-                        bytes[off..off + 8].copy_from_slice(&reg.to_ne_bytes());
+                    match ptrace_copy_regs_to_user::<UREG_COUNT>(data, &regs) {
+                        Ok(())  => 0,
+                        Err(e)  => e,
                     }
-                    if copy_to_user(data, &bytes).is_err() { return efault(); }
-                    0
                 }
                 _ => esrch(),
             }
         }
 
-        // ── PTRACE_SETREGS ───────────────────────────────────────────────────
-        //
-        // Previously: `core::mem::transmute(bytes)` to get [u64; UREG_COUNT].
-        // Replaced with a safe loop: read UREG_COUNT * 8 bytes from user space,
-        // then reconstruct each u64 from its 8-byte chunk via from_ne_bytes.
         PTRACE_SETREGS => {
-            let mut bytes = [0u8; UREG_COUNT * 8];
-            if copy_from_user(&mut bytes, data).is_err() { return efault(); }
-            let mut regs = [0u64; UREG_COUNT];
-            for i in 0..UREG_COUNT {
-                let off = i * 8;
-                regs[i] = u64::from_ne_bytes(
-                    bytes[off..off + 8].try_into().unwrap_or([0u8; 8])
-                );
-            }
+            let regs = match ptrace_copy_regs_from_user::<UREG_COUNT>(data) {
+                Ok(r)  => r,
+                Err(e) => return e,
+            };
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
                 if let Some(ks) = p.kstack_top {
                     apply_user_regs_pub(ks, &regs);
