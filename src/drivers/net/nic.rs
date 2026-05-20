@@ -1,76 +1,81 @@
 //! NIC abstraction layer.
 //!
-//! Provides a unified `NetworkDevice` trait and a global registry so the
-//! network stack can send/receive frames without caring about the
-//! underlying hardware driver (e1000e, virtio-net, etc.).
+//! Provides a unified `NetworkDevice` trait and a global registry so that
+//! higher layers (TCP/IP stack, DHCP client) can send/receive frames without
+//! knowing which physical driver is backing them.
 
 extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 use spin::Mutex;
 
 // ---------------------------------------------------------------------------
-// Trait
+// NetworkDevice trait
 // ---------------------------------------------------------------------------
 
-/// Minimal NIC interface consumed by the kernel network stack.
+/// Ethernet frame transmit/receive interface.
 pub trait NetworkDevice: Send {
-    /// Transmit a raw Ethernet frame.  Returns Ok(()) on success.
+    /// Transmit a raw Ethernet frame.  `frame` includes the Ethernet header.
+    /// Returns Ok(()) on success or Err on queue-full / hardware error.
     fn send(&mut self, frame: &[u8]) -> Result<(), &'static str>;
 
-    /// Receive one pending Ethernet frame into `buf`.
-    /// Returns Some(len) if a frame was available, None if the RX queue
-    /// is empty.
-    fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
+    /// Poll for a received frame.  Returns Some(Vec<u8>) if a frame is
+    /// waiting, None if the receive queue is empty.
+    fn recv(&mut self) -> Option<Vec<u8>>;
 
-    /// 6-byte MAC address of this NIC.
+    /// 6-byte MAC address of this interface.
     fn mac(&self) -> [u8; 6];
 
-    /// Human-readable driver name (e.g. "e1000e", "virtio-net").
-    fn name(&self) -> &'static str;
+    /// Link speed in Mbit/s, or 0 if unknown / link-down.
+    fn link_speed(&self) -> u32 { 0 }
 
     /// True if the link is up.
     fn link_up(&self) -> bool { true }
 }
 
 // ---------------------------------------------------------------------------
-// Global registry
+// Global device registry
 // ---------------------------------------------------------------------------
 
-static NICS: Mutex<Vec<Box<dyn NetworkDevice>>> = Mutex::new(Vec::new());
+static DEVICES: Mutex<Vec<Box<dyn NetworkDevice>>> = Mutex::new(Vec::new());
 
-/// Register a NIC with the global registry.  Returns the assigned index.
-pub fn register(nic: Box<dyn NetworkDevice>) -> usize {
-    let mut nics = NICS.lock();
-    let idx = nics.len();
-    nics.push(nic);
+/// Register a NIC.  Returns the assigned interface index.
+pub fn register(dev: Box<dyn NetworkDevice>) -> usize {
+    let mut devs = DEVICES.lock();
+    let idx = devs.len();
+    devs.push(dev);
     idx
 }
 
 /// Number of registered NICs.
-pub fn count() -> usize { NICS.lock().len() }
+pub fn count() -> usize {
+    DEVICES.lock().len()
+}
 
-/// Send a frame via NIC `idx`.
+/// Transmit a frame on interface `idx`.
 pub fn send(idx: usize, frame: &[u8]) -> Result<(), &'static str> {
-    NICS.lock().get_mut(idx).ok_or("no such nic")?.send(frame)
+    let mut devs = DEVICES.lock();
+    devs.get_mut(idx).ok_or("no such nic")?.send(frame)
 }
 
-/// Receive a frame from NIC `idx` into `buf`.
-pub fn recv(idx: usize, buf: &mut [u8]) -> Option<usize> {
-    NICS.lock().get_mut(idx)?.recv(buf)
+/// Poll interface `idx` for a received frame.
+pub fn recv(idx: usize) -> Option<Vec<u8>> {
+    let mut devs = DEVICES.lock();
+    devs.get_mut(idx)?.recv()
 }
 
-/// MAC address of NIC `idx`.
+/// MAC address of interface `idx`.
 pub fn mac(idx: usize) -> Option<[u8; 6]> {
-    NICS.lock().get(idx).map(|n| n.mac())
+    DEVICES.lock().get(idx).map(|d| d.mac())
 }
 
-/// Poll all NICs and pass received frames to `handler`.
-pub fn poll_all(handler: impl Fn(usize, &[u8])) {
-    let mut buf = [0u8; 2048];
-    let n = count();
-    for i in 0..n {
-        while let Some(len) = recv(i, &mut buf) {
-            handler(i, &buf[..len]);
+/// Poll all interfaces; returns the first frame found along with its
+/// interface index, or None if all queues are empty.
+pub fn recv_any() -> Option<(usize, Vec<u8>)> {
+    let mut devs = DEVICES.lock();
+    for (i, dev) in devs.iter_mut().enumerate() {
+        if let Some(frame) = dev.recv() {
+            return Some((i, frame));
         }
     }
+    None
 }
