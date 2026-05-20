@@ -38,7 +38,7 @@ Outputs:
 
 ## Boot with QEMU (x86_64)
 
-Add `-initrd initramfs.cpio` to your QEMU flags in `run_qemu.sh`:
+Add `-initrd initramfs.cpio` to your QEMU flags in `run_qemu_x86_64.sh`:
 
 ```bash
 qemu-system-x86_64 \

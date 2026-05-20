@@ -72,7 +72,7 @@
             echo "  Build (x86_64):      cargo build --target x86_64-unknown-none --no-default-features"
             echo "                         -Z build-std=core,alloc,compiler_builtins"
             echo "                         -Z build-std-features=compiler-builtins-mem"
-            echo "  Run QEMU:            ./run_qemu.sh"
+            echo "  Run QEMU:            ./run_qemu_x86_64.sh"
             echo "  Run QEMU (RISC-V):   ./run_qemu_riscv.sh"
             echo ""
           '';

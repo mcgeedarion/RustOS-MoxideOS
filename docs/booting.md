@@ -52,32 +52,32 @@ default boot entry.
 
 ```bash
 # Default — UEFI via OVMF:
-./run_qemu.sh
+./run_qemu_x86_64.sh
 
 # With a virtio-blk disk image:
-./run_qemu.sh disk.img
+./run_qemu_x86_64.sh disk.img
 
 # With GDB stub:
-./run_qemu.sh --gdb
+./run_qemu_x86_64.sh --gdb
 
 # Release build:
-./run_qemu.sh --release
+./run_qemu_x86_64.sh --release
 
 # Legacy multiboot2 (no OVMF needed):
-./run_qemu.sh --multiboot
+./run_qemu_x86_64.sh --multiboot
 
 # Headless smoke test: wait up to 20 seconds for the early UART marker.
-./run_qemu.sh --smoke --timeout 20
+./run_qemu_x86_64.sh --smoke --timeout 20
 
 # Userspace smoke test: require PID 1 to print its pass marker.
-./run_qemu.sh --smoke --smoke-marker '[init] TEST PASS: userspace_init' --timeout 30
+./run_qemu_x86_64.sh --smoke --smoke-marker '[init] TEST PASS: userspace_init' --timeout 30
 ```
 
-`run_qemu.sh --smoke` disables networking and graphics, captures serial output,
+`run_qemu_x86_64.sh --smoke` disables networking and graphics, captures serial output,
 and exits successfully only when the configured marker appears.  See
 `docs/status.md` for the current vertical-slice checklist.
 
-`run_qemu.sh` searches for OVMF in the following paths:
+`run_qemu_x86_64.sh` searches for OVMF in the following paths:
 
 | Path | Distribution |
 |---|---|

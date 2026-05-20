@@ -39,7 +39,7 @@
 
   "pre-link-args": {
     "ld.lld": [
-      "--script=linker.ld"
+      "--script=linker_x86_64.ld"
     ]
   }
 }
