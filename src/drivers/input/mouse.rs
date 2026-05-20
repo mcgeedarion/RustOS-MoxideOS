@@ -1,184 +1,68 @@
-//! PS/2 mouse driver (Aux port, IRQ 12).
+//! PS/2 mouse driver.
 //!
-//! Receives 3-byte (standard) or 4-byte (IntelliMouse) packets from the
-//! PS/2 aux port and pushes REL_X, REL_Y, REL_WHEEL and BTN_* events
-//! into the evdev queue.
+//! Receives 3-byte PS/2 packets from the i8042 auxiliary port and pushes
+//! EV_REL (X/Y delta, wheel) and EV_KEY (button) events to evdev.
+//!
+//! ## PS/2 mouse packet format (standard 3-byte)
+//!
+//!   Byte 0: YO XO YS XS  1  M  R  L
+//!   Byte 1: X movement delta (2’s complement)
+//!   Byte 2: Y movement delta (2’s complement, positive = up)
 
-use super::evdev::{self, EventType, InputEvent,
-                   REL_X, REL_Y, REL_WHEEL,
-                   BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
 use spin::Mutex;
+use crate::drivers::input::evdev::{self, REL_X, REL_Y, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
 
-// ---------------------------------------------------------------------------
-// PS/2 I/O ports (x86)
-// ---------------------------------------------------------------------------
-
-const PS2_DATA: u16 = 0x60;
-const PS2_CMD:  u16 = 0x64; // also STATUS when read
-
-// Status bits
-const STS_OBF:  u8 = 1 << 0; // Output Buffer Full
-const STS_IBF:  u8 = 1 << 1; // Input  Buffer Full
-const STS_AUX:  u8 = 1 << 5; // Aux (mouse) data in OBF
-
-// Commands
-const CMD_WRITE_AUX:   u8 = 0xD4;
-const CMD_READ_CFG:    u8 = 0x20;
-const CMD_WRITE_CFG:   u8 = 0x60;
-const MOUSE_ENABLE:    u8 = 0xF4;
-const MOUSE_DEFAULTS:  u8 = 0xF6;
-const MOUSE_INTELLIMOUSE: u8 = 0xF3;
-const MOUSE_ACK:       u8 = 0xFA;
-
-// ---------------------------------------------------------------------------
-// Driver state
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
 struct MouseState {
-    packet:     [u8; 4],
-    byte_idx:   usize,
-    four_byte:  bool,   // IntelliMouse scroll wheel
-    prev_btns:  u8,
+    buf:   [u8; 3],
+    phase: usize,
 }
 
-static STATE: Mutex<MouseState> = Mutex::new(MouseState {
-    packet: [0; 4], byte_idx: 0, four_byte: false, prev_btns: 0,
+static MOUSE: Mutex<MouseState> = Mutex::new(MouseState {
+    buf: [0; 3],
+    phase: 0,
 });
 
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
+/// Feed one raw PS/2 byte from the mouse into the packet assembler.
+/// Call from the IRQ 12 handler (x86) or the i8042 aux interrupt.
+pub fn handle_byte(byte: u8) {
+    let mut ms = MOUSE.lock();
 
-/// Initialise PS/2 mouse.  Must be called after PS/2 controller init.
-pub fn init() {
-    unsafe {
-        // Enable aux port in controller config byte.
-        ps2_cmd(CMD_READ_CFG);
-        let cfg = ps2_read();
-        ps2_cmd(CMD_WRITE_CFG);
-        ps2_write(cfg | 0x02); // enable IRQ12
+    // Resync: byte 0 must have bit 3 set.
+    if ms.phase == 0 && byte & 0x08 == 0 {
+        return;
+    }
 
-        // Try to enable IntelliMouse (scroll wheel).
-        aux_write(MOUSE_DEFAULTS);
-        ps2_read(); // ACK
-        aux_write(MOUSE_INTELLIMOUSE);
-        ps2_read();
-        aux_write(200);
-        ps2_read();
-        aux_write(MOUSE_INTELLIMOUSE);
-        ps2_read();
-        aux_write(100);
-        ps2_read();
-        aux_write(80);
-        ps2_read();
-        aux_write(0xF2); // GET_ID
-        ps2_read(); // ACK
-        let id = ps2_read();
-        STATE.lock().four_byte = id == 3;
+    ms.buf[ms.phase] = byte;
+    ms.phase += 1;
 
-        aux_write(MOUSE_ENABLE);
-        ps2_read(); // ACK
+    if ms.phase == 3 {
+        ms.phase = 0;
+        let b0 = ms.buf[0];
+        let b1 = ms.buf[1];
+        let b2 = ms.buf[2];
+        drop(ms);
+        decode_packet(b0, b1, b2);
     }
 }
 
-// ---------------------------------------------------------------------------
-// IRQ12 handler (call from interrupt dispatcher)
-// ---------------------------------------------------------------------------
+fn decode_packet(b0: u8, b1: u8, b2: u8) {
+    // X delta: sign bit in b0 bit 4.
+    let xs = (b0 & 0x10) != 0;
+    let ys = (b0 & 0x20) != 0;
+    let mut dx = b1 as i32;
+    let mut dy = b2 as i32;
+    if xs { dx -= 256; }
+    if ys { dy -= 256; }
+    // PS/2 Y is inverted vs evdev convention.
+    dy = -dy;
 
-pub fn irq_handler() {
-    let byte = unsafe {
-        let s = ps2_status();
-        if s & STS_OBF == 0 || s & STS_AUX == 0 { return; }
-        ps2_data_read()
-    };
+    if dx != 0 { evdev::push_rel(REL_X, dx); }
+    if dy != 0 { evdev::push_rel(REL_Y, dy); }
 
-    let mut ms = STATE.lock();
-    let pkt_len = if ms.four_byte { 4 } else { 3 };
-    ms.packet[ms.byte_idx] = byte;
-    ms.byte_idx += 1;
-
-    if ms.byte_idx < pkt_len { return; }
-    ms.byte_idx = 0;
-
-    // Decode packet.
-    let flags = ms.packet[0];
-    // Overflow bits: discard corrupted packet.
-    if flags & 0xC0 != 0 { return; }
-
-    let dx = ms.packet[1] as i8 as i32
-           - if flags & 0x10 != 0 { 256 } else { 0 };
-    let dy = ms.packet[2] as i8 as i32
-           - if flags & 0x20 != 0 { 256 } else { 0 };
-    let dz = if ms.four_byte { ms.packet[3] as i8 as i32 } else { 0 };
-
-    let btns = flags & 0x07;
-    let changed = btns ^ ms.prev_btns;
-    ms.prev_btns = btns;
-
-    drop(ms);
-
-    if dx != 0 { evdev::push(InputEvent { ev_type: EventType::Relative, code: REL_X, value: dx }); }
-    if dy != 0 { evdev::push(InputEvent { ev_type: EventType::Relative, code: REL_Y, value: -dy }); }
-    if dz != 0 { evdev::push(InputEvent { ev_type: EventType::Relative, code: REL_WHEEL, value: dz }); }
-
-    for (bit, code) in [(0, BTN_LEFT), (1, BTN_RIGHT), (2, BTN_MIDDLE)] {
-        if changed & (1 << bit) != 0 {
-            let val = if btns & (1 << bit) != 0 { 1 } else { 0 };
-            evdev::push(InputEvent { ev_type: EventType::Key, code, value: val });
-        }
-    }
+    // Buttons.
+    evdev::push_key(BTN_LEFT,   (b0 & 0x01) as i32);
+    evdev::push_key(BTN_RIGHT,  (b0 & 0x02) as i32 >> 1);
+    evdev::push_key(BTN_MIDDLE, (b0 & 0x04) as i32 >> 2);
 
     evdev::sync();
-}
-
-// ---------------------------------------------------------------------------
-// PS/2 helpers
-// ---------------------------------------------------------------------------
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn ps2_status() -> u8 { x86_in8(PS2_CMD) }
-#[cfg(target_arch = "x86_64")]
-unsafe fn ps2_data_read() -> u8 { x86_in8(PS2_DATA) }
-#[cfg(target_arch = "x86_64")]
-unsafe fn ps2_read() -> u8 {
-    let mut spin = 0u32;
-    while x86_in8(PS2_CMD) & STS_OBF == 0 { core::hint::spin_loop(); spin += 1; if spin > 100_000 { return 0; } }
-    x86_in8(PS2_DATA)
-}
-#[cfg(target_arch = "x86_64")]
-unsafe fn ps2_write_port(port: u16, val: u8) {
-    let mut spin = 0u32;
-    while x86_in8(PS2_CMD) & STS_IBF != 0 { core::hint::spin_loop(); spin += 1; if spin > 100_000 { return; } }
-    x86_out8(port, val);
-}
-#[cfg(target_arch = "x86_64")]
-unsafe fn ps2_cmd(cmd: u8) { ps2_write_port(PS2_CMD, cmd); }
-#[cfg(target_arch = "x86_64")]
-unsafe fn ps2_write(val: u8) { ps2_write_port(PS2_DATA, val); }
-#[cfg(target_arch = "x86_64")]
-unsafe fn aux_write(val: u8) { ps2_cmd(CMD_WRITE_AUX); ps2_write(val); }
-
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn ps2_status() -> u8 { 0 }
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn ps2_data_read() -> u8 { 0 }
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn ps2_read() -> u8 { 0 }
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn ps2_cmd(_: u8) {}
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn ps2_write(_: u8) {}
-#[cfg(not(target_arch = "x86_64"))]
-unsafe fn aux_write(_: u8) {}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn x86_in8(port: u16) -> u8 {
-    let val: u8;
-    core::arch::asm!("in al, dx", out("al") val, in("dx") port);
-    val
-}
-#[cfg(target_arch = "x86_64")]
-unsafe fn x86_out8(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val);
 }
