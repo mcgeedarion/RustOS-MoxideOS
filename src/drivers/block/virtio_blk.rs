@@ -1,1 +1,1 @@
-placeholder_virtio_blk
+VIRTIO_BLK_CONTENT
