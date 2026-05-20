@@ -37,6 +37,7 @@ extern crate alloc;
 //
 //   arch        — Architecture-specific code (x86_64, riscv64)
 //   firmware    — Platform firmware interfaces (ACPI, Device Tree)
+//   irq         — Interrupt controllers (PLIC, CLINT; arch-gated)
 //   mm          — Memory management (PMM, heap, slab, mmap, swap, allocator)
 //   sync        — Synchronisation primitives (spinlock, mutex, condvar)
 //   drivers     — Hardware drivers (virtio, NIC, AHCI, NVMe, PCIe, USB, …)
@@ -71,6 +72,7 @@ pub mod fs;
 pub mod init;
 pub mod io_uring;
 pub mod ipc;
+pub mod irq;
 pub mod kernel;
 pub mod mm;
 pub mod net;

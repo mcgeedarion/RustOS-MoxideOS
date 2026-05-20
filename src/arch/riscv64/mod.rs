@@ -4,7 +4,6 @@ pub mod fdt;
 pub mod hal;
 pub mod mem_layout;
 pub mod paging;
-pub mod plic;
 pub mod smp;
 pub mod syscall;
 pub mod trap;
