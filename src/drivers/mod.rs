@@ -21,6 +21,7 @@
 //!   mouse             — PS/2 / USB mouse
 //!   hid               — USB HID
 //!   usb               — USB xHCI host controller
+//!   bluetooth         — Bluetooth HCI over USB transport
 //!   clint             — RISC-V CLINT timer
 //!   gpio              — GPIO (stub)
 //!   tty               — TTY driver shim (real impl in shell/tty.rs)
@@ -30,6 +31,7 @@
 //!   amdgpu_gem    — AMD GEM/TTM memory manager; requires feature "amdgpu"
 
 pub mod ahci;
+pub mod bluetooth;
 pub mod clint;
 pub mod drm;
 pub mod e1000e;
