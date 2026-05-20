@@ -9,6 +9,7 @@
 //!   ldisc.rs    — N_TTY line discipline (canonical + raw mode)
 //!   pty.rs      — PtyMaster / PtySlave pair, posix_openpt / grantpt / unlockpt
 //!   pts_fs.rs   — /dev/pts virtual filesystem (devpts)
+//!   serial.rs   — COM1 serial line discipline (used by stdin/stdout before PTY init)
 //! ```
 //!
 //! ## Syscall surface implemented
@@ -31,6 +32,7 @@ pub mod termios;
 pub mod ldisc;
 pub mod pty;
 pub mod pts_fs;
+pub mod serial;
 
 extern crate alloc;
 use alloc::{collections::BTreeMap, sync::Arc};

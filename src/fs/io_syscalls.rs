@@ -125,7 +125,7 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     let n: isize;
 
     if bfd == 0 {
-        n = crate::shell::tty::read_line(&mut kbuf);
+        n = crate::tty::serial::read_line(&mut kbuf);
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         n = crate::fs::devfs::read(bfd, &mut kbuf);
     } else if crate::fs::procfs::is_procfs_fd(bfd) {
@@ -176,7 +176,7 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     if copy_from_user(&mut kbuf, buf_va).is_err() { return -14; }
 
     if bfd == 1 || bfd == 2 {
-        return crate::shell::tty::write(&kbuf);
+        return crate::tty::serial::write(&kbuf);
     }
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         return crate::fs::devfs::write(bfd, &kbuf);
@@ -434,7 +434,7 @@ fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     let mut kbuf = alloc::vec![0u8; count];
     let n: isize;
     if bfd == 0 {
-        n = crate::shell::tty::read_line(&mut kbuf);
+        n = crate::tty::serial::read_line(&mut kbuf);
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         n = crate::fs::devfs::read(bfd, &mut kbuf);
     } else if crate::fs::procfs::is_procfs_fd(bfd) {
@@ -472,7 +472,7 @@ fn write_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     let mut kbuf = alloc::vec![0u8; count];
     if copy_from_user(&mut kbuf, buf_va).is_err() { return -14; }
     if bfd == 1 || bfd == 2 {
-        return crate::shell::tty::write(&kbuf);
+        return crate::tty::serial::write(&kbuf);
     }
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         return crate::fs::devfs::write(bfd, &kbuf);

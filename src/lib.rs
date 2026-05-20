@@ -48,7 +48,7 @@ extern crate alloc;
 //   fs          — Filesystem layer (VFS, ext2, FAT32, initramfs mount)
 //   net         — Network stack (TCP/UDP/IP, DHCP, DNS, sockets)
 //   block       — Block layer (I/O scheduler, bio abstraction)
-//   tty         — TTY/PTY subsystem (ldisc, termios, pts)
+//   tty         — TTY/PTY subsystem (ldisc, termios, pts, serial COM1)
 //   input       — Input event subsystem  [cfg(feature = "input_events")]
 //   console     — Kernel console (printk destination)
 //   proc        — Process management (scheduler, exec, wait, signals, namespaces)
