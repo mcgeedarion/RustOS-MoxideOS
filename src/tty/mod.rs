@@ -71,7 +71,6 @@ pub fn alloc_pty() -> Result<(u32, Arc<PtyPair>), isize> {
     let pair = Arc::new(PtyPair::new(idx));
     let mut reg = REGISTRY.lock();
     reg.as_mut().ok_or(-1isize)?.pairs.insert(idx, pair.clone());
-    // Register the slave in /dev/pts/<idx>
     pts_fs::register_slave(idx);
     Ok((idx, pair))
 }
@@ -87,5 +86,50 @@ pub fn free_pty(idx: u32) {
     if let Some(r) = reg.as_mut() {
         r.pairs.remove(&idx);
         pts_fs::unregister_slave(idx);
+    }
+}
+
+// ── Console output abstraction ───────────────────────────────────────────────
+//
+// Drivers that want to emit bytes to a physical console implement this trait
+// instead of calling arch serial functions directly.  This keeps src/tty/
+// free of arch ifdefs everywhere output is needed.
+
+pub trait ConsoleOutput: Send + Sync {
+    fn write_bytes(&self, bytes: &[u8]);
+}
+
+pub struct SerialConsole;
+
+impl ConsoleOutput for SerialConsole {
+    fn write_bytes(&self, bytes: &[u8]) {
+        #[cfg(target_arch = "x86_64")]
+        for &b in bytes {
+            crate::arch::x86_64::serial::serial_write_byte(b);
+        }
+        #[cfg(target_arch = "riscv64")]
+        for &b in bytes {
+            crate::arch::riscv64::uart::uart_write_byte(b);
+        }
+    }
+}
+
+// ── Keyboard → console PTY input ────────────────────────────────────────────
+//
+// Call this from the keyboard ISR or a periodic timer tick.
+// Drains `keyboard::read_char()` and injects ASCII bytes into the
+// PTY-0 master (the system console).  If PTY-0 hasn't been allocated
+// yet (early boot), chars are silently dropped — same behaviour as the
+// old drivers/tty.rs tty_keyboard_tick().
+
+pub fn keyboard_tick() {
+    let pair = match lookup_pty(0) {
+        Some(p) => p,
+        None    => return,
+    };
+    while let Some(c) = crate::drivers::keyboard::read_char() {
+        if c.is_ascii() {
+            pair.master_write(&[c as u8]);
+        }
     }
 }
