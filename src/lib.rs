@@ -35,6 +35,8 @@ extern crate alloc;
 //
 // Organised by kernel layer (outermost = most dependent on others):
 //
+//   core        — Zero-dependency foundation (error types, panic, cpu-local,
+//                 intrusive collections).  Everything may depend on this.
 //   arch        — Architecture-specific code (x86_64, riscv64)
 //   firmware    — Platform firmware interfaces (ACPI, Device Tree)
 //   device      — Hardware-neutral bus manager (PCI, future: platform, USB)
@@ -62,6 +64,7 @@ extern crate alloc;
 //   debug       — Debugging infrastructure  [cfg(feature = "gdbstub")]
 //   kernel      — Core kernel utilities (panic, rand, uaccess, utils)
 
+pub mod core;
 pub mod arch;
 pub mod block;
 pub mod console;
