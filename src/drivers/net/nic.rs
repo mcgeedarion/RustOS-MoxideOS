@@ -1,81 +1,66 @@
-//! NIC abstraction layer.
+//! Common NIC abstractions shared by network drivers.
 //!
-//! Provides a unified `NetworkDevice` trait and a global registry so that
-//! higher layers (TCP/IP stack, DHCP client) can send/receive frames without
-//! knowing which physical driver is backing them.
+//! This module provides a tiny, allocation-free façade over the concrete
+//! drivers (`e1000e`, `virtio_net`, `virtio_net_mmio`).  The rest of the
+//! network stack can send/receive Ethernet frames via these helpers without
+//! caring which device backed the link.
 
-extern crate alloc;
-use alloc::{boxed::Box, vec::Vec};
-use spin::Mutex;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MacAddr(pub [u8; 6]);
 
-// ---------------------------------------------------------------------------
-// NetworkDevice trait
-// ---------------------------------------------------------------------------
-
-/// Ethernet frame transmit/receive interface.
-pub trait NetworkDevice: Send {
-    /// Transmit a raw Ethernet frame.  `frame` includes the Ethernet header.
-    /// Returns Ok(()) on success or Err on queue-full / hardware error.
-    fn send(&mut self, frame: &[u8]) -> Result<(), &'static str>;
-
-    /// Poll for a received frame.  Returns Some(Vec<u8>) if a frame is
-    /// waiting, None if the receive queue is empty.
-    fn recv(&mut self) -> Option<Vec<u8>>;
-
-    /// 6-byte MAC address of this interface.
-    fn mac(&self) -> [u8; 6];
-
-    /// Link speed in Mbit/s, or 0 if unknown / link-down.
-    fn link_speed(&self) -> u32 { 0 }
-
-    /// True if the link is up.
-    fn link_up(&self) -> bool { true }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NicStats {
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes:   u64,
+    pub tx_bytes:   u64,
 }
 
-// ---------------------------------------------------------------------------
-// Global device registry
-// ---------------------------------------------------------------------------
-
-static DEVICES: Mutex<Vec<Box<dyn NetworkDevice>>> = Mutex::new(Vec::new());
-
-/// Register a NIC.  Returns the assigned interface index.
-pub fn register(dev: Box<dyn NetworkDevice>) -> usize {
-    let mut devs = DEVICES.lock();
-    let idx = devs.len();
-    devs.push(dev);
-    idx
+/// Returns true if any supported NIC driver is initialised.
+pub fn is_initialised() -> bool {
+    crate::drivers::net::e1000e::is_initialised()
+        || crate::drivers::net::virtio_net::is_initialised()
+        || crate::drivers::net::virtio_net_mmio::is_initialised()
 }
 
-/// Number of registered NICs.
-pub fn count() -> usize {
-    DEVICES.lock().len()
+/// Returns the MAC address of the first initialised NIC.
+pub fn mac() -> Option<MacAddr> {
+    crate::drivers::net::e1000e::mac()
+        .or_else(crate::drivers::net::virtio_net::mac)
+        .or_else(crate::drivers::net::virtio_net_mmio::mac)
 }
 
-/// Transmit a frame on interface `idx`.
-pub fn send(idx: usize, frame: &[u8]) -> Result<(), &'static str> {
-    let mut devs = DEVICES.lock();
-    devs.get_mut(idx).ok_or("no such nic")?.send(frame)
+/// Returns statistics for the first initialised NIC.
+pub fn stats() -> Option<NicStats> {
+    crate::drivers::net::e1000e::stats()
+        .or_else(crate::drivers::net::virtio_net::stats)
+        .or_else(crate::drivers::net::virtio_net_mmio::stats)
 }
 
-/// Poll interface `idx` for a received frame.
-pub fn recv(idx: usize) -> Option<Vec<u8>> {
-    let mut devs = DEVICES.lock();
-    devs.get_mut(idx)?.recv()
+/// Send one raw Ethernet frame.
+pub fn send(frame: &[u8]) -> Result<(), &'static str> {
+    if crate::drivers::net::e1000e::is_initialised() {
+        return crate::drivers::net::e1000e::send(frame);
+    }
+    if crate::drivers::net::virtio_net::is_initialised() {
+        return crate::drivers::net::virtio_net::send(frame);
+    }
+    if crate::drivers::net::virtio_net_mmio::is_initialised() {
+        return crate::drivers::net::virtio_net_mmio::send(frame);
+    }
+    Err("no NIC initialised")
 }
 
-/// MAC address of interface `idx`.
-pub fn mac(idx: usize) -> Option<[u8; 6]> {
-    DEVICES.lock().get(idx).map(|d| d.mac())
-}
-
-/// Poll all interfaces; returns the first frame found along with its
-/// interface index, or None if all queues are empty.
-pub fn recv_any() -> Option<(usize, Vec<u8>)> {
-    let mut devs = DEVICES.lock();
-    for (i, dev) in devs.iter_mut().enumerate() {
-        if let Some(frame) = dev.recv() {
-            return Some((i, frame));
-        }
+/// Receive one raw Ethernet frame into `out`, returning the frame length.
+pub fn recv(out: &mut [u8]) -> Option<usize> {
+    if crate::drivers::net::e1000e::is_initialised() {
+        return crate::drivers::net::e1000e::recv(out);
+    }
+    if crate::drivers::net::virtio_net::is_initialised() {
+        return crate::drivers::net::virtio_net::recv(out);
+    }
+    if crate::drivers::net::virtio_net_mmio::is_initialised() {
+        return crate::drivers::net::virtio_net_mmio::recv(out);
     }
     None
 }

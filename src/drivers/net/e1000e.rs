@@ -1,263 +1,333 @@
-//! Intel e1000e Gigabit Ethernet driver.
+//! Intel e1000e / 82574L gigabit Ethernet driver.
 //!
-//! Supports the 82574L / 82579LM / I217 family as exposed by QEMU `-device e1000`.
+//! ## Scope
+//!   - PCI BAR0 MMIO initialisation
+//!   - RX/TX descriptor rings (legacy format)
+//!   - Link up / MAC address readout
+//!   - Interrupt moderation (optional, polling works without it)
+//!   - Public API compatible with `nic.rs`
 //!
-//! ## Architecture
-//!   - 16-entry TX descriptor ring (legacy format, single buffer per descriptor)
-//!   - 16-entry RX descriptor ring (legacy format)
-//!   - MMIO via BAR0 (memory-mapped, 128 KiB)
-//!   - No interrupt support yet; TX/RX are polled
+//! ## Supported devices
+//!   - 8086:10D3  82574L
+//!   - 8086:10F6  82574L low-profile
+//!   - 8086:150C  82583V (same register model)
 //!
-//! ## Usage
-//!   ```
-//!   let nic = e1000e::E1000e::new(bar0_phys).unwrap();
-//!   crate::drivers::nic::register(Box::new(nic));
-//!   ```
+//! The driver is intentionally simple: one RX ring, one TX ring, all memory
+//! allocated from the PMM and identity-mapped.  The `send` path is blocking
+//! (spins until the NIC sets DD); the `recv` path polls the next RX desc.
 
 extern crate alloc;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
+use spin::Mutex;
 
-use super::nic::NetworkDevice;
+use crate::drivers::net::nic::{MacAddr, NicStats};
 
-// ---------------------------------------------------------------------------
-// Register offsets
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// PCI IDs
+// ─────────────────────────────────────────────────────────────────────────────
 
-const E1000_CTRL:    usize = 0x0000;
-const E1000_STATUS:  usize = 0x0008;
-const E1000_CTRL_EXT:usize = 0x0018;
-const E1000_RCTL:    usize = 0x0100;
-const E1000_TCTL:    usize = 0x0400;
-const E1000_TIPG:    usize = 0x0410;
-const E1000_RDBAL:   usize = 0x2800;
-const E1000_RDBAH:   usize = 0x2804;
-const E1000_RDLEN:   usize = 0x2808;
-const E1000_RDH:     usize = 0x2810;
-const E1000_RDT:     usize = 0x2818;
-const E1000_TDBAL:   usize = 0x3800;
-const E1000_TDBAH:   usize = 0x3804;
-const E1000_TDLEN:   usize = 0x3808;
-const E1000_TDH:     usize = 0x3810;
-const E1000_TDT:     usize = 0x3818;
-const E1000_RAL:     usize = 0x5400;
-const E1000_RAH:     usize = 0x5404;
-const E1000_MTA:     usize = 0x5200; // Multicast table (128 x u32)
+pub const VENDOR_INTEL: u16 = 0x8086;
+pub const DEV_82574L:   u16 = 0x10D3;
+pub const DEV_82574L2:  u16 = 0x10F6;
+pub const DEV_82583V:   u16 = 0x150C;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MMIO register offsets
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CTRL:      usize = 0x0000;
+const STATUS:    usize = 0x0008;
+const EERD:      usize = 0x0014;
+const CTRL_EXT:  usize = 0x0018;
+const IMS:       usize = 0x00D0;
+const IMC:       usize = 0x00D8;
+const RCTL:      usize = 0x0100;
+const TCTL:      usize = 0x0400;
+const TIPG:      usize = 0x0410;
+
+const RDBAL:     usize = 0x2800;
+const RDBAH:     usize = 0x2804;
+const RDLEN:     usize = 0x2808;
+const RDH:       usize = 0x2810;
+const RDT:       usize = 0x2818;
+
+const TDBAL:     usize = 0x3800;
+const TDBAH:     usize = 0x3804;
+const TDLEN:     usize = 0x3808;
+const TDH:       usize = 0x3810;
+const TDT:       usize = 0x3818;
+
+const RAL0:      usize = 0x5400;
+const RAH0:      usize = 0x5404;
+
+const ICR:       usize = 0x00C0;
 
 // CTRL bits
-const CTRL_RST:      u32 = 1 << 26;
-const CTRL_SLU:      u32 = 1 << 6;  // Set Link Up
-const CTRL_ASDE:     u32 = 1 << 5;  // Auto-Speed Detection
+const CTRL_RST:  u32 = 1 << 26;
+const CTRL_SLU:  u32 = 1 << 6;
+const CTRL_ASDE: u32 = 1 << 5;
 
 // RCTL bits
 const RCTL_EN:       u32 = 1 << 1;
-const RCTL_BAM:      u32 = 1 << 15; // Broadcast Accept
-const RCTL_BSIZE_2K: u32 = 0 << 16; // Buffer size 2048
-const RCTL_SECRC:    u32 = 1 << 26; // Strip Ethernet CRC
+const RCTL_BAM:      u32 = 1 << 15;
+const RCTL_SECRC:    u32 = 1 << 26;
+const RCTL_SZ_2048:  u32 = 0 << 16;
 
 // TCTL bits
 const TCTL_EN:       u32 = 1 << 1;
-const TCTL_PSP:      u32 = 1 << 3;  // Pad Short Packets
-const TCTL_CT:       u32 = 0x0F << 4;
-const TCTL_COLD:     u32 = 0x3F << 12;
+const TCTL_PSP:      u32 = 1 << 3;
+const TCTL_CT_SHIFT: u32 = 4;
+const TCTL_COLD_SHIFT:u32 = 12;
 
-// TX descriptor CMD bits
-const TX_CMD_EOP:    u8  = 1 << 0; // End Of Packet
-const TX_CMD_IFCS:   u8  = 1 << 1; // Insert FCS
-const TX_CMD_RS:     u8  = 1 << 3; // Report Status
+// RX/TX ring sizes
+const RX_DESC_COUNT: usize = 256;
+const TX_DESC_COUNT: usize = 256;
+const RX_BUF_SIZE:   usize = 2048;
 
-// TX descriptor status
-const TX_STA_DD:     u8  = 1 << 0; // Descriptor Done
-
-// RX descriptor status
-const RX_STA_DD:     u8  = 1 << 0; // Descriptor Done
-const RX_STA_EOP:    u8  = 1 << 1; // End Of Packet
-
-const RING_SIZE: usize = 16;
-const BUF_SIZE:  usize = 2048;
-
-// ---------------------------------------------------------------------------
-// Descriptor layouts
-// ---------------------------------------------------------------------------
-
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-struct TxDesc {
-    addr:    u64,
-    length:  u16,
-    cso:     u8,
-    cmd:     u8,
-    status:  u8,
-    css:     u8,
-    special: u16,
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Descriptor formats (legacy)
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 struct RxDesc {
-    addr:    u64,
-    length:  u16,
-    checksum:u16,
-    status:  u8,
-    errors:  u8,
-    special: u16,
+    addr:   u64,
+    len:    u16,
+    csum:   u16,
+    status: u8,
+    errors: u8,
+    special:u16,
 }
 
-// ---------------------------------------------------------------------------
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct TxDesc {
+    addr:   u64,
+    len:    u16,
+    cso:    u8,
+    cmd:    u8,
+    status: u8,
+    css:    u8,
+    special:u16,
+}
+
+const RXD_STAT_DD: u8 = 1 << 0;
+const TXD_CMD_EOP: u8 = 1 << 0;
+const TXD_CMD_IFCS:u8 = 1 << 1;
+const TXD_CMD_RS:  u8 = 1 << 3;
+const TXD_STAT_DD: u8 = 1 << 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Driver state
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 
-pub struct E1000e {
-    bar0:     u64,
-    mac:      [u8; 6],
-    tx_ring:  u64, // physical addr
-    rx_ring:  u64, // physical addr
-    tx_bufs:  [u64; RING_SIZE],
-    rx_bufs:  [u64; RING_SIZE],
-    tx_tail:  usize,
-    rx_tail:  usize,
+struct E1000e {
+    mmio:        usize,
+    rx_descs:    *mut RxDesc,
+    tx_descs:    *mut TxDesc,
+    rx_bufs:     Vec<u64>,
+    tx_bufs:     Vec<u64>,
+    rx_tail:     usize,
+    tx_tail:     usize,
+    mac:         MacAddr,
+    stats:       NicStats,
 }
 
-impl E1000e {
-    /// Initialise from BAR0 physical address.  Returns None on failure.
-    pub fn new(bar0_phys: u64) -> Option<Self> {
-        unsafe { Self::_new(bar0_phys) }
-    }
+unsafe impl Send for E1000e {}
+unsafe impl Sync for E1000e {}
 
-    unsafe fn _new(bar0: u64) -> Option<Self> {
-        // Reset.
-        let ctrl = mmio_r(bar0, E1000_CTRL);
-        mmio_w(bar0, E1000_CTRL, ctrl | CTRL_RST);
-        for _ in 0..100_000 { core::hint::spin_loop(); }
+static NIC: Mutex<Option<E1000e>> = Mutex::new(None);
 
-        // Set Link Up + Auto-Speed.
-        mmio_w(bar0, E1000_CTRL, CTRL_SLU | CTRL_ASDE);
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
 
-        // Clear multicast table.
-        for i in 0..128usize {
-            mmio_w(bar0, E1000_MTA + i * 4, 0);
-        }
-
-        // Read MAC from RAL/RAH.
-        let ral = mmio_r(bar0, E1000_RAL);
-        let rah = mmio_r(bar0, E1000_RAH);
-        let mac = [
-            (ral & 0xFF) as u8, ((ral >> 8) & 0xFF) as u8,
-            ((ral >> 16) & 0xFF) as u8, ((ral >> 24) & 0xFF) as u8,
-            (rah & 0xFF) as u8, ((rah >> 8) & 0xFF) as u8,
-        ];
-
-        // Allocate rings.
-        let tx_ring = alloc_dma(RING_SIZE * 16, 16)?;
-        let rx_ring = alloc_dma(RING_SIZE * 16, 16)?;
-        let mut tx_bufs = [0u64; RING_SIZE];
-        let mut rx_bufs = [0u64; RING_SIZE];
-
-        // Set up TX buffers and descriptors.
-        for i in 0..RING_SIZE {
-            tx_bufs[i] = alloc_dma(BUF_SIZE, 16)?;
-            let desc = (tx_ring as usize + i * 16) as *mut TxDesc;
-            (*desc).addr = tx_bufs[i];
-            (*desc).status = TX_STA_DD; // mark as done so first use works
-        }
-
-        // Set up RX buffers and descriptors.
-        for i in 0..RING_SIZE {
-            rx_bufs[i] = alloc_dma(BUF_SIZE, 16)?;
-            let desc = (rx_ring as usize + i * 16) as *mut RxDesc;
-            (*desc).addr = rx_bufs[i];
-        }
-
-        // Program TX ring.
-        mmio_w(bar0, E1000_TDBAL, (tx_ring & 0xFFFF_FFFF) as u32);
-        mmio_w(bar0, E1000_TDBAH, (tx_ring >> 32) as u32);
-        mmio_w(bar0, E1000_TDLEN, (RING_SIZE * 16) as u32);
-        mmio_w(bar0, E1000_TDH, 0);
-        mmio_w(bar0, E1000_TDT, 0);
-        mmio_w(bar0, E1000_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD);
-        mmio_w(bar0, E1000_TIPG, 0x00602006); // standard IPG
-
-        // Program RX ring.
-        mmio_w(bar0, E1000_RDBAL, (rx_ring & 0xFFFF_FFFF) as u32);
-        mmio_w(bar0, E1000_RDBAH, (rx_ring >> 32) as u32);
-        mmio_w(bar0, E1000_RDLEN, (RING_SIZE * 16) as u32);
-        mmio_w(bar0, E1000_RDH, 0);
-        mmio_w(bar0, E1000_RDT, (RING_SIZE - 1) as u32);
-        mmio_w(bar0, E1000_RCTL, RCTL_EN | RCTL_BAM | RCTL_BSIZE_2K | RCTL_SECRC);
-
-        Some(E1000e { bar0, mac, tx_ring, rx_ring, tx_bufs, rx_bufs,
-            tx_tail: 0, rx_tail: 0 })
-    }
+pub fn init(mmio_base: u64) {
+    unsafe { _init(mmio_base as usize); }
 }
 
-impl NetworkDevice for E1000e {
-    fn send(&mut self, frame: &[u8]) -> Result<(), &'static str> {
-        if frame.len() > BUF_SIZE { return Err("frame too large"); }
-        let desc = unsafe {
-            &mut *((self.tx_ring as usize + self.tx_tail * 16) as *mut TxDesc)
-        };
-        // Wait until descriptor is free.
-        let mut spin = 0;
-        while desc.status & TX_STA_DD == 0 {
-            core::hint::spin_loop();
-            spin += 1;
-            if spin > 1_000_000 { return Err("tx timeout"); }
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                frame.as_ptr(),
-                self.tx_bufs[self.tx_tail] as *mut u8,
-                frame.len(),
-            );
-        }
-        desc.length = frame.len() as u16;
-        desc.cmd    = TX_CMD_EOP | TX_CMD_IFCS | TX_CMD_RS;
-        desc.status = 0;
-        self.tx_tail = (self.tx_tail + 1) % RING_SIZE;
-        unsafe { mmio_w(self.bar0, E1000_TDT, self.tx_tail as u32); }
-        Ok(())
-    }
-
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        let desc = unsafe {
-            &mut *((self.rx_ring as usize + self.rx_tail * 16) as *mut RxDesc)
-        };
-        if desc.status & RX_STA_DD == 0 { return None; }
-        if desc.status & RX_STA_EOP == 0 { desc.status = 0; return None; } // multi-buf: discard
-        let len = desc.length as usize;
-        let frame = unsafe {
-            core::slice::from_raw_parts(self.rx_bufs[self.rx_tail] as *const u8, len)
-        }.to_vec();
-        desc.status = 0;
-        self.rx_tail = (self.rx_tail + 1) % RING_SIZE;
-        unsafe { mmio_w(self.bar0, E1000_RDT, ((self.rx_tail + RING_SIZE - 1) % RING_SIZE) as u32); }
-        Some(frame)
-    }
-
-    fn mac(&self) -> [u8; 6] { self.mac }
-
-    fn link_up(&self) -> bool {
-        unsafe { mmio_r(self.bar0, E1000_STATUS) & 0x2 != 0 }
-    }
+pub fn is_initialised() -> bool {
+    NIC.lock().is_some()
 }
 
-// ---------------------------------------------------------------------------
-// MMIO helpers
-// ---------------------------------------------------------------------------
+pub fn mac() -> Option<MacAddr> {
+    NIC.lock().as_ref().map(|n| n.mac)
+}
+
+pub fn stats() -> Option<NicStats> {
+    NIC.lock().as_ref().map(|n| n.stats)
+}
+
+pub fn send(frame: &[u8]) -> Result<(), &'static str> {
+    unsafe { _send(frame) }
+}
+
+pub fn recv(out: &mut [u8]) -> Option<usize> {
+    unsafe { _recv(out) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────────────────────
+
+unsafe fn _init(mmio: usize) {
+    // Global reset.
+    write32(mmio, CTRL, read32(mmio, CTRL) | CTRL_RST);
+    for _ in 0..1_000_000 { core::hint::spin_loop(); }
+
+    // Disable interrupts for polling mode.
+    write32(mmio, IMC, 0xFFFF_FFFF);
+    let _ = read32(mmio, ICR);
+
+    // Allocate RX ring + buffers.
+    let rx_descs_phys = alloc_dma(core::mem::size_of::<RxDesc>() * RX_DESC_COUNT, 4096).unwrap();
+    let rx_descs = rx_descs_phys as *mut RxDesc;
+    let mut rx_bufs = Vec::with_capacity(RX_DESC_COUNT);
+    for i in 0..RX_DESC_COUNT {
+        let buf = alloc_dma(RX_BUF_SIZE, 2048).unwrap();
+        rx_bufs.push(buf);
+        (*rx_descs.add(i)) = RxDesc { addr: buf, ..Default::default() };
+    }
+
+    // Allocate TX ring + buffers.
+    let tx_descs_phys = alloc_dma(core::mem::size_of::<TxDesc>() * TX_DESC_COUNT, 4096).unwrap();
+    let tx_descs = tx_descs_phys as *mut TxDesc;
+    let mut tx_bufs = Vec::with_capacity(TX_DESC_COUNT);
+    for i in 0..TX_DESC_COUNT {
+        let buf = alloc_dma(2048, 2048).unwrap();
+        tx_bufs.push(buf);
+        (*tx_descs.add(i)) = TxDesc { status: TXD_STAT_DD, ..Default::default() };
+    }
+
+    // Program RX ring.
+    write32(mmio, RDBAL, rx_descs_phys as u32);
+    write32(mmio, RDBAH, (rx_descs_phys >> 32) as u32);
+    write32(mmio, RDLEN, (RX_DESC_COUNT * core::mem::size_of::<RxDesc>()) as u32);
+    write32(mmio, RDH, 0);
+    write32(mmio, RDT, (RX_DESC_COUNT - 1) as u32);
+
+    // Program TX ring.
+    write32(mmio, TDBAL, tx_descs_phys as u32);
+    write32(mmio, TDBAH, (tx_descs_phys >> 32) as u32);
+    write32(mmio, TDLEN, (TX_DESC_COUNT * core::mem::size_of::<TxDesc>()) as u32);
+    write32(mmio, TDH, 0);
+    write32(mmio, TDT, 0);
+
+    // Bring link up.
+    write32(mmio, CTRL, read32(mmio, CTRL) | CTRL_SLU | CTRL_ASDE);
+
+    // Receive control: enable, broadcast accept, strip CRC, 2048-byte buffers.
+    write32(mmio, RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | RCTL_SZ_2048);
+
+    // Transmit control.
+    let tctl = TCTL_EN | TCTL_PSP | (0x10 << TCTL_CT_SHIFT) | (0x40 << TCTL_COLD_SHIFT);
+    write32(mmio, TCTL, tctl);
+    write32(mmio, TIPG, 10 | (8 << 10) | (6 << 20));
+
+    let mac = read_mac(mmio);
+    *NIC.lock() = Some(E1000e {
+        mmio,
+        rx_descs,
+        tx_descs,
+        rx_bufs,
+        tx_bufs,
+        rx_tail: RX_DESC_COUNT - 1,
+        tx_tail: 0,
+        mac,
+        stats: NicStats::default(),
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RX/TX paths
+// ─────────────────────────────────────────────────────────────────────────────
+
+unsafe fn _send(frame: &[u8]) -> Result<(), &'static str> {
+    let mut nic_g = NIC.lock();
+    let nic = nic_g.as_mut().ok_or("e1000e not initialised")?;
+    if frame.len() > 2048 { return Err("frame too large"); }
+
+    let idx = nic.tx_tail;
+    let desc = &mut *nic.tx_descs.add(idx);
+
+    // Wait until NIC owns no longer.
+    for _ in 0..5_000_000 {
+        if desc.status & TXD_STAT_DD != 0 { break; }
+        core::hint::spin_loop();
+    }
+    if desc.status & TXD_STAT_DD == 0 { return Err("tx timeout"); }
+
+    core::ptr::copy_nonoverlapping(frame.as_ptr(), nic.tx_bufs[idx] as *mut u8, frame.len());
+    *desc = TxDesc {
+        addr: nic.tx_bufs[idx],
+        len: frame.len() as u16,
+        cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+        status: 0,
+        ..Default::default()
+    };
+
+    nic.tx_tail = (idx + 1) % TX_DESC_COUNT;
+    write32(nic.mmio, TDT, nic.tx_tail as u32);
+    nic.stats.tx_packets += 1;
+    nic.stats.tx_bytes += frame.len() as u64;
+    Ok(())
+}
+
+unsafe fn _recv(out: &mut [u8]) -> Option<usize> {
+    let mut nic_g = NIC.lock();
+    let nic = nic_g.as_mut()?;
+
+    let idx = (nic.rx_tail + 1) % RX_DESC_COUNT;
+    let desc = &mut *nic.rx_descs.add(idx);
+    if desc.status & RXD_STAT_DD == 0 {
+        return None;
+    }
+
+    let len = desc.len as usize;
+    let n = out.len().min(len);
+    core::ptr::copy_nonoverlapping(nic.rx_bufs[idx] as *const u8, out.as_mut_ptr(), n);
+
+    // Hand descriptor back to NIC.
+    desc.status = 0;
+    nic.rx_tail = idx;
+    write32(nic.mmio, RDT, idx as u32);
+
+    nic.stats.rx_packets += 1;
+    nic.stats.rx_bytes += len as u64;
+    Some(n)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+unsafe fn read_mac(mmio: usize) -> MacAddr {
+    let ral = read32(mmio, RAL0);
+    let rah = read32(mmio, RAH0);
+    MacAddr([
+        (ral & 0xFF) as u8,
+        ((ral >> 8) & 0xFF) as u8,
+        ((ral >> 16) & 0xFF) as u8,
+        ((ral >> 24) & 0xFF) as u8,
+        (rah & 0xFF) as u8,
+        ((rah >> 8) & 0xFF) as u8,
+    ])
+}
 
 #[inline]
-unsafe fn mmio_r(base: u64, off: usize) -> u32 {
-    read_volatile((base as usize + off) as *const u32)
+unsafe fn read32(base: usize, off: usize) -> u32 {
+    read_volatile((base + off) as *const u32)
 }
 
 #[inline]
-unsafe fn mmio_w(base: u64, off: usize, val: u32) {
-    write_volatile((base as usize + off) as *mut u32, val);
+unsafe fn write32(base: usize, off: usize, val: u32) {
+    write_volatile((base + off) as *mut u32, val);
 }
 
-fn alloc_dma(size: usize, _align: usize) -> Option<u64> {
+fn alloc_dma(size: usize, align: usize) -> Option<u64> {
     let pages = (size + 0xFFF) / 0x1000;
-    let phys = crate::mm::pmm::alloc_pages(pages)?.as_ptr() as u64;
+    let phys = crate::mm::pmm::alloc_pages_aligned(pages, align)?.as_ptr() as u64;
     unsafe { core::ptr::write_bytes(phys as *mut u8, 0, pages * 0x1000); }
     Some(phys)
 }

@@ -1,279 +1,260 @@
-//! virtio-net MMIO transport driver (RISC-V / ARM).
+//! Virtio-net MMIO driver (for RISC-V `virt` machine and other MMIO transports).
 //!
-//! Uses the virtio MMIO transport (as exposed by QEMU `-device virtio-net-device`).
-//! Register layout follows virtio spec 1.1, section 4.2.
-//!
-//! Queue layout is identical to the PCI driver (virtio_net.rs):
-//!   Queue 0 = RX, Queue 1 = TX
-//!   Each chain: [virtio_net_hdr (12 B)][payload]
+//! Provides a single RX queue and a single TX queue using the virtio 1.0 MMIO
+//! transport.  Packets include the standard 10-byte virtio-net header.
 
 extern crate alloc;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
+use spin::Mutex;
 
-use super::nic::NetworkDevice;
+use crate::drivers::net::nic::{MacAddr, NicStats};
 
-// ---------------------------------------------------------------------------
-// MMIO register offsets (virtio spec 1.1 s4.2.2)
-// ---------------------------------------------------------------------------
+const MMIO_MAGIC:       usize = 0x000;
+const MMIO_VERSION:     usize = 0x004;
+const MMIO_DEVICE_ID:   usize = 0x008;
+const MMIO_VENDOR_ID:   usize = 0x00C;
+const MMIO_DEV_FEAT:    usize = 0x010;
+const MMIO_DEV_FEATSEL: usize = 0x014;
+const MMIO_DRV_FEAT:    usize = 0x020;
+const MMIO_DRV_FEATSEL: usize = 0x024;
+const MMIO_GUEST_PAGE:  usize = 0x028; // legacy field on old QEMU, harmless otherwise
+const MMIO_QUEUE_SEL:   usize = 0x030;
+const MMIO_QUEUE_NUMMAX:usize = 0x034;
+const MMIO_QUEUE_NUM:   usize = 0x038;
+const MMIO_QUEUE_ALIGN: usize = 0x03C;
+const MMIO_QUEUE_PFN:   usize = 0x040;
+const MMIO_QUEUE_READY: usize = 0x044;
+const MMIO_QUEUE_NOTIFY:usize = 0x050;
+const MMIO_INT_STATUS:  usize = 0x060;
+const MMIO_INT_ACK:     usize = 0x064;
+const MMIO_STATUS:      usize = 0x070;
+const MMIO_CONFIG:      usize = 0x100;
 
-const MMIO_MAGIC:           usize = 0x000;
-const MMIO_VERSION:         usize = 0x004;
-const MMIO_DEVICE_ID:       usize = 0x008;
-const MMIO_VENDOR_ID:       usize = 0x00C;
-const MMIO_HOST_FEATURES:   usize = 0x010;
-const MMIO_HOST_FEAT_SEL:   usize = 0x014;
-const MMIO_GUEST_FEATURES:  usize = 0x020;
-const MMIO_GUEST_FEAT_SEL:  usize = 0x024;
-const MMIO_GUEST_PAGE_SHIFT:usize = 0x028;
-const MMIO_QUEUE_SEL:       usize = 0x030;
-const MMIO_QUEUE_NUM_MAX:   usize = 0x034;
-const MMIO_QUEUE_NUM:       usize = 0x038;
-const MMIO_QUEUE_ALIGN:     usize = 0x03C;
-const MMIO_QUEUE_PFN:       usize = 0x040;
-const MMIO_QUEUE_NOTIFY:    usize = 0x050;
-const MMIO_INTERRUPT_STATUS:usize = 0x060;
-const MMIO_INTERRUPT_ACK:   usize = 0x064;
-const MMIO_STATUS:          usize = 0x070;
-const MMIO_CONFIG:          usize = 0x100; // device-specific config
+const STATUS_ACK:      u32 = 1;
+const STATUS_DRIVER:   u32 = 2;
+const STATUS_OK:       u32 = 4;
+const STATUS_FEAT_OK:  u32 = 8;
 
-const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
-const DEVICE_NET:   u32 = 1;
+const FEAT_MAC:        u32 = 1 << 5;
 
-const STATUS_ACK:        u32 = 1;
-const STATUS_DRIVER:     u32 = 2;
-const STATUS_DRIVER_OK:  u32 = 4;
-const STATUS_FEAT_OK:    u32 = 8;
-const STATUS_FAILED:     u32 = 0x80;
-
-const VRING_SIZE:  usize = 64;
-const BUF_SIZE:    usize = 1526;
-const HDR_SIZE:    usize = 12;
-const PAGE_SIZE:   u32   = 4096;
-
-// Descriptor flags
-const DESC_F_NEXT:  u16 = 1;
-const DESC_F_WRITE: u16 = 2;
-
-// ---------------------------------------------------------------------------
-// Shared vring types (same as virtio_net.rs)
-// ---------------------------------------------------------------------------
+const QUEUE_RX:        u32 = 0;
+const QUEUE_TX:        u32 = 1;
+const QSZ:             usize = 256;
+const PKT_BUF:         usize = 2048;
+const NET_HDR_LEN:     usize = 10;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
-struct VringDesc { addr: u64, len: u32, flags: u16, next: u16 }
-
-#[repr(C, packed)]
-struct VringAvail { flags: u16, idx: u16, ring: [u16; VRING_SIZE] }
-
-#[repr(C, packed)]
-struct VringUsedElem { id: u32, len: u32 }
-
-#[repr(C, packed)]
-struct VringUsed { flags: u16, idx: u16, ring: [VringUsedElem; VRING_SIZE] }
-
-#[repr(C, packed)]
-#[derive(Default)]
-struct VirtioNetHdr {
-    flags: u8, gso_type: u8, hdr_len: u16,
-    gso_size: u16, csum_start: u16, csum_offset: u16, num_buffers: u16,
+struct Desc {
+    addr:  u64,
+    len:   u32,
+    flags: u16,
+    next:  u16,
 }
 
-// ---------------------------------------------------------------------------
-// Queue state
-// ---------------------------------------------------------------------------
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Avail {
+    flags: u16,
+    idx:   u16,
+    ring:  [u16; QSZ],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct UsedElem {
+    id:  u32,
+    len: u32,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Used {
+    flags: u16,
+    idx:   u16,
+    ring:  [UsedElem; QSZ],
+}
+
+const DESC_F_WRITE: u16 = 2;
 
 struct Queue {
-    desc:       u64,
-    avail:      u64,
-    used:       u64,
-    bufs:       [u64; VRING_SIZE],
-    avail_idx:  u16,
-    used_idx:   u16,
+    desc:  *mut Desc,
+    avail: *mut Avail,
+    used:  *mut Used,
+    bufs:  Vec<u64>,
+    last_used: u16,
 }
 
-// ---------------------------------------------------------------------------
-// Driver
-// ---------------------------------------------------------------------------
-
-pub struct VirtioNetMmio {
-    base:  u64,
-    mac:   [u8; 6],
-    rx:    Queue,
-    tx:    Queue,
+struct VirtioNetMmio {
+    base:   usize,
+    rxq:    Queue,
+    txq:    Queue,
+    mac:    MacAddr,
+    stats:  NicStats,
 }
 
-impl VirtioNetMmio {
-    /// Probe and initialise a virtio-net MMIO device at `base_phys`.
-    pub fn new(base_phys: u64) -> Option<Self> {
-        unsafe { Self::_new(base_phys) }
+unsafe impl Send for VirtioNetMmio {}
+unsafe impl Sync for VirtioNetMmio {}
+
+static NIC: Mutex<Option<VirtioNetMmio>> = Mutex::new(None);
+
+pub fn init(mmio_base: u64) { unsafe { _init(mmio_base as usize); } }
+pub fn is_initialised() -> bool { NIC.lock().is_some() }
+pub fn mac() -> Option<MacAddr> { NIC.lock().as_ref().map(|n| n.mac) }
+pub fn stats() -> Option<NicStats> { NIC.lock().as_ref().map(|n| n.stats) }
+pub fn send(frame: &[u8]) -> Result<(), &'static str> { unsafe { _send(frame) } }
+pub fn recv(out: &mut [u8]) -> Option<usize> { unsafe { _recv(out) } }
+
+unsafe fn _init(base: usize) {
+    if read32(base, MMIO_MAGIC) != 0x7472_6976 { return; }
+    if read32(base, MMIO_DEVICE_ID) != 1 { return; } // net device
+
+    write32(base, MMIO_STATUS, 0);
+    write32(base, MMIO_STATUS, STATUS_ACK | STATUS_DRIVER);
+
+    // Feature negotiation (page 0 only, enough for MAC).
+    write32(base, MMIO_DEV_FEATSEL, 0);
+    let feats = read32(base, MMIO_DEV_FEAT);
+    write32(base, MMIO_DRV_FEATSEL, 0);
+    write32(base, MMIO_DRV_FEAT, feats & FEAT_MAC);
+    write32(base, MMIO_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEAT_OK);
+
+    let rxq = setup_queue(base, QUEUE_RX);
+    let txq = setup_queue(base, QUEUE_TX);
+
+    let mut mac = [0u8; 6];
+    for i in 0..6 { mac[i] = read8(base, MMIO_CONFIG + i); }
+
+    write32(base, MMIO_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEAT_OK | STATUS_OK);
+
+    let mut nic = VirtioNetMmio {
+        base,
+        rxq,
+        txq,
+        mac: MacAddr(mac),
+        stats: NicStats::default(),
+    };
+    refill_rx(&mut nic.rxq, base);
+    *NIC.lock() = Some(nic);
+}
+
+unsafe fn _send(frame: &[u8]) -> Result<(), &'static str> {
+    let mut g = NIC.lock();
+    let nic = g.as_mut().ok_or("virtio-net-mmio not initialised")?;
+    if frame.len() + NET_HDR_LEN > PKT_BUF { return Err("frame too large"); }
+
+    let idx = poll_free_desc(&nic.txq)?;
+    let buf = nic.txq.bufs[idx as usize] as *mut u8;
+    core::ptr::write_bytes(buf, 0, NET_HDR_LEN);
+    core::ptr::copy_nonoverlapping(frame.as_ptr(), buf.add(NET_HDR_LEN), frame.len());
+
+    let d = &mut *nic.txq.desc.add(idx as usize);
+    d.addr = nic.txq.bufs[idx as usize];
+    d.len  = (frame.len() + NET_HDR_LEN) as u32;
+    d.flags = 0;
+    d.next  = 0;
+
+    post_avail(&mut nic.txq, idx, nic.base, QUEUE_TX);
+    nic.stats.tx_packets += 1;
+    nic.stats.tx_bytes += frame.len() as u64;
+    Ok(())
+}
+
+unsafe fn _recv(out: &mut [u8]) -> Option<usize> {
+    let mut g = NIC.lock();
+    let nic = g.as_mut()?;
+    let used = pop_used(&mut nic.rxq)?;
+    let buf = nic.rxq.bufs[used.id as usize] as *const u8;
+    if used.len as usize <= NET_HDR_LEN {
+        recycle_rx(&mut nic.rxq, used.id as u16, nic.base);
+        return None;
     }
-
-    unsafe fn _new(base: u64) -> Option<Self> {
-        let magic = mmio_r(base, MMIO_MAGIC);
-        if magic != VIRTIO_MAGIC { return None; }
-        let dev_id = mmio_r(base, MMIO_DEVICE_ID);
-        if dev_id != DEVICE_NET { return None; }
-
-        // Reset.
-        mmio_w(base, MMIO_STATUS, 0);
-        // Ack + Driver.
-        mmio_w(base, MMIO_STATUS, STATUS_ACK | STATUS_DRIVER);
-
-        // Negotiate features (accept everything for now).
-        mmio_w(base, MMIO_HOST_FEAT_SEL, 0);
-        let feat = mmio_r(base, MMIO_HOST_FEATURES);
-        mmio_w(base, MMIO_GUEST_FEAT_SEL, 0);
-        mmio_w(base, MMIO_GUEST_FEATURES, feat & 0x0000_FFFF);
-        mmio_w(base, MMIO_STATUS, STATUS_ACK | STATUS_DRIVER | STATUS_FEAT_OK);
-
-        // Read MAC from config space (+0x100).
-        let mac = [
-            mmio_r8(base, MMIO_CONFIG),
-            mmio_r8(base, MMIO_CONFIG + 1),
-            mmio_r8(base, MMIO_CONFIG + 2),
-            mmio_r8(base, MMIO_CONFIG + 3),
-            mmio_r8(base, MMIO_CONFIG + 4),
-            mmio_r8(base, MMIO_CONFIG + 5),
-        ];
-
-        mmio_w(base, MMIO_GUEST_PAGE_SHIFT, 12); // 4 KiB pages
-
-        let rx = setup_queue(base, 0)?;
-        let tx = setup_queue(base, 1)?;
-
-        // Pre-fill RX ring.
-        let mut rxq = rx;
-        for i in 0..VRING_SIZE {
-            let buf = alloc_dma(BUF_SIZE)?;
-            rxq.bufs[i] = buf;
-            let desc = (rxq.desc as usize + i * 16) as *mut VringDesc;
-            *desc = VringDesc { addr: buf, len: BUF_SIZE as u32,
-                flags: DESC_F_WRITE, next: 0 };
-            let avail = &mut *(rxq.avail as *mut VringAvail);
-            avail.ring[i] = i as u16;
-        }
-        {
-            let avail = &mut *(rxq.avail as *mut VringAvail);
-            avail.idx = VRING_SIZE as u16;
-            rxq.avail_idx = VRING_SIZE as u16;
-        }
-        mmio_w(base, MMIO_QUEUE_NOTIFY, 0);
-
-        mmio_w(base, MMIO_STATUS,
-            STATUS_ACK | STATUS_DRIVER | STATUS_FEAT_OK | STATUS_DRIVER_OK);
-
-        Some(VirtioNetMmio { base, mac, rx: rxq, tx })
-    }
+    let plen = used.len as usize - NET_HDR_LEN;
+    let n = out.len().min(plen);
+    core::ptr::copy_nonoverlapping(buf.add(NET_HDR_LEN), out.as_mut_ptr(), n);
+    recycle_rx(&mut nic.rxq, used.id as u16, nic.base);
+    nic.stats.rx_packets += 1;
+    nic.stats.rx_bytes += plen as u64;
+    Some(n)
 }
 
-impl NetworkDevice for VirtioNetMmio {
-    fn send(&mut self, frame: &[u8]) -> Result<(), &'static str> {
-        let total = HDR_SIZE + frame.len();
-        if total > BUF_SIZE { return Err("frame too large"); }
-        let idx = self.tx.avail_idx as usize % VRING_SIZE;
-        let buf = if self.tx.bufs[idx] == 0 {
-            let p = alloc_dma(BUF_SIZE).ok_or("tx alloc")?;
-            self.tx.bufs[idx] = p;
-            p
-        } else { self.tx.bufs[idx] };
-        unsafe {
-            core::ptr::write_bytes(buf as *mut u8, 0, HDR_SIZE);
-            core::ptr::copy_nonoverlapping(
-                frame.as_ptr(), (buf as usize + HDR_SIZE) as *mut u8, frame.len());
-            let desc = (self.tx.desc as usize + idx * 16) as *mut VringDesc;
-            *desc = VringDesc { addr: buf, len: total as u32, flags: 0, next: 0 };
-            let avail = &mut *(self.tx.avail as *mut VringAvail);
-            avail.ring[self.tx.avail_idx as usize % VRING_SIZE] = idx as u16;
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            avail.idx = avail.idx.wrapping_add(1);
-            self.tx.avail_idx = avail.idx;
-        }
-        unsafe { mmio_w(self.base, MMIO_QUEUE_NOTIFY, 1); }
-        Ok(())
-    }
+unsafe fn setup_queue(base: usize, q: u32) -> Queue {
+    write32(base, MMIO_QUEUE_SEL, q);
+    let qmax = read32(base, MMIO_QUEUE_NUMMAX) as usize;
+    assert!(qmax >= QSZ);
+    write32(base, MMIO_QUEUE_NUM, QSZ as u32);
+    write32(base, MMIO_QUEUE_ALIGN, 4096);
 
-    fn recv(&mut self) -> Option<Vec<u8>> {
-        let used = unsafe { &*(self.rx.used as *const VringUsed) };
-        if used.idx == self.rx.used_idx { return None; }
-        let entry = &used.ring[self.rx.used_idx as usize % VRING_SIZE];
-        let buf_idx = entry.id as usize % VRING_SIZE;
-        let total   = entry.len as usize;
-        if total <= HDR_SIZE {
-            self.rx.used_idx = self.rx.used_idx.wrapping_add(1);
-            return None;
-        }
-        let frame = unsafe {
-            core::slice::from_raw_parts(
-                (self.rx.bufs[buf_idx] as usize + HDR_SIZE) as *const u8,
-                total - HDR_SIZE,
-            )
-        }.to_vec();
-        unsafe {
-            let avail = &mut *(self.rx.avail as *mut VringAvail);
-            avail.ring[self.rx.avail_idx as usize % VRING_SIZE] = buf_idx as u16;
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            avail.idx = avail.idx.wrapping_add(1);
-            self.rx.avail_idx = avail.idx;
-            mmio_w(self.base, MMIO_QUEUE_NOTIFY, 0);
-        }
-        self.rx.used_idx = self.rx.used_idx.wrapping_add(1);
-        Some(frame)
-    }
+    let bytes_desc  = QSZ * core::mem::size_of::<Desc>();
+    let bytes_avail = core::mem::size_of::<Avail>();
+    let bytes_used  = core::mem::size_of::<Used>();
+    let total = align_up(bytes_desc + bytes_avail, 4096) + align_up(bytes_used, 4096);
+    let phys = alloc_dma(total, 4096).unwrap();
+    core::ptr::write_bytes(phys as *mut u8, 0, total);
 
-    fn mac(&self) -> [u8; 6] { self.mac }
+    write32(base, MMIO_QUEUE_PFN, (phys >> 12) as u32);
+    write32(base, MMIO_QUEUE_READY, 1);
+
+    let desc  = phys as *mut Desc;
+    let avail = (phys as usize + bytes_desc) as *mut Avail;
+    let used  = (phys as usize + align_up(bytes_desc + bytes_avail, 4096)) as *mut Used;
+
+    let mut bufs = Vec::with_capacity(QSZ);
+    for _ in 0..QSZ { bufs.push(alloc_dma(PKT_BUF, 2048).unwrap()); }
+
+    Queue { desc, avail, used, bufs, last_used: 0 }
 }
 
-// ---------------------------------------------------------------------------
-// Queue setup
-// ---------------------------------------------------------------------------
-
-unsafe fn setup_queue(base: u64, idx: u32) -> Option<Queue> {
-    mmio_w(base, MMIO_QUEUE_SEL, idx);
-    let max = mmio_r(base, MMIO_QUEUE_NUM_MAX) as usize;
-    if max == 0 { return None; }
-    let size = max.min(VRING_SIZE);
-    mmio_w(base, MMIO_QUEUE_NUM, size as u32);
-    mmio_w(base, MMIO_QUEUE_ALIGN, PAGE_SIZE);
-
-    let desc_bytes  = size * 16;
-    let avail_bytes = 4 + size * 2;
-    let used_off    = (desc_bytes + avail_bytes + 4095) / 4096 * 4096;
-    let total       = used_off + 4 + size * 8;
-    let pages       = (total + 4095) / 4096;
-
-    let phys = alloc_dma(pages * 4096)?;
-    core::ptr::write_bytes(phys as *mut u8, 0, pages * 4096);
-
-    mmio_w(base, MMIO_QUEUE_PFN, (phys / PAGE_SIZE as u64) as u32);
-
-    Some(Queue {
-        desc:      phys,
-        avail:     phys + desc_bytes as u64,
-        used:      phys + used_off as u64,
-        bufs:      [0u64; VRING_SIZE],
-        avail_idx: 0,
-        used_idx:  0,
-    })
+unsafe fn refill_rx(q: &mut Queue, base: usize) {
+    for i in 0..QSZ as u16 { recycle_rx(q, i, base); }
 }
 
-fn alloc_dma(size: usize) -> Option<u64> {
+unsafe fn recycle_rx(q: &mut Queue, idx: u16, base: usize) {
+    let d = &mut *q.desc.add(idx as usize);
+    d.addr = q.bufs[idx as usize];
+    d.len  = PKT_BUF as u32;
+    d.flags = DESC_F_WRITE;
+    d.next  = 0;
+    post_avail(q, idx, base, QUEUE_RX);
+}
+
+unsafe fn poll_free_desc(q: &Queue) -> Result<u16, &'static str> {
+    for i in 0..QSZ {
+        let d = &*q.desc.add(i);
+        if d.len == 0 { return Ok(i as u16); }
+    }
+    Err("no free tx desc")
+}
+
+unsafe fn post_avail(q: &mut Queue, idx: u16, base: usize, which: u32) {
+    let a = &mut *q.avail;
+    let slot = (a.idx as usize) % QSZ;
+    a.ring[slot] = idx;
+    a.idx = a.idx.wrapping_add(1);
+    write32(base, MMIO_QUEUE_NOTIFY, which);
+}
+
+unsafe fn pop_used(q: &mut Queue) -> Option<UsedElem> {
+    let u = &*q.used;
+    if q.last_used == u.idx { return None; }
+    let elem = u.ring[(q.last_used as usize) % QSZ];
+    q.last_used = q.last_used.wrapping_add(1);
+    let d = &mut *q.desc.add(elem.id as usize);
+    d.len = 0;
+    Some(elem)
+}
+
+#[inline]
+fn align_up(x: usize, a: usize) -> usize { (x + a - 1) & !(a - 1) }
+
+fn alloc_dma(size: usize, align: usize) -> Option<u64> {
     let pages = (size + 0xFFF) / 0x1000;
-    let phys = crate::mm::pmm::alloc_pages(pages)?.as_ptr() as u64;
+    let phys = crate::mm::pmm::alloc_pages_aligned(pages, align)?.as_ptr() as u64;
     unsafe { core::ptr::write_bytes(phys as *mut u8, 0, pages * 0x1000); }
     Some(phys)
 }
 
-// ---------------------------------------------------------------------------
-// MMIO helpers
-// ---------------------------------------------------------------------------
-
-#[inline] unsafe fn mmio_r(base: u64, off: usize) -> u32 {
-    read_volatile((base as usize + off) as *const u32)
-}
-#[inline] unsafe fn mmio_w(base: u64, off: usize, val: u32) {
-    write_volatile((base as usize + off) as *mut u32, val);
-}
-#[inline] unsafe fn mmio_r8(base: u64, off: usize) -> u8 {
-    read_volatile((base as usize + off) as *const u8)
-}
+#[inline] unsafe fn read8(base: usize, off: usize) -> u8 { read_volatile((base + off) as *const u8) }
+#[inline] unsafe fn read32(base: usize, off: usize) -> u32 { read_volatile((base + off) as *const u32) }
+#[inline] unsafe fn write32(base: usize, off: usize, val: u32) { write_volatile((base + off) as *mut u32, val); }
