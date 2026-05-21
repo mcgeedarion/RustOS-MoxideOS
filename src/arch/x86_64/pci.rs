@@ -18,6 +18,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA:    u16 = 0xCFC;
 
+// ── Well-known class/subclass/prog_if tuples ──────────────────────────────────
+
+/// PCI mass-storage, SATA, AHCI 1.0  (class=0x01, sub=0x06, prog_if=0x01)
+pub const PCI_CLASS_STORAGE_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
+/// PCI mass-storage, NVMe            (class=0x01, sub=0x08, prog_if=0x02)
+pub const PCI_CLASS_STORAGE_NVME: (u8, u8, u8) = (0x01, 0x08, 0x02);
+/// PCI network, Ethernet             (class=0x02, sub=0x00)
+pub const PCI_CLASS_NETWORK_ETH:  (u8, u8)     = (0x02, 0x00);
+
 // ── I/O helpers ──────────────────────────────────────────────────────────────
 
 #[inline]
@@ -55,9 +64,6 @@ pub fn config_write_u32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
 
 // ── Device table ─────────────────────────────────────────────────────────────
 
-/// Maximum number of PCI functions the static table can hold.
-/// Theoretical max is 256 buses × 32 devices × 8 functions = 65 536;
-/// 256 is ample for QEMU and most real machines.
 const MAX_DEVICES: usize = 256;
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -74,6 +80,33 @@ pub struct PciDevice {
     pub irq_pin:  u8,
 }
 
+impl PciDevice {
+    /// Read a 32-bit BAR, decode it as a 64-bit MMIO address (handles 64-bit BARs).
+    /// Returns `None` if the BAR is I/O space or zero.
+    pub fn bar_mmio(&self, bar_index: u8) -> Option<u64> {
+        let offset = 0x10 + bar_index * 4;
+        let lo = config_read_u32(self.bus, self.dev, self.func, offset);
+        if lo & 1 != 0 { return None; } // I/O BAR
+        let base_lo = (lo & !0xF) as u64;
+        if base_lo == 0 { return None; }
+        // Type field bits [2:1]: 0x2 = 64-bit BAR
+        if (lo >> 1) & 3 == 2 {
+            let hi = config_read_u32(self.bus, self.dev, self.func, offset + 4) as u64;
+            Some(base_lo | (hi << 32))
+        } else {
+            Some(base_lo)
+        }
+    }
+
+    /// Enable bus-mastering and MMIO decoding for this device.
+    pub fn enable(&self) {
+        let cmd = config_read_u16(self.bus, self.dev, self.func, 0x04);
+        // bit 1 = Memory Space Enable, bit 2 = Bus Master Enable
+        config_write_u32(self.bus, self.dev, self.func, 0x04,
+            (cmd as u32) | 0x06);
+    }
+}
+
 static mut PCI_DEVICES: [PciDevice; MAX_DEVICES] = [PciDevice {
     bus: 0, dev: 0, func: 0,
     vendor: 0, device: 0,
@@ -85,17 +118,15 @@ static PCI_COUNT: AtomicU32 = AtomicU32::new(0);
 fn register_device(d: PciDevice) {
     let idx = PCI_COUNT.fetch_add(1, Ordering::Relaxed) as usize;
     if idx < MAX_DEVICES {
-        // SAFETY: single-threaded at this point in boot (before smp::init returns).
         unsafe { PCI_DEVICES[idx] = d; }
     }
 }
 
 // ── Public query API ─────────────────────────────────────────────────────────
 
-/// Find a device by vendor + device ID.  Returns the first match.
+/// Find a device by vendor + device ID.
 pub fn find_device(vendor: u16, device_id: u16) -> Option<PciDevice> {
     let n = PCI_COUNT.load(Ordering::Relaxed) as usize;
-    // SAFETY: PCI_DEVICES[0..n] written during init(); read-only after.
     unsafe { PCI_DEVICES[..n].iter().find(|d| d.vendor == vendor && d.device == device_id).copied() }
 }
 
@@ -105,16 +136,32 @@ pub fn find_class(class: u8, subclass: u8) -> Option<PciDevice> {
     unsafe { PCI_DEVICES[..n].iter().find(|d| d.class == class && d.subclass == subclass).copied() }
 }
 
-/// Iterate all discovered devices.  `f` receives each `PciDevice`.
+/// Find the first device matching (class, subclass, prog_if).
+/// Use this for NVMe (0x01, 0x08, 0x02) and AHCI (0x01, 0x06, 0x01).
+pub fn find_class_progif(class: u8, subclass: u8, prog_if: u8) -> Option<PciDevice> {
+    let n = PCI_COUNT.load(Ordering::Relaxed) as usize;
+    unsafe {
+        PCI_DEVICES[..n].iter().find(|d|
+            d.class == class && d.subclass == subclass && d.prog_if == prog_if
+        ).copied()
+    }
+}
+
+/// Iterate all discovered devices.
 pub fn for_each(mut f: impl FnMut(PciDevice)) {
     let n = PCI_COUNT.load(Ordering::Relaxed) as usize;
     unsafe { PCI_DEVICES[..n].iter().copied().for_each(&mut f); }
 }
 
+// ── Kernel-main helpers (used by probe_ahci / probe_nvme) ────────────────────
+
+/// Find device by (class, subclass, prog_if) — thin alias used by kernel_main.
+pub fn find_device_by_class(tuple: (u8, u8, u8)) -> Option<PciDevice> {
+    find_class_progif(tuple.0, tuple.1, tuple.2)
+}
+
 // ── Bus scan ─────────────────────────────────────────────────────────────────
 
-/// Enumerate all PCI buses, devices, and functions using Type-1 config cycles.
-/// Populates `PCI_DEVICES`; must be called exactly once, after `smp::init()`.
 pub fn init() {
     let mut count = 0u32;
 
@@ -124,7 +171,7 @@ pub fn init() {
                 let dword0 = config_read_u32(bus, dev, func, 0x00);
                 let vendor  = (dword0 & 0xFFFF) as u16;
                 if vendor == 0xFFFF {
-                    if func == 0 { continue; }  // no device, skip remaining funcs
+                    if func == 0 { continue; }
                     else         { continue; }
                 }
                 let device_id = (dword0 >> 16) as u16;
@@ -143,20 +190,16 @@ pub fn init() {
                 count += 1;
 
                 crate::println!(
-                    "pci: {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}/{:02x} irq {}",
-                    bus, dev, func, vendor, device_id, class, subclass, irq_line
+                    "pci: {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}/{:02x}/{:02x} irq {}",
+                    bus, dev, func, vendor, device_id, class, subclass, prog_if, irq_line
                 );
 
                 if func == 0 {
-                    // bit 7 of header-type = multi-function device
                     let hdr = config_read_u8(bus, dev, func, 0x0E);
-                    if hdr & 0x80 == 0 { break; }  // single-function, skip funcs 1–7
+                    if hdr & 0x80 == 0 { break; }
                 }
             }
         }
-        // Bus 0 always exists; if bus > 0 and no devices found we could break,
-        // but a full scan is the safest default.
-        let _ = bus; // suppress unused-variable warning when optimised out
         if bus == 255 { break 'bus; }
     }
 
