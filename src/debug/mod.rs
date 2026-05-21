@@ -8,19 +8,16 @@
 //! ```sh
 //! cargo build --features debug          # full debug build
 //! cargo build --features debug,gdbstub  # same (gdbstub is implied by debug)
-//! cargo build --features gdbstub        # GDB stub only, no other debug helpers
+//! cargo build --features debug,trace    # with ftrace function hooks
+//! cargo build --features gdbstub        # GDB stub only
 //! ```
-//!
-//! The outer `#[cfg(feature = "debug")]` on this file's contents keeps
-//! **release builds completely clean** — no dead code, no extra sections,
-//! no debug-only symbols in the final binary.
 //!
 //! ## Modules
 //!
-//! - `gdbstub` — GDB Remote Serial Protocol (RSP) stub for kernel-level
-//!   debugging over a serial transport. Supports both x86_64 and RISC-V
-//!   register sets (`rsp.rs` / `rsp_riscv.rs`). Gated behind the additional
-//!   `gdbstub` feature (implied by `debug`).
+//! - `gdbstub`  — GDB Remote Serial Protocol (RSP) stub (requires `gdbstub` feature)
+//! - `trace`    — lock-free ring buffer for syscall/IRQ/sched events
+//! - `ftrace`   — LLVM `-Z instrument-functions` hooks (requires `trace` feature)
+//! - `oops`     — enriched panic formatter: register dump + stack backtrace
 //!
 //! ## Adding new debug subsystems
 //!
@@ -28,40 +25,24 @@
 //! 2. Add a matching feature flag in `Cargo.toml` (optional, or imply it
 //!    from `debug = ["gdbstub", "<subsystem>"]`).
 //! 3. Gate the `pub mod` below with `#[cfg(feature = "<subsystem>")]`.
-//!    The outer `#[cfg(feature = "debug")]` on this whole block already
-//!    ensures the subsystem is unreachable in release builds even if the
-//!    inner flag were somehow set without `debug`.
-//!
-//! ## Crate-split note
-//!
-//! When `kernel-hal` is extracted into its own crate:
-//!
-//! ```toml
-//! # kernel-hal/Cargo.toml
-//! [features]
-//! debug   = ["gdbstub"]
-//! gdbstub = []
-//! ```
-//!
-//! and the root `Cargo.toml` re-exports:
-//!
-//! ```toml
-//! debug   = ["kernel-hal/debug"]
-//! gdbstub = ["kernel-hal/gdbstub"]
-//! ```
 
-// Nothing in this file is compiled unless `--features debug` is passed.
-// This single outer gate is the canonical enforcement point for keeping
-// release builds free of all debugging infrastructure.
 #[cfg(feature = "debug")]
 mod debug_impl {
     // GDB Remote Serial Protocol stub.
-    // Also requires the `gdbstub` sub-feature (implied by `debug`).
     #[cfg(feature = "gdbstub")]
     pub mod gdbstub;
-
     #[cfg(feature = "gdbstub")]
     pub use gdbstub as _gdbstub_reexport;
+
+    // Lock-free kernel trace ring buffer (syscall/IRQ/sched events).
+    pub mod trace;
+
+    // ftrace-style function entry/exit hooks via LLVM instrument-functions.
+    #[cfg(feature = "trace")]
+    pub mod ftrace;
+
+    // Enriched panic handler: register dump + frame-pointer backtrace.
+    pub mod oops;
 }
 
 #[cfg(feature = "debug")]
