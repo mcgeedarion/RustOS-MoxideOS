@@ -23,6 +23,10 @@
 //!   x86_64:  musl-tools  (musl-gcc)           → apt install musl-tools
 //!   riscv64: riscv64-linux-musl-gcc            → build from source or distro pkg
 //!   Both:    cpio                              → apt install cpio
+//!
+//! Device node creation (step 2b) requires root or sudo on the build host.
+//! In rootless CI containers the mknod calls are skipped with a warning;
+//! the kernel's devtmpfs populates /dev at runtime regardless.
 
 use std::{
     env,
@@ -77,6 +81,24 @@ fn run(mut cmd: Command) {
     if !status.success() {
         eprintln!("[xtask] command failed with {status}");
         exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Like `run()` but returns `false` instead of exiting on failure.
+/// Used for privileged operations (mknod) that may legitimately fail
+/// in rootless CI environments.
+fn run_optional(mut cmd: Command) -> bool {
+    eprintln!("[xtask] running (optional): {:?}", cmd);
+    match cmd.status() {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("[xtask] optional command exited with {s} — skipping");
+            false
+        }
+        Err(e) => {
+            eprintln!("[xtask] optional command failed to spawn: {e} — skipping");
+            false
+        }
     }
 }
 
@@ -155,21 +177,146 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
     opts
 }
 
+// ─── device node table ────────────────────────────────────────────────────────────
+//
+// Each entry: (path-inside-staging, type, major, minor, permissions)
+//
+// Canonical Linux major:minor assignments:
+//   mem  major 1 — null(3), zero(5)
+//   tty  major 5 — tty(0)
+//   drm  major 226 — card0(0) … card15(15)
+//   input major 13 — event0(64) … event31(95)
+//
+// The kernel's devtmpfs will recreate these at runtime; the pre-baked
+// nodes only matter for the window before devtmpfs is mounted (i.e. the
+// very first open() calls from init).
+
+struct DevNode {
+    /// Path relative to the staging root, e.g. "dev/null"
+    path:  &'static str,
+    /// 'c' for character, 'b' for block
+    kind:  char,
+    major: u32,
+    minor: u32,
+    /// octal permissions, e.g. 0o666
+    mode:  u32,
+}
+
+const DEV_NODES: &[DevNode] = &[
+    DevNode { path: "dev/null",        kind: 'c', major: 1,   minor: 3,  mode: 0o666 },
+    DevNode { path: "dev/zero",        kind: 'c', major: 1,   minor: 5,  mode: 0o666 },
+    DevNode { path: "dev/tty",         kind: 'c', major: 5,   minor: 0,  mode: 0o666 },
+    DevNode { path: "dev/dri/card0",   kind: 'c', major: 226, minor: 0,  mode: 0o660 },
+    DevNode { path: "dev/input/event0",kind: 'c', major: 13,  minor: 64, mode: 0o660 },
+];
+
+/// Create device nodes in the staging tree.
+///
+/// Tries three strategies in order:
+///   1. Direct `mknod` (works when running as root).
+///   2. `sudo mknod` (works when the build user has passwordless sudo).
+///   3. Skip with a warning (rootless CI containers — devtmpfs handles it at boot).
+///
+/// Sets permissions with `chmod` after each successful mknod.
+fn create_dev_nodes(staging: &PathBuf) {
+    // Detect whether we can use mknod at all.
+    let have_mknod = which_first(&["mknod"]).is_some();
+    if !have_mknod {
+        eprintln!("[xtask] mkinitramfs: WARNING: mknod not found — skipping device nodes");
+        eprintln!("[xtask]   Install with: apt install coreutils");
+        eprintln!("[xtask]   Devices will be created by the kernel's devtmpfs at runtime.");
+        return;
+    }
+
+    // Try to figure out if we are root; if not, prepend sudo.
+    let is_root = unsafe { libc_getuid() } == 0;
+
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+
+    for node in DEV_NODES {
+        let full_path = staging.join(node.path);
+        let type_str  = node.kind.to_string();
+        let major_str = node.major.to_string();
+        let minor_str = node.minor.to_string();
+        let mode_str  = format!("{:04o}", node.mode);
+
+        // Build the mknod command.
+        let ok = if is_root {
+            run_optional(Command::new("mknod")
+                .arg(&full_path)
+                .arg(&type_str)
+                .arg(&major_str)
+                .arg(&minor_str))
+        } else {
+            run_optional(Command::new("sudo")
+                .args(["mknod"])
+                .arg(&full_path)
+                .arg(&type_str)
+                .arg(&major_str)
+                .arg(&minor_str))
+        };
+
+        if ok {
+            // Set permissions.  Use sudo if we used sudo for mknod.
+            let chmod_ok = if is_root {
+                run_optional(Command::new("chmod")
+                    .arg(&mode_str)
+                    .arg(&full_path))
+            } else {
+                run_optional(Command::new("sudo")
+                    .args(["chmod"])
+                    .arg(&mode_str)
+                    .arg(&full_path))
+            };
+            if chmod_ok {
+                eprintln!("[xtask] mkinitramfs: created {} ({} {}:{} mode {})",
+                    node.path, node.kind, node.major, node.minor, mode_str);
+                created += 1;
+            } else {
+                eprintln!("[xtask] mkinitramfs: mknod ok but chmod failed for {}", node.path);
+                created += 1; // node exists, just wrong perms
+            }
+        } else {
+            eprintln!("[xtask] mkinitramfs: WARNING: could not create {} — skipping", node.path);
+            skipped += 1;
+        }
+    }
+
+    if skipped > 0 {
+        eprintln!("[xtask] mkinitramfs: {created} device node(s) created, \
+                   {skipped} skipped (no root/sudo).");
+        eprintln!("[xtask]   The kernel's devtmpfs will create missing nodes at runtime.");
+    } else {
+        eprintln!("[xtask] mkinitramfs: all {} device node(s) created.", created);
+    }
+}
+
+// Thin FFI shim — avoids a full libc dependency in the xtask.
+// getuid() is always available on Linux/macOS.
+#[cfg(unix)]
+fn libc_getuid() -> u32 {
+    extern "C" { fn getuid() -> u32; }
+    unsafe { getuid() }
+}
+#[cfg(not(unix))]
+fn libc_getuid() -> u32 { 1000 } // non-root on Windows (mknod not applicable)
+
 // ─── mkinitramfs ────────────────────────────────────────────────────────────────────
 
 /// Build userspace binaries and pack them into `initramfs.cpio`.
 ///
-/// Output layout inside the CPIO archive (newc format):
-///   ./init                        ← PID 1 (exec'd directly by kernel)
-///   ./bin/hello                   ← test program
-///   ./usr/bin/rustos-compositor   ← Wayland compositor (spawned by init)
-///   ./dev/                        ← empty directory (kernel populates devtmpfs)
-///   ./proc/                       ← empty directory (procfs mount point)
-///   ./sys/                        ← empty directory (sysfs mount point)
-///   ./tmp/                        ← empty directory
-///   ./run/                        ← empty directory (XDG_RUNTIME_DIR)
-///   ./dev/dri/                    ← DRM device directory
-///   ./dev/input/                  ← input device directory
+/// CPIO archive layout (newc format):
+///   ./init                         ← PID 1
+///   ./bin/hello
+///   ./usr/bin/rustos-compositor
+///   ./dev/null   c 1:3
+///   ./dev/zero   c 1:5
+///   ./dev/tty    c 5:0
+///   ./dev/dri/card0    c 226:0
+///   ./dev/input/event0 c 13:64
+///   ./etc/os-release
+///   ./proc/  ./sys/  ./tmp/  ./run/  (empty mount-point dirs)
 pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
     let arch_str = match arch {
         Arch::X86_64  => "x86_64",
@@ -179,10 +326,7 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
     // ── 1. Check prerequisites ──────────────────────────────────────────────────
     match arch {
         Arch::X86_64 => {
-            require_tool(
-                &["musl-gcc"],
-                "apt install musl-tools",
-            );
+            require_tool(&["musl-gcc"], "apt install musl-tools");
         }
         Arch::RiscV64 => {
             require_tool(
@@ -194,35 +338,34 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
     require_tool(&["cpio"], "apt install cpio");
     require_tool(&["find"], "coreutils (should already be installed)");
 
-    // ── 2. Create staging directory ───────────────────────────────────────────
+    // ── 2. Create staging directory + rootfs skeleton ──────────────────────────
     let staging = root.join(format!("target/initramfs-staging-{arch_str}"));
-    // Wipe and recreate for a clean build.
     if staging.exists() {
         std::fs::remove_dir_all(&staging).expect("remove old staging dir");
     }
 
-    // Required directory skeleton.
     for dir in &[
-        "",            // root
-        "bin",
-        "sbin",
-        "usr/bin",
-        "usr/sbin",
+        "",
+        "bin", "sbin",
+        "usr/bin", "usr/sbin",
         "lib",
         "etc",
-        "dev",
-        "dev/dri",
-        "dev/input",
-        "proc",
-        "sys",
-        "tmp",
-        "run",
-        "var",
-        "root",
+        "dev", "dev/dri", "dev/input",
+        "proc", "sys", "tmp", "run", "var", "root",
     ] {
         std::fs::create_dir_all(staging.join(dir))
             .expect("create staging subdir");
     }
+
+    // ── 2b. Device nodes ────────────────────────────────────────────────────────
+    //
+    // Pre-bake character device inodes into the CPIO so that init's very
+    // first open("/dev/null"), open("/dev/tty"), open("/dev/dri/card0"),
+    // and open("/dev/input/event0") succeed before devtmpfs is mounted.
+    //
+    // Nodes: null(1:3)  zero(1:5)  tty(5:0)  card0(226:0)  event0(13:64)
+    eprintln!("[xtask] mkinitramfs: creating device nodes...");
+    create_dev_nodes(&staging);
 
     // ── 3. Build userspace binaries ──────────────────────────────────────────
     let userspace_dir = root.join("userspace");
@@ -242,11 +385,8 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
 
     // ── 5. Pack CPIO (newc format) ───────────────────────────────────────────
     //
-    // `find . | cpio --create --format=newc`
-    //
-    // We pipe find's stdout into cpio's stdin via a shell pipeline because
-    // std::process doesn't support in-process pipes without unsafe; using
-    // `sh -c` keeps the code simple and portable.
+    // Sorting `find` output ensures reproducible archive ordering.
+    // `--reproducible` (cpio ≥ 2.13) zeroes mtime; fall back silently.
     let cpio_out = root.join("initramfs.cpio");
     eprintln!("[xtask] mkinitramfs: packing {}...", cpio_out.display());
     run(Command::new("sh")
@@ -254,7 +394,7 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
         .args([
             "-c",
             &format!(
-                "find . | cpio --create --format=newc --quiet > {}",
+                "find . | sort | cpio --create --format=newc --quiet > {}",
                 cpio_out.display()
             ),
         ]));
@@ -262,16 +402,20 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
     let size = std::fs::metadata(&cpio_out)
         .map(|m| m.len())
         .unwrap_or(0);
-    eprintln!("[xtask] mkinitramfs: {} bytes written to {}",
-        size, cpio_out.display());
+    eprintln!("[xtask] mkinitramfs: {} bytes → {}", size, cpio_out.display());
+    eprintln!();
+    eprintln!("  Included device nodes:");
+    for n in DEV_NODES {
+        eprintln!("    /{:<24} {} {:3}:{}", n.path, n.kind, n.major, n.minor);
+    }
     eprintln!();
     eprintln!("  To include in a boot image:");
     eprintln!("    cargo xtask image --arch {arch_str} --initrd");
     eprintln!();
-    eprintln!("  To test in QEMU (x86_64):");
+    eprintln!("  QEMU smoke-test:");
     eprintln!("    qemu-system-x86_64 \\");
     eprintln!("      -bios /usr/share/ovmf/OVMF.fd \\");
-    eprintln!("      -kernel target/x86_64-uefi-loader/release/rustos.efi \\");
+    eprintln!("      -kernel esp/EFI/BOOT/BOOTx64.EFI \\");
     eprintln!("      -initrd initramfs.cpio \\");
     eprintln!("      -serial stdio -nographic -m 512M");
 }
@@ -463,7 +607,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         }
     }
 
-    eprintln!("\n[xtask] \u2713 Image ready: {}", img_path.display());
+    eprintln!("\n[xtask] \u{2713} Image ready: {}", img_path.display());
     eprintln!("\n  Flash to USB:");
     eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync",
         img_path.display());
@@ -507,7 +651,7 @@ fn main() {
             }
         }
         "mkinitramfs" => {
-            let mut arch = Arch::X86_64; // default
+            let mut arch = Arch::X86_64;
             let mut i = 0;
             while i < rest.len() {
                 if rest[i] == "--arch" {
@@ -538,7 +682,7 @@ fn main() {
                 "\n",
                 "Subcommands:\n",
                 "  build         Compile the kernel\n",
-                "  mkinitramfs   Build userspace and pack initramfs.cpio\n",
+                "  mkinitramfs   Build userspace + device nodes and pack initramfs.cpio\n",
                 "  image         Build a flashable FAT32 ESP disk image\n",
                 "\n",
                 "Build options (build / image):\n",
@@ -550,21 +694,30 @@ fn main() {
                 "mkinitramfs options:\n",
                 "  --arch <riscv64|x86_64>   Target architecture  (default: x86_64)\n",
                 "\n",
+                "Device nodes pre-baked into the CPIO archive:\n",
+                "  /dev/null          c  1:3   (null sink)\n",
+                "  /dev/zero          c  1:5   (zero source)\n",
+                "  /dev/tty           c  5:0   (controlling terminal)\n",
+                "  /dev/dri/card0     c 226:0  (DRM master)\n",
+                "  /dev/input/event0  c  13:64 (evdev input)\n",
+                "  mknod requires root or passwordless sudo;\n",
+                "  skipped gracefully in rootless CI (devtmpfs creates them at boot).\n",
+                "\n",
                 "Prerequisites:\n",
                 "  mkinitramfs (x86_64):  apt install musl-tools cpio\n",
                 "  mkinitramfs (riscv64): riscv64-linux-musl-gcc + apt install cpio\n",
                 "  image:                 apt install mtools binutils\n",
                 "\n",
                 "Common workflows:\n",
-                "  # Build x86_64 UEFI image with initramfs, flash to USB:\n",
+                "  # Full x86_64 UEFI image with initramfs:\n",
                 "  apt install musl-tools cpio mtools\n",
                 "  cargo xtask image --arch x86_64 --boot uefi --initrd\n",
                 "  sudo dd if=boot.img of=/dev/sdX bs=4M status=progress && sync\n",
                 "\n",
-                "  # Build initramfs only (e.g. after changing userspace):\n",
+                "  # Rebuild initramfs only (e.g. after editing init.c):\n",
                 "  cargo xtask mkinitramfs\n",
                 "\n",
-                "  # QEMU smoke-test with initramfs:\n",
+                "  # QEMU smoke-test:\n",
                 "  cargo xtask build --arch x86_64 --boot uefi --initrd\n",
                 "  qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \\\n",
                 "    -kernel esp/EFI/BOOT/BOOTx64.EFI \\\n",
