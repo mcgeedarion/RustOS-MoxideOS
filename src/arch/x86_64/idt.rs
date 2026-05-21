@@ -556,10 +556,36 @@ pub extern "C" fn nmi_handler(frame: &mut InterruptFrame) {
     // TODO: inspect NMI source (ECC, watchdog, IOCK#).
 }
 
+// ── #DB handler — single-step (RFLAGS.TF) and hardware breakpoints/watchpoints
+//
+// Called for:
+//   • Single-step: RFLAGS.TF was set by rsp_x86_64::step_set_tf()
+//   • Hardware BP/watchpoint: DR0–DR3 triggered via DR7
+//
+// When the gdbstub feature is active:
+//   1. Clear RFLAGS.TF from the *saved* frame so iretq does not re-arm it.
+//   2. Clear DR6 (status register) so the next #DB isn't a false positive.
+//   3. Notify the GDB session that the target has stopped.
+//
+// When gdbstub is not active fall through to generic_exception_handler.
+
+const RFLAGS_TF: u64 = 1 << 8;
+
 #[no_mangle]
 pub unsafe extern "C" fn db_handler(frame: *mut InterruptFrame) {
     #[cfg(feature = "gdbstub")]
     {
+        let f = &mut *frame;
+
+        // 1. Clear TF in the saved RFLAGS so it is not re-armed after iretq.
+        f.rflags &= !RFLAGS_TF;
+
+        // 2. Clear DR6 (debug status) to avoid stale bits on the next #DB.
+        //    We write zero directly rather than going through proc_debug so
+        //    this works even before the GDB session is fully attached.
+        core::arch::asm!("mov dr6, {z}", z = in(reg) 0u64, options(nostack, nomem));
+
+        // 3. Hand control to the GDB stop-reply loop.
         let pid = crate::proc::scheduler::current_pid();
         crate::gdbstub::gdb_trap(
             frame as *mut crate::gdbstub::SavedRegs,
@@ -571,10 +597,21 @@ pub unsafe extern "C" fn db_handler(frame: *mut InterruptFrame) {
     generic_exception_handler(&mut *frame, 1);
 }
 
+// ── #BP handler — INT3 / software breakpoint (0xCC)
+//
+// The CPU does NOT decrement RIP after a trap-gate #BP — RIP already points
+// past the 0xCC byte.  We rewind by 1 so GDB sees the address of the
+// breakpoint instruction itself (matching the address stored in SwBreakpointTable).
+
 #[no_mangle]
 pub unsafe extern "C" fn bp_handler(frame: *mut InterruptFrame) {
     #[cfg(feature = "gdbstub")]
     {
+        let f = &mut *frame;
+
+        // Rewind RIP by 1: GDB expects stop address == breakpoint address.
+        f.rip = f.rip.saturating_sub(1);
+
         let pid = crate::proc::scheduler::current_pid();
         crate::gdbstub::gdb_trap(
             frame as *mut crate::gdbstub::SavedRegs,

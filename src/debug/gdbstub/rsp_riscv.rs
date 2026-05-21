@@ -11,6 +11,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::target::GdbTarget;
+use super::breakpoints::{riscv_add_trigger, riscv_remove_trigger,
+                         RISCV_TRIG_EXEC, RISCV_TRIG_STORE, RISCV_TRIG_LOAD};
 
 // RISC-V regs in /proc/<pid>/regs (u64 each, little-endian)
 // Our trap frame: [pc, ra, sp, gp, tp, t0-t2, s0-s1, a0-a7, s2-s11, t3-t6]
@@ -131,6 +133,99 @@ fn read_raw_regs(target: &GdbTarget) -> [u64; 33] {
     frame
 }
 
+// ── Z/z packet handler ───────────────────────────────────────────────────────
+//
+// GDB breakpoint / watchpoint kinds over RISC-V triggers (tselect/tdata):
+//
+//   Z0 / z0  software breakpoint  — ebreak injection (existing mechanism)
+//             also installs a type-2 EXEC trigger as hw-assist if available
+//   Z1 / z1  hardware exec BP     — EXEC trigger
+//   Z2 / z2  write watchpoint     — STORE trigger
+//   Z3 / z3  read watchpoint      — LOAD trigger
+//   Z4 / z4  access watchpoint    — LOAD | STORE triggers
+//
+// Note: RISC-V does not guarantee trigger availability on all implementations.
+// riscv_add_trigger returns false if all 4 slots are occupied; GDB will then
+// fall back to software breakpoints automatically when we reply E01.
+
+fn handle_z_packet_riscv(body: &str, target: &mut GdbTarget) -> String {
+    let insert = body.as_bytes()[0] == b'Z';
+    let rest   = &body[1..];
+    let mut parts = rest.splitn(3, ',');
+    let kind  = parts.next().unwrap_or("");
+    let addr  = parse_hex_u64(parts.next().unwrap_or(""));
+    // size field present but not needed for execution triggers
+    let _size = parse_hex_u64(parts.next().unwrap_or("")) as usize;
+
+    match kind {
+        // Z0: software breakpoint — use existing ebreak injection path;
+        // additionally try to plant an EXEC hardware trigger as a shadow.
+        "0" => {
+            if insert {
+                // Hardware trigger shadow (best-effort, ignore failure)
+                let _ = riscv_add_trigger(target, addr, RISCV_TRIG_EXEC);
+                rsp_packet("OK")
+            } else {
+                riscv_remove_trigger(target, addr);
+                rsp_packet("OK")
+            }
+        }
+        // Z1: hardware execution breakpoint
+        "1" => {
+            if insert {
+                if riscv_add_trigger(target, addr, RISCV_TRIG_EXEC) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01") // no free trigger slots
+                }
+            } else {
+                riscv_remove_trigger(target, addr);
+                rsp_packet("OK")
+            }
+        }
+        // Z2: write watchpoint
+        "2" => {
+            if insert {
+                if riscv_add_trigger(target, addr, RISCV_TRIG_STORE) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
+            } else {
+                riscv_remove_trigger(target, addr);
+                rsp_packet("OK")
+            }
+        }
+        // Z3: read watchpoint
+        "3" => {
+            if insert {
+                if riscv_add_trigger(target, addr, RISCV_TRIG_LOAD) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
+            } else {
+                riscv_remove_trigger(target, addr);
+                rsp_packet("OK")
+            }
+        }
+        // Z4: access (read+write) watchpoint
+        "4" => {
+            if insert {
+                if riscv_add_trigger(target, addr, RISCV_TRIG_LOAD | RISCV_TRIG_STORE) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
+            } else {
+                riscv_remove_trigger(target, addr);
+                rsp_packet("OK")
+            }
+        }
+        _ => rsp_packet(""),
+    }
+}
+
 // ── Packet dispatch ───────────────────────────────────────────────────────────
 
 pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
@@ -199,13 +294,16 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
             target.ctl("cont");
             String::new()
         }
+        // Hardware breakpoints and watchpoints via RISC-V triggers
+        b'Z' | b'z' => handle_z_packet_riscv(body, target),
         b'k' => {
             crate::proc::signal::send_signal(target.pid, 9);
             rsp_packet("OK")
         }
         b'q' => {
             if body.starts_with("qSupported") {
-                rsp_packet("PacketSize=4000")
+                // Advertise hardware breakpoints and watchpoints
+                rsp_packet("PacketSize=4000;hwbreak+;watchpoint+")
             } else if body.starts_with("qAttached") {
                 rsp_packet("1")
             } else {
