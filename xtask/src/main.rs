@@ -6,8 +6,10 @@
 //!   cargo xtask build --arch riscv64 --boot sbi
 //!   cargo xtask build --arch x86_64               # x86_64 kernel (ELF, no UEFI wrapper)
 //!   cargo xtask build --arch x86_64 --boot uefi   # x86_64 UEFI loader (PE32+)
-//!   cargo xtask build --arch riscv64 --boot sbi --debug
-//!   cargo xtask build --arch riscv64 --boot sbi --initrd
+//!   cargo xtask build --arch x86_64 --boot uefi --initrd
+//!
+//!   cargo xtask mkinitramfs                        # x86_64 initramfs (default)
+//!   cargo xtask mkinitramfs --arch riscv64
 //!
 //!   cargo xtask image                              # x86_64 release ESP image
 //!   cargo xtask image --arch riscv64               # riscv64 release ESP image
@@ -16,6 +18,11 @@
 //!
 //! The `image` subcommand requires mtools (mformat, mmd, mcopy) and
 //! objcopy (binutils / llvm-objcopy).  Install hint is printed if missing.
+//!
+//! The `mkinitramfs` subcommand requires:
+//!   x86_64:  musl-tools  (musl-gcc)           → apt install musl-tools
+//!   riscv64: riscv64-linux-musl-gcc            → build from source or distro pkg
+//!   Both:    cpio                              → apt install cpio
 
 use std::{
     env,
@@ -23,11 +30,8 @@ use std::{
     process::{Command, exit},
 };
 
-// ─── target JSON paths ───────────────────────────────────────────────────────────
+// ─── target JSON paths ───────────────────────────────────────────────────────────────
 
-/// All custom target specs live under targets/ in the workspace root.
-/// Kernel targets produce ELF via ld.lld + linker script.
-/// UEFI loader targets produce PE32+ via lld-link.
 fn target_json(root: &PathBuf, arch: Arch, boot: Boot) -> PathBuf {
     let name = match (arch, boot) {
         (Arch::X86_64,  Boot::Uefi) => "x86_64-uefi-loader.json",
@@ -38,17 +42,15 @@ fn target_json(root: &PathBuf, arch: Arch, boot: Boot) -> PathBuf {
     root.join("targets").join(name)
 }
 
-/// The cargo target/ output directory name matches the JSON stem.
 fn target_dir_name(arch: Arch, boot: Boot) -> &'static str {
     match (arch, boot) {
         (Arch::X86_64,  Boot::Uefi) => "x86_64-uefi-loader",
         (Arch::X86_64,  Boot::Sbi)  => "x86_64-kernel",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
-        (Arch::RiscV64, Boot::Sbi)  => "riscv64gc-unknown-none-elf",  // uses built-in triple
+        (Arch::RiscV64, Boot::Sbi)  => "riscv64gc-unknown-none-elf",
     }
 }
 
-/// UEFI default boot binary name per arch (UEFI spec §3.4).
 fn efi_boot_filename(arch: Arch) -> &'static str {
     match arch {
         Arch::X86_64  => "BOOTx64.EFI",
@@ -56,12 +58,11 @@ fn efi_boot_filename(arch: Arch) -> &'static str {
     }
 }
 
-// ─── helpers ─────────────────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────────────────
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("xtask has no parent directory")
+        .parent().expect("xtask has no parent directory")
         .to_path_buf()
 }
 
@@ -86,9 +87,7 @@ fn which_first(names: &[&str]) -> Option<String> {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        if found {
-            return Some((*name).into());
-        }
+        if found { return Some((*name).into()); }
     }
     None
 }
@@ -104,19 +103,13 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
     }
 }
 
-// ─── CLI parsing ─────────────────────────────────────────────────────────────────
+// ─── CLI parsing ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Arch {
-    RiscV64,
-    X86_64,
-}
+enum Arch { RiscV64, X86_64 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Boot {
-    Uefi,
-    Sbi,
-}
+enum Boot { Uefi, Sbi }
 
 #[derive(Debug)]
 struct BuildOpts {
@@ -128,12 +121,7 @@ struct BuildOpts {
 
 impl Default for BuildOpts {
     fn default() -> Self {
-        Self {
-            arch:   Arch::RiscV64,
-            boot:   Boot::Uefi,
-            debug:  false,
-            initrd: false,
-        }
+        Self { arch: Arch::RiscV64, boot: Boot::Uefi, debug: false, initrd: false }
     }
 }
 
@@ -147,10 +135,7 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                 match args.get(i).map(String::as_str) {
                     Some("riscv64") => opts.arch = Arch::RiscV64,
                     Some("x86_64")  => opts.arch = Arch::X86_64,
-                    other => {
-                        eprintln!("[xtask] unknown --arch value: {:?}", other);
-                        exit(1);
-                    }
+                    other => { eprintln!("[xtask] unknown --arch: {:?}", other); exit(1); }
                 }
             }
             "--boot" => {
@@ -158,28 +143,148 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                 match args.get(i).map(String::as_str) {
                     Some("uefi") => opts.boot = Boot::Uefi,
                     Some("sbi")  => opts.boot = Boot::Sbi,
-                    other => {
-                        eprintln!("[xtask] unknown --boot value: {:?}", other);
-                        exit(1);
-                    }
+                    other => { eprintln!("[xtask] unknown --boot: {:?}", other); exit(1); }
                 }
             }
             "--debug"  => opts.debug  = true,
             "--initrd" => opts.initrd = true,
-            other => {
-                eprintln!("[xtask] unknown argument: {other}");
-                exit(1);
-            }
+            other => { eprintln!("[xtask] unknown argument: {other}"); exit(1); }
         }
         i += 1;
     }
     opts
 }
 
-// ─── build actions ───────────────────────────────────────────────────────────────
+// ─── mkinitramfs ────────────────────────────────────────────────────────────────────
 
-/// Shared cargo build invocation for any custom-target JSON build.
-/// For UEFI targets the output is already a PE32+ .efi; no objcopy needed.
+/// Build userspace binaries and pack them into `initramfs.cpio`.
+///
+/// Output layout inside the CPIO archive (newc format):
+///   ./init                        ← PID 1 (exec'd directly by kernel)
+///   ./bin/hello                   ← test program
+///   ./usr/bin/rustos-compositor   ← Wayland compositor (spawned by init)
+///   ./dev/                        ← empty directory (kernel populates devtmpfs)
+///   ./proc/                       ← empty directory (procfs mount point)
+///   ./sys/                        ← empty directory (sysfs mount point)
+///   ./tmp/                        ← empty directory
+///   ./run/                        ← empty directory (XDG_RUNTIME_DIR)
+///   ./dev/dri/                    ← DRM device directory
+///   ./dev/input/                  ← input device directory
+pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
+    let arch_str = match arch {
+        Arch::X86_64  => "x86_64",
+        Arch::RiscV64 => "riscv64",
+    };
+
+    // ── 1. Check prerequisites ──────────────────────────────────────────────────
+    match arch {
+        Arch::X86_64 => {
+            require_tool(
+                &["musl-gcc"],
+                "apt install musl-tools",
+            );
+        }
+        Arch::RiscV64 => {
+            require_tool(
+                &["riscv64-linux-musl-gcc", "riscv64-unknown-linux-musl-gcc"],
+                "build musl from source: https://musl.libc.org/  (target: riscv64-linux-musl)",
+            );
+        }
+    }
+    require_tool(&["cpio"], "apt install cpio");
+    require_tool(&["find"], "coreutils (should already be installed)");
+
+    // ── 2. Create staging directory ───────────────────────────────────────────
+    let staging = root.join(format!("target/initramfs-staging-{arch_str}"));
+    // Wipe and recreate for a clean build.
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).expect("remove old staging dir");
+    }
+
+    // Required directory skeleton.
+    for dir in &[
+        "",            // root
+        "bin",
+        "sbin",
+        "usr/bin",
+        "usr/sbin",
+        "lib",
+        "etc",
+        "dev",
+        "dev/dri",
+        "dev/input",
+        "proc",
+        "sys",
+        "tmp",
+        "run",
+        "var",
+        "root",
+    ] {
+        std::fs::create_dir_all(staging.join(dir))
+            .expect("create staging subdir");
+    }
+
+    // ── 3. Build userspace binaries ──────────────────────────────────────────
+    let userspace_dir = root.join("userspace");
+    eprintln!("[xtask] mkinitramfs: building userspace ({arch_str})...");
+    run(Command::new("make")
+        .current_dir(&userspace_dir)
+        .args(["-j4",
+               &format!("ARCH={arch_str}"),
+               &format!("DESTDIR={}", staging.display()),
+               "install"]));
+
+    // ── 4. Write /etc/os-release ────────────────────────────────────────────
+    std::fs::write(
+        staging.join("etc/os-release"),
+        b"NAME=RustOS\nID=rustos\nVERSION=0.1.0\nPRETTY_NAME=\"RustOS 0.1.0\"\n",
+    ).expect("write os-release");
+
+    // ── 5. Pack CPIO (newc format) ───────────────────────────────────────────
+    //
+    // `find . | cpio --create --format=newc`
+    //
+    // We pipe find's stdout into cpio's stdin via a shell pipeline because
+    // std::process doesn't support in-process pipes without unsafe; using
+    // `sh -c` keeps the code simple and portable.
+    let cpio_out = root.join("initramfs.cpio");
+    eprintln!("[xtask] mkinitramfs: packing {}...", cpio_out.display());
+    run(Command::new("sh")
+        .current_dir(&staging)
+        .args([
+            "-c",
+            &format!(
+                "find . | cpio --create --format=newc --quiet > {}",
+                cpio_out.display()
+            ),
+        ]));
+
+    let size = std::fs::metadata(&cpio_out)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!("[xtask] mkinitramfs: {} bytes written to {}",
+        size, cpio_out.display());
+    eprintln!();
+    eprintln!("  To include in a boot image:");
+    eprintln!("    cargo xtask image --arch {arch_str} --initrd");
+    eprintln!();
+    eprintln!("  To test in QEMU (x86_64):");
+    eprintln!("    qemu-system-x86_64 \\");
+    eprintln!("      -bios /usr/share/ovmf/OVMF.fd \\");
+    eprintln!("      -kernel target/x86_64-uefi-loader/release/rustos.efi \\");
+    eprintln!("      -initrd initramfs.cpio \\");
+    eprintln!("      -serial stdio -nographic -m 512M");
+}
+
+// ─── mkinitramfs step (called by build_* when --initrd is set) ────────────────
+
+fn mkinitramfs_step(root: &PathBuf, arch: Arch) {
+    eprintln!("[xtask] --initrd: building initramfs for {arch:?}...");
+    mkinitramfs(root, arch);
+}
+
+// ─── build actions ────────────────────────────────────────────────────────────────
+
 fn build_with_target_json(root: &PathBuf, opts: &BuildOpts, features: &[&str]) {
     let profile     = if opts.debug { "debug" } else { "release" };
     let target_path = target_json(root, opts.arch, opts.boot);
@@ -207,7 +312,6 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts, features: &[&str]) {
     if !opts.debug { cmd.arg("--release"); }
     run(cmd);
 
-    // For UEFI targets, copy the PE binary into esp/EFI/BOOT/
     if opts.boot == Boot::Uefi {
         let bin_name = efi_boot_filename(opts.arch);
         let src = root.join(format!("target/{target_dir}/{profile}/rustos.efi"));
@@ -238,7 +342,6 @@ fn build_riscv_uefi(root: &PathBuf, debug: bool) {
 }
 
 fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
-    // SBI uses the built-in riscv64gc triple, not a custom JSON.
     let profile = if debug { "debug" } else { "release" };
     eprintln!("[xtask] Building rustos (RISC-V SBI, {profile})...");
 
@@ -259,43 +362,34 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
     ));
     eprintln!("[xtask] Built: {}", kernel_elf.display());
 
-    if initrd {
-        eprintln!("[xtask] Building RISC-V userspace + initramfs...");
-        run(Command::new("bash")
-            .current_dir(root)
-            .args(["tools/build_userspace.sh", "riscv64"]));
-        eprintln!("[xtask] Initramfs: {}", root.join("initramfs.cpio").display());
-    }
+    if initrd { mkinitramfs_step(root, Arch::RiscV64); }
 }
 
 fn build_x86_64_kernel(root: &PathBuf, debug: bool, initrd: bool) {
-    if initrd {
-        eprintln!("[xtask] WARNING: --initrd is not supported for x86_64 builds.");
-    }
     build_with_target_json(
         root,
         &BuildOpts { arch: Arch::X86_64, boot: Boot::Sbi, debug, initrd: false },
         &[],
     );
-    // The kernel target produces an ELF; strip to flat binary for legacy use.
     let profile = if debug { "debug" } else { "release" };
     let elf = root.join(format!("target/x86_64-kernel/{profile}/rustos"));
     let bin = root.join("kernel.bin");
     let objcopy = require_tool(&["llvm-objcopy", "objcopy"], "apt install llvm binutils");
     run(Command::new(&objcopy).args(["-O", "binary"]).arg(&elf).arg(&bin));
     eprintln!("[xtask] Flat binary: {}", bin.display());
+    if initrd { mkinitramfs_step(root, Arch::X86_64); }
 }
 
-fn build_x86_64_uefi(root: &PathBuf, debug: bool) {
-    // Produces a native PE32+ UEFI application via lld-link — no objcopy needed.
+fn build_x86_64_uefi(root: &PathBuf, debug: bool, initrd: bool) {
     build_with_target_json(
         root,
         &BuildOpts { arch: Arch::X86_64, boot: Boot::Uefi, debug, initrd: false },
         &["uefi_boot"],
     );
+    if initrd { mkinitramfs_step(root, Arch::X86_64); }
 }
 
-// ─── image action ─────────────────────────────────────────────────────────────────
+// ─── image action ───────────────────────────────────────────────────────────────────
 
 fn image(root: &PathBuf, opts: &BuildOpts) {
     require_tool(
@@ -313,7 +407,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     match (opts.arch, opts.boot) {
         (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(root, opts.debug),
         (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(root, opts.debug, opts.initrd),
-        (Arch::X86_64,  Boot::Uefi) => build_x86_64_uefi(root, opts.debug),
+        (Arch::X86_64,  Boot::Uefi) => build_x86_64_uefi(root, opts.debug, opts.initrd),
         (Arch::X86_64,  Boot::Sbi)  => build_x86_64_kernel(root, opts.debug, opts.initrd),
     }
 
@@ -325,7 +419,6 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     };
     let efi_path  = root.join("esp/EFI/BOOT").join(efi_name);
 
-    // x86_64 kernel (non-UEFI) path: convert ELF → PE via objcopy
     if opts.arch == Arch::X86_64 && opts.boot == Boot::Sbi {
         let elf = root.join(format!("target/x86_64-kernel/{profile}/rustos"));
         if !elf.exists() {
@@ -336,8 +429,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         std::fs::create_dir_all(&esp_dir).expect("create esp dir");
         run(Command::new(&objcopy)
             .args(["--target", "efi-app-x86-64", "--subsystem", "10"])
-            .arg(&elf)
-            .arg(&efi_path));
+            .arg(&elf).arg(&efi_path));
     }
 
     if !efi_path.exists() {
@@ -350,8 +442,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
 
     run(Command::new("mformat")
         .args(["-C", "-F", "-h", "64", "-s", "32", "-t", "64", "-i"])
-        .arg(&img_path)
-        .arg("::"));
+        .arg(&img_path).arg("::"));
     run(Command::new("mmd").args(["-i"]).arg(&img_path).args(["|::/EFI", "::/EFI/BOOT"]));
     run(Command::new("mcopy")
         .args(["-i"]).arg(&img_path)
@@ -368,12 +459,14 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
             eprintln!("[xtask] Embedded initramfs: {}", cpio.display());
         } else {
             eprintln!("[xtask] WARNING: --initrd specified but initramfs.cpio not found.");
+            eprintln!("[xtask]          Run `cargo xtask mkinitramfs` first.");
         }
     }
 
-    eprintln!("\n[xtask] ✓ Image ready: {}", img_path.display());
+    eprintln!("\n[xtask] \u2713 Image ready: {}", img_path.display());
     eprintln!("\n  Flash to USB:");
-    eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync", img_path.display());
+    eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync",
+        img_path.display());
     match opts.arch {
         Arch::X86_64 => {
             eprintln!("\n  Smoke-test in QEMU:");
@@ -395,13 +488,12 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     eprintln!();
 }
 
-// ─── entrypoint ───────────────────────────────────────────────────────────────────
+// ─── entrypoint ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     let mut args = env::args().skip(1);
     let subcommand = args.next().unwrap_or_default();
     let rest: Vec<String> = args.collect();
-
     let root = workspace_root();
 
     match subcommand.as_str() {
@@ -410,9 +502,28 @@ fn main() {
             match (opts.arch, opts.boot) {
                 (Arch::RiscV64, Boot::Uefi) => build_riscv_uefi(&root, opts.debug),
                 (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(&root, opts.debug, opts.initrd),
-                (Arch::X86_64,  Boot::Uefi) => build_x86_64_uefi(&root, opts.debug),
+                (Arch::X86_64,  Boot::Uefi) => build_x86_64_uefi(&root, opts.debug, opts.initrd),
                 (Arch::X86_64,  Boot::Sbi)  => build_x86_64_kernel(&root, opts.debug, opts.initrd),
             }
+        }
+        "mkinitramfs" => {
+            let mut arch = Arch::X86_64; // default
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == "--arch" {
+                    i += 1;
+                    arch = match rest.get(i).map(String::as_str) {
+                        Some("x86_64")  => Arch::X86_64,
+                        Some("riscv64") => Arch::RiscV64,
+                        other => {
+                            eprintln!("[xtask] unknown --arch: {:?}", other);
+                            exit(1);
+                        }
+                    };
+                }
+                i += 1;
+            }
+            mkinitramfs(&root, arch);
         }
         "image" => {
             let mut opts = parse_build_args(&rest);
@@ -426,36 +537,39 @@ fn main() {
                 "cargo xtask <subcommand> [options]\n",
                 "\n",
                 "Subcommands:\n",
-                "  build    Compile the kernel\n",
-                "  image    Build a flashable FAT32 ESP disk image\n",
+                "  build         Compile the kernel\n",
+                "  mkinitramfs   Build userspace and pack initramfs.cpio\n",
+                "  image         Build a flashable FAT32 ESP disk image\n",
                 "\n",
-                "Build / image options:\n",
+                "Build options (build / image):\n",
                 "  --arch <riscv64|x86_64>   Target architecture  (image default: x86_64)\n",
                 "  --boot <uefi|sbi>         Boot mode            (default: uefi)\n",
-                "                             x86_64+uefi → PE32+ UEFI app via lld-link\n",
-                "                             x86_64+sbi  → ELF kernel via ld.lld\n",
-                "                             riscv64+uefi → PE32+ UEFI app via lld-link\n",
-                "                             riscv64+sbi  → ELF via built-in triple\n",
-                "  --debug                   Debug build          (default: release)\n",
-                "  --initrd                  Build/include initramfs (RISC-V SBI only)\n",
+                "  --debug                   Debug build\n",
+                "  --initrd                  Build and include initramfs.cpio\n",
                 "\n",
-                "Target JSON files (in targets/):\n",
-                "  x86_64-uefi-loader.json   PE32+ UEFI app, lld-link, os=uefi\n",
-                "  x86_64-kernel.json        ELF kernel, ld.lld, os=none\n",
-                "  riscv64-uefi-loader.json  PE32+ UEFI app, lld-link, os=uefi\n",
-                "  riscv64-kernel.json       ELF kernel, ld.lld, os=none\n",
+                "mkinitramfs options:\n",
+                "  --arch <riscv64|x86_64>   Target architecture  (default: x86_64)\n",
                 "\n",
-                "image requires:\n",
-                "  mtools   (mformat, mmd, mcopy)  →  apt install mtools\n",
-                "  objcopy  (binutils/llvm)        →  apt install binutils\n",
+                "Prerequisites:\n",
+                "  mkinitramfs (x86_64):  apt install musl-tools cpio\n",
+                "  mkinitramfs (riscv64): riscv64-linux-musl-gcc + apt install cpio\n",
+                "  image:                 apt install mtools binutils\n",
                 "\n",
-                "Examples:\n",
-                "  cargo xtask build                                   # riscv64 uefi release\n",
-                "  cargo xtask build --arch x86_64 --boot uefi        # x86_64 UEFI loader\n",
-                "  cargo xtask build --arch x86_64                    # x86_64 ELF kernel\n",
-                "  cargo xtask image                                   # x86_64 boot.img\n",
-                "  cargo xtask image --arch riscv64                    # riscv64 boot-riscv64.img\n",
-                "  cargo xtask image --arch x86_64 --boot uefi --debug\n"
+                "Common workflows:\n",
+                "  # Build x86_64 UEFI image with initramfs, flash to USB:\n",
+                "  apt install musl-tools cpio mtools\n",
+                "  cargo xtask image --arch x86_64 --boot uefi --initrd\n",
+                "  sudo dd if=boot.img of=/dev/sdX bs=4M status=progress && sync\n",
+                "\n",
+                "  # Build initramfs only (e.g. after changing userspace):\n",
+                "  cargo xtask mkinitramfs\n",
+                "\n",
+                "  # QEMU smoke-test with initramfs:\n",
+                "  cargo xtask build --arch x86_64 --boot uefi --initrd\n",
+                "  qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \\\n",
+                "    -kernel esp/EFI/BOOT/BOOTx64.EFI \\\n",
+                "    -initrd initramfs.cpio \\\n",
+                "    -serial stdio -nographic -m 512M\n",
             ));
         }
         other => {
