@@ -5,7 +5,8 @@
 //!
 //! ## Initialisation order
 //!
-//!   BSP: `gdt::gdt_init()` → `idt::idt_init()` → `apic::apic_init()`
+//!   BSP: `gdt::gdt_init()` → `idt::idt_init()` → `time::init()` →
+//!        `apic::apic_init()` → `apic::calibrate_lapic_timer()`
 //!   AP:  `gdt::init_ap()`  → `idt::load()`     → `apic::ap_init_local()`
 //!
 //! ## LAPIC register map (xAPIC byte offsets — 32-bit access only)
@@ -31,6 +32,9 @@ use crate::arch::x86_64::mem_layout::{apic as ml, trampoline as tram, higher_hal
 
 static X2APIC_MODE: AtomicBool  = AtomicBool::new(false);
 static LAPIC_PHYS:  AtomicU64   = AtomicU64::new(ml::LAPIC_PHYS_DEFAULT);
+
+/// Calibrated APIC timer ticks per millisecond (set by calibrate_lapic_timer).
+static APIC_TICKS_PER_MS: AtomicU64 = AtomicU64::new(0);
 
 #[inline] fn x2apic() -> bool { X2APIC_MODE.load(Ordering::Relaxed) }
 
@@ -140,6 +144,9 @@ unsafe fn enable_apic() {
 }
 
 /// Common LAPIC setup run on every CPU after `enable_apic()`.
+/// The APIC timer LVT is left MASKED here; `calibrate_lapic_timer()` on the
+/// BSP (and `ap_init_local()` on APs after calibration is complete) will
+/// unmask it with the correct ICR.
 unsafe fn local_apic_setup() {
     // Accept all interrupt priorities.
     lapic_write(ml::REG_TPR, 0);
@@ -156,16 +163,16 @@ unsafe fn local_apic_setup() {
     // Spurious Vector Register: software-enable LAPIC + spurious vector.
     lapic_write(ml::REG_SPURIOUS,
         ml::SPURIOUS_ENABLE | ml::SPURIOUS_VECTOR as u32);
-    // Timer: divide-by-16, periodic, vector 32 (~1 ms at 100 MHz bus clock).
-    // Calibrate properly in time::calibrate_lapic_timer() later.
+    // Timer: divide-by-16, MASKED until calibrate_lapic_timer() runs.
     lapic_write(ml::REG_TIMER_DCR, 0x3);  // divide by 16
-    lapic_write(ml::REG_TIMER_LVT, (1 << 17) | crate::smp::ipi::APIC_TIMER_VECTOR as u32);
-    lapic_write(ml::REG_TIMER_ICR, 100_000);
+    lapic_write(ml::REG_TIMER_LVT, ml::LVT_MASKED);
+    lapic_write(ml::REG_TIMER_ICR, 0);
 }
 
 // ── Public init entrypoints ───────────────────────────────────────────────────
 
-/// BSP initialisation.  Call after `gdt_init()` and `idt_init()`.
+/// BSP initialisation.  Call after `gdt_init()`, `idt_init()`, and
+/// critically **after** `time::init()` so that `busy_wait_us()` is accurate.
 pub fn apic_init() {
     unsafe {
         enable_apic();
@@ -177,9 +184,144 @@ pub fn apic_init() {
 }
 
 /// Per-AP initialisation.  Called from `ap_entry()` after GDT+IDT are live.
+/// Reuses the BSP-calibrated APIC_TICKS_PER_MS to arm the timer directly.
 pub unsafe fn ap_init_local() {
     enable_apic();
     local_apic_setup();
+    // Arm timer using BSP-calibrated value if available.
+    let ticks_per_ms = APIC_TICKS_PER_MS.load(Ordering::Relaxed);
+    if ticks_per_ms > 0 {
+        arm_periodic_1ms(ticks_per_ms);
+    }
+}
+
+// ── APIC timer calibration ────────────────────────────────────────────────────
+
+/// Calibrate the APIC bus clock and arm the periodic 1 ms timer.
+///
+/// Strategy (in priority order):
+///   1. TSC window  — if `time::tsc` was calibrated (invariant TSC present).
+///   2. HPET window — if HPET is initialised.
+///   3. PIT window  — 8253 channel 2, always available on x86.
+///
+/// Must be called on the BSP after `apic_init()` and `time::init()`.
+/// Unmasks the APIC timer LVT on completion.
+pub fn calibrate_lapic_timer() {
+    let ticks_per_ms = unsafe { measure_apic_ticks_per_ms() };
+    APIC_TICKS_PER_MS.store(ticks_per_ms, Ordering::SeqCst);
+    unsafe { arm_periodic_1ms(ticks_per_ms); }
+    log::info!("apic: timer calibrated — {} ticks/ms (ICR={})",
+        ticks_per_ms, ticks_per_ms);
+}
+
+/// Measure how many APIC bus ticks elapse in 10 ms, return ticks/ms.
+unsafe fn measure_apic_ticks_per_ms() -> u64 {
+    const DIVIDE_BY: u64 = 16; // must match REG_TIMER_DCR = 0x3
+    const WINDOW_MS: u64 = 10;
+
+    // Set APIC timer to count-down from max with divider, no interrupt.
+    lapic_write(ml::REG_TIMER_DCR, 0x3);         // divide by 16
+    lapic_write(ml::REG_TIMER_LVT, ml::LVT_MASKED);
+    lapic_write(ml::REG_TIMER_ICR, 0xFFFF_FFFF);
+
+    // Gate over WINDOW_MS using the best available reference.
+    let elapsed_apic = measure_with_best_reference(WINDOW_MS);
+
+    // Stop the count-down.
+    lapic_write(ml::REG_TIMER_ICR, 0);
+
+    // elapsed_apic = ticks elapsed in WINDOW_MS ms.
+    // ticks_per_ms = elapsed_apic / WINDOW_MS
+    let ticks_per_ms = (elapsed_apic / WINDOW_MS).max(1);
+    ticks_per_ms
+}
+
+/// Spin for `window_ms` milliseconds using TSC → HPET → PIT in that order.
+/// Returns the number of APIC timer ticks that elapsed.
+unsafe fn measure_with_best_reference(window_ms: u64) -> u64 {
+    use crate::time;
+
+    let start_apic = lapic_read(ml::REG_TIMER_CCR) as u64;
+
+    // ── TSC path (preferred) ──────────────────────────────────────────────
+    let tsc_freq = time::tsc::freq_hz();
+    if tsc_freq > 0 {
+        let tsc_ticks = tsc_freq / 1000 * window_ms;
+        let t0 = rdtsc();
+        while rdtsc().wrapping_sub(t0) < tsc_ticks {
+            core::hint::spin_loop();
+        }
+        let end_apic = lapic_read(ml::REG_TIMER_CCR) as u64;
+        return start_apic.saturating_sub(end_apic); // counts down
+    }
+
+    // ── HPET path ─────────────────────────────────────────────────────────
+    if time::hpet::is_ready() {
+        let t0_ns = time::hpet::read_ns();
+        let target_ns = window_ms * 1_000_000;
+        while time::hpet::read_ns().wrapping_sub(t0_ns) < target_ns {
+            core::hint::spin_loop();
+        }
+        let end_apic = lapic_read(ml::REG_TIMER_CCR) as u64;
+        return start_apic.saturating_sub(end_apic);
+    }
+
+    // ── PIT path (last resort) ────────────────────────────────────────────
+    // PIT channel 2, mode 0 (one-shot), 11932 counts ≈ 10 ms.
+    // We fire one PIT window per window_ms / 10 iteration (or one if ≤ 10 ms).
+    pit_wait_ms(window_ms);
+    let end_apic = lapic_read(ml::REG_TIMER_CCR) as u64;
+    start_apic.saturating_sub(end_apic)
+}
+
+/// Busy-spin for `ms` milliseconds using the 8253 PIT channel 2.
+/// Does not require the heap, TSC, or HPET.
+unsafe fn pit_wait_ms(ms: u64) {
+    const PIT_HZ: u64 = 1_193_182;
+    // Max PIT one-shot count = 65535 ≈ 54.9 ms.  Split into 10 ms chunks.
+    const CHUNK_MS:    u64 = 10;
+    const CHUNK_COUNT: u16 = 11932; // PIT counts for ~10 ms
+
+    let full_chunks = ms / CHUNK_MS;
+    let remainder   = ms % CHUNK_MS;
+
+    for _ in 0..full_chunks {
+        pit_oneshot(CHUNK_COUNT);
+    }
+    if remainder > 0 {
+        let counts = (remainder * PIT_HZ / 1000) as u16;
+        pit_oneshot(counts.max(1));
+    }
+}
+
+/// Program PIT channel 2 mode 0 and wait for OUT to go high.
+unsafe fn pit_oneshot(count: u16) {
+    // Disable gate, configure channel 2 mode 0.
+    let mut v: u8 = inb(0x61) & 0xFE; // gate off
+    outb(0x61, v & 0xFD);             // speaker off
+    outb(0x43, 0xB0);                 // channel 2, mode 0, binary
+    outb(0x42, (count & 0xFF) as u8);
+    outb(0x42, (count >> 8) as u8);
+    // Start count: set gate bit.
+    v = inb(0x61) | 0x01;
+    outb(0x61, v);
+    // Wait for OUT2 (bit 5 of port 0x61) to go high.
+    while inb(0x61) & 0x20 == 0 {
+        core::hint::spin_loop();
+    }
+    // Gate off to stop.
+    outb(0x61, inb(0x61) & 0xFE);
+}
+
+/// Arm the APIC periodic timer for a 1 ms period.
+/// Unmasks the LVT timer vector.
+unsafe fn arm_periodic_1ms(ticks_per_ms: u64) {
+    let icr = (ticks_per_ms as u32).max(1);
+    lapic_write(ml::REG_TIMER_DCR, 0x3); // divide by 16
+    lapic_write(ml::REG_TIMER_ICR, icr);
+    // Enable periodic mode (bit 17) + vector, unmask.
+    lapic_write(ml::REG_TIMER_LVT,
+        (1 << 17) | crate::smp::ipi::APIC_TIMER_VECTOR as u32);
 }
 
 // ── EOI ───────────────────────────────────────────────────────────────────────
@@ -234,6 +376,8 @@ extern "C" {
 ///
 /// Called from `smp::init()` (x86_64 path) after `acpi::init()` has
 /// registered all CPUs via `smp::register_cpu()`.
+/// Must be called AFTER `calibrate_lapic_timer()` so `busy_wait_us()` is
+/// accurate.
 pub fn start_all_aps() {
     let tram_page = (ml::TRAMPOLINE_PHYS >> 12) as u8;
     let tram_base = ml::TRAMPOLINE_PHYS;
@@ -278,7 +422,7 @@ pub fn start_all_aps() {
         ;
         icr_wait_idle();
     }
-    busy_wait_us(10_000);  // 10 ms
+    busy_wait_us(10_000);  // 10 ms — now calibrated
 
     unsafe {
         icr_wait_idle();
@@ -371,16 +515,26 @@ fn register_ipi_handlers() {
     });
 }
 
-// ── Micro-delay (TSC busy-spin, pre-calibration) ──────────────────────────────
+// ── Micro-delay (calibrated TSC busy-spin, PIT fallback) ─────────────────────
 
-#[inline]
-fn busy_wait_us(us: u64) {
-    // Conservative: assumes >= 1 GHz TSC at boot.
-    // Replace with `time::busy_spin_ns(us * 1000)` once TSC is calibrated.
-    const CYCLES_PER_US: u64 = 1_000;
-    let end = rdtsc().wrapping_add(us * CYCLES_PER_US);
-    while rdtsc().wrapping_sub(end) as i64 > 0 {
-        core::hint::spin_loop();
+/// Spin for `us` microseconds.
+///
+/// Uses the TSC multiplier from `time::tsc` if available (accurate on any
+/// CPU speed).  Falls back to a PIT-based spin if the TSC has not been
+/// calibrated yet (e.g. very early in boot before `time::init()`).
+pub fn busy_wait_us(us: u64) {
+    let freq = crate::time::tsc::freq_hz();
+    if freq > 0 {
+        // TSC path: exact regardless of CPU frequency.
+        let tsc_ticks = freq / 1_000_000 * us;
+        let t0 = rdtsc();
+        while rdtsc().wrapping_sub(t0) < tsc_ticks {
+            core::hint::spin_loop();
+        }
+    } else {
+        // PIT path: no TSC yet — use PIT channel 2 (safe at any point).
+        let ms = (us + 999) / 1000; // round up to ms
+        unsafe { pit_wait_ms(ms.max(1)); }
     }
 }
 
@@ -393,6 +547,20 @@ fn rdtsc() -> u64 {
             options(nostack, preserves_flags));
     }
     (hi as u64) << 32 | lo as u64
+}
+
+// ── I/O port helpers (shared with PIT calibration) ───────────────────────────
+
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    core::arch::asm!("in al, dx", out("al") val, in("dx") port, options(nostack));
+    val
+}
+
+#[inline]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack));
 }
 
 // ── APIC timer vector constant (used by local_apic_setup) ────────────────────

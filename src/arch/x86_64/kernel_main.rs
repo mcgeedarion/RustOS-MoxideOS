@@ -12,40 +12,28 @@
 //!   4.  serial::init()               — full 16550 reinit (IRQ-driven, FIFOs)
 //!   5.  memmap_init()                — Phase 2: feed EFI memory map to PMM
 //!       parse_mbi() [multiboot only] — walk multiboot2 info block
+//!   5b. time::init()                 — TSC/HPET calibration (BEFORE apic_init)
 //!   6.  xsave_init()                 — XSAVE/FXSAVE feature detection
 //!   7.  acpi_init()                  — RSDP → MADT: CPU list, I/O APIC
 //!   8.  pcie_init()                  — Phase 1: PCIe bus enumeration + BAR
-//!   8a. virtio_gpu::init()           — probe virtio-gpu PCI device, allocate
-//!                                       scanout resources
-//!   8b. drm::init_heads()            — register GOP (head 0) + virtio-gpu
-//!                                       scanouts (heads 1+) in KMS topology
-//!   9.  apic_init()                  — Local APIC + timer (enables interrupts)
-//!  10.  ahci_probe()                 — AHCI via PCI, init
+//!   8a. virtio_gpu::init()           — probe virtio-gpu PCI device
+//!   8b. drm::init_heads()            — register GOP + virtio-gpu scanouts
+//!   9.  apic_init()                  — Local APIC enable (timer MASKED)
+//!   9b. apic::calibrate_lapic_timer()— measure bus clock, arm 1ms periodic
+//!  10.  ahci_probe()                 — AHCI via PCI
 //!  11.  virtio_blk fallback          — if no AHCI disk found
 //!  12.  mount_initramfs()            — populate VFS ramfs from CPIO initrd
 //!  13.  mount_root()                 — ext2 or ramfs
 //!  14.  spawn_init()                 — PID 1
 //!  15.  idle loop
 //!
-//! ## Why serial::early_init() comes before everything
-//!   heap_init() can panic if the kernel image layout assumptions are wrong.
-//!   Without serial::early_init() that panic is completely invisible on real
-//!   hardware.  early_init() uses only I/O port instructions and no heap.
-//!
-//! ## UEFI boot (primary path)
-//!   uefi_start() in uefi_entry.rs:
-//!     1. Prints banner via EFI SimpleTextOutput.
-//!     2. Captures GOP framebuffer (graceful fallback to serial-only).
-//!     3. Locates ACPI 2.0 RSDP from EFI configuration table.
-//!     4. Loads initrd via EFI_INITRD_MEDIA_GUID LoadFile2 protocol
-//!        (systemd-boot / GRUB2) or OVMF vendor table fallback.
-//!     5. Obtains EFI memory map + calls ExitBootServices (with AMI/Insyde
-//!        firmware retry per UEFI spec §7.4.6).
-//!     6. Switches to kernel boot stack, tail-calls kernel_main().
-//!
-//! ## VGA text mode
-//!   vga::init() probes BDA 0x0449.  When UEFI/GOP took over it returns false
-//!   and the GOP framebuffer driver stays in control.  Safe unconditionally.
+//! ## Why time::init() must precede apic_init()
+//!   apic_init() → start_all_aps() calls busy_wait_us() for INIT/SIPI timing.
+//!   busy_wait_us() uses the TSC frequency from time::tsc::freq_hz(); if that
+//!   is zero it falls back to the PIT, which is always safe but slower.
+//!   More critically, calibrate_lapic_timer() needs a reference clock
+//!   (TSC > HPET > PIT) to measure the APIC bus frequency accurately.
+//!   Calling time::init() first ensures TSC and HPET are ready.
 
 use core::arch::asm;
 use crate::arch::x86_64::{
@@ -53,7 +41,7 @@ use crate::arch::x86_64::{
     idt::idt_init,
     syscall::syscall_setup,
     serial,
-    apic::apic_init,
+    apic::{apic_init, calibrate_lapic_timer},
     xsave::xsave_init,
 };
 use crate::proc::exec::spawn_user_process;
@@ -134,6 +122,12 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // 5b. Time subsystem: TSC and HPET calibration.
+    //     MUST come before apic_init() so that busy_wait_us() is accurate
+    //     and calibrate_lapic_timer() has a reference clock available.
+    crate::time::init();
+    serial_println!("time: clocksource={:?}", crate::time::clocksource());
+
     // 6. FP state.
     xsave_init();
 
@@ -146,21 +140,24 @@ pub extern "C" fn kernel_main() -> ! {
     // 8. PCIe enumeration.
     crate::drivers::pcie::pcie_init();
 
-    // 8a. virtio-gpu: probe PCI device and allocate per-scanout resources.
-    //     Must come after pcie_init() so BARs are mapped, and before
-    //     drm::init_heads() which reads num_scanouts().
+    // 8a. virtio-gpu.
     crate::drivers::virtio_gpu::init();
     serial_println!("virtio-gpu: {} scanout(s)",
                     crate::drivers::virtio_gpu::num_scanouts());
 
-    // 8b. DRM head registration: GOP → head 0, virtio-gpu scanouts → heads 1+.
-    //     NUM_HEADS was 0 until this call; KMS ioctls are useless before it.
+    // 8b. DRM head registration.
     crate::drivers::drm::init_heads();
     serial_println!("drm: {} head(s) registered",
                     crate::drivers::drm::num_heads());
 
-    // 9. APIC + timer (enables interrupts).
+    // 9. APIC enable (timer LVT left MASKED at this point).
     apic_init();
+
+    // 9b. Calibrate APIC bus clock and arm 1 ms periodic timer.
+    //     Uses TSC (preferred) → HPET → PIT as reference.
+    //     Unmasks the timer LVT on completion.
+    calibrate_lapic_timer();
+    serial_println!("apic: timer armed (1 ms periodic)");
 
     // 10. AHCI probe.
     let ahci_found = probe_ahci();
