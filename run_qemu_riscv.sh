@@ -7,7 +7,7 @@
 # Options:
 #   --sbi      Use OpenSBI boot path instead of UEFI (default: UEFI)
 #   --uefi     Explicit UEFI mode (no-op; already the default)
-#   --gdb      Halt at entry, wait for GDB on :1235
+#   --gdb      Halt at entry, wait for GDB on :1234
 #   --no-net   Disable virtio-net
 #
 # Boot modes:
@@ -26,10 +26,10 @@
 #
 # GDB workflow:
 #   Terminal 1: ./run_qemu_riscv.sh --gdb [--sbi] [disk.img]
-#   Terminal 2: gdb-multiarch \
-#                 -ex 'set arch riscv:rv64' \
-#                 -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \
-#                 -ex 'target remote :1235'
+#   Terminal 2: gdb-multiarch \\
+#                 -ex 'set arch riscv:rv64' \\
+#                 -ex 'file target/riscv64gc-unknown-none-elf/debug/rustos' \\
+#                 -ex 'target remote :1234'
 #
 # Requirements:
 #   rustup target add riscv64gc-unknown-none-elf
@@ -88,7 +88,7 @@ gdb_banner() {
   │   gdb-multiarch \\                                │
   │     -ex 'set arch riscv:rv64' \\                  │
   │     -ex 'file ${sym_file}' \\
-  │     -ex 'target remote :1235'                     │
+  │     -ex 'target remote :1234'                     │
   └───────────────────────────────────────────────────┘
 
 GDB
@@ -154,7 +154,7 @@ if [[ "$BOOT" == "uefi" ]]; then
     echo "[*] No disk image — ramfs only"
   fi
 
-  [[ "$GDB_MODE" -eq 1 ]] && { QEMU_ARGS+=(-gdb tcp::1235 -S); gdb_banner; }
+  [[ "$GDB_MODE" -eq 1 ]] && { QEMU_ARGS+=(-gdb tcp::1234 -S); gdb_banner; }
 
   echo "[*] Starting QEMU (RISC-V UEFI)..."
   echo "    Firmware : $FW_CODE"
@@ -194,7 +194,7 @@ else
   echo "[*] No disk image — ramfs only"
 fi
 
-[[ "$GDB_MODE" -eq 1 ]] && { QEMU_ARGS+=(-gdb tcp::1235 -S); gdb_banner; }
+[[ "$GDB_MODE" -eq 1 ]] && { QEMU_ARGS+=(-gdb tcp::1234 -S); gdb_banner; }
 
 echo "[*] Starting QEMU (RISC-V SBI)..."
 echo

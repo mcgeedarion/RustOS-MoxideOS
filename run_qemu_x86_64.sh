@@ -209,13 +209,14 @@ else
 fi
 
 if [[ "$GDB_MODE" -eq 1 ]]; then
-  QEMU_ARGS+=(-s -S)
+  QEMU_ARGS+=(-gdb tcp::1234 -S)
   cat <<'GDB'
 
   ┌─────────────────────────────────────────────┐
   │ GDB mode: kernel halted at entry point.     │
   │ In another terminal:                        │
   │   gdb  (.gdbinit auto-connects + symbols)   │
+  │   or: target remote :1234                   │
   └─────────────────────────────────────────────┘
 
 GDB
