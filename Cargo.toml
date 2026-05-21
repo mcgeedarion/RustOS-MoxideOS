@@ -2,21 +2,32 @@
 members  = [".", "xtask", "crates/scheme-api", "userspace/drivers/virtio_net"]
 resolver = "2"
 
-[package]
-name    = "rustos"
+[workspace.package]
 version = "0.2.0"
 edition = "2021"
+authors = ["mcgeedarion"]
+license = "MIT OR Apache-2.0"
+
+[package]
+name    = "rustos"
+version.workspace = true
+edition.workspace = true
 
 # ── Profiles ────────────────────────────────────────────────────────────────
 
 [profile.release]
-opt-level      = 3
-codegen-units  = 1
-lto            = true
-panic          = "abort"
+opt-level     = 3
+codegen-units = 1
+lto           = true
+panic         = "abort"
+strip         = "debuginfo"   # remove debug symbols from the final binary
 
 [profile.dev]
-panic = "abort"
+panic         = "abort"
+opt-level     = 1             # faster incremental builds without being fully unoptimised
+
+[profile.test]
+panic         = "unwind"      # keep stack-unwind for test harness
 
 # ── Dependencies ────────────────────────────────────────────────────────────
 
