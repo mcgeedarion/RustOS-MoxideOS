@@ -5,4 +5,6 @@
 pub mod target;
 pub mod rsp;
 pub mod rsp_riscv;
+pub mod rsp_x86_64;
+pub mod breakpoints;
 pub mod serial;
