@@ -286,15 +286,29 @@ pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
 /// `dispatch()` is the legacy shim (passes 0 for RIP).
 ///
 /// Structure:
-///   1. seccomp pre-check  — may kill, trap, or override the return code
-///   2. subsystem routers  — each returns `Some(retval)` or `None`
-///   3. catch-all          — returns ENOSYS for any unrecognised NR
+///   1. trace entry        — record syscall enter event (debug builds only)
+///   2. seccomp pre-check  — may kill, trap, or override the return code
+///   3. subsystem routers  — each returns `Some(retval)` or `None`
+///   4. trace exit         — record syscall exit event with return value
+///   5. catch-all          — returns ENOSYS for any unrecognised NR
 ///
 /// All actual syscall logic lives in the five routers in `routers.rs`.
 /// Adding a match arm here is a bug; add it to the appropriate router.
 pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                          d: usize, e: usize, f: usize,
                          saved_rip: u64) -> isize {
+
+    // ── trace: syscall entry ──────────────────────────────────────────────
+    #[cfg(feature = "debug")]
+    {
+        use crate::debug::trace::{emit, TraceEvent, TraceKind};
+        emit(TraceEvent {
+            kind:  TraceKind::SyscallEnter,
+            id:    nr as u32,
+            arg:   a as u64,
+            ticks: crate::time::read_ticks(),
+        });
+    }
 
     // ── seccomp pre-check ─────────────────────────────────────────────────
     let is_exit = nr == SYS_EXIT || nr == SYS_EXIT_GROUP;
@@ -318,14 +332,27 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
     // Tried in call-frequency order (fs > proc > memory > ipc > time).
     // Each returns Some(retval) when it owns the nr.
     let ctx = SyscallContext::new(nr, [a, b, c, d, e, f], saved_rip);
-    if let Some(ret) = routers::dispatch_filesystem(&ctx) { return ret; }
-    if let Some(ret) = routers::dispatch_process(&ctx)    { return ret; }
-    if let Some(ret) = routers::dispatch_memory(&ctx)     { return ret; }
-    if let Some(ret) = routers::dispatch_ipc(&ctx)        { return ret; }
-    if let Some(ret) = routers::dispatch_time(&ctx)       { return ret; }
+    let ret;
+    if let Some(r) = routers::dispatch_filesystem(&ctx) { ret = r; }
+    else if let Some(r) = routers::dispatch_process(&ctx)    { ret = r; }
+    else if let Some(r) = routers::dispatch_memory(&ctx)     { ret = r; }
+    else if let Some(r) = routers::dispatch_ipc(&ctx)        { ret = r; }
+    else if let Some(r) = routers::dispatch_time(&ctx)       { ret = r; }
+    else { ret = enosys(); }
 
-    // ── unrecognised syscall ──────────────────────────────────────────────
-    enosys()
+    // ── trace: syscall exit ───────────────────────────────────────────────
+    #[cfg(feature = "debug")]
+    {
+        use crate::debug::trace::{emit, TraceEvent, TraceKind};
+        emit(TraceEvent {
+            kind:  TraceKind::SyscallExit,
+            id:    nr as u32,
+            arg:   ret as u64,
+            ticks: crate::time::read_ticks(),
+        });
+    }
+
+    ret
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

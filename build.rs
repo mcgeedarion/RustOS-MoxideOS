@@ -16,6 +16,15 @@ fn main() {
     if target_arch == "x86_64" && std::env::var("CARGO_FEATURE_UEFI_BOOT").is_ok() {
         produce_uefi_image(&out);
     }
+
+    // When `--features trace` is active, inject LLVM -Z instrument-functions
+    // so that every Rust function gets __cyg_profile_func_enter/exit calls.
+    // This is a nightly-only rustc flag; it is intentionally gated behind the
+    // `trace` feature so release builds and CI without nightly are unaffected.
+    if std::env::var("CARGO_FEATURE_TRACE").is_ok() {
+        println!("cargo:rustc-flags=-Z instrument-functions");
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TRACE");
+    }
 }
 
 // Compile src/init/crt/*.c into a static archive `librustos_crt.a` and

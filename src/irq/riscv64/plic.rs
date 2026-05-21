@@ -165,6 +165,19 @@ pub fn handle_irq() {
     loop {
         let irq = unsafe { r32(claim_addr) };
         if irq == 0 { break; }
+
+        // ── trace: IRQ dispatch ──────────────────────────────────────────
+        #[cfg(feature = "debug")]
+        {
+            use crate::debug::trace::{emit, TraceEvent, TraceKind};
+            emit(TraceEvent {
+                kind:  TraceKind::IrqDispatch,
+                id:    irq,
+                arg:   hart_id as u64,
+                ticks: crate::time::read_ticks(),
+            });
+        }
+
         let handler = PLIC.lock().handlers.get(irq as usize).copied().flatten();
         if let Some(h) = handler { h(); }
         unsafe { w32(claim_addr, irq); }

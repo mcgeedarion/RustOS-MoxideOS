@@ -227,3 +227,33 @@ pub fn kernel_main(fdt_ptr: usize) -> ! {
 
     unreachable!("scheduler returned to kernel_main");
 }
+
+// ── Panic handler ────────────────────────────────────────────────────────────
+
+/// Kernel panic handler.
+///
+/// In debug builds (`--features debug`) this calls `oops()` which prints:
+///   - the panic message
+///   - a frame-pointer stack backtrace with symbol names
+///   - a flush of any pending trace ring-buffer events
+///
+/// In release builds the message is printed directly to the serial console
+/// and the CPU halts.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    let msg = if let Some(m) = info.message().as_str() {
+        m
+    } else {
+        "(no message)"
+    };
+
+    #[cfg(feature = "debug")]
+    crate::debug::oops::oops(msg);
+
+    #[cfg(not(feature = "debug"))]
+    crate::serial_println!("KERNEL PANIC: {}", msg);
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
