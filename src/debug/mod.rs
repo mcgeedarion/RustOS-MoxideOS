@@ -33,14 +33,11 @@ mod debug_impl {
     pub mod gdbstub;
     #[cfg(feature = "gdbstub")]
     pub use gdbstub as _gdbstub_reexport;
-
     // Lock-free kernel trace ring buffer (syscall/IRQ/sched events).
     pub mod trace;
-
     // ftrace-style function entry/exit hooks via LLVM instrument-functions.
     #[cfg(feature = "trace")]
     pub mod ftrace;
-
     // Enriched panic handler: register dump + frame-pointer backtrace.
     pub mod oops;
 }
