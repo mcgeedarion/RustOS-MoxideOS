@@ -10,6 +10,7 @@
 //!   `core_dump`  — ELF core-dump generation on fatal signals.
 //!   `cow_fault`  — Copy-on-write page-fault handler.
 //!   `heap`       — Linked-list allocator bootstrap over PMM frames.
+//!   `kasan`      — KASAN-lite shadow-memory poisoning/checking for heap debug builds.
 //!   `kstack`     — Per-CPU kernel stack allocator and guard pages.
 //!   `memmap`     — Physical memory map parsing (E820 / UEFI memory map).
 //!   `mlock`      — `mlock`/`munlock` syscall implementation.
@@ -24,6 +25,7 @@ pub mod allocator;
 pub mod core_dump;
 pub mod cow_fault;
 pub mod heap;
+pub mod kasan;
 pub mod kstack;
 pub mod memmap;
 pub mod mlock;
