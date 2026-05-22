@@ -7,4 +7,13 @@ edition = "2021"
 # existing deps...
 
 [features]
-# existing feature flags...
+# Full debug build: GDB RSP stub + rich oops/backtrace + trace drain.
+# Use `--features debug` as the single flag for a debug kernel.
+# `debug_stub` and `trace` can still be enabled individually if needed.
+debug = ["debug_stub", "trace"]
+
+# GDB Remote Serial Protocol stub only (no oops/trace overhead).
+debug_stub = []
+
+# Ring-buffer trace event drain, flushed to serial on panic.
+trace = []

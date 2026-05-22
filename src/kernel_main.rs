@@ -21,7 +21,7 @@
 //!  5. heap::init()                   — linked-list allocator over PMM
 //!  6. mm::init()                     — slab cache pre-warm
 //!  7. security::init()               — ASLR, stack canaries, seccomp tables
-//!  8. debug::init()                  — GDB RSP stub (conditional)
+//!  8. debug::init()                  — GDB RSP stub (gated on `debug_stub`; implied by `debug`)
 //!  9. display::framebuffer::init()   — virtio-gpu framebuffer → kernel console
 //! 10. display::drm::init()           — DRM/KMS object model
 //! 11. display::wayland::init()       — Wayland compositor
@@ -68,6 +68,8 @@ pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
 
     crate::security::init();
 
+    // Gated on `debug_stub`; the umbrella `debug` feature implies it via
+    // Cargo feature dependencies (see Cargo.toml [features]).
     #[cfg(feature = "debug_stub")]
     crate::debug::init();
 
@@ -102,13 +104,27 @@ pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let msg = if let Some(m) = info.message().as_str() { m } else { "(no message)" };
+    let msg = info.message().as_str().unwrap_or("(no message)");
 
+    // Always emit a canonical header with source location so the crash site
+    // is visible even in release builds without a full oops backtrace.
+    if let Some(loc) = info.location() {
+        crate::serial_println!(
+            "KERNEL PANIC at {}:{}:{}: {}",
+            loc.file(),
+            loc.line(),
+            loc.column(),
+            msg,
+        );
+    } else {
+        crate::serial_println!("KERNEL PANIC: {}", msg);
+    }
+
+    // In debug builds additionally trigger the full oops handler:
+    // register dump, frame-pointer backtrace, and trace drain.
+    // `debug` implies `debug_stub` and `trace` via Cargo feature deps.
     #[cfg(feature = "debug")]
     crate::debug::oops::oops(msg);
-
-    #[cfg(not(feature = "debug"))]
-    crate::serial_println!("KERNEL PANIC: {}", msg);
 
     loop { core::hint::spin_loop(); }
 }

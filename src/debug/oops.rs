@@ -1,6 +1,16 @@
 //! Panic/oops formatter — register dump, frame-pointer stack backtrace,
 //! and best-effort symbol resolution.
 //!
+//! # Usage
+//!
+//! `oops` is called from the `#[panic_handler]` in `src/kernel_main.rs`
+//! when the kernel is built with `--features debug` (which also implies
+//! `debug_stub` and `trace` via Cargo feature dependencies).
+//!
+//! The panic handler emits a canonical `KERNEL PANIC at file:line:col`
+//! header unconditionally; `oops` then adds the register dump, backtrace,
+//! and trace drain on top of that.
+//!
 //! # Register dump
 //!
 //! When a panic originates from a trap handler, pass the `TrapFrame` pointer
@@ -20,8 +30,6 @@
 //! A sorted `(address, name)` table is embedded at build time by `build.rs`
 //! (generated from `llvm-nm --numeric-sort` on the kernel ELF). At runtime
 //! `resolve_symbol` binary-searches the table for the nearest symbol.
-//!
-//! Enabled only under `--features debug`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -157,10 +165,18 @@ pub fn dump_regs_riscv(regs: &crate::arch::riscv64::TrapFrame) {
 
 /// Enrich a panic with a register dump and backtrace.
 ///
-/// Call from your `#[panic_handler]`:
+/// The `#[panic_handler]` in `src/kernel_main.rs` already emits a
+/// `KERNEL PANIC at file:line:col: message` header before calling this;
+/// `oops` adds the register dump, backtrace, and trace drain on top.
+///
+/// Only called when built with `--features debug` (which implies both
+/// `debug_stub` and `trace` via Cargo feature dependencies).
+///
 /// ```rust
 /// #[panic_handler]
 /// fn panic(info: &core::panic::PanicInfo) -> ! {
+///     // emit canonical header with location...
+///     #[cfg(feature = "debug")]
 ///     crate::debug::oops::oops(info.message().as_str().unwrap_or("(no message)"));
 ///     loop { core::hint::spin_loop(); }
 /// }
