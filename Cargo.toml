@@ -1,90 +1,10 @@
-[workspace]
-members  = [".", "xtask", "crates/scheme-api", "userspace/drivers/virtio_net"]
-resolver = "2"
-
-[workspace.package]
-version = "0.2.0"
-edition = "2021"
-authors = ["mcgeedarion"]
-license = "MIT OR Apache-2.0"
-
 [package]
-name    = "rustos"
-version.workspace = true
-edition.workspace = true
-
-# ── Profiles ────────────────────────────────────────────────────────────────
-
-[profile.release]
-opt-level          = 3
-codegen-units      = 1
-lto                = true
-panic              = "abort"
-strip              = "debuginfo"   # remove debug symbols from the final binary
-force-frame-pointers = true        # required for oops.rs backtrace unwinding
-
-[profile.dev]
-panic              = "abort"
-opt-level          = 1             # faster incremental builds without being fully unoptimised
-force-frame-pointers = true        # required for oops.rs backtrace unwinding
-
-[profile.test]
-panic              = "unwind"      # keep stack-unwind for test harness
-force-frame-pointers = true
-
-# ── Dependencies ────────────────────────────────────────────────────────────
+name = "rustos-kernel"
+version = "0.1.0"
+edition = "2021"
 
 [dependencies]
-spin                  = { version = "0.9", features = ["mutex", "spin_mutex"] }
-bitflags              = "2"
-linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
-
-[build-dependencies]
-cc = "1"
-
-# ── Features ────────────────────────────────────────────────────────────────
-#
-# Boot paths (mutually exclusive):
-#   cargo build                                       → UEFI (default)
-#   cargo build --no-default-features \
-#     --features multiboot2_boot,sysv_ipc,namespaces  → multiboot2 / GRUB2
-#
-# Optional subsystems:
-#   --features debug         → all debug infrastructure (GDB stub + tracing + oops)
-#   --features gdbstub       → GDB RSP stub only (UART/SBI)   (owning module: src/debug)
-#   --features trace         → ftrace-style function hooks via LLVM instrument-functions
-#   --features cgroups       → cgroups v2 cgroupfs             (owning module: src/security)
-#   --features input_events  → /dev/input evdev layer          (owning module: src/input)
-#   --features wayland       → Wayland compositor scaffold     (owning module: src/display)
-#
-# When kernel-security / kernel-drivers crates are split out, these become
-# pass-through re-exports, e.g.:
-#   debug        = ["kernel-hal/debug"]
-#   gdbstub      = ["kernel-hal/gdbstub"]
-#   cgroups      = ["kernel-security/cgroups"]
-#   wayland      = ["kernel-drivers/wayland"]
-#   input_events = ["kernel-drivers/input_events"]
+# existing deps...
 
 [features]
-default = ["uefi_boot", "sysv_ipc", "namespaces"]
-
-# Boot paths
-uefi_boot       = []  # PE32+ BOOTX64.EFI via build.rs; primary path
-multiboot2_boot = []  # GRUB2 / QEMU -kernel fallback; use --no-default-features
-
-# Stable subsystems (enabled by default)
-sysv_ipc   = []  # SysV IPC + POSIX message queues (NR 29-31, 64-71, 240-245)
-namespaces = []  # Linux-compatible ns isolation (NEWNS/PID/NET/UTS/IPC/USER)
-
-# Optional / WIP subsystems
-# Each flag is consumed by cfg(feature = "...") gates in the owning module.
-#
-# `debug` is the umbrella gate for the entire src/debug/ tree; it implies
-# `gdbstub` and `trace` so that `--features debug` is sufficient for a full
-# debug build.  Use sub-features directly only when you want a subset.
-debug        = ["gdbstub", "trace"]  # Umbrella: all debug infrastructure (gates src/debug/)
-gdbstub      = []                    # Experimental: GDB RSP over UART (x86_64) / SBI console (RISC-V)
-trace        = []                    # ftrace hooks via LLVM -Z instrument-functions + ring buffer
-cgroups      = []                    # Experimental: cgroups v2 hierarchy + cgroupfs VFS mount
-input_events = []                    # /dev/input evdev layer (keyboard + mouse ring buffers)
-wayland      = []                    # WIP stub: in-kernel Wayland compositor scaffold
+# existing feature flags...
