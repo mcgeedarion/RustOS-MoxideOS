@@ -14,6 +14,7 @@
 #   build/<arch>/init               → staged as /init        (PID 1)
 #   build/<arch>/hello              → staged as /bin/hello
 #   build/<arch>/rustos-compositor  → staged as /usr/bin/rustos-compositor
+#   build/<arch>/smoke              → staged as /bin/smoke   (QEMU smoke test)
 
 ARCH       ?= x86_64
 BUILD_DIR  := build/$(ARCH)
@@ -31,7 +32,7 @@ else
 endif
 
 # List every subdirectory that contains a C program here.
-PROGRAMS := init hello wayland
+PROGRAMS := init hello wayland smoke
 
 .PHONY: all clean install $(PROGRAMS)
 
@@ -45,6 +46,13 @@ init: $(BUILD_DIR)
 
 hello: $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $(BUILD_DIR)/hello hello/hello.c
+
+# Minimal QEMU smoke binary:
+#   - prints a well-known marker to the serial console
+#   - returns 0 on success
+#   - can be extended later with basic invariants (e.g. /proc/1 exists).
+smoke: $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $(BUILD_DIR)/smoke smoke/smoke.c
 
 # The Wayland compositor is a privileged userspace process.
 # It is installed as /usr/bin/rustos-compositor in the initramfs.
@@ -67,6 +75,7 @@ wayland: $(BUILD_DIR)
 #   DESTDIR/
 #     init                        ← exec'd directly as PID 1 by the kernel
 #     bin/hello
+#     bin/smoke                   ← small QEMU smoke-test helper
 #     usr/bin/rustos-compositor   ← spawned by init as PID 2
 #
 # Usage: make install DESTDIR=path/to/initramfs/root
@@ -75,6 +84,7 @@ install: all
 	mkdir -p $(DESTDIR)/bin $(DESTDIR)/usr/bin
 	cp $(BUILD_DIR)/init                $(DESTDIR)/init
 	cp $(BUILD_DIR)/hello               $(DESTDIR)/bin/hello
+	cp $(BUILD_DIR)/smoke               $(DESTDIR)/bin/smoke
 	cp $(BUILD_DIR)/rustos-compositor   $(DESTDIR)/usr/bin/rustos-compositor
 
 clean:
