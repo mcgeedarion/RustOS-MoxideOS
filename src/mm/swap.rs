@@ -34,6 +34,11 @@
 //! ```text
 //!  x86_64 (64-bit PTE):  [ slot:32 | dev_id:8 | type=SWAP:8 | P=0 ]
 //!  RISC-V Sv39 (64-bit): [ slot:32 | dev_id:8 | type=SWAP:8 | V=0 ]
+//!
+//!  Bit layout (LSB = bit 0):
+//!    bits  7:0  = 0xAB  (swap-type marker; bit 0 = P/V = 0)
+//!    bits 23:16 = dev_id (0..MAX_SWAP_DEVS-1)
+//!    bits 55:24 = slot index (1-based)
 //! ```
 //!
 //! The P/V bit is **0** so the hardware treats it as not-present and traps;
@@ -58,7 +63,7 @@
 extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 use crate::arch::{Arch, api::{Paging, PageFlags}};
 use crate::mm::pmm::{alloc_page, free_page};
@@ -96,14 +101,19 @@ pub struct SwapSlot {
 impl SwapSlot {
     /// Encode into the upper bits of a not-present PTE.
     ///
-    /// Layout: `[ slot:32 | dev:8 | SWAP_MARKER:8 | present=0 ]`
-    /// Bits 15:8 = 0xAB (swap marker distinguishes from a zero PTE).
+    /// Layout (LSB = bit 0):
+    ///   bits  7:0  = 0xAB  (swap marker; bit 0 = P/V = 0)
+    ///   bits 23:16 = dev   (8 bits, supports up to 256 devices)
+    ///   bits 55:24 = slot  (32 bits; slot is u32 so this never overflows)
+    ///
+    /// Previously slot was at bit 16 and dev at bit 8, which caused slot
+    /// values >= 256 to corrupt the dev field on decode.  The fields are
+    /// now non-overlapping for the full u32 slot range.
     #[inline]
     pub fn encode_pte(self) -> usize {
-        ((self.slot as usize) << 16)
-            | ((self.dev  as usize) << 8)
-            | 0xAB // swap-type marker
-        // bit 0 (PRESENT/VALID) is always 0
+        ((self.slot as usize) << 24)
+            | ((self.dev  as usize) << 16)
+            | 0xAB // swap-type marker; bit 0 (PRESENT/VALID) = 0
     }
 
     /// Decode a not-present PTE back to a `SwapSlot`.
@@ -112,8 +122,8 @@ impl SwapSlot {
     pub fn decode_pte(pte: usize) -> Option<Self> {
         if pte & 1 != 0 { return None; }         // present — not a swap PTE
         if (pte & 0xFF) != 0xAB { return None; } // wrong marker
-        let dev  = ((pte >> 8) & 0xFF) as u8;
-        let slot = (pte >> 16) as u32;
+        let dev  = ((pte >> 16) & 0xFF) as u8;
+        let slot = (pte >> 24) as u32;
         if dev as usize >= MAX_SWAP_DEVS || slot == 0 { return None; }
         Some(SwapSlot { dev, slot })
     }
@@ -217,8 +227,6 @@ struct DevTable {
 
 impl DevTable {
     const fn new() -> Self {
-        // Can't use [None; N] with non-Copy type directly in const context;
-        // init with a manual approach.
         DevTable {
             devs: [
                 None, None, None, None,
@@ -278,36 +286,40 @@ impl LruClock {
     }
 
     /// Remove an entry by physical address (called when page is freed).
+    ///
+    /// Uses swap-with-tail to keep the live region dense, so
+    /// `next_candidate` never wastes iterations on tombstones.
     fn remove_pa(&mut self, pa: usize) {
         if let Some(pos) = self.ring[..self.count].iter().position(|e| e.pa == pa) {
-            self.ring[pos] = LruEntry::default();
-            // Don't shrink count; leave a zero-pa tombstone — it will be
-            // skipped by the eviction scan.
+            self.count -= 1;
+            // Move the last live entry into the vacated slot.
+            self.ring[pos] = self.ring[self.count];
+            self.ring[self.count] = LruEntry::default();
+            // Keep the clock hand in bounds after the shrink.
+            if self.hand >= self.count && self.count > 0 {
+                self.hand = self.hand % self.count;
+            } else if self.count == 0 {
+                self.hand = 0;
+            }
         }
     }
 
     /// Advance the clock hand and return the next candidate for eviction.
     ///
-    /// Skips tombstones (pa == 0).  Returns `None` if no candidates exist.
+    /// Returns `None` if the ring is empty.
     fn next_candidate(&mut self) -> Option<LruEntry> {
-        let n = self.count;
-        if n == 0 { return None; }
-        for _ in 0..n {
-            let e = self.ring[self.hand];
-            self.hand = (self.hand + 1) % n;
-            if e.pa != 0 { return Some(e); }
-        }
-        None
+        if self.count == 0 { return None; }
+        let e = self.ring[self.hand];
+        self.hand = (self.hand + 1) % self.count;
+        if e.pa != 0 { Some(e) } else { None }
     }
 }
 
-static LRU: Mutex<LruClock> = Mutex::new(unsafe {
-    // SAFETY: LruClock::new() cannot run in const context because Vec doesn't
-    // have const-new. We use a lazy-init pattern: the Mutex wraps a dummy
-    // LruClock and init() replaces it.  Access before init() is guarded by
-    // INITIALISED.
-    core::mem::zeroed()
-});
+// Use spin::Once so LruClock::new() (which allocates a Vec) is called at
+// runtime after the heap is ready, not at link time.  The previous approach
+// of wrapping a mem::zeroed() LruClock in a Mutex was unsound because a
+// zeroed Vec (null data pointer, zero len/cap) is not a valid Rust value.
+static LRU: Once<Mutex<LruClock>> = Once::new();
 
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 
@@ -370,9 +382,9 @@ pub fn add_swap_device(ops: SwapOps, num_slots: u32) -> Result<u8, isize> {
 
 /// Remove a previously-registered swap device by index.
 ///
-/// All slots on this device must have been freed before calling this;
-/// in-use slots are silently abandoned (the PMM pages remain swapped out
-/// and those virtual addresses will fault with -EIO).
+/// Callers must have already drained all pages off the device via
+/// `drain_swap_device` before calling this (i.e. `sys_swapoff` does this).
+/// In-use slots are silently abandoned only if the caller skips the drain.
 pub fn remove_swap_device(dev_idx: u8) -> Result<(), isize> {
     let mut tbl = DEV_TABLE.lock();
     let idx = dev_idx as usize;
@@ -399,14 +411,16 @@ pub fn is_enabled() -> bool {
 /// The page is registered in the LRU clock ring and becomes eligible for
 /// future eviction by kswapd.
 pub fn track_page(pa: usize, pid: u32, va: usize) {
-    if !INITIALISED.load(Ordering::Acquire) { return; }
-    LRU.lock().insert(pa, pid, va);
+    if let Some(lru) = LRU.get() {
+        lru.lock().insert(pa, pid, va);
+    }
 }
 
 /// Remove a page from the LRU ring (call when a page is freed by the process).
 pub fn untrack_page(pa: usize) {
-    if !INITIALISED.load(Ordering::Acquire) { return; }
-    LRU.lock().remove_pa(pa);
+    if let Some(lru) = LRU.get() {
+        lru.lock().remove_pa(pa);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,11 +438,14 @@ pub fn untrack_page(pa: usize) {
 ///   - from `kswapd_tick` on a schedule
 pub fn swapout_one() -> bool {
     if !is_enabled() { return false; }
-    if !INITIALISED.load(Ordering::Acquire) { return false; }
+    let lru_mutex = match LRU.get() {
+        Some(m) => m,
+        None => return false,
+    };
 
     // ── 1. Pick a victim from the LRU clock ──────────────────────────────
     let victim = {
-        let mut lru = LRU.lock();
+        let mut lru = lru_mutex.lock();
         let mut candidate = None;
         let n = lru.count.min(LRU_CAPACITY);
         for _ in 0..n * 2 {
@@ -485,19 +502,23 @@ pub fn swapout_one() -> bool {
     STAT_FREE_SLOTS.fetch_sub(1, Ordering::Relaxed);
 
     // ── 3. Write the page to the swap device ─────────────────────────────
-    let io_ok = {
+    //
+    // Extract the I/O function pointers and drop DEV_TABLE *before* calling
+    // write_page.  Holding a spinlock across a synchronous block I/O write
+    // would serialise all swap activity on all CPUs for the disk latency.
+    let (write_fn, dev_priv, byte_offset) = {
         let tbl = DEV_TABLE.lock();
-        if let Some(ref dev) = tbl.devs[slot.dev as usize] {
-            let rc = unsafe {
-                (dev.ops.write_page)(
-                    dev.ops.dev_priv,
-                    slot.byte_offset(),
-                    e.pa as *const u8,
-                )
-            };
-            rc >= 0
-        } else { false }
-    };
+        match tbl.devs[slot.dev as usize].as_ref() {
+            Some(dev) => (dev.ops.write_page, dev.ops.dev_priv, slot.byte_offset()),
+            None => {
+                // Device disappeared between slot allocation and write.
+                STAT_EVICT_FAIL.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+    }; // DEV_TABLE lock released here — before the I/O call
+
+    let io_ok = unsafe { write_fn(dev_priv, byte_offset, e.pa as *const u8) } >= 0;
 
     if !io_ok {
         // I/O failed — free the slot and bail.
@@ -519,8 +540,8 @@ pub fn swapout_one() -> bool {
     }
 
     // ── 5. Free the physical page and untrack it ──────────────────────────
-    LRU.lock().remove_pa(e.pa);
-    free_page(e.pa as *mut u8);
+    lru_mutex.lock().remove_pa(e.pa);
+    free_page(e.pa);
     STAT_SWAPOUT.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -566,19 +587,22 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
     };
 
     // ── 3. Read the page from the swap device ─────────────────────────────
-    let io_ok = {
+    //
+    // Same pattern as swapout_one: extract I/O pointers then drop the lock
+    // before performing the I/O.
+    let (read_fn, dev_priv, byte_offset) = {
         let tbl = DEV_TABLE.lock();
-        if let Some(ref dev) = tbl.devs[slot.dev as usize] {
-            let rc = unsafe {
-                (dev.ops.read_page)(
-                    dev.ops.dev_priv,
-                    slot.byte_offset(),
-                    pa as *mut u8,
-                )
-            };
-            rc >= 0
-        } else { false }
-    };
+        match tbl.devs[slot.dev as usize].as_ref() {
+            Some(dev) => (dev.ops.read_page, dev.ops.dev_priv, slot.byte_offset()),
+            None => {
+                free_page(pa);
+                crate::proc::signal::send_signal(pid, 7 /* SIGBUS */);
+                return false;
+            }
+        }
+    }; // DEV_TABLE lock released here
+
+    let io_ok = unsafe { read_fn(dev_priv, byte_offset, pa as *mut u8) } >= 0;
 
     if !io_ok {
         free_page(pa);
@@ -689,8 +713,10 @@ pub fn sys_swapon(path: *const u8, path_len: usize) -> isize {
 
 /// `swapoff(2)` — deactivate a swap device by the same path.
 ///
-/// Initiates swapin for all pages currently on this device before
-/// deregistering it.  Returns `0` on success or a negative errno.
+/// Drains all pages currently on this device back into RAM before
+/// deregistering it, so no process is left with a live swap-special PTE
+/// pointing at the removed device.  Returns `0` on success or a negative
+/// errno.
 pub fn sys_swapoff(path: *const u8, path_len: usize) -> isize {
     let name = unsafe { core::slice::from_raw_parts(path, path_len) };
     let dev_idx = match crate::fs::vfs::find_swap_device(name) {
@@ -698,13 +724,49 @@ pub fn sys_swapoff(path: *const u8, path_len: usize) -> isize {
         Err(e) => return e,
     };
     // Drain all swapped-out pages back to RAM before removing the device.
-    // This is a best-effort pass; in a full implementation we would iterate
-    // every process's page tables.  For now we rely on processes faulting
-    // them back in themselves; we just mark the device inactive so new
-    // allocations don't use it.
+    // This walks every live process's page tables and calls swapin for each
+    // PTE whose SwapSlot::dev matches dev_idx.  Without this drain, any
+    // subsequent fault on those addresses would find the device gone and
+    // deliver SIGBUS with no recovery possible.
+    drain_swap_device(dev_idx);
     match remove_swap_device(dev_idx) {
         Ok(()) => 0,
         Err(e) => e,
+    }
+}
+
+/// Walk every live process's page tables and swapin any page whose backing
+/// slot is on `dev_idx`.  Called by `sys_swapoff` before the device is
+/// deregistered.
+///
+/// Requires `Paging::walk_swap_ptes` — a page-table walker that calls the
+/// provided closure for every not-present PTE that decodes as a valid
+/// `SwapSlot`.  The closure receives `(va, slot)` and should return `true`
+/// to continue the walk.
+fn drain_swap_device(dev_idx: u8) {
+    // Collect (pid, cr3) pairs under a read lock so we don't hold the
+    // scheduler lock across the (potentially slow) swapin I/O calls.
+    let targets: alloc::vec::Vec<(u32, usize)> = scheduler::with_procs_ro(|procs| {
+        procs.iter()
+            .filter(|p| p.user_satp != 0)
+            .map(|p| (p.pid as u32, p.user_satp))
+            .collect()
+    });
+
+    for (pid, cr3) in targets {
+        // Collect all VAs with swap PTEs on this device, then swapin each
+        // one.  We collect first to avoid calling swapin while holding a
+        // page-table lock inside walk_swap_ptes.
+        let mut vas: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        <Arch as Paging>::walk_swap_ptes(cr3, |va, slot| {
+            if slot.dev == dev_idx {
+                vas.push(va);
+            }
+            true // continue walk
+        });
+        for va in vas {
+            swapin(pid, va);
+        }
     }
 }
 
@@ -739,8 +801,8 @@ pub fn proc_swaps() -> Vec<SwapEntry> {
 // Paging trait extensions required by this module
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// The following methods must be added to the `Paging` trait in
-// `src/arch/api.rs` if not already present:
+// The following methods must be present on the `Paging` trait in
+// `src/arch/api.rs`:
 //
 //   /// Read the raw PTE for `va` in address space `cr3`.
 //   fn read_pte(cr3: usize, va: usize) -> usize;
@@ -754,6 +816,10 @@ pub fn proc_swaps() -> Vec<SwapEntry> {
 //   /// Clear the accessed bit in the PTE for `va`.
 //   fn clear_accessed(cr3: usize, va: usize);
 //
+//   /// Walk all not-present PTEs in `cr3` that decode as valid SwapSlots.
+//   /// Calls `f(va, slot)` for each; stops early if `f` returns false.
+//   fn walk_swap_ptes(cr3: usize, f: impl FnMut(usize, SwapSlot) -> bool);
+//
 // `map_page` and `flush_va` are already required by the demand-paging path.
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -765,8 +831,8 @@ pub fn proc_swaps() -> Vec<SwapEntry> {
 ///
 /// This call is idempotent — calling it a second time is a no-op.
 pub fn init() {
-    if INITIALISED.swap(true, Ordering::AcqRel) { return; } // already initialised
-    *LRU.lock() = LruClock::new();
+    LRU.call_once(|| Mutex::new(LruClock::new()));
+    INITIALISED.store(true, Ordering::Release);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

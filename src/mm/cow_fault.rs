@@ -73,14 +73,16 @@ pub fn clone_for_fork(
 /// ## SMP TLB shootdown protocol
 ///
 /// After mapping the new private copy and replacing the PTE, we must
-/// invalidate the old mapping on ALL CPUs before freeing `old_pa`.  The
-/// sequence is:
+/// invalidate the old mapping on ALL CPUs before releasing our reference
+/// to `old_pa`.  The sequence is:
 ///
 ///   1. map_page()      — replace the PTE in this process's page tables
 ///   2. flush_va()      — invalidate local TLB entry
 ///   3. tlb_shootdown() — send TLB-shootdown IPIs to all other CPUs and
 ///                        WAIT for their acknowledgment (blocking)
-///   4. free_page()     — only now is it safe to recycle old_pa
+///   4. put_page()      — decrement the refcount; buddy_free_page is called
+///                        only when the count reaches zero, which is safe
+///                        when multiple fork children share the same frame.
 ///
 /// Skipping step 3 on a multi-processor system would allow another CPU
 /// that held this process's address space loaded to dereference the freed
@@ -132,7 +134,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         );
     }
 
-    // ── Step 5: remap, flush, shootdown, free ───────────────────────────
+    // ── Step 5: remap, flush, shootdown, release old frame ──────────────
     let page_va = faulting_va & !0xFFF;
     let flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER;
 
@@ -150,8 +152,14 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         0, // asid 0 = all address spaces (conservative)
     );
 
-    // 5d. Now safe to recycle the old frame.
-    pmm::free_page(old_pa);
+    // 5d. Release our reference to the old frame.
+    //
+    // put_page() decrements the PMM refcount and only calls buddy_free_page
+    // when it reaches zero.  This is correct when multiple fork() children
+    // share the same CoW source frame — the last one to fault frees it.
+    // Previously this was an unconditional free_page() which caused a
+    // double-free when two children faulted the same frame concurrently.
+    pmm::put_page(old_pa);
 
     true
 }
