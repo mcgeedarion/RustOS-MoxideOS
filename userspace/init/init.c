@@ -7,9 +7,10 @@
  *
  * Responsibilities:
  *   1. Write a boot message to stdout (fd 1) via the write syscall.
- *   2. Launch the Wayland compositor as a supervised child process.
- *   3. Wait for children via waitpid(); restart the compositor if it exits.
- *   4. Never return — loop forever supervising children.
+ *   2. Run /bin/smoke (if present) as an early boot sanity check.
+ *   3. Launch the Wayland compositor as a supervised child process.
+ *   4. Wait for children via waitpid(); restart the compositor if it exits.
+ *   5. Never return — loop forever supervising children.
  *
  * Wayland compositor launch
  * ─────────────────────────
@@ -61,6 +62,7 @@
 #define COMPOSITOR_BIN      "/usr/bin/rustos-compositor"
 #define DRM_DEV             "/dev/dri/card0"
 #define INPUT_DEV           "/dev/input/event0"
+#define SMOKE_BIN           "/bin/smoke"
 #define RESTART_DELAY_SEC   1
 
 static void puts_fd(int fd, const char *s)
@@ -102,6 +104,52 @@ static void fmt_env(char *buf, size_t buf_len,
     else { int v = val; while (v > 0) { digits[d++] = (char)('0' + v % 10); v /= 10; } }
     for (int r = d - 1; r >= 0 && k < buf_len - 1; r--) buf[k++] = digits[r];
     buf[k] = '\0';
+}
+
+/*
+ * run_smoke_test — fork/exec /bin/smoke and wait for it.
+ *
+ * Exercises: PID 1 came up, fork() works, execve() works, waitpid() works.
+ * /bin/smoke prints "SMOKE OK: userspace_smoke" to stdout (captured by
+ * QEMU --smoke serial scan) and exits 0.
+ *
+ * If /bin/smoke is missing (e.g. non-CI builds without initrd flag) the
+ * open() of the executable will fail inside execve and we just log a
+ * warning — normal boot continues.
+ */
+static void run_smoke_test(void)
+{
+    puts_fd(1, "[init] running smoke test: " SMOKE_BIN);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        puts_fd(2, "[init] WARNING: fork() failed for smoke test");
+        return;
+    }
+
+    if (pid == 0) {
+        char *argv[] = { SMOKE_BIN, NULL };
+        char *envp[] = {
+            "HOME=/root",
+            "PATH=/usr/bin:/bin",
+            NULL
+        };
+        execve(SMOKE_BIN, argv, envp);
+        /* execve only returns on error — binary missing or not executable */
+        puts_fd(2, "[init] WARNING: execve(" SMOKE_BIN ") failed — skipping smoke test");
+        _exit(1);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        puts_fd(1, "[init] smoke test PASSED");
+    } else {
+        puts_fd(2, "[init] smoke test FAILED, exit=");
+        putint_fd(2, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        write(2, "\n", 1);
+    }
 }
 
 /*
@@ -177,6 +225,14 @@ int main(void)
     puts_fd(1, "[init] rustos userspace init started");
     puts_fd(1, "[init] PID 1 running under musl-libc");
     puts_fd(1, "[init] TEST PASS: userspace_init");
+
+    /*
+     * Early smoke test: exercises fork()+execve()+waitpid() from PID 1
+     * before any other child is launched.  In QEMU smoke mode the serial
+     * output is scanned for "SMOKE OK: userspace_smoke" by xtask/
+     * run_qemu_x86_64.sh --smoke.  Missing binary is non-fatal.
+     */
+    run_smoke_test();
 
     /*
      * Initial compositor launch.
