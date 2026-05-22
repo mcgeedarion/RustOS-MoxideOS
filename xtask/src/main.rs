@@ -16,6 +16,8 @@
 //!   cargo xtask image --arch x86_64 --debug        # x86_64 debug ESP image
 //!   cargo xtask image --arch x86_64 --initrd       # include initramfs.cpio
 //!
+//!   cargo xtask smoke                              # x86_64 QEMU smoke test (headless)
+//!
 //! The `image` subcommand requires mtools (mformat, mmd, mcopy) and
 //! objcopy (binutils / llvm-objcopy).  Install hint is printed if missing.
 //!
@@ -587,7 +589,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     run(Command::new("mformat")
         .args(["-C", "-F", "-h", "64", "-s", "32", "-t", "64", "-i"])
         .arg(&img_path).arg("::"));
-    run(Command::new("mmd").args(["-i"]).arg(&img_path).args(["|::/EFI", "::/EFI/BOOT"]));
+    run(Command::new("mmd").args(["-i"]).arg(&img_path).args(["::/EFI", "::/EFI/BOOT"]));
     run(Command::new("mcopy")
         .args(["-i"]).arg(&img_path)
         .arg(&efi_path)
@@ -676,6 +678,25 @@ fn main() {
             }
             image(&root, &opts);
         }
+        "smoke" => {
+            // Thin QEMU x86_64 smoke test wrapper.
+            // Builds a UEFI+initrd image, then delegates to run_qemu_x86_64.sh --smoke
+            // with a fixed marker that the /bin/smoke helper prints.
+            let img_opts = BuildOpts { arch: Arch::X86_64, boot: Boot::Uefi, debug: true, initrd: true };
+            image(&root, &img_opts);
+
+            let script = root.join("run_qemu_x86_64.sh");
+            if !script.exists() {
+                eprintln!("[xtask] ERROR: run_qemu_x86_64.sh not found at {}", script.display());
+                exit(1);
+            }
+
+            let mut cmd = Command::new(script);
+            cmd.arg("--smoke")
+               .arg("--smoke-marker")
+               .arg("SMOKE OK: userspace_smoke");
+            run(cmd);
+        }
         "help" | "--help" | "-h" | "" => {
             println!(concat!(
                 "cargo xtask <subcommand> [options]\n",
@@ -684,6 +705,7 @@ fn main() {
                 "  build         Compile the kernel\n",
                 "  mkinitramfs   Build userspace + device nodes and pack initramfs.cpio\n",
                 "  image         Build a flashable FAT32 ESP disk image\n",
+                "  smoke         Build x86_64 UEFI+initrd and run a QEMU smoke test\n",
                 "\n",
                 "Build options (build / image):\n",
                 "  --arch <riscv64|x86_64>   Target architecture  (image default: x86_64)\n",
@@ -717,12 +739,8 @@ fn main() {
                 "  # Rebuild initramfs only (e.g. after editing init.c):\n",
                 "  cargo xtask mkinitramfs\n",
                 "\n",
-                "  # QEMU smoke-test:\n",
-                "  cargo xtask build --arch x86_64 --boot uefi --initrd\n",
-                "  qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd \\\n",
-                "    -kernel esp/EFI/BOOT/BOOTx64.EFI \\\n",
-                "    -initrd initramfs.cpio \\\n",
-                "    -serial stdio -nographic -m 512M\n",
+                "  # QEMU smoke-test (x86_64, headless):\n",
+                "  cargo xtask smoke\n",
             ));
         }
         other => {
