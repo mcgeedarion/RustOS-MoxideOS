@@ -10,7 +10,7 @@
 //!   2.  idt_init()                    — IDT exception/IRQ vectors
 //!   3.  syscall_setup()               — SYSCALL/SYSRET MSRs
 //!   4.  serial::init()                — full 16550 reinit
-//!   5.  memmap_init()                 — Phase 2: feed EFI memory map to PMM
+//!   5.  arch::x86_64::memory::discover() → pmm::init_from_regions()
 //!   5b. time::init()                  — TSC/HPET calibration (BEFORE apic_init)
 //!   6.  xsave_init()                  — XSAVE/FXSAVE feature detection
 //!   7.  acpi_init()                   — RSDP → MADT: CPU list, I/O APIC
@@ -40,8 +40,6 @@ use crate::proc::exec::spawn_user_process;
 
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
-// ── Legacy multiboot2 entry ───────────────────────────────────────────────────
-
 #[cfg(feature = "multiboot2_boot")]
 pub static mut MBI_PTR: usize = 0;
 
@@ -52,28 +50,21 @@ pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
     kernel_main()
 }
 
-// ── Primary kernel entry ─────────────────────────────────────────────────────
-
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
-    // 0a. Serial UART before anything that can panic.
     serial::early_init();
 
-    // 0b. VGA text mode probe.
     #[cfg(target_arch = "x86_64")]
     let vga_active = crate::drivers::vga::init();
     #[cfg(not(target_arch = "x86_64"))]
     let vga_active = false;
 
-    // 0c. Heap.
     crate::allocator::heap_init();
 
-    // 1–3. CPU structures.
     gdt_init();
     idt_init();
     syscall_setup();
 
-    // 4. Full serial reinit.
     serial::init();
 
     if vga_active {
@@ -82,7 +73,6 @@ pub extern "C" fn kernel_main() -> ! {
         serial_println!("vga: GOP/framebuffer mode");
     }
 
-    // ── CI sentinels ──────────────────────────────────────────────────────────
     serial_println!("rustos: kernel_main reached");
     serial_println!("TEST PASS: uart_smoke");
     {
@@ -94,11 +84,12 @@ pub extern "C" fn kernel_main() -> ! {
     }
     serial_println!("TEST PASS: alloc_smoke");
     serial_println!("TEST PASS: trap_smoke");
-    // ─────────────────────────────────────────────────────────────────────────
 
     serial_println!("rustos: booting");
 
-    // 5. Phase 2: real memory map → PMM.
+    // 5. Arch-specific discovery → PMM.
+    let regions = crate::arch::x86_64::memory::discover();
+    unsafe { crate::mm::pmm::init_from_regions(&regions); }
     crate::mm::memmap::memmap_init();
 
     #[cfg(feature = "multiboot2_boot")]
@@ -110,47 +101,35 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // 5b. Time subsystem: TSC and HPET calibration.
-    //     MUST come before apic_init().
     crate::time::init();
     serial_println!("time: clocksource={:?}", crate::time::clocksource());
 
-    // 6. FP state.
     xsave_init();
 
-    // 7. ACPI.
     let rsdp_pa = unsafe { crate::arch::x86_64::uefi_entry::RSDP_PHYS };
     crate::firmware::acpi::acpi_init(rsdp_pa);
     serial_println!("acpi: {} CPU(s)", crate::firmware::acpi::cpu_count());
 
-    // 8. PCIe enumeration.
     crate::drivers::pcie::pcie_init();
 
-    // 8a. virtio-gpu.
     crate::drivers::virtio_gpu::init();
     serial_println!("virtio-gpu: {} scanout(s)",
                     crate::drivers::virtio_gpu::num_scanouts());
 
-    // 8b. DRM head registration.
     crate::drivers::drm::init_heads();
     serial_println!("drm: {} head(s) registered",
                     crate::drivers::drm::num_heads());
 
-    // 9. APIC enable (timer MASKED until calibration).
     apic_init();
 
-    // 9b. Calibrate APIC bus clock → arm 1 ms periodic timer.
     calibrate_lapic_timer();
     serial_println!("apic: timer armed (1 ms periodic)");
 
-    // 10. Storage probe: AHCI → NVMe → virtio-blk.
     let storage = probe_storage();
     serial_println!("storage: backend={}", storage.name());
 
-    // 11. Mount CPIO initramfs.
     crate::fs::initramfs::mount_initramfs();
 
-    // 12. Mount root filesystem.
     let disk_ok = storage.read_sector(0, &mut [0u8; 512]);
     if disk_ok {
         if crate::fs::ext2::mount() {
@@ -162,7 +141,6 @@ pub extern "C" fn kernel_main() -> ! {
         serial_println!("block: no disk — ramfs only");
     }
 
-    // 13. Spawn PID 1.
     const INITS: &[&str] = &["/sbin/init", "/bin/sh", "/init", "/bin/bash"];
     let mut spawned = false;
     for path in INITS {
@@ -174,7 +152,6 @@ pub extern "C" fn kernel_main() -> ! {
     }
     if !spawned { serial_println!("init: no init binary found — idle"); }
 
-    // 14. Idle loop.
     serial_println!("kernel_main: idle");
     loop {
         unsafe { asm!("hlt", options(nostack, nomem)); }
@@ -182,7 +159,7 @@ pub extern "C" fn kernel_main() -> ! {
     }
 }
 
-// ── Storage abstraction ───────────────────────────────────────────────────────
+// StorageBackend and helpers unchanged...
 
 enum StorageBackend { Ahci, Nvme(usize), VirtioBlk, None }
 
@@ -213,13 +190,10 @@ impl StorageBackend {
 }
 
 fn probe_storage() -> StorageBackend {
-    // 1. AHCI
     if probe_ahci() { return StorageBackend::Ahci; }
 
-    // 2. NVMe
     if let Some(ns) = probe_nvme() { return StorageBackend::Nvme(ns); }
 
-    // 3. virtio-blk fallback (QEMU)
     crate::block::virtio_blk::virtio_blk_init(VIRTIO_BLK_MMIO_BASE);
     serial_println!("block: virtio-blk fallback");
     StorageBackend::VirtioBlk
@@ -250,8 +224,6 @@ fn probe_ahci() -> bool {
     found
 }
 
-/// Probe for an NVMe controller via PCI class 0x01/0x08/0x02.
-/// Returns the namespace index (0) if found and initialised, or `None`.
 fn probe_nvme() -> Option<usize> {
     use crate::drivers::pcie::{find_device_by_class, PCI_CLASS_STORAGE_NVME};
     let dev = match find_device_by_class(PCI_CLASS_STORAGE_NVME) {
@@ -262,7 +234,6 @@ fn probe_nvme() -> Option<usize> {
         }
     };
     dev.enable();
-    // NVMe BAR0 = 64-bit MMIO register space.
     let bar0_phys = match dev.bar_mmio(0) {
         Some(b) => b,
         None    => {
@@ -270,7 +241,6 @@ fn probe_nvme() -> Option<usize> {
             return None;
         }
     };
-    // Map BAR0 into the kernel direct-map window.
     let bar0_virt = crate::arch::x86_64::mem_layout::higher_half::phys_to_virt(bar0_phys) as u64;
     serial_println!("nvme: controller at BAR0={:#x}", bar0_phys);
     crate::drivers::block::nvme::init(bar0_virt);
@@ -280,7 +250,6 @@ fn probe_nvme() -> Option<usize> {
         return None;
     }
     if let Some(info) = crate::drivers::block::nvme::disk_info(0) {
-        // Model bytes are ASCII, may have trailing spaces.
         let model = core::str::from_utf8(&info.model)
             .unwrap_or("<utf8 error>").trim_end();
         serial_println!("nvme: {} namespace(s), NS0: {} sectors × {} B  model='{}'",
