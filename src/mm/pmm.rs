@@ -1,9 +1,15 @@
 //! Physical Memory Manager (PMM) — buddy allocator with NUMA awareness
 //! and per-page reference counting.
+//!
+//! The PMM is now initialised from an arch-agnostic `Regions` description
+//! defined in `mm::boot_memory`. Arch-specific code is responsible for
+//! discovering the memory map and passing it here.
 
 use core::sync::atomic::{
     AtomicU32, AtomicU8, AtomicUsize, AtomicPtr, AtomicBool, Ordering,
 };
+
+use crate::mm::boot_memory::{Region, RegionKind, Regions};
 
 pub const PAGE_SIZE:   usize = 4096;
 pub const MAX_ORDER:   usize = 11;
@@ -569,124 +575,16 @@ pub fn pmm_add_region(base: usize, size: usize) {
     pmm_add_region_node(base, size, 0);
 }
 
-pub use crate::arch::x86_64::uefi_entry::EfiMemDescriptor;
-const EFI_CONVENTIONAL_MEMORY: u32 = 4;
-const EFI_PERSISTENT_MEMORY:   u32 = 14;
-#[inline]
-fn efi_mem_type_is_usable(t: u32) -> bool {
-    matches!(t, EFI_CONVENTIONAL_MEMORY | EFI_PERSISTENT_MEMORY)
-}
-
-pub unsafe fn pmm_add_efi_map(
-    map_ptr:   usize,
-    map_size:  usize,
-    desc_size: usize,
-) {
-    pmm_add_efi_map_node(map_ptr, map_size, desc_size, 0);
-}
-
-pub unsafe fn pmm_add_efi_map_node(
-    map_ptr:   usize,
-    map_size:  usize,
-    desc_size: usize,
-    node:      u8,
-) {
-    if map_ptr == 0 || map_size == 0 || desc_size == 0 { return; }
-    let mut off = 0usize;
-    while off + desc_size <= map_size {
-        let desc = &*((map_ptr + off) as *const EfiMemDescriptor);
-        if efi_mem_type_is_usable(desc.type_) {
-            let base = desc.physical_start as usize;
-            let size = desc.num_pages as usize * PAGE_SIZE;
-            if size > 0 { pmm_add_region_node(base, size, node); }
-        }
-        off += desc_size;
-    }
-}
-
-pub fn init_from_fdt(fdt_ptr: usize) {
-    if fdt_ptr == 0 { return; }
-    unsafe { fdt_walk_memory(fdt_ptr); }
-}
-
-#[cfg(target_arch = "x86_64")]
-pub fn init() {}
-
-#[cfg(target_arch = "riscv64")]
-pub fn init(fdt_ptr: usize) {
-    init_from_fdt(fdt_ptr);
-}
-
-const FDT_MAGIC:      u32 = 0xd00d_feed;
-const FDT_BEGIN_NODE: u32 = 1;
-const FDT_END_NODE:   u32 = 2;
-const FDT_PROP:       u32 = 3;
-const FDT_NOP:        u32 = 4;
-const FDT_END:        u32 = 9;
-
-#[inline] unsafe fn fdt_u32(p: *const u8) -> u32 {
-    u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
-}
-#[inline] unsafe fn fdt_u64(p: *const u8) -> u64 {
-    let b = core::slice::from_raw_parts(p, 8);
-    u64::from_be_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]])
-}
-
-unsafe fn fdt_walk_memory(fdt_ptr: usize) {
-    let base = fdt_ptr as *const u8;
-    if fdt_u32(base) != FDT_MAGIC { return; }
-    let total_size  = fdt_u32(base.add(4))  as usize;
-    let off_struct  = fdt_u32(base.add(8))  as usize;
-    let off_strings = fdt_u32(base.add(12)) as usize;
-    if total_size > 64 * 1024 * 1024 { return; }
-    let strings_base = base.add(off_strings);
-    let struct_base  = base.add(off_struct);
-    let mut offset = 0usize;
-    let mut depth  = 0i32;
-    let mut in_mem = false;
-    loop {
-        let token = fdt_u32(struct_base.add(offset));
-        offset += 4;
-        match token {
-            FDT_BEGIN_NODE => {
-                let np = struct_base.add(offset);
-                let mut nl = 0usize;
-                while np.add(nl).read() != 0 { nl += 1; }
-                let name = core::slice::from_raw_parts(np, nl);
-                depth += 1;
-                in_mem = depth == 1 && name.starts_with(b"memory");
-                offset += (nl + 1 + 3) & !3;
-            }
-            FDT_END_NODE => {
-                if depth == 1 { in_mem = false; }
-                depth -= 1;
-                if depth < 0 { break; }
-            }
-            FDT_PROP => {
-                let plen = fdt_u32(struct_base.add(offset))     as usize;
-                let pnof = fdt_u32(struct_base.add(offset + 4)) as usize;
-                offset += 8;
-                if in_mem {
-                    let pnp = strings_base.add(pnof);
-                    let mut pnl = 0usize;
-                    while pnp.add(pnl).read() != 0 { pnl += 1; }
-                    if core::slice::from_raw_parts(pnp, pnl) == b"reg" {
-                        let data = struct_base.add(offset);
-                        let mut i = 0usize;
-                        while i + 16 <= plen {
-                            let bpa  = fdt_u64(data.add(i))     as usize;
-                            let size = fdt_u64(data.add(i + 8)) as usize;
-                            if size > 0 { pmm_add_region(bpa, size); }
-                            i += 16;
-                        }
-                    }
-                }
-                offset += (plen + 3) & !3;
-            }
-            FDT_NOP => {}
-            FDT_END | _ => break,
-        }
-        if offset >= total_size { break; }
+/// Arch-agnostic PMM init from a boot-memory map.
+///
+/// This replaces the old `init()` and `init(fdt_ptr)` entrypoints. Arch
+/// code is responsible for building a `Regions` value and passing it here.
+pub unsafe fn init_from_regions(regions: &Regions) {
+    for r in regions.iter() {
+        if !r.is_usable() { continue; }
+        let base = r.start as usize;
+        let size = r.length as usize;
+        pmm_add_region(base, size);
     }
 }
 
