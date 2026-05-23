@@ -3,6 +3,7 @@ pub mod cwd;
 pub mod exec;
 pub mod fork;
 pub mod fork_syscall;
+pub mod cow_fault;
 pub mod clone;
 pub mod process;
 pub mod proc_table;

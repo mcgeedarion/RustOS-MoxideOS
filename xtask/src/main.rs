@@ -32,6 +32,7 @@
 
 use std::{
     env,
+    fs,
     path::PathBuf,
     process::{Command, exit},
 };
@@ -102,6 +103,16 @@ fn run_optional(mut cmd: Command) -> bool {
             false
         }
     }
+}
+
+fn run_capture(mut cmd: Command) -> String {
+    eprintln!("[xtask] running (capture): {:?}", cmd);
+    let output = cmd.output().expect("failed to spawn command");
+    if !output.status.success() {
+        eprintln!("[xtask] command failed with {}", output.status);
+        exit(output.status.code().unwrap_or(1));
+    }
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn which_first(names: &[&str]) -> Option<String> {
@@ -634,6 +645,71 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     eprintln!();
 }
 
+fn lint_modules(root: &PathBuf) {
+    let files = run_capture({
+        let mut c = Command::new("rg");
+        c.current_dir(root).args(["--files", "src"]);
+        c
+    });
+
+    let mut by_name: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for line in files.lines().filter(|l| l.ends_with(".rs")) {
+        if let Some(name) = std::path::Path::new(line).file_name().and_then(|n| n.to_str()) {
+            by_name.entry(name.to_string()).or_default().push(line.to_string());
+        }
+    }
+
+    let mut duplicate_count = 0usize;
+    for (name, paths) in by_name.iter().filter(|(_, v)| v.len() > 1) {
+        duplicate_count += 1;
+        eprintln!("[xtask][lint-modules] duplicate basename `{name}`:");
+        for p in paths {
+            eprintln!("  - {p}");
+        }
+    }
+
+    let mut missing_docs = 0usize;
+    for module in ["src/mm/mod.rs", "src/proc/mod.rs", "src/fs/mod.rs", "src/net/mod.rs"] {
+        let text = fs::read_to_string(root.join(module)).unwrap_or_default();
+        if !text.trim_start().starts_with("//!") {
+            missing_docs += 1;
+            eprintln!("[xtask][lint-modules] missing module docs header in {module}");
+        }
+    }
+
+    eprintln!(
+        "[xtask][lint-modules] done: duplicate basenames={}, missing core module docs={}",
+        duplicate_count, missing_docs
+    );
+}
+
+fn bench_kernel(root: &PathBuf) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    eprintln!("[xtask][bench-kernel] baseline workflow starting");
+    let out_dir = root.join("target/bench-kernel");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let report = out_dir.join("baseline.txt");
+    let mut file = std::fs::File::create(&report).expect("create bench-kernel report");
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(file, "bench-kernel baseline");
+    let _ = writeln!(file, "timestamp_unix={ts}");
+    let _ = writeln!(file, "host={}", std::env::consts::OS);
+    let _ = writeln!(file, "arch={}", std::env::consts::ARCH);
+    let _ = writeln!(file, "step=smoke");
+    run(Command::new("cargo").current_dir(root).args(["xtask", "smoke"]));
+    let _ = writeln!(file, "result=smoke_passed_or_delegated");
+    eprintln!("[xtask][bench-kernel] TODO: add scheduler-latency microbench");
+    eprintln!("[xtask][bench-kernel] TODO: add pipe-throughput microbench");
+    eprintln!("[xtask][bench-kernel] TODO: add mmap-fault microbench");
+    eprintln!("[xtask][bench-kernel] report: {}", report.display());
+    eprintln!("[xtask][bench-kernel] baseline workflow complete");
+}
+
 // ─── entrypoint ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -697,6 +773,8 @@ fn main() {
                .arg("SMOKE OK: userspace_smoke");
             run(cmd);
         }
+        "lint-modules" => lint_modules(&root),
+        "bench-kernel" => bench_kernel(&root),
         "help" | "--help" | "-h" | "" => {
             println!(concat!(
                 "cargo xtask <subcommand> [options]\n",
@@ -706,6 +784,8 @@ fn main() {
                 "  mkinitramfs   Build userspace + device nodes and pack initramfs.cpio\n",
                 "  image         Build a flashable FAT32 ESP disk image\n",
                 "  smoke         Build x86_64 UEFI+initrd and run a QEMU smoke test\n",
+                "  lint-modules  Report duplicate module basenames and docs gaps\n",
+                "  bench-kernel  Run baseline smoke flow + benchmark placeholders\n",
                 "\n",
                 "Build options (build / image):\n",
                 "  --arch <riscv64|x86_64>   Target architecture  (image default: x86_64)\n",
