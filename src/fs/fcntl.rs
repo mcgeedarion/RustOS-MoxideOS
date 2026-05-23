@@ -82,6 +82,7 @@ struct FdMeta {
 }
 
 static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
+static FD_LOCKS: Mutex<BTreeMap<usize, i16>> = Mutex::new(BTreeMap::new());
 
 // ── RLIMIT_NOFILE helpers ─────────────────────────────────────────────────────
 
@@ -273,11 +274,34 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             if arg == 0 { return 0; }
             if !validate_user_ptr(arg, 32) { return -14; }
             let mut buf = [0u8; 32];
-            buf[0..2].copy_from_slice(&F_UNLCK.to_le_bytes());
+            let lock_ty = FD_LOCKS.lock().get(&fd).copied().unwrap_or(F_UNLCK);
+            buf[0..2].copy_from_slice(&lock_ty.to_le_bytes());
             if !copy_to_user(arg, &buf) { return -14; }
             0
         }
-        F_SETLK | F_SETLKW => 0,
+        F_SETLK | F_SETLKW => {
+            if arg == 0 || !validate_user_ptr(arg, 2) { return -14; }
+            let mut t = [0u8; 2];
+            if crate::uaccess::copy_from_user(&mut t, arg).is_err() { return -14; }
+            let req = i16::from_le_bytes(t);
+            let mut locks = FD_LOCKS.lock();
+            match req {
+                F_UNLCK => {
+                    locks.remove(&fd);
+                    0
+                }
+                F_RDLCK | F_WRLCK => {
+                    if let Some(curr) = locks.get(&fd).copied() {
+                        if curr != req {
+                            return -11; // EAGAIN
+                        }
+                    }
+                    locks.insert(fd, req);
+                    0
+                }
+                _ => -22,
+            }
+        }
         F_SETOWN => {
             FD_META.lock().entry(fd).or_default().owner_pid = arg as i32;
             0

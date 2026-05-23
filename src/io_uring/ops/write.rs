@@ -36,35 +36,9 @@ pub fn handle(sqe: &Sqe) -> i32 {
         fd, buf_va, len, offset, sqe.user_data
     );
 
-    // ── Dispatch to appropriate driver ────────────────────────────────────────────
-
-    // TODO: look up fd in fd table and dispatch:
-    //   match fd_table::get(fd) {
-    //       FdKind::File(inode) => vfs::write(inode, buf_va, len, offset),
-    //       FdKind::Socket(sock) => net::send(sock, buf_va, len),
-    //       FdKind::Pipe(pipe)   => pipe::write(pipe, buf_va, len),
-    //       None                 => errno::E_BADF,
-    //   }
-
-    perform_write_stub(fd, buf_va, len, offset)
-}
-
-fn perform_write_stub(fd: i32, buf_va: u64, len: usize, _offset: u64) -> i32 {
-    // SAFETY: caller validates buf_va is a readable kernel VA of `len` bytes.
-    let buf = unsafe { core::slice::from_raw_parts(buf_va as *const u8, len) };
-
-    // In a real kernel we'd push `buf` to the fd's backing resource.
-    // Here we just log the first few bytes as a smoke-test.
-    let preview_len = core::cmp::min(buf.len(), 16);
-    log::debug!(
-        "[io_uring::write] stub write {} bytes to fd={}, preview={:02x?}",
-        len,
-        fd,
-        &buf[..preview_len]
-    );
-
-    // Report all bytes as "written".
-    len as i32
+    // Core write dispatch now routes through shared VFS/io syscalls.
+    let _ = offset; // positional write support is wired via IORING_OP_WRITEV path later.
+    crate::fs::io_syscalls::sys_write(fd as usize, buf_va as usize, len) as i32
 }
 
 // ── Future-layer wrapper ──────────────────────────────────────────────────────────────

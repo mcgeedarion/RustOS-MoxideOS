@@ -1,6 +1,12 @@
 //! Devicetree blob parser stub.
 //!
-//! TODO: implement full FDT/DTB parsing for RISC-V boot.
-//! This function is intentionally a no-op until the parser is written.
+//! On RISC-V, delegate to the architecture FDT walker.
 #[allow(dead_code)]
-pub fn parse(_dtb: *const u8) {}
+pub fn parse(dtb: *const u8) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        if !dtb.is_null() {
+            crate::arch::riscv64::fdt::fdt_phase1(dtb as usize);
+        }
+    }
+}

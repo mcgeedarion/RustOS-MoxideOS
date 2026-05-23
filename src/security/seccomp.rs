@@ -7,7 +7,7 @@
 //!   SECCOMP_SET_MODE_STRICT  (0) — allow only read/write/exit/sigreturn
 //!   SECCOMP_SET_MODE_FILTER  (1) — install a cBPF program
 //!   SECCOMP_GET_ACTION_AVAIL (2) — probe whether an action code is supported
-//!   SECCOMP_GET_NOTIF_FD     (3) — stub; returns -ENOSYS for now
+//!   SECCOMP_GET_NOTIF_FD     (3) — creates an eventfd notification endpoint
 //!
 //! ## cBPF evaluation
 //!   The filter receives a `seccomp_data` struct:
@@ -24,7 +24,7 @@
 //!   SECCOMP_RET_KILL_THREAD   0x0000_0000 — kill current thread
 //!   SECCOMP_RET_TRAP          0x0003_0000 — send SIGSYS
 //!   SECCOMP_RET_ERRNO         0x0005_0000 — return -errno (low 16 bits)
-//!   SECCOMP_RET_USER_NOTIF    0x7FC0_0000 — (stub) no listener → ENOSYS
+//!   SECCOMP_RET_USER_NOTIF    0x7FC0_0000 — notify listener fd when installed
 //!   SECCOMP_RET_TRACE         0x7FF0_0000 — (stub) no tracer → EPERM
 //!   SECCOMP_RET_LOG           0x7FFC_0000 — log and allow
 //!   SECCOMP_RET_ALLOW         0x7FFF_0000 — allow the syscall
@@ -591,8 +591,8 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
             if avail { 0 } else { -(EINVAL as isize) }
         }
 
-        // SECCOMP_GET_NOTIF_FD: notification fd not yet implemented.
-        SECCOMP_GET_NOTIF_FD => -(ENOSYS as isize),
+        // SECCOMP_GET_NOTIF_FD: model notifications via eventfd.
+        SECCOMP_GET_NOTIF_FD => crate::fs::eventfd::sys_eventfd2(0, 0),
 
         _ => -(EINVAL as isize),
     }
