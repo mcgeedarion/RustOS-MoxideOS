@@ -677,9 +677,47 @@ fn lint_modules(root: &PathBuf) {
         }
     }
 
+    let max_module_loc = 600usize;
+    let mut oversized_modules = 0usize;
+    for line in files.lines().filter(|l| l.ends_with(".rs")) {
+        let path = root.join(line);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let loc = text.lines().filter(|l| !l.trim().is_empty()).count();
+        if loc > max_module_loc {
+            oversized_modules += 1;
+            eprintln!(
+                "[xtask][lint-modules] oversized module ({loc} LOC > {max_module_loc}): {line}"
+            );
+        }
+    }
+
+    let mut undocumented_pub_items = 0usize;
+    for line in files.lines().filter(|l| l.ends_with(".rs")) {
+        let text = fs::read_to_string(root.join(line)).unwrap_or_default();
+        let has_module_docs = text.trim_start().starts_with("//!");
+        if has_module_docs {
+            continue;
+        }
+        for (idx, raw) in text.lines().enumerate() {
+            let t = raw.trim_start();
+            if t.starts_with("pub ")
+                || t.starts_with("pub(crate)")
+                || t.starts_with("pub(super)")
+                || t.starts_with("pub(in ")
+            {
+                undocumented_pub_items += 1;
+                eprintln!(
+                    "[xtask][lint-modules] public item in undocumented module: {}:{}",
+                    line,
+                    idx + 1
+                );
+            }
+        }
+    }
+
     eprintln!(
-        "[xtask][lint-modules] done: duplicate basenames={}, missing core module docs={}",
-        duplicate_count, missing_docs
+        "[xtask][lint-modules] done: duplicate basenames={}, missing core module docs={}, oversized modules={}, public items in undocumented modules={}",
+        duplicate_count, missing_docs, oversized_modules, undocumented_pub_items
     );
 }
 

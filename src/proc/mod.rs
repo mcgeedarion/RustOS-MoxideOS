@@ -1,3 +1,11 @@
+//! Process-management subsystem.
+//!
+//! Invariants:
+//! - `proc_table` is the authoritative PID/TID index for live tasks.
+//! - Scheduler-visible task state transitions go through `scheduler` + `thread`.
+//! - Signal delivery and reaping semantics are centralized in `signal` and `wait`.
+//! - Namespace, credentials, and cgroup membership must remain coherent across `fork`/`clone`/`exec`.
+
 pub mod context;
 pub mod cwd;
 pub mod exec;
