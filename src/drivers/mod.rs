@@ -15,3 +15,4 @@ pub mod gpu;
 pub mod input;
 pub mod net;
 pub mod platform;
+pub mod virtio_blk;

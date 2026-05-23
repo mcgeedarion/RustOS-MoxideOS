@@ -5,7 +5,6 @@
 //!   nic              — NIC abstraction layer (send / recv / mac / stats)
 //!   virtio_net       — VirtIO network device (PCIe, x86_64; takes BAR0 I/O port u16)
 //!   virtio_net_mmio  — VirtIO network device (MMIO, RISC-V virt machine)
-//!   virtio_blk       — VirtIO block stubs
 //!
 //! ## Boot entry-point
 //!
@@ -25,7 +24,6 @@
 
 pub mod e1000e;
 pub mod nic;
-pub mod virtio_blk;
 pub mod virtio_net;
 pub mod virtio_net_mmio;
 
