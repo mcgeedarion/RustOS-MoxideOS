@@ -41,45 +41,12 @@ pub fn handle(sqe: &Sqe) -> i32 {
         listen_fd, addr_va, addrlen_va, flags, sqe.user_data
     );
 
-    // ── Dispatch to network stack ──────────────────────────────────────────────────
-
-    // TODO: call net::accept(listen_fd, addr_va, addrlen_va, flags)
-    // which should:
-    //   1. Dequeue the first entry from the socket's accept queue.
-    //   2. Fill *addr_va with the peer's sockaddr.
-    //   3. Update *addrlen_va with the filled length.
-    //   4. Allocate a new fd in the calling process's fd table.
-    //   5. Return the new fd, or -EAGAIN if the accept queue is empty.
-
-    perform_accept_stub(listen_fd, addr_va, addrlen_va, flags)
-}
-
-fn perform_accept_stub(
-    listen_fd: i32,
-    addr_va: u64,
-    addrlen_va: u64,
-    _flags: u32,
-) -> i32 {
-    // Simulate an empty accept queue (no pending connections).
-    // The Future layer will re-submit on -EAGAIN.
-
-    if addr_va != 0 && addrlen_va != 0 {
-        // Zero out the sockaddr so callers don't read uninitialised memory.
-        // A real implementation fills in AF_INET/AF_INET6 sockaddr here.
-        // SAFETY: caller guarantees addr_va is a valid writable VA of at
-        // least sizeof(sockaddr_storage) = 128 bytes.
-        unsafe {
-            core::ptr::write_bytes(addr_va as *mut u8, 0, 128);
-            *(addrlen_va as *mut u32) = 0;
-        }
-    }
-
-    log::debug!(
-        "[io_uring::accept] stub: no connection pending on listen_fd={}",
-        listen_fd
-    );
-
-    errno::E_AGAIN // would block — EAGAIN
+    let _ = flags; // accept4 flags plumbing can be added to socket core later.
+    crate::net::socket::core::sys_accept(
+        listen_fd as usize,
+        addr_va as usize,
+        addrlen_va as usize,
+    ) as i32
 }
 
 // ── Future-layer wrapper ──────────────────────────────────────────────────────────────

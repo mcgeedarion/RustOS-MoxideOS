@@ -43,38 +43,10 @@ pub fn handle(sqe: &Sqe) -> i32 {
         fd, buf_va, len, offset, sqe.user_data
     );
 
-    // ── Dispatch to the appropriate driver ────────────────────────────────────────
-    //
-    // The kernel fd table will eventually map `fd` → a concrete resource
-    // (VFS file, socket, pipe, …).  For now we stub each branch.
-
-    // TODO: look up fd in the process fd table.
-    //   match fd_table::get(fd) {
-    //       FdKind::File(inode) => vfs::read(inode, buf_va, len, offset),
-    //       FdKind::Socket(sock) => net::recv(sock, buf_va, len),
-    //       FdKind::Pipe(pipe)   => pipe::read(pipe, buf_va, len),
-    //       None                 => errno::E_BADF,
-    //   }
-
-    // SAFETY stub: materialise the buffer slice and zero-fill it so callers
-    // get defined memory.  In production this is replaced by the VFS call.
-    let n = perform_read_stub(fd, buf_va, len, offset);
-    n
-}
-
-/// Placeholder implementation that simulates a successful zero-byte read on
-/// any fd.  Replace with real VFS / driver calls.
-fn perform_read_stub(fd: i32, buf_va: u64, len: usize, _offset: u64) -> i32 {
-    // SAFETY: caller must ensure `buf_va` is a valid writable kernel VA of
-    // at least `len` bytes.  We trust the SQE validation above.
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf_va as *mut u8, len) };
-    buf.fill(0);
-
-    log::debug!("[io_uring::read] stub read {} bytes from fd={}", len, fd);
-
-    // Simulate EOF (0 bytes) for files, or EAGAIN for sockets.
-    // Real implementation returns actual bytes transferred.
-    0
+    // Core read dispatch now routes through the shared VFS/io path so io_uring
+    // read semantics match synchronous read(2).
+    let _ = offset; // positional read support is wired via IORING_OP_READV path later.
+    crate::fs::io_syscalls::sys_read(fd as usize, buf_va as usize, len) as i32
 }
 
 // ── Future-layer wrapper ──────────────────────────────────────────────────────────────

@@ -17,5 +17,7 @@ pub const TRAMPOLINE_VADDR: usize = 0xFFFF_FFFF_FFFF_F000;
 /// into a dedicated physical page and map it read+execute into the
 /// kernel page table so every `satp` switch preserves the mapping.
 pub fn trampoline_init() {
-    // TODO: map trampoline page
+    use crate::arch::riscv64::paging::{self, PTE_R, PTE_X};
+    let pa = TRAMPOLINE_VADDR & !0xfff;
+    paging::map_page(TRAMPOLINE_VADDR, pa, PTE_R | PTE_X);
 }
