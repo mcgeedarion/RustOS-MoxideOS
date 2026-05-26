@@ -23,8 +23,9 @@ use spin::Mutex;
 
 use crate::mm::pmm::{alloc_page, free_page};
 use crate::sync::wait_queue::{WaitQueue, ReadyMask};
+use crate::io_uring::sqe::Sqe;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 
 /// Maximum SQE/CQE depth for a single ring (must be a power of two).
 pub const MAX_ENTRIES: u32   = 4096;
@@ -36,12 +37,12 @@ pub const CQE_SIZE: usize = 16; // struct io_uring_cqe
 
 const PAGE_SIZE: usize = 4096;
 
-// ── ReadyMask aliases ─────────────────────────────────────────────────────────
+// ── ReadyMask aliases ─────────────────────────────────────────────────────────────
 
 /// Used by cq_wq to signal "at least one CQE is available".
 const CQ_READY: ReadyMask = 0x0001; // POLLIN
 
-// ── Wire structures (ABI-compatible with Linux) ───────────────────────────────
+// ── Wire structures (ABI-compatible with Linux) ────────────────────────────────
 
 /// Submission Queue Entry — 64 bytes, matches Linux `struct io_uring_sqe`.
 #[repr(C)]
@@ -63,6 +64,28 @@ pub struct IoUringSqe {
 }
 
 const _: () = assert!(core::mem::size_of::<IoUringSqe>() == SQE_SIZE);
+
+/// Convert the internal `sqe::Sqe` type to the wire `IoUringSqe`.
+impl From<Sqe> for IoUringSqe {
+    fn from(s: Sqe) -> Self {
+        IoUringSqe {
+            opcode:               s.opcode,
+            flags:                s.flags,
+            ioprio:               s.ioprio,
+            fd:                   s.fd,
+            off_or_addr2:         s.off,
+            addr_or_splice_fd_in: s.addr,
+            len:                  s.len,
+            op_flags:             s.op_flags,
+            user_data:            s.user_data,
+            buf_index:            s.buf_index,
+            personality:          s.personality,
+            splice_fd_in:         s.splice_fd_in,
+            // addr3 and __pad2 go into the two-element _pad array.
+            _pad:                 [s.addr3, s.__pad2],
+        }
+    }
+}
 
 /// Completion Queue Entry — 16 bytes, matches Linux `struct io_uring_cqe`.
 #[repr(C)]
@@ -119,7 +142,7 @@ pub struct CqRingOffsets {
     pub resv2:        u64,
 }
 
-// ── IORING_FEAT_* flags ───────────────────────────────────────────────────────
+// ── IORING_FEAT_* flags ────────────────────────────────────────────────────────────
 pub const IORING_FEAT_SINGLE_MMAP:     u32 = 1 << 0;
 pub const IORING_FEAT_NODROP:          u32 = 1 << 1;
 pub const IORING_FEAT_SUBMIT_STABLE:   u32 = 1 << 2;
@@ -128,7 +151,7 @@ pub const IORING_FEAT_CUR_PERSONALITY: u32 = 1 << 4;
 pub const IORING_FEAT_FAST_POLL:       u32 = 1 << 5;
 pub const IORING_FEAT_POLL_32BITS:     u32 = 1 << 6;
 
-// ── SQ/CQ in-memory page layout ───────────────────────────────────────────────
+// ── SQ/CQ in-memory page layout ────────────────────────────────────────────────────
 //
 // SQ page (4 KiB):
 //   offset  0 : SqRingHdr       (64 bytes)
@@ -165,7 +188,7 @@ struct CqRingHdr {
 const _: () = assert!(core::mem::size_of::<SqRingHdr>() <= RING_HDR_SIZE);
 const _: () = assert!(core::mem::size_of::<CqRingHdr>() <= RING_HDR_SIZE);
 
-// ── IoUringRing ───────────────────────────────────────────────────────────────
+// ── IoUringRing ────────────────────────────────────────────────────────────────
 
 /// Kernel-side descriptor for one io_uring instance.
 pub struct IoUringRing {
@@ -202,6 +225,12 @@ impl IoUringRing {
         unsafe { core::slice::from_raw_parts(base as *const AtomicU32, self.entries as usize) }
     }
 
+    fn sqe_array_mut(&self) -> &mut [IoUringSqe] {
+        let base = self.sq_pa + RING_HDR_SIZE + self.entries as usize * 4;
+        let base = (base + SQE_SIZE - 1) & !(SQE_SIZE - 1);
+        unsafe { core::slice::from_raw_parts_mut(base as *mut IoUringSqe, self.entries as usize) }
+    }
+
     fn sqe_array(&self) -> &[IoUringSqe] {
         let base = self.sq_pa + RING_HDR_SIZE + self.entries as usize * 4;
         let base = (base + SQE_SIZE - 1) & !(SQE_SIZE - 1);
@@ -215,7 +244,7 @@ impl IoUringRing {
 
     #[inline] pub fn mask(&self) -> u32 { self.entries - 1 }
 
-    // ── CQ available count ────────────────────────────────────────────────────
+    // ── CQ available count ────────────────────────────────────────────────────────────
 
     /// Number of CQEs available for the user to consume.
     #[inline]
@@ -225,7 +254,34 @@ impl IoUringRing {
             .wrapping_sub(hdr.head.load(Ordering::Acquire))
     }
 
-    // ── SQ drain ──────────────────────────────────────────────────────────────
+    // ── SQ push ───────────────────────────────────────────────────────────────────
+
+    /// Push one SQE into the submission queue.
+    ///
+    /// Uses an identity slot mapping: slot index = `tail & mask`, matching
+    /// how `drain_sq` reads entries back out.  Returns `false` if the SQ is
+    /// full (tail has lapped head).
+    pub fn push_sqe(&self, sqe: IoUringSqe) -> bool {
+        let hdr  = self.sq_hdr();
+        let mask = self.mask();
+        let tail = hdr.tail.load(Ordering::Relaxed);
+        let head = hdr.head.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) >= self.entries {
+            hdr.dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let slot = (tail & mask) as usize;
+        // Write the SQE into the SQE array.
+        self.sqe_array_mut()[slot] = sqe;
+        // Point sq_array[slot] at that same slot (identity mapping).
+        self.sq_array()[slot].store(slot as u32, Ordering::Relaxed);
+        // Publish the new tail so the consumer sees the entry.
+        core::sync::atomic::fence(Ordering::Release);
+        hdr.tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    // ── SQ drain ──────────────────────────────────────────────────────────────────
 
     /// Drain all pending SQEs and return them. Advances `sq_head`.
     #[inline]
@@ -261,7 +317,7 @@ impl IoUringRing {
         out
     }
 
-    // ── CQ post ───────────────────────────────────────────────────────────────
+    // ── CQ post ──────────────────────────────────────────────────────────────────
 
     /// Append a CQE and wake any task sleeping on `cq_wq`.
     ///
@@ -286,7 +342,7 @@ impl IoUringRing {
         true
     }
 
-    // ── IoUringParams builder ─────────────────────────────────────────────────
+    // ── IoUringParams builder ───────────────────────────────────────────────────────
 
     pub fn build_params(&self) -> IoUringParams {
         let mut p = IoUringParams::default();
@@ -322,7 +378,7 @@ impl Drop for IoUringRing {
     }
 }
 
-// ── Field-offset helpers ──────────────────────────────────────────────────────
+// ── Field-offset helpers ─────────────────────────────────────────────────────────────
 
 macro_rules! field_offset {
     ($T:ty, $field:ident) => {{
@@ -345,7 +401,7 @@ fn offset_of_cq_mask()     -> u32 { field_offset!(CqRingHdr, ring_mask) }
 fn offset_of_cq_entries()  -> u32 { field_offset!(CqRingHdr, ring_entries) }
 fn offset_of_cq_overflow() -> u32 { field_offset!(CqRingHdr, overflow) }
 
-// ── Global ring table ─────────────────────────────────────────────────────────
+// ── Global ring table ───────────────────────────────────────────────────────────────
 
 struct RingTable {
     rings: Vec<Option<IoUringRing>>,
@@ -383,7 +439,7 @@ pub fn init() {
     *RING_TABLE.lock() = Some(RingTable::new());
 }
 
-// ── Public ring-table API ─────────────────────────────────────────────────────
+// ── Public ring-table API ────────────────────────────────────────────────────────────
 
 pub fn alloc_ring(pid: u32, entries: u32) -> Result<usize, isize> {
     let entries = entries.next_power_of_two().clamp(1, MAX_ENTRIES);

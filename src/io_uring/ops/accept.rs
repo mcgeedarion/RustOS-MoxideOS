@@ -54,7 +54,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
-use crate::io_uring::{IoUringError, with_ring_mut};
+use crate::io_uring::{IoUringError, with_ring_mut, ring::IoUringSqe};
 
 /// Async wrapper around IORING_OP_ACCEPT.
 ///
@@ -66,7 +66,7 @@ use crate::io_uring::{IoUringError, with_ring_mut};
 /// ```rust,no_run
 /// let mut peer_addr = SockaddrStorage::zeroed();
 /// let mut addrlen: u32 = core::mem::size_of::<SockaddrStorage>() as u32;
-/// let client_fd = IoAccept::new(ring_idx, listen_fd, &mut peer_addr, &mut addrlen, 0, token).await?;
+/// let client_fd = IoAccept::new(ring_idx, listen_fd, addr_va, addrlen_va, 0, token).await?;
 /// ```
 pub struct IoAccept {
     ring_idx:   usize,
@@ -102,30 +102,18 @@ impl Future for IoAccept {
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.submitted {
-            let sqe = crate::io_uring::sqe::Sqe::accept(
+            let wire_sqe = IoUringSqe::from(Sqe::accept(
                 self.fd,
                 self.addr_va,
                 self.addrlen_va,
                 self.flags,
                 self.token,
-            );
-            // Push the SQE into the per-ring submission queue.
-            // with_ring_mut returns None only if the ring index is invalid.
-            let pushed = with_ring_mut(self.ring_idx, |r| {
-                // Convert our sqe::Sqe into the wire IoUringSqe expected by the ring.
-                // The ring's SQ is user-visible memory; we write via the sq_array
-                // indirection.  For now we delegate to the synchronous handle() path
-                // directly so the op executes on the next poll_completions tick.
-                let _ = sqe;
-                let _ = r;
-                // TODO: write sqe into r.sqe_array and advance sq_tail.
-                //       For now fall through to Poll::Pending and let the
-                //       scheduler's drain_sq / post_cqe / cq_wq.wake() path
-                //       drive the wakeup naturally.
-                true
-            });
-            if pushed.is_none() {
-                return Poll::Ready(Err(IoUringError::InvalidRing));
+            ));
+            let result = with_ring_mut(self.ring_idx, |r| r.push_sqe(wire_sqe));
+            match result {
+                None        => return Poll::Ready(Err(IoUringError::InvalidRing)),
+                Some(false) => return Poll::Ready(Err(IoUringError::SqFull)),
+                Some(true)  => {}
             }
             self.submitted = true;
         }
