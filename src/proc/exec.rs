@@ -56,6 +56,8 @@ use crate::proc::rlimit::RLIM_INFINITY;
 use crate::security::CapSet;
 use crate::mm::kstack::alloc_kstack;
 use crate::uaccess::copy_from_user;
+#[cfg(target_arch = "riscv64")]
+use crate::arch::riscv64::trampoline::TRAPFRAME_VADDR;
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::syscall::SyscallFrame;
@@ -64,8 +66,383 @@ use crate::arch::x86_64::gdt::update_rsp0;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86_64::paging;
 
-const STACK_TOP:          usize = 0x0000_7FFF_FF00_0000;
-const INTERP_BASE:        usize = 0x0060_0000;
-const STACK_MAX:          usize = 64 * 1024 * 1024;
-const STACK_MIN:          usize = PAGE;
-c
+const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
+const INTERP_BASE: usize = 0x0060_0000;
+const STACK_MAX:   usize = 64 * 1024 * 1024;
+const STACK_MIN:   usize = PAGE;
+
+// ── spawn_user_process ────────────────────────────────────────────────────────
+//
+// Called from kernel_main to bootstrap PID 1.  Reads the ELF from VFS, builds
+// a fresh address space, allocates a kernel stack, fills a Pcb, and enqueues.
+// Returns true on success.
+
+pub fn spawn_user_process(path: &str, argv: &[&str], envp: &[&str]) -> bool {
+    let fd = match vfs::open(path, 0, 0) {
+        fd if fd >= 0 => fd as usize,
+        _             => return false,
+    };
+    let size = vfs::fsize(fd).unwrap_or(0);
+    if size == 0 { vfs::close(fd); return false; }
+    let mut data = Vec::with_capacity(size);
+    data.resize(size, 0u8);
+    if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return false; }
+    vfs::close(fd);
+
+    spawn_user_process_from_bytes(path, &data, argv, envp)
+}
+
+pub fn spawn_user_process_from_bytes(
+    path: &str,
+    data: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+) -> bool {
+    use crate::proc::process::{Pcb, State};
+    use crate::proc::context::Context;
+    use crate::proc::pid::alloc_pid;
+
+    // Parse ELF.
+    let hdr   = match elf::parse_elf_header(data)          { Some(h) => h, None => return false };
+    let phdrs = match elf::parse_phdrs_with_hdr(data, &hdr) { Some(p) => p, None => return false };
+
+    // Fresh address space.
+    #[cfg(target_arch = "x86_64")]
+    let new_cr3 = paging::alloc_root_page_table();
+    #[cfg(target_arch = "riscv64")]
+    let new_cr3 = crate::arch::riscv64::paging::alloc_root_page_table();
+
+    // Load ELF segments.
+    let entry_va = match elf::load_elf_into(new_cr3, data, &hdr, &phdrs) {
+        Some(e) => e,
+        None    => { pmm::free_page_table(new_cr3); return false; }
+    };
+    let brk_base = elf::end_of_bss(&phdrs, 0);
+
+    // Interpreter.
+    let (final_entry, interp_bias) =
+        if let Some(interp_path) = crate::proc::dynlink::find_interp(data) {
+            match crate::proc::dynlink::load_interp(&interp_path) {
+                Ok((ie, bias)) => (ie, bias),
+                Err(_)         => { pmm::free_page_table(new_cr3); return false; }
+            }
+        } else {
+            (entry_va, 0)
+        };
+
+    // User stack.
+    #[cfg(target_arch = "x86_64")]
+    let user_sp_top = alloc_map_stack(new_cr3, STACK_TOP);
+    #[cfg(target_arch = "riscv64")]
+    let user_sp_top = match crate::arch::riscv64::uentry::alloc_user_stack(new_cr3 >> 12) {
+        Some(sp) => sp,
+        None     => { pmm::free_page_table(new_cr3); return false; }
+    };
+
+    // Build argv/envp/auxv stack image.
+    let (initial_sp, vmas) = crate::auxv::build_stack(
+        new_cr3, user_sp_top, argv, envp,
+        &hdr, &phdrs, entry_va, interp_bias, brk_base,
+    );
+
+    // Kernel stack.
+    let kstack_top = match alloc_kstack() {
+        Some(k) => k,
+        None    => { pmm::free_page_table(new_cr3); return false; }
+    };
+
+    // Arch-specific kernel-stack frame + Context.
+    #[cfg(target_arch = "x86_64")]
+    let ctx = {
+        use crate::arch::x86_64::syscall::push_syscall_frame;
+        push_syscall_frame(kstack_top, final_entry, 0x202, initial_sp);
+        Context {
+            rip: crate::proc::context::task_entry_trampoline as usize,
+            rsp: kstack_top - 17 * 8,
+            ..Context::zero()
+        }
+    };
+
+    #[cfg(target_arch = "riscv64")]
+    let (ctx, trapframe_pa) = {
+        use crate::arch::riscv64::trap::{rebuild_trap_frame_riscv, TRAP_FRAME_SIZE};
+        rebuild_trap_frame_riscv(kstack_top, final_entry, initial_sp, 0);
+        let trapframe_pa = kstack_top - TRAP_FRAME_SIZE;
+        let ctx = Context {
+            ra:  crate::proc::context::task_entry_trampoline as usize,
+            sp:  trapframe_pa,
+            s0:  0,
+            ..Context::zero()
+        };
+        (ctx, trapframe_pa)
+    };
+
+    let pid = alloc_pid();
+
+    let mut pcb = Pcb::zeroed();
+    pcb.pid        = pid;
+    pcb.ppid       = 0;
+    pcb.tgid       = pid;
+    pcb.pgid       = pid;
+    pcb.sid        = pid;
+    pcb.state      = State::Ready;
+    pcb.pc         = final_entry;
+    pcb.sp         = initial_sp;
+    pcb.user_satp  = new_cr3;
+    pcb.kstack_top = kstack_top;
+    pcb.ctx        = ctx;
+    pcb.vmas       = vmas;
+    pcb.brk_base   = brk_base;
+    pcb.brk        = brk_base;
+    pcb.exe_path   = Some(String::from(path));
+    pcb.caps       = CapSet::full();
+    #[cfg(target_arch = "riscv64")]
+    {
+        pcb.trapframe_pa   = trapframe_pa;
+        pcb.trapframe_virt = TRAPFRAME_VADDR;
+    }
+
+    scheduler::enqueue(pcb);
+    true
+}
+
+// ── do_execve (x86_64) ────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+pub fn do_execve(
+    pid:     usize,
+    path_va: usize,
+    argv_va: usize,
+    envp_va: usize,
+) -> isize {
+    let path = match copy_cstr_from_user(path_va) { Some(s) => s, None => return -14 };
+    let argv = copy_strvec_from_user(argv_va);
+    let envp = copy_strvec_from_user(envp_va);
+
+    let fd = match vfs::open(&path, 0, 0) { fd if fd >= 0 => fd as usize, e => return e };
+    let size = match vfs::fsize(fd) { Some(s) => s, None => { vfs::close(fd); return -2; } };
+    let mut data = Vec::with_capacity(size);
+    data.resize(size, 0u8);
+    if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return -5; }
+    vfs::close(fd);
+
+    let hdr   = match elf::parse_elf_header(&data)          { Some(h) => h, None => return -8 };
+    let phdrs = match elf::parse_phdrs_with_hdr(&data, &hdr) { Some(p) => p, None => return -8 };
+
+    let new_cr3  = paging::alloc_root_page_table();
+    let entry_va = match elf::load_elf_into(new_cr3, &data, &hdr, &phdrs) {
+        Some(e) => e,
+        None    => { pmm::free_page_table(new_cr3); return -12; }
+    };
+    let brk_base = elf::end_of_bss(&phdrs, 0);
+
+    let (final_entry, interp_bias) =
+        if let Some(interp_path) = crate::proc::dynlink::find_interp(&data) {
+            match crate::proc::dynlink::load_interp(&interp_path) {
+                Ok((ie, bias)) => (ie, bias),
+                Err(e)         => { pmm::free_page_table(new_cr3); return e; }
+            }
+        } else {
+            (entry_va, 0)
+        };
+
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+
+    let user_sp_top = alloc_map_stack(new_cr3, STACK_TOP);
+    let (initial_rsp, new_vmas) = crate::auxv::build_stack(
+        new_cr3, user_sp_top, &argv_refs, &envp_refs,
+        &hdr, &phdrs, entry_va, interp_bias, brk_base,
+    );
+
+    let kstack_top = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        mmap::clear_vmas(p);
+        unsafe { paging::free_user_page_table(p.user_satp); }
+        unsafe { paging::load_cr3(new_cr3); }
+        update_rsp0(p.kstack_top);
+    });
+
+    use crate::arch::x86_64::syscall::patch_syscall_frame;
+    patch_syscall_frame(kstack_top, final_entry, 0x202, initial_rsp);
+
+    let new_ctx = crate::proc::context::Context {
+        rip: crate::proc::context::task_entry_trampoline as usize,
+        rsp: kstack_top - 17 * 8,
+        ..crate::proc::context::Context::zero()
+    };
+
+    let old_handlers = scheduler::with_proc(pid, |p| p.signal_handlers.lock().clone()).unwrap();
+    let vfork_parent = scheduler::with_proc(pid, |p| p.vfork_parent).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        p.user_satp       = new_cr3;
+        p.pc              = final_entry;
+        p.sp              = initial_rsp;
+        p.ctx             = new_ctx;
+        p.brk_base        = brk_base;
+        p.brk             = brk_base;
+        p.vmas            = new_vmas;
+        p.exe_path        = Some(path.clone());
+        p.signal_handlers = alloc::sync::Arc::new(spin::Mutex::new(old_handlers.exec_reset()));
+        p.pending_signals.clear();
+        p.vfork_parent    = 0;
+    });
+
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
+
+    thread::set_run_state_cold(pid, final_entry, initial_rsp);
+    0
+}
+
+// ── do_execve_riscv ───────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "riscv64")]
+pub fn do_execve_riscv(
+    pid:     usize,
+    path_va: usize,
+    argv_va: usize,
+    envp_va: usize,
+) -> isize {
+    use crate::arch::riscv64::trap::{rebuild_trap_frame_riscv, TRAP_FRAME_SIZE};
+    use crate::arch::riscv64::paging::alloc_root_page_table;
+    use crate::arch::riscv64::uentry::alloc_user_stack;
+
+    let path = match copy_cstr_from_user(path_va) { Some(s) => s, None => return -14 };
+    let argv = copy_strvec_from_user(argv_va);
+    let envp = copy_strvec_from_user(envp_va);
+
+    let fd = match vfs::open(&path, 0, 0) { fd if fd >= 0 => fd as usize, e => return e };
+    let size = match vfs::fsize(fd) { Some(s) => s, None => { vfs::close(fd); return -2; } };
+    let mut data = Vec::with_capacity(size);
+    data.resize(size, 0u8);
+    if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return -5; }
+    vfs::close(fd);
+
+    let hdr   = match elf::parse_elf_header(&data)          { Some(h) => h, None => return -8 };
+    let phdrs = match elf::parse_phdrs_with_hdr(&data, &hdr) { Some(p) => p, None => return -8 };
+
+    let new_root_ppn = alloc_root_page_table() >> 12;
+    let new_cr3      = new_root_ppn << 12;
+
+    let entry_va = match elf::load_elf_into(new_cr3, &data, &hdr, &phdrs) {
+        Some(e) => e,
+        None    => { pmm::free_page_table(new_cr3); return -12; }
+    };
+    let brk_base = elf::end_of_bss(&phdrs, 0);
+
+    let (final_entry, interp_bias) =
+        if let Some(interp_path) = crate::proc::dynlink::find_interp(&data) {
+            match crate::proc::dynlink::load_interp(&interp_path) {
+                Ok((ie, bias)) => (ie, bias),
+                Err(e)         => { pmm::free_page_table(new_cr3); return e; }
+            }
+        } else {
+            (entry_va, 0)
+        };
+
+    let user_sp_top = match alloc_user_stack(new_root_ppn) {
+        Some(sp) => sp,
+        None     => { pmm::free_page_table(new_cr3); return -12; }
+    };
+
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+
+    let (initial_sp, new_vmas) = crate::auxv::build_stack(
+        new_cr3, user_sp_top, &argv_refs, &envp_refs,
+        &hdr, &phdrs, entry_va, interp_bias, brk_base,
+    );
+
+    let kstack_top = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        mmap::clear_vmas(p);
+        crate::arch::riscv64::paging::free_user_page_table(p.user_satp);
+    });
+
+    // Overwrite the trapframe already sitting on the kernel stack.
+    rebuild_trap_frame_riscv(kstack_top, final_entry, initial_sp, 0);
+    let trapframe_pa = kstack_top - TRAP_FRAME_SIZE;
+
+    let new_ctx = crate::proc::context::Context {
+        ra:  crate::proc::context::task_entry_trampoline as usize,
+        sp:  trapframe_pa,
+        s0:  0,
+        ..crate::proc::context::Context::zero()
+    };
+
+    let old_handlers = scheduler::with_proc(pid, |p| p.signal_handlers.lock().clone()).unwrap();
+    let vfork_parent = scheduler::with_proc(pid, |p| p.vfork_parent).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        p.user_satp       = new_cr3;
+        p.pc              = final_entry;
+        p.sp              = initial_sp;
+        p.ctx             = new_ctx;
+        p.trapframe_pa    = trapframe_pa;
+        p.trapframe_virt  = TRAPFRAME_VADDR;
+        p.brk_base        = brk_base;
+        p.brk             = brk_base;
+        p.vmas            = new_vmas;
+        p.exe_path        = Some(path.clone());
+        p.signal_handlers = alloc::sync::Arc::new(spin::Mutex::new(old_handlers.exec_reset()));
+        p.pending_signals.clear();
+        p.vfork_parent    = 0;
+    });
+
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
+
+    thread::set_run_state_cold(pid, final_entry, initial_sp);
+    0
+}
+
+// ── sys_execve dispatcher ─────────────────────────────────────────────────────
+
+pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
+    let pid = scheduler::current_pid();
+    #[cfg(target_arch = "x86_64")]
+    { do_execve(pid, path_va, argv_va, envp_va) }
+    #[cfg(target_arch = "riscv64")]
+    { do_execve_riscv(pid, path_va, argv_va, envp_va) }
+}
+
+// ── Userspace string helpers ──────────────────────────────────────────────────
+
+fn copy_cstr_from_user(va: usize) -> Option<String> {
+    let mut buf = [0u8; 4096];
+    copy_from_user(va, &mut buf).ok()?;
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    core::str::from_utf8(&buf[..end]).ok().map(String::from)
+}
+
+fn copy_strvec_from_user(vec_va: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if vec_va == 0 { return out; }
+    let mut ptr_va = vec_va;
+    loop {
+        let mut slot = [0u8; 8];
+        if copy_from_user(ptr_va, &mut slot).is_err() { break; }
+        let p = usize::from_ne_bytes(slot.try_into().unwrap());
+        if p == 0 { break; }
+        if let Some(s) = copy_cstr_from_user(p) { out.push(s); }
+        ptr_va += 8;
+    }
+    out
+}
+
+// ── Stack allocation helper (x86_64) ─────────────────────────────────────────
+
+#[cfg(target_arch = "x86_64")]
+fn alloc_map_stack(cr3: usize, stack_top: usize) -> usize {
+    use crate::arch::x86_64::paging::{map_page_into, PTE_R, PTE_W, PTE_U};
+    const STACK_PAGES: usize = 4;
+    let base = stack_top - STACK_PAGES * PAGE;
+    for i in 0..STACK_PAGES {
+        let pa = pmm::alloc_page().expect("alloc_map_stack: OOM");
+        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+        unsafe { map_page_into(cr3, base + i * PAGE, pa, PTE_R | PTE_W | PTE_U); }
+    }
+    stack_top
+}
