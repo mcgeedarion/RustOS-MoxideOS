@@ -194,6 +194,17 @@ pub struct Pcb {
     // TLS
     pub tls_base: usize,
 
+    // ── Trampoline / trapframe (RISC-V) ──────────────────────────────────────
+    /// Physical address of this process's trapframe page.
+    /// Allocated by `map_trampoline_for_process` (or carved from the kstack
+    /// for processes set up via `rebuild_trap_frame_riscv`).
+    /// 0 on x86_64 (unused).
+    pub trapframe_pa:   usize,
+    /// User virtual address at which the trapframe page is mapped in this
+    /// process's address space.  Equal to `TRAPFRAME_VADDR` on RISC-V.
+    /// 0 on x86_64 (unused).
+    pub trapframe_virt: usize,
+
     // clone3 / POSIX thread ABI
     pub child_tid_va:       usize,
     pub child_tid_val:      u32,
@@ -293,6 +304,8 @@ impl Pcb {
             kstack_top:          0,
             ctx:                 Context::zero(),
             tls_base:            0,
+            trapframe_pa:        0,
+            trapframe_virt:      0,
             child_tid_va:        0,
             child_tid_val:       0,
             clear_child_tid_va:  0,
