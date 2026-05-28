@@ -16,6 +16,9 @@
 //! | Ext2       | fs::ext2             | /  (rw, plain ext2/ext3)  |
 //! | Ext4       | fs::ext4             | /  (ro, ext4 with extents)|
 //! | Fat32      | fs::fat32            | /boot/efi, /mnt/usb       |
+//! | ExFat      | fs::exfat            | /mnt/usb (exFAT drives)   |
+//! | Ntfs       | fs::ntfs             | /mnt/win (ro)             |
+//! | Cdfs       | fs::cdfs             | /mnt/cdrom (ISO 9660, ro) |
 //! | Tmpfs      | fs::ramfs            | /tmp, /run, /dev/shm      |
 //! | Overlayfs  | fs::overlayfs        | /overlay, container roots |
 //! | Devfs      | fs::devfs            | /dev                      |
@@ -31,13 +34,16 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Filesystem type discriminant ─────────────────────────────────────────────
+// ── Filesystem type discriminant ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FsType {
     Ext2,
     Ext4,
     Fat32,
+    ExFat,
+    Ntfs,
+    Cdfs,
     Tmpfs,
     Overlayfs,
     Devfs,
@@ -51,17 +57,20 @@ impl FsType {
     /// Parse the kernel-facing filesystem name string (as passed to mount(2)).
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "ext2" | "ext3"          => Some(FsType::Ext2),
-            "ext4"                   => Some(FsType::Ext4),
-            "vfat" | "fat32" | "fat" => Some(FsType::Fat32),
-            "tmpfs"                  => Some(FsType::Tmpfs),
-            "overlay" | "overlayfs"  => Some(FsType::Overlayfs),
-            "devtmpfs" | "devfs"     => Some(FsType::Devfs),
-            "proc"                   => Some(FsType::Procfs),
-            "sysfs"                  => Some(FsType::Sysfs),
-            "cgroup2" | "cgroup"     => Some(FsType::Cgroupfs),
-            "btrfs"                  => Some(FsType::Btrfs),
-            _                        => None,
+            "ext2" | "ext3"           => Some(FsType::Ext2),
+            "ext4"                    => Some(FsType::Ext4),
+            "vfat" | "fat32" | "fat"  => Some(FsType::Fat32),
+            "exfat"                   => Some(FsType::ExFat),
+            "ntfs" | "ntfs-3g"        => Some(FsType::Ntfs),
+            "iso9660" | "cdfs"        => Some(FsType::Cdfs),
+            "tmpfs"                   => Some(FsType::Tmpfs),
+            "overlay" | "overlayfs"   => Some(FsType::Overlayfs),
+            "devtmpfs" | "devfs"      => Some(FsType::Devfs),
+            "proc"                    => Some(FsType::Procfs),
+            "sysfs"                   => Some(FsType::Sysfs),
+            "cgroup2" | "cgroup"      => Some(FsType::Cgroupfs),
+            "btrfs"                   => Some(FsType::Btrfs),
+            _                         => None,
         }
     }
 
@@ -70,6 +79,9 @@ impl FsType {
             FsType::Ext2      => "ext2",
             FsType::Ext4      => "ext4",
             FsType::Fat32     => "vfat",
+            FsType::ExFat     => "exfat",
+            FsType::Ntfs      => "ntfs",
+            FsType::Cdfs      => "iso9660",
             FsType::Tmpfs     => "tmpfs",
             FsType::Overlayfs => "overlay",
             FsType::Devfs     => "devtmpfs",
@@ -81,7 +93,7 @@ impl FsType {
     }
 }
 
-// ── Mount flags (mirrors Linux MS_* bits) ───────────────────────────────────
+// ── Mount flags (mirrors Linux MS_* bits) ─────────────────────────────────────
 
 pub const MS_RDONLY:      u64 = 1 << 0;
 pub const MS_NOSUID:      u64 = 1 << 1;
@@ -97,7 +109,7 @@ pub const MNT_FORCE:      u32 = 1;
 pub const MNT_DETACH:     u32 = 2;
 pub const MNT_EXPIRE:     u32 = 4;
 
-// ── Per-entry overlay options ──────────────────────────────────────────────
+// ── Per-entry overlay options ─────────────────────────────────────────────────────
 
 /// Extra parameters carried for overlayfs mounts.
 #[derive(Clone, Debug)]
@@ -107,7 +119,7 @@ pub struct OverlayOpts {
     pub work:    String,   // work directory (must be on same fs as upper)
 }
 
-// ── MountEntry ─────────────────────────────────────────────────────────────────
+// ── MountEntry ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct MountEntry {
@@ -118,7 +130,7 @@ pub struct MountEntry {
     pub overlay:    Option<OverlayOpts>,
 }
 
-// ── FsHandle — returned to vfs_ops callers ────────────────────────────────────
+// ── FsHandle — returned to vfs_ops callers ────────────────────────────────────────────
 
 /// Identifies which filesystem owns a path and the mount-relative sub-path.
 #[derive(Clone, Debug)]
@@ -136,7 +148,7 @@ impl FsHandle {
     }
 }
 
-// ── Global mount table ──────────────────────────────────────────────────────────
+// ── Global mount table ────────────────────────────────────────────────────────────────
 
 pub struct MountTable {
     entries: Vec<MountEntry>,
@@ -236,7 +248,7 @@ impl MountTable {
     }
 }
 
-// ── Global instance ────────────────────────────────────────────────────────────────
+// ── Global instance ────────────────────────────────────────────────────────────────────────
 
 static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable::new());
 
@@ -258,29 +270,35 @@ pub fn list_mounts() -> Vec<MountEntry> {
     MOUNT_TABLE.lock().list()
 }
 
-// ── Kernel boot mounts ────────────────────────────────────────────────────────
+// ── Kernel boot mounts ────────────────────────────────────────────────────────────────
 
 /// Called once from the kernel main entry point after the PMM is ready.
 /// Registers canonical virtual/pseudo filesystems and detects the root
-/// block-device filesystem type automatically.
+/// block-device filesystem type automatically via fs_recognizer.
 pub fn init_mounts() {
     let mut tbl = MOUNT_TABLE.lock();
 
-    // Root filesystem: try btrfs first, then ext2 (rw), then ext4 (ro).
-    let root_fstype = if crate::fs::btrfs::mount() {
-        log::info!("mount: root filesystem: btrfs (rw)");
-        FsType::Btrfs
-    } else if crate::fs::ext2::mount() {
-        log::info!("mount: root filesystem: ext2/ext3 (rw)");
-        FsType::Ext2
-    } else if crate::fs::ext4::mount() {
-        log::info!("mount: root filesystem: ext4 (ro)");
-        FsType::Ext4
-    } else {
-        log::warn!("mount: no recognised filesystem on virtio-blk; root will be unavailable");
-        FsType::Ext2
+    // Read the first 64 KiB of the root block device for FS detection.
+    // This covers all magic locations including Btrfs (at 0x10040).
+    let boot_sector = crate::block::read_blocks(0, 128); // 128 * 512 = 65536 bytes
+
+    // Auto-detect root filesystem type.
+    let root_fstype = boot_sector
+        .as_deref()
+        .and_then(|data| crate::fs::fs_recognizer::probe(data))
+        .unwrap_or_else(|| {
+            log::warn!("mount: fs_recognizer could not identify root FS; defaulting to ext2");
+            FsType::Ext2
+        });
+
+    let root_flags = match root_fstype {
+        FsType::Ntfs | FsType::Cdfs | FsType::Ext4 => MS_RDONLY,
+        _ => 0,
     };
-    let root_flags = if root_fstype == FsType::Ext4 { MS_RDONLY } else { 0 };
+
+    log::info!("mount: root filesystem detected as '{}'",
+        crate::fs::fs_recognizer::fs_type_name(&root_fstype));
+
     let _ = tbl.mount("sda", "/", root_fstype, root_flags, None);
 
     // EFI System Partition (FAT32, read-only by default).
@@ -303,7 +321,7 @@ pub fn init_mounts() {
     tbl.sort();
 }
 
-// ── sys_mount / sys_umount2 ───────────────────────────────────────────────────────
+// ── sys_mount / sys_umount2 ────────────────────────────────────────────────────────────
 
 pub fn sys_mount(
     source:   &str,
@@ -312,9 +330,24 @@ pub fn sys_mount(
     flags:    u64,
     data:     &str,
 ) -> isize {
-    let fstype = match FsType::from_str(fstype_s) {
-        Some(t) => t,
-        None    => return -22,
+    // "auto" delegates to the recognizer: read first 64 KiB of the source device.
+    let fstype = if fstype_s == "auto" {
+        let boot_sector = crate::block::read_blocks(0, 128);
+        boot_sector
+            .as_deref()
+            .and_then(|d| crate::fs::fs_recognizer::probe(d))
+            .unwrap_or(FsType::Ext2)
+    } else {
+        match FsType::from_str(fstype_s) {
+            Some(t) => t,
+            None    => return -22,
+        }
+    };
+
+    // NTFS and CDFS are always read-only.
+    let flags = match fstype {
+        FsType::Ntfs | FsType::Cdfs => flags | MS_RDONLY,
+        _ => flags,
     };
 
     let overlay = if fstype == FsType::Overlayfs {
