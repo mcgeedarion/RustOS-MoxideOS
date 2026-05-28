@@ -1,0 +1,42 @@
+kernel:
+  - changed-files:
+    - any-glob-to-any-file: 'src/**'
+
+crates:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/**'
+
+userspace:
+  - changed-files:
+    - any-glob-to-any-file: 'userspace/**'
+
+tests:
+  - changed-files:
+    - any-glob-to-any-file: 'tests/**'
+
+tooling:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'tools/**'
+      - 'xtask/**'
+
+build:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'rust-toolchain.toml'
+      - 'rustfmt.toml'
+      - 'flake.nix'
+      - '.cargo/**'
+      - 'targets/**'
+      - 'linker_*.ld'
+      - '*.sh'
+
+ci:
+  - changed-files:
+    - any-glob-to-any-file: '.github/**'
+
+docs:
+  - changed-files:
+    - any-glob-to-any-file: 'docs/**'
