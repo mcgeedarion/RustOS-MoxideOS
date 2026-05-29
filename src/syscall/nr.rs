@@ -116,3 +116,16 @@ pub const SYS_SECCOMP:         usize = 317;
 pub const STRICT_ALLOWLIST: &[usize] = &[
     SYS_READ, SYS_WRITE, SYS_RT_SIGRETURN, SYS_EXIT, SYS_EXIT_GROUP,
 ];
+
+// ── RustOS-private debug/test syscalls ───────────────────────────────────
+//
+// These numbers are in the 0x8000_0000+ range, well above any current or
+// planned Linux NR, so they can never collide.  They are compiled out in
+// release builds (only present when feature = "kmtest").
+//
+// SYS_KMTEST_LIST: returns the count of registered tests; optionally fills
+//                  a user-supplied buffer with NUL-terminated name strings.
+// SYS_KMTEST_RUN:  runs one test by index; streams pass/fail lines to the
+//                  kernel serial console and returns the failure count.
+pub const SYS_KMTEST_LIST: usize = 0x8000_0000;
+pub const SYS_KMTEST_RUN:  usize = 0x8000_0001;

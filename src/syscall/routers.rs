@@ -414,3 +414,22 @@ pub fn dispatch_time(ctx: &SyscallContext) -> Option<isize> {
         _ => None,
     }
 }
+
+// ── Kernel test router ───────────────────────────────────────────────────────
+//
+// Only active when the kernel is compiled with --features kmtest.
+// Uses a private NR range (0x8000_0000+) that can never collide with Linux.
+#[cfg(feature = "kmtest")]
+pub fn dispatch_kmtest(ctx: &SyscallContext) -> Option<isize> {
+    let (a, b, ..) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
+    match ctx.nr {
+        SYS_KMTEST_LIST => Some(crate::syscall::kmtest::sys_kmtest_list(a, b)),
+        SYS_KMTEST_RUN  => Some(crate::syscall::kmtest::sys_kmtest_run(a)),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "kmtest"))]
+pub fn dispatch_kmtest(_ctx: &SyscallContext) -> Option<isize> {
+    None
+}
