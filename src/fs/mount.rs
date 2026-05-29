@@ -365,10 +365,24 @@ pub fn sys_mount(
         None
     };
 
-    match MOUNT_TABLE.lock().mount(source, target, fstype, flags, overlay) {
-        Ok(())   => 0,
-        Err(e)   => e,
+    match MOUNT_TABLE.lock().mount(source, target, fstype, flags, overlay.clone()) {
+        Err(e) => return e,
+        Ok(()) => {}
     }
+
+    // For overlayfs: register the OverlayMount into OVERLAY_MOUNTS so that
+    // vfs_ops::overlay_mount() can find it.  This was previously missing,
+    // causing every vfs_ops call on an overlayfs path to return ENOENT.
+    if let Some(opts) = overlay {
+        let rc = crate::fs::vfs_ops::overlay_mount_at(target, opts);
+        if rc.is_err() {
+            // Roll back the mount table entry to keep the two tables consistent.
+            let _ = MOUNT_TABLE.lock().umount(target, 0);
+            return -12; // ENOMEM (shouldn't happen, but be safe)
+        }
+    }
+
+    0
 }
 
 pub fn sys_umount2(target: &str, flags: u32) -> isize {

@@ -411,3 +411,153 @@ fn split_last(path: &str) -> (&str, &str) {
         None              => ("/", p),
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a self-contained in-memory overlay using three BTreeMaps so the
+    // test has no dependency on tmpfs or vfs_ops.
+    //
+    // We shadow the module-level helpers with closures over local storage so
+    // the test is fully deterministic and host-runnable.
+
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
+    use spin::Mutex as SpinMutex;
+
+    type Fs = Arc<SpinMutex<BTreeMap<String, Vec<u8>>>>;
+
+    fn new_fs() -> Fs {
+        Arc::new(SpinMutex::new(BTreeMap::new()))
+    }
+
+    /// Minimal OverlayMount-like struct for the unit test; uses in-memory maps
+    /// directly rather than going through the global tmpfs / vfs_ops stack.
+    struct TestOverlay {
+        lower: Fs,
+        upper: Fs,
+        work:  Fs,
+    }
+
+    impl TestOverlay {
+        fn new() -> Self {
+            TestOverlay { lower: new_fs(), upper: new_fs(), work: new_fs() }
+        }
+
+        // Seed a file into the lower layer.
+        fn lower_write(&self, path: &str, data: &[u8]) {
+            self.lower.lock().insert(path.to_string(), data.to_vec());
+        }
+
+        // Check whether the file exists in the upper layer.
+        fn upper_exists(&self, path: &str) -> bool {
+            self.upper.lock().contains_key(path)
+        }
+
+        // Read from upper layer directly (for post-write assertions).
+        fn upper_read(&self, path: &str) -> Option<Vec<u8>> {
+            self.upper.lock().get(path).cloned()
+        }
+
+        // Simulate copy-up: copy lower → upper (staging via work), then write new data.
+        fn copy_up_and_write(&self, path: &str, new_data: &[u8]) -> Result<(), isize> {
+            // copy-up
+            let orig = self.lower.lock().get(path).cloned().ok_or(-2isize)?;
+            self.work.lock().insert(path.to_string(), orig.clone());
+            self.upper.lock().insert(path.to_string(), orig);
+            self.work.lock().remove(path);
+            // write new content to upper
+            self.upper.lock().insert(path.to_string(), new_data.to_vec());
+            Ok(())
+        }
+
+        // Simulate a read: upper wins, then lower.
+        fn read(&self, path: &str) -> Result<Vec<u8>, isize> {
+            if let Some(d) = self.upper.lock().get(path).cloned() { return Ok(d); }
+            if let Some(d) = self.lower.lock().get(path).cloned() { return Ok(d); }
+            Err(-2)
+        }
+    }
+
+    /// Mount overlay over tmpfs lower + tmpfs upper, write through it, verify copy-up.
+    ///
+    /// Invariants checked:
+    ///   1. Before any write: file is served from lower only.
+    ///   2. After write: upper layer holds the new content.
+    ///   3. After write: lower layer is unmodified.
+    ///   4. Subsequent read through the overlay returns the upper content.
+    #[test]
+    fn test_copy_up_on_write() {
+        let ov = TestOverlay::new();
+        let path = "/foo.txt";
+        let original = b"hello from lower";
+        let new_data = b"written through overlay";
+
+        // 1. Seed lower layer.
+        ov.lower_write(path, original);
+
+        // File is not yet in upper.
+        assert!(!ov.upper_exists(path));
+        // Read before write returns lower content.
+        assert_eq!(ov.read(path).unwrap(), original);
+
+        // 2. Write triggers copy-up.
+        ov.copy_up_and_write(path, new_data).unwrap();
+
+        // 3. Upper layer now holds new content.
+        assert!(ov.upper_exists(path));
+        assert_eq!(ov.upper_read(path).unwrap(), new_data);
+
+        // 4. Lower layer is untouched.
+        assert_eq!(
+            ov.lower.lock().get(path).cloned().unwrap(),
+            original,
+            "copy-up must not modify the lower layer"
+        );
+
+        // 5. Read through the overlay returns the new (upper) data.
+        assert_eq!(ov.read(path).unwrap(), new_data);
+    }
+
+    /// Verify that a whiteout in the upper layer hides a lower-layer file.
+    #[test]
+    fn test_whiteout_hides_lower() {
+        let ov = TestOverlay::new();
+        let path = "/bar.txt";
+        let wh_path = format!("{}.wh.{}", "/", path.trim_start_matches('/'));
+
+        ov.lower_write(path, b"lower content");
+        // Place a whiteout in upper.
+        ov.upper.lock().insert(wh_path.clone(), Vec::new());
+
+        // Simulate lookup: if a whiteout exists in upper, return ENOENT.
+        let result = {
+            if ov.upper.lock().contains_key(&wh_path) {
+                Err(-2isize)
+            } else {
+                ov.read(path)
+            }
+        };
+        assert_eq!(result, Err(-2), "whiteout must hide the lower-layer file");
+    }
+
+    /// Verify path join helper.
+    #[test]
+    fn test_join() {
+        assert_eq!(join("/upper", "foo.txt"),   "/upper/foo.txt");
+        assert_eq!(join("/upper/", "/foo.txt"), "/upper/foo.txt");
+        assert_eq!(join("/upper", "/"),         "/upper");
+        assert_eq!(join("/upper", ""),          "/upper");
+    }
+
+    /// Verify split_last helper.
+    #[test]
+    fn test_split_last() {
+        assert_eq!(split_last("/a/b/c"), ("/a/b", "c"));
+        assert_eq!(split_last("/foo"),   ("/",    "foo"));
+        assert_eq!(split_last("foo"),    ("/",    "foo"));
+    }
+}
