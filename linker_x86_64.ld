@@ -50,6 +50,17 @@ SECTIONS {
 
   .data ALIGN(4096) : { *(.data .data.*) }
 
+  /*
+   * Kernel test registry — populated at link time by #[kernel_test] statics.
+   * Only present when the kernel is compiled with --features kmtest.
+   * __kmtest_start / __kmtest_end are extern "C" symbols in kmtest::lib.
+   */
+  .kmtest_registry ALIGN(8) : {
+    __kmtest_start = .;
+    KEEP(*(.kmtest_registry))
+    __kmtest_end = .;
+  }
+
   .bss ALIGN(4096) : {
     *(.bss .bss.*)
     *(COMMON)
