@@ -1,9 +1,20 @@
+[workspace]
+members = [
+    ".",
+    "crates/scheme-api",
+    "crates/kmtest",
+    "crates/kmtest-macros",
+]
+resolver = "2"
+
 [package]
 name = "rustos-kernel"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+kmtest = { path = "crates/kmtest", optional = true }
+
 # existing deps...
 
 [features]
@@ -17,3 +28,7 @@ debug_stub = []
 
 # Ring-buffer trace event drain, flushed to serial on panic.
 trace = []
+
+# Enable in-kernel test harness.  Build with:
+#   cargo build --features kmtest --target x86_64-unknown-none
+kmtest = ["dep:kmtest"]
