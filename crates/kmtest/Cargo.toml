@@ -1,0 +1,13 @@
+[package]
+name = "kmtest"
+version = "0.1.0"
+edition = "2021"
+
+# no_std — this crate must compile for bare-metal kernel targets.
+[lib]
+
+[dependencies]
+kmtest-macros = { path = "../kmtest-macros" }
+
+[features]
+default = []
