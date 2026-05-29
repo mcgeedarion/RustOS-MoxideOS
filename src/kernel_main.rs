@@ -10,6 +10,8 @@
 //! ## x86_64 boot sequence
 //!
 //! See `arch::x86_64::kernel_main` for the full x86_64 boot pipeline.
+//! When `feature = "kmtest"` is active, `kmtest::init()` is called there
+//! immediately before `proc::spawn_init()` (same placement as RISC-V below).
 //!
 //! ## RISC-V boot sequence
 //!
@@ -39,17 +41,18 @@
 //! 23. dhcp::init()                   — DORA handshake
 //! 24. cgroup::init()                 — seed ROOT_CGROUP
 //! 25. shell::init()                  — built-in debug shell
-//! 26. proc::spawn_init()             — spawn pid 1; scheduler takes over
+//! 26. kmtest::init()                 — register test suites [cfg(feature = "kmtest")]
+//! 27. proc::spawn_init()             — spawn pid 1; scheduler takes over
 //! ```
 
-// ── x86_64 ───────────────────────────────────────────────────────────────────
+// ── x86_64 ────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 pub fn kernel_main() -> ! {
     crate::arch::x86_64::kernel_main::kernel_main()
 }
 
-// ── riscv64 ──────────────────────────────────────────────────────────────────
+// ── riscv64 ─────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
@@ -95,12 +98,19 @@ pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
 
     crate::proc::cgroup::init();
     crate::shell::init();
+
+    // Register all kernel test suites before handing off to the scheduler.
+    // Tests are triggered later by the userspace kmtest runner via
+    // SYS_KMTEST_LIST / SYS_KMTEST_RUN.
+    #[cfg(feature = "kmtest")]
+    crate::kmtest::init();
+
     crate::proc::spawn_init();
 
     unreachable!("scheduler returned to kernel_main_riscv64");
 }
 
-// ── Panic handler ────────────────────────────────────────────────────────────
+// ── Panic handler ─────────────────────────────────────────────────────────────
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {

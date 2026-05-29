@@ -4,7 +4,7 @@
 #![feature(alloc_error_handler)]
 #![feature(naked_functions)]
 #![feature(asm_const)]
-// ── Clippy complexity gates ──────────────────────────────────────────────────
+// ── Clippy complexity gates ───────────────────────────────────────────────
 //
 // These lints are intentionally set at the crate root so they apply
 // globally.  They will surface the known high-complexity functions
@@ -63,6 +63,7 @@ extern crate alloc;
 //   exec        — Executable format parsers (ELF-64)
 //   debug       — Debugging infrastructure  [cfg(feature = "gdbstub")]
 //   kernel      — Core kernel utilities (panic, rand, uaccess, utils)
+//   kmtest      — Kernel test harness  [cfg(feature = "kmtest")]
 
 pub mod core;
 pub mod arch;
@@ -96,6 +97,9 @@ pub mod input;
 
 #[cfg(feature = "gdbstub")]
 pub mod debug;
+
+#[cfg(feature = "kmtest")]
+pub mod kmtest;
 
 pub use kernel_main::kernel_main;
 mod kernel_main;
