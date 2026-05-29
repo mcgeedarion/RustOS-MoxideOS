@@ -13,6 +13,7 @@
 //!        dispatch_memory      mmap, mprotect, munmap, brk, madvise, pkey_* …
 //!        dispatch_ipc         SysV shm/sem/msg, POSIX mq
 //!        dispatch_time        clock_*, timers, getitimer, times
+//!        dispatch_kmtest      SYS_KMTEST_LIST / SYS_KMTEST_RUN (kmtest feature only)
 //!
 //!   3. Implementation modules — the actual syscall logic lives in the
 //!      subsystem modules (fs::*, proc::*, mm::*, ipc::*, …).
@@ -34,6 +35,8 @@
 //!   NR 326  copy_file_range                  => posix_full::sys_copy_file_range_impl
 //!   NR 435  clone3                           => proc::clone::sys_clone3
 //!   NR 437  openat2                          => openat2_mincore::sys_openat2_impl
+//!   0x8000_0000  kmtest_list                 => syscall::kmtest::sys_kmtest_list
+//!   0x8000_0001  kmtest_run                  => syscall::kmtest::sys_kmtest_run
 
 #![allow(unused_variables, unused_imports)]
 extern crate alloc;
@@ -49,6 +52,9 @@ pub mod errno;
 pub mod signal_nr;
 pub mod dispatcher_context;
 pub mod routers;
+
+#[cfg(feature = "kmtest")]
+pub mod kmtest;
 
 use nr::{SYS_EXIT, SYS_EXIT_GROUP};
 use errno::{efault, einval, enosys, emsgsize};
@@ -330,6 +336,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
 
     // ── subsystem routers ─────────────────────────────────────────────────
     // Tried in call-frequency order (fs > proc > memory > ipc > time).
+    // kmtest is last: private NR range, only active under --features kmtest.
     // Each returns Some(retval) when it owns the nr.
     let ctx = SyscallContext::new(nr, [a, b, c, d, e, f], saved_rip);
     let ret;
@@ -338,6 +345,7 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
     else if let Some(r) = routers::dispatch_memory(&ctx)     { ret = r; }
     else if let Some(r) = routers::dispatch_ipc(&ctx)        { ret = r; }
     else if let Some(r) = routers::dispatch_time(&ctx)       { ret = r; }
+    else if let Some(r) = routers::dispatch_kmtest(&ctx)     { ret = r; }
     else { ret = enosys(); }
 
     // ── trace: syscall exit ───────────────────────────────────────────────
