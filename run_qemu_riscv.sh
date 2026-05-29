@@ -9,6 +9,11 @@
 #   --uefi     Explicit UEFI mode (no-op; already the default)
 #   --gdb      Halt at entry, wait for GDB on :1234
 #   --no-net   Disable virtio-net
+#   --test     Run the kmtest suite: builds with --features kmtest,
+#              boots with init=/bin/kmtest, captures serial output,
+#              and exits with the kmtest runner’s exit code.
+#              Implies --no-net, headless.
+#   --timeout N  Test timeout in seconds (default: 60)
 #
 # Boot modes:
 #   UEFI (default) — EDK2 RiscVVirt pflash + vvfat ESP; release build.
@@ -41,22 +46,40 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Argument parsing ─────────────────────────────────────────────────────────
+# ── Argument parsing ─────────────────────────────────────────────────────
 
 GDB_MODE=0
 BOOT="uefi"
 NET_MODE=1
+TEST_MODE=0
+TEST_TIMEOUT=60
 DISK=""
 
 for arg in "$@"; do
   case "$arg" in
-    --gdb)    GDB_MODE=1 ;;
-    --sbi)    BOOT="sbi" ;;
-    --uefi)   BOOT="uefi" ;;
-    --no-net) NET_MODE=0 ;;
-    *)        DISK="$arg" ;;
+    --gdb)      GDB_MODE=1 ;;
+    --sbi)      BOOT="sbi" ;;
+    --uefi)     BOOT="uefi" ;;
+    --no-net)   NET_MODE=0 ;;
+    --test)     TEST_MODE=1; NET_MODE=0 ;;
+    --timeout=*) TEST_TIMEOUT="${arg#--timeout=}" ;;
+    --timeout)  ;; # handled via next arg below; skip
+    *)          DISK="$arg" ;;
   esac
 done
+
+# Two-token --timeout N handling (simple positional scan).
+ARGS=("$@")
+for ((i=0; i<${#ARGS[@]}; i++)); do
+  if [[ "${ARGS[$i]}" == "--timeout" && $((i+1)) -lt ${#ARGS[@]} ]]; then
+    TEST_TIMEOUT="${ARGS[$((i+1))]}"
+  fi
+done
+
+if [[ "$TEST_MODE" -eq 1 && "$GDB_MODE" -eq 1 ]]; then
+  echo "[!] --test cannot be combined with --gdb" >&2
+  exit 2
+fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -82,23 +105,83 @@ gdb_banner() {
   fi
   cat <<GDB
 
-  ┌───────────────────────────────────────────────────┐
+  ┌─────────────────────────────────────────────────┐
   │ GDB mode: kernel halted at entry point.           │
   │ In another terminal:                              │
   │   gdb-multiarch \\                                │
   │     -ex 'set arch riscv:rv64' \\                  │
   │     -ex 'file ${sym_file}' \\
   │     -ex 'target remote :1234'                     │
-  └───────────────────────────────────────────────────┘
+  └─────────────────────────────────────────────────┘
 
 GDB
+}
+
+# ── Shared: run QEMU headless, parse kmtest output, return exit code ───────
+
+run_kmtest() {
+  local qemu_bin=$1; shift
+  local -n _qargs=$1; shift
+
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[!] --test requires the 'timeout' command" >&2
+    exit 1
+  fi
+
+  LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/rustos-kmtest.XXXXXX.log")
+  trap 'rm -f "$LOG_FILE"' EXIT
+
+  echo "[*] Starting QEMU kmtest run (${TEST_TIMEOUT}s timeout)..."
+  echo
+
+  set +e
+  timeout "${TEST_TIMEOUT}" "$qemu_bin" "${_qargs[@]}" >"$LOG_FILE" 2>&1
+  QEMU_STATUS=$?
+  set -e
+
+  echo "---------- serial log ----------"
+  cat "$LOG_FILE"
+  echo "--------------------------------"
+
+  echo
+  echo "[*] kmtest results:"
+  grep '^  \(PASS\|FAIL\)' "$LOG_FILE" || true
+  SUMMARY=$(grep '^kmtest: .* passed' "$LOG_FILE" || true)
+  echo "${SUMMARY:-[!] no summary line found}"
+
+  if echo "$SUMMARY" | grep -qE '^kmtest: ([0-9]+)/\1 passed$'; then
+    echo "[✓] All tests passed."
+    exit 0
+  fi
+
+  if grep -q '^  FAIL ' "$LOG_FILE"; then
+    NFAIL=$(grep -c '^  FAIL ' "$LOG_FILE" || true)
+    echo "[!] ${NFAIL} test(s) failed." >&2
+    exit 1
+  fi
+
+  if [[ -z "$SUMMARY" ]]; then
+    echo "[!] kmtest summary not found in serial output" >&2
+    echo "    (was the kernel built with --features kmtest?)" >&2
+    exit 2
+  fi
+
+  echo "[!] Some tests failed (see summary above)." >&2
+  exit 1
 }
 
 # ── UEFI boot ────────────────────────────────────────────────────────────────
 
 if [[ "$BOOT" == "uefi" ]]; then
-  echo "[*] Building rustos (RISC-V UEFI release)..."
-  bash "$SCRIPT_DIR/build_riscv.sh"
+  BUILD_FLAGS=()
+  [[ "$TEST_MODE" -eq 1 ]] && BUILD_FLAGS+=(--features kmtest)
+  echo "[*] Building rustos (RISC-V UEFI release${TEST_MODE:+ + kmtest})..."
+  bash "$SCRIPT_DIR/build_riscv.sh" "${BUILD_FLAGS[@]}"
+
+  if [[ "$TEST_MODE" -eq 1 ]]; then
+    echo "[*] Building kmtest userspace runner..."
+    (cd "$SCRIPT_DIR/userspace" && make ARCH=riscv64 kmtest 2>&1)
+  fi
 
   FW_SEARCH=(
     /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd
@@ -142,6 +225,8 @@ if [[ "$BOOT" == "uefi" ]]; then
     -d guest_errors,cpu_reset
   )
 
+  [[ "$TEST_MODE" -eq 1 ]] && QEMU_ARGS+=(-append "init=/bin/kmtest")
+
   add_net_args QEMU_ARGS
 
   if [[ -n "$DISK" ]]; then
@@ -156,6 +241,10 @@ if [[ "$BOOT" == "uefi" ]]; then
 
   [[ "$GDB_MODE" -eq 1 ]] && { QEMU_ARGS+=(-gdb tcp::1234 -S); gdb_banner; }
 
+  if [[ "$TEST_MODE" -eq 1 ]]; then
+    run_kmtest qemu-system-riscv64 QEMU_ARGS
+  fi
+
   echo "[*] Starting QEMU (RISC-V UEFI)..."
   echo "    Firmware : $FW_CODE"
   echo "    ESP      : $SCRIPT_DIR/esp/EFI/BOOT/BOOTRISCV64.EFI"
@@ -163,12 +252,19 @@ if [[ "$BOOT" == "uefi" ]]; then
   exec qemu-system-riscv64 "${QEMU_ARGS[@]}"
 fi
 
-# ── SBI boot ─────────────────────────────────────────────────────────────────
+# ── SBI boot ───────────────────────────────────────────────────────────────────
 
 KERNEL="target/riscv64gc-unknown-none-elf/debug/rustos"
 
-echo "[*] Building rustos (RISC-V SBI debug)..."
-bash "$SCRIPT_DIR/build_riscv.sh" --sbi --debug
+BUILD_FLAGS=()
+[[ "$TEST_MODE" -eq 1 ]] && BUILD_FLAGS+=(--features kmtest)
+echo "[*] Building rustos (RISC-V SBI debug${TEST_MODE:+ + kmtest})..."
+bash "$SCRIPT_DIR/build_riscv.sh" --sbi --debug "${BUILD_FLAGS[@]}"
+
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  echo "[*] Building kmtest userspace runner (RISC-V)..."
+  (cd "$SCRIPT_DIR/userspace" && make ARCH=riscv64 kmtest 2>&1)
+fi
 
 QEMU_ARGS=(
   -machine virt
@@ -181,6 +277,8 @@ QEMU_ARGS=(
   -no-reboot
   -d guest_errors,cpu_reset
 )
+
+[[ "$TEST_MODE" -eq 1 ]] && QEMU_ARGS+=(-append "init=/bin/kmtest")
 
 add_net_args QEMU_ARGS
 
@@ -195,6 +293,10 @@ else
 fi
 
 [[ "$GDB_MODE" -eq 1 ]] && { QEMU_ARGS+=(-gdb tcp::1234 -S); gdb_banner; }
+
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  run_kmtest qemu-system-riscv64 QEMU_ARGS
+fi
 
 echo "[*] Starting QEMU (RISC-V SBI)..."
 echo

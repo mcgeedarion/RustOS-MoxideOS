@@ -1,0 +1,243 @@
+name: kmtest
+
+# Run the kernel test harness on every push/PR to main, and on demand.
+# The job boots each arch under QEMU, runs /bin/kmtest as init, and
+# fails the workflow if any test returns non-zero.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # allow manual re-runs from the Actions UI
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # RISC-V — SBI (OpenSBI) boot, debug build, 256 MiB, 1 hart
+  # ────────────────────────────────────────────────────────────────────────────
+  kmtest-riscv:
+    name: kmtest • RISC-V (SBI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: file
+          targets: riscv64gc-unknown-none-elf
+          components: rust-src, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: riscv64-kmtest-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+
+      - name: Install QEMU (RISC-V) + musl toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-riscv64 \
+            musl-tools
+          # riscv64 musl cross-compiler for the userspace runner
+          sudo apt-get install -y --no-install-recommends \
+            gcc-riscv64-linux-gnu libc-dev-riscv64-cross || true
+
+      - name: Build kernel (RISC-V + kmtest feature)
+        run: |
+          cargo build \
+            --target riscv64gc-unknown-none-elf \
+            --features kmtest \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem \
+            2>&1 | tee build-riscv-kmtest.log
+          test -f target/riscv64gc-unknown-none-elf/debug/rustos
+
+      - name: Build kmtest userspace runner (RISC-V)
+        run: |
+          cd userspace
+          make ARCH=riscv64 kmtest 2>&1 | tee ../build-kmtest-runner-riscv.log
+          test -f build/riscv64/kmtest
+
+      - name: Stage kmtest runner into initramfs
+        run: |
+          # The kernel's initramfs builder picks up /bin/kmtest from the
+          # staging tree.  Mirror what build_initramfs.sh does.
+          mkdir -p initramfs-kmtest-riscv/bin
+          cp userspace/build/riscv64/kmtest initramfs-kmtest-riscv/bin/kmtest
+          chmod +x initramfs-kmtest-riscv/bin/kmtest
+
+      - name: Boot QEMU + run kmtest suite (RISC-V)
+        run: |
+          # Boot with init=/bin/kmtest; capture all serial output.
+          # QEMU exits when kmtest calls exit_group(); timeout is a safety net.
+          timeout 60 qemu-system-riscv64 \
+            -machine virt \
+            -cpu rv64 \
+            -m 256M \
+            -bios default \
+            -kernel target/riscv64gc-unknown-none-elf/debug/rustos \
+            -initrd <(find initramfs-kmtest-riscv -mindepth 1 | \
+                      cpio -o -H newc --quiet) \
+            -append "init=/bin/kmtest" \
+            -serial stdio \
+            -display none \
+            -no-reboot \
+            -d guest_errors,cpu_reset \
+            2>&1 | tee qemu-kmtest-riscv.log || true
+
+      - name: Parse results (RISC-V)
+        run: |
+          echo "--- kmtest output ---"
+          grep -E '^(  (PASS|FAIL)|kmtest:)' qemu-kmtest-riscv.log || true
+          echo "---------------------"
+
+          # Require the summary line.
+          SUMMARY=$(grep '^kmtest: ' qemu-kmtest-riscv.log || true)
+          if [[ -z "$SUMMARY" ]]; then
+            echo "::error::kmtest summary line not found in serial output" >&2
+            echo "::error::Was the kernel built with --features kmtest?" >&2
+            exit 2
+          fi
+          echo "$SUMMARY"
+
+          # Fail if any test failed.
+          if grep -q '^  FAIL ' qemu-kmtest-riscv.log; then
+            NFAIL=$(grep -c '^  FAIL ' qemu-kmtest-riscv.log)
+            echo "::error::${NFAIL} kmtest(s) failed on RISC-V" >&2
+            exit 1
+          fi
+
+          # Check summary is "N/N passed" (all pass).
+          if ! echo "$SUMMARY" | grep -qE '^kmtest: ([0-9]+)/\1 passed$'; then
+            echo "::error::kmtest reported failures: $SUMMARY" >&2
+            exit 1
+          fi
+
+          echo "\u2705 All RISC-V kmtests passed."
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmtest-riscv-logs
+          path: |
+            build-riscv-kmtest.log
+            build-kmtest-runner-riscv.log
+            qemu-kmtest-riscv.log
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # x86_64 — multiboot2 (-kernel) boot, debug build, 256 MiB
+  # (OVMF UEFI is tested by the existing qemu-smoke job; multiboot is
+  # faster for CI and sufficient for exercising the test syscall path.)
+  # ────────────────────────────────────────────────────────────────────────────
+  kmtest-x86:
+    name: kmtest • x86_64 (multiboot2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: file
+          targets: x86_64-unknown-none
+          components: rust-src, llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-kmtest-${{ hashFiles('rust-toolchain.toml', 'Cargo.toml') }}
+
+      - name: Install QEMU (x86) + musl toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            musl-tools
+
+      - name: Build kernel (x86_64 + kmtest feature)
+        run: |
+          cargo build \
+            --target x86_64-unknown-none \
+            --features kmtest \
+            --no-default-features \
+            --features kmtest,multiboot2_boot,sysv_ipc,namespaces \
+            -Z build-std=core,alloc,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem \
+            2>&1 | tee build-x86-kmtest.log
+          test -f target/x86_64-unknown-none/debug/rustos
+
+      - name: Build kmtest userspace runner (x86_64)
+        run: |
+          cd userspace
+          make ARCH=x86_64 kmtest 2>&1 | tee ../build-kmtest-runner-x86.log
+          test -f build/x86_64/kmtest
+
+      - name: Stage kmtest runner into initramfs
+        run: |
+          mkdir -p initramfs-kmtest-x86/bin
+          cp userspace/build/x86_64/kmtest initramfs-kmtest-x86/bin/kmtest
+          chmod +x initramfs-kmtest-x86/bin/kmtest
+
+      - name: Boot QEMU + run kmtest suite (x86_64)
+        run: |
+          timeout 60 qemu-system-x86_64 \
+            -machine q35 \
+            -cpu qemu64,+xsave,+avx \
+            -m 256M \
+            -kernel target/x86_64-unknown-none/debug/rustos \
+            -initrd <(find initramfs-kmtest-x86 -mindepth 1 | \
+                      cpio -o -H newc --quiet) \
+            -append "init=/bin/kmtest" \
+            -serial stdio \
+            -display none \
+            -no-reboot \
+            -d guest_errors,cpu_reset \
+            2>&1 | tee qemu-kmtest-x86.log || true
+
+      - name: Parse results (x86_64)
+        run: |
+          echo "--- kmtest output ---"
+          grep -E '^(  (PASS|FAIL)|kmtest:)' qemu-kmtest-x86.log || true
+          echo "---------------------"
+
+          SUMMARY=$(grep '^kmtest: ' qemu-kmtest-x86.log || true)
+          if [[ -z "$SUMMARY" ]]; then
+            echo "::error::kmtest summary line not found in serial output" >&2
+            echo "::error::Was the kernel built with --features kmtest?" >&2
+            exit 2
+          fi
+          echo "$SUMMARY"
+
+          if grep -q '^  FAIL ' qemu-kmtest-x86.log; then
+            NFAIL=$(grep -c '^  FAIL ' qemu-kmtest-x86.log)
+            echo "::error::${NFAIL} kmtest(s) failed on x86_64" >&2
+            exit 1
+          fi
+
+          if ! echo "$SUMMARY" | grep -qE '^kmtest: ([0-9]+)/\1 passed$'; then
+            echo "::error::kmtest reported failures: $SUMMARY" >&2
+            exit 1
+          fi
+
+          echo "\u2705 All x86_64 kmtests passed."
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmtest-x86-logs
+          path: |
+            build-x86-kmtest.log
+            build-kmtest-runner-x86.log
+            qemu-kmtest-x86.log

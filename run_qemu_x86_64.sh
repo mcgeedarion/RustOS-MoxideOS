@@ -11,9 +11,13 @@
 #   --gdb         Halt at entry, wait for GDB on :1234
 #   --no-net      Disable virtio-net
 #   --smoke       Run headless, capture serial, and require a boot marker
-#   --timeout N   Smoke-test timeout in seconds (default: 20)
+#   --test        Run the kmtest suite: builds with --features kmtest,
+#                 boots with init=/bin/kmtest, captures serial output,
+#                 and exits with the kmtest runner's exit code.
+#                 Implies --no-net, no GPU, headless.
+#   --timeout N   Smoke/test timeout in seconds (default: 20; test default: 60)
 #   --smoke-marker TEXT
-#                Marker required in serial output (default: TEST PASS: uart_smoke)
+#                 Marker required in serial output (default: TEST PASS: uart_smoke)
 #
 # Boot modes:
 #   UEFI (default) — OVMF pflash + vvfat ESP; identical to real hardware.
@@ -42,7 +46,7 @@
 
 set -euo pipefail
 
-# ── Argument parsing ─────────────────────────────────────────────────────────
+# ── Argument parsing ─────────────────────────────────────────────────────
 
 GDB_MODE=0
 GPU_MODE=0
@@ -50,7 +54,9 @@ NET_MODE=1
 MULTIBOOT_MODE=0
 RELEASE_MODE=0
 SMOKE_MODE=0
+TEST_MODE=0
 SMOKE_TIMEOUT=20
+TEST_TIMEOUT=60
 SMOKE_MARKER="TEST PASS: uart_smoke"
 DISK=""
 
@@ -62,16 +68,19 @@ while [[ $# -gt 0 ]]; do
     --multiboot) MULTIBOOT_MODE=1; shift ;;
     --release)   RELEASE_MODE=1; shift ;;
     --smoke)     SMOKE_MODE=1; NET_MODE=0; GPU_MODE=0; shift ;;
+    --test)      TEST_MODE=1; NET_MODE=0; GPU_MODE=0; shift ;;
     --timeout)
       if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ || "$2" -eq 0 ]]; then
         echo "[!] --timeout requires a positive integer number of seconds" >&2
         exit 2
       fi
       SMOKE_TIMEOUT="$2"
+      TEST_TIMEOUT="$2"
       shift 2
       ;;
     --timeout=*)
       SMOKE_TIMEOUT="${1#--timeout=}"
+      TEST_TIMEOUT="$SMOKE_TIMEOUT"
       if [[ ! "$SMOKE_TIMEOUT" =~ ^[0-9]+$ || "$SMOKE_TIMEOUT" -eq 0 ]]; then
         echo "[!] --timeout requires a positive integer number of seconds" >&2
         exit 2
@@ -106,10 +115,18 @@ if [[ "$SMOKE_MODE" -eq 1 && "$GDB_MODE" -eq 1 ]]; then
   echo "[!] --smoke cannot be combined with --gdb" >&2
   exit 2
 fi
+if [[ "$TEST_MODE" -eq 1 && "$GDB_MODE" -eq 1 ]]; then
+  echo "[!] --test cannot be combined with --gdb" >&2
+  exit 2
+fi
+if [[ "$TEST_MODE" -eq 1 && "$SMOKE_MODE" -eq 1 ]]; then
+  echo "[!] --test cannot be combined with --smoke" >&2
+  exit 2
+fi
 
 PROFILE=$([ "$RELEASE_MODE" -eq 1 ] && echo release || echo debug)
 
-# ── Build ────────────────────────────────────────────────────────────────────
+# ── Build ────────────────────────────────────────────────────────────────
 
 CARGO_FLAGS=(
   --target x86_64-unknown-none
@@ -117,6 +134,12 @@ CARGO_FLAGS=(
   -Z build-std-features=compiler-builtins-mem
 )
 [[ "$RELEASE_MODE" -eq 1 ]] && CARGO_FLAGS+=(--release)
+
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  # Build a separate kmtest-enabled kernel; don't clobber the normal build.
+  echo "[*] Building rustos (x86_64, kmtest, $PROFILE)..."
+  CARGO_FLAGS+=(--features kmtest)
+fi
 
 if [[ "$MULTIBOOT_MODE" -eq 1 ]]; then
   echo "[*] Building rustos (multiboot2, $PROFILE)..."
@@ -133,7 +156,13 @@ else
   fi
 fi
 
-# ── Locate OVMF ──────────────────────────────────────────────────────────────
+# Build the kmtest userspace runner whenever --test is active.
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  echo "[*] Building kmtest userspace runner..."
+  (cd userspace && make ARCH=x86_64 kmtest 2>&1)
+fi
+
+# ── Locate OVMF ────────────────────────────────────────────────────────────
 
 if [[ "$MULTIBOOT_MODE" -eq 0 ]]; then
   OVMF_CANDIDATES=(
@@ -159,7 +188,7 @@ if [[ "$MULTIBOOT_MODE" -eq 0 ]]; then
   echo "[*] OVMF: $OVMF"
 fi
 
-# ── Assemble QEMU arguments ──────────────────────────────────────────────────
+# ── Assemble QEMU arguments ─────────────────────────────────────────────────────
 
 QEMU_ARGS=(
   -machine q35
@@ -179,6 +208,12 @@ else
     -drive "if=pflash,format=raw,readonly=on,file=${OVMF}"
     -drive "if=virtio,format=raw,file=fat:rw:target/esp,label=ESP"
   )
+fi
+
+# --test: override init with kmtest runner and add initrd with the binary.
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  echo "[*] Test mode: init=/bin/kmtest"
+  QEMU_ARGS+=(-append "init=/bin/kmtest")
 fi
 
 if [[ "$NET_MODE" -eq 1 ]]; then
@@ -222,6 +257,8 @@ if [[ "$GDB_MODE" -eq 1 ]]; then
 GDB
 fi
 
+# ── Smoke mode ─────────────────────────────────────────────────────────────
+
 if [[ "$SMOKE_MODE" -eq 1 ]]; then
   if ! command -v timeout >/dev/null 2>&1; then
     echo "[!] --smoke requires the 'timeout' command" >&2
@@ -251,6 +288,75 @@ if [[ "$SMOKE_MODE" -eq 1 ]]; then
   if [[ "$QEMU_STATUS" -ne 124 ]]; then
     echo "[!] QEMU exited with status ${QEMU_STATUS}" >&2
   fi
+  exit 1
+fi
+
+# ── Test mode ──────────────────────────────────────────────────────────────
+#
+# Boot the kmtest kernel, wait for the runner to complete, and parse
+# the exit status from the serial log.
+#
+# The kernel calls exit_group(N) after the runner exits; QEMU propagates
+# the guest exit code via -no-reboot + shutdown.  We also grep the serial
+# log for the canonical summary line so the exit code is reliable even if
+# the guest doesn’t shut down cleanly within the timeout.
+#
+# Exit-code contract (mirrors the userspace runner):
+#   0  — all tests passed
+#   1  — one or more tests failed
+#   2  — runner or syscall error (harness not built into kernel)
+
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "[!] --test requires the 'timeout' command" >&2
+    exit 1
+  fi
+
+  LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/rustos-kmtest.XXXXXX.log")
+  trap 'rm -f "$LOG_FILE"' EXIT
+
+  echo "[*] Starting QEMU kmtest run (${TEST_TIMEOUT}s timeout)..."
+  echo
+
+  set +e
+  timeout "${TEST_TIMEOUT}" qemu-system-x86_64 "${QEMU_ARGS[@]}" >"$LOG_FILE" 2>&1
+  QEMU_STATUS=$?
+  set -e
+
+  echo "---------- serial log ----------"
+  cat "$LOG_FILE"
+  echo "--------------------------------"
+
+  # Print the KMTEST lines in a human-friendly block.
+  echo
+  echo "[*] kmtest results:"
+  grep '^  \(PASS\|FAIL\)' "$LOG_FILE" || true
+  SUMMARY=$(grep '^kmtest: .* passed' "$LOG_FILE" || true)
+  echo "${SUMMARY:-[!] no summary line found}"
+
+  # Determine pass/fail.
+  # Priority: explicit summary line > grep for any FAIL line.
+  if echo "$SUMMARY" | grep -qE '^kmtest: ([0-9]+)/\1 passed$'; then
+    # "kmtest: N/N passed" means zero failures.
+    echo "[✓] All tests passed."
+    exit 0
+  fi
+
+  if grep -q '^  FAIL ' "$LOG_FILE"; then
+    NFAIL=$(grep -c '^  FAIL ' "$LOG_FILE" || true)
+    echo "[!] ${NFAIL} test(s) failed." >&2
+    exit 1
+  fi
+
+  # If we find no summary at all the harness likely didn’t run.
+  if [[ -z "$SUMMARY" ]]; then
+    echo "[!] kmtest summary not found in serial output" >&2
+    echo "    (was the kernel built with --features kmtest?)" >&2
+    exit 2
+  fi
+
+  # Summary line found but shows failures ("kmtest: 3/5 passed").
+  echo "[!] Some tests failed (see summary above)." >&2
   exit 1
 fi
 
