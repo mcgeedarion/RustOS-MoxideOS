@@ -16,14 +16,18 @@
 //!   /sys/devices/system/cpu/possible → cpu mask string
 //!   /sys/devices/system/cpu/present  → cpu mask string
 //!
-//!   /sys/bus/pci/devices/         → directory (empty listing)
+//!   /sys/bus/pci/devices/<bdf>/   → per-device dir, e.g. "0000:00:01.0"
+//!   /sys/bus/pci/devices/<bdf>/vendor  → "0xvvvv\n"
+//!   /sys/bus/pci/devices/<bdf>/device  → "0xdddd\n"
+//!   /sys/bus/pci/devices/<bdf>/class   → "0xcccccc\n" (class<<8|subclass)
 //!
 //!   /sys/class/net/lo/operstate   → "unknown"
 //!   /sys/class/net/lo/mtu         → "65536"
 //!   /sys/class/net/eth0/operstate → "up"
 //!   /sys/class/net/eth0/mtu       → "1500"
 //!
-//!   /sys/block/                   → directory (empty listing)
+//!   /sys/block/<name>/            → one dir per mass-storage PCI device
+//!
 //!   /sys/power/state              → "freeze standby mem disk"
 //!   /sys/power/wakeup_count       → "0"
 //!
@@ -63,7 +67,7 @@ pub fn is_sysfs_fd(fdno: usize) -> bool {
 
 /// Called by sys_open() when the path starts with "/sys/".
 /// Returns a synthetic fd on success, or -ENOENT (-2).
-pub fn sysfs_open(path: &str) -> isize {
+pub fn sysfs_open(path: &str, _flags: u32) -> isize {
     let (content, is_dir) = match generate(path) {
         Some(pair) => pair,
         None       => return -2,
@@ -113,6 +117,72 @@ pub struct DirEntry {
 pub fn sysfs_list_dir(path: &str) -> Option<Vec<DirEntry>> {
     let entries = static_children(path)?;
     Some(entries)
+}
+
+// ─── PCI helpers ────────────────────────────────────────────────────────────
+
+/// Build "0000:BB:DD.F" BDF strings for every enumerated PCI device.
+fn pci_list_devices() -> Vec<String> {
+    crate::device::pci::devices()
+        .into_iter()
+        .map(|d| alloc::format!("0000:{:02x}:{:02x}.{}", d.bus, d.dev, d.func))
+        .collect()
+}
+
+/// Parse a BDF string and return the matching PciDevice, if any.
+fn pci_lookup_by_bdf(bdf: &str) -> Option<crate::device::pci::PciDevice> {
+    // Expected format: "0000:bb:dd.f"
+    let mut parts = bdf.splitn(3, ':');
+    let _domain = parts.next()?;                          // always "0000"
+    let bus_s   = parts.next()?;
+    let rest    = parts.next()?;
+    let (dev_s, func_s) = rest.split_once('.')?;
+
+    let bus  = u8::from_str_radix(bus_s, 16).ok()?;
+    let devn = u8::from_str_radix(dev_s, 16).ok()?;
+    let func = u8::from_str_radix(func_s, 10).ok()?;
+
+    crate::device::pci::devices()
+        .into_iter()
+        .find(|d| d.bus == bus && d.dev == devn && d.func == func)
+}
+
+/// Return the sysfs attribute content for a path under /sys/bus/pci/devices/<bdf>/<attr>.
+/// Returns None if the path doesn't match that pattern.
+fn pci_sysfs_attr(path: &str) -> Option<Vec<u8>> {
+    const PREFIX: &str = "/sys/bus/pci/devices/";
+    let tail = path.strip_prefix(PREFIX)?;
+    let (bdf, attr) = tail.split_once('/')?;
+    let dev = pci_lookup_by_bdf(bdf)?;
+    match attr {
+        "vendor" => Some(alloc::format!("0x{:04x}\n", dev.vendor).into_bytes()),
+        "device" => Some(alloc::format!("0x{:04x}\n", dev.device).into_bytes()),
+        // class register is the upper byte of the 16-bit PCI_CLASS field;
+        // expose as 0xCCSS00 (class << 16 | subclass << 8) so lspci is happy.
+        "class"  => Some(alloc::format!("0x{:06x}\n",
+                         (dev.class as u32) << 8).into_bytes()),
+        _ => None,
+    }
+}
+
+// ─── Block device helpers ────────────────────────────────────────────────────
+//
+// No separate block registry exists yet; derive block device names from the
+// PCI class code.  PCI mass-storage class is 0x01xx (upper byte 0x01).
+// We name them vda, vdb, … in enumeration order (VirtIO convention).
+
+fn block_list_devices() -> Vec<String> {
+    let devs = crate::device::pci::devices();
+    let mut names = Vec::new();
+    let mut idx: u8 = 0;
+    for d in devs {
+        if (d.class >> 8) == 0x01 {
+            // 'a' == 97u8
+            names.push(alloc::format!("vd{}", (b'a' + idx) as char));
+            idx += 1;
+        }
+    }
+    names
 }
 
 // ─── Content / directory generator ─────────────────────────────────────────
@@ -182,6 +252,19 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
         return Some((Vec::new(), true));
     }
 
+    // Per-device BDF directory, e.g. /sys/bus/pci/devices/0000:00:01.0
+    if let Some(tail) = path.strip_prefix("/sys/bus/pci/devices/") {
+        if !tail.contains('/') {
+            // The BDF directory itself — valid if the device exists.
+            return pci_lookup_by_bdf(tail).map(|_| (Vec::new(), true));
+        }
+        // Attribute file under a BDF dir.
+        if let Some(content) = pci_sysfs_attr(path) {
+            return Some((content, false));
+        }
+        return None;
+    }
+
     // ── /sys/class/net/* ────────────────────────────────────────────────────
     if path == "/sys/class"
         || path == "/sys/class/net"
@@ -205,6 +288,13 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
     // ── /sys/block ──────────────────────────────────────────────────────────
     if path == "/sys/block" {
         return Some((Vec::new(), true));
+    }
+    // Block device subdirectory, e.g. /sys/block/vda
+    if let Some(name) = path.strip_prefix("/sys/block/") {
+        if !name.contains('/') && block_list_devices().contains(&name.to_string()) {
+            return Some((Vec::new(), true));
+        }
+        return None;
     }
 
     // ── /sys/power/* ────────────────────────────────────────────────────────
@@ -234,7 +324,7 @@ fn static_children(path: &str) -> Option<Vec<DirEntry>> {
         ],
         "/sys/kernel" => vec![
             fil("hostname"), fil("ostype"), fil("osrelease"),
-            fil("version"),  fil("pid_max"),fil("threads-max"),
+            fil("version"),  fil("pid_max"), fil("threads-max"),
             fil("dmesg_restrict"), fil("perf_event_paranoid"),
             fil("randomize_va_space"),
         ],
@@ -243,15 +333,31 @@ fn static_children(path: &str) -> Option<Vec<DirEntry>> {
         "/sys/devices/system/cpu"      => vec![
             fil("online"), fil("possible"), fil("present"),
         ],
-        "/sys/bus"                     => vec![dir("pci")],
-        "/sys/bus/pci"                 => vec![dir("devices")],
-        "/sys/bus/pci/devices"         => vec![],
-        "/sys/class"                   => vec![dir("net")],
-        "/sys/class/net"               => vec![dir("lo"), dir("eth0")],
-        "/sys/class/net/lo"            => vec![fil("operstate"), fil("mtu")],
-        "/sys/class/net/eth0"          => vec![fil("operstate"), fil("mtu")],
-        "/sys/block"                   => vec![],
-        "/sys/power"                   => vec![fil("state"), fil("wakeup_count")],
+        "/sys/bus"     => vec![dir("pci")],
+        "/sys/bus/pci" => vec![dir("devices")],
+        "/sys/bus/pci/devices" => {
+            pci_list_devices().iter().map(|bdf| dir(bdf)).collect()
+        }
+        path if path.starts_with("/sys/bus/pci/devices/") => {
+            let tail = &path["/sys/bus/pci/devices/".len()..];
+            if tail.contains('/') {
+                // No subdirectories inside a BDF dir yet.
+                Vec::new()
+            } else {
+                // Only show children for BDF dirs that actually exist.
+                pci_lookup_by_bdf(tail).map(|_| {
+                    vec![fil("vendor"), fil("device"), fil("class")]
+                }).unwrap_or_default()
+            }
+        }
+        "/sys/class"          => vec![dir("net")],
+        "/sys/class/net"      => vec![dir("lo"), dir("eth0")],
+        "/sys/class/net/lo"   => vec![fil("operstate"), fil("mtu")],
+        "/sys/class/net/eth0" => vec![fil("operstate"), fil("mtu")],
+        "/sys/block" => {
+            block_list_devices().iter().map(|n| dir(n)).collect()
+        }
+        "/sys/power" => vec![fil("state"), fil("wakeup_count")],
         _ => return None,
     };
     Some(entries)
