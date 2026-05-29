@@ -24,6 +24,7 @@
 //!  10c. virtio_blk fallback           — QEMU / no real disk
 //!  11.  mount_initramfs()             — CPIO initrd
 //!  12.  mount_root()                  — ext2 or ramfs
+//!  12b. gdbstub::session::init()      — /dev/gdbstub on COM1 [cfg(gdbstub)]
 //!  13.  spawn_init()                  — PID 1
 //!  14.  idle loop
 
@@ -42,6 +43,13 @@ const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
 #[cfg(feature = "multiboot2_boot")]
 pub static mut MBI_PTR: usize = 0;
+
+// GDB stub uses its own SerialPort instance on COM1 (separate from the
+// console which is write-only).  Guarded so it isn't compiled in at all
+// unless the `gdbstub` feature is active.
+#[cfg(feature = "gdbstub")]
+static mut GDBSTUB_SERIAL: crate::debug::gdbstub::serial::SerialPort =
+    unsafe { crate::debug::gdbstub::serial::SerialPort::new() };
 
 #[cfg(feature = "multiboot2_boot")]
 #[no_mangle]
@@ -140,6 +148,11 @@ pub extern "C" fn kernel_main() -> ! {
     } else {
         serial_println!("block: no disk — ramfs only");
     }
+
+    // 12b. GDB stub — init after devfs is live (initramfs::mount sets up /dev).
+    // Initialises COM1 for RSP and registers /dev/gdbstub.
+    #[cfg(feature = "gdbstub")]
+    unsafe { crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL); }
 
     const INITS: &[&str] = &["/sbin/init", "/bin/sh", "/init", "/bin/bash"];
     let mut spawned = false;
