@@ -13,12 +13,19 @@
 //!   `s[addr]`     → single-step
 //!   `k`           → kill
 //!   `q*`          → qSupported / qAttached stubs
+//!   `Z<t>,<addr>,<len>` → insert breakpoint / watchpoint
+//!   `z<t>,<addr>,<len>` → remove breakpoint / watchpoint
 
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::target::GdbTarget;
+use super::breakpoints::{
+    SwBreakpointTable, HwBreakpointTable, WatchpointTable, WatchKind,
+    riscv_add_trigger, riscv_remove_trigger,
+    RISCV_TRIG_EXEC, RISCV_TRIG_STORE, RISCV_TRIG_LOAD,
+};
 use crate::proc::ptrace::{
     UREG_COUNT, UREG_RIP, UREG_RSP, UREG_EFLAGS,
     UREG_RAX, UREG_RBX, UREG_RCX, UREG_RDX,
@@ -100,11 +107,54 @@ fn gdb_reg_order() -> [usize; GDB_REG_COUNT] {
     ]
 }
 
+// ── Z/z helpers ───────────────────────────────────────────────────────────────
+
+/// Parse `<type>,<addr>,<len>` from a Z or z packet body (after the leading
+/// `Z`/`z` byte has been stripped).
+fn parse_zpacket(rest: &str) -> Option<(u8, u64, usize)> {
+    let mut it = rest.splitn(3, ',');
+    let t    = u8::from_str_radix(it.next()?, 16).ok()?;
+    let addr = parse_hex_u64(it.next()?);
+    let len  = usize::from_str_radix(it.next()?, 16).unwrap_or(1);
+    Some((t, addr, len))
+}
+
+// ── Session state (breakpoint tables) ─────────────────────────────────────────
+//
+// `handle_packet` is stateless for every packet *except* Z/z which must
+// consult the per-session breakpoint tables.  Pass a `Session` alongside
+// the target so the tables survive across calls.
+
+pub struct Session {
+    pub sw_bps:  SwBreakpointTable,
+    pub hw_bps:  HwBreakpointTable,
+    pub watches: WatchpointTable,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Session {
+            sw_bps:  SwBreakpointTable::new(),
+            hw_bps:  HwBreakpointTable::new(),
+            watches: WatchpointTable::new(),
+        }
+    }
+
+    /// Remove every bp/watchpoint — call on detach or kill.
+    pub fn detach(&mut self, target: &mut GdbTarget) {
+        self.sw_bps.remove_all(target);
+        self.hw_bps.remove_all(target);
+        self.watches.remove_all(target);
+    }
+}
+
 // ── Packet dispatch ───────────────────────────────────────────────────────────
 
 /// Process one RSP packet body (without the `$` prefix and `#XX` suffix).
-/// Returns the response string (already framed with `rsp_packet`).
-pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
+/// Returns the response string (already framed with `rsp_packet`), or an
+/// empty string for packets where GDB expects no reply until the next stop
+/// event (e.g. `c`, `s`).
+pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) -> String {
     if body.is_empty() { return rsp_packet(""); }
 
     match body.as_bytes()[0] {
@@ -112,7 +162,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
         b'?' => {
             let status = target.poll_status();
             if status.starts_with('T') {
-                // Already in RSP stop-reply format: "T05" etc.
                 rsp_packet(&status)
             } else {
                 rsp_packet("T05")
@@ -136,7 +185,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
             let hex = &body[1..];
             let bytes = decode_hex_bytes(hex);
             let order = gdb_reg_order();
-            let mut regs = target.read_regs(); // start from current
+            let mut regs = target.read_regs();
             for (i, &idx) in order.iter().enumerate() {
                 if idx >= UREG_COUNT { continue; }
                 let off = i * 8;
@@ -149,7 +198,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
 
         // ── m — read memory ───────────────────────────────────────────────────
         b'm' => {
-            // format: m<addr>,<len>
             let rest = &body[1..];
             let mut parts = rest.splitn(2, ',');
             let addr = parse_hex_u64(parts.next().unwrap_or(""));
@@ -160,7 +208,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
 
         // ── M — write memory ──────────────────────────────────────────────────
         b'M' => {
-            // format: M<addr>,<len>:<hexdata>
             let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
             let addr_len = &rest[..colon];
@@ -174,7 +221,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
 
         // ── c — continue ──────────────────────────────────────────────────────
         b'c' => {
-            // optional address: set RIP before continuing
             let rest = &body[1..];
             if !rest.is_empty() {
                 let addr = parse_hex_u64(rest);
@@ -183,8 +229,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
                 target.write_regs(&regs);
             }
             target.ctl("cont");
-            // GDB expects no reply for 'c' until the next stop
-            String::new()
+            String::new() // no reply until next stop
         }
 
         // ── s — single-step ───────────────────────────────────────────────────
@@ -197,19 +242,53 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
                 target.write_regs(&regs);
             }
             target.ctl("step");
-            String::new()
+            String::new() // no reply until next stop
         }
 
         // ── k — kill ──────────────────────────────────────────────────────────
         b'k' => {
+            session.detach(target);
             crate::proc::signal::send_signal(target.pid, 9);
             rsp_packet("OK")
+        }
+
+        // ── Z — insert breakpoint / watchpoint ───────────────────────────────
+        // Z0,addr,len  software breakpoint
+        // Z1,addr,len  hardware execution breakpoint
+        // Z2,addr,len  write watchpoint
+        // Z3,addr,len  read watchpoint
+        // Z4,addr,len  access (read/write) watchpoint
+        b'Z' => {
+            let ok = match parse_zpacket(&body[1..]) {
+                None => false,
+                Some((0, addr, _len)) => session.sw_bps.add(target, addr),
+                Some((1, addr, _len)) => session.hw_bps.add_exec(target, addr),
+                Some((2, addr, len))  => session.watches.add(target, addr, len, WatchKind::Write),
+                Some((3, addr, len))  => session.watches.add(target, addr, len, WatchKind::Read),
+                Some((4, addr, len))  => session.watches.add(target, addr, len, WatchKind::Access),
+                Some(_) => false,
+            };
+            if ok { rsp_packet("OK") } else { rsp_packet("E01") }
+        }
+
+        // ── z — remove breakpoint / watchpoint ───────────────────────────────
+        b'z' => {
+            let ok = match parse_zpacket(&body[1..]) {
+                None => false,
+                Some((0, addr, _))   => session.sw_bps.remove(target, addr),
+                Some((1, addr, _))   => session.hw_bps.remove(target, addr),
+                Some((2, addr, _)) | Some((3, addr, _)) | Some((4, addr, _))
+                                     => session.watches.remove(target, addr),
+                Some(_) => false,
+            };
+            if ok { rsp_packet("OK") } else { rsp_packet("E01") }
         }
 
         // ── q — query packets ─────────────────────────────────────────────────
         b'q' => {
             if body.starts_with("qSupported") {
-                rsp_packet("PacketSize=4000")
+                // Advertise Z/z support alongside PacketSize
+                rsp_packet("PacketSize=4000;swbreak+;hwbreak+")
             } else if body.starts_with("qAttached") {
                 rsp_packet("1")
             } else if body.starts_with("qC") {
