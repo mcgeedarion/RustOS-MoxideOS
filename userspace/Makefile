@@ -15,6 +15,7 @@
 #   build/<arch>/hello              → staged as /bin/hello
 #   build/<arch>/rustos-compositor  → staged as /usr/bin/rustos-compositor
 #   build/<arch>/smoke              → staged as /bin/smoke   (QEMU smoke test)
+#   build/<arch>/kmtest             → staged as /bin/kmtest  (kernel test runner)
 
 ARCH       ?= x86_64
 BUILD_DIR  := build/$(ARCH)
@@ -32,7 +33,7 @@ else
 endif
 
 # List every subdirectory that contains a C program here.
-PROGRAMS := init hello wayland smoke
+PROGRAMS := init hello wayland smoke kmtest
 
 .PHONY: all clean install $(PROGRAMS)
 
@@ -53,6 +54,14 @@ hello: $(BUILD_DIR)
 #   - can be extended later with basic invariants (e.g. /proc/1 exists).
 smoke: $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $(BUILD_DIR)/smoke smoke/smoke.c
+
+# Kernel test runner:
+#   - calls SYS_KMTEST_LIST to discover registered tests
+#   - calls SYS_KMTEST_RUN per test (or a named subset from argv)
+#   - exits non-zero on any failure, making it CI-friendly
+#   - _GNU_SOURCE required for snprintf in strict -std=c11 mode with musl
+kmtest: $(BUILD_DIR)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $(BUILD_DIR)/kmtest kmtest/kmtest.c
 
 # The Wayland compositor is a privileged userspace process.
 # It is installed as /usr/bin/rustos-compositor in the initramfs.
@@ -76,6 +85,7 @@ wayland: $(BUILD_DIR)
 #     init                        ← exec'd directly as PID 1 by the kernel
 #     bin/hello
 #     bin/smoke                   ← small QEMU smoke-test helper
+#     bin/kmtest                  ← kernel test runner
 #     usr/bin/rustos-compositor   ← spawned by init as PID 2
 #
 # Usage: make install DESTDIR=path/to/initramfs/root
@@ -85,6 +95,7 @@ install: all
 	cp $(BUILD_DIR)/init                $(DESTDIR)/init
 	cp $(BUILD_DIR)/hello               $(DESTDIR)/bin/hello
 	cp $(BUILD_DIR)/smoke               $(DESTDIR)/bin/smoke
+	cp $(BUILD_DIR)/kmtest              $(DESTDIR)/bin/kmtest
 	cp $(BUILD_DIR)/rustos-compositor   $(DESTDIR)/usr/bin/rustos-compositor
 
 clean:
