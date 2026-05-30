@@ -17,17 +17,28 @@
 //!   ```
 //!
 //! No code outside `src/arch/` should import from `arch::x86_64` or
-//! `arch::riscv64` directly.  Use `arch::Arch` and `arch::api::*`.
+//! `arch::riscv64`, or `arch::aarch64` directly.  Use `arch::Arch` and `arch::api::*`.
 
 pub mod api;
 
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64;
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::hal;
+#[cfg(target_arch = "aarch64")]
+use aarch64::hal::ArchImpl;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::hal;
 #[cfg(target_arch = "x86_64")]
 use x86_64::hal::ArchImpl;
 
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::hal;
 #[cfg(target_arch = "riscv64")]
 use riscv64::hal::ArchImpl;
 

@@ -6,6 +6,7 @@
 //! |-----------|-------------------------------------------|
 //! | x86_64    | `multiboot2_entry()` or `uefi_start()`    |
 //! | riscv64   | RISC-V SBI stub in `arch/riscv64/boot.rs` |
+//! | aarch64   | ARM64 UEFI `efi_main()` in `arch/aarch64/uefi_entry.rs` |
 //!
 //! ## x86_64 boot sequence
 //!
@@ -59,10 +60,14 @@ pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
     use crate::arch::riscv64::{fdt, plic, trap};
 
     trap::trap_init();
-    unsafe { fdt::fdt_phase1(fdt_ptr); }
+    unsafe {
+        fdt::fdt_phase1(fdt_ptr);
+    }
 
     let regions = crate::arch::riscv64::memory::discover(fdt_ptr);
-    unsafe { crate::mm::pmm::init_from_regions(&regions); }
+    unsafe {
+        crate::mm::pmm::init_from_regions(&regions);
+    }
 
     plic::init();
 
@@ -80,7 +85,9 @@ pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
     crate::display::drm::init();
     crate::display::wayland::init();
 
-    unsafe { fdt::fdt_phase2(fdt_ptr); }
+    unsafe {
+        fdt::fdt_phase2(fdt_ptr);
+    }
     crate::block::virtio_blk::init();
 
     crate::drivers::keyboard::init();
@@ -110,6 +117,26 @@ pub fn kernel_main_riscv64(fdt_ptr: usize) -> ! {
     unreachable!("scheduler returned to kernel_main_riscv64");
 }
 
+// ── aarch64 / ARM64 ─────────────────────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+pub fn kernel_main_aarch64() -> ! {
+    crate::serial_println!(
+        "RustOS ARM64 boot: {}",
+        crate::arch::aarch64::mem_layout::BASELINE
+    );
+
+    // Until ACPI/DT discovery is wired into the generic boot path, bring up the
+    // QEMU `virt` GICv3-compatible baseline so early IRQ code has a concrete
+    // controller implementation. Real hardware should replace this with MADT/FDT
+    // supplied GICv2/GICv3 MMIO addresses before unmasking external IRQs.
+    crate::irq::aarch64::gic::init(crate::irq::aarch64::gic::GicConfig::qemu_virt_v3());
+
+    loop {
+        crate::arch::aarch64::hal::wait_for_interrupt();
+    }
+}
+
 // ── Panic handler ─────────────────────────────────────────────────────────────
 
 #[panic_handler]
@@ -136,5 +163,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     #[cfg(feature = "debug")]
     crate::debug::oops::oops(msg);
 
-    loop { core::hint::spin_loop(); }
+    loop {
+        core::hint::spin_loop();
+    }
 }

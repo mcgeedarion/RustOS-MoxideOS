@@ -8,6 +8,10 @@
 //!   Firmware → `uefi_start()` (in `arch/x86_64/uefi_entry.rs`)
 //!            → `kernel_main()` (in `arch/x86_64/kernel_main.rs`)
 //!
+//! ## ARM64 UEFI path
+//!   Firmware → `efi_main()` (in `arch/aarch64/uefi_entry.rs`)
+//!            → `kernel_main_aarch64()` (in `kernel_main.rs`)
+//!
 //! ## x86_64 Multiboot2 / QEMU `-kernel` path
 //!   QEMU loads the ELF64, enters long mode, and jumps to `_start` below.
 //!   `_start` sets RSP to `BOOT_STACK_TOP` and calls `kernel_main()`.
@@ -16,6 +20,7 @@
 #![no_main]
 extern crate rustos;
 
+#[cfg(target_arch = "x86_64")]
 use rustos::arch::x86_64::uefi_entry::RSDP_PHYS;
 
 /// x86_64 Multiboot2 / QEMU entry stub.

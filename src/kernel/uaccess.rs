@@ -99,9 +99,18 @@ where
     {
         arch_riscv64::with_user_access_enabled(f)
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+    #[cfg(target_arch = "aarch64")]
     {
-        // Fallback for unsupported architectures (should not link in practice).
+        // ARM64 user access is controlled by PAN. The initial ARM64 bring-up
+        // keeps this path explicit until exception-table fault fixups land.
+        Ok(f())
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )))]
+    {
         let _ = f;
         Err(UaccessError::Fault)
     }

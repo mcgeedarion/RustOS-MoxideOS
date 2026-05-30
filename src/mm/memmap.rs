@@ -15,7 +15,11 @@
 
 /// How this kernel instance was booted.
 #[derive(Clone, Copy, PartialEq)]
-pub enum BootSource { Uefi, Multiboot2, Unknown }
+pub enum BootSource {
+    Uefi,
+    Multiboot2,
+    Unknown,
+}
 
 pub static mut BOOT_SOURCE: BootSource = BootSource::Unknown;
 
@@ -28,8 +32,16 @@ fn phys_to_virt(pa: u64) -> usize {
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn phys_to_virt(pa: u64) -> usize {
-    extern "C" { static KERNEL_PHYS_BASE: usize; }
+    extern "C" {
+        static KERNEL_PHYS_BASE: usize;
+    }
     unsafe { pa as usize + KERNEL_PHYS_BASE }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn phys_to_virt(pa: u64) -> usize {
+    crate::arch::aarch64::mem_layout::va48::phys_to_virt(pa as usize)
 }
 
 // UEFI / Multiboot2 ingestion now lives in arch-specific memory
@@ -41,6 +53,6 @@ pub fn memmap_init() {
     crate::log::kprintln!(
         "pmm: {} MiB total, {} MiB free",
         crate::mm::pmm::total_pages() * 4 / 1024,
-        crate::mm::pmm::free_pages()  * 4 / 1024,
+        crate::mm::pmm::free_pages() * 4 / 1024,
     );
 }

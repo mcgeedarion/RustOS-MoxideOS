@@ -2,10 +2,12 @@
 use alloc::string::String;
 
 pub fn print(s: &str) {
-    #[cfg(target_arch="x86_64")]
+    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::serial::serial_print(s);
-    #[cfg(target_arch="riscv64")]
+    #[cfg(target_arch = "riscv64")]
     crate::arch::riscv64::hal::sbi_console_putstr(s);
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::hal::serial_write(s.as_bytes());
 }
 
 pub fn println(s: &str) {

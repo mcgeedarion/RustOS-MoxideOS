@@ -35,6 +35,6 @@ components = [
 targets = [
   "riscv64gc-unknown-none-elf", # SBI / bare RISC-V boot
   "x86_64-unknown-none",        # x86_64 bare-metal
-  # riscv64-uefi.json is a *custom* target — not listed here.
-  # Used via --target riscv64-uefi.json with -Z build-std.
+  # riscv64-uefi.json and aarch64-uefi-loader.json are custom targets — not listed here.
+  # Used via --target <json> with -Z build-std.
 ]

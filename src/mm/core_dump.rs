@@ -46,7 +46,9 @@ const PF_X:        u32    = 1;
 const EM_MACHINE: u16 = 62;  // EM_X86_64
 #[cfg(target_arch = "riscv64")]
 const EM_MACHINE: u16 = 243; // EM_RISCV
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(target_arch = "aarch64")]
+const EM_MACHINE: u16 = 183; // EM_AARCH64
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
 const EM_MACHINE: u16 = 0;   // EM_NONE — unsupported arch
 
 // ── Note type numbers ────────────────────────────────────────────────────────

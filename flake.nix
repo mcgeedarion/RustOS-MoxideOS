@@ -1,5 +1,5 @@
 {
-  description = "rustos — Rust bare-metal OS (x86_64 + RISC-V)";
+  description = "rustos — Rust bare-metal OS (x86_64 + RISC-V + ARM64)";
 
   # IMPORTANT: keep the nightly date here in sync with:
   #   rust-toolchain.toml  (channel = "nightly-YYYY-MM-DD")
@@ -31,7 +31,7 @@
           targets = [
             "riscv64gc-unknown-none-elf"
             "x86_64-unknown-none"
-            # riscv64-uefi.json is a custom JSON target; not a rustup target.
+            # riscv64-uefi.json and aarch64-uefi-loader.json are custom JSON targets; not rustup targets.
           ];
         };
 
@@ -120,6 +120,7 @@
             echo "                         -Z build-std=core,alloc,compiler_builtins"
             echo "                         -Z build-std-features=compiler-builtins-mem"
             echo "  Build (x86_64):      cargo build --target x86_64-unknown-none --no-default-features"
+            echo "  Build (ARM64 UEFI):  cargo build --target targets/aarch64-uefi-loader.json"
             echo "                         -Z build-std=core,alloc,compiler_builtins"
             echo "                         -Z build-std-features=compiler-builtins-mem"
             echo "  Run QEMU:            ./run_qemu_x86_64.sh"

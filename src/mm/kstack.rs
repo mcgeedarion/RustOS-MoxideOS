@@ -15,7 +15,10 @@
 //! the initial RSP).  `free_kstack()` uses those records directly — never
 //! pointer arithmetic — so the allocator is correct even when VA != PA.
 
-use crate::arch::{Arch, api::{Paging, PageFlags}};
+use crate::arch::{
+    api::{PageFlags, Paging},
+    Arch,
+};
 
 const PAGE: usize = 4096;
 
@@ -37,8 +40,16 @@ fn phys_to_virt(pa: usize) -> usize {
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn phys_to_virt(pa: usize) -> usize {
-    extern "C" { static KERNEL_PHYS_BASE: usize; }
+    extern "C" {
+        static KERNEL_PHYS_BASE: usize;
+    }
     unsafe { pa + KERNEL_PHYS_BASE }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn phys_to_virt(pa: usize) -> usize {
+    crate::arch::aarch64::mem_layout::va48::phys_to_virt(pa)
 }
 
 // ── Public types ───────────────────────────────────────────────────────────────────
@@ -54,13 +65,13 @@ pub struct KstackInfo {
 
     // Virtual addresses (physmap window) — passed to unmap_page.
     va_guard: usize,
-    va0:      usize,
-    va1:      usize,
+    va0: usize,
+    va1: usize,
 
     // Physical addresses — passed to pmm::free_page.
     pa_guard: usize,
-    pa0:      usize,
-    pa1:      usize,
+    pa0: usize,
+    pa1: usize,
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────────
@@ -93,16 +104,16 @@ pub fn alloc_kstack() -> Option<KstackInfo> {
     // Derive kernel-virtual addresses through the physmap window.
     // These are the VAs that map_page / unmap_page / the scheduler use.
     let va_guard = phys_to_virt(pa_guard);
-    let va0      = phys_to_virt(pa0);
-    let va1      = phys_to_virt(pa1);
+    let va0 = phys_to_virt(pa0);
+    let va1 = phys_to_virt(pa1);
 
-    let cr3          = <Arch as Paging>::kernel_cr3();
+    let cr3 = <Arch as Paging>::kernel_cr3();
     let kstack_flags = PageFlags::PRESENT | PageFlags::WRITE; // supervisor R/W, no USER
 
     // Guard page: PageFlags::empty() → not-present → overflow faults immediately.
     <Arch as Paging>::map_page(cr3, va_guard, pa_guard, PageFlags::empty());
-    <Arch as Paging>::map_page(cr3, va0,      pa0,      kstack_flags);
-    <Arch as Paging>::map_page(cr3, va1,      pa1,      kstack_flags);
+    <Arch as Paging>::map_page(cr3, va0, pa0, kstack_flags);
+    <Arch as Paging>::map_page(cr3, va1, pa1, kstack_flags);
 
     Some(KstackInfo {
         top: va1 + PAGE, // RSP starts one byte past the top of va1
