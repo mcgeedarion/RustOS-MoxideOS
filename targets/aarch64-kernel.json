@@ -1,0 +1,55 @@
+{
+  "llvm-target": "aarch64-unknown-none",
+  "target-endian": "little",
+  "target-pointer-width": "64",
+  "target-c-int-width": "32",
+  "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128",
+  "arch": "aarch64",
+
+  "os": "none",
+  "env": "",
+  "vendor": "rustos",
+
+  "linker-flavor": "ld.lld",
+  "linker": "rust-lld",
+
+  "executables": true,
+
+  /*
+   * Disable the red-zone: exception handlers on AArch64 can fire at any time
+   * and would corrupt a red-zone below SP.
+   */
+  "disable-redzone": true,
+
+  "panic-strategy": "abort",
+
+  "relocation-model": "static",
+
+  /*
+   * "small" code model: all symbols within a 4 GiB range.
+   * Matches the static kernel image assumption in linker_aarch64.ld and
+   * consistent with aarch64-uefi-loader.json.
+   */
+  "code-model": "small",
+
+  /*
+   * Disable NEON/FP entirely: the kernel must not touch the FP/SIMD register
+   * file because those registers are not saved on exception entry by default.
+   * +strict-align prevents unaligned accesses (required for device MMIO).
+   */
+  "features": "-neon,-fp-armv8,+strict-align",
+
+  "max-atomic-width": 128,
+
+  "frame-pointer": "always",
+
+  "eliminate-frame-pointer": false,
+
+  "no-default-libraries": true,
+
+  "pre-link-args": {
+    "ld.lld": [
+      "--script=linker_aarch64.ld"
+    ]
+  }
+}
