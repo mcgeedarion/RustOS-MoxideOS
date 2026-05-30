@@ -9,12 +9,14 @@
 //! * [`panic`]       — kernel panic handler
 //! * [`cpu_local`]   — per-CPU variable accessor
 //! * [`collections`] — intrusive linked-list and ring-buffer
+//! * [`fast_hash`]   — fast maps for trusted kernel-internal keys
 
 #![allow(dead_code)]
 
 pub mod collections;
 pub mod cpu_local;
 pub mod error;
+pub mod fast_hash;
 pub mod panic;
 
 pub use error::{KernelError, KResult};

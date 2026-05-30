@@ -1,15 +1,15 @@
 # Hashing policy and performance audit
 
-This kernel currently does not use `HashMap`, `HashSet`, `DefaultHasher`,
-`SipHasher`, or a custom `BuildHasher` in runtime code. Most keyed registries
-are `BTreeMap`s, and the remaining "hash-like" code paths are protocol or
-integrity checksums. If a future change converts a registry from `BTreeMap` to a
-hash table, use the policy below to choose the hasher.
+This kernel now provides `KernelFastMap`, a small FxHash-style hash table for
+trusted, bounded, kernel-internal keys. Most keyed registries still use
+`BTreeMap`, and the remaining "hash-like" code paths are protocol or integrity
+checksums. If a future change converts another registry from `BTreeMap` to a fast
+hash table, use the policy below to choose the map.
 
 ## Rule of thumb
 
-Use a fast, non-cryptographic keyed hash such as `FxHash` or `AHash` only when
-all of the following are true:
+Use a fast, non-cryptographic hash such as `KernelFastMap`, `FxHash`, or `AHash`
+only when all of the following are true:
 
 1. The key is kernel-generated, bounded, or otherwise not chosen in bulk by an
    untrusted user or network peer.
@@ -24,7 +24,7 @@ Prefer a collision-resistant or randomized hasher, or keep `BTreeMap`, whenever
 keys are attacker-controlled strings, paths, socket names, namespace names,
 packet fields, or other externally supplied values that can be sprayed in bulk.
 Never replace cryptographic/security randomness or required protocol checksums
-with `FxHash`/`AHash`.
+with `KernelFastMap`/`FxHash`/`AHash`.
 
 ## Good candidates for fast hashing
 
@@ -34,7 +34,7 @@ bytes:
 
 | Area | Current examples | Why it can be safe |
 | --- | --- | --- |
-| File-descriptor and synthetic descriptor tables | `RAW_FDS`, `PROC_FD_TABLES`, scheme fd maps, pipe tables, timerfd/eventfd/pidfd/procfs/debug fd tables | Keys are kernel-assigned descriptor numbers or process ids; values are protected by kernel synchronization. |
+| File-descriptor and synthetic descriptor tables | `RAW_FDS`, `PROC_FD_TABLES`, timerfd/pidfd/proc-debug fd tables, scheme fd maps, pipe tables, eventfd/procfs tables | Keys are kernel-assigned descriptor numbers or process ids; values are protected by kernel synchronization. Several of these now use `KernelFastMap`. |
 | Scheduler/process bookkeeping | task-group maps, per-pid restart blocks, signal queues, itimer tables | Keys are kernel process or group ids; collision attacks are not the security boundary. |
 | Futex and wait bookkeeping | futex table and priority-inheritance records keyed by normalized futex addresses | The lookup is a synchronization accelerator; do not hash raw unvalidated user bytes. |
 | In-memory filesystem caches | dcache `(parent, name)` cache, tmpfs/ramfs inode-number maps, mount tables with trusted/generated names | Numeric inode keys are safe; path/name keys need the caution below because names can be user supplied. |
@@ -44,7 +44,7 @@ bytes:
 
 ## Keep security-oriented or deterministic code out of fast hashing
 
-Do not replace the following with `FxHash`/`AHash`:
+Do not replace the following with `KernelFastMap`/`FxHash`/`AHash`:
 
 | Area | Current examples | Reason |
 | --- | --- | --- |
@@ -56,12 +56,11 @@ Do not replace the following with `FxHash`/`AHash`:
 
 ## Implementation guidance
 
-* Introduce type aliases instead of open-coding hashers, for example
-  `type KernelFastMap<K, V> = hashbrown::HashMap<K, V, ahash::RandomState>` for
-  approved non-security-critical tables.
-* Keep a separate alias for attacker-controlled keys, e.g.
-  `KernelSafeMap`, so review can distinguish performance-only lookups from
-  security-sensitive or externally keyed maps.
+* Use `crate::core::fast_hash::KernelFastMap` for approved non-security-critical
+  tables instead of open-coding new hashers or ad-hoc hash tables.
+* Keep attacker-controlled keys on `BTreeMap` or a future `KernelSafeMap`, so
+  review can distinguish performance-only lookups from security-sensitive or
+  externally keyed maps.
 * Add a short comment at each conversion explaining why the key is trusted,
   bounded, and not part of deterministic output.
 * Benchmark or profile before replacing `BTreeMap`; for tiny tables, tree maps

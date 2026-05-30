@@ -32,16 +32,13 @@
 //! blocking driver IPC round-trips.
 
 extern crate alloc;
-use alloc::{
-    collections::BTreeMap,
-    sync::Arc,
-    vec::Vec,
-};
+use crate::core::fast_hash::KernelFastMap;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 
-use scheme_api::{SchemeFileId, SchemeError};
 use super::scheme_table::Scheme;
+use scheme_api::{SchemeError, SchemeFileId};
 
 // ---------------------------------------------------------------------------
 // Synthetic backing-fd allocator
@@ -53,7 +50,7 @@ use super::scheme_table::Scheme;
 // `free_scheme_backing_fd` so numbers are reused rather than lost.
 
 static SCHEME_FD_COUNTER: AtomicUsize = AtomicUsize::new(0x8000_0000);
-static FREE_SCHEME_FDS:   Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static FREE_SCHEME_FDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Allocate a fresh synthetic backing-fd number for a scheme fd.
 ///
@@ -80,30 +77,41 @@ pub fn free_scheme_backing_fd(fd: usize) {
 
 struct SchemeFdEntry {
     scheme: Arc<dyn Scheme>,
-    fid:    SchemeFileId,
+    fid: SchemeFileId,
 }
 
 struct SchemeFdStore {
-    map: Mutex<BTreeMap<usize, SchemeFdEntry>>,
+    map: Mutex<KernelFastMap<usize, SchemeFdEntry>>,
 }
 
 impl SchemeFdStore {
     const fn new() -> Self {
-        Self { map: Mutex::new(BTreeMap::new()) }
+        // Fast map is safe here: keys are kernel-assigned synthetic backing fd
+        // numbers and no user-visible output depends on iteration order.
+        Self {
+            map: Mutex::new(KernelFastMap::new()),
+        }
     }
 
     fn insert(&self, backing_fd: usize, scheme: Arc<dyn Scheme>, fid: SchemeFileId) {
-        self.map.lock().insert(backing_fd, SchemeFdEntry { scheme, fid });
+        self.map
+            .lock()
+            .insert(backing_fd, SchemeFdEntry { scheme, fid });
     }
 
     /// Clone the (scheme, fid) pair for `backing_fd`, if present.
     fn get(&self, backing_fd: usize) -> Option<(Arc<dyn Scheme>, SchemeFileId)> {
         let guard = self.map.lock();
-        guard.get(&backing_fd).map(|e| (Arc::clone(&e.scheme), e.fid))
+        guard
+            .get(&backing_fd)
+            .map(|e| (Arc::clone(&e.scheme), e.fid))
     }
 
     fn remove(&self, backing_fd: usize) -> Option<(Arc<dyn Scheme>, SchemeFileId)> {
-        self.map.lock().remove(&backing_fd).map(|e| (e.scheme, e.fid))
+        self.map
+            .lock()
+            .remove(&backing_fd)
+            .map(|e| (e.scheme, e.fid))
     }
 
     /// Returns true iff `backing_fd` is a scheme fd.
@@ -140,10 +148,10 @@ pub fn is_scheme_fd(backing_fd: usize) -> bool {
 pub fn scheme_fd_read(backing_fd: usize, buf: &mut [u8]) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
-        None       => return -9,  // EBADF
+        None => return -9, // EBADF
     };
     match scheme.read(fid, buf) {
-        Ok(n)  => n as isize,
+        Ok(n) => n as isize,
         Err(e) => scheme_error_to_errno(e),
     }
 }
@@ -154,10 +162,10 @@ pub fn scheme_fd_read(backing_fd: usize, buf: &mut [u8]) -> isize {
 pub fn scheme_fd_write(backing_fd: usize, buf: &[u8]) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
-        None       => return -9,
+        None => return -9,
     };
     match scheme.write(fid, buf) {
-        Ok(n)  => n as isize,
+        Ok(n) => n as isize,
         Err(e) => scheme_error_to_errno(e),
     }
 }
@@ -168,11 +176,11 @@ pub fn scheme_fd_write(backing_fd: usize, buf: &[u8]) -> isize {
 pub fn scheme_fd_seek(backing_fd: usize, offset: i64, whence: u8) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
-        None       => return -9,
+        None => return -9,
     };
     match scheme.seek(fid, offset, whence) {
         Ok(pos) => pos as isize,
-        Err(e)  => scheme_error_to_errno(e),
+        Err(e) => scheme_error_to_errno(e),
     }
 }
 
@@ -182,10 +190,10 @@ pub fn scheme_fd_seek(backing_fd: usize, offset: i64, whence: u8) -> isize {
 pub fn scheme_fd_ioctl(backing_fd: usize, cmd: u64, arg: usize) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
-        None       => return -9,
+        None => return -9,
     };
     match scheme.ioctl(fid, cmd, arg) {
-        Ok(n)  => n as isize,
+        Ok(n) => n as isize,
         Err(e) => scheme_error_to_errno(e),
     }
 }
@@ -212,14 +220,14 @@ pub fn scheme_fd_close(backing_fd: usize) {
 #[inline]
 fn scheme_error_to_errno(e: SchemeError) -> isize {
     match e {
-        SchemeError::NoSuchScheme     => -2,   // ENOENT
-        SchemeError::NotFound         => -2,   // ENOENT
-        SchemeError::PermissionDenied => -13,  // EACCES
-        SchemeError::InvalidArg       => -22,  // EINVAL
-        SchemeError::WouldBlock       => -11,  // EAGAIN
-        SchemeError::Io               => -5,   // EIO
-        SchemeError::Unreachable      => -5,   // EIO
-        SchemeError::Other            => -5,   // EIO
+        SchemeError::NoSuchScheme => -2,      // ENOENT
+        SchemeError::NotFound => -2,          // ENOENT
+        SchemeError::PermissionDenied => -13, // EACCES
+        SchemeError::InvalidArg => -22,       // EINVAL
+        SchemeError::WouldBlock => -11,       // EAGAIN
+        SchemeError::Io => -5,                // EIO
+        SchemeError::Unreachable => -5,       // EIO
+        SchemeError::Other => -5,             // EIO
     }
 }
 
@@ -230,9 +238,9 @@ fn scheme_error_to_errno(e: SchemeError) -> isize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::scheme_table::Scheme;
     use alloc::sync::Arc;
     use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
-    use crate::fs::scheme_table::Scheme;
 
     struct DummyScheme;
     impl Scheme for DummyScheme {
@@ -240,7 +248,8 @@ mod tests {
             Ok(SchemeFileId(42))
         }
         fn read(&self, _: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
-            buf[0] = b'X'; Ok(1)
+            buf[0] = b'X';
+            Ok(1)
         }
         fn write(&self, _: SchemeFileId, buf: &[u8]) -> Result<usize, SchemeError> {
             Ok(buf.len())
@@ -248,7 +257,9 @@ mod tests {
         fn ioctl(&self, _: SchemeFileId, _: u64, _: usize) -> Result<usize, SchemeError> {
             Ok(0)
         }
-        fn close(&self, _: SchemeFileId) -> Result<(), SchemeError> { Ok(()) }
+        fn close(&self, _: SchemeFileId) -> Result<(), SchemeError> {
+            Ok(())
+        }
     }
 
     #[test]
