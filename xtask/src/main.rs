@@ -7,12 +7,15 @@
 //!   cargo xtask build --arch x86_64               # x86_64 kernel (ELF, no UEFI wrapper)
 //!   cargo xtask build --arch x86_64 --boot uefi   # x86_64 UEFI loader (PE32+)
 //!   cargo xtask build --arch x86_64 --boot uefi --initrd
+//!   cargo xtask build --arch aarch64              # AArch64 UEFI loader
 //!
 //!   cargo xtask mkinitramfs                        # x86_64 initramfs (default)
 //!   cargo xtask mkinitramfs --arch riscv64
+//!   cargo xtask mkinitramfs --arch aarch64
 //!
 //!   cargo xtask image                              # x86_64 release ESP image
 //!   cargo xtask image --arch riscv64               # riscv64 release ESP image
+//!   cargo xtask image --arch aarch64               # aarch64 release ESP image
 //!   cargo xtask image --arch x86_64 --debug        # x86_64 debug ESP image
 //!   cargo xtask image --arch x86_64 --initrd       # include initramfs.cpio
 //!
@@ -24,6 +27,7 @@
 //! The `mkinitramfs` subcommand requires:
 //!   x86_64:  musl-tools  (musl-gcc)           → apt install musl-tools
 //!   riscv64: riscv64-linux-musl-gcc            → build from source or distro pkg
+//!   aarch64: aarch64-linux-musl-gcc            → build from source or distro pkg
 //!   Both:    cpio                              → apt install cpio
 //!
 //! Device node creation (step 2b) requires root or sudo on the build host.
@@ -45,6 +49,11 @@ fn target_json(root: &PathBuf, arch: Arch, boot: Boot) -> PathBuf {
         (Arch::X86_64,  Boot::Sbi)  => "x86_64-kernel.json",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader.json",
         (Arch::RiscV64, Boot::Sbi)  => "riscv64-kernel.json",
+        (Arch::AArch64, Boot::Uefi) => "aarch64-uefi-loader.json",
+        (Arch::AArch64, Boot::Sbi)  => {
+            eprintln!("[xtask] ERROR: AArch64 SBI boot is not supported (use --boot uefi)");
+            exit(1);
+        }
     };
     root.join("targets").join(name)
 }
@@ -55,6 +64,8 @@ fn target_dir_name(arch: Arch, boot: Boot) -> &'static str {
         (Arch::X86_64,  Boot::Sbi)  => "x86_64-kernel",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
         (Arch::RiscV64, Boot::Sbi)  => "riscv64gc-unknown-none-elf",
+        (Arch::AArch64, Boot::Uefi) => "aarch64-uefi-loader",
+        (Arch::AArch64, Boot::Sbi)  => "aarch64-uefi-loader", // unreachable, but exhaustive
     }
 }
 
@@ -62,6 +73,7 @@ fn efi_boot_filename(arch: Arch) -> &'static str {
     match arch {
         Arch::X86_64  => "BOOTx64.EFI",
         Arch::RiscV64 => "BOOTRISCV64.EFI",
+        Arch::AArch64 => "BOOTAA64.EFI",
     }
 }
 
@@ -141,22 +153,23 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
 // ─── CLI parsing ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Arch { RiscV64, X86_64 }
+enum Arch { RiscV64, X86_64, AArch64 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Boot { Uefi, Sbi }
 
 #[derive(Debug)]
 struct BuildOpts {
-    arch:   Arch,
-    boot:   Boot,
-    debug:  bool,
-    initrd: bool,
+    arch:     Arch,
+    boot:     Boot,
+    debug:    bool,
+    initrd:   bool,
+    features: Option<String>,
 }
 
 impl Default for BuildOpts {
     fn default() -> Self {
-        Self { arch: Arch::RiscV64, boot: Boot::Uefi, debug: false, initrd: false }
+        Self { arch: Arch::RiscV64, boot: Boot::Uefi, debug: false, initrd: false, features: None }
     }
 }
 
@@ -170,6 +183,7 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                 match args.get(i).map(String::as_str) {
                     Some("riscv64") => opts.arch = Arch::RiscV64,
                     Some("x86_64")  => opts.arch = Arch::X86_64,
+                    Some("aarch64") => opts.arch = Arch::AArch64,
                     other => { eprintln!("[xtask] unknown --arch: {:?}", other); exit(1); }
                 }
             }
@@ -181,6 +195,10 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                     other => { eprintln!("[xtask] unknown --boot: {:?}", other); exit(1); }
                 }
             }
+            "--features" => {
+                i += 1;
+                opts.features = args.get(i).cloned();
+            }
             "--debug"  => opts.debug  = true,
             "--initrd" => opts.initrd = true,
             other => { eprintln!("[xtask] unknown argument: {other}"); exit(1); }
@@ -191,27 +209,12 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
 }
 
 // ─── device node table ────────────────────────────────────────────────────────────
-//
-// Each entry: (path-inside-staging, type, major, minor, permissions)
-//
-// Canonical Linux major:minor assignments:
-//   mem  major 1 — null(3), zero(5)
-//   tty  major 5 — tty(0)
-//   drm  major 226 — card0(0) … card15(15)
-//   input major 13 — event0(64) … event31(95)
-//
-// The kernel's devtmpfs will recreate these at runtime; the pre-baked
-// nodes only matter for the window before devtmpfs is mounted (i.e. the
-// very first open() calls from init).
 
 struct DevNode {
-    /// Path relative to the staging root, e.g. "dev/null"
     path:  &'static str,
-    /// 'c' for character, 'b' for block
     kind:  char,
     major: u32,
     minor: u32,
-    /// octal permissions, e.g. 0o666
     mode:  u32,
 }
 
@@ -223,16 +226,7 @@ const DEV_NODES: &[DevNode] = &[
     DevNode { path: "dev/input/event0",kind: 'c', major: 13,  minor: 64, mode: 0o660 },
 ];
 
-/// Create device nodes in the staging tree.
-///
-/// Tries three strategies in order:
-///   1. Direct `mknod` (works when running as root).
-///   2. `sudo mknod` (works when the build user has passwordless sudo).
-///   3. Skip with a warning (rootless CI containers — devtmpfs handles it at boot).
-///
-/// Sets permissions with `chmod` after each successful mknod.
 fn create_dev_nodes(staging: &PathBuf) {
-    // Detect whether we can use mknod at all.
     let have_mknod = which_first(&["mknod"]).is_some();
     if !have_mknod {
         eprintln!("[xtask] mkinitramfs: WARNING: mknod not found — skipping device nodes");
@@ -241,7 +235,6 @@ fn create_dev_nodes(staging: &PathBuf) {
         return;
     }
 
-    // Try to figure out if we are root; if not, prepend sudo.
     let is_root = unsafe { libc_getuid() } == 0;
 
     let mut created = 0usize;
@@ -254,42 +247,25 @@ fn create_dev_nodes(staging: &PathBuf) {
         let minor_str = node.minor.to_string();
         let mode_str  = format!("{:04o}", node.mode);
 
-        // Build the mknod command.
         let ok = if is_root {
             run_optional(Command::new("mknod")
-                .arg(&full_path)
-                .arg(&type_str)
-                .arg(&major_str)
-                .arg(&minor_str))
+                .arg(&full_path).arg(&type_str).arg(&major_str).arg(&minor_str))
         } else {
             run_optional(Command::new("sudo")
-                .args(["mknod"])
-                .arg(&full_path)
-                .arg(&type_str)
-                .arg(&major_str)
-                .arg(&minor_str))
+                .args(["mknod"]).arg(&full_path).arg(&type_str).arg(&major_str).arg(&minor_str))
         };
 
         if ok {
-            // Set permissions.  Use sudo if we used sudo for mknod.
             let chmod_ok = if is_root {
-                run_optional(Command::new("chmod")
-                    .arg(&mode_str)
-                    .arg(&full_path))
+                run_optional(Command::new("chmod").arg(&mode_str).arg(&full_path))
             } else {
-                run_optional(Command::new("sudo")
-                    .args(["chmod"])
-                    .arg(&mode_str)
-                    .arg(&full_path))
+                run_optional(Command::new("sudo").args(["chmod"]).arg(&mode_str).arg(&full_path))
             };
             if chmod_ok {
                 eprintln!("[xtask] mkinitramfs: created {} ({} {}:{} mode {})",
                     node.path, node.kind, node.major, node.minor, mode_str);
-                created += 1;
-            } else {
-                eprintln!("[xtask] mkinitramfs: mknod ok but chmod failed for {}", node.path);
-                created += 1; // node exists, just wrong perms
             }
+            created += 1;
         } else {
             eprintln!("[xtask] mkinitramfs: WARNING: could not create {} — skipping", node.path);
             skipped += 1;
@@ -305,38 +281,23 @@ fn create_dev_nodes(staging: &PathBuf) {
     }
 }
 
-// Thin FFI shim — avoids a full libc dependency in the xtask.
-// getuid() is always available on Linux/macOS.
 #[cfg(unix)]
 fn libc_getuid() -> u32 {
     extern "C" { fn getuid() -> u32; }
     unsafe { getuid() }
 }
 #[cfg(not(unix))]
-fn libc_getuid() -> u32 { 1000 } // non-root on Windows (mknod not applicable)
+fn libc_getuid() -> u32 { 1000 }
 
 // ─── mkinitramfs ────────────────────────────────────────────────────────────────────
 
-/// Build userspace binaries and pack them into `initramfs.cpio`.
-///
-/// CPIO archive layout (newc format):
-///   ./init                         ← PID 1
-///   ./bin/hello
-///   ./usr/bin/rustos-compositor
-///   ./dev/null   c 1:3
-///   ./dev/zero   c 1:5
-///   ./dev/tty    c 5:0
-///   ./dev/dri/card0    c 226:0
-///   ./dev/input/event0 c 13:64
-///   ./etc/os-release
-///   ./proc/  ./sys/  ./tmp/  ./run/  (empty mount-point dirs)
 pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
     let arch_str = match arch {
         Arch::X86_64  => "x86_64",
         Arch::RiscV64 => "riscv64",
+        Arch::AArch64 => "aarch64",
     };
 
-    // ── 1. Check prerequisites ──────────────────────────────────────────────────
     match arch {
         Arch::X86_64 => {
             require_tool(&["musl-gcc"], "apt install musl-tools");
@@ -347,11 +308,16 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
                 "build musl from source: https://musl.libc.org/  (target: riscv64-linux-musl)",
             );
         }
+        Arch::AArch64 => {
+            require_tool(
+                &["aarch64-linux-musl-gcc", "aarch64-unknown-linux-musl-gcc"],
+                "build musl from source: https://musl.libc.org/  (target: aarch64-linux-musl)",
+            );
+        }
     }
     require_tool(&["cpio"], "apt install cpio");
     require_tool(&["find"], "coreutils (should already be installed)");
 
-    // ── 2. Create staging directory + rootfs skeleton ──────────────────────────
     let staging = root.join(format!("target/initramfs-staging-{arch_str}"));
     if staging.exists() {
         std::fs::remove_dir_all(&staging).expect("remove old staging dir");
@@ -366,21 +332,12 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
         "dev", "dev/dri", "dev/input",
         "proc", "sys", "tmp", "run", "var", "root",
     ] {
-        std::fs::create_dir_all(staging.join(dir))
-            .expect("create staging subdir");
+        std::fs::create_dir_all(staging.join(dir)).expect("create staging subdir");
     }
 
-    // ── 2b. Device nodes ────────────────────────────────────────────────────────
-    //
-    // Pre-bake character device inodes into the CPIO so that init's very
-    // first open("/dev/null"), open("/dev/tty"), open("/dev/dri/card0"),
-    // and open("/dev/input/event0") succeed before devtmpfs is mounted.
-    //
-    // Nodes: null(1:3)  zero(1:5)  tty(5:0)  card0(226:0)  event0(13:64)
     eprintln!("[xtask] mkinitramfs: creating device nodes...");
     create_dev_nodes(&staging);
 
-    // ── 3. Build userspace binaries ──────────────────────────────────────────
     let userspace_dir = root.join("userspace");
     eprintln!("[xtask] mkinitramfs: building userspace ({arch_str})...");
     run(Command::new("make")
@@ -390,16 +347,11 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
                &format!("DESTDIR={}", staging.display()),
                "install"]));
 
-    // ── 4. Write /etc/os-release ────────────────────────────────────────────
     std::fs::write(
         staging.join("etc/os-release"),
         b"NAME=RustOS\nID=rustos\nVERSION=0.1.0\nPRETTY_NAME=\"RustOS 0.1.0\"\n",
     ).expect("write os-release");
 
-    // ── 5. Pack CPIO (newc format) ───────────────────────────────────────────
-    //
-    // Sorting `find` output ensures reproducible archive ordering.
-    // `--reproducible` (cpio ≥ 2.13) zeroes mtime; fall back silently.
     let cpio_out = root.join("initramfs.cpio");
     eprintln!("[xtask] mkinitramfs: packing {}...", cpio_out.display());
     run(Command::new("sh")
@@ -412,28 +364,9 @@ pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
             ),
         ]));
 
-    let size = std::fs::metadata(&cpio_out)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = std::fs::metadata(&cpio_out).map(|m| m.len()).unwrap_or(0);
     eprintln!("[xtask] mkinitramfs: {} bytes → {}", size, cpio_out.display());
-    eprintln!();
-    eprintln!("  Included device nodes:");
-    for n in DEV_NODES {
-        eprintln!("    /{:<24} {} {:3}:{}", n.path, n.kind, n.major, n.minor);
-    }
-    eprintln!();
-    eprintln!("  To include in a boot image:");
-    eprintln!("    cargo xtask image --arch {arch_str} --initrd");
-    eprintln!();
-    eprintln!("  QEMU smoke-test:");
-    eprintln!("    qemu-system-x86_64 \\");
-    eprintln!("      -bios /usr/share/ovmf/OVMF.fd \\");
-    eprintln!("      -kernel esp/EFI/BOOT/BOOTx64.EFI \\");
-    eprintln!("      -initrd initramfs.cpio \\");
-    eprintln!("      -serial stdio -nographic -m 512M");
 }
-
-// ─── mkinitramfs step (called by build_* when --initrd is set) ────────────────
 
 fn mkinitramfs_step(root: &PathBuf, arch: Arch) {
     eprintln!("[xtask] --initrd: building initramfs for {arch:?}...");
@@ -442,7 +375,7 @@ fn mkinitramfs_step(root: &PathBuf, arch: Arch) {
 
 // ─── build actions ────────────────────────────────────────────────────────────────
 
-fn build_with_target_json(root: &PathBuf, opts: &BuildOpts, features: &[&str]) {
+fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) {
     let profile     = if opts.debug { "debug" } else { "release" };
     let target_path = target_json(root, opts.arch, opts.boot);
     let target_dir  = target_dir_name(opts.arch, opts.boot);
@@ -460,9 +393,8 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts, features: &[&str]) {
             "-Z", "build-std=core,alloc,compiler_builtins",
             "-Z", "build-std-features=compiler-builtins-mem",
         ]);
-    if !features.is_empty() {
-        cmd.arg("--features");
-        cmd.arg(features.join(","));
+    if let Some(ref feats) = opts.features {
+        cmd.arg("--features").arg(feats);
     } else {
         cmd.arg("--no-default-features");
     }
@@ -493,8 +425,8 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts, features: &[&str]) {
 fn build_riscv_uefi(root: &PathBuf, debug: bool) {
     build_with_target_json(
         root,
-        &BuildOpts { arch: Arch::RiscV64, boot: Boot::Uefi, debug, initrd: false },
-        &["uefi_boot"],
+        &BuildOpts { arch: Arch::RiscV64, boot: Boot::Uefi, debug, initrd: false,
+                     features: Some("uefi_boot".into()) },
     );
 }
 
@@ -514,9 +446,7 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
     if !debug { cmd.arg("--release"); }
     run(cmd);
 
-    let kernel_elf = root.join(format!(
-        "target/riscv64gc-unknown-none-elf/{profile}/rustos"
-    ));
+    let kernel_elf = root.join(format!("target/riscv64gc-unknown-none-elf/{profile}/rustos"));
     eprintln!("[xtask] Built: {}", kernel_elf.display());
 
     if initrd { mkinitramfs_step(root, Arch::RiscV64); }
@@ -525,8 +455,7 @@ fn build_riscv_sbi(root: &PathBuf, debug: bool, initrd: bool) {
 fn build_x86_64_kernel(root: &PathBuf, debug: bool, initrd: bool) {
     build_with_target_json(
         root,
-        &BuildOpts { arch: Arch::X86_64, boot: Boot::Sbi, debug, initrd: false },
-        &[],
+        &BuildOpts { arch: Arch::X86_64, boot: Boot::Sbi, debug, initrd: false, features: None },
     );
     let profile = if debug { "debug" } else { "release" };
     let elf = root.join(format!("target/x86_64-kernel/{profile}/rustos"));
@@ -540,10 +469,20 @@ fn build_x86_64_kernel(root: &PathBuf, debug: bool, initrd: bool) {
 fn build_x86_64_uefi(root: &PathBuf, debug: bool, initrd: bool) {
     build_with_target_json(
         root,
-        &BuildOpts { arch: Arch::X86_64, boot: Boot::Uefi, debug, initrd: false },
-        &["uefi_boot"],
+        &BuildOpts { arch: Arch::X86_64, boot: Boot::Uefi, debug, initrd: false,
+                     features: Some("uefi_boot".into()) },
     );
     if initrd { mkinitramfs_step(root, Arch::X86_64); }
+}
+
+fn build_aarch64_uefi(root: &PathBuf, debug: bool, initrd: bool, features: Option<String>) {
+    let feats = features.unwrap_or_else(|| "uefi_boot".into());
+    build_with_target_json(
+        root,
+        &BuildOpts { arch: Arch::AArch64, boot: Boot::Uefi, debug, initrd: false,
+                     features: Some(feats) },
+    );
+    if initrd { mkinitramfs_step(root, Arch::AArch64); }
 }
 
 // ─── image action ───────────────────────────────────────────────────────────────────
@@ -566,6 +505,11 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
         (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(root, opts.debug, opts.initrd),
         (Arch::X86_64,  Boot::Uefi) => build_x86_64_uefi(root, opts.debug, opts.initrd),
         (Arch::X86_64,  Boot::Sbi)  => build_x86_64_kernel(root, opts.debug, opts.initrd),
+        (Arch::AArch64, Boot::Uefi) => build_aarch64_uefi(root, opts.debug, opts.initrd, opts.features.clone()),
+        (Arch::AArch64, Boot::Sbi)  => {
+            eprintln!("[xtask] ERROR: AArch64 SBI boot is not supported");
+            exit(1);
+        }
     }
 
     let profile   = if opts.debug { "debug" } else { "release" };
@@ -573,6 +517,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     let img_name  = match opts.arch {
         Arch::X86_64  => "boot.img",
         Arch::RiscV64 => "boot-riscv64.img",
+        Arch::AArch64 => "boot-aarch64.img",
     };
     let efi_path  = root.join("esp/EFI/BOOT").join(efi_name);
 
@@ -624,25 +569,6 @@ fn image(root: &PathBuf, opts: &BuildOpts) {
     eprintln!("\n  Flash to USB:");
     eprintln!("    sudo dd if={} of=/dev/sdX bs=4M status=progress && sync",
         img_path.display());
-    match opts.arch {
-        Arch::X86_64 => {
-            eprintln!("\n  Smoke-test in QEMU:");
-            eprintln!("    qemu-system-x86_64 \\");
-            eprintln!("      -bios /usr/share/ovmf/OVMF.fd \\");
-            eprintln!("      -drive format=raw,file={} \\", img_path.display());
-            eprintln!("      -serial stdio -nographic -m 512M");
-        }
-        Arch::RiscV64 => {
-            eprintln!("\n  Smoke-test in QEMU:");
-            eprintln!("    qemu-system-riscv64 \\");
-            eprintln!("      -machine virt \\");
-            eprintln!("      -bios /usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.bin \\");
-            eprintln!("      -drive if=pflash,format=raw,file=/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd \\");
-            eprintln!("      -drive format=raw,file={} \\", img_path.display());
-            eprintln!("      -serial stdio -nographic -m 512M");
-        }
-    }
-    eprintln!();
 }
 
 fn lint_modules(root: &PathBuf) {
@@ -663,9 +589,7 @@ fn lint_modules(root: &PathBuf) {
     for (name, paths) in by_name.iter().filter(|(_, v)| v.len() > 1) {
         duplicate_count += 1;
         eprintln!("[xtask][lint-modules] duplicate basename `{name}`:");
-        for p in paths {
-            eprintln!("  - {p}");
-        }
+        for p in paths { eprintln!("  - {p}"); }
     }
 
     let mut missing_docs = 0usize;
@@ -695,9 +619,7 @@ fn lint_modules(root: &PathBuf) {
     for line in files.lines().filter(|l| l.ends_with(".rs")) {
         let text = fs::read_to_string(root.join(line)).unwrap_or_default();
         let has_module_docs = text.trim_start().starts_with("//!");
-        if has_module_docs {
-            continue;
-        }
+        if has_module_docs { continue; }
         for (idx, raw) in text.lines().enumerate() {
             let t = raw.trim_start();
             if t.starts_with("pub ")
@@ -708,8 +630,7 @@ fn lint_modules(root: &PathBuf) {
                 undocumented_pub_items += 1;
                 eprintln!(
                     "[xtask][lint-modules] public item in undocumented module: {}:{}",
-                    line,
-                    idx + 1
+                    line, idx + 1
                 );
             }
         }
@@ -746,6 +667,11 @@ fn main() {
                 (Arch::RiscV64, Boot::Sbi)  => build_riscv_sbi(&root, opts.debug, opts.initrd),
                 (Arch::X86_64,  Boot::Uefi) => build_x86_64_uefi(&root, opts.debug, opts.initrd),
                 (Arch::X86_64,  Boot::Sbi)  => build_x86_64_kernel(&root, opts.debug, opts.initrd),
+                (Arch::AArch64, Boot::Uefi) => build_aarch64_uefi(&root, opts.debug, opts.initrd, opts.features),
+                (Arch::AArch64, Boot::Sbi)  => {
+                    eprintln!("[xtask] ERROR: AArch64 SBI boot is not supported");
+                    exit(1);
+                }
             }
         }
         "mkinitramfs" => {
@@ -757,6 +683,7 @@ fn main() {
                     arch = match rest.get(i).map(String::as_str) {
                         Some("x86_64")  => Arch::X86_64,
                         Some("riscv64") => Arch::RiscV64,
+                        Some("aarch64") => Arch::AArch64,
                         other => {
                             eprintln!("[xtask] unknown --arch: {:?}", other);
                             exit(1);
@@ -775,10 +702,8 @@ fn main() {
             image(&root, &opts);
         }
         "smoke" => {
-            // Thin QEMU x86_64 smoke test wrapper.
-            // Builds a UEFI+initrd image, then delegates to run_qemu_x86_64.sh --smoke
-            // with a fixed marker that the /bin/smoke helper prints.
-            let img_opts = BuildOpts { arch: Arch::X86_64, boot: Boot::Uefi, debug: true, initrd: true };
+            let img_opts = BuildOpts { arch: Arch::X86_64, boot: Boot::Uefi, debug: true,
+                                       initrd: true, features: None };
             image(&root, &img_opts);
 
             let script = root.join("run_qemu_x86_64.sh");
@@ -788,9 +713,7 @@ fn main() {
             }
 
             let mut cmd = Command::new(script);
-            cmd.arg("--smoke")
-               .arg("--smoke-marker")
-               .arg("SMOKE OK: userspace_smoke");
+            cmd.arg("--smoke").arg("--smoke-marker").arg("SMOKE OK: userspace_smoke");
             run(cmd);
         }
         "lint-modules" => lint_modules(&root),
@@ -808,39 +731,14 @@ fn main() {
                 "  bench-kernel  Run baseline smoke flow + benchmark placeholders\n",
                 "\n",
                 "Build options (build / image):\n",
-                "  --arch <riscv64|x86_64>   Target architecture  (image default: x86_64)\n",
-                "  --boot <uefi|sbi>         Boot mode            (default: uefi)\n",
-                "  --debug                   Debug build\n",
-                "  --initrd                  Build and include initramfs.cpio\n",
+                "  --arch <riscv64|x86_64|aarch64>  Target architecture  (image default: x86_64)\n",
+                "  --boot <uefi|sbi>                Boot mode            (default: uefi)\n",
+                "  --features <feat>                Cargo features to enable\n",
+                "  --debug                          Debug build\n",
+                "  --initrd                         Build and include initramfs.cpio\n",
                 "\n",
                 "mkinitramfs options:\n",
-                "  --arch <riscv64|x86_64>   Target architecture  (default: x86_64)\n",
-                "\n",
-                "Device nodes pre-baked into the CPIO archive:\n",
-                "  /dev/null          c  1:3   (null sink)\n",
-                "  /dev/zero          c  1:5   (zero source)\n",
-                "  /dev/tty           c  5:0   (controlling terminal)\n",
-                "  /dev/dri/card0     c 226:0  (DRM master)\n",
-                "  /dev/input/event0  c  13:64 (evdev input)\n",
-                "  mknod requires root or passwordless sudo;\n",
-                "  skipped gracefully in rootless CI (devtmpfs creates them at boot).\n",
-                "\n",
-                "Prerequisites:\n",
-                "  mkinitramfs (x86_64):  apt install musl-tools cpio\n",
-                "  mkinitramfs (riscv64): riscv64-linux-musl-gcc + apt install cpio\n",
-                "  image:                 apt install mtools binutils\n",
-                "\n",
-                "Common workflows:\n",
-                "  # Full x86_64 UEFI image with initramfs:\n",
-                "  apt install musl-tools cpio mtools\n",
-                "  cargo xtask image --arch x86_64 --boot uefi --initrd\n",
-                "  sudo dd if=boot.img of=/dev/sdX bs=4M status=progress && sync\n",
-                "\n",
-                "  # Rebuild initramfs only (e.g. after editing init.c):\n",
-                "  cargo xtask mkinitramfs\n",
-                "\n",
-                "  # QEMU smoke-test (x86_64, headless):\n",
-                "  cargo xtask smoke\n",
+                "  --arch <riscv64|x86_64|aarch64>  Target architecture  (default: x86_64)\n",
             ));
         }
         other => {
