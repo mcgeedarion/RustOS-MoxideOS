@@ -80,18 +80,18 @@
 //! | write end  | read_open == 0  → POLLERR  (broken pipe)  |
 
 extern crate alloc;
+use crate::core::fast_hash::KernelFastMap;
 use alloc::sync::Arc;
-use alloc::collections::BTreeMap;
-use spin::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Mutex;
 
-use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 use crate::fs::scheme_table::Scheme;
-use crate::sync::wait_queue::{WaitQueue, WakeReason};
 use crate::sync::poll_source::PollSource;
 use crate::sync::wait_queue::ReadyMask;
+use crate::sync::wait_queue::{WaitQueue, WakeReason};
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 
-use crate::fs::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, POLLHUP, POLLERR, POLLNVAL};
+use crate::fs::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLRDNORM, POLLWRNORM};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -106,20 +106,20 @@ pub const PIPE_BUF: usize = 4096;
 pub(crate) const PIPE_FD_BASE: usize = 0x8000_0000;
 
 const EAGAIN: isize = -11;
-const EINTR:  isize = -4;
-const EPIPE:  isize = -32;
+const EINTR: isize = -4;
+const EPIPE: isize = -32;
 const EFAULT: isize = -14;
 const EMFILE: isize = -24;
-const SIGPIPE: u32  = 13;
+const SIGPIPE: u32 = 13;
 
 // ── Ring-buffer (data only, no blocking state) ────────────────────────────────
 
 struct PipeInner {
-    buf:         alloc::vec::Vec<u8>,
-    head:        usize,
-    len:         usize,
-    write_open:  u32,
-    read_open:   u32,
+    buf: alloc::vec::Vec<u8>,
+    head: usize,
+    len: usize,
+    write_open: u32,
+    read_open: u32,
     nonblocking: bool,
 }
 
@@ -135,9 +135,18 @@ impl PipeInner {
         }
     }
 
-    #[inline] fn capacity(&self) -> usize { self.buf.len() }
-    #[inline] fn space(&self)    -> usize { self.capacity() - self.len }
-    #[inline] fn is_empty(&self) -> bool  { self.len == 0 }
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+    #[inline]
+    fn space(&self) -> usize {
+        self.capacity() - self.len
+    }
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     fn read_bytes(&mut self, dst: &mut [u8]) -> usize {
         let n = dst.len().min(self.len);
@@ -150,7 +159,7 @@ impl PipeInner {
     }
 
     fn write_bytes(&mut self, src: &[u8]) {
-        let cap  = self.capacity();
+        let cap = self.capacity();
         let tail = (self.head + self.len) % cap;
         for (i, &b) in src.iter().enumerate() {
             self.buf[(tail + i) % cap] = b;
@@ -165,9 +174,9 @@ impl PipeInner {
 // holding the lock (avoids priority inversion and lock ordering issues).
 
 struct PipeState {
-    inner:    Mutex<PipeInner>,
+    inner: Mutex<PipeInner>,
     /// Woken when data is written (POLLIN) or write-end closes (POLLHUP).
-    read_wq:  WaitQueue,
+    read_wq: WaitQueue,
     /// Woken when data is read (POLLOUT) or read-end closes (POLLERR).
     write_wq: WaitQueue,
 }
@@ -175,8 +184,8 @@ struct PipeState {
 impl PipeState {
     fn new(nonblocking: bool) -> Self {
         PipeState {
-            inner:    Mutex::new(PipeInner::new(nonblocking)),
-            read_wq:  WaitQueue::new(),
+            inner: Mutex::new(PipeInner::new(nonblocking)),
+            read_wq: WaitQueue::new(),
             write_wq: WaitQueue::new(),
         }
     }
@@ -185,15 +194,29 @@ impl PipeState {
 // ── Pipe table: backing_fd → Arc<PipeState> ───────────────────────────────────
 
 struct PipeTable {
-    map: BTreeMap<usize, Arc<PipeState>>,
+    map: KernelFastMap<usize, Arc<PipeState>>,
 }
 
 impl PipeTable {
-    const fn new() -> Self { PipeTable { map: BTreeMap::new() } }
-    fn get(&self, bfd: usize) -> Option<Arc<PipeState>> { self.map.get(&bfd).cloned() }
-    fn insert(&mut self, bfd: usize, s: Arc<PipeState>) { self.map.insert(bfd, s); }
-    fn remove(&mut self, bfd: usize) -> bool { self.map.remove(&bfd).is_some() }
-    fn contains(&self, bfd: usize) -> bool { self.map.contains_key(&bfd) }
+    const fn new() -> Self {
+        // Fast map is safe here: keys are kernel-assigned pipe backing fd
+        // numbers and pipe lookup order is never user-visible.
+        PipeTable {
+            map: KernelFastMap::new(),
+        }
+    }
+    fn get(&self, bfd: usize) -> Option<Arc<PipeState>> {
+        self.map.get(&bfd).cloned()
+    }
+    fn insert(&mut self, bfd: usize, s: Arc<PipeState>) {
+        self.map.insert(bfd, s);
+    }
+    fn remove(&mut self, bfd: usize) -> bool {
+        self.map.remove(&bfd).is_some()
+    }
+    fn contains(&self, bfd: usize) -> bool {
+        self.map.contains_key(&bfd)
+    }
 }
 
 static PIPE_TABLE: Mutex<PipeTable> = Mutex::new(PipeTable::new());
@@ -208,14 +231,18 @@ fn alloc_pipe_fds() -> (usize, usize) {
 
 #[inline]
 pub fn is_pipe(bfd: usize) -> bool {
-    if bfd < PIPE_FD_BASE { return false; }
+    if bfd < PIPE_FD_BASE {
+        return false;
+    }
     PIPE_TABLE.lock().contains(bfd)
 }
 
 pub fn is_pipe_fd(user_fd: usize) -> bool {
     let pid = crate::proc::scheduler::current_pid();
     let bfd = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
-    if bfd < 0 { return false; }
+    if bfd < 0 {
+        return false;
+    }
     is_pipe(bfd as usize)
 }
 
@@ -223,14 +250,16 @@ pub fn is_pipe_fd(user_fd: usize) -> bool {
 
 /// Legacy readiness oracle — called by poll::fd_ready().
 pub fn pipe_poll(user_fd: usize, events: u32) -> u32 {
-    let pid     = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid();
     let bfd_raw = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
-    if bfd_raw < 0 { return POLLNVAL; }
+    if bfd_raw < 0 {
+        return POLLNVAL;
+    }
     let bfd = bfd_raw as usize;
 
     let state = match PIPE_TABLE.lock().get(bfd) {
         Some(s) => s,
-        None    => return POLLNVAL,
+        None => return POLLNVAL,
     };
     let inner = state.inner.lock();
     pipe_ready(&inner, bfd, events)
@@ -242,13 +271,21 @@ fn pipe_ready(inner: &PipeInner, bfd: usize, events: u32) -> u32 {
     let is_write_end = bfd & 1 != 0;
     if is_write_end {
         let mut r = 0u32;
-        if inner.read_open == 0                                        { r |= POLLERR; }
-        if events & (POLLOUT | POLLWRNORM) != 0 && inner.space() > 0  { r |= POLLOUT | POLLWRNORM; }
+        if inner.read_open == 0 {
+            r |= POLLERR;
+        }
+        if events & (POLLOUT | POLLWRNORM) != 0 && inner.space() > 0 {
+            r |= POLLOUT | POLLWRNORM;
+        }
         r
     } else {
         let mut r = 0u32;
-        if inner.write_open == 0 { r |= POLLHUP | POLLIN | POLLRDNORM; }
-        if events & (POLLIN | POLLRDNORM) != 0 && inner.len > 0       { r |= POLLIN | POLLRDNORM; }
+        if inner.write_open == 0 {
+            r |= POLLHUP | POLLIN | POLLRDNORM;
+        }
+        if events & (POLLIN | POLLRDNORM) != 0 && inner.len > 0 {
+            r |= POLLIN | POLLRDNORM;
+        }
         r
     }
 }
@@ -263,7 +300,9 @@ impl PollSource for PipeReadSource {
         let inner = self.0.inner.lock();
         pipe_ready(&inner, self.1, interest)
     }
-    fn wait_queue(&self) -> &WaitQueue { &self.0.read_wq }
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.0.read_wq
+    }
 }
 
 impl PollSource for PipeWriteSource {
@@ -271,7 +310,9 @@ impl PollSource for PipeWriteSource {
         let inner = self.0.inner.lock();
         pipe_ready(&inner, self.1, interest)
     }
-    fn wait_queue(&self) -> &WaitQueue { &self.0.write_wq }
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.0.write_wq
+    }
 }
 
 /// Returns the correct PollSource end based on bfd parity.
@@ -288,11 +329,16 @@ pub fn pipe_poll_source(bfd: usize) -> Option<Arc<dyn PollSource>> {
 // ── Dup ───────────────────────────────────────────────────────────────────────
 
 pub fn pipe_dup(bfd: usize) {
-    if bfd < PIPE_FD_BASE { return; }
-    let state = match PIPE_TABLE.lock().get(bfd) { Some(s) => s, None => return };
+    if bfd < PIPE_FD_BASE {
+        return;
+    }
+    let state = match PIPE_TABLE.lock().get(bfd) {
+        Some(s) => s,
+        None => return,
+    };
     let mut inner = state.inner.lock();
     if bfd & 1 == 0 {
-        inner.read_open  = inner.read_open.saturating_add(1);
+        inner.read_open = inner.read_open.saturating_add(1);
     } else {
         inner.write_open = inner.write_open.saturating_add(1);
     }
@@ -305,12 +351,19 @@ pub fn pipe_dup(bfd: usize) {
 /// Blocking behaviour: parks on `read_wq` via `WaitQueue::wait()` — no
 /// spin loop.  Returns -EINTR if a signal cancels the wait.
 pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
 
-    let state = match PIPE_TABLE.lock().get(bfd) { Some(s) => s, None => return -9 };
-    if bfd & 1 != 0 { return -9; } // wrong end
+    let state = match PIPE_TABLE.lock().get(bfd) {
+        Some(s) => s,
+        None => return -9,
+    };
+    if bfd & 1 != 0 {
+        return -9;
+    } // wrong end
 
-    let pid    = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid();
     let cancel = crate::proc::scheduler::task_cancel_token(pid);
 
     loop {
@@ -329,12 +382,20 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
         };
         let _ = got_data;
 
-        if is_eof    { return 0; }      // all writers closed, buffer empty
-        if nonblock  { return EAGAIN; }
+        if is_eof {
+            return 0;
+        } // all writers closed, buffer empty
+        if nonblock {
+            return EAGAIN;
+        }
 
         // ── Block until data arrives, HUP, or cancellation ─────────────────
-        let reason = state.read_wq.wait(POLLIN | POLLHUP, cancel.as_deref(), None);
-        if reason == WakeReason::Cancelled { return EINTR; }
+        let reason = state
+            .read_wq
+            .wait(POLLIN | POLLHUP, cancel.as_deref(), None);
+        if reason == WakeReason::Cancelled {
+            return EINTR;
+        }
         // WakeReason::Ready or Timeout (no timeout set) → re-check loop.
     }
 }
@@ -346,14 +407,21 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
 /// Blocking behaviour: parks on `write_wq` via `WaitQueue::wait()` — no
 /// spin loop.  Returns -EINTR if a signal cancels the wait.
 pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
 
-    let state = match PIPE_TABLE.lock().get(bfd) { Some(s) => s, None => return -9 };
-    if bfd & 1 == 0 { return -9; } // wrong end
+    let state = match PIPE_TABLE.lock().get(bfd) {
+        Some(s) => s,
+        None => return -9,
+    };
+    if bfd & 1 == 0 {
+        return -9;
+    } // wrong end
 
-    let pid    = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid();
     let cancel = crate::proc::scheduler::task_cancel_token(pid);
-    let mut written   = 0usize;
+    let mut written = 0usize;
     let mut remaining = buf;
 
     while !remaining.is_empty() {
@@ -368,7 +436,11 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
                     // Broken pipe: deliver SIGPIPE, return EPIPE.
                     drop(inner);
                     crate::proc::signal::send_signal(pid, SIGPIPE);
-                    return if written == 0 { EPIPE } else { written as isize };
+                    return if written == 0 {
+                        EPIPE
+                    } else {
+                        written as isize
+                    };
                 }
 
                 let space = inner.space();
@@ -378,8 +450,8 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
                     if space >= remaining.len() {
                         inner.write_bytes(remaining);
                         let n = remaining.len();
-                        written   += n;
-                        remaining  = &[];
+                        written += n;
+                        remaining = &[];
                         drop(inner);
                         state.read_wq.wake(POLLIN);
                         (true, false, false)
@@ -390,8 +462,8 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
                 } else {
                     let chunk = space.min(remaining.len());
                     inner.write_bytes(&remaining[..chunk]);
-                    written   += chunk;
-                    remaining  = &remaining[chunk..];
+                    written += chunk;
+                    remaining = &remaining[chunk..];
                     drop(inner);
                     state.read_wq.wake(POLLIN);
                     (true, false, false)
@@ -399,15 +471,25 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
             };
             let _ = broken_pipe;
 
-            if wrote_chunk { break; } // advance outer while loop
+            if wrote_chunk {
+                break;
+            } // advance outer while loop
             if nonblock {
-                return if written == 0 { EAGAIN } else { written as isize };
+                return if written == 0 {
+                    EAGAIN
+                } else {
+                    written as isize
+                };
             }
 
             // ── Block until space opens or read end closes ───────────────────
             let reason = state.write_wq.wait(POLLOUT, cancel.as_deref(), None);
             if reason == WakeReason::Cancelled {
-                return if written == 0 { EINTR } else { written as isize };
+                return if written == 0 {
+                    EINTR
+                } else {
+                    written as isize
+                };
             }
         }
     }
@@ -423,13 +505,16 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
 /// wakes read waiters with POLLHUP.  When the last reader closes, wakes
 /// write waiters with POLLERR so they observe EPIPE on next iteration.
 pub fn sys_close_pipe(bfd: usize) {
-    let state = match PIPE_TABLE.lock().get(bfd) { Some(s) => s, None => return };
+    let state = match PIPE_TABLE.lock().get(bfd) {
+        Some(s) => s,
+        None => return,
+    };
 
     let (wake_read, wake_write) = {
         let mut inner = state.inner.lock();
         if bfd & 1 == 0 {
             inner.read_open = inner.read_open.saturating_sub(1);
-            (false, inner.read_open == 0)  // last reader gone → POLLERR for writers
+            (false, inner.read_open == 0) // last reader gone → POLLERR for writers
         } else {
             inner.write_open = inner.write_open.saturating_sub(1);
             (inner.write_open == 0, false) // last writer gone → POLLHUP for readers
@@ -437,8 +522,12 @@ pub fn sys_close_pipe(bfd: usize) {
     };
 
     // Wake blocked tasks AFTER releasing the data lock.
-    if wake_read  { state.read_wq.wake(POLLHUP); }
-    if wake_write { state.write_wq.wake(POLLERR); }
+    if wake_read {
+        state.read_wq.wake(POLLHUP);
+    }
+    if wake_write {
+        state.write_wq.wake(POLLERR);
+    }
 
     PIPE_TABLE.lock().remove(bfd);
 }
@@ -450,7 +539,9 @@ pub struct PipeScheme {
 }
 
 impl PipeScheme {
-    fn new(read_bfd: usize) -> Self { Self { ring_bfd: read_bfd } }
+    fn new(read_bfd: usize) -> Self {
+        Self { ring_bfd: read_bfd }
+    }
 
     #[inline]
     fn bfd_from_fid(&self, fid: SchemeFileId) -> usize {
@@ -466,9 +557,9 @@ impl Scheme for PipeScheme {
     fn read(&self, fid: SchemeFileId, buf: &mut [u8]) -> Result<usize, SchemeError> {
         let n = pipe_read(self.bfd_from_fid(fid), buf);
         match n {
-            n if n >= 0  => Ok(n as usize),
-            -4           => Err(SchemeError::Interrupted), // EINTR
-            _            => Err(SchemeError::Io),
+            n if n >= 0 => Ok(n as usize),
+            -4 => Err(SchemeError::Interrupted), // EINTR
+            _ => Err(SchemeError::Io),
         }
     }
 
@@ -476,21 +567,17 @@ impl Scheme for PipeScheme {
         let n = pipe_write(self.bfd_from_fid(fid), buf);
         match n {
             n if n >= 0 => Ok(n as usize),
-            -4          => Err(SchemeError::Interrupted), // EINTR
-            -32         => Err(SchemeError::Other),       // EPIPE
-            _           => Err(SchemeError::Io),
+            -4 => Err(SchemeError::Interrupted), // EINTR
+            -32 => Err(SchemeError::Other),      // EPIPE
+            _ => Err(SchemeError::Io),
         }
     }
 
-    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8)
-        -> Result<u64, SchemeError>
-    {
+    fn seek(&self, _fid: SchemeFileId, _offset: i64, _whence: u8) -> Result<u64, SchemeError> {
         Err(SchemeError::InvalidArg)
     }
 
-    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize)
-        -> Result<usize, SchemeError>
-    {
+    fn ioctl(&self, _fid: SchemeFileId, _cmd: u64, _arg: usize) -> Result<usize, SchemeError> {
         Err(SchemeError::InvalidArg)
     }
 
@@ -509,19 +596,23 @@ pub fn sys_pipe(pipefd_va: usize) -> isize {
 
 /// NR 293.
 pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
-    use crate::uaccess::{copy_to_user, validate_user_ptr};
-    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
     use crate::fs::process_fd::proc_fd_install;
+    use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
+    use crate::uaccess::{copy_to_user, validate_user_ptr};
 
-    const O_CLOEXEC:  u32 = 0o2000000;
+    const O_CLOEXEC: u32 = 0o2000000;
     const O_NONBLOCK: u32 = 0o4000;
-    const EINVAL: isize   = -22;
+    const EINVAL: isize = -22;
 
-    if flags & !(O_CLOEXEC | O_NONBLOCK | 0o40000) != 0 { return EINVAL; }
-    if !validate_user_ptr(pipefd_va, 8) { return EFAULT; }
+    if flags & !(O_CLOEXEC | O_NONBLOCK | 0o40000) != 0 {
+        return EINVAL;
+    }
+    if !validate_user_ptr(pipefd_va, 8) {
+        return EFAULT;
+    }
 
     let nonblocking = flags & O_NONBLOCK != 0;
-    let cloexec     = flags & O_CLOEXEC  != 0;
+    let cloexec = flags & O_CLOEXEC != 0;
 
     // 1. Allocate shared PipeState.
     let pipe_arc = Arc::new(PipeState::new(nonblocking));
@@ -532,15 +623,15 @@ pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     // 3. Register both ends in PIPE_TABLE.
     {
         let mut tbl = PIPE_TABLE.lock();
-        tbl.insert(read_bfd,  Arc::clone(&pipe_arc));
+        tbl.insert(read_bfd, Arc::clone(&pipe_arc));
         tbl.insert(write_bfd, Arc::clone(&pipe_arc));
     }
 
     // 4. Build PipeScheme and scheme backing fds.
     let scheme: Arc<dyn Scheme> = Arc::new(PipeScheme::new(read_bfd));
-    let scheme_read_bfd  = alloc_scheme_backing_fd();
+    let scheme_read_bfd = alloc_scheme_backing_fd();
     let scheme_write_bfd = alloc_scheme_backing_fd();
-    scheme_fd_register(scheme_read_bfd,  Arc::clone(&scheme), SchemeFileId(0));
+    scheme_fd_register(scheme_read_bfd, Arc::clone(&scheme), SchemeFileId(0));
     scheme_fd_register(scheme_write_bfd, Arc::clone(&scheme), SchemeFileId(1));
 
     // 5. RLIMIT_NOFILE check.
@@ -548,7 +639,7 @@ pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     {
         use crate::fs::process_fd::proc_fd_list;
         let open_count = proc_fd_list(pid).len();
-        let (soft, _)  = crate::proc::rlimit::getrlimit_for(pid, 7);
+        let (soft, _) = crate::proc::rlimit::getrlimit_for(pid, 7);
         if (open_count + 2) as u64 > soft {
             PIPE_TABLE.lock().remove(read_bfd);
             PIPE_TABLE.lock().remove(write_bfd);
@@ -561,7 +652,7 @@ pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     // 6. Install scheme fds into the process fd table.
     let rd_flags = if cloexec { O_CLOEXEC } else { 0 };
     let wr_flags = 1 | if cloexec { O_CLOEXEC } else { 0 };
-    let read_fd  = proc_fd_install(pid, scheme_read_bfd,  None, rd_flags, None);
+    let read_fd = proc_fd_install(pid, scheme_read_bfd, None, rd_flags, None);
     let write_fd = proc_fd_install(pid, scheme_write_bfd, None, wr_flags, None);
 
     // 7. Copy [read_fd, write_fd] to userspace.

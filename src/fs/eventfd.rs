@@ -27,45 +27,52 @@
 //! callers that check `EFD_NONBLOCK` and is a known limitation for
 //! blocking callers.
 
-use alloc::collections::BTreeMap;
+use crate::core::fast_hash::KernelFastMap;
 use spin::Mutex;
 
 // ── flags ────────────────────────────────────────────────────────────────────
 
 pub const EFD_SEMAPHORE: u32 = 1;
-pub const EFD_CLOEXEC:   u32 = 0o2000000; // same as O_CLOEXEC
-pub const EFD_NONBLOCK:  u32 = 0o4000;    // same as O_NONBLOCK
+pub const EFD_CLOEXEC: u32 = 0o2000000; // same as O_CLOEXEC
+pub const EFD_NONBLOCK: u32 = 0o4000; // same as O_NONBLOCK
 
 // ── per-fd state ─────────────────────────────────────────────────────────────
 
 struct EventFd {
-    counter:   u64,
+    counter: u64,
     semaphore: bool,
-    nonblock:  bool,
+    nonblock: bool,
 }
 
-static EVENTFDS: Mutex<BTreeMap<usize, EventFd>> = Mutex::new(BTreeMap::new());
+/// Fast map is safe here: keys are kernel-assigned fd numbers and eventfd
+/// readiness is not exposed through deterministic iteration.
+static EVENTFDS: Mutex<KernelFastMap<usize, EventFd>> = Mutex::new(KernelFastMap::new());
 
 // ── kernel-internal helpers ───────────────────────────────────────────────────
 
 /// Attach eventfd state to an already-open VFS fd.
 pub fn eventfd_register(fd: usize, initval: u64, flags: u32) {
-    EVENTFDS.lock().insert(fd, EventFd {
-        counter:   initval,
-        semaphore: flags & EFD_SEMAPHORE != 0,
-        nonblock:  flags & EFD_NONBLOCK  != 0,
-    });
+    EVENTFDS.lock().insert(
+        fd,
+        EventFd {
+            counter: initval,
+            semaphore: flags & EFD_SEMAPHORE != 0,
+            nonblock: flags & EFD_NONBLOCK != 0,
+        },
+    );
 }
 
 /// Called from the VFS read path.  `buf` must be exactly 8 bytes.
 /// Returns 8 on success, or a negative errno.
 pub fn eventfd_read(fd: usize, buf: &mut [u8]) -> isize {
-    if buf.len() < 8 { return -22; } // EINVAL
+    if buf.len() < 8 {
+        return -22;
+    } // EINVAL
 
     let mut map = EVENTFDS.lock();
     let efd = match map.get_mut(&fd) {
         Some(e) => e,
-        None    => return -9, // EBADF
+        None => return -9, // EBADF
     };
 
     if efd.counter == 0 {
@@ -90,7 +97,9 @@ pub fn eventfd_read(fd: usize, buf: &mut [u8]) -> isize {
 /// Called from the VFS write path.  `buf` must be exactly 8 bytes.
 /// Returns 8 on success, or a negative errno.
 pub fn eventfd_write(fd: usize, buf: &[u8]) -> isize {
-    if buf.len() < 8 { return -22; } // EINVAL
+    if buf.len() < 8 {
+        return -22;
+    } // EINVAL
 
     let val = u64::from_ne_bytes(match buf[..8].try_into() {
         Ok(b) => b,
@@ -98,18 +107,18 @@ pub fn eventfd_write(fd: usize, buf: &[u8]) -> isize {
     });
 
     // Writing u64::MAX is explicitly forbidden by the Linux ABI.
-    if val == u64::MAX { return -22; } // EINVAL
+    if val == u64::MAX {
+        return -22;
+    } // EINVAL
 
     let mut map = EVENTFDS.lock();
     let efd = match map.get_mut(&fd) {
         Some(e) => e,
-        None    => return -9, // EBADF
+        None => return -9, // EBADF
     };
 
     // Saturate at u64::MAX - 1 (the maximum readable value).
-    efd.counter = efd.counter
-        .saturating_add(val)
-        .min(u64::MAX - 1);
+    efd.counter = efd.counter.saturating_add(val).min(u64::MAX - 1);
 
     8
 }
@@ -129,11 +138,15 @@ pub fn eventfd_poll(fd: usize) -> u32 {
     let map = EVENTFDS.lock();
     let efd = match map.get(&fd) {
         Some(e) => e,
-        None    => return 0,
+        None => return 0,
     };
     let mut mask = 0u32;
-    if efd.counter > 0           { mask |= 0x001; } // POLLIN
-    if efd.counter < u64::MAX - 1 { mask |= 0x004; } // POLLOUT
+    if efd.counter > 0 {
+        mask |= 0x001;
+    } // POLLIN
+    if efd.counter < u64::MAX - 1 {
+        mask |= 0x004;
+    } // POLLOUT
     mask
 }
 
@@ -153,8 +166,8 @@ pub fn sys_eventfd2(initval: u32, flags: u32) -> isize {
     };
 
     let fd = match crate::fs::vfs::open_anon(open_flags) {
-        Ok(fd)  => fd,
-        Err(_)  => return -24, // EMFILE
+        Ok(fd) => fd,
+        Err(_) => return -24, // EMFILE
     };
 
     eventfd_register(fd, initval as u64, flags);
