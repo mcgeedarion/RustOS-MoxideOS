@@ -6,8 +6,12 @@
 
 use core::ops::Range;
 
-/// Human-readable architecture name (`"riscv64"`, `"x86_64"`, ...).
+/// Human-readable architecture name (`"aarch64"`, `"riscv64"`, `"x86_64"`, ...).
 pub fn name() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
     #[cfg(target_arch = "riscv64")]
     {
         "riscv64"
@@ -25,7 +29,7 @@ pub const fn page_size() -> usize {
 
 /// Returns the canonical kernel virtual address range.
 ///
-/// On RV64 we identity-map a large chunk early, then move to the higher-half
+/// On ARM64 and RV64 we identity-map a large chunk early, then move to the higher-half
 /// if desired later.  On x86_64 this typically points at the higher-half.
 pub fn kernel_va_range() -> Range<usize> {
     crate::arch::hal::kernel_va_range()

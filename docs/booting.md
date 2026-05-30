@@ -2,7 +2,7 @@
 
 ## Overview
 
-RustOS boots as a **UEFI application** on x86_64.  The build system produces
+RustOS boots as a **UEFI application** on x86_64 and now has an ARM64 UEFI bring-up target.  The build system produces
 a PE32+ binary (`BOOTX64.EFI`) that UEFI firmware loads directly — no
 bootloader (GRUB, syslinux) is required.  This is the same mechanism used by
 Windows, modern Linux distributions with systemd-boot, and most embedded
@@ -14,6 +14,8 @@ A legacy multiboot2 path (for GRUB2 or QEMU `-kernel`) is available behind
 ---
 
 ## Build
+
+### x86_64
 
 ```bash
 # Requires:
@@ -30,6 +32,23 @@ cargo build --release --target x86_64-unknown-none \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem
 ```
+
+
+
+### ARM64 / AArch64
+
+The ARM64 target intentionally follows the same baseline hardware requirements
+as the ReactOS ARM64 bring-up: a UEFI-compatible system, an Armv8-A (or newer)
+processor, and either a GICv2 or GICv3 interrupt controller.
+
+```bash
+cargo build --target targets/aarch64-uefi-loader.json \
+  -Z build-std=core,alloc,compiler_builtins \
+  -Z build-std-features=compiler-builtins-mem
+```
+
+The default removable-media UEFI path for ARM64 firmware is
+`EFI/BOOT/BOOTAA64.EFI`; copy the linked image there when constructing an ESP.
 
 `build.rs` invokes `llvm-objcopy --target=efi-app-x86_64` to convert the ELF
 kernel into a PE32+ UEFI application.  The output is placed at:
@@ -92,6 +111,18 @@ or mkdosfs is needed.
 ---
 
 ## Real Hardware (bare-metal)
+
+### ARM64 baseline
+
+ARM64 support requires all of the following before RustOS will treat a board as
+a supported target:
+
+- UEFI firmware (`efi_main` entry, no non-UEFI ARM64 boot path yet).
+- Armv8-A or newer AArch64 processor.
+- GICv2 or GICv3 interrupt controller, discovered from firmware tables or
+  supplied by the platform fallback during early bring-up.
+
+
 
 ### 1. Prepare a USB drive
 

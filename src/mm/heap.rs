@@ -37,8 +37,8 @@
 
 extern crate alloc;
 
-use spin::Mutex;
 use core::alloc::Layout;
+use spin::Mutex;
 
 // ── Physical-to-virtual offset for the higher-half direct map ───────────────
 //
@@ -60,8 +60,16 @@ fn phys_to_kernel_virt(pa: usize) -> usize {
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn phys_to_kernel_virt(pa: usize) -> usize {
-    extern "C" { static KERNEL_PHYS_BASE: usize; }
+    extern "C" {
+        static KERNEL_PHYS_BASE: usize;
+    }
     unsafe { pa + KERNEL_PHYS_BASE }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn phys_to_kernel_virt(pa: usize) -> usize {
+    crate::arch::aarch64::mem_layout::va48::phys_to_virt(pa)
 }
 
 const PAGE: usize = 4096;
@@ -73,8 +81,7 @@ const PAGE: usize = 4096;
 static HEAP_END: Mutex<usize> = Mutex::new(0);
 
 /// Total pages currently committed to the kernel heap (for /proc/meminfo).
-static HEAP_PAGES: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static HEAP_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 // ── public API ─────────────────────────────────────────────────────────────────
 
@@ -111,14 +118,15 @@ pub fn grow(pages: usize) -> Option<usize> {
     //
     // Collect all frames before touching the allocator.  If the PMM runs
     // dry partway through we roll back the already-allocated frames.
-    let mut phys_pages: alloc::vec::Vec<usize> =
-        alloc::vec::Vec::with_capacity(pages);
+    let mut phys_pages: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(pages);
 
     for _ in 0..pages {
         match crate::mm::pmm::alloc_page() {
             Some(pa) => phys_pages.push(pa),
             None => {
-                for pa in &phys_pages { crate::mm::pmm::free_page(*pa); }
+                for pa in &phys_pages {
+                    crate::mm::pmm::free_page(*pa);
+                }
                 return None;
             }
         }
