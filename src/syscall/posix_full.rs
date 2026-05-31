@@ -103,13 +103,17 @@ pub(super) fn sys_uname_impl(uname_va: usize) -> isize {
         dst[n] = 0;
     }
     let mut buf = [[0u8; 65]; 6];
-    write_field(&mut buf[0], "Linux");       // sysname
-    write_field(&mut buf[1], "rustos");      // nodename
+    write_field(&mut buf[0], "Linux");        // sysname
+    write_field(&mut buf[1], "rustos");       // nodename
     write_field(&mut buf[2], "6.1.0-rustos"); // release
-    write_field(&mut buf[3], "#1 SMP");      // version
-    write_field(&mut buf[4], "x86_64");      // machine
-    write_field(&mut buf[5], "(none)");      // domainname
-    let flat: [u8; 390] = unsafe { core::mem::transmute(buf) };
+    write_field(&mut buf[3], "#1 SMP");       // version
+    write_field(&mut buf[4], "x86_64");       // machine
+    write_field(&mut buf[5], "(none)");       // domainname
+    // Flatten [[u8;65];6] → [u8;390] safely (no transmute).
+    let mut flat = [0u8; 390];
+    for (i, field) in buf.iter().enumerate() {
+        flat[i * 65..(i + 1) * 65].copy_from_slice(field);
+    }
     if crate::mm::uaccess::copy_to_user(uname_va, &flat).is_err() { return -14; }
     0
 }
@@ -247,7 +251,7 @@ pub(super) fn sys_copy_file_range_impl(
         fd_in, off_in_va, fd_out, off_out_va, len)
 }
 
-// ─── sync / fsync / fdatasync ─────────────────────────────────────────────────
+// ─── sync / fsync / fdatasync ─────────────────────────────────────────────────────
 
 /// NR 162  fsync(fd)
 pub(super) fn sys_fsync_impl(fd: usize) -> isize {
@@ -270,7 +274,7 @@ pub(super) fn sys_sync_impl() -> isize { 0 }
 /// NR 135  personality(persona) — report PER_LINUX, accept silently.
 pub(super) fn sys_personality_impl(_persona: u32) -> isize { 0 }
 
-// ─── setpgid / getpgid / setsid / getsid ─────────────────────────────────────
+// ─── setpgid / getpgid / setsid / getsid ────────────────────────────────────────────
 
 pub(super) fn sys_setpgid_impl(pid: usize, pgid: usize) -> isize {
     crate::proc::session::set_pgid(pid, pgid)
@@ -285,13 +289,13 @@ pub(super) fn sys_getsid_impl(pid: usize) -> isize {
     crate::proc::session::get_sid(pid)
 }
 
-// ─── getpriority / setpriority / nice ────────────────────────────────────────
+// ─── getpriority / setpriority / nice ──────────────────────────────────────────────
 
 pub(super) fn sys_getpriority_impl(_which: i32, _who: u32) -> isize { 20 }
 pub(super) fn sys_setpriority_impl(_which: i32, _who: u32, _prio: i32) -> isize { 0 }
 pub(super) fn sys_nice_impl(_inc: i32) -> isize { 0 }
 
-// ─── capget / capset ─────────────────────────────────────────────────────────
+// ─── capget / capset ─────────────────────────────────────────────────────────────
 
 /// NR 125/126  capget/capset — report full capabilities (we run as root).
 pub(super) fn sys_capget_impl(hdr_va: usize, data_va: usize) -> isize {
