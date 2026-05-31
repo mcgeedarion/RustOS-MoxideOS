@@ -20,11 +20,9 @@ pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 ///
 /// ## Field ordering note
 ///
-/// `self_ptr` and `cpu_id` are at offsets 0 and 8 respectively; the
-/// x86_64 `current_cpu_id()` fast path reads `gs:[4]` (offset 4 inside
-/// the pointer-sized slot that starts at 0 on LP64 — actually the u32
-/// `cpu_id` is at offset 8 due to the pointer being 8 bytes).  Do NOT
-/// reorder the first two fields without updating the inline asm.
+/// `self_ptr` is at offset 0 (8 bytes on LP64), and `cpu_id` is therefore
+/// at offset 8.  The x86_64 `current_cpu_id()` fast path reads `gs:[8]`.
+/// Do NOT reorder the first two fields without updating the inline asm.
 ///
 /// `current_pid` is written by `scheduler::schedule()` on every CPU every
 /// time a new task is selected.  `scheduler::current_pid()` reads it
@@ -35,7 +33,7 @@ pub const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 pub struct PercpuBlock {
     /// Pointer to self — must stay at offset 0.
     pub self_ptr: *mut PercpuBlock,
-    /// Logical CPU id (0-based).
+    /// Logical CPU id (0-based). Offset 8 on LP64.
     pub cpu_id: u32,
     /// NUMA node.
     pub node: u32,
@@ -141,7 +139,7 @@ pub fn current_cpu_id() -> u32 {
     unsafe {
         let id: u32;
         core::arch::asm!(
-            "mov {}, gs:[4]",  // offset 4 = cpu_id field
+            "mov {}, gs:[8]",  // offset 8 = cpu_id field (self_ptr is 8 bytes on LP64)
             out(reg) id,
             options(nostack, preserves_flags, readonly)
         );
