@@ -437,26 +437,29 @@ fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> 
     }
 }
 
-/// Read `UREG_COUNT` u64 register values from userspace at `va`.
+/// Read `N` u64 register values from userspace at `va`.
+/// Uses little-endian byte order to match the debugger-facing ptrace ABI
+/// (consistent with PEEKUSER, PEEKTEXT, and GETEVENTMSG which all emit LE).
 #[inline]
 fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isize> {
-    let mut bytes = [0u8; N * 8];  // stack-allocates; N is a const
+    let mut bytes = [0u8; N * 8];
     if copy_from_user(&mut bytes, va).is_err() { return Err(efault()); }
     let mut regs = [0u64; N];
     for i in 0..N {
         let off = i * 8;
-        regs[i] = u64::from_ne_bytes(bytes[off..off + 8].try_into().unwrap_or([0u8; 8]));
+        regs[i] = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap_or([0u8; 8]));
     }
     Ok(regs)
 }
 
-/// Write `UREG_COUNT` u64 register values to userspace at `va`.
+/// Write `N` u64 register values to userspace at `va`.
+/// Uses little-endian byte order to match the debugger-facing ptrace ABI.
 #[inline]
 fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Result<(), isize> {
     let mut bytes = [0u8; N * 8];
     for (i, &reg) in regs.iter().enumerate() {
         let off = i * 8;
-        bytes[off..off + 8].copy_from_slice(&reg.to_ne_bytes());
+        bytes[off..off + 8].copy_from_slice(&reg.to_le_bytes());
     }
     if copy_to_user(va, &bytes).is_err() { return Err(efault()); }
     Ok(())
