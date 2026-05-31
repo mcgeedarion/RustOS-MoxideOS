@@ -332,6 +332,24 @@ pub fn sys_mmap(
         let va = if is_fixed || is_fixed_noreplace {
             if !is_fixed_noreplace {
                 let end = va_end_of(addr, len);
+                // Tear down the hardware page table entries for the range
+                // being replaced before removing the VMA records.  Without
+                // this the old physical pages remain mapped and are leaked.
+                let cr3 = p.user_satp;
+                if cr3 != 0 {
+                    for va in (addr..end).step_by(PAGE) {
+                        let is_phys = p.vmas.iter().any(|v| {
+                            matches!(v.kind, VmaKind::PhysMap(_))
+                                && v.start <= va && va < v.end
+                        });
+                        if let Some(pa) = <Arch as Paging>::virt_to_phys(cr3, va) {
+                            <Arch as Paging>::unmap_page(va);
+                            if !is_phys {
+                                crate::mm::pmm::free_page(pa);
+                            }
+                        }
+                    }
+                }
                 remove_vma_inner(p, addr, end);
             }
             addr
