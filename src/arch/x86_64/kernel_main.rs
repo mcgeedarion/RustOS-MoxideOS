@@ -28,16 +28,17 @@
 //!  13.  spawn_init()                  — PID 1
 //!  14.  idle loop
 
-use core::arch::asm;
 use crate::arch::x86_64::{
+    apic::{apic_init, calibrate_lapic_timer},
     gdt::gdt_init,
     idt::idt_init,
-    syscall::syscall_setup,
     serial,
-    apic::{apic_init, calibrate_lapic_timer},
+    syscall::syscall_setup,
     xsave::xsave_init,
 };
+use crate::init::boot_info::BootInfo;
 use crate::proc::exec::spawn_user_process;
+use core::arch::asm;
 
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
@@ -54,12 +55,14 @@ static mut GDBSTUB_SERIAL: crate::debug::gdbstub::serial::SerialPort =
 #[cfg(feature = "multiboot2_boot")]
 #[no_mangle]
 pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
-    if magic == 0x36d7_6289 { MBI_PTR = info_phys as usize; }
-    kernel_main()
+    static mut BOOT_INFO: BootInfo = BootInfo::empty();
+    if magic == 0x36d7_6289 {
+        MBI_PTR = info_phys as usize;
+    }
+    crate::kernel_main::kernel_main(&BOOT_INFO)
 }
 
-#[no_mangle]
-pub extern "C" fn kernel_main() -> ! {
+pub fn init(_boot_info: &'static BootInfo) -> ! {
     serial::early_init();
 
     #[cfg(target_arch = "x86_64")]
@@ -97,14 +100,18 @@ pub extern "C" fn kernel_main() -> ! {
 
     // 5. Arch-specific discovery → PMM.
     let regions = crate::arch::x86_64::memory::discover();
-    unsafe { crate::mm::pmm::init_from_regions(&regions); }
+    unsafe {
+        crate::mm::pmm::init_from_regions(&regions);
+    }
     crate::mm::memmap::memmap_init();
 
     #[cfg(feature = "multiboot2_boot")]
     {
         let mbi = unsafe { MBI_PTR };
         if mbi != 0 {
-            unsafe { crate::arch::x86_64::multiboot2::parse_mbi(mbi); }
+            unsafe {
+                crate::arch::x86_64::multiboot2::parse_mbi(mbi);
+            }
             serial_println!("mb2: MBI at {:#x} parsed", mbi);
         }
     }
@@ -121,12 +128,16 @@ pub extern "C" fn kernel_main() -> ! {
     crate::drivers::pcie::pcie_init();
 
     crate::drivers::virtio_gpu::init();
-    serial_println!("virtio-gpu: {} scanout(s)",
-                    crate::drivers::virtio_gpu::num_scanouts());
+    serial_println!(
+        "virtio-gpu: {} scanout(s)",
+        crate::drivers::virtio_gpu::num_scanouts()
+    );
 
     crate::drivers::drm::init_heads();
-    serial_println!("drm: {} head(s) registered",
-                    crate::drivers::drm::num_heads());
+    serial_println!(
+        "drm: {} head(s) registered",
+        crate::drivers::drm::num_heads()
+    );
 
     apic_init();
 
@@ -152,7 +163,9 @@ pub extern "C" fn kernel_main() -> ! {
     // 12b. GDB stub — init after devfs is live (initramfs::mount sets up /dev).
     // Initialises COM1 for RSP and registers /dev/gdbstub.
     #[cfg(feature = "gdbstub")]
-    unsafe { crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL); }
+    unsafe {
+        crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL);
+    }
 
     const INITS: &[&str] = &["/sbin/init", "/bin/sh", "/init", "/bin/bash"];
     let mut spawned = false;
@@ -163,49 +176,56 @@ pub extern "C" fn kernel_main() -> ! {
             break;
         }
     }
-    if !spawned { serial_println!("init: no init binary found — idle"); }
+    if !spawned {
+        serial_println!("init: no init binary found — idle");
+    }
 
     serial_println!("kernel_main: idle");
     loop {
-        unsafe { asm!("hlt", options(nostack, nomem)); }
+        unsafe {
+            asm!("hlt", options(nostack, nomem));
+        }
         crate::proc::scheduler::schedule();
     }
 }
 
 // StorageBackend and helpers unchanged...
 
-enum StorageBackend { Ahci, Nvme(usize), VirtioBlk, None }
+enum StorageBackend {
+    Ahci,
+    Nvme(usize),
+    VirtioBlk,
+    None,
+}
 
 impl StorageBackend {
     fn name(&self) -> &'static str {
         match self {
-            Self::Ahci      => "ahci",
-            Self::Nvme(_)   => "nvme",
+            Self::Ahci => "ahci",
+            Self::Nvme(_) => "nvme",
             Self::VirtioBlk => "virtio-blk",
-            Self::None      => "none",
+            Self::None => "none",
         }
     }
 
     fn read_sector(&self, lba: u64, buf: &mut [u8]) -> bool {
         match self {
-            Self::Ahci => {
-                crate::drivers::block::ahci::ahci_read_sector(0, lba, buf)
-            }
-            Self::Nvme(ns) => {
-                crate::drivers::block::nvme::read_sectors(*ns, lba, 1, buf).is_ok()
-            }
-            Self::VirtioBlk => {
-                crate::block::virtio_blk::read_sector(lba, buf)
-            }
+            Self::Ahci => crate::drivers::block::ahci::ahci_read_sector(0, lba, buf),
+            Self::Nvme(ns) => crate::drivers::block::nvme::read_sectors(*ns, lba, 1, buf).is_ok(),
+            Self::VirtioBlk => crate::block::virtio_blk::read_sector(lba, buf),
             Self::None => false,
         }
     }
 }
 
 fn probe_storage() -> StorageBackend {
-    if probe_ahci() { return StorageBackend::Ahci; }
+    if probe_ahci() {
+        return StorageBackend::Ahci;
+    }
 
-    if let Some(ns) = probe_nvme() { return StorageBackend::Nvme(ns); }
+    if let Some(ns) = probe_nvme() {
+        return StorageBackend::Nvme(ns);
+    }
 
     crate::block::virtio_blk::virtio_blk_init(VIRTIO_BLK_MMIO_BASE);
     serial_println!("block: virtio-blk fallback");
@@ -216,7 +236,7 @@ fn probe_ahci() -> bool {
     use crate::drivers::pcie::{find_device_by_class, PCI_CLASS_STORAGE_AHCI};
     let dev = match find_device_by_class(PCI_CLASS_STORAGE_AHCI) {
         Some(d) => d,
-        None    => {
+        None => {
             serial_println!("ahci: no controller on PCI bus");
             return false;
         }
@@ -224,7 +244,7 @@ fn probe_ahci() -> bool {
     dev.enable();
     let bar5 = match dev.bar_mmio(5) {
         Some(b) => b as usize,
-        None    => {
+        None => {
             serial_println!("ahci: BAR5 not decoded");
             return false;
         }
@@ -232,8 +252,10 @@ fn probe_ahci() -> bool {
     serial_println!("ahci: controller at BAR5={:#x}", bar5);
     crate::drivers::block::ahci::ahci_init(bar5);
     let found = crate::drivers::block::ahci::ahci_present();
-    serial_println!("ahci: {} port(s)",
-        crate::drivers::block::ahci::ahci_port_count());
+    serial_println!(
+        "ahci: {} port(s)",
+        crate::drivers::block::ahci::ahci_port_count()
+    );
     found
 }
 
@@ -241,7 +263,7 @@ fn probe_nvme() -> Option<usize> {
     use crate::drivers::pcie::{find_device_by_class, PCI_CLASS_STORAGE_NVME};
     let dev = match find_device_by_class(PCI_CLASS_STORAGE_NVME) {
         Some(d) => d,
-        None    => {
+        None => {
             serial_println!("nvme: no controller on PCI bus");
             return None;
         }
@@ -249,7 +271,7 @@ fn probe_nvme() -> Option<usize> {
     dev.enable();
     let bar0_phys = match dev.bar_mmio(0) {
         Some(b) => b,
-        None    => {
+        None => {
             serial_println!("nvme: BAR0 not decoded");
             return None;
         }
@@ -264,9 +286,15 @@ fn probe_nvme() -> Option<usize> {
     }
     if let Some(info) = crate::drivers::block::nvme::disk_info(0) {
         let model = core::str::from_utf8(&info.model)
-            .unwrap_or("<utf8 error>").trim_end();
-        serial_println!("nvme: {} namespace(s), NS0: {} sectors × {} B  model='{}'",
-            count, info.sector_count, info.sector_size, model);
+            .unwrap_or("<utf8 error>")
+            .trim_end();
+        serial_println!(
+            "nvme: {} namespace(s), NS0: {} sectors × {} B  model='{}'",
+            count,
+            info.sector_count,
+            info.sector_size,
+            model
+        );
     }
     Some(0)
 }

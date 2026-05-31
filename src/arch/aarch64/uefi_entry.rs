@@ -5,12 +5,15 @@
 
 #![allow(dead_code)]
 
+use crate::init::boot_info::BootInfo;
 use core::ptr;
 
 type EfiHandle = *mut core::ffi::c_void;
 type EfiStatus = usize;
 
 const EFI_SUCCESS: EfiStatus = 0;
+
+static mut BOOT_INFO: BootInfo = BootInfo::empty();
 
 #[repr(C)]
 pub struct EfiTableHeader {
@@ -47,7 +50,8 @@ pub unsafe extern "efiapi" fn efi_main(_image: EfiHandle, st: *mut EfiSystemTabl
         );
     }
     crate::arch::aarch64::hal::init();
-    crate::kernel_main::kernel_main_aarch64();
+    BOOT_INFO = BootInfo::empty();
+    crate::kernel_main::kernel_main(&BOOT_INFO);
 }
 
 unsafe fn efi_print(con_out: *mut EfiSimpleTextOutput, s: &str) {
