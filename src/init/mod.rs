@@ -13,6 +13,7 @@
 //! | `schemes`   | Registers all built-in kernel schemes into `SCHEME_TABLE`.   |
 //! |             | Called from `kernel_main` after NIC + DHCP init.             |
 
+pub mod boot_info;
 pub mod crt;
 pub mod initramfs;
 pub mod loader;

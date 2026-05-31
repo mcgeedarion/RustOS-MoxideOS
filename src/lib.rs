@@ -76,6 +76,7 @@ pub mod exec;
 pub mod firmware;
 pub mod fs;
 pub mod init;
+pub use init::initramfs;
 pub mod io_uring;
 pub mod ipc;
 pub mod irq;

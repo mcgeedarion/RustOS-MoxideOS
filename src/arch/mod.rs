@@ -45,3 +45,14 @@ use riscv64::hal::ArchImpl;
 /// The concrete architecture implementation.
 /// Generic code uses this type alias to access all HAL traits.
 pub type Arch = ArchImpl;
+
+/// Run architecture-specific boot initialisation and hand off to the scheduler
+/// or final idle loop. This is the only hook called by the common kernel entry.
+pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
+    #[cfg(target_arch = "x86_64")]
+    { return x86_64::init(boot_info); }
+    #[cfg(target_arch = "riscv64")]
+    { return riscv64::init(boot_info); }
+    #[cfg(target_arch = "aarch64")]
+    { return aarch64::init(boot_info); }
+}
