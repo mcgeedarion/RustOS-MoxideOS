@@ -31,7 +31,7 @@
   "pre-link-args": {
     "lld-link": [
       "/subsystem:efi_application",
-      "/entry:efi_main"
+      "/entry:uefi_start"
     ]
   }
 }

@@ -18,6 +18,9 @@ kmtest = { path = "crates/kmtest", optional = true }
 # existing deps...
 
 [features]
+# Build as a UEFI loader/application.
+uefi_boot = []
+
 # Full debug build: GDB RSP stub + rich oops/backtrace + trace drain.
 # Use `--features debug` as the single flag for a debug kernel.
 # `debug_stub` and `trace` can still be enabled individually if needed.
