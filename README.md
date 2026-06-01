@@ -21,7 +21,7 @@ exported `kernel_main(boot_info)` symbol, and then dispatches once through
 |---|---|---|---|
 | `x86_64` | UEFI loader and direct kernel / Multiboot2-style path | `src/arch/x86_64/uefi_entry.rs`, `src/main.rs`, `src/arch/x86_64/kernel_main.rs` | Active |
 | `riscv64` | SBI/FDT kernel path and UEFI loader target | `src/arch/riscv64/boot.rs`, `src/arch/riscv64/uefi_entry.rs`, `src/arch/riscv64/mod.rs` | Active |
-| `aarch64` | UEFI loader and bare-metal kernel target scaffolding | `src/arch/aarch64/uefi_entry.rs`, `src/arch/aarch64/mod.rs` | Early bring-up |
+| `aarch64` | UEFI loader and bare-metal kernel target | `src/arch/aarch64/uefi_entry.rs`, `src/arch/aarch64/mod.rs` | Active bring-up |
 
 Per-architecture linker scripts live at the repository root
 (`linker_x86_64.ld`, `linker_riscv.ld`, `linker_aarch64.ld`). Custom target
@@ -75,7 +75,7 @@ Important files:
 │   ├── display/            # Framebuffer, DRM/KMS objects, Wayland pieces
 │   ├── drivers/            # Block, GPU, input, network, platform, virtio drivers
 │   ├── exec/               # Executable loading helpers
-│   ├── firmware/           # Firmware interfaces such as ACPI
+│   ├── firmware/           # ACPI, Device Tree, PSCI, CPU topology
 │   ├── fs/                 # VFS, filesystem drivers, FD-backed kernel objects
 │   ├── init/               # BootInfo, initramfs, ELF loader, scheme registration
 │   ├── input/              # Input event subsystem
@@ -150,7 +150,30 @@ checking.
 
 `src/proc` owns the Unix-like task model: process/thread state, PID/TID tables,
 fork/clone/exec, wait/reaping, resource limits, scheduler integration, signal
-delivery, ptrace, namespaces, cgroups, and seccomp filters.
+delivery (x86_64 and AArch64), ptrace, namespaces, cgroups, and seccomp filters.
+
+### Signal Delivery (`src/proc/signal.rs`)
+
+Signals are delivered to either a specific thread (`send_signal`) or a thread
+group (`send_signal_group`). At each syscall exit the kernel calls
+`check_and_deliver` (x86_64) or `check_and_deliver_aarch64` (AArch64) to pop
+the highest-priority pending signal and either invoke the userspace handler or
+apply the default action (terminate / stop / ignore).
+
+The signal frame pushed on the user stack is ABI-compatible with musl's
+`struct ucontext` on both architectures. `sys_rt_sigreturn` /
+`sys_rt_sigreturn_aarch64` restore all saved register state and the
+pre-signal sigmask on return from the handler. SIGKILL and SIGSTOP cannot be
+masked or caught.
+
+### Firmware Interfaces (`src/firmware`)
+
+| Module | Description |
+|---|---|
+| `acpi` | RSDP → RSDT/XSDT → MADT table walker. Exposes LAPIC/IOAPIC info (x86_64), GIC CPU Interface info (AArch64), FADT/DSDT power management, S3 sleep/resume, P-state CPU frequency scaling, battery status, PCIe ECAM base (`mcfg_base`), NUMA topology (SRAT/SLIT), and PCIe GPE hot-plug. |
+| `dt` | Device Tree / FDT helpers for RISC-V and AArch64 bare-metal paths. |
+| `psci` | ARM PSCI 1.0 over HVC/SMC conduit. Provides `cpu_on`, `cpu_off`, `system_off`, `system_reset`. Used by the AArch64 SMP bringup path to power on secondary CPUs. |
+| `topology` | Discovers secondary CPU MPIDR values from ACPI MADT (type 0x0B GIC CPU Interface entries) or falls back to a QEMU virt heuristic. Called by `smp::init` before issuing PSCI `CPU_ON`. |
 
 ### Filesystems and File Descriptors (`src/fs`)
 
@@ -230,7 +253,7 @@ cargo xtask build --arch riscv64 --boot uefi
 # AArch64 UEFI loader target
 cargo xtask build --arch aarch64 --boot uefi
 
-# AArch64 bare-metal kernel target scaffolding
+# AArch64 bare-metal kernel target
 cargo xtask build --arch aarch64 --boot sbi
 ```
 
