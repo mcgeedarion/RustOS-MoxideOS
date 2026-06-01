@@ -174,15 +174,44 @@ pub unsafe fn walk_madt(mut f: impl FnMut(&MadtEntryHdr, *const u8)) {
     }
 }
 
-/// Return the base address of the PCIe ECAM region from MCFG, if present.
-pub fn pcie_ecam_base() -> Option<u64> {
+/// Return the physical base address of the PCIe ECAM window from the MCFG
+/// table, if present.
+///
+/// The MCFG body starts at offset 44 from the table start:
+///   36 bytes SdtHeader + 8 bytes reserved = 44.
+/// The first MCFG allocation structure begins there with:
+///   [0..8]  Base Address (u64)
+///   [8..10] PCI Segment Group Number
+///   [10]    Start PCI Bus
+///   [11]    End PCI Bus
+///   [12..16] Reserved
+pub fn mcfg_base() -> Option<usize> {
     unsafe {
         let mcfg = find_table(b"MCFG")?;
-        // MCFG body starts at offset 44 (SdtHeader=36 + 8 reserved bytes).
         let body = (mcfg as usize + 44) as *const u64;
         let base = body.read_unaligned();
-        if base == 0 { None } else { Some(base) }
+        if base == 0 { None } else { Some(base as usize) }
     }
+}
+
+/// Return the number of logical CPUs found in the MADT, or 1 if unknown.
+pub fn cpu_count() -> usize {
+    let mut count = 0usize;
+    unsafe {
+        walk_madt(|hdr, _| {
+            // Type 0 = Local APIC (x86), type 0x0B = GIC CPU Interface (arm64)
+            if hdr.kind == 0 || hdr.kind == 0x0B {
+                count += 1;
+            }
+        });
+    }
+    if count == 0 { 1 } else { count }
+}
+
+/// Return the base address of the PCIe ECAM region from MCFG, if present.
+/// Alias kept for x86_64 callers that used `pcie_ecam_base()`.
+pub fn pcie_ecam_base() -> Option<u64> {
+    mcfg_base().map(|b| b as u64)
 }
 
 /// Convenience: initialise all ACPI sub-systems after the RSDP has been found.
@@ -203,4 +232,9 @@ pub unsafe fn init_all(rsdp_phys: usize) {
     battery::init();
     hotplug::init();
     numa::init();
+}
+
+/// Convenience wrapper used by x86_64 kernel_main.
+pub unsafe fn acpi_init(rsdp_phys: usize) {
+    init(rsdp_phys);
 }
