@@ -14,7 +14,7 @@
 //!
 //! # Registration
 //!
-//! Scheme drivers (kernel subsystems or future userspace servers) call
+//! Scheme drivers (kernel subsystems or userspace service servers) call
 //! `SCHEME_TABLE.register(name, handler)` at init time.  `name` is the bare
 //! string without the trailing colon (e.g., `"tcp"`, not `"tcp:"`).
 //!
@@ -23,7 +23,9 @@
 //! `open_url(url, flags)` strips the scheme prefix from a URL, looks up the
 //! handler, and calls `handler.open(path_after_colon, flags)` →
 //! `(Arc<dyn Scheme>, SchemeFileId)`.  This is used by `proc_fd_open` to
-//! replace ad-hoc scheme dispatch.
+//! replace ad-hoc scheme dispatch.  The same registry accepts native
+//! in-kernel handlers and `IpcProxyScheme` handlers, which is the resource
+//! routing boundary for the RustOS hybrid-kernel model.
 //!
 //! # Introspection
 //!

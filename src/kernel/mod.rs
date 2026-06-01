@@ -8,7 +8,9 @@
 //!   `uaccess` — Safe helpers for copying data between kernel and user space
 //!               (`copy_from_user`, `copy_to_user`, `get_user`, `put_user`).
 //!   `utils`   — Small cross-cutting helpers (alignment, bit ops, etc.).
+//!   `architecture` — Hybrid-kernel architecture contract and diagnostics.
 
+pub mod architecture;
 pub mod panic;
 pub mod rand;
 pub mod uaccess;

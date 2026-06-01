@@ -1,6 +1,9 @@
 # RustOS
 
-RustOS is a `no_std` monolithic kernel written in Rust. The repository is a
+RustOS is a `no_std` hybrid kernel written in Rust. It keeps
+latency-sensitive core mechanisms in kernel space while supporting
+microkernel-style userspace drivers and service servers through schemes, IPC,
+and capability-checked driver handles. The repository is a
 single Cargo workspace: the root package contains the kernel binary/library,
 `xtask` provides host-side build automation, and helper crates under `crates/`
 provide shared protocol types and the in-kernel test harness.
@@ -53,6 +56,8 @@ Important files:
   from loaders to the kernel.
 - `docs/boot-architecture.md` describes the long-term rule that boot methods
   converge into one common kernel initialization path.
+- `docs/hybrid-kernel-architecture.md` defines the RustOS hybrid split between
+  in-kernel core services and userspace scheme/driver servers.
 
 ---
 
@@ -104,6 +109,24 @@ Important files:
 ├── targets/                # Rust custom target JSON specs
 └── flake.nix               # Nix development shell
 ```
+
+---
+
+## Kernel Architecture Model
+
+RustOS uses a hybrid-kernel architecture rather than a purely monolithic or
+purely microkernel design:
+
+- The architecture HAL, memory manager, scheduler, interrupt routing, VFS core,
+  security enforcement, and common fast paths remain in kernel space.
+- Device drivers and resource providers can run as isolated userspace services
+  when they can be represented through kernel-mediated schemes and IPC.
+- The canonical in-code contract is `kernel::architecture::KERNEL_ARCHITECTURE`,
+  which is set to `KernelArchitecture::Hybrid` and logged during `kernel_main`.
+- The scheme table provides one namespace for both native kernel handlers and
+  `IpcProxyScheme` handlers backed by userspace servers.
+
+See `docs/hybrid-kernel-architecture.md` for the subsystem boundary rules.
 
 ---
 
