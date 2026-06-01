@@ -5,19 +5,21 @@
 //! interrupt controller.
 
 pub mod boot;
+pub mod cpu;
 pub mod hal;
+pub mod interrupts;
+pub mod kernel_main;
 pub mod mem_layout;
 pub mod paging;
+pub mod pci;
+pub mod serial;
+pub mod simd;
+pub mod smp;
+pub mod syscall;
 pub mod uefi_entry;
+pub mod uentry;
 
 /// ARM64 early/kernel boot hook used by the common entry point.
-pub fn init(_boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
-    crate::serial_println!(
-        "RustOS ARM64 boot: {}",
-        crate::arch::aarch64::mem_layout::BASELINE
-    );
-    crate::irq::aarch64::gic::init(crate::irq::aarch64::gic::GicConfig::qemu_virt_v3());
-    loop {
-        crate::arch::aarch64::hal::wait_for_interrupt();
-    }
+pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
+    kernel_main::init(boot_info)
 }
