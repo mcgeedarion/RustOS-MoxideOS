@@ -42,8 +42,6 @@ use crate::sync::spinlock::SpinLock;
 use crate::proc::process::{Pcb, ProcLock, State};
 use crate::proc::task_types::Task;
 
-// ── Global table ──────────────────────────────────────────────────────────────
-
 static PROC_TABLE: SpinLock<Vec<Arc<ProcLock>>> = SpinLock::new(Vec::new());
 
 static NEXT_PID: core::sync::atomic::AtomicU32 =
@@ -56,8 +54,6 @@ pub fn next_pid() -> u32 {
 pub fn proc_count() -> usize {
     PROC_TABLE.lock().len()
 }
-
-// ── Lookup helpers ────────────────────────────────────────────────────────────
 
 /// Find and clone the `Arc<ProcLock>` for `pid`.
 /// Holds `PROC_TABLE` for the minimum time (lookup + clone only).
@@ -103,8 +99,6 @@ pub fn with_procs_mut<T, F: FnOnce(&mut Vec<Arc<ProcLock>>) -> T>(f: F) -> T {
     f(&mut PROC_TABLE.lock())
 }
 
-// ── Thread-count helper ───────────────────────────────────────────────────────
-
 /// Count live (non-Zombie) threads that share the same tgid as `pid`.
 /// Used by `sys_setns` to reject CLONE_NEWPID / CLONE_NEWUSER joins from
 /// multi-threaded processes (Linux setns(2) semantics).
@@ -129,8 +123,6 @@ pub fn thread_count_of(pid: usize) -> Option<usize> {
         .count();
     Some(count)
 }
-
-// ── Insert / remove ───────────────────────────────────────────────────────────
 
 /// Insert a new process.  Wraps the Pcb in a ProcLock and pushes to table.
 /// Also allocates and links the Task struct.

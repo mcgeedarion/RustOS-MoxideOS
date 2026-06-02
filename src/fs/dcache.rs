@@ -19,15 +19,11 @@ use spin::Mutex;
 
 const DCACHE_MAX: usize = 1024;
 
-// ── internal key type ────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct DKey {
     parent: u64,
     name:   String,
 }
-
-// ── cache struct ─────────────────────────────────────────────────────────────
 
 struct DCache {
     /// The actual mapping.
@@ -94,11 +90,7 @@ impl DCache {
     }
 }
 
-// ── global singleton ─────────────────────────────────────────────────────────
-
 static DCACHE: Mutex<DCache> = Mutex::new(DCache::new());
-
-// ── public API ───────────────────────────────────────────────────────────────
 
 /// Return the child inode number for `(parent, name)`, or `None` on a miss.
 pub fn dcache_lookup(parent: u64, name: &str) -> Option<u64> {

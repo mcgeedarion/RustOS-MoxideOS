@@ -69,8 +69,6 @@ fn sysret_trampoline() {}
 const USER_CS: usize = 0x23;
 const USER_SS: usize = 0x1b;
 
-// ── CLONE_* flag bits ───────────────────────────────────────────────────────────
-
 pub const CLONE_VM:             u64 = 0x0000_0100;
 pub const CLONE_FS:             u64 = 0x0000_0200;
 pub const CLONE_FILES:          u64 = 0x0000_0400;
@@ -112,8 +110,6 @@ const CLONE_ARGS_SIZE_VER0: usize = 64;
 /// Full 11-field struct size (88 bytes).
 const CLONE_ARGS_SIZE_FULL: usize = core::mem::size_of::<CloneArgs>();
 
-// ── Safe user-space parser for clone_args ──────────────────────────────────
-//
 // Replaces the previous `unsafe { core::mem::transmute(kbuf) }` cast.
 // All fields are u64 at fixed offsets; parsing them explicitly:
 //   (a) is safe regardless of padding or future field additions;
@@ -143,8 +139,6 @@ fn parse_clone_args(buf: &[u8]) -> CloneArgs {
         cgroup:       u64_at(80),
     }
 }
-
-// ── sys_clone3 ─────────────────────────────────────────────────────────────────
 
 pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     // Validate the user pointer and reported size.
@@ -197,8 +191,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         0
     };
 
-    // ── Build arch Context and record the first-entry pc/sp ────────────────
-    //
     // These values are written to child_pcb.pc / child_pcb.sp BEFORE
     // scheduler::enqueue() is called.  proc_table::enqueue() constructs a
     // Task via Task::new(pcb_ptr), which reads pcb.pc and pcb.sp at that
@@ -251,15 +243,11 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
         0
     };
 
-    // ── Build child PCB ───────────────────────────────────────────────────────────
-    //
     // Start with a clone of the parent PCB so most fields are inherited.
     // Then override the fields that must differ in the child.
     let mut child_pcb: Pcb = scheduler::with_proc(parent_pid, |p| p.clone())
         .unwrap_or_else(make_blank_pcb);
 
-    // ── Signal handler table ───────────────────────────────────────────────────
-    //
     // CLONE_SIGHAND: share the Arc — all threads see sigaction() changes instantly.
     // Otherwise: deep-copy so parent and child have independent dispositions.
     child_pcb.signal_handlers = if flags & CLONE_SIGHAND != 0 {
@@ -272,8 +260,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
                 crate::proc::fork::SignalHandlers::default())))
     };
 
-    // ── mm_lock sharing ─────────────────────────────────────────────────────────
-    //
     // CLONE_VM: reuse parent's Arc so all threads in the group block together
     // on the same RwLock during uaccess validate+copy (see module doc).
     // Otherwise: independent lock — the child's address space is its own.
@@ -318,7 +304,6 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
             .unwrap_or_default();
     }
 
-    // ── Enqueue (Task::new reads pcb.pc / pcb.sp here) ───────────────────
     let child_pid_usize = child_pid as usize;
     scheduler::enqueue(child_pcb);
 
@@ -329,13 +314,9 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     child_pid as isize
 }
 
-// ── Internal helpers ───────────────────────────────────────────────────────────────
-
 fn make_blank_pcb() -> Pcb {
     Pcb::zeroed()
 }
-
-// ── x86_64 frame helpers ──────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 fn push_syscall_frame(
@@ -357,8 +338,6 @@ fn push_syscall_frame(
     frame[3]  = USER_CS;
     frame[4]  = pc;
 }
-
-// ── RISC-V frame helper ───────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 fn push_trap_frame_riscv(

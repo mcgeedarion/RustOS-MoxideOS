@@ -81,8 +81,6 @@ pub fn set_oneshot(ns_from_now: u64) {
     mmio_write64(base, T0_CMP,  now.wrapping_add(ticks));
 }
 
-// ── ACPI helper ───────────────────────────────────────────────────────────────
-
 fn acpi_hpet_base() -> Option<u64> {
     let table = crate::firmware::acpi::find_table(b"HPET")?;
     if table.len() < 52 { return None; }
@@ -90,8 +88,6 @@ fn acpi_hpet_base() -> Option<u64> {
     let addr = u64::from_le_bytes(addr_bytes);
     if addr == 0 { None } else { Some(addr) }
 }
-
-// ── MMIO helpers ──────────────────────────────────────────────────────────────
 
 fn mmio_read64(base: u64, offset: usize) -> u64 {
     unsafe { core::ptr::read_volatile((base as usize + offset) as *const u64) }

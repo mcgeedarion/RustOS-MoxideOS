@@ -24,10 +24,6 @@ use alloc::sync::Arc;
 use crate::fs::vfs_ops::FileOps;
 use crate::input::{EventNode, device_count};
 
-// ---------------------------------------------------------------------------
-// Dispatch table
-// ---------------------------------------------------------------------------
-
 /// Maximum number of majors we track.
 const MAX_MAJOR: usize = 256;
 /// Maximum minors per major.
@@ -76,10 +72,6 @@ static mut DEVFS_TABLE: DevfsTable = DevfsTable {
     majors: [const { None }; MAX_MAJOR],
 };
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /// Register a character device at (major, minor).
 ///
 /// Idempotent: registering the same (major, minor) twice replaces the old
@@ -112,10 +104,6 @@ pub fn devfs_open(path: &str) -> Option<Arc<dyn FileOps + Send + Sync>> {
 
 /// Input subsystem major number (matches Linux).
 pub const INPUT_MAJOR: usize = 13;
-
-// ---------------------------------------------------------------------------
-// init_devfs — called from kernel_main after input::init()
-// ---------------------------------------------------------------------------
 
 /// Initialise the devfs layer.
 ///

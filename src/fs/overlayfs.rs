@@ -38,12 +38,8 @@ use alloc::{
 use crate::fs::mount::{self, FsType};
 use spin::Mutex;
 
-// ── Global overlay mount table ─────────────────────────────────────────────
-
 pub static OVERLAY_MOUNTS: Mutex<alloc::collections::BTreeMap<String, OverlayMount>> =
     Mutex::new(alloc::collections::BTreeMap::new());
-
-// ── Error constants ─────────────────────────────────────────────────
 
 const ENOENT:  isize = -2;
 const EIO:     isize = -5;
@@ -53,15 +49,12 @@ const EISDIR:  isize = -21;
 const ENOSPC:  isize = -28;
 const EINVAL:  isize = -22;
 
-// ── Whiteout prefix ──────────────────────────────────────────────────
 const WH_PREFIX: &str = ".wh.";
 
 // Symlink xattr key stored as a small inline file alongside the inode.
 // We encode symlink targets as the file content of a sidecar file named
 // "<name>.ovl_symlink" in the upper layer.
 const SYMLINK_SUFFIX: &str = ".ovl_symlink";
-
-// ── Layer paths ─────────────────────────────────────────────────────────────
 
 /// Options extracted from the mount table for a given overlayfs mount.
 #[derive(Clone, Debug)]
@@ -93,8 +86,6 @@ impl OverlayMount {
         format!("{}{}", self.upper_path(rel), SYMLINK_SUFFIX)
     }
 }
-
-// ── Existence / metadata helpers ─────────────────────────────────────────
 
 fn path_exists(path: &str) -> bool {
     crate::fs::vfs_ops::stat(path).is_ok()
@@ -131,10 +122,7 @@ fn list_dir(path: &str) -> Result<Vec<String>, isize> {
         .map(|entries| entries.into_iter().map(|e| e.name).collect())
 }
 
-// ── KStat re-export for callers ─────────────────────────────────────────────
 pub use crate::fs::vfs_ops::KStat;
-
-// ── Public overlay operations ───────────────────────────────────────────────
 
 /// Resolve an overlay-relative path to the concrete layer path used for reading.
 pub fn lookup(om: &OverlayMount, rel: &str) -> Result<String, isize> {
@@ -305,8 +293,6 @@ pub fn link(om: &OverlayMount, old_rel: &str, new_rel: &str) -> Result<(), isize
     write(om, new_rel, &buf)
 }
 
-// ── symlink / readlink ──────────────────────────────────────────────────────────
-//
 // Symlinks are stored as sidecar files "<name>.ovl_symlink" in the upper
 // layer containing the raw target string.  This avoids requiring the
 // underlying ext2/tmpfs to support symlinks at the overlay's upper path.
@@ -338,8 +324,6 @@ pub fn readlink(om: &OverlayMount, rel: &str) -> Result<String, isize> {
     crate::fs::vfs_ops::readlink(&lo)
 }
 
-// ── chmod / chown ──────────────────────────────────────────────────────────────
-//
 // Both operate on the upper-layer copy.  copy_up_if_needed must be called
 // before either of these (enforced by vfs_ops).
 
@@ -357,8 +341,6 @@ pub fn chown(om: &OverlayMount, rel: &str, uid: u32, gid: u32) -> Result<(), isi
     crate::fs::vfs_ops::chown(&up, uid, gid)
 }
 
-// ── copy_up_if_needed ──────────────────────────────────────────────────────────
-//
 // Public entry point used by vfs_ops before chmod/chown so that the upper
 // layer has a writable copy before the metadata update is applied.
 
@@ -371,8 +353,6 @@ pub fn copy_up_if_needed(om: &OverlayMount, rel: &str) -> Result<(), isize> {
     }
     Err(ENOENT)
 }
-
-// ── Copy-up ──────────────────────────────────────────────────────────────────
 
 fn copy_up(om: &OverlayMount, rel: &str, lower_path: &str, upper_path: &str) -> Result<(), isize> {
     let (dir, base) = split_last(rel);
@@ -394,8 +374,6 @@ fn ensure_upper_dir(om: &OverlayMount, dir: &str) -> Result<(), isize> {
     create_dir(&up_dir)
 }
 
-// ── Path utilities ─────────────────────────────────────────────────────────────
-
 fn join(base: &str, rel: &str) -> String {
     let base = base.trim_end_matches('/');
     let rel  = rel.trim_start_matches('/');
@@ -412,15 +390,12 @@ fn split_last(path: &str) -> (&str, &str) {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // Build a self-contained in-memory overlay using three BTreeMaps so the
     // test has no dependency on tmpfs or vfs_ops.
-    //
     // We shadow the module-level helpers with closures over local storage so
     // the test is fully deterministic and host-runnable.
 

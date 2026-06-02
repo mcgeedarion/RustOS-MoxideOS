@@ -22,10 +22,6 @@ use spin::Mutex;
 use crate::drivers::gpu::framebuffer::{Framebuffer, PixelFormat};
 use crate::drivers::gpu::gpu::DisplayInfo;
 
-// ---------------------------------------------------------------------------
-// Virtio MMIO registers
-// ---------------------------------------------------------------------------
-
 const MMIO_MAGIC:        usize = 0x000;
 const MMIO_VERSION:      usize = 0x004;
 const MMIO_DEVICE_ID:    usize = 0x008;
@@ -52,10 +48,6 @@ const STATUS_FEAT_OK: u32 = 8;
 const DEVICE_ID_GPU: u32 = 16;
 const MAGIC:         u32 = 0x7472_6976;
 
-// ---------------------------------------------------------------------------
-// Virtio-gpu command types
-// ---------------------------------------------------------------------------
-
 const CMD_GET_DISPLAY_INFO:       u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D:     u32 = 0x0101;
 const CMD_RESOURCE_UNREF:         u32 = 0x0102;
@@ -70,10 +62,6 @@ const RESP_OK_DISPLAYINFO: u32 = 0x1101;
 
 const FORMAT_B8G8R8X8:    u32 = 2;
 const FORMAT_B8G8R8A8:    u32 = 1;
-
-// ---------------------------------------------------------------------------
-// Virtio-gpu structs (packed, as per spec)
-// ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
@@ -163,10 +151,6 @@ struct CmdUnref {
     _pad:        u32,
 }
 
-// ---------------------------------------------------------------------------
-// Virtqueue structures
-// ---------------------------------------------------------------------------
-
 const QSZ: usize = 64;
 
 #[repr(C, packed)]
@@ -196,10 +180,6 @@ struct Vq {
     free_head: u16,
 }
 
-// ---------------------------------------------------------------------------
-// Driver state
-// ---------------------------------------------------------------------------
-
 struct VirtioGpu {
     base:        usize,
     ctrlq:       Vq,
@@ -214,10 +194,6 @@ unsafe impl Send for VirtioGpu {}
 unsafe impl Sync for VirtioGpu {}
 
 static GPU: Mutex<Option<VirtioGpu>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 pub fn init(mmio_base: u64) { unsafe { _init(mmio_base as usize); } }
 pub fn is_initialised() -> bool { GPU.lock().is_some() }
@@ -243,10 +219,6 @@ pub fn blit(x: u32, y: u32, w: u32, h: u32, pixels: &[u32]) {
 }
 
 pub fn flush() { unsafe { _flush(); } }
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
 
 unsafe fn _init(base: usize) {
     if read32(base, MMIO_MAGIC) != MAGIC { return; }
@@ -358,10 +330,6 @@ unsafe fn _flush() {
         transfer_flush(gpu.base, &gpu.ctrlq, gpu.resource_id, gpu.width, gpu.height);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Simple polling send (no vq, direct MMIO for init path)
-// ---------------------------------------------------------------------------
 
 unsafe fn send_cmd_sync(base: usize, cmd_phys: u64, _cmd_size: usize) {
     // Write interrupt-ACK and notify queue 0.

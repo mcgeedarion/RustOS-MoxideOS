@@ -48,8 +48,6 @@ use super::rsp::{handle_packet, rsp_packet, Session};
 use super::serial::SerialPort;
 use super::target::GdbTarget;
 
-// ── RSP framing state machine ─────────────────────────────────────────────────
-
 /// Read one complete `$body#xx` packet from the serial port.
 /// Returns the packet body on success, or `None` if a 0x03 interrupt byte
 /// is received (GDB Ctrl-C).
@@ -102,8 +100,6 @@ fn send_response(serial: &mut SerialPort, resp: &str) {
     }
 }
 
-// ── Stop-reply helper ─────────────────────────────────────────────────────────
-
 /// Block until the target transitions out of the running state, then send
 /// the stop reply to GDB.  Called after `c` or `s` packets.
 fn wait_and_notify(serial: &mut SerialPort, target: &mut GdbTarget) {
@@ -127,8 +123,6 @@ fn wait_and_notify(serial: &mut SerialPort, target: &mut GdbTarget) {
     send_response(serial, &reply);
 }
 
-// ── /dev/gdbstub char device registration ────────────────────────────────────
-
 /// Register `/dev/gdbstub` in devfs so GDB can open it as a serial device.
 ///
 /// Must be called after devfs is mounted (i.e. after `init_mounts`).
@@ -138,8 +132,6 @@ pub fn register_dev() {
     // avoid conflicting with existing ttyS* nodes (minor 64 = ttyS0, 65 = ttyS1).
     crate::fs::devfs::register_char_dev("gdbstub", 4, 66);
 }
-
-// ── Main session loop ─────────────────────────────────────────────────────────
 
 /// Attach to `pid` and drive the RSP loop until the debugger detaches or
 /// kills the target.  Returns when the session is done.
@@ -197,8 +189,6 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
         }
     }
 }
-
-// ── Boot-time GDB stub init ───────────────────────────────────────────────────
 
 /// Initialise the stub's serial port and register `/dev/gdbstub`.
 ///

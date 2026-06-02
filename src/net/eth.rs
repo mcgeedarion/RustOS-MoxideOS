@@ -16,8 +16,6 @@ const ETHERTYPE_IP:  u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const BCAST_MAC: [u8; 6] = [0xFF; 6];
 
-// ── MAC address type ─────────────────────────────────────────────────────────────────
-
 /// A 6-byte IEEE 802.3 MAC address.
 ///
 /// The raw `[u8; 6]` form is used throughout the network stack for zero-copy
@@ -63,8 +61,6 @@ impl core::fmt::Display for MacAddr {
     }
 }
 
-// ── MAC store ─────────────────────────────────────────────────────────────────────
-
 static OUR_MAC: Mutex<[u8; 6]> = Mutex::new([0u8; 6]);
 
 /// Set our MAC address (called once by the NIC driver at init time).
@@ -81,8 +77,6 @@ pub fn our_mac() -> [u8; 6] {
 pub fn our_mac_addr() -> MacAddr {
     MacAddr(*OUR_MAC.lock())
 }
-
-// ── Send / receive ─────────────────────────────────────────────────────────────
 
 /// Send an Ethernet II frame to `dst_mac` carrying `payload` with `ethertype`.
 pub fn send(dst_mac: [u8; 6], ethertype: u16, payload: &[u8]) {

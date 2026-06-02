@@ -64,7 +64,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
     let page_va = faulting_va & PAGE_MASK;
     let pid     = scheduler::current_pid();
 
-    // ── 1. VMA lookup (binary search, O(log n)) ───────────────────────────
     let vma = match find_vma(pid, faulting_va) {
         Some(v) => v,
         None    => {
@@ -73,7 +72,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
         }
     };
 
-    // ── 2. Address space / page table handle ──────────────────────────────
     // `user_satp` doubles as CR3 on x86_64 (same field name in the PCB;
     // the Paging trait methods interpret the value correctly per arch).
     let user_cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
@@ -82,8 +80,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
         return false;
     }
 
-    // ── 3. Physical page allocation ───────────────────────────────────────
-    //
     // For PhysMap VMAs the allocated page is immediately returned to the PMM
     // (we re-use the physical address in the VMA instead). For all other
     // kinds we keep it.
@@ -97,16 +93,12 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
         }
     };
 
-    // ── 4. Per-kind page fill ─────────────────────────────────────────────
     match &vma.kind {
 
-        // ── Anonymous (zero-fill) ─────────────────────────────────────────
         VmaKind::Anonymous | VmaKind::Heap | VmaKind::Stack => {
             // alloc_page() guarantees a zero-filled page; nothing more needed.
         }
 
-        // ── File-backed (demand fault from VFS) ───────────────────────────
-        //
         // This arm handles both x86_64 and RISC-V identically: `pread` is
         // the shared arch-neutral VFS call and `map_page`/`flush_va` are
         // Paging trait methods dispatched at compile time per arch.
@@ -117,10 +109,8 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
 
             // Step B — compute the byte offset of this page in the file.
-            //
             //   page_index = (page_va - vma.start) / PAGE_SIZE
             //   file_off   = base_offset + page_index * PAGE_SIZE
-            //
             // Cast to i64 for pread's offset argument.  The VMA can't start
             // above i64::MAX (we'd have rejected the mmap), so this is safe.
             let page_index = (page_va - vma.start) / PAGE_SIZE;
@@ -132,12 +122,10 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             let n = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_off);
 
             // Step D — classify the result.
-            //
             // IMPORTANT: check `n < 0` before casting to usize. A negative
             // isize cast to usize wraps to near usize::MAX, so a naive
             // `(n as usize) < PAGE_SIZE` check would pass for error returns,
             // silently mapping a zero page instead of delivering SIGBUS.
-            //
             //   n < 0              I/O error — free the frame, deliver SIGBUS.
             //   n >= 0             Success (full or partial):
             //     n == 0           EOF before this page: zero page is correct.
@@ -159,7 +147,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             // suffix from Step A is the correct POSIX behaviour.
         }
 
-        // ── Fixed (kernel-internal, no backing store) ─────────────────────
         VmaKind::Fixed => {
             // MAP_FIXED over an already-unmapped region — access violation.
             free_page(pa);
@@ -167,7 +154,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             return false;
         }
 
-        // ── PhysMap (MMIO / framebuffer) ──────────────────────────────────
         VmaKind::PhysMap(phys_base) => {
             // Re-map the exact physical page — do NOT use the PMM-allocated
             // `pa`. Return `pa` to the PMM immediately; the physical page is
@@ -181,8 +167,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
         }
     }
 
-    // ── 5. Map the (now-filled) physical page and flush the TLB entry ─────
-    //
     // prot_to_flags() derives PRESENT | USER | (WRITE if PROT_WRITE) |
     // (NX if !PROT_EXEC) from the VMA's protection flags.  On RISC-V the
     // Paging impl translates these to Sv39 PTE bits; on x86_64 it writes

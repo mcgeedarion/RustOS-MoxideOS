@@ -36,8 +36,6 @@
 
 use crate::rand::arch_entropy;
 
-// ── Virtual address regions (userspace, 48-bit canonical) ────────────────────
-
 /// Default stack top (top of user VA space minus a guard gap).
 pub const STACK_TOP_DEFAULT: u64 = 0x0000_7FFF_FFFF_0000;
 
@@ -55,8 +53,6 @@ const MMAP_MAX: u64 = 0x0000_0500_0000_0000;
 
 /// Granularity of all random offsets (2 MiB = huge-page size).
 const ALIGN: u64 = 2 * 1024 * 1024;
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Returns a random downward offset to subtract from `STACK_TOP_DEFAULT`.
 ///
@@ -121,8 +117,6 @@ impl AslrLayout {
         }
     }
 }
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Return a uniformly-random, 2 MiB-aligned address in `[lo, hi)`.
 #[inline]

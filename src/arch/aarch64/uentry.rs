@@ -64,11 +64,9 @@ pub unsafe fn eret_to_user(ttbr0: usize, entry: usize, user_sp: usize) -> ! {
         "msr ttbr0_el1, {ttbr0}",
         "isb",
 
-        // Set up ELR_EL1 and SPSR_EL1 (EL0t, interrupts unmasked).
         "msr elr_el1,  {entry}",
         "msr spsr_el1, xzr",
 
-        // Set user stack pointer.
         "msr sp_el0,   {sp}",
 
         // Zero all GPRs that musl/libc inspects on startup.

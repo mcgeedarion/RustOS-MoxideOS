@@ -6,10 +6,6 @@
 
 use crate::drivers::gpu::drm::GemBo;
 
-// ---------------------------------------------------------------------------
-// Pixel format
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
     Argb8888,  // 0xAARRGGBB
@@ -31,10 +27,6 @@ impl PixelFormat {
 impl Default for PixelFormat {
     fn default() -> Self { PixelFormat::Xrgb8888 }
 }
-
-// ---------------------------------------------------------------------------
-// Framebuffer descriptor
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct Framebuffer {

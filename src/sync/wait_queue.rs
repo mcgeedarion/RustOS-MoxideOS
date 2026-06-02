@@ -46,8 +46,6 @@ pub enum WakeReason {
     Cancelled,
 }
 
-// ── Internal waiter record ────────────────────────────────────────────────────
-
 struct Waiter {
     task_id:  usize,
     interest: ReadyMask,
@@ -63,8 +61,6 @@ struct Forwarder {
 // WaitQueue targets are always held in Arc<dyn PollSource> which outlives
 // the forwarder registration (register/remove are paired in wait_any).
 unsafe impl Send for Forwarder {}
-
-// ── WaitQueue ─────────────────────────────────────────────────────────────────
 
 pub struct WaitQueue {
     /// Current readiness bits — published atomically by device/IRQ side.
@@ -85,8 +81,6 @@ impl WaitQueue {
             forwarders: Mutex::new(Vec::new()),
         }
     }
-
-    // ── Device / IRQ side — called from interrupt context ─────────────────
 
     /// Publish readiness bits and wake all matching waiters.
     ///
@@ -127,8 +121,6 @@ impl WaitQueue {
         self.ready.fetch_and(!bits, Ordering::AcqRel);
     }
 
-    // ── Syscall / task side ────────────────────────────────────────────────
-
     /// Non-blocking readiness snapshot.  Lock-free.  IRQ-safe.
     #[inline]
     pub fn poll(&self, interest: ReadyMask) -> ReadyMask {
@@ -146,7 +138,6 @@ impl WaitQueue {
         cancel:    Option<&CancellationToken>,
         deadline:  Option<u64>,
     ) -> WakeReason {
-        // ── Fast paths (no scheduler interaction) ─────────────────────────
         if self.ready.load(Ordering::Acquire) & interest != 0 {
             return WakeReason::Ready;
         }
@@ -157,7 +148,6 @@ impl WaitQueue {
         let task_id = crate::proc::scheduler::current_pid();
         let full_interest = interest | WAKE_TIMEOUT | WAKE_CANCEL;
 
-        // ── Arm deadline timer before registering as waiter ───────────────
         // This ordering prevents a lost wakeup: if the timer fires between
         // the fast-path check and the waiter registration, it will set
         // WAKE_TIMEOUT in ready, and we will see it after taking the lock.
@@ -171,7 +161,6 @@ impl WaitQueue {
             })
         });
 
-        // ── Register waiter under lock (closes ready-vs-register race) ────
         {
             let mut waiters = self.waiters.lock();
             // Re-check under lock: readiness may have arrived between the
@@ -186,7 +175,6 @@ impl WaitQueue {
             waiters.push_back(Waiter { task_id, interest: full_interest });
         }
 
-        // ── Hook cancellation: if already cancelled, fire immediately ─────
         if let Some(ct) = cancel {
             if ct.is_cancelled() {
                 // Remove ourselves before returning.
@@ -198,16 +186,13 @@ impl WaitQueue {
             }
         }
 
-        // ── Yield to scheduler — woken by wake() ──────────────────────────
         crate::proc::scheduler::block_current();
 
-        // ── Cleanup ───────────────────────────────────────────────────────
         self.waiters.lock().retain(|w| w.task_id != task_id);
         if let Some(tid) = timer_id {
             crate::time::timer::cancel_timer(tid);
         }
 
-        // ── Determine wake reason ─────────────────────────────────────────
         if cancel.map(|c| c.is_cancelled()).unwrap_or(false) {
             return WakeReason::Cancelled;
         }
@@ -218,8 +203,6 @@ impl WaitQueue {
         }
         WakeReason::Ready
     }
-
-    // ── Forwarder management (used by wait_any in poll_source) ────────────
 
     /// Register `target` to be woken whenever this queue fires `interest` bits.
     /// Caller must call `remove_forwarder(target)` when done.
@@ -254,14 +237,11 @@ impl WaitQueue {
     }
 }
 
-// ── CancellationToken ─────────────────────────────────────────────────────────
-//
 // Unified cancellation model replacing:
 //   - futex_clear_pid()
 //   - cancel_timer() in nanosleep
 //   - post-hoc has_pending_signal() checks
 //   - EPIPE / fd-close races
-//
 // Every wait path accepts Option<&CancellationToken>.
 // Signal delivery, fd close, and task exit all call cancel().
 

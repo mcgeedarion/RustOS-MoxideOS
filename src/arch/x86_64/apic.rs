@@ -28,8 +28,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::arch::x86_64::mem_layout::{apic as ml, trampoline as tram, higher_half};
 
-// ── Mode flag ─────────────────────────────────────────────────────────────────
-
 static X2APIC_MODE: AtomicBool  = AtomicBool::new(false);
 static LAPIC_PHYS:  AtomicU64   = AtomicU64::new(ml::LAPIC_PHYS_DEFAULT);
 
@@ -41,14 +39,10 @@ static APIC_TICKS_PER_MS: AtomicU64 = AtomicU64::new(0);
 /// Override the LAPIC physical base (called from ACPI MADT parser).
 pub fn set_lapic_base(phys: u64) { LAPIC_PHYS.store(phys, Ordering::Relaxed); }
 
-// ── LAPIC MMIO virtual address ────────────────────────────────────────────────
-
 #[inline]
 fn lapic_virt() -> usize {
     higher_half::phys_to_virt(LAPIC_PHYS.load(Ordering::Relaxed))
 }
-
-// ── Low-level register access ─────────────────────────────────────────────────
 
 #[inline]
 unsafe fn lapic_read(offset: usize) -> u32 {
@@ -103,8 +97,6 @@ unsafe fn icr_wait_idle() {
         }
     }
 }
-
-// ── APIC enable ───────────────────────────────────────────────────────────────
 
 /// Detect and enable x2APIC (if supported) or xAPIC on the calling CPU.
 /// Safe to call on BSP and each AP independently.
@@ -169,8 +161,6 @@ unsafe fn local_apic_setup() {
     lapic_write(ml::REG_TIMER_ICR, 0);
 }
 
-// ── Public init entrypoints ───────────────────────────────────────────────────
-
 /// BSP initialisation.  Call after `gdt_init()`, `idt_init()`, and
 /// critically **after** `time::init()` so that `busy_wait_us()` is accurate.
 pub fn apic_init() {
@@ -194,8 +184,6 @@ pub unsafe fn ap_init_local() {
         arm_periodic_1ms(ticks_per_ms);
     }
 }
-
-// ── APIC timer calibration ────────────────────────────────────────────────────
 
 /// Calibrate the APIC bus clock and arm the periodic 1 ms timer.
 ///
@@ -243,7 +231,6 @@ unsafe fn measure_with_best_reference(window_ms: u64) -> u64 {
 
     let start_apic = lapic_read(ml::REG_TIMER_CCR) as u64;
 
-    // ── TSC path (preferred) ──────────────────────────────────────────────
     let tsc_freq = time::tsc::freq_hz();
     if tsc_freq > 0 {
         let tsc_ticks = tsc_freq / 1000 * window_ms;
@@ -255,7 +242,6 @@ unsafe fn measure_with_best_reference(window_ms: u64) -> u64 {
         return start_apic.saturating_sub(end_apic); // counts down
     }
 
-    // ── HPET path ─────────────────────────────────────────────────────────
     if time::hpet::is_ready() {
         let t0_ns = time::hpet::read_ns();
         let target_ns = window_ms * 1_000_000;
@@ -266,7 +252,6 @@ unsafe fn measure_with_best_reference(window_ms: u64) -> u64 {
         return start_apic.saturating_sub(end_apic);
     }
 
-    // ── PIT path (last resort) ────────────────────────────────────────────
     // PIT channel 2, mode 0 (one-shot), 11932 counts ≈ 10 ms.
     // We fire one PIT window per window_ms / 10 iteration (or one if ≤ 10 ms).
     pit_wait_ms(window_ms);
@@ -324,16 +309,12 @@ unsafe fn arm_periodic_1ms(ticks_per_ms: u64) {
         (1 << 17) | crate::smp::ipi::APIC_TIMER_VECTOR as u32);
 }
 
-// ── EOI ───────────────────────────────────────────────────────────────────────
-
 /// Signal end-of-interrupt to the LAPIC.  Must be called before returning
 /// from any LAPIC-sourced interrupt handler (timer, IPI, etc.).
 #[inline]
 pub fn send_eoi() {
     unsafe { lapic_write(ml::REG_EOI, 0); }
 }
-
-// ── LAPIC ID ──────────────────────────────────────────────────────────────────
 
 /// Return the calling CPU's APIC ID.
 #[inline]
@@ -346,8 +327,6 @@ pub fn lapic_id() -> u32 {
         }
     }
 }
-
-// ── IPI send ──────────────────────────────────────────────────────────────────
 
 /// Send a fixed-mode IPI to `apic_id` on `vector`.
 /// Called by `smp::ipi::send()` after the pending bit has been set.
@@ -363,8 +342,6 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
         icr_wait_idle();
     }
 }
-
-// ── AP bring-up ───────────────────────────────────────────────────────────────
 
 extern "C" {
     static ap_trampoline_start: u8;
@@ -382,7 +359,6 @@ pub fn start_all_aps() {
     let tram_page = (ml::TRAMPOLINE_PHYS >> 12) as u8;
     let tram_base = ml::TRAMPOLINE_PHYS;
 
-    // ── 1. Copy trampoline code into physical 0x8000 (direct-map) ─────────
     unsafe {
         let src  = &ap_trampoline_start as *const u8;
         let end  = &ap_trampoline_end   as *const u8;
@@ -391,7 +367,6 @@ pub fn start_all_aps() {
         core::ptr::copy_nonoverlapping(src, dst, len);
     }
 
-    // ── 2. Write the kernel PML4 PA into the trampoline slot ─────────────
     unsafe {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
@@ -403,14 +378,12 @@ pub fn start_all_aps() {
         core::ptr::write_volatile(pml4_slot, cr3 & !0xFFFu64);
     }
 
-    // ── 3. Write the BSP's GDTR into the trampoline GDT-ptr slot ─────────
     unsafe {
         let gdt_slot = higher_half::phys_to_virt(
             tram_base + tram::GDT_PTR_OFFSET as u64) as *mut u8;
         core::arch::asm!("sgdt [{p}]", p = in(reg) gdt_slot, options(nostack));
     }
 
-    // ── 4. Global INIT deassert, then assert ──────────────────────────────
     unsafe {
         icr_wait_idle();
         // Deassert to ensure clean state.
@@ -436,7 +409,6 @@ pub fn start_all_aps() {
     }
     busy_wait_us(10_000);
 
-    // ── 5. Per-AP stack allocation + SIPI×2 ───────────────────────────────
     let total = crate::smp::num_cpus();
     for cpu_id in 0..total {
         let info = match crate::smp::cpu_info(cpu_id) {
@@ -488,8 +460,6 @@ fn allocate_ap_stack(_cpu_id: u32) -> u64 {
     (virt + AP_STACK_PAGES * 0x1000) as u64
 }
 
-// ── IPI vector registration ───────────────────────────────────────────────────
-
 /// Wire IPI vectors 0xF0/0xF1/0xF2/0xFE into the IDT.
 /// Each handler: set pending bit (already done by sender), call
 /// `ipi::dispatch()` to drain all pending bits, then EOI.
@@ -514,8 +484,6 @@ fn register_ipi_handlers() {
         send_eoi();  // unreachable if PanicHalt fires, kept for correctness
     });
 }
-
-// ── Micro-delay (calibrated TSC busy-spin, PIT fallback) ─────────────────────
 
 /// Spin for `us` microseconds.
 ///
@@ -549,8 +517,6 @@ fn rdtsc() -> u64 {
     (hi as u64) << 32 | lo as u64
 }
 
-// ── I/O port helpers (shared with PIT calibration) ───────────────────────────
-
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
     let val: u8;
@@ -563,7 +529,6 @@ unsafe fn outb(port: u16, val: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nostack));
 }
 
-// ── APIC timer vector constant (used by local_apic_setup) ────────────────────
 pub mod ipi {
     /// Vector 32 = APIC timer (IDT slot 32, same as IRQ0 in PIC-free mode).
     pub const APIC_TIMER_VECTOR: u8 = 32;

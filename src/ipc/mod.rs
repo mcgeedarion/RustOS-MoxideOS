@@ -25,8 +25,6 @@ pub mod pipe_scheme;
 pub mod sem;
 pub mod shm;
 
-// ── Common IPC permission structure ───────────────────────────────────────────
-
 /// `struct ipc_perm` — matches Linux x86_64 UAPI layout.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -56,8 +54,6 @@ pub fn check_perm(perm: &IpcPerm, uid: u32, gid: u32, need: u16) -> bool {
     let shift = if uid == perm.uid { 6 } else if gid == perm.gid { 3 } else { 0 };
     (perm.mode >> shift) & need == need
 }
-
-// ── Common IPC flags / commands ───────────────────────────────────────────────
 
 pub const IPC_PRIVATE: i32 = 0;
 pub const IPC_CREAT:   i32 = 0o001000;

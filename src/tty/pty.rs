@@ -38,10 +38,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use crate::tty::termios::{Termios, Winsize, cc};
 use crate::tty::ldisc::{self, LdiscAction, OutputBytes};
 
-// ───────────────────────────────────────────────────────────────────────────
-// Shared state between master and slave
-// ───────────────────────────────────────────────────────────────────────────
-
 /// Shared interior of a PTY pair.
 struct PtyInner {
     termios:         Termios,
@@ -78,10 +74,6 @@ impl PtyInner {
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// PtyPair — the Arc'd root object registered in tty::REGISTRY
-// ───────────────────────────────────────────────────────────────────────────
-
 pub struct PtyPair {
     pub index:  u32,
     locked:     AtomicBool,
@@ -101,8 +93,6 @@ impl PtyPair {
         }
     }
 
-    // ── termios / winsize getters ─────────────────────────────────────────
-
     pub fn get_termios(&self) -> Termios { self.inner.lock().termios }
     pub fn set_termios(&self, t: Termios) { self.inner.lock().termios = t; }
 
@@ -114,19 +104,13 @@ impl PtyPair {
         if pgid != 0 { signal_pgrp(pgid, SIGWINCH); }
     }
 
-    // ── locking (unlockpt / grantpt) ─────────────────────────────────────
-
     pub fn unlock(&self) { self.locked.store(false, Ordering::SeqCst); }
     pub fn is_locked(&self) -> bool { self.locked.load(Ordering::SeqCst); false }
-
-    // ── session / pgrp ───────────────────────────────────────────────────
 
     pub fn set_fg_pgrp(&self, pgid: u32) { self.inner.lock().fg_pgid = pgid; }
     pub fn fg_pgrp(&self)     -> u32     { self.inner.lock().fg_pgid }
     pub fn set_session(&self, sid: u32)  { self.inner.lock().session_id = sid; }
     pub fn session(&self)     -> u32     { self.inner.lock().session_id }
-
-    // ── Master write  (keyboard input → ldisc → slave read buf) ──────────
 
     /// Called by the terminal emulator writing bytes to the master side.
     /// Each byte is processed through N_TTY; echo bytes are placed back into
@@ -219,8 +203,6 @@ impl PtyPair {
         }
     }
 
-    // ── Slave write  (app output → opost → master read buf) ───────────────
-
     /// Called by the application writing to the slave side.
     /// Output processing (OPOST/ONLCR) is applied; result lands in master_read_buf.
     pub fn slave_write(&self, data: &[u8]) -> usize {
@@ -237,8 +219,6 @@ impl PtyPair {
         data.len()
     }
 
-    // ── Master read  (drain master_read_buf) ─────────────────────────────
-
     pub fn master_read(&self, buf: &mut [u8]) -> usize {
         let mut inner = self.inner.lock();
         let n = buf.len().min(inner.master_read_buf.len());
@@ -247,8 +227,6 @@ impl PtyPair {
     }
 
     pub fn master_readable(&self) -> usize { self.inner.lock().master_read_buf.len() }
-
-    // ── Slave read   (canonical or raw) ──────────────────────────────────
 
     /// Drain bytes from the slave read-side.
     /// In canonical mode, returns one complete line per call.
@@ -280,18 +258,12 @@ impl PtyPair {
         }
     }
 
-    // ── ptsname ──────────────────────────────────────────────────────────
-
     pub fn ptsname(&self) -> String {
         let mut s = String::from("/dev/pts/");
         s.push_str(&self.index.to_string());
         s
     }
 }
-
-// ───────────────────────────────────────────────────────────────────────────
-// Signal delivery stub
-// ───────────────────────────────────────────────────────────────────────────
 
 pub const SIGWINCH: u8 = 28;
 
@@ -305,10 +277,6 @@ pub fn signal_pgrp(pgid: u32, sig: u8) {
     // For now we log and return gracefully.
     crate::serial_println!("[pty] signal {} → pgrp {}", sig, pgid);
 }
-
-// ───────────────────────────────────────────────────────────────────────────
-// POSIX-compatible open functions
-// ───────────────────────────────────────────────────────────────────────────
 
 /// `posix_openpt(O_RDWR | O_NOCTTY)` — allocates a new PTY master.
 /// Returns `(slave_index, Arc<PtyPair>)`.  The caller is responsible for
@@ -330,10 +298,6 @@ pub fn unlockpt(pair: &PtyPair) -> Result<(), isize> {
 
 /// `ptsname(fd)` — returns the slave path string (e.g. "/dev/pts/3").
 pub fn ptsname(pair: &PtyPair) -> String { pair.ptsname() }
-
-// ───────────────────────────────────────────────────────────────────────────
-// ioctl dispatcher (called from syscall::ioctl)
-// ───────────────────────────────────────────────────────────────────────────
 
 use crate::tty::termios::ioctl as req;
 

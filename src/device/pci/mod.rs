@@ -11,10 +11,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PCI configuration-space register offsets
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub(crate) const PCI_VENDOR:      u16 = 0x00;
 pub(crate) const PCI_DEVICE:      u16 = 0x02;
 pub(crate) const PCI_COMMAND:     u16 = 0x04;
@@ -30,10 +26,6 @@ pub(crate) const STATUS_CAP_LIST: u16 = 1 << 4;
 
 pub(crate) const CAP_MSIX:        u8  = 0x11;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Device descriptor
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// A single PCI function discovered during bus enumeration.
 #[derive(Clone, Debug)]
 pub struct PciDevice {
@@ -48,10 +40,6 @@ pub struct PciDevice {
     /// Offset of the MSI-X capability record, or 0 if not present.
     pub msix_cap: u8,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Global device registry
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub(crate) static DEVICES: Mutex<Vec<PciDevice>> = Mutex::new(Vec::new());
 

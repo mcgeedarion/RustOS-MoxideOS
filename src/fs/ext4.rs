@@ -31,8 +31,6 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 
-// ─── feature flags ────────────────────────────────────────────────────────────
-
 /// INCOMPAT bits that this driver can handle.
 const INCOMPAT_HANDLED: u32 =
     0x0002  // FILETYPE
@@ -58,8 +56,6 @@ const EXT4_INODE_EXTENTS: u32 = 0x0008_0000;
 const MAX_IMAGE_BYTES:  usize = 256 * 1024 * 1024;
 const MAX_FILE_SIZE:    usize = 256 * 1024 * 1024;
 const MAX_SYMLINK_DEPTH: usize = 8;
-
-// ─── on-disk structures ───────────────────────────────────────────────────────
 
 /// Ext4 superblock (first 256 bytes of the 1024-byte block at offset 1024).
 /// Fields beyond offset 0x54 are ext2rev1 / ext4 extensions.
@@ -259,8 +255,6 @@ struct DirEntry2 {
     file_type: u8,
 }
 
-// ─── public stat types ────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Default)]
 pub struct Ext4Stat {
     pub ino:     u64,
@@ -294,8 +288,6 @@ pub struct Ext4Statfs {
     pub f_namelen: u32,
 }
 
-// ─── filesystem state ─────────────────────────────────────────────────────────
-
 struct Ext4Fs {
     data:            Vec<u8>,
     block_size:      usize,
@@ -314,8 +306,6 @@ struct Ext4Fs {
 }
 
 static FS: Mutex<Option<Ext4Fs>> = Mutex::new(None);
-
-// ─── mount ────────────────────────────────────────────────────────────────────
 
 /// Mount an ext4 filesystem from the virtio-blk device.
 ///
@@ -403,8 +393,6 @@ pub fn mount() -> bool {
     true
 }
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
 #[inline]
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]])
@@ -415,10 +403,7 @@ fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off+1]])
 }
 
-// ─── Ext4Fs impl ──────────────────────────────────────────────────────────────
-
 impl Ext4Fs {
-    // ── block access ─────────────────────────────────────────────────────────
 
     #[inline]
     fn block_slice(&self, blkno: u64) -> Option<&[u8]> {
@@ -428,8 +413,6 @@ impl Ext4Fs {
         if end > self.data.len() { return None; }
         Some(&self.data[off..end])
     }
-
-    // ── block group descriptor ────────────────────────────────────────────────
 
     fn bgd_offset(&self, g: usize) -> usize {
         // BGD table starts immediately after the superblock block.
@@ -466,8 +449,6 @@ impl Ext4Fs {
         } else { lo }
     }
 
-    // ── inode access ──────────────────────────────────────────────────────────
-
     fn inode_offset(&self, ino: u32) -> Option<usize> {
         if ino == 0 { return None; }
         let idx   = (ino - 1) as usize;
@@ -499,8 +480,6 @@ impl Ext4Fs {
         }
     }
 
-    // ── extent tree walker ────────────────────────────────────────────────────
-    //
     // Returns all physical (blkno, len) pairs in logical order.
     // Panic-safe: bounds-checked at every level.
 
@@ -555,8 +534,6 @@ impl Ext4Fs {
         out
     }
 
-    // ── block-map (legacy indirect pointer) read ──────────────────────────────
-
     fn read_ptrs(&self, blkno: u64) -> Vec<u32> {
         let ppb = self.block_size / 4;
         match self.block_slice(blkno) {
@@ -564,8 +541,6 @@ impl Ext4Fs {
             Some(d) => (0..ppb).map(|i| read_u32_le(d, i * 4)).collect(),
         }
     }
-
-    // ── unified inode data reader ─────────────────────────────────────────────
 
     fn read_inode_data(&self, ino: &Inode) -> Vec<u8> {
         let size = (self.inode_size_bytes(ino) as usize).min(MAX_FILE_SIZE);
@@ -587,7 +562,6 @@ impl Ext4Fs {
         }
 
         if ino.flags & EXT4_INODE_EXTENTS != 0 {
-            // ── extent tree path ─────────────────────────────────────────────
             let extents = self.read_extents(ino);
             'ext: for (phys, len) in extents {
                 for i in 0..(len as u64) {
@@ -596,7 +570,6 @@ impl Ext4Fs {
                 }
             }
         } else {
-            // ── legacy block-map path ────────────────────────────────────────
             let ppb = bs / 4;
 
             // Direct (inode.block[0..11] as u32 little-endian).
@@ -651,8 +624,6 @@ impl Ext4Fs {
         out
     }
 
-    // ── directory scan ────────────────────────────────────────────────────────
-    //
     // Works for both linear directories and htree (dir_index) directories.
     // HTree leaf blocks contain exactly the same DirEntry2 records as linear
     // directories, so scanning every data block linearly is always correct
@@ -752,8 +723,6 @@ impl Ext4Fs {
         out
     }
 
-    // ── path resolution ───────────────────────────────────────────────────────
-
     fn lookup_path_depth(&self, path: &str, depth: usize) -> Option<u32> {
         if depth > MAX_SYMLINK_DEPTH { return None; }
         let mut ino = 2u32; // root
@@ -810,8 +779,6 @@ impl Ext4Fs {
     }
 }
 
-// ─── public read-only API ─────────────────────────────────────────────────────
-
 /// Returns the inode number for `path`, or `None` if not found.
 pub fn stat(path: &str) -> Option<u32> {
     FS.lock().as_ref()?.lookup_path(path)
@@ -849,8 +816,6 @@ pub fn readdir_raw(dir_ino: u32) -> Option<Vec<(u32, String, bool)>> {
     let fs = fs.as_ref()?;
     Some(fs.list_dir_ino(dir_ino))
 }
-
-// ─── VFS-facing stat API ──────────────────────────────────────────────────────
 
 pub fn sys_stat(path: &str) -> Result<Ext4Stat, i32> {
     let fs = FS.lock();

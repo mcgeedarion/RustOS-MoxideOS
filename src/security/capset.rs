@@ -17,8 +17,6 @@ pub struct CapSet {
     pub inheritable: u64,
 }
 
-// ─── Capability bit indices ───────────────────────────────────────────────────
-
 pub mod cap {
     pub const CHOWN:            u8 = 0;
     pub const DAC_OVERRIDE:     u8 = 1;

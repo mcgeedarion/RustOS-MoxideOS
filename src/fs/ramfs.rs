@@ -28,8 +28,6 @@ use alloc::{
 
 use spin::Mutex;
 
-// ── INode data ────────────────────────────────────────────────────────────────────────
-
 pub(crate) enum INodeData {
     File(Vec<u8>),
     Dir(BTreeMap<String, u64>),
@@ -82,8 +80,6 @@ impl INode {
     }
 }
 
-// ── Statfs result (tmpfs-internal) ────────────────────────────────────────────────
-
 pub struct TmpFsStatfs {
     pub f_type:    u64,   // always TMPFS_MAGIC
     pub f_bsize:   u64,
@@ -95,8 +91,6 @@ pub struct TmpFsStatfs {
 
 /// Linux TMPFS_MAGIC
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
-
-// ── TmpFs struct ───────────────────────────────────────────────────────────────────────
 
 pub(crate) struct TmpFs {
     pub inodes:   BTreeMap<u64, INode>,
@@ -152,8 +146,6 @@ impl TmpFs {
     }
 }
 
-// ── Global instance table ───────────────────────────────────────────────────────────
-
 pub(crate) static TMPFS_INSTANCES: Mutex<BTreeMap<String, TmpFs>> =
     Mutex::new(BTreeMap::new());
 
@@ -178,8 +170,6 @@ fn normalise_mp(mp: &str) -> String {
     let s = mp.trim_end_matches('/');
     if s.is_empty() { "/".to_string() } else { s.to_string() }
 }
-
-// ── Path utilities ─────────────────────────────────────────────────────────────────────
 
 /// Strip the mount-point prefix from a full path, returning the
 /// in-filesystem relative path (always starts with '/').
@@ -240,8 +230,6 @@ fn basename(rel: &str) -> &str {
         trimmed
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_create(full_path: &str) -> Result<(), isize> {
     ensure_defaults();
@@ -676,8 +664,6 @@ pub fn tmpfs_chown(full_path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     Ok(())
 }
 
-// ── tmpfs_statfs_for ──────────────────────────────────────────────────────────────
-//
 // Returns a KStatfs for the tmpfs instance whose mount-point is the longest
 // prefix of `full_path`.  Called by stat_syscalls::sys_statfs / sys_fstatfs.
 
@@ -711,8 +697,6 @@ pub fn tmpfs_statfs_for(full_path: &str) -> crate::fs::vfs_ops::KStatfs {
     crate::fs::vfs_ops::KStatfs::default()
 }
 
-// ── O_TMPFILE anonymous inode support ───────────────────────────────────────────────
-//
 // An anon inode lives in the inode table of the owning tmpfs instance but is
 // never inserted into any directory.  Its FD backing path is the synthetic
 // string "<mountpoint>/@anon:<ino>".  Both '@' and ':' are illegal in POSIX

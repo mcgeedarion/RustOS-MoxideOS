@@ -64,8 +64,6 @@ pub fn freq_hz() -> u64 {
     (1_000_000_000u64 << shift) / mul
 }
 
-// ── Internals ────────────────────────────────────────────────────────────────────
-
 fn rdtsc() -> u64 {
     #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::x86_64::_rdtsc() }
@@ -145,8 +143,6 @@ fn compute_mul_shift(freq_hz: u64) {
         if shift == 0 { break; }
     }
 }
-
-// ── CPUID helpers ─────────────────────────────────────────────────────────────
 
 fn cpuid3(leaf: u32) -> (u32, u32, u32) {
     let (eax, ebx, ecx): (u32, u32, u32);

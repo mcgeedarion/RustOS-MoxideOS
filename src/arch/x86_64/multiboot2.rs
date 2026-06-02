@@ -23,8 +23,6 @@
 //!   Type 6  — memory map
 //!   Type 21 — EFI memory map
 
-// ─── Multiboot2 header ────────────────────────────────────────────────────────
-
 #[link_section = ".text.boot"]
 #[used]
 static MULTIBOOT2_HEADER: Multiboot2Header = Multiboot2Header::new();
@@ -82,8 +80,6 @@ impl Multiboot2Header {
     }
 }
 
-// ─── MBI tag walker ───────────────────────────────────────────────────────────
-
 /// Walk the Multiboot2 Information structure at `mbi_ptr` and:
 ///   1. Feed usable memory map entries to `pmm::add_region()`.
 ///   2. Record the first module (initrd) via `initramfs::set_initramfs_range()`.
@@ -114,10 +110,8 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
         if tag_size < 8 { break; }
 
         match tag_type {
-            // ── End tag ──
             0 => break,
 
-            // ── Module tag (type 3): mod_start u32, mod_end u32, string… ──
             3 => {
                 if tag_size >= 16 {
                     let mod_start = *(( base + off + 8 ) as *const u32) as usize;
@@ -138,7 +132,6 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
                 }
             }
 
-            // ── Memory map tag (type 6) ──
             6 => {
                 // entry_size: u32, entry_version: u32, then entries.
                 if tag_size >= 16 {
@@ -171,7 +164,6 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
                 }
             }
 
-            // ── All other tags: skip ──
             _ => {}
         }
 

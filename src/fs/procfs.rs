@@ -41,8 +41,6 @@ use alloc::collections::BTreeMap;
 /// The 7 canonical namespace names in /proc/<pid>/ns/.
 pub const NS_NAMES: &[&str] = &["mnt", "pid", "net", "uts", "ipc", "user", "time"];
 
-// ─── Synthetic fd table ────────────────────────────────────────────────────────────────────
-
 /// Returns true if `fdno` is a procfs synthetic (text-content) fd.
 pub fn is_procfs_fd(fdno: usize) -> bool {
     PROCFS_FDS.lock().contains_key(&fdno)
@@ -79,8 +77,6 @@ pub fn procfs_fds() -> Vec<usize> {
     PROCFS_FDS.lock().keys().cloned().collect()
 }
 
-// ─── Namespace inode helpers ───────────────────────────────────────────────────────────────
-
 /// True if `path` is a /proc/<pid>/ns or /proc/<pid>/ns/<name> path.
 pub fn procfs_is_ns_path(path: &str) -> bool {
     let pid = crate::proc::scheduler::current_pid();
@@ -106,8 +102,6 @@ pub fn procfs_ns_stat(path: &str) -> Option<(u64, u32)> {
     let ns_id = crate::proc::namespace::ns_id_of(tpid, name)?;
     Some((ns_id, 0o120444))
 }
-
-// ─── readlink support ───────────────────────────────────────────────────────────────────────
 
 pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     let pid = crate::proc::scheduler::current_pid();
@@ -155,8 +149,6 @@ fn copy_link(src: &[u8], buf: &mut [u8]) -> isize {
     buf[..n].copy_from_slice(&src[..n]);
     n as isize
 }
-
-// ─── Content generators ───────────────────────────────────────────────────────────────────
 
 fn generate(path: &str) -> Option<Vec<u8>> {
     let pid = crate::proc::scheduler::current_pid();
@@ -245,12 +237,10 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     if p == "/proc/slabinfo" {
         return Some(gen_slabinfo().into_bytes());
     }
-    // ── /proc/schemes ────────────────────────────────────────────────────────────
     // Redox-inspired: expose all currently-registered scheme names so that
     // userspace service managers can poll this file to discover which drivers
     // are live.  Format: one bare scheme name per line (no colon suffix),
     // alphabetically sorted (BTreeMap order from SchemeTable::list).
-    //
     // Example contents after blk + net + tcp drivers register:
     //   blk
     //   file
@@ -268,8 +258,6 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     }
     None
 }
-
-// ─── /proc/slabinfo ───────────────────────────────────────────────────────────────────
 
 fn gen_slabinfo() -> String {
     use crate::mm::slab::slab_stats;
@@ -298,8 +286,6 @@ fn gen_slabinfo() -> String {
     }
     out
 }
-
-// ─── /proc/<pid>/limits ───────────────────────────────────────────────────────────────
 
 const RLIM_INFINITY: u64 = u64::MAX;
 
@@ -338,8 +324,6 @@ fn gen_limits(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/status ───────────────────────────────────────────────────────────────
-
 fn gen_status(pid: usize) -> String {
     use crate::proc::scheduler::with_proc;
     use crate::proc::process::State;
@@ -360,8 +344,6 @@ fn gen_status(pid: usize) -> String {
         comm, state_ch, pid, ppid, vsize_kb, vsize_kb, rt_cpu_time_us
     )
 }
-
-// ─── /proc/<pid>/stat ────────────────────────────────────────────────────────────────────
 
 const USER_HZ: u64 = 100;
 
@@ -426,16 +408,12 @@ fn gen_stat(pid: usize) -> String {
     )
 }
 
-// ─── Shared helpers ───────────────────────────────────────────────────────────────────────
-
 fn exe_basename(exe_path: &Option<String>) -> String {
     exe_path.as_deref()
         .and_then(|p| p.rsplit('/').next())
         .map(|s| s.to_string())
         .unwrap_or_else(|| String::from("rustos"))
 }
-
-// ─── /proc/<pid>/maps ───────────────────────────────────────────────────────────────────
 
 fn gen_maps(pid: usize) -> String {
     let mut out = String::new();
@@ -460,8 +438,6 @@ fn gen_maps(pid: usize) -> String {
     out
 }
 
-// ─── /proc/<pid>/fd ────────────────────────────────────────────────────────────────────
-
 fn gen_fd_dir(pid: usize) -> Vec<u8> {
     let _ = pid;
     let mut out = Vec::new();
@@ -472,8 +448,6 @@ fn gen_fd_dir(pid: usize) -> Vec<u8> {
     }
     out
 }
-
-// ─── open ─────────────────────────────────────────────────────────────────────────────────
 
 /// Open a procfs path and return a synthetic fd number, or a negative errno.
 pub fn procfs_open(path: &str, _flags: u32) -> isize {
@@ -537,8 +511,6 @@ fn next_procfs_fd() -> usize {
     }
     256
 }
-
-// ─── helpers ─────────────────────────────────────────────────────────────────────────────────
 
 fn norm_self(path: &str, pid: usize) -> Cow<'static, str> {
     if path.starts_with("/proc/self") {

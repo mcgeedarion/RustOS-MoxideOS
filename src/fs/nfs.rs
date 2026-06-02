@@ -16,7 +16,6 @@ use alloc::vec::Vec;
 use alloc::string::String;
 use spin::Mutex;
 
-// ── RPC / XDR constants ───────────────────────────────────────────────────
 const PROGRAM_PORTMAP:  u32 = 100000;
 const PROGRAM_MOUNT:    u32 = 100005;
 const PROGRAM_NFS:      u32 = 100003;
@@ -56,8 +55,6 @@ const NFS3_OK:          u32 = 0;
 // Stable write
 const FILE_SYNC:  u32 = 2;
 
-// ── file handle ───────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Default)]
 pub struct Fh {
     pub data: Vec<u8>,
@@ -69,8 +66,6 @@ impl Fh {
         xdr_opaque(buf, &self.data);
     }
 }
-
-// ── public types ──────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct NfsStat {
@@ -107,8 +102,6 @@ pub struct NfsFsStat {
     pub free_files:  u64,
 }
 
-// ── client state ──────────────────────────────────────────────────────────
-
 struct NfsClient {
     server_ip:   u32,
     nfs_port:    u16,
@@ -117,8 +110,6 @@ struct NfsClient {
 }
 
 static CLIENT: Mutex<Option<NfsClient>> = Mutex::new(None);
-
-// ── XDR encode helpers ────────────────────────────────────────────────────
 
 fn xdr_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_be_bytes());
@@ -135,8 +126,6 @@ fn xdr_string(buf: &mut Vec<u8>, s: &str) {
     xdr_u32(buf, s.len() as u32);
     xdr_opaque(buf, s.as_bytes());
 }
-
-// ── XDR decode helpers ────────────────────────────────────────────────────
 
 struct XdrBuf<'a> {
     data: &'a [u8],
@@ -196,8 +185,6 @@ impl<'a> XdrBuf<'a> {
     }
 }
 
-// ── RPC call builder ──────────────────────────────────────────────────────
-
 fn build_rpc_call(xid: u32, program: u32, version: u32, procedure: u32,
                   body: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -214,8 +201,6 @@ fn build_rpc_call(xid: u32, program: u32, version: u32, procedure: u32,
     buf.extend_from_slice(body);
     buf
 }
-
-// ── UDP send/receive ──────────────────────────────────────────────────────
 
 fn rpc_call(
     client: &mut NfsClient,
@@ -262,8 +247,6 @@ fn rpc_call(
     }
 }
 
-// ── portmap ───────────────────────────────────────────────────────────────
-
 fn portmap_getport(server_ip: u32, program: u32, version: u32, proto: u32) -> Option<u16> {
     let mut dummy = NfsClient { server_ip, nfs_port: 111, root_fh: Fh::default(), xid: 0x1000 };
     let mut body = Vec::new();
@@ -277,8 +260,6 @@ fn portmap_getport(server_ip: u32, program: u32, version: u32, proto: u32) -> Op
     let port = u32::from_be_bytes(reply[28..32].try_into().ok()?) as u16;
     if port == 0 { None } else { Some(port) }
 }
-
-// ── public API ────────────────────────────────────────────────────────────
 
 /// Mount an NFS export.
 /// `server_ip` is a u32 in host byte order.
@@ -330,8 +311,6 @@ pub fn umount(export_path: &str) {
     }
     *guard = None;
 }
-
-// ── NFS operations ────────────────────────────────────────────────────────
 
 /// Lookup a path component in a directory, returning the child FH.
 pub fn lookup(dir_fh: &Fh, name: &str) -> Option<Fh> {

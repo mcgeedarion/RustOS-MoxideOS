@@ -4,10 +4,6 @@
 //! The struct is `repr(C)` so it can be passed directly through ioctl
 //! TCGETS / TCSETS without any translation.
 
-// ─────────────────────────────────────────────────────────────────────────────
-// c_iflag — input mode flags
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub mod iflag {
     pub const IGNBRK:  u32 = 0o000001;
     pub const BRKINT:  u32 = 0o000002;
@@ -26,10 +22,6 @@ pub mod iflag {
     pub const IUTF8:   u32 = 0o040000;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// c_oflag — output mode flags
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub mod oflag {
     pub const OPOST:  u32 = 0o000001;  // Enable output processing
     pub const OLCUC:  u32 = 0o000002;
@@ -40,10 +32,6 @@ pub mod oflag {
     pub const OFILL:  u32 = 0o000100;
     pub const OFDEL:  u32 = 0o000200;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// c_cflag — control mode flags
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub mod cflag {
     pub const CS5:    u32 = 0o000000;
@@ -63,10 +51,6 @@ pub mod cflag {
     pub const B115200:u32 = 0o010017;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// c_lflag — local mode flags
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub mod lflag {
     pub const ISIG:   u32 = 0o000001;  // Generate signals (INTR/QUIT/SUSP)
     pub const ICANON: u32 = 0o000002;  // Canonical (line) mode
@@ -84,10 +68,6 @@ pub mod lflag {
     pub const PENDIN: u32 = 0o040000;
     pub const IEXTEN: u32 = 0o100000;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// c_cc indices
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub mod cc {
     pub const VINTR:  usize = 0;   // ^C  → SIGINT
@@ -109,10 +89,6 @@ pub mod cc {
     pub const VEOL2:  usize = 16;
     pub const NCCS:   usize = 19;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// struct termios
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -177,10 +153,6 @@ impl Termios {
     pub fn is_icrnl(&self)     -> bool { self.c_iflag & iflag::ICRNL  != 0 }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// struct winsize  (TIOCGWINSZ / TIOCSWINSZ)
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Winsize {
@@ -189,10 +161,6 @@ pub struct Winsize {
     pub ws_xpixel: u16,
     pub ws_ypixel: u16,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ioctl request codes  (match Linux x86_64 UAPI <asm/ioctls.h>)
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub mod ioctl {
     pub const TCGETS:    usize = 0x5401;

@@ -19,8 +19,6 @@
 extern crate alloc;
 use crate::fs::mount::FsType;
 
-// ── Magic constants ───────────────────────────────────────────────────────────
-
 const EXT_MAGIC_OFF:    usize = 0x438;
 const EXT_MAGIC:        [u8; 2] = [0x53, 0xEF];
 

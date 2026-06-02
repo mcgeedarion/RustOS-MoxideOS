@@ -10,7 +10,6 @@
 use kmtest::{register, KmTestResult};
 use crate::mm::mmap::{sys_mmap, sys_munmap, sys_mprotect};
 
-// ── constants mirroring Linux mmap flags ───────────────────────────────────
 const PROT_NONE:    u32 = 0x0;
 const PROT_READ:    u32 = 0x1;
 const PROT_WRITE:   u32 = 0x2;

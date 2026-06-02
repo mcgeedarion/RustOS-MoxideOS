@@ -56,23 +56,19 @@ pub enum LdiscAction {
 ///
 /// The caller (PtySlave) maintains the actual line buffer and read queue.
 pub fn process_input(t: &Termios, byte: u8) -> LdiscAction {
-    // ── Signal generation ──────────────────────────────────────────────────
     if t.is_isig() {
         if byte == t.c_cc[cc::VINTR]  { return LdiscAction::Signal(SIGINT);  }
         if byte == t.c_cc[cc::VQUIT]  { return LdiscAction::Signal(SIGQUIT); }
         if byte == t.c_cc[cc::VSUSP]  { return LdiscAction::Signal(SIGTSTP); }
     }
 
-    // ── XON / XOFF ─────────────────────────────────────────────────────────
     if t.c_iflag & termios::iflag::IXON != 0 {
         if byte == t.c_cc[cc::VSTOP]  { return LdiscAction::Xoff; }
         if byte == t.c_cc[cc::VSTART] { return LdiscAction::Xon;  }
     }
 
-    // ── ICRNL: translate CR → NL on input ─────────────────────────────────
     let byte = if t.is_icrnl() && byte == b'\r' { b'\n' } else { byte };
 
-    // ── Canonical mode ─────────────────────────────────────────────────────
     if t.is_canonical() {
         // EOF (^D) — deliver whatever is in the line buffer immediately.
         if byte == t.c_cc[cc::VEOF] {
@@ -100,7 +96,6 @@ pub fn process_input(t: &Termios, byte: u8) -> LdiscAction {
         return LdiscAction::Append(byte);
     }
 
-    // ── Raw mode ───────────────────────────────────────────────────────────
     LdiscAction::Append(byte)
 }
 

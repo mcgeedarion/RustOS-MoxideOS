@@ -40,8 +40,6 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::proc::namespace::{NsId, INIT_NS, alloc_ns_id};
 
-// ── Per-namespace entry ───────────────────────────────────────────────────────────
-
 struct PidNsEntry {
     /// Parent namespace.  INIT_NS entries have parent == INIT_NS (sentinel).
     parent:   NsId,
@@ -98,8 +96,6 @@ impl PidNsEntry {
     }
 }
 
-// ── Global registry ──────────────────────────────────────────────────────────────
-
 static PID_NS_TABLE: Mutex<BTreeMap<NsId, PidNsEntry>> =
     Mutex::new(BTreeMap::new());
 
@@ -124,8 +120,6 @@ pub fn drop_pid_ns(ns: NsId) {
     if ns == INIT_NS { return; }
     PID_NS_TABLE.lock().remove(&ns);
 }
-
-// ── Ancestor chain helpers ───────────────────────────────────────────────────────
 
 /// Return the full ancestor chain for `ns`, from `ns` up to (and including)
 /// INIT_NS.  Maximum depth is capped at 32 to prevent infinite loops on
@@ -165,8 +159,6 @@ pub fn ns_is_ancestor_or_equal(ancestor: NsId, descendant: NsId) -> bool {
     false
 }
 
-// ── Registration (fork / clone path) ───────────────────────────────────────
-
 /// Register `global_pid` into `ns` **and every ancestor namespace** up to
 /// INIT_NS.  Returns the local PID as seen from `ns` (the innermost ns).
 ///
@@ -194,8 +186,6 @@ pub fn register_pid(ns: NsId, global_pid: usize) -> u32 {
     innermost_local
 }
 
-// ── Translation ─────────────────────────────────────────────────────────────────
-
 /// Translate `global_pid` to its local PID as seen from namespace `ns`.
 /// Returns the global PID unchanged for INIT_NS or unregistered processes.
 pub fn local_pid(ns: NsId, global_pid: usize) -> usize {
@@ -215,8 +205,6 @@ pub fn global_pid(ns: NsId, local: usize) -> usize {
         .and_then(|e| e.global_of(local as u32))
         .unwrap_or(local)
 }
-
-// ── Deregistration (exit path) ───────────────────────────────────────────────
 
 /// Remove `global_pid` from `ns` and every ancestor namespace.
 /// If the exiting process is the ns-init (local PID 1), all remaining
@@ -266,8 +254,6 @@ fn kill_namespace(ns: NsId) {
     }
 }
 
-// ── getpid / getppid helpers ────────────────────────────────────────────────────
-
 /// Return the PID visible to the calling process in its own namespace.
 /// Used by `getpid(2)` (NR 39) and `gettid(2)` (NR 186).
 pub fn current_visible_pid() -> usize {
@@ -290,8 +276,6 @@ pub fn current_visible_ppid() -> usize {
         None        => 0, // parent is outside (or above) this ns
     }
 }
-
-// ── Signal permission check ─────────────────────────────────────────────────────
 
 /// True if a process in `sender_ns` is permitted to send signals to a process
 /// in `target_ns` by namespace hierarchy rules alone.

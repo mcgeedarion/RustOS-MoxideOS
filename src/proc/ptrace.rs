@@ -13,8 +13,6 @@ extern crate alloc;
 use crate::proc::scheduler;
 use crate::proc::signal::send_signal;
 
-// ── Constants (kept for wait.rs / signal.rs consumers) ──────────────────────
-
 pub const PTRACE_TRACEME:     i32 = 0;
 pub const PTRACE_PEEKTEXT:    i32 = 1;
 pub const PTRACE_PEEKDATA:    i32 = 2;
@@ -41,8 +39,6 @@ pub const PTRACE_O_TRACEEXEC:    u64 = 0x00000010;
 pub const PTRACE_O_TRACEEXIT:    u64 = 0x00000040;
 pub const PTRACE_O_EXITKILL:     u64 = 0x00100000;
 pub const PTRACE_O_MASK:         u64 = 0x001000ff;
-
-// ── Register layout constants (shared with proc_debug.rs) ───────────────────
 
 pub const FRAME_SZ:  usize = 17 * 8;
 
@@ -97,8 +93,6 @@ pub const UREG_COUNT:    usize = 27;
 const USER_CS64: u64 = 0x33;
 const USER_SS:   u64 = 0x2b;
 
-// ── PtraceState ────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtraceState {
     None,
@@ -117,8 +111,6 @@ pub enum PtraceState {
 impl Default for PtraceState {
     fn default() -> Self { PtraceState::None }
 }
-
-// ── Public register helpers (used by proc_debug.rs and syscall/stubs.rs) ────
 
 unsafe fn frame_ptr(kstack_top: usize) -> *mut usize {
     (kstack_top - FRAME_SZ) as *mut usize
@@ -180,8 +172,6 @@ pub fn apply_user_regs_pub(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
     f[F_RIP] = regs[UREG_RIP]    as usize;
 }
 
-// ── sys_ptrace ──────────────────────────────────────────────────────────────
-
 /// NR 101  ptrace(request, pid, addr, data)
 ///
 /// The full implementation lives in syscall/stubs.rs as sys_ptrace_impl;
@@ -190,8 +180,6 @@ pub fn apply_user_regs_pub(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
 pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
     crate::syscall::stubs::sys_ptrace_impl(req, pid, addr, data)
 }
-
-// ── ptrace_syscall_stop (still needed by signal.rs) ──────────────────────────
 
 pub fn ptrace_syscall_stop() {
     let pid = scheduler::current_pid();

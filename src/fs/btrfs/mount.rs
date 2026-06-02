@@ -57,7 +57,6 @@ fn resolve_fs_tree_root(fs: &BtrfsFs) -> Option<u64> {
     Some(BtrfsRootItem::from_bytes(&data)?.bytenr)
 }
 
-// ── block-level I/O helpers (from io.rs) ────────────────────────────────────────────────────
 pub(crate) fn read_sectors_raw(lba: u64, count: u32) -> Vec<u8> {
     crate::drivers::block::read_sectors_vec(lba, count)
 }

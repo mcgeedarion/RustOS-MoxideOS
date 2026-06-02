@@ -53,8 +53,6 @@ extern crate alloc;
 
 pub fn now_ns() -> u64 { read_monotonic_ns() }
 
-// ── sys_nanosleep ───────────────────────────────────────────────────────────────
-
 /// sys_nanosleep(req_va, rem_va)  [NR 35]
 ///
 /// Sleeps for the relative duration given in `*req_va`.
@@ -80,8 +78,6 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
     if rem_va != 0 { let _ = copy_to_user(rem_va, &[0u8; 16]); }
     ret
 }
-
-// ── sys_clock_nanosleep ────────────────────────────────────────────────
 
 /// sys_clock_nanosleep(clockid, flags, req_va, rem_va)  [NR 230]
 ///
@@ -125,8 +121,6 @@ pub fn sys_clock_nanosleep(
     }
 }
 
-// ── sys_clock_gettime ───────────────────────────────────────────────────
-
 /// sys_clock_gettime(clockid, timespec_va)  [NR 228]
 pub fn sys_clock_gettime(clockid: u32, timespec_va: usize) -> isize {
     let pid = scheduler::current_pid();
@@ -149,8 +143,6 @@ pub fn sys_clock_gettime(clockid: u32, timespec_va: usize) -> isize {
     0
 }
 
-// ── sys_clock_getres ────────────────────────────────────────────────────
-
 /// sys_clock_getres(clockid, timespec_va)  [NR 229]
 pub fn sys_clock_getres(clockid: u32, timespec_va: usize) -> isize {
     let res = match clock::clock_getres(clockid as i32) {
@@ -164,8 +156,6 @@ pub fn sys_clock_getres(clockid: u32, timespec_va: usize) -> isize {
     if !copy_to_user(timespec_va, &buf) { return -14; }
     0
 }
-
-// ── Internal blocking primitive ──────────────────────────────────────────────
 
 /// Block the current task for `delta_ns` nanoseconds.
 #[inline]
@@ -210,8 +200,6 @@ pub fn sleep_until_ns(deadline_ns: u64) -> isize {
         WakeReason::Cancelled => -4, // EINTR
     }
 }
-
-// ── Remainder helper ─────────────────────────────────────────────────────────────
 
 /// Write the remaining sleep time to `rem_va` for EINTR paths.
 /// `deadline_ns` is the absolute monotonic deadline that was passed to

@@ -38,8 +38,6 @@ use alloc::{
 use spin::Mutex;
 use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
-// ── semctl command constants ─────────────────────────────────────────────────
-
 pub const GETVAL:  i32 = 12;
 pub const SETVAL:  i32 = 16;
 pub const GETALL:  i32 = 13;
@@ -47,8 +45,6 @@ pub const SETALL:  i32 = 17;
 pub const GETPID:  i32 = 11;
 pub const GETNCNT: i32 = 14;
 pub const GETZCNT: i32 = 15;
-
-// ── Data structures ──────────────────────────────────────────────────────────
 
 /// One semaphore within a set.
 #[derive(Clone)]
@@ -65,8 +61,6 @@ struct SemSet {
     sems: Vec<Sem>,
 }
 
-// ── Global table ─────────────────────────────────────────────────────────────
-
 use alloc::sync::Arc;
 static SEM_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<SemSet>>>> = Mutex::new(BTreeMap::new());
 static NEXT_ID:   Mutex<i32>                                = Mutex::new(1);
@@ -78,8 +72,6 @@ fn alloc_id() -> i32 {
     *id += 1;
     v
 }
-
-// ── semget ───────────────────────────────────────────────────────────────────
 
 pub fn semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, isize> {
     if nsems < 0 { return Err(-22); } // EINVAL
@@ -108,16 +100,12 @@ pub fn semget(key: i32, nsems: i32, semflg: i32) -> Result<i32, isize> {
     Ok(id)
 }
 
-// ── sembuf (input to semop) ───────────────────────────────────────────────────
-
 /// One element of the `sembuf` array passed to `semop(2)`.
 pub struct SemBuf {
     pub sem_num: u16,
     pub sem_op:  i16,
     pub sem_flg: i16,
 }
-
-// ── semop ────────────────────────────────────────────────────────────────────
 
 pub fn semop(semid: i32, sops: &[SemBuf]) -> Result<(), isize> {
     loop {
@@ -163,8 +151,6 @@ pub fn semop(semid: i32, sops: &[SemBuf]) -> Result<(), isize> {
         return Ok(());
     }
 }
-
-// ── semctl ───────────────────────────────────────────────────────────────────
 
 pub fn semctl(semid: i32, semnum: i32, cmd: i32, arg: u64) -> Result<i32, isize> {
     let arc = {

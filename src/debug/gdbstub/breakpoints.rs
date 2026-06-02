@@ -29,7 +29,6 @@ use alloc::vec::Vec;
 
 use super::target::GdbTarget;
 
-// ── x86-64 DR offsets in /proc/<pid>/debug ────────────────────────────────────
 // Layout: [dr0, dr1, dr2, dr3, dr6, dr7]  each u64, little-endian.
 // The kernel exposes these at byte offset 0 in the debug pseudo-fd.
 const DR0_OFFSET: usize = 0;
@@ -95,8 +94,6 @@ fn write_debug_regs(target: &GdbTarget, dr: &[u64; 6]) {
     proc_debug_write(bfd, &buf, DR_VIRT_OFFSET);
 }
 
-// ── Software Breakpoints ──────────────────────────────────────────────────────
-
 struct SwBreakpoint {
     addr:     u64,
     original: u8,
@@ -140,8 +137,6 @@ impl SwBreakpointTable {
         for addr in addrs { self.remove(target, addr); }
     }
 }
-
-// ── Hardware Breakpoints (x86-64 DR0–DR3 execution) ───────────────────────────
 
 struct HwBreakpoint {
     slot: usize, // 0..3
@@ -205,8 +200,6 @@ impl HwBreakpointTable {
         for addr in addrs { self.remove(target, addr); }
     }
 }
-
-// ── Watchpoints (x86-64 DR0–DR3 data access) ─────────────────────────────────
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum WatchKind {
@@ -301,12 +294,9 @@ impl WatchpointTable {
     }
 }
 
-// ── RISC-V Trigger (tselect/tdata) helpers ────────────────────────────────────
-//
 // RISC-V debug triggers are written via /proc/<pid>/debug at
 // PROC_DEBUG_RISCV_TRIG_OFFSET.  Layout: pairs of [tdata1, tdata2] per slot,
 // up to 4 slots.  tdata1 type=2 (mcontrol) is used.
-//
 // tdata1 (mcontrol) relevant fields:
 //   bits 63:60  type=2
 //   bit  19     action=0 (raise debug exception)

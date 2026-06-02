@@ -33,10 +33,6 @@ const USER_ADDR_MAX: usize = 0x0000_8000_0000_0000;
 #[cfg(target_arch = "riscv64")]
 const USER_ADDR_MAX: usize = 0x0000_0040_0000_0000;
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Error type (thin alias so callers keep using the kernel's Errno)
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// Errors returned by uaccess operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -46,10 +42,6 @@ pub enum UaccessError {
 }
 
 pub type UaccessResult<T = ()> = Result<T, UaccessError>;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Address validation helpers
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Returns `true` when `[addr, addr + len)` is entirely within user space and
 /// the range does not wrap around.
@@ -67,10 +59,6 @@ pub fn user_access_ok(addr: usize, len: usize) -> bool {
 pub fn user_ptr_ok<T>(addr: usize) -> bool {
     user_access_ok(addr, mem::size_of::<T>())
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Architecture-specific SMAP / SUM bracket
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Executes `f` inside an architecture-specific "user access window".
 ///
@@ -115,10 +103,6 @@ where
         Err(UaccessError::Fault)
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// x86_64 SMAP implementation
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 mod arch_x86_64 {
@@ -183,10 +167,6 @@ mod arch_x86_64 {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// RISC-V SUM implementation
-// ──────────────────────────────────────────────────────────────────────────────
-
 #[cfg(target_arch = "riscv64")]
 mod arch_riscv64 {
     use super::UaccessError;
@@ -248,10 +228,6 @@ mod arch_riscv64 {
         }
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Core copy primitives
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// Copies `len` bytes **from** a user-space address into `dst`.
 ///
@@ -352,10 +328,6 @@ pub fn put_user<T: Copy>(user_addr: usize, val: T) -> UaccessResult {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Typed user pointer wrapper
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// A typed pointer into user virtual address space.
 ///
 /// `UserPtr<T>` carries only an address; it does not dereference the pointer
@@ -449,10 +421,6 @@ impl<T> core::fmt::Debug for UserPtr<T> {
         write!(f, "UserPtr({:#018x})", self.addr)
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// User-space slice abstraction
-// ──────────────────────────────────────────────────────────────────────────────
 
 /// A contiguous slice of `len` elements of type `T` in user virtual address
 /// space.
@@ -598,10 +566,6 @@ impl<T: Copy> core::fmt::Debug for UserSlice<T> {
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Byte-string helpers (for syscall paths that copy NUL-terminated strings)
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// Copies a NUL-terminated C-string from user space into `buf`.
 ///
 /// Returns the number of bytes written (not including the NUL).  Returns
@@ -670,10 +634,6 @@ pub fn copyout_str(user_addr: usize, s: &str, user_len: usize) -> UaccessResult<
     Ok(bytes.len() + 1) // "would-write" count including NUL
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Zero-fill helper
-// ──────────────────────────────────────────────────────────────────────────────
-
 /// Writes `len` zero bytes to the user address `dst`.
 ///
 /// Typically used by `mmap` / `execve` to clear BSS or zero-init stack frames.
@@ -692,10 +652,6 @@ pub fn clear_user(dst: usize, len: usize) -> UaccessResult {
         })
     }
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests (host-side; compile with `--target x86_64-unknown-linux-gnu` for dev)
-// ──────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

@@ -37,10 +37,6 @@ extern crate alloc;
 use core::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use spin::Mutex;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Clocksource abstraction
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClockSource { Tsc, Hpet, ClintMtime, ApicTimer }
 
@@ -48,10 +44,6 @@ static CLOCKSOURCE: Mutex<ClockSource> = Mutex::new(ClockSource::ApicTimer);
 
 pub fn set_clocksource(cs: ClockSource) { *CLOCKSOURCE.lock() = cs; }
 pub fn clocksource() -> ClockSource { *CLOCKSOURCE.lock() }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Core time primitives
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub const NSEC_PER_SEC:  u64 = 1_000_000_000;
 pub const NSEC_PER_MSEC: u64 = 1_000_000;
@@ -129,10 +121,8 @@ impl Timeval {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Global monotonic nanosecond counter
 // Incremented by the tick handler; read by all clock_gettime paths.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Nanoseconds since boot (CLOCK_MONOTONIC base).
 /// Updated atomically from the timer interrupt; read lock-free via

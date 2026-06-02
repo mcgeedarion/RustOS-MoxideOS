@@ -22,16 +22,12 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 /// Fixed-point scale: 1.0 CPU = CBS_SCALE units.
 pub const CBS_SCALE: u64 = 1u64 << 32;
 
 /// Maximum CPUs tracked by the admission table.
 /// Must be ≥ the maximum CPUMASK bit width (64).
 pub const MAX_CBS_CPUS: usize = 64;
-
-// ── Global utilization table ──────────────────────────────────────────────────
 
 /// Per-CPU utilization accumulators.  Index = CPU id.
 /// Value = sum of (runtime << 32) / period for all DEADLINE tasks
@@ -69,8 +65,6 @@ impl CbsUtilBucket {
 }
 
 static CBS_UTIL: CbsUtilBucket = CbsUtilBucket::new();
-
-// ── Admission test ────────────────────────────────────────────────────────────
 
 fn scaled_util(runtime: u64, period: u64) -> Option<u64> {
     if period == 0 { return None; }
@@ -155,8 +149,6 @@ fn commit(su: u64, cpumask: u64) {
         CBS_UTIL.cpu[cpu].fetch_add(su, Ordering::Relaxed);
     }
 }
-
-// ── nice_to_weight (re-export for syscall/sched.rs) ───────────────────────────
 
 pub fn nice_to_weight_pub(nice: i8) -> u64 {
     crate::proc::scheduler::nice_to_weight(nice)

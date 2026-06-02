@@ -1,10 +1,7 @@
 // src/io_uring/ops/connect.rs
-//
 // IORING_OP_CONNECT handler.
-//
 // Initiates a connection on socket `sqe.fd` to the address described by the
 // sockaddr at virtual address `sqe.addr` (length `sqe.len`).
-//
 // CQE result:
 //   res == 0  → connected (or connection in progress for non-blocking sockets)
 //   res <  0  → negated errno
@@ -20,8 +17,6 @@ pub fn handle(sqe: &Sqe) -> i32 {
     let sock_fd   = sqe.fd;
     let addr_va   = sqe.addr;
     let addrlen   = sqe.len;
-
-    // ── Validate ─────────────────────────────────────────────────────────────────────
 
     if sock_fd < 0 {
         log::warn!("[io_uring::connect] invalid sock_fd={}", sock_fd);
@@ -44,8 +39,6 @@ pub fn handle(sqe: &Sqe) -> i32 {
 
     crate::net::socket::core::sys_connect(sock_fd as usize, addr_va as usize, addrlen) as i32
 }
-
-// ── Future-layer wrapper ──────────────────────────────────────────────────────────────
 
 use core::{
     future::Future,

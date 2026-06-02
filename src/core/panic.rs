@@ -23,8 +23,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// double-panics and avoid infinite recursion.
 static IN_PANIC: AtomicBool = AtomicBool::new(false);
 
-// ── Panic message writer ──────────────────────────────────────────────────
-
 /// A `fmt::Write` sink that routes characters to the early (UART) console
 /// without requiring the full console subsystem to be alive.
 ///
@@ -41,8 +39,6 @@ impl fmt::Write for EarlyWriter {
         Ok(())
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Structured panic information printed before the CPU halts.
 #[derive(Debug)]
@@ -120,8 +116,6 @@ macro_rules! kernel_panic {
         }
     }};
 }
-
-// ── Architecture halt shim ─────────────────────────────────────────────────
 
 /// Spin-halt the current CPU.  Uses the arch-specific idle instruction.
 #[inline(always)]

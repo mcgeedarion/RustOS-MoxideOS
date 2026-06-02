@@ -14,7 +14,6 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KernelError {
-    // ── Resource errors ──────────────────────────────────────────────────
     /// Physical or virtual memory exhausted.
     OutOfMemory,
     /// Address is not aligned to the required boundary.
@@ -24,7 +23,6 @@ pub enum KernelError {
     /// Integer or pointer arithmetic would overflow.
     Overflow,
 
-    // ── Argument / permission errors ─────────────────────────────────────
     /// Caller supplied an invalid argument.
     InvalidArgument,
     /// Operation is not permitted for the calling context.
@@ -34,7 +32,6 @@ pub enum KernelError {
     /// The resource already exists.
     AlreadyExists,
 
-    // ── Device / I/O errors ───────────────────────────────────────────────
     /// An underlying hardware or firmware operation failed.
     IoError,
     /// A device is not ready or not present.
@@ -42,13 +39,11 @@ pub enum KernelError {
     /// A timeout elapsed before the operation completed.
     Timeout,
 
-    // ── Concurrency errors ────────────────────────────────────────────────
     /// A lock or resource is currently held by another owner.
     WouldBlock,
     /// A deadlock was detected or is imminent.
     Deadlock,
 
-    // ── State / protocol errors ───────────────────────────────────────────
     /// The subsystem or object has not been initialised yet.
     NotInitialised,
     /// An operation was attempted in an invalid state.
@@ -56,7 +51,6 @@ pub enum KernelError {
     /// Internal kernel invariant violated (should trigger a panic in debug).
     InternalError,
 
-    // ── POSIX errno shim ──────────────────────────────────────────────────
     /// Wrap a raw POSIX errno for syscall return paths.
     Errno(i32),
 }

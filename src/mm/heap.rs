@@ -40,12 +40,9 @@ extern crate alloc;
 use core::alloc::Layout;
 use spin::Mutex;
 
-// ── Physical-to-virtual offset for the higher-half direct map ───────────────
-//
 // On x86-64 rustos identity-maps all of physical RAM at PHYS_OFFSET.
 // On RISC-V it is mapped at KERNEL_PHYS_BASE (same role, different name).
 // Both are flat-offset maps: virt = phys + BASE.
-//
 // If neither cfg matches the build will fail with an unresolved symbol, which
 // is intentional — adding a new architecture requires explicitly defining its
 // physmap base here.
@@ -74,16 +71,12 @@ fn phys_to_kernel_virt(pa: usize) -> usize {
 
 const PAGE: usize = 4096;
 
-// ── globals ─────────────────────────────────────────────────────────────────────
-
 /// Monotonically-increasing watermark used only for `/proc/meminfo`
 /// accounting.  NOT the VA passed to `add_free_region`.
 static HEAP_END: Mutex<usize> = Mutex::new(0);
 
 /// Total pages currently committed to the kernel heap (for /proc/meminfo).
 static HEAP_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-
-// ── public API ─────────────────────────────────────────────────────────────────
 
 /// Called once at boot after the linked_list_allocator has been initialised.
 /// `heap_virt_start` is the virtual address passed to `ALLOCATOR.lock().init()`;
@@ -114,8 +107,6 @@ pub fn grow(pages: usize) -> Option<usize> {
 
     let mut end_guard = HEAP_END.lock();
 
-    // ── Step 1: allocate physical frames ───────────────────────────────────────
-    //
     // Collect all frames before touching the allocator.  If the PMM runs
     // dry partway through we roll back the already-allocated frames.
     let mut phys_pages: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(pages);
@@ -132,12 +123,9 @@ pub fn grow(pages: usize) -> Option<usize> {
         }
     }
 
-    // ── Step 2: translate to kernel-virtual addresses ───────────────────────
-    //
     // The architecture's direct physmap (PHYS_OFFSET / KERNEL_PHYS_BASE) covers
     // all of physical RAM from boot — no explicit map_page() call is needed.
     // We just derive the virtual address of each frame.
-    //
     // NOTE: the physical frames may not be contiguous in physical address space
     // (the PMM's free-list allocator does not guarantee that).  They ARE
     // contiguous in virtual space only if we treat each one independently.
@@ -145,7 +133,6 @@ pub fn grow(pages: usize) -> Option<usize> {
     // addresses happen to be laid out consecutively, which is always true for
     // a flat-offset physmap (virt = phys + BASE is monotone in the same order
     // as the physical addresses, but not necessarily adjacent).
-    //
     // For simplicity and correctness we add each page separately.  The
     // linked_list_allocator merges adjacent free regions automatically.
     let first_virt = phys_to_kernel_virt(phys_pages[0]);
@@ -161,7 +148,6 @@ pub fn grow(pages: usize) -> Option<usize> {
         }
     }
 
-    // ── Step 3: update accounting watermarks ───────────────────────────────
     *end_guard += pages * PAGE;
     HEAP_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
 
@@ -172,8 +158,6 @@ pub fn grow(pages: usize) -> Option<usize> {
 pub fn committed_pages() -> usize {
     HEAP_PAGES.load(core::sync::atomic::Ordering::Relaxed)
 }
-
-// ── OOM hook called from global_alloc ──────────────────────────────────────────
 
 /// Called by the custom `#[global_allocator]` OOM handler before panicking.
 /// Tries to grow the heap by 256 pages (~1 MiB) and retries the allocation.

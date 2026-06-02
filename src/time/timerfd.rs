@@ -27,14 +27,10 @@ use crate::time::{Timespec, read_monotonic_ns};
 use crate::time::timer::{add_oneshot, add_periodic, cancel_timer, TIMER_ABSTIME};
 use crate::time::clock;
 
-// ── Flags ──────────────────────────────────────────────────────────────────────────
-
 pub const TFD_NONBLOCK:          i32 = 0x0000_0800;
 pub const TFD_CLOEXEC:           i32 = 0x0008_0000;
 pub const TFD_TIMER_ABSTIME:     i32 = 1;
 pub const TFD_TIMER_CANCEL_ON_SET: i32 = 2;
-
-// ── TimerFd object ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct TimerFdId(pub u64);
@@ -145,8 +141,6 @@ fn timerfd_expire(id: u64) {
         }
     }
 }
-
-// ── Global registry ────────────────────────────────────────────────────────────────
 
 static REGISTRY: Mutex<Option<BTreeMap<TimerFdId, TimerFd>>> = Mutex::new(None);
 

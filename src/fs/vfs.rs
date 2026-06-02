@@ -17,8 +17,6 @@ use spin::Mutex;
 // Re-export the seek constants used by callers.
 pub use crate::fs::fcntl::{SEEK_CUR, SEEK_END, SEEK_SET};
 
-// ── raw VFS backing fd table ───────────────────────────────────────────────
-
 const RAW_FD_BASE: usize = 1024;
 const RAW_FD_END: usize = 4096;
 const O_WRONLY: u32 = 1;
@@ -215,7 +213,6 @@ pub fn seek_raw(fd: usize, offset: i64, whence: i32) -> isize {
     new as isize
 }
 
-// ── fd-table dispatch stubs ───────────────────────────────────────────────
 // These are thin forwarders into fcntl's fd table. They exist so callers
 // can write `vfs::read(fd, buf)` without importing fcntl directly.
 
@@ -239,8 +236,6 @@ pub fn seek(fd: usize, offset: i64, whence: i32) -> isize {
     seek_raw(fd, offset, whence)
 }
 
-// ── file_size ─────────────────────────────────────────────────────────────
-//
 // Returns the size in bytes of the file backing `fd`, or None if the fd
 // is not a regular VFS file (pipe, socket, device, synthetic fd).
 // Used by RLIMIT_FSIZE enforcement in io_syscalls::check_fsize_limit.
@@ -248,8 +243,6 @@ pub fn seek(fd: usize, offset: i64, whence: i32) -> isize {
 pub fn file_size(fd: usize) -> Option<usize> {
     crate::fs::fcntl::fd_size(fd)
 }
-
-// ── fd path / debug-name helpers ─────────────────────────────────────────────
 
 /// Return the VFS path registered for `fd`, if any.
 pub fn fd_to_path(fd: usize) -> Option<String> {
@@ -302,12 +295,9 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
     crate::fs::vfs_ops::rmdir(path)
 }
 
-// ── inode_id_of_fd ───────────────────────────────────────────────────────────
-//
 // Resolves fd → path → stat().ino.  Used by flock(2) to key the advisory
 // lock table on inode identity so two fds opened on the same file (or two
 // hard links) share a single lock entry, matching POSIX semantics.
-//
 // Returns None when:
 //   - the fd is not a VFS file (pipe, socket, anonymous, etc.)
 //   - the path is no longer resolvable (file was unlinked)
@@ -318,13 +308,9 @@ pub fn inode_id_of_fd(fd: usize) -> Option<u64> {
     Some(st.ino)
 }
 
-// ── flush_fd / flush_all_dirty ───────────────────────────────────────────────
-//
 // Called by vfs_extras::{fsync_fd, fdatasync_fd, sync_all} which are the
 // implementations of fsync(2), fdatasync(2), and sync(2).
-//
 // Our write paths are effectively write-through on all current backends:
-//
 //   ext2     – fd_write calls ext2::write_data which writes directly to the
 //              block layer; no page cache sits in front.  ext2::sync_inode
 //              is called here as a belt-and-suspenders flush.
@@ -333,10 +319,8 @@ pub fn inode_id_of_fd(fd: usize) -> Option<u64> {
 //   fat32    – cluster writes go straight to the block device.
 //   overlayfs– writes land on the upper layer (tmpfs); no-op.
 //   devfs / procfs / sysfs – no persistent data.
-//
 // `include_metadata`:  true → fsync (data + metadata),
 //                     false → fdatasync (data only, skip metadata flush).
-//
 // Returns 0 on success, negative errno on error.
 pub fn flush_fd(fd: usize, include_metadata: bool) -> isize {
     let path = match crate::fs::fcntl::fd_get_path(fd) {
@@ -381,13 +365,10 @@ pub fn flush_all_dirty() {
     }
 }
 
-// ── with_inode_mut ────────────────────────────────────────────────────────────
-//
 // Thin abstraction that lets vfs_extras::set_times update inode timestamps
 // without duplicating mount-dispatch logic.  The closure receives an
 // InodeMeta view; mutations to atime_ns / mtime_ns are written back to the
 // backing filesystem on return.
-//
 // Currently only ext2 and tmpfs support mutable timestamps.  For read-only
 // or virtual filesystems the closure still runs but writes are silently
 // discarded (same behaviour as Linux on read-only mounts with noatime).
@@ -427,17 +408,13 @@ where
     let _ = crate::fs::vfs_ops::utimens(path, meta.atime_ns, meta.mtime_ns);
 }
 
-// ── pread ────────────────────────────────────────────────────────────────
 // Kernel-internal positional read.  Saves and restores the file offset so
 // pread has no side-effect on the fd's seek position (POSIX pread64).
-//
 // `buf` must be a kernel virtual address (e.g. a freshly allocated page
 // frame). Unlike sys_pread64, no user-space copy is performed.
-//
 // Returns:
 //   >= 0   number of bytes read
 //   <  0   negative errno (-9 EBADF, -5 EIO, etc.)
-//
 // # Reentrancy caveat
 // The seek-save / seek-to-offset / read / seek-restore sequence is not
 // atomic.  Concurrent calls on the *same* fd will race.  All current
@@ -445,7 +422,6 @@ where
 // lock or operate on fds not shared between concurrently runnable threads,
 // so this is safe in practice.  A proper per-fd position lock is the
 // correct long-term fix.
-//
 // Called from:
 //   - mm/page_fault.rs: FileBacked VMA demand fault
 //   - fs/elf.rs:        ELF segment loading
@@ -479,22 +455,17 @@ pub fn pread(fd: usize, buf: *mut u8, len: usize, offset: i64) -> isize {
     n
 }
 
-// ── pwrite ───────────────────────────────────────────────────────────────
 // Kernel-internal positional write.  Saves and restores the file offset so
 // pwrite has no side-effect on the fd's seek position (POSIX pwrite64).
-//
 // `buf` must be a kernel virtual address.  Unlike sys_pwrite64, no
 // user-space copy is performed by this function.
-//
 // Returns:
 //   >= 0   number of bytes written
 //   <  0   negative errno (-9 EBADF, -28 ENOSPC, etc.)
-//
 // # Reentrancy caveat
 // Same as pread: the seek-save/restore sequence is not atomic.  Concurrent
 // calls on the same fd race.  sys_pwrite64 serialises through the scheduler
 // at syscall entry, so it is safe for the current single-CPU implementation.
-//
 // Called from:
 //   - fs/io_syscalls.rs: sys_pwrite64
 pub fn pwrite(fd: usize, buf: *const u8, len: usize, offset: i64) -> isize {

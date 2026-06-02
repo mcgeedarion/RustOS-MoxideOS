@@ -27,7 +27,6 @@
 
 use super::mem_layout::page as P;
 
-// ── PTE flag constants ─────────────────────────────────────────────────────
 // (pub so loader/elf64.rs and other consumers can reference them)
 
 pub const PTE_PRESENT:  u64 = 1 << 0;
@@ -45,8 +44,6 @@ const COW_BIT:   u64 = PTE_COW;
 /// PTE physical address mask — bits [51:12].
 /// Canonical single definition lives in `mem_layout::page::PTE_ADDR_MASK`.
 const ADDR_MASK: u64 = P::PTE_ADDR_MASK;
-
-// ── CR3 helpers ────────────────────────────────────────────────────────────
 
 /// Read the current CR3 (physical address of the active PML4).
 #[inline]
@@ -79,8 +76,6 @@ pub fn load_cr3(cr3: usize) {
 pub fn invlpg(va: usize) {
     unsafe { core::arch::asm!("invlpg [{v}]", v = in(reg) va, options(nostack)); }
 }
-
-// ── Page-table walk ────────────────────────────────────────────────────────
 
 /// Allocate a zeroed page-table page from the PMM. Returns PA.
 fn alloc_table() -> usize {
@@ -149,8 +144,6 @@ unsafe fn walk_ro(cr3: usize, va: usize) -> Option<*mut u64> {
     Some(pte_ptr(pt, pt_idx))
 }
 
-// ── Public API ─────────────────────────────────────────────────────────────
-
 /// Map `va` → `pa` under `cr3` with the given PTE `flags`.
 /// Creates any missing intermediate tables.
 pub fn map_page(cr3: usize, va: usize, pa: usize, flags: u64) {
@@ -182,8 +175,6 @@ pub fn virt_to_phys(cr3: usize, va: usize) -> Option<usize> {
         Some((*pte & ADDR_MASK) as usize)
     }
 }
-
-// ── Copy-on-Write PML4 clone ───────────────────────────────────────────────
 
 /// Clone the parent's PML4 for a CoW fork.
 ///

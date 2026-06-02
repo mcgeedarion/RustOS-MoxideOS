@@ -11,7 +11,6 @@ use super::directory::*;
 use super::symlink::*;
 use crate::fs::vfs_ops::{KStat, KStatfs, DirEntry};
 
-// ── on-disk types (from structs.rs) ──────────────────────────────────────────────────────
 use spin::Mutex;
 
 const EXT2_SUPER_MAGIC: u16 = 0xEF53;
@@ -207,7 +206,6 @@ impl Ext2Fs {
     }
 }
 
-// ── low-level block/inode I/O (from impl_a.rs) ────────────────────────────────────────────
 impl Ext2Fs {
     pub(crate) fn read_inode(&self, ino: u32) -> Option<Inode> {
         if ino == 0 { return None; }
@@ -373,7 +371,6 @@ impl Ext2Fs {
     }
 }
 
-// ── path resolution, directory ops, metadata (from impl_b.rs) ────────────────────────
 impl Ext2Fs {
     pub(crate) fn resolve_path(&self, path: &str) -> Option<u32> {
         let mut ino = EXT2_ROOT_INO;

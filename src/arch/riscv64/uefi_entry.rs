@@ -25,8 +25,6 @@
 use crate::init::boot_info::{BootInfo, BootRange, EfiMemoryMapInfo};
 use core::arch::asm;
 
-// ─── EFI types ────────────────────────────────────────────────────────────────
-
 type EfiStatus = usize;
 type EfiHandle = *mut core::ffi::c_void;
 
@@ -105,8 +103,6 @@ struct EfiConfigTable {
     table: *mut core::ffi::c_void,
 }
 
-// ─── LoadFile2 ─────────────────────────────────────────────────────────────────
-
 #[repr(C)]
 struct EfiLoadFile2Protocol {
     load_file: unsafe extern "efiapi" fn(
@@ -139,13 +135,9 @@ const BY_PROTOCOL: u32 = 2;
 const EXIT_BOOT_SERVICES_OFFSET: usize = 0x190;
 type ExitBootServicesFn = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 
-// ─── GUIDs ────────────────────────────────────────────────────────────────────
-
 const ACPI2_GUID: [u64; 2] = [0x11d3_f1e4_71e8_6888, 0x8188_3cc7_8000_22bc];
 
 const INITRD_MEDIA_GUID: [u64; 2] = [0x4f3d_fc68_27e4_6855, 0x68cc_3152_55ca_74ac];
-
-// ─── Globals set before kernel_main ───────────────────────────────────────────
 
 /// Physical address of the ACPI 2.0 RSDP. 0 = not found.
 pub static mut RSDP_PHYS: u64 = 0;
@@ -157,8 +149,6 @@ pub static mut EFI_MAP_SIZE: usize = 0;
 pub static mut EFI_DESC_SIZE: usize = 0;
 
 static mut BOOT_INFO: BootInfo = BootInfo::empty();
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub unsafe extern "efiapi" fn uefi_start(
@@ -255,7 +245,6 @@ pub unsafe extern "efiapi" fn uefi_start(
     };
 
     // 7. ExitBootServices — with mandatory retry on EFI_INVALID_PARAMETER.
-    //
     // UEFI spec §7.4.6: firmware may modify the memory map between
     // GetMemoryMap and ExitBootServices, invalidating map_key.  Observed
     // on SiFive P550 and StarFive VisionFive 2 firmware.
@@ -295,7 +284,6 @@ pub unsafe extern "efiapi" fn uefi_start(
     }
 
     // 8. Switch to the kernel boot stack and tail-call kernel_main.
-    //
     // BOOT_STACK_TOP is immediately above BOOT_STACK in .bss (see boot.rs).
     // sp = BOOT_STACK_TOP is the correct initial stack pointer value for a
     // downward-growing RISC-V stack.
@@ -315,8 +303,6 @@ pub unsafe extern "efiapi" fn uefi_start(
         options(noreturn),
     );
 }
-
-// ─── LoadFile2 initramfs ───────────────────────────────────────────────────────
 
 unsafe fn load_initrd_via_loadfile2(
     boot_services: *mut core::ffi::c_void,
@@ -382,8 +368,6 @@ unsafe fn load_initrd_via_loadfile2(
     }
     None
 }
-
-// ─── EFI text output helper ────────────────────────────────────────────────────
 
 unsafe fn efi_print(con_out: *mut EfiSimpleTextOutput, s: &str) {
     let mut buf = [0u16; 128];

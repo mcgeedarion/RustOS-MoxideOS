@@ -19,14 +19,10 @@
 //! for entry in ram.entries() { /* walk archive */ }
 //! ```
 
-// ─── cpio newc constants ───────────────────────────────────────────────────
-
 const NEWC_MAGIC: &[u8; 6] = b"070701";
 const HEADER_LEN: usize    = 110;
 const TRAILER:    &str     = "TRAILER!!!";
 
-// ─── Global initramfs range (set by boot stub before kernel_main) ──────────
-//
 // We store the physical address and byte length in two static atomics so they
 // can be written once by the early boot code (before the allocator is up) and
 // read later by `load()`.
@@ -44,8 +40,6 @@ pub fn set_initramfs_range(phys_start: usize, byte_len: usize) {
     INITRAMFS_PA .store(phys_start, Ordering::Relaxed);
     INITRAMFS_LEN.store(byte_len,   Ordering::Relaxed);
 }
-
-// ─── InitramfsHandle ──────────────────────────────────────────────────────
 
 /// Borrowed view of the in-memory CPIO archive.  Returned by `load()`.
 ///
@@ -69,8 +63,6 @@ impl<'a> InitramfsHandle<'a> {
         iter(self.cpio)
     }
 }
-
-// ─── load() ───────────────────────────────────────────────────────────────
 
 /// Obtain a zero-copy handle to the initramfs CPIO archive.
 ///
@@ -113,8 +105,6 @@ pub fn load() -> InitramfsHandle<'static> {
     InitramfsHandle { cpio }
 }
 
-// ─── Parsed entry ─────────────────────────────────────────────────────────
-
 /// One file/directory entry inside the CPIO archive.
 #[derive(Debug, Clone, Copy)]
 pub struct CpioEntry<'a> {
@@ -143,8 +133,6 @@ impl<'a> CpioEntry<'a> {
     #[inline] pub fn permissions(&self)  -> u32  { self.mode & 0o007777 }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────
-
 #[inline]
 fn parse_hex8(bytes: &[u8]) -> u32 {
     let mut val: u32 = 0;
@@ -164,8 +152,6 @@ fn parse_hex8(bytes: &[u8]) -> u32 {
 fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
-
-// ─── Iterator ─────────────────────────────────────────────────────────────
 
 /// Iterator over entries in a newc CPIO archive.
 pub struct CpioIter<'a> {
@@ -225,8 +211,6 @@ impl<'a> Iterator for CpioIter<'a> {
     }
 }
 
-// ─── Public free functions ─────────────────────────────────────────────────
-
 /// Return an iterator over every entry in a newc CPIO archive slice.
 pub fn iter(cpio: &[u8]) -> CpioIter<'_> {
     CpioIter { data: cpio, offset: 0 }
@@ -244,8 +228,6 @@ pub fn find_file<'a>(cpio: &'a [u8], path: &str) -> Option<&'a [u8]> {
     }
     None
 }
-
-// ─── Unit tests (host) ────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

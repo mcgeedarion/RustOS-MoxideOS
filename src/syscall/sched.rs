@@ -51,12 +51,8 @@ use crate::proc::sched_helpers::{cbs_admit, cbs_release};
 use crate::uaccess::{copy_from_user, copy_to_user};
 use super::errno::{eacces, ebusy, efault, einval, enosys, esrch};
 
-// ── Linux ABI constants ──────────────────────────────────────────────────
-
 // Recognised values for the `which` argument of setpriority / getpriority.
 const PRIO_PROCESS: i32 = 0;
-
-// ── Linux ABI structs ──────────────────────────────────────────────────
 
 /// `struct sched_param` (single field: `sched_priority`).
 #[derive(Clone, Copy, Default)]
@@ -89,8 +85,6 @@ pub struct SchedAttr {
 
 const SCHED_ATTR_SIZE: usize = 48; // bytes in the user-visible wire format
 
-// ── Safe user-copy helpers for sched types ─────────────────────────────────────
-//
 // All access to user-space memory goes through the byte-slice uaccess ABI,
 // consistent with every other syscall module.  No typed-pointer transmutes.
 
@@ -140,8 +134,6 @@ fn write_sched_attr(uptr: usize, attr: &SchedAttr) -> Result<(), isize> {
     copy_to_user(uptr, &buf).map_err(|_| efault())
 }
 
-// ── RLIMIT helpers ────────────────────────────────────────────────────────────────
-
 fn nice_floor(pid: usize) -> i8 {
     use crate::proc::scheduler::with_proc;
     let (soft, _) = crate::proc::scheduler::with_proc(pid, |p| p.rlimits.get(RLIMIT_NICE))
@@ -170,8 +162,6 @@ fn is_privileged(pid: usize) -> bool {
     crate::proc::scheduler::with_proc(pid, |p| p.caps.has(crate::security::Cap::SysNice))
         .unwrap_or(false)
 }
-
-// ── Core attribute application ──────────────────────────────────────────────────
 
 /// Snapshot of a task's current deadline parameters and cpumask, used
 /// to release CBS utilization before applying new parameters.
@@ -207,7 +197,6 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
         None    => return einval(),
     };
 
-    // ── Parameter sanity check for Deadline ────────────────────────────────────
     if policy == SchedPolicy::Deadline {
         if attr.sched_runtime == 0
             || attr.sched_deadline == 0
@@ -219,14 +208,12 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
         }
     }
 
-    // ── RLIMIT_RTPRIO: reject unprivileged RT elevation ───────────────────────
     if matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
         let ceiling = rt_prio_ceiling(pid);
         if ceiling == 0 { return eacces(); }
         if attr.sched_priority as u8 > ceiling { return eacces(); }
     }
 
-    // ── CBS admission gate (SCHED_DEADLINE only) ───────────────────────────
     if policy == SchedPolicy::Deadline {
         let privileged = is_privileged(pid);
 
@@ -249,7 +236,6 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
         }
     }
 
-    // ── If leaving Deadline, release old CBS slot ────────────────────────────
     if policy != SchedPolicy::Deadline {
         if let Some(snap) = snapshot_deadline(pid) {
             cbs_release(snap.runtime, snap.period, snap.cpumask);
@@ -258,7 +244,6 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
 
     let now_ns = crate::time::monotonic_ns();
 
-    // ── Apply to PCB ────────────────────────────────────────────────────────
     crate::proc::scheduler::with_proc_mut(pid, |pcb, _pl| {
         let was_rt     = matches!(pcb.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr);
         let becomes_rt = matches!(policy, SchedPolicy::Fifo | SchedPolicy::Rr);
@@ -294,8 +279,6 @@ fn apply_sched_attr(pid: usize, attr: &SchedAttr) -> isize {
     }).map(|_| 0isize).unwrap_or_else(|| esrch())
 }
 
-// ── sched_setscheduler ────────────────────────────────────────────────────────────
-
 /// `sys_sched_setscheduler(pid, policy, param_uptr)` [NR 144]
 pub fn sys_sched_setscheduler(pid: usize, policy: u32, param_uptr: usize) -> isize {
     let param = match read_sched_param(param_uptr) {
@@ -312,15 +295,11 @@ pub fn sys_sched_setscheduler(pid: usize, policy: u32, param_uptr: usize) -> isi
     apply_sched_attr(pid, &attr)
 }
 
-// ── sched_getscheduler ────────────────────────────────────────────────────────────
-
 /// `sys_sched_getscheduler(pid)` [NR 145]
 pub fn sys_sched_getscheduler(pid: usize) -> isize {
     crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.policy as i32 as isize)
         .unwrap_or_else(|| esrch())
 }
-
-// ── sched_setparam / sched_getparam ─────────────────────────────────────────────
 
 /// `sys_sched_setparam(pid, param_uptr)` [NR 142]
 pub fn sys_sched_setparam(pid: usize, param_uptr: usize) -> isize {
@@ -351,8 +330,6 @@ pub fn sys_sched_getparam(pid: usize, param_uptr: usize) -> isize {
     }
 }
 
-// ── setpriority / getpriority ───────────────────────────────────────────────────
-
 /// `sys_setpriority(which, who, prio)` [NR 141]
 ///
 /// Only PRIO_PROCESS (which == 0) is implemented; PRIO_PGRP and
@@ -379,8 +356,6 @@ pub fn sys_getpriority(which: i32, who: usize) -> isize {
         .unwrap_or_else(|| esrch())
 }
 
-// ── sched_setaffinity ─────────────────────────────────────────────────────────────
-
 /// `sys_sched_setaffinity(pid, cpusetsize, mask_uptr)` [NR 203]
 pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
     if mask_uptr == 0 || cpusetsize == 0 { return einval(); }
@@ -396,7 +371,6 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     let effective = mask & online_mask;
     if effective == 0 { return einval(); }
 
-    // ── CBS: re-check admission if this is a DEADLINE task ───────────────────
     let snap = snapshot_deadline(pid);
     if let Some(ref s) = snap {
         let privileged = is_privileged(pid);
@@ -422,8 +396,6 @@ pub fn sys_sched_setaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     0
 }
 
-// ── sched_getaffinity ─────────────────────────────────────────────────────────────
-
 /// `sys_sched_getaffinity(pid, cpusetsize, mask_uptr)` [NR 204]
 pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) -> isize {
     if mask_uptr == 0 || cpusetsize == 0 { return einval(); }
@@ -443,15 +415,11 @@ pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
     0
 }
 
-// ── sched_yield ──────────────────────────────────────────────────────────────────
-
 /// `sys_sched_yield()` [NR 24]
 pub fn sys_sched_yield() -> isize {
     crate::proc::scheduler::schedule();
     0
 }
-
-// ── priority range ─────────────────────────────────────────────────────────────
 
 /// `sys_sched_get_priority_max(policy)` [NR 146]
 pub fn sys_sched_get_priority_max(policy: u32) -> isize {
@@ -469,8 +437,6 @@ pub fn sys_sched_get_priority_min(policy: u32) -> isize {
         _     => 0,
     }
 }
-
-// ── sched_setattr / sched_getattr (NR 314 / 315) ───────────────────────────────
 
 /// `sys_sched_setattr(pid, attr_uptr, flags)` [NR 314]
 pub fn sys_sched_setattr(pid: usize, attr_uptr: usize, _flags: u32) -> isize {

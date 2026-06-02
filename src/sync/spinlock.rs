@@ -26,8 +26,6 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::cell::UnsafeCell;
 
-// ─── SpinLock ────────────────────────────────────────────────────────────────
-
 pub struct SpinLock<T> {
     next_ticket:  AtomicU32,
     now_serving:  AtomicU32,
@@ -52,7 +50,6 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
 
-        // ── Fast path: tight spin (no pause) ────────────────────────────
         // Try a short burst first.  If the lock is uncontended or the holder
         // is in a very short critical section, we may get it here without
         // ever paying the ~140-cycle `pause` penalty.
@@ -63,7 +60,6 @@ impl<T> SpinLock<T> {
             core::hint::spin_loop();
         }
 
-        // ── Slow path: pause loop ────────────────────────────────────────
         // Contention is real.  Switch to `pause` to reduce memory-bus
         // traffic and yield bandwidth to the lock holder.
         while self.now_serving.load(Ordering::Acquire) != ticket {
@@ -118,8 +114,6 @@ impl<'a, T> Drop for SpinLockGuard<'a, T> {
         self.lock.now_serving.fetch_add(1, Ordering::Release);
     }
 }
-
-// ─── IrqSpinLock ─────────────────────────────────────────────────────────────
 
 pub struct IrqSpinLock<T> {
     inner: SpinLock<T>,
@@ -178,8 +172,6 @@ impl<'a, T> Drop for IrqSpinLockGuard<'a, T> {
         if self.irq_was_enabled { irq_enable(); }
     }
 }
-
-// ─── Arch-abstracted IRQ helpers ─────────────────────────────────────────────
 
 #[inline]
 fn irq_flags_and_disable() -> bool {

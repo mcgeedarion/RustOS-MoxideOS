@@ -17,8 +17,6 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use crate::console::println;
 use super::power::{enter_sleep_state, init as power_init};
 
-// ── FACS layout (ACPI 6.5 §5.2.10) ──────────────────────────────────────
-
 #[repr(C, packed)]
 struct Facs {
     sig:                    [u8; 4],  // "FACS"
@@ -34,8 +32,6 @@ struct Facs {
     _rsvd2:                 [u8; 24],
 }
 
-// ── FADT offsets for FACS pointer ────────────────────────────────────────
-
 const FADT_OFF_FIRMWARE_CTRL: usize = 36;   // 32-bit FACS phys address
 const FADT_OFF_X_FIRMWARE_CTRL: usize = 132; // 64-bit FACS phys address (v2)
 
@@ -44,8 +40,6 @@ static FACS_PHYS: AtomicU32 = AtomicU32::new(0);
 
 /// Set to true once a successful S3 resume has been detected.
 pub static RESUMED_FROM_S3: AtomicBool = AtomicBool::new(false);
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Locate the FACS and cache its physical address.
 ///

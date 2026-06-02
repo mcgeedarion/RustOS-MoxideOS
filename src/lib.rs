@@ -4,14 +4,11 @@
 #![feature(alloc_error_handler)]
 #![feature(naked_functions)]
 #![feature(asm_const)]
-// ── Clippy complexity gates ───────────────────────────────────────────────
-//
 // These lints are intentionally set at the crate root so they apply
 // globally.  They will surface the known high-complexity functions
 // (dispatch_with_rip, sys_ptrace_impl, sys_clone3, bpf_run) during
 // normal `cargo clippy` runs, making complexity regressions visible
 // in CI before they are merged.
-//
 // Rationale per lint:
 //   cognitive_complexity  — catches functions with deeply nested
 //                           conditionals / match arms (the primary issue
@@ -31,10 +28,7 @@
 
 extern crate alloc;
 
-// ── Canonical subsystem modules ──────────────────────────────────────────────
-//
 // Organised by kernel layer (outermost = most dependent on others):
-//
 //   core        — Zero-dependency foundation (error types, panic, cpu-local,
 //                 intrusive collections).  Everything may depend on this.
 //   arch        — Architecture-specific code (x86_64, riscv64)

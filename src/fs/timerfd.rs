@@ -49,8 +49,6 @@ use spin::Mutex;
 use crate::fs::scheme_table::Scheme;
 use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 
-// ── constants ──────────────────────────────────────────────────────────────────
-
 /// Raw fdno namespace for the TABLE.
 pub const TIMERFD_FD_BASE: usize = 0x6000_0000;
 
@@ -60,8 +58,6 @@ pub const TFD_TIMER_ABSTIME: i32 = 1;
 
 const CLOCK_REALTIME: u32 = 0;
 const CLOCK_MONOTONIC: u32 = 1;
-
-// ── data structures ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 pub struct ItimerspecNs {
@@ -76,15 +72,11 @@ pub struct TimerFdEntry {
     pub nonblocking: bool,
 }
 
-// ── global table ────────────────────────────────────────────────────────────────
-
 /// Fast map is safe here: keys are monotonic kernel-assigned timerfd table
 /// numbers and the table is never iterated for user-visible ordering.
 static TABLE: Mutex<KernelFastMap<usize, TimerFdEntry>> = Mutex::new(KernelFastMap::new());
 static COUNTER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-// ── scheme bfd → TABLE fdno translation ───────────────────────────────────────
-//
 // `sys_timerfd_settime` and `sys_timerfd_gettime` are called from the
 // syscall dispatch table with the *scheme* backing fd (already resolved
 // from the user-visible fd).  They need the raw TABLE fdno to look up
@@ -104,8 +96,6 @@ pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
         None
     }
 }
-
-// ── TimerFdScheme — Scheme trait wrapper ───────────────────────────────────────
 
 pub struct TimerFdScheme;
 
@@ -143,8 +133,6 @@ impl Scheme for TimerFdScheme {
         Ok(())
     }
 }
-
-// ── helpers ──────────────────────────────────────────────────────────────────────
 
 #[inline]
 fn now_ns() -> u64 {
@@ -201,13 +189,9 @@ fn tick(entry: &mut TimerFdEntry) {
     }
 }
 
-// ── public API ─────────────────────────────────────────────────────────────────
-
 pub fn is_timerfd(fdno: usize) -> bool {
     fdno >= TIMERFD_FD_BASE && TABLE.lock().contains_key(&fdno)
 }
-
-// ── sys_timerfd_create [NR 283] ────────────────────────────────────────────────
 
 pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
     use crate::fs::process_fd::proc_fd_install;
@@ -219,7 +203,6 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
         _ => return -22, // EINVAL
     }
 
-    // ── 1. Allocate a raw TABLE fdno ──────────────────────────────────────────
     let id = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let table_fdno = TIMERFD_FD_BASE + id;
 
@@ -232,15 +215,12 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
         },
     );
 
-    // ── 2. Register a TimerFdScheme in SCHEME_FD_STORE ─────────────────────
-    //
     // SchemeFileId carries the TABLE fdno for reverse lookup in
     // scheme_bfd_to_table_fdno (used by settime/gettime).
     let scheme: Arc<dyn Scheme> = Arc::new(TimerFdScheme);
     let scheme_bfd = alloc_scheme_backing_fd();
     scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
 
-    // ── 3. Install scheme bfd into the process fd table ───────────────────
     let pid = crate::proc::scheduler::current_pid();
     let install_flags = if flags & TFD_CLOEXEC != 0 {
         TFD_CLOEXEC
@@ -252,8 +232,6 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
     user_fd as isize
 }
 
-// ── sys_timerfd_settime [NR 286] ───────────────────────────────────────────────
-//
 // The syscall dispatch calls this with the scheme backing fd already
 // resolved from the user-visible fd.  We translate to the TABLE fdno
 // via scheme_bfd_to_table_fdno.
@@ -305,8 +283,6 @@ fn entry_settime(entry: &mut TimerFdEntry, flags: i32, interval_ns: u64, value_n
     };
 }
 
-// ── sys_timerfd_gettime [NR 287 / 288] ────────────────────────────────────────
-
 pub fn sys_timerfd_gettime(scheme_bfd: usize, curr_va: usize) -> isize {
     if !validate_user_ptr(curr_va, 32) {
         return -14;
@@ -331,8 +307,6 @@ pub fn sys_timerfd_gettime(scheme_bfd: usize, curr_va: usize) -> isize {
     write_itimerspec(curr_va, interval_ns, remaining_ns);
     0
 }
-
-// ── timerfd_read (called via TimerFdScheme::read) ───────────────────────────
 
 pub fn timerfd_read(fdno: usize, buf: &mut [u8]) -> isize {
     if buf.len() < 8 {
@@ -365,8 +339,6 @@ pub fn timerfd_read(fdno: usize, buf: &mut [u8]) -> isize {
     }
 }
 
-// ── poll readiness ─────────────────────────────────────────────────────────────
-
 /// `fdno` here is the raw TABLE fdno (not the scheme bfd).
 pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
     let mut tbl = TABLE.lock();
@@ -382,8 +354,6 @@ pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
         }
     }
 }
-
-// ── close ──────────────────────────────────────────────────────────────────────
 
 pub fn timerfd_close(fdno: usize) {
     TABLE.lock().remove(&fdno);

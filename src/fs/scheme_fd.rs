@@ -40,10 +40,6 @@ use spin::Mutex;
 use super::scheme_table::Scheme;
 use scheme_api::{SchemeError, SchemeFileId};
 
-// ---------------------------------------------------------------------------
-// Synthetic backing-fd allocator
-// ---------------------------------------------------------------------------
-//
 // Fds are drawn from the 0x8000_0000…0xFFFF_FFFF range.  The free list is
 // checked first; only when it is empty does the counter increment.
 // `scheme_fd_close` returns the fd to the free list via
@@ -70,10 +66,6 @@ pub fn alloc_scheme_backing_fd() -> usize {
 pub fn free_scheme_backing_fd(fd: usize) {
     FREE_SCHEME_FDS.lock().push(fd);
 }
-
-// ---------------------------------------------------------------------------
-// SchemeFdStore
-// ---------------------------------------------------------------------------
 
 struct SchemeFdEntry {
     scheme: Arc<dyn Scheme>,
@@ -122,10 +114,6 @@ impl SchemeFdStore {
 
 static SCHEME_FD_STORE: SchemeFdStore = SchemeFdStore::new();
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /// Register a newly-opened scheme fd.
 ///
 /// Called from `proc_fd_open` after `SCHEME_TABLE.open` succeeds.
@@ -137,10 +125,6 @@ pub fn scheme_fd_register(backing_fd: usize, scheme: Arc<dyn Scheme>, fid: Schem
 pub fn is_scheme_fd(backing_fd: usize) -> bool {
     SCHEME_FD_STORE.contains(backing_fd)
 }
-
-// ---------------------------------------------------------------------------
-// I/O dispatch
-// ---------------------------------------------------------------------------
 
 /// Read up to `buf.len()` bytes from the scheme fd.
 ///
@@ -213,10 +197,6 @@ pub fn scheme_fd_close(backing_fd: usize) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errno translation
-// ---------------------------------------------------------------------------
-
 #[inline]
 fn scheme_error_to_errno(e: SchemeError) -> isize {
     match e {
@@ -230,10 +210,6 @@ fn scheme_error_to_errno(e: SchemeError) -> isize {
         SchemeError::Other => -5,             // EIO
     }
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

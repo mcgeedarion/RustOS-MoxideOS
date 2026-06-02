@@ -11,8 +11,6 @@ use core::fmt;
 use gdbstub::conn::Connection;
 use x86_64::instructions::port::Port;
 
-// ── COM1 base address and register offsets ────────────────────────────────────
-
 const COM1_BASE: u16 = 0x3F8;
 
 const REG_DATA:    u16 = COM1_BASE;       // RBR (r) / THR (w)
@@ -30,8 +28,6 @@ const LSR_THRE:        u8 = 1 << 5;  // Transmitter Holding Register Empty
 
 // Baud divisor for 115200 baud (base clock = 1.8432 MHz)
 const BAUD_115200: u16 = 1;
-
-// ── SerialPort ────────────────────────────────────────────────────────────────
 
 /// A thin wrapper around COM1 configured for GDB RSP communication.
 ///
@@ -89,8 +85,6 @@ impl SerialPort {
         self.mcr.write(0x0B);
     }
 
-    // ── private helpers ───────────────────────────────────────────────────────
-
     /// Block until the Line Status Register says a byte is waiting.
     #[inline]
     unsafe fn wait_rx(&mut self) {
@@ -131,8 +125,6 @@ impl SerialPort {
         self.data.write(byte);
     }
 }
-
-// ── Connection impl (gdbstub 0.6.x) ──────────────────────────────────────────
 
 /// Infallible error type — port I/O on x86 cannot fail at the Rust level.
 #[derive(Debug)]

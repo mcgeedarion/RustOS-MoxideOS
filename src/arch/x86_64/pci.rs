@@ -18,16 +18,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA:    u16 = 0xCFC;
 
-// ── Well-known class/subclass/prog_if tuples ──────────────────────────────────
-
 /// PCI mass-storage, SATA, AHCI 1.0  (class=0x01, sub=0x06, prog_if=0x01)
 pub const PCI_CLASS_STORAGE_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
 /// PCI mass-storage, NVMe            (class=0x01, sub=0x08, prog_if=0x02)
 pub const PCI_CLASS_STORAGE_NVME: (u8, u8, u8) = (0x01, 0x08, 0x02);
 /// PCI network, Ethernet             (class=0x02, sub=0x00)
 pub const PCI_CLASS_NETWORK_ETH:  (u8, u8)     = (0x02, 0x00);
-
-// ── I/O helpers ──────────────────────────────────────────────────────────────
 
 #[inline]
 fn config_addr(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
@@ -61,8 +57,6 @@ pub fn config_write_u32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
         x86::io::outl(CONFIG_DATA, val);
     }
 }
-
-// ── Device table ─────────────────────────────────────────────────────────────
 
 const MAX_DEVICES: usize = 256;
 
@@ -122,8 +116,6 @@ fn register_device(d: PciDevice) {
     }
 }
 
-// ── Public query API ─────────────────────────────────────────────────────────
-
 /// Find a device by vendor + device ID.
 pub fn find_device(vendor: u16, device_id: u16) -> Option<PciDevice> {
     let n = PCI_COUNT.load(Ordering::Relaxed) as usize;
@@ -153,14 +145,10 @@ pub fn for_each(mut f: impl FnMut(PciDevice)) {
     unsafe { PCI_DEVICES[..n].iter().copied().for_each(&mut f); }
 }
 
-// ── Kernel-main helpers (used by probe_ahci / probe_nvme) ────────────────────
-
 /// Find device by (class, subclass, prog_if) — thin alias used by kernel_main.
 pub fn find_device_by_class(tuple: (u8, u8, u8)) -> Option<PciDevice> {
     find_class_progif(tuple.0, tuple.1, tuple.2)
 }
-
-// ── Bus scan ─────────────────────────────────────────────────────────────────
 
 pub fn init() {
     let mut count = 0u32;

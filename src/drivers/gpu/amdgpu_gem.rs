@@ -18,19 +18,11 @@ use spin::Mutex;
 use crate::drivers::gpu::gpu::DisplayInfo;
 use crate::drivers::gpu::framebuffer::{Framebuffer, PixelFormat};
 
-// ---------------------------------------------------------------------------
-// MMIO register offsets (GFX9 subset)
-// ---------------------------------------------------------------------------
-
 const MMIO_SCRATCH_0: usize = 0x2040; // Scratch register (sanity check)
 const MMIO_HDP_FLUSH:  usize = 0x2F00; // HDP cache flush
 const MMIO_GRBM_SOFT_RESET: usize = 0x8020; // GRBM soft reset
 const MMIO_CP_ME_RAM_WADDR:  usize = 0xC000;
 const MMIO_SOC15_OFFSET:     usize = 0x0; // SoC15 base offset
-
-// ---------------------------------------------------------------------------
-// GEM buffer object
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct GemBo {
@@ -39,10 +31,6 @@ pub struct GemBo {
     pub phys:   u64,  // CPU-visible physical address
     pub gpu_va: u64,  // GPU virtual address (GART-mapped)
 }
-
-// ---------------------------------------------------------------------------
-// AMD GPU state
-// ---------------------------------------------------------------------------
 
 struct AmdGpu {
     mmio:       usize,
@@ -54,10 +42,6 @@ struct AmdGpu {
 }
 
 static AMD: Mutex<Option<AmdGpu>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 pub fn init(mmio_base: u64) {
     unsafe { _init(mmio_base as usize); }
@@ -96,10 +80,6 @@ pub fn gem_free(handle: u32) {
 pub fn gem_phys(handle: u32) -> Option<u64> {
     AMD.lock().as_ref()?.bos.iter().find(|b| b.handle == handle).map(|b| b.phys)
 }
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
 
 unsafe fn _init(mmio: usize) {
     use core::ptr::{read_volatile, write_volatile};

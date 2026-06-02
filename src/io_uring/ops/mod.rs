@@ -1,7 +1,5 @@
 // src/io_uring/ops/mod.rs
-//
 // Opcode dispatch.
-//
 // `dispatch()` is called by the SQ processing loop for each dequeued SQE.
 // It routes to the appropriate handler and returns an i32 result that is
 // stored verbatim in the CQE `res` field (Linux convention: non-negative =
@@ -47,8 +45,6 @@ pub fn dispatch(sqe: &Sqe) -> i32 {
         }
     }
 }
-
-// ── CLOSE ────────────────────────────────────────────────────────────────────────────
 
 /// Close a file descriptor.
 ///

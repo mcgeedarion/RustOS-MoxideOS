@@ -26,8 +26,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::sync::wait_queue::{WaitQueue, ReadyMask, WakeReason, CancellationToken};
 
-// ── Core trait ────────────────────────────────────────────────────────────────
-
 pub trait PollSource: Send + Sync {
     /// Return the immediately-ready subset of `interest`. Must not block.
     /// Called lock-free from IRQ-safe context.
@@ -36,8 +34,6 @@ pub trait PollSource: Send + Sync {
     /// The WaitQueue to sleep on when `poll()` returns 0.
     fn wait_queue(&self) -> &WaitQueue;
 }
-
-// ── Single-source blocking helper ─────────────────────────────────────────────
 
 /// Block until `src` has bits matching `interest`, deadline, or cancel.
 ///
@@ -66,8 +62,6 @@ pub fn wait_on(
         }
     }
 }
-
-// ── Aggregate N-source helper (poll / select / epoll_wait) ───────────────────
 
 /// Sleep until ANY of `sources` has ready bits matching its mask.
 ///
@@ -114,8 +108,6 @@ pub fn wait_any(
 
     reason
 }
-
-// ── AlwaysReady — for regular files and devfs ─────────────────────────────────
 
 /// PollSource for objects that are always readable and writable
 /// (regular VFS files, devfs nodes).

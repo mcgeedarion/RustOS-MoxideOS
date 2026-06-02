@@ -25,8 +25,6 @@
 use core::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use crate::console::println;
 
-// ── FADT GPE block offsets ────────────────────────────────────────────────
-
 const FADT_OFF_GPE0_BLK:     usize = 80;
 const FADT_OFF_GPE1_BLK:     usize = 84;
 const FADT_OFF_GPE0_BLK_LEN: usize = 92;
@@ -38,8 +36,6 @@ static GPE0_EN_PORT:  AtomicU8 = AtomicU8::new(0);
 static GPE0_LEN:      AtomicU8 = AtomicU8::new(0); // bytes per half-block
 static HOTPLUG_GPE_BIT: AtomicU8 = AtomicU8::new(0xFF); // 0xFF = none found
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-
-// ── GPE I/O helpers ───────────────────────────────────────────────────────
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
@@ -60,13 +56,9 @@ unsafe fn inb(_port: u16) -> u8 { 0 }
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn outb(_port: u16, _val: u8) {}
 
-// ── ACPI Notify values ────────────────────────────────────────────────────
-
 pub const NOTIFY_BUS_CHECK:    u8 = 0x00; // re-enumerate
 pub const NOTIFY_DEVICE_CHECK: u8 = 0x01; // specific device added/removed
 pub const NOTIFY_EJECT_REQ:    u8 = 0x03; // user pressed eject button
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Initialise the ACPI hot-plug GPE handler.
 ///

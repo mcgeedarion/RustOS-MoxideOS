@@ -22,8 +22,6 @@
 use crate::proc::scheduler;
 use crate::arch;
 
-// ─── arch_prctl ────────────────────────────────────────────────────────────
-
 pub const ARCH_SET_GS: u64 = 0x1001;
 pub const ARCH_SET_FS: u64 = 0x1002;
 pub const ARCH_GET_FS: u64 = 0x1003;
@@ -102,8 +100,6 @@ pub fn sys_arch_prctl(_code: u64, _addr: u64) -> isize {
     -(crate::syscall::errno::ENOSYS as isize)
 }
 
-// ─── set_tid_address ───────────────────────────────────────────────────────
-
 /// `set_tid_address(tidptr)` — store `tidptr` in the thread's PCB.  The
 /// kernel writes 0 to `*tidptr` and sends SIGCHLD to the parent when the
 /// thread exits (used for `pthread_join` fast-path).
@@ -114,8 +110,6 @@ pub fn sys_set_tid_address(tidptr: u64) -> isize {
     });
     pid as isize
 }
-
-// ─── set_robust_list ───────────────────────────────────────────────────────
 
 /// `set_robust_list(head, len)` — register the robust futex list for this
 /// thread.  On thread exit the kernel walks the list and wakes waiters.
@@ -142,8 +136,6 @@ pub struct RobustListHead {
     pub list_op_pending: u64,
 }
 
-// ─── getrandom ─────────────────────────────────────────────────────────────
-
 /// `getrandom(buf, buflen, flags)` — fill `buf` with `buflen` random bytes.
 /// Delegates to `rand::rdrand64()` in a loop.  `GRND_NONBLOCK` (flag 0x1)
 /// and `GRND_RANDOM` (flag 0x2) are both honoured (RDRAND never blocks).
@@ -167,8 +159,6 @@ pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> isize {
     }
     buflen as isize
 }
-
-// ─── prlimit64 ─────────────────────────────────────────────────────────────
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -222,8 +212,6 @@ pub fn sys_prlimit64(
     let _ = new_limit;
     0
 }
-
-// ─── RustOS private syscalls ───────────────────────────────────────────────
 
 /// Syscall 500: `rustos_version()` — return (major << 16) | minor.
 pub fn sys_rustos_version() -> isize {

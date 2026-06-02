@@ -32,10 +32,6 @@ use crate::{
     },
 };
 
-// ---------------------------------------------------------------------------
-// sys_open
-// ---------------------------------------------------------------------------
-
 /// Open a file, device, or scheme resource.
 ///
 /// `path` is a NUL-terminated string in userspace.  `flags` is a bitfield
@@ -50,9 +46,6 @@ pub fn sys_open(path: &str, flags: u32) -> i64 {
     };
 
     if is_scheme_url(path) {
-        // ----------------------------------------------------------------
-        // Scheme URL path: route through the scheme table.
-        // ----------------------------------------------------------------
         match SCHEME_TABLE.open(path, flags) {
             Ok((handler, fid)) => {
                 let proc = current_process();
@@ -63,9 +56,6 @@ pub fn sys_open(path: &str, flags: u32) -> i64 {
             Err(e) => e.to_errno(),
         }
     } else {
-        // ----------------------------------------------------------------
-        // Classic POSIX path: legacy VFS resolver.
-        // ----------------------------------------------------------------
         match vfs_ops::open(path, flags) {
             Ok(node) => {
                 let proc = current_process();
@@ -77,10 +67,6 @@ pub fn sys_open(path: &str, flags: u32) -> i64 {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// sys_read
-// ---------------------------------------------------------------------------
 
 /// Read up to `len` bytes from `fd` into `buf`.
 ///
@@ -106,10 +92,6 @@ pub fn sys_read(fd: RawFd, buf: &mut [u8]) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// sys_write
-// ---------------------------------------------------------------------------
-
 /// Write `buf` to `fd`.
 ///
 /// Returns bytes written (>= 0) or a negative errno.
@@ -134,10 +116,6 @@ pub fn sys_write(fd: RawFd, buf: &[u8]) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// sys_close
-// ---------------------------------------------------------------------------
-
 /// Close `fd` and release associated resources.
 pub fn sys_close(fd: RawFd) -> i64 {
     let proc = current_process();
@@ -159,10 +137,6 @@ pub fn sys_close(fd: RawFd) -> i64 {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// sys_seek
-// ---------------------------------------------------------------------------
 
 /// Reposition the file offset of `fd`.
 ///
@@ -186,10 +160,6 @@ pub fn sys_seek(fd: RawFd, offset: i64, whence: u8) -> i64 {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// sys_ioctl
-// ---------------------------------------------------------------------------
 
 /// Device control.
 pub fn sys_ioctl(fd: RawFd, cmd: u64, arg: usize) -> i64 {

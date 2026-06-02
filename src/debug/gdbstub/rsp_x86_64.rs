@@ -72,8 +72,6 @@ fn unpack_gdb_regs(gdb_regs: &[u64; X86_REG_COUNT], ureg: &mut [u64; UREG_COUNT]
     }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 fn from_hex(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -118,8 +116,6 @@ fn rsp_packet(body: &str) -> String {
     alloc::format!("+${}#{:02x}", body, csum)
 }
 
-// ── x86-64 single-step via RFLAGS.TF ─────────────────────────────────────────
-//
 // On x86-64 we set the Trap Flag (bit 8) in RFLAGS before continuing.
 // The CPU delivers a #DB exception after the next instruction, which the
 // kernel translates to SIGTRAP.  We clear TF again in the trap handler.
@@ -140,8 +136,6 @@ pub fn step_clear_tf(target: &mut GdbTarget) {
     target.write_regs(&regs);
 }
 
-// ── Session state ─────────────────────────────────────────────────────────────
-
 pub struct X86Session {
     pub sw_bps:  SwBreakpointTable,
     pub hw_bps:  HwBreakpointTable,
@@ -157,8 +151,6 @@ impl X86Session {
         }
     }
 }
-
-// ── Packet dispatch ───────────────────────────────────────────────────────────
 
 pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut X86Session) -> String {
     if body.is_empty() { return rsp_packet(""); }
@@ -261,8 +253,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut X86Sessio
     }
 }
 
-// ── Z/z packet handler ────────────────────────────────────────────────────────
-//
 // GDB breakpoint kinds:
 //   Z0 / z0  software breakpoint
 //   Z1 / z1  hardware execution breakpoint

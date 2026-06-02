@@ -20,8 +20,6 @@ use crate::arch::x86_64::{
 
 pub struct ArchImpl;
 
-// ─── ArchInit ────────────────────────────────────────────────────────────
-
 impl ArchInit for ArchImpl {
     fn early_init() {
         gdt_init();
@@ -35,8 +33,6 @@ impl ArchInit for ArchImpl {
         apic::apic_init(); // enables interrupts (STI)
     }
 }
-
-// ─── Interrupts ──────────────────────────────────────────────────────────
 
 impl Interrupts for ArchImpl {
     #[inline]
@@ -54,8 +50,6 @@ impl Interrupts for ArchImpl {
         rflags & (1 << 9) != 0 // IF bit
     }
 }
-
-// ─── Cpu ─────────────────────────────────────────────────────────────────
 
 impl Cpu for ArchImpl {
     #[inline]
@@ -92,8 +86,6 @@ impl Cpu for ArchImpl {
     }
 }
 
-// ─── Timer ───────────────────────────────────────────────────────────────
-
 impl Timer for ArchImpl {
     fn init_timer() {
         apic::apic_init(); // programs LAPIC timer + issues STI
@@ -111,8 +103,6 @@ impl Timer for ArchImpl {
         ((hi as u64) << 32) | lo as u64
     }
 }
-
-// ─── Paging ──────────────────────────────────────────────────────────────
 
 impl Paging for ArchImpl {
     fn map_page(cr3: usize, va: usize, pa: usize, flags: PageFlags) -> bool {
@@ -168,8 +158,6 @@ impl Paging for ArchImpl {
     }
 }
 
-// ─── Tlb ─────────────────────────────────────────────────────────────────
-
 impl Tlb for ArchImpl {
     fn flush_va(va: usize) {
         x86_paging::invlpg(va);
@@ -183,8 +171,6 @@ impl Tlb for ArchImpl {
         Self::flush_all();
     }
 }
-
-// ─── ContextSwitch ───────────────────────────────────────────────────────
 
 impl ContextSwitch for ArchImpl {
     unsafe fn switch_to(
@@ -242,8 +228,6 @@ impl ContextSwitch for ArchImpl {
     }
 }
 
-// ─── Syscall ─────────────────────────────────────────────────────────────
-
 impl Syscall for ArchImpl {
     fn syscall_setup() {
         x86_syscall_setup();
@@ -267,15 +251,11 @@ impl Syscall for ArchImpl {
     }
 }
 
-// ─── Serial ──────────────────────────────────────────────────────────────
-
 impl Serial for ArchImpl {
     fn serial_init() { x86_serial::init(); }
     fn serial_putc(byte: u8) { x86_serial::putc(byte); }
     fn serial_getc() -> Option<u8> { x86_serial::getc() }
 }
-
-// ─── FpState ─────────────────────────────────────────────────────────────
 
 impl FpState for ArchImpl {
     fn fp_init() { xsave::xsave_init(); }

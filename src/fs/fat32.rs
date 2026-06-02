@@ -26,8 +26,6 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
 const FAT32_EOC:     u32 = 0x0FFF_FFF8; // End-of-chain threshold
 const FAT32_BAD:     u32 = 0x0FFF_FFF7;
 const FAT32_FREE:    u32 = 0x0000_0000;
@@ -43,7 +41,6 @@ const ATTR_LFN:       u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOL
 
 const SECTOR_SIZE: usize = 512;
 
-// ── Simulated block I/O ──────────────────────────────────────────────────────
 // In the real kernel these forward to drivers::block::read_sectors.
 // We keep the interface identical so swapping in the real driver is trivial.
 
@@ -57,8 +54,6 @@ fn blk_write(dev: u32, lba: u64, buf: &[u8]) -> Result<(), isize> {
     let _ = (dev, lba, buf);
     Ok(())
 }
-
-// ── BPB (BIOS Parameter Block) ───────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct Bpb {
@@ -129,8 +124,6 @@ impl Bpb {
     }
 }
 
-// ── Directory entry ──────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Default)]
 pub struct DirEntry {
     pub name:      String,    // decoded (LFN if present, else 8.3 trimmed)
@@ -148,8 +141,6 @@ impl DirEntry {
     pub fn is_volume_id(&self)-> bool { self.attr & ATTR_VOLUME_ID != 0 }
 }
 
-// ── Open file handle ─────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 pub struct FatFile {
     pub cluster:  u32,    // first cluster of file
@@ -160,8 +151,6 @@ pub struct FatFile {
     pub entry_off: usize,
 }
 
-// ── Per-mount filesystem state ───────────────────────────────────────────────
-
 pub struct Fat32Fs {
     pub dev:        u32,
     pub bpb:        Bpb,
@@ -170,7 +159,6 @@ pub struct Fat32Fs {
 }
 
 impl Fat32Fs {
-    // ── Mount ────────────────────────────────────────────────────────────────
 
     pub fn mount(dev: u32) -> Result<Self, isize> {
         let mut sector = [0u8; 512];
@@ -178,8 +166,6 @@ impl Fat32Fs {
         let bpb = Bpb::parse(&sector)?;
         Ok(Fat32Fs { dev, bpb, free_count: u32::MAX, next_free: 2 })
     }
-
-    // ── FAT access ───────────────────────────────────────────────────────────
 
     fn fat_get(&self, cluster: u32) -> Result<u32, isize> {
         let (lba, off) = self.bpb.fat_lba(cluster);
@@ -256,8 +242,6 @@ impl Fat32Fs {
         Ok(())
     }
 
-    // ── Cluster I/O ──────────────────────────────────────────────────────────
-
     fn read_cluster(&self, cluster: u32, buf: &mut [u8]) -> Result<(), isize> {
         let lba = self.bpb.cluster_to_lba(cluster);
         let spc = self.bpb.sectors_per_cluster as usize;
@@ -275,8 +259,6 @@ impl Fat32Fs {
         }
         Ok(())
     }
-
-    // ── Directory reading ─────────────────────────────────────────────────────
 
     /// Read all valid directory entries from the cluster chain rooted at `dir_cluster`.
     /// LFN sequences are collected and applied to the following short entry.
@@ -380,8 +362,6 @@ impl Fat32Fs {
         Err(-2) // ENOENT
     }
 
-    // ── File read ─────────────────────────────────────────────────────────────
-
     pub fn read(&self, file: &mut FatFile, buf: &mut [u8]) -> Result<usize, isize> {
         let remaining = file.size.saturating_sub(file.pos) as usize;
         let to_read   = buf.len().min(remaining);
@@ -405,8 +385,6 @@ impl Fat32Fs {
         file.pos += done as u32;
         Ok(done)
     }
-
-    // ── File write ────────────────────────────────────────────────────────────
 
     pub fn write(&mut self, file: &mut FatFile, buf: &[u8]) -> Result<usize, isize> {
         let csz = self.bpb.cluster_size();
@@ -438,8 +416,6 @@ impl Fat32Fs {
         Ok(done)
     }
 
-    // ── Truncate ──────────────────────────────────────────────────────────────
-
     pub fn truncate(&mut self, file: &mut FatFile, new_size: u32) -> Result<(), isize> {
         let csz      = self.bpb.cluster_size() as u32;
         let new_clus = (new_size + csz - 1) / csz;
@@ -468,8 +444,6 @@ impl Fat32Fs {
         if file.pos > new_size { file.pos = new_size; }
         self.flush_file_meta(file)
     }
-
-    // ── mkdir / unlink ────────────────────────────────────────────────────────
 
     pub fn mkdir(&mut self, path: &str) -> Result<(), isize> {
         let (parent_path, name) = split_path(path);
@@ -503,8 +477,6 @@ impl Fat32Fs {
         self.mark_deleted(entry.entry_lba, entry.entry_off)
     }
 
-    // ── rename ────────────────────────────────────────────────────────────────
-
     pub fn rename(&mut self, old: &str, new: &str) -> Result<(), isize> {
         // Minimal: copy entry to new location, mark old deleted.
         // Full VFAT rename with LFN rebuild would be a separate pass.
@@ -515,8 +487,6 @@ impl Fat32Fs {
         self.append_dir_entry(new_parent.cluster, new_name, entry.cluster, entry.size, entry.attr)?;
         self.mark_deleted(entry.entry_lba, entry.entry_off)
     }
-
-    // ── statfs ────────────────────────────────────────────────────────────────
 
     pub fn statfs(&self) -> FatStatfs {
         let total = self.bpb.data_clusters();
@@ -530,8 +500,6 @@ impl Fat32Fs {
             f_namelen: 255,
         }
     }
-
-    // ── Internal helpers ──────────────────────────────────────────────────────
 
     fn flush_file_meta(&self, file: &FatFile) -> Result<(), isize> {
         let mut sec = [0u8; 512];
@@ -589,8 +557,6 @@ impl Fat32Fs {
     }
 }
 
-// ── statfs result ────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 pub struct FatStatfs {
     pub f_type:    u64,
@@ -601,7 +567,6 @@ pub struct FatStatfs {
     pub f_namelen: u64,
 }
 
-// ── Global per-mount table ───────────────────────────────────────────────────
 // pub so that vfs_ops can lock it directly for read/write dispatch.
 
 pub static FAT_MOUNTS: Mutex<BTreeMap<String, Fat32Fs>> = Mutex::new(BTreeMap::new());
@@ -635,8 +600,6 @@ pub fn fat_creat(mountpoint: &str, path: &str) -> Result<FatFile, isize> {
     Ok(FatFile { cluster: new_c, size: 0, pos: 0, attr: ATTR_ARCHIVE,
                  entry_lba: 0, entry_off: 0 })
 }
-
-// ── Free helpers ─────────────────────────────────────────────────────────────
 
 fn split_path(path: &str) -> (&str, &str) {
     let path = path.trim_end_matches('/');

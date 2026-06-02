@@ -43,12 +43,10 @@ pub fn sys_splice(
     // Clamp transfer to a sane maximum (16 MiB) to avoid unbounded loops.
     let len = len.min(16 * 1024 * 1024);
 
-    // ── case 1: pipe → pipe ───────────────────────────────────────────────
     if in_is_pipe && out_is_pipe {
         return splice_pipe_to_pipe(fd_in, fd_out, len, nonblock);
     }
 
-    // ── case 2: fd → pipe ─────────────────────────────────────────────────
     if !in_is_pipe && out_is_pipe {
         let offset = off_in.unwrap_or_else(|| current_offset(fd_in));
         let mut buf = alloc::vec![0u8; len];
@@ -63,7 +61,6 @@ pub fn sys_splice(
         return written;
     }
 
-    // ── case 3: pipe → fd ─────────────────────────────────────────────────
     // in_is_pipe && !out_is_pipe
     let data = crate::fs::pipe::pipe_read_kernel(fd_in, len, nonblock);
     if data.is_empty() {
@@ -78,8 +75,6 @@ pub fn sys_splice(
     }
     written
 }
-
-// ── helpers ──────────────────────────────────────────────────────────────────
 
 fn read_loff(va: usize) -> Option<i64> {
     if va == 0 { return None; }

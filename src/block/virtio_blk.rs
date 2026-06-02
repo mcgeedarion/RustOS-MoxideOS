@@ -21,7 +21,6 @@
 
 use spin::Mutex;
 
-// ─── MMIO register layout (offsets from BAR base) ─────────────────────────────
 // From virtio spec 4.2.2
 
 const MMIO_MAGIC:         usize = 0x000; // should read 0x74726976 ("virt")
@@ -59,8 +58,6 @@ const VIRTIO_BLK_T_OUT: u32 = 1; // write
 const SECTOR_SIZE: usize = 512;
 const QUEUE_SIZE:  usize = 8; // power of 2; must be <= QueueNumMax
 
-// ─── Descriptor table ────────────────────────────────────────────────────────
-
 const VRING_DESC_F_NEXT:  u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2; // device writes to this buffer
 
@@ -91,8 +88,6 @@ struct VirtqUsed {
     avail_event: u16,
 }
 
-// ─── virtio-blk request header ────────────────────────────────────────────────
-
 #[repr(C)]
 struct BlkReqHeader {
     type_:   u32,
@@ -100,7 +95,6 @@ struct BlkReqHeader {
     sector:  u64,
 }
 
-// ─── Static queue storage ────────────────────────────────────────────────────
 // All must be physically contiguous and correctly aligned.
 // We use statics so addresses are known at link time.
 
@@ -120,8 +114,6 @@ static mut REQ_BUF:    [u8; SECTOR_SIZE] = [0u8; SECTOR_SIZE];
 static LOCK: Mutex<()> = Mutex::new(());
 static mut MMIO_BASE: usize = 0;
 static mut LAST_USED_IDX: u16 = 0;
-
-// ─── Init ─────────────────────────────────────────────────────────────────────
 
 /// Initialise the virtio-blk device at `mmio_pa`.
 /// Call after PMM is up; `mmio_pa` must be identity-mapped.
@@ -174,8 +166,6 @@ pub fn virtio_blk_init(mmio_pa: usize) {
                             | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
     }
 }
-
-// ─── Read / Write ─────────────────────────────────────────────────────────────
 
 /// Read one 512-byte sector at `lba` into `buf`.
 /// Returns true on success.
@@ -255,8 +245,6 @@ fn do_request(req_type: u32, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
         REQ_STATUS == 0
     }
 }
-
-// ─── MMIO helpers ─────────────────────────────────────────────────────────────
 
 unsafe fn mmio_r32(off: usize) -> u32 {
     let va = MMIO_BASE + off;

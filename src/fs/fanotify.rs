@@ -24,8 +24,6 @@ use spin::Mutex;
 use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 use crate::fs::scheme_table::Scheme;
 
-// ── fanotify_init flags ──────────────────────────────────────────────────────────────────
-
 pub const FAN_CLASS_NOTIF:       u32 = 0x0000_0000;
 pub const FAN_CLASS_CONTENT:     u32 = 0x0000_0004;
 pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
@@ -38,8 +36,6 @@ pub const FAN_REPORT_FID:        u32 = 0x0000_0200;
 pub const FAN_REPORT_DIR_FID:    u32 = 0x0000_0400;
 pub const FAN_REPORT_NAME:       u32 = 0x0000_0800;
 
-// ── fanotify_mark flags ─────────────────────────────────────────────────────────────────
-
 pub const FAN_MARK_ADD:          u32 = 0x0000_0001;
 pub const FAN_MARK_REMOVE:       u32 = 0x0000_0002;
 pub const FAN_MARK_DONT_FOLLOW:  u32 = 0x0000_0004;
@@ -50,8 +46,6 @@ pub const FAN_MARK_IGNORED_SURV_MODIFY: u32 = 0x0000_0040;
 pub const FAN_MARK_FLUSH:        u32 = 0x0000_0080;
 pub const FAN_MARK_INODE:        u32 = 0x0000_0000;
 pub const FAN_MARK_FILESYSTEM:   u32 = 0x0000_0100;
-
-// ── fanotify event mask bits ──────────────────────────────────────────────────────────
 
 pub const FAN_ACCESS:       u64 = 0x0000_0001;
 pub const FAN_MODIFY:       u64 = 0x0000_0002;
@@ -86,8 +80,6 @@ pub const FAN_NOFD: i32 = -1;
 
 pub const FANOTIFY_FD_BASE: usize = 0x8800_0000;
 
-// ── Internal structures ─────────────────────────────────────────────────────────────
-
 struct QueuedEvent { mask: u64, pid: i32 }
 
 struct Mark {
@@ -112,8 +104,6 @@ static TABLE: Mutex<BTreeMap<usize, FanotifyInstance>> =
 static COUNTER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-// ── scheme_bfd → TABLE fdno translation ───────────────────────────────────────────
-
 /// Translate a scheme backing fd to the fanotify TABLE fdno.
 pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
     let (_, fid) = crate::fs::scheme_fd::scheme_fd_get_fid(scheme_bfd)?;
@@ -124,8 +114,6 @@ pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
         None
     }
 }
-
-// ── FanotifyScheme ────────────────────────────────────────────────────────────────────
 
 pub struct FanotifyScheme;
 
@@ -165,14 +153,11 @@ impl Scheme for FanotifyScheme {
     }
 }
 
-// ── sys_fanotify_init [NR 300] ──────────────────────────────────────────────────────
-
 pub fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
     use alloc::sync::Arc;
     use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
     use crate::fs::process_fd::proc_fd_install;
 
-    // ── 1. Allocate raw TABLE entry ────────────────────────────────────────────
     let id       = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let table_fdno = FANOTIFY_FD_BASE + id;
     let nonblock = flags & FAN_NONBLOCK != 0;
@@ -183,20 +168,16 @@ pub fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
         marks: Vec::new(),
     });
 
-    // ── 2. Register FanotifyScheme ───────────────────────────────────────────────
     let scheme: Arc<dyn Scheme> = Arc::new(FanotifyScheme);
     let scheme_bfd = alloc_scheme_backing_fd();
     scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
 
-    // ── 3. Install scheme bfd ──────────────────────────────────────────────────
     let pid = crate::proc::scheduler::current_pid();
     let install_flags = if flags & FAN_CLOEXEC != 0 { FAN_CLOEXEC } else { 0 };
     let user_fd = proc_fd_install(pid, scheme_bfd, None, install_flags, None);
     user_fd as isize
 }
 
-// ── sys_fanotify_mark [NR 301] ──────────────────────────────────────────────────────
-//
 // Called with the scheme bfd (already resolved from user fd).
 
 pub fn sys_fanotify_mark(
@@ -250,8 +231,6 @@ pub fn sys_fanotify_mark(
     0
 }
 
-// ── read (called via FanotifyScheme::read) ────────────────────────────────────────
-
 pub fn fanotify_read(fdno: usize, buf: &mut [u8]) -> isize {
     if buf.len() < FAN_EVENT_METADATA_LEN { return -22; }
     let deadline = crate::time::monotonic_ns() + 5_000_000_000;
@@ -286,26 +265,18 @@ pub fn fanotify_read(fdno: usize, buf: &mut [u8]) -> isize {
     }
 }
 
-// ── write (permission response) ─────────────────────────────────────────────────────
-
 pub fn fanotify_write(fdno: usize, buf: &[u8]) -> isize {
     if buf.len() < 8 { return -22; }
     if TABLE.lock().contains_key(&fdno) { 8 } else { -9 }
 }
 
-// ── close ──────────────────────────────────────────────────────────────────────
-
 pub fn fanotify_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
-// ── Predicates ───────────────────────────────────────────────────────────────────
-
 pub fn is_fanotify_fd(fdno: usize) -> bool {
     fdno >= FANOTIFY_FD_BASE && TABLE.lock().contains_key(&fdno)
 }
-
-// ── poll readiness ─────────────────────────────────────────────────────────────
 
 pub fn fanotify_poll(fdno: usize, events: u32) -> u32 {
     let tbl = TABLE.lock();
@@ -318,8 +289,6 @@ pub fn fanotify_poll(fdno: usize, events: u32) -> u32 {
         }
     }
 }
-
-// ── Kernel-internal event emission ──────────────────────────────────────────────────
 
 pub fn fanotify_emit(path: &str, mask: u64, pid: i32) {
     let mut tbl = TABLE.lock();

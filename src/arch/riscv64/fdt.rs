@@ -33,8 +33,6 @@ const FDT_PROP:        u32 = 3;
 const FDT_NOP:         u32 = 4;
 const FDT_END:         u32 = 9;
 
-// ── Header ──────────────────────────────────────────────────────────────────
-
 #[repr(C)]
 struct FdtHeader {
     magic:             u32,
@@ -61,8 +59,6 @@ impl FdtHeader {
     fn size_dt_strings(&self) -> u32 { u32::from_be(self.size_dt_strings) }
 }
 
-// ── Big-endian integer helpers ───────────────────────────────────────────────
-
 #[inline]
 fn be32(b: &[u8], off: usize) -> Option<u32> {
     let s = b.get(off..off + 4)?;
@@ -81,11 +77,7 @@ fn be64(b: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_be_bytes(s.try_into().unwrap()))
 }
 
-// ── Kernel end symbol ────────────────────────────────────────────────────────
-
 extern "C" { static _kernel_end: u8; }
-
-// ── Node-tracking state (shared by both phases) ──────────────────────────────
 
 #[derive(Default)]
 struct VirtioMmioNode {
@@ -99,8 +91,6 @@ enum SocChild { None, Plic, Other }
 
 #[derive(PartialEq)]
 enum CpusChild { None, Cpu }
-
-// ── Shared walker primitive ───────────────────────────────────────────────────
 
 /// Validate FDT magic, bounds-check all header offsets, and return
 /// (blob slice, structs slice, strings slice).
@@ -146,10 +136,8 @@ unsafe fn open_fdt(fdt_ptr: usize) -> Option<(&'static [u8], &'static [u8], &'st
     Some((blob, structs, strings))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Phase 1 — pre-heap: PMM + PLIC base + initramfs bounds + CPU enumeration
 // No heap allocations permitted here.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Walk the FDT and populate:
 ///   - PMM (`pmm::add_region`) from `/memory` nodes
@@ -390,10 +378,8 @@ pub unsafe fn fdt_phase1(fdt_ptr: usize) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Phase 2 — post-heap: virtio-net MMIO device probe
 // Heap allocations ARE permitted here.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Walk the FDT a second time and probe all `virtio,mmio` nodes.
 /// Heap must be initialised before calling this function.

@@ -49,8 +49,6 @@ use spin::Mutex;
 use crate::proc::{scheduler, process::State};
 use crate::uaccess::{copy_from_user, copy_to_user, USER_SPACE_END};
 
-// ── Signal metadata ───────────────────────────────────────────────────
-
 #[derive(Clone, Copy, Default, Debug)]
 pub struct SigInfo {
     pub sig:    u32,
@@ -76,20 +74,14 @@ const SIG_IGN_DEFAULT: u64 =
 const SIG_STOP_DEFAULT: u64 =
     (1u64 << 19) | (1u64 << 20) | (1u64 << 21) | (1u64 << 22);
 
-// ── SA_* flags ───────────────────────────────────────────────────────────
-
 const SA_ONSTACK:  u32 = 0x08000000;
 const SA_RESTART:  u32 = 0x10000000;
 const SA_RESTORER: u32 = 0x04000000;
 const SA_NODEFER:  u32 = 0x40000000;
 
-// ── sigprocmask how ──────────────────────────────────────────────────────
-
 const SIG_BLOCK:   u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
 const SIG_SETMASK: u32 = 2;
-
-// ── Signal storage ───────────────────────────────────────────────────
 
 /// Thread-directed pending signals, keyed by TID.
 static PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
@@ -102,8 +94,6 @@ static GROUP_PENDING: Mutex<BTreeMap<usize, VecDeque<SigInfo>>> =
 /// Per-TID signal mask.
 static SIGMASK: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
 
-// ── Alternate stack ───────────────────────────────────────────────────
-
 #[derive(Clone, Copy, Default)]
 struct AltStack { ss_sp: usize, ss_flags: i32, ss_size: usize }
 
@@ -111,8 +101,6 @@ const SS_DISABLE:    i32 = 2;
 const SS_AUTODISARM: i32 = 0x80000000u32 as i32;
 
 static ALTSTACK: Mutex<BTreeMap<usize, AltStack>> = Mutex::new(BTreeMap::new());
-
-// ── Process-group helpers ─────────────────────────────────────────────
 
 fn pids_in_pgrp(pgid: usize) -> Vec<usize> {
     scheduler::with_procs_ro(|procs| {
@@ -122,8 +110,6 @@ fn pids_in_pgrp(pgid: usize) -> Vec<usize> {
             .collect()
     })
 }
-
-// ── Thread-directed send API ───────────────────────────────────────────
 
 pub fn send_signal(tid: usize, sig: i32) -> isize {
     if sig <= 0 || sig > 64 { return -22; }
@@ -160,8 +146,6 @@ pub fn send_signal_info(tid: usize, info: SigInfo) {
     scheduler::wake_for_signal(tid, sig);
 }
 
-// ── Group-directed send API ───────────────────────────────────────────
-
 pub fn send_signal_group(tgid: usize, sig: i32) -> isize {
     if sig <= 0 || sig > 64 { return -22; }
     send_signal_group_info(tgid, SigInfo {
@@ -184,8 +168,6 @@ pub fn send_signal_group_info(tgid: usize, info: SigInfo) {
     });
 }
 
-// ── Claim helpers ─────────────────────────────────────────────────────
-
 fn pop_pending(tid: usize) -> Option<SigInfo> {
     PENDING.lock().get_mut(&tid)?.pop_front()
 }
@@ -193,8 +175,6 @@ fn pop_pending(tid: usize) -> Option<SigInfo> {
 fn pop_group_pending(tgid: usize) -> Option<SigInfo> {
     GROUP_PENDING.lock().get_mut(&tgid)?.pop_front()
 }
-
-// ── SigAction storage ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 pub struct SigAction {
@@ -214,8 +194,6 @@ pub fn get_sigaction(pid: usize, sig: u32) -> SigAction {
 pub fn set_sigaction(pid: usize, sig: u32, sa: SigAction) {
     SIGACTIONS.lock().insert((pid, sig), sa);
 }
-
-// ── x86_64 sigframe layout (for push_sigframe_x86) ────────────────────
 
 #[repr(C)]
 struct SigFrameX86 {
@@ -239,14 +217,11 @@ struct SigFrameX86 {
     sig_mask: u64,
 }
 
-// ── AArch64 sigframe layout (musl uc_mcontext for arm64) ──────────────
-//
 // musl's aarch64 ucontext_t.uc_mcontext layout:
 //   regs[0..30]  x0-x30  (31 × u64)
 //   sp           u64
 //   pc           u64
 //   pstate       u64
-//
 // We push: magic(u64) | saved_frame | siginfo | sig_mask
 // The restorer (in user space) executes `svc #139` (rt_sigreturn).
 
@@ -265,8 +240,6 @@ struct SigFrameAarch64 {
 }
 
 const SIGFRAME_AARCH64_MAGIC: u64 = 0xDEAD_BEEF_CAFE_0000;
-
-// ── x86_64 delivery ───────────────────────────────────────────────────
 
 fn push_sigframe_x86(
     frame: &mut crate::arch::x86_64::syscall::SyscallFrame,
@@ -305,8 +278,6 @@ fn push_sigframe_x86(
     frame.rdx = user_rsp;        // ucontext_t pointer
     true
 }
-
-// ── AArch64 delivery ─────────────────────────────────────────────────
 
 /// Push a signal frame onto the user stack and redirect ELR/SP to the handler.
 ///
@@ -353,8 +324,6 @@ fn push_sigframe_aarch64(
     true
 }
 
-// ── sigmask helper ────────────────────────────────────────────────────
-
 fn sigmask_for(tid: usize) -> u64 {
     SIGMASK.lock().get(&tid).copied().unwrap_or(0)
 }
@@ -364,8 +333,6 @@ fn is_masked(tid: usize, sig: u32) -> bool {
     let mask = sigmask_for(tid);
     (mask >> (sig - 1)) & 1 != 0
 }
-
-// ── Default-action helper ─────────────────────────────────────────────
 
 fn apply_default(pid: usize, info: &SigInfo) {
     let bit = 1u64 << (info.sig.saturating_sub(1));
@@ -377,8 +344,6 @@ fn apply_default(pid: usize, info: &SigInfo) {
     // Default terminate.
     crate::proc::exit::do_exit(pid, (info.sig as i32) << 8);
 }
-
-// ── x86_64 delivery entry point ───────────────────────────────────────
 
 /// Called by `rust_syscall_handler` after every syscall (except rt_sigreturn).
 pub fn check_and_deliver(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) {
@@ -431,8 +396,6 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) 
     *SIGMASK.lock().entry(tid).or_insert(0) = sf.sig_mask;
     let _ = sf_size;
 }
-
-// ── AArch64 delivery entry point ──────────────────────────────────────
 
 /// Called by `aarch64_sync_handler` after every SVC (except rt_sigreturn).
 ///
@@ -496,16 +459,12 @@ pub fn sys_rt_sigreturn_aarch64(
     *SIGMASK.lock().entry(tid).or_insert(0) = sf.sig_mask;
 }
 
-// ── put_back helper ───────────────────────────────────────────────────
-
 fn put_back_pending(tid: usize, info: SigInfo) {
     PENDING.lock()
         .entry(tid)
         .or_insert_with(VecDeque::new)
         .push_front(info);
 }
-
-// ── Existing public syscall API ───────────────────────────────────────
 
 pub fn sys_rt_sigaction(
     pid: usize,

@@ -66,7 +66,6 @@ pub fn sys_fork() -> isize {
         None => return -1,
     };
 
-    // ── arch-specific kernel-stack frame + Context init ──────────────────
     #[cfg(target_arch = "x86_64")]
     let child_ctx = {
         push_syscall_frame(kstack_top, child_pcb.pc, 0x202, child_pcb.sp);
@@ -127,8 +126,6 @@ pub fn sys_fork() -> isize {
     child_pid as isize
 }
 
-// ── x86_64: 17-slot iretq frame ────────────────────────────────────────────────
-
 #[cfg(target_arch = "x86_64")]
 fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: usize) {
     const FRAME_SZ: usize = 17 * 8;
@@ -142,8 +139,6 @@ fn push_syscall_frame(kstack_top: usize, rip: usize, rflags: usize, user_rsp: us
         p.add(16).write(user_rsp); // RSP
     }
 }
-
-// ── RISC-V: full TrapFrame ───────────────────────────────────────────────────────
 
 /// RISC-V: build a `TrapFrame` at `kstack_top - TRAP_FRAME_SIZE`.
 ///

@@ -16,8 +16,6 @@
 //!   - [`gdt_layout`] — GDT selector indices
 //!   - [`trampoline`] — AP shared-memory slot offsets within the trampoline page
 
-// ── Page constants ────────────────────────────────────────────────────────────
-
 pub mod page {
     pub const SIZE:      usize = 4096;
     pub const SHIFT:     usize = 12;
@@ -28,8 +26,6 @@ pub mod page {
     /// PTE address mask — bits [51:12].
     pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 }
-
-// ── Higher-half virtual address space ─────────────────────────────────────────
 
 pub mod higher_half {
     /// PA → VA: add this offset to any physical address to get the
@@ -48,8 +44,6 @@ pub mod higher_half {
     pub fn virt_to_phys(va: usize) -> u64  { (va - PHYS_OFFSET) as u64 }
 }
 
-// ── 16550 UART serial ports ───────────────────────────────────────────────────
-
 pub mod serial {
     /// COM1 base I/O port.  All register offsets are added to this.
     pub const COM1_BASE: u16 = 0x3F8;
@@ -60,7 +54,6 @@ pub mod serial {
     /// COM4 base I/O port.
     pub const COM4_BASE: u16 = 0x2E8;
 
-    // ── Register offsets (relative to COMx_BASE) ───────────────────────────
     /// Transmit Holding / Receive Buffer (DLAB=0).
     pub const OFF_DATA:     u16 = 0;
     /// Interrupt Enable Register (DLAB=0) / Baud rate divisor high (DLAB=1).
@@ -78,7 +71,6 @@ pub mod serial {
     /// Line Status Register.
     pub const OFF_LSR:      u16 = 5;
 
-    // ── Divisors for common baud rates (assuming 1.8432 MHz clock) ─────────
     /// 115200 baud.
     pub const BAUD_115200: u16 = 1;
     /// 57600 baud.
@@ -88,7 +80,6 @@ pub mod serial {
     /// 9600 baud.
     pub const BAUD_9600:   u16 = 12;
 
-    // ── LCR / MCR / FCR values ──────────────────────────────────────────────
     /// LCR: 8 data bits, no parity, 1 stop bit (8N1).
     pub const LCR_8N1:   u8 = 0x03;
     /// LCR: DLAB enable bit.
@@ -100,8 +91,6 @@ pub mod serial {
     /// LSR bit 5: Transmit Holding Register Empty — safe to send next byte.
     pub const LSR_THRE: u8 = 0x20;
 }
-
-// ── 8253/8254 PIT ─────────────────────────────────────────────────────────────
 
 pub mod pit {
     /// PIT Channel 0 I/O port (IRQ 0 / system timer).
@@ -122,15 +111,11 @@ pub mod pit {
     pub const CALIB_DIVISOR: u16 = 59_659;
 }
 
-// ── Local APIC ────────────────────────────────────────────────────────────────
-
 pub mod apic {
-    // ── MMIO base ──────────────────────────────────────────────────────────
     /// Architectural default LAPIC MMIO base (before firmware relocation).
     /// Always verify the actual base from IA32_APIC_BASE (MSR 0x1B) at init.
     pub const LAPIC_PHYS_DEFAULT: u64 = 0xFEE0_0000;
 
-    // ── MSRs ────────────────────────────────────────────────────────────────
     /// IA32_APIC_BASE MSR — contains LAPIC enable, x2APIC enable, and
     /// the MMIO base physical address in bits [51:12].
     pub const MSR_IA32_APIC_BASE: u32 = 0x1B;
@@ -144,7 +129,6 @@ pub mod apic {
     /// is `X2APIC_MSR_BASE + (off >> 4)`.
     pub const X2APIC_MSR_BASE:    u32 = 0x800;
 
-    // ── LAPIC register offsets (bytes from MMIO base) ───────────────────────
     pub const REG_ID:          usize = 0x020;
     pub const REG_VERSION:     usize = 0x030;
     pub const REG_TPR:         usize = 0x080;
@@ -162,17 +146,14 @@ pub mod apic {
     pub const REG_TIMER_CCR:   usize = 0x390;
     pub const REG_TIMER_DCR:   usize = 0x3E0;
 
-    // ── SPURIOUS register bits ──────────────────────────────────────────────
     /// LAPIC software-enable bit in the Spurious Vector register.
     pub const SPURIOUS_ENABLE:   u32 = 1 << 8;
     /// Vector number used for spurious interrupts (conventionally 0xFF).
     pub const SPURIOUS_VECTOR:   u8  = 0xFF;
 
-    // ── LVT mask bit ───────────────────────────────────────────────────────
     /// Set this bit in any LVT entry to mask (disable) the interrupt.
     pub const LVT_MASKED: u32 = 1 << 16;
 
-    // ── ICR delivery mode bits ──────────────────────────────────────────────
     pub const ICR_DELIVERY_FIXED:   u32 = 0 << 8;
     pub const ICR_DELIVERY_INIT:    u32 = 5 << 8;
     pub const ICR_DELIVERY_SIPI:    u32 = 6 << 8;
@@ -181,14 +162,11 @@ pub mod apic {
     pub const ICR_TRIGGER_LEVEL:    u32 = 1 << 15;
     pub const ICR_DELIVERY_PENDING: u32 = 1 << 12;
 
-    // ── AP trampoline ───────────────────────────────────────────────────────
     /// Physical address where the 16-bit AP trampoline code is copied.
     /// Must be in the first MiB and page-aligned.  The SIPI vector is
     /// `TRAMPOLINE_PHYS >> 12`.
     pub const TRAMPOLINE_PHYS: u64 = 0x8000;
 }
-
-// ── I/O APIC ──────────────────────────────────────────────────────────────────
 
 pub mod ioapic {
     /// Default MMIO base for I/O APIC 0.  May differ on multi-socket systems;
@@ -208,8 +186,6 @@ pub mod ioapic {
     pub const IDX_REDTBL:  u8 = 0x10;
 }
 
-// ── Legacy VGA text buffer ─────────────────────────────────────────────────────
-
 pub mod vga {
     /// Physical address of the VGA text-mode framebuffer (80×25 characters).
     /// Only valid when a VBE/UEFI GOP framebuffer is NOT in use.  Under UEFI
@@ -222,8 +198,6 @@ pub mod vga {
     pub const BUFFER_SIZE: usize = COLS * ROWS * BYTES_PER_CELL;
 }
 
-// ── GDT selector layout ────────────────────────────────────────────────────────
-
 pub mod gdt_layout {
     // Segment selectors used in the GDT.  These must match the entries
     // actually installed by gdt.rs.
@@ -235,8 +209,6 @@ pub mod gdt_layout {
     pub const TSS_SEL:         u16 = 0x28; // TSS (two slots)
 }
 
-// ── AP trampoline shared-memory slot offsets ───────────────────────────────────
-//
 // These offsets are added to `apic::TRAMPOLINE_PHYS` to find each slot.
 // They must match the layout documented in apic.rs and written by gdt.rs.
 

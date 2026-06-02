@@ -59,8 +59,6 @@ pub use crate::proc::scheduler::{
     CfsEntry, NICE0_WEIGHT, SchedPolicy,
 };
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 /// Maximum number of CPUs a GroupRq array covers.
 pub const MAX_GROUP_CPUS: usize = 64;
 
@@ -71,8 +69,6 @@ pub const ROOT_TG_ID: usize = 0;
 /// a group (not a concrete task).  The scheduler detects this and calls
 /// group_dequeue_next() instead of running the pointer directly.
 pub const GROUP_SENTINEL: *mut crate::proc::task_types::Task = core::ptr::null_mut();
-
-// ── GroupRq ─────────────────────────────────────────────────────────────────
 
 /// Per-CPU inner CFS queue for tasks belonging to one `TaskGroup`.
 pub struct GroupRq {
@@ -145,8 +141,6 @@ impl GroupRq {
     #[inline] pub fn len(&self)     -> usize { self.inner_heap.len() }
 }
 
-// ── TaskGroup ─────────────────────────────────────────────────────────────────
-
 /// A CFS scheduling group.  Corresponds to a cpu-cgroup.
 ///
 /// - `id`      : unique non-zero group identifier
@@ -178,8 +172,6 @@ impl TaskGroup {
         self.weight = w.clamp(1, 1u64 << 32);
     }
 }
-
-// ── Global task-group table ────────────────────────────────────────────────
 
 /// Global registry of all TaskGroups.
 /// Key = tg_id.  Value = Arc<Mutex<TaskGroup>>.
@@ -215,8 +207,6 @@ pub fn find_task_group(tg_id: usize) -> Option<Arc<Mutex<TaskGroup>>> {
 pub fn destroy_task_group(tg_id: usize) {
     TASK_GROUPS.lock().remove(&tg_id);
 }
-
-// ── Scheduler integration helpers ──────────────────────────────────────────────
 
 /// Enqueue `task` (which has `tg_id != 0`) into its group's inner heap.
 ///
@@ -328,8 +318,6 @@ pub fn group_remove_pid(tg_id: usize, pid: u32, cpu: u32) -> bool {
     let cpu = (cpu as usize).min(MAX_GROUP_CPUS - 1);
     tg.grq[cpu].remove_pid(pid)
 }
-
-// ── Public syscall-level API ────────────────────────────────────────────────────
 
 /// Create a new scheduling group and attach the calling process to it.
 ///

@@ -40,7 +40,6 @@ use core::{
 };
 use spin::Mutex;
 
-// ── O_* flags (match Linux) ─────────────────────────────────────────────────
 pub const O_RDONLY:   i32 = 0;
 pub const O_WRONLY:   i32 = 1;
 pub const O_RDWR:     i32 = 2;
@@ -49,7 +48,6 @@ pub const O_EXCL:     i32 = 0o200;
 pub const O_NONBLOCK: i32 = 0o4000;
 pub const O_CLOEXEC:  i32 = 0o2000000;
 
-// ── Limits ──────────────────────────────────────────────────────────────────
 pub const MQ_MAXMSG:   usize = 10;
 pub const MQ_MSGSIZE:  usize = 8192;
 pub const MQ_PRIO_MAX: u32   = 32768;
@@ -58,8 +56,6 @@ pub const MQ_PRIO_MAX: u32   = 32768;
 const QUEUE_OVERHEAD: u64 = 272;
 /// Bytes of overhead per queued message (mirrors `struct msg_msg`).
 const MSG_OVERHEAD:   u64 = 48;
-
-// ── struct mq_attr ──────────────────────────────────────────────────────────
 
 /// `struct mq_attr` — matches Linux POSIX mqueue UAPI.
 #[repr(C)]
@@ -71,8 +67,6 @@ pub struct MqAttr {
     pub mq_curmsgs: i64,
     _pad: [u8; 16],
 }
-
-// ── Internal message ────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct PriMsg {
@@ -92,8 +86,6 @@ impl PartialOrd for PriMsg {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
-// ── Queue internals ──────────────────────────────────────────────────────────
-
 struct MqInner {
     attr:         MqAttr,
     heap:         BinaryHeap<PriMsg>,
@@ -111,8 +103,6 @@ struct MqObject {
     refs:  core::sync::atomic::AtomicUsize,
 }
 
-// ── Global tables ────────────────────────────────────────────────────────────
-
 static QUEUES:   Mutex<BTreeMap<String, Arc<MqObject>>> = Mutex::new(BTreeMap::new());
 static NEXT_MQD: AtomicU64                              = AtomicU64::new(1);
 
@@ -125,8 +115,6 @@ pub struct MqdEntry {
 
 static MQD_TABLE: Mutex<BTreeMap<u64, MqdEntry>> = Mutex::new(BTreeMap::new());
 
-// ── Per-process MSGQUEUE byte accounting ─────────────────────────────────────
-//
 // Side-table keyed by PID (the PCB already has `mq_bytes`; this table avoids
 // requiring a PCB field add).
 
@@ -153,8 +141,6 @@ fn mq_bytes_discharge(pid: usize, bytes: u64) {
         *v = v.saturating_sub(bytes);
     }
 }
-
-// ── mq_open ──────────────────────────────────────────────────────────────────
 
 pub fn mq_open(
     name:  &str,
@@ -224,8 +210,6 @@ fn alloc_mqd(queue: Arc<MqObject>, oflag: i32) -> u64 {
     id
 }
 
-// ── mq_close ─────────────────────────────────────────────────────────────────
-
 pub fn mq_close(mqd: u64) -> Result<(), isize> {
     let entry = MQD_TABLE.lock().remove(&mqd).ok_or(-9isize)?; // EBADF
     let old = entry.queue.refs.fetch_sub(1, AOrdering::SeqCst);
@@ -241,8 +225,6 @@ pub fn mq_close(mqd: u64) -> Result<(), isize> {
     Ok(())
 }
 
-// ── mq_unlink ────────────────────────────────────────────────────────────────
-
 pub fn mq_unlink(name: &str) -> Result<(), isize> {
     let mut qs = QUEUES.lock();
     let obj = qs.get(name).ok_or(-2isize)?; // ENOENT
@@ -250,8 +232,6 @@ pub fn mq_unlink(name: &str) -> Result<(), isize> {
     qs.remove(name);
     Ok(())
 }
-
-// ── mq_send ──────────────────────────────────────────────────────────────────
 
 pub fn mq_send(mqd: u64, data: Vec<u8>, prio: u32) -> Result<(), isize> {
     if prio >= MQ_PRIO_MAX { return Err(-22); }
@@ -299,8 +279,6 @@ pub fn mq_send(mqd: u64, data: Vec<u8>, prio: u32) -> Result<(), isize> {
     }
 }
 
-// ── mq_receive ───────────────────────────────────────────────────────────────
-
 pub fn mq_receive(mqd: u64, max_len: usize) -> Result<(Vec<u8>, u32), isize> {
     loop {
         let tbl   = MQD_TABLE.lock();
@@ -322,8 +300,6 @@ pub fn mq_receive(mqd: u64, max_len: usize) -> Result<(Vec<u8>, u32), isize> {
     }
 }
 
-// ── mq_getattr / mq_setattr ──────────────────────────────────────────────────
-
 pub fn mq_getattr(mqd: u64) -> Result<MqAttr, isize> {
     let tbl   = MQD_TABLE.lock();
     let entry = tbl.get(&mqd).ok_or(-9isize)?;
@@ -342,8 +318,6 @@ pub fn mq_setattr(mqd: u64, new: MqAttr) -> Result<MqAttr, isize> {
     inner.attr.mq_flags = new.mq_flags;
     Ok(old)
 }
-
-// ── mq_notify ────────────────────────────────────────────────────────────────
 
 /// Register a signal-based notification for the next message arrival.
 /// `signo == 0` cancels any existing registration.

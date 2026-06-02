@@ -16,8 +16,6 @@ use crate::syscall::dispatcher_context::SyscallContext;
 use crate::syscall::errno::{efault, einval, enosys, emsgsize};
 use crate::syscall::nr::*;
 
-// ── Filesystem router ────────────────────────────────────────────────────────
-//
 // Covers: basic I/O, stat/path ops, directory ops, *at variants, timerfd,
 // inotify, fanotify, epoll/poll/select, io_uring, pipes, sendfile,
 // eventfd, getdents, fcntl, ioctl, fallocate, copy_file_range, statx,
@@ -25,7 +23,6 @@ use crate::syscall::nr::*;
 pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
     let (a, b, c, d, e, f) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
     match ctx.nr {
-        // ── basic I/O ────────────────────────────────────────────────────────
         SYS_READ     => Some(crate::fs::io_syscalls::sys_read(a, b, c)),
         SYS_WRITE    => Some(crate::fs::io_syscalls::sys_write(a, b, c)),
         SYS_OPEN     => Some(crate::fs::io_syscalls::sys_open(a, b as u32, c as u32)),
@@ -35,7 +32,6 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         SYS_READV    => Some(crate::syscall::sys_readv_impl(a, b, c)),
         SYS_WRITEV   => Some(crate::fs::io_syscalls::sys_writev(a, b, c)),
         SYS_SENDFILE => Some(crate::syscall::sys_sendfile_impl(a, b, c, d)),
-        // ── stat / path ──────────────────────────────────────────────────────
         SYS_STAT     => Some(crate::fs::stat_syscalls::sys_stat(a, b)),
         SYS_FSTAT    => Some(crate::fs::stat_syscalls::sys_fstat(a, b)),
         SYS_LSTAT    => Some(crate::fs::stat_syscalls::sys_lstat(a, b)),
@@ -75,20 +71,16 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         SYS_TRUNCATE  => Some(crate::syscall::sys_truncate_impl(a, b as i64)),
         SYS_FTRUNCATE => Some(crate::syscall::sys_ftruncate_impl(a, b as i64)),
         SYS_FALLOCATE => Some(crate::syscall::sys_fallocate_impl(a, b as i32, c as i64, d as i64)),
-        // ── dup / fcntl / ioctl ──────────────────────────────────────────────
         SYS_DUP    => Some(crate::fs::vfs::dup(a)),
         SYS_DUP2   => Some(crate::fs::fcntl::sys_dup2(a, b)),
         SYS_DUP3   => Some(crate::fs::fcntl::sys_dup3(a, b, c as i32)),
         SYS_FCNTL  => Some(crate::fs::fcntl::sys_fcntl(a, b as i32, c)),
         SYS_IOCTL  => Some(crate::fs::ioctl::sys_ioctl(a, b, c)),
         SYS_FLOCK  => Some(crate::fs::vfs_extras::sys_flock(a, b as i32)),
-        // ── pipe ─────────────────────────────────────────────────────────────
         SYS_PIPE   => Some(crate::fs::pipe::sys_pipe(a)),
         SYS_PIPE2  => Some(crate::fs::pipe::sys_pipe2(a, b as u32)),
-        // ── getdents ─────────────────────────────────────────────────────────
         SYS_GETDENTS   => Some(crate::fs::getdents::sys_getdents(a, b, c)),
         SYS_GETDENTS64 => Some(crate::fs::getdents::sys_getdents64(a, b, c)),
-        // ── *at variants ─────────────────────────────────────────────────────
         SYS_OPENAT     => Some(crate::syscall::sys_openat_impl(a as i32, b, c as i32, d as u32)),
         SYS_MKDIRAT    => Some(crate::syscall::sys_mkdirat_impl(a as i32, b, c as u32)),
         SYS_MKNODAT    => Some(crate::syscall::sys_mknodat_impl(a as i32, b, c as u32, d as u64)),
@@ -119,7 +111,6 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         SYS_MEMFD_CREATE     => Some(crate::syscall::sys_memfd_create_impl(a, b as u32)),
         SYS_REMAP_FILE_PAGES => Some(crate::syscall::sys_remap_file_pages_impl()),
         SYS_POSIX_FADVISE    => Some(crate::fs::vfs_extras::sys_posix_fadvise(a, b as i64, c as i64, d as i32)),
-        // ── epoll / poll / select ────────────────────────────────────────────
         SYS_POLL       => Some(crate::fs::poll::sys_poll(a, b, c as i32)),
         SYS_SELECT     => Some(crate::fs::poll::sys_select(a, b, c, d, e)),
         SYS_PPOLL      => Some(crate::fs::poll::sys_ppoll(a, b, c, d, e)),
@@ -129,7 +120,6 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         SYS_EPOLL_CTL     => Some(crate::fs::poll::sys_epoll_ctl(a, b as i32, c as i32, d)),
         SYS_EPOLL_WAIT    => Some(crate::fs::poll::sys_epoll_wait(a, b, c as i32, d as i32)),
         SYS_EPOLL_PWAIT   => Some(crate::fs::poll::sys_epoll_pwait(a, b, c as i32, d as i32, e, f)),
-        // ── eventfd / timerfd / inotify / fanotify ───────────────────────────
         SYS_EVENTFD          => Some(crate::fs::eventfd::sys_eventfd(a as u32)),
         SYS_EVENTFD2         => Some(crate::fs::eventfd::sys_eventfd2(a as u32, b as u32)),
         SYS_TIMERFD_CREATE   => Some(crate::fs::timerfd::sys_timerfd_create(a as u32, b as u32)),
@@ -141,11 +131,9 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         SYS_INOTIFY_INIT1     => Some(crate::fs::inotify::sys_inotify_init1(a as u32)),
         SYS_FANOTIFY_INIT     => Some(crate::fs::fanotify::sys_fanotify_init(a as u32, b as u32)),
         SYS_FANOTIFY_MARK     => Some(crate::fs::fanotify::sys_fanotify_mark(a, b as u32, c as u64, d as i32, e)),
-        // ── io_uring ─────────────────────────────────────────────────────────
         SYS_IO_URING_SETUP    => Some(crate::io_uring::syscall::sys_io_uring_setup(a as u32, b)),
         SYS_IO_URING_ENTER    => Some(crate::io_uring::syscall::sys_io_uring_enter(a, b as u32, c as u32, d as u32, e, f)),
         SYS_IO_URING_REGISTER => Some(crate::io_uring::syscall::sys_io_uring_register(a, b as u32, c, d as u32)),
-        // ── socket syscalls (NR 41-55, 288) ──────────────────────────────────
         SYS_SOCKET      => Some(crate::net::socket::sys_socket(a as i32, b as i32, c as i32)),
         SYS_CONNECT     => Some(crate::net::socket::sys_connect(a, b, c as u32)),
         SYS_ACCEPT      => Some(crate::net::socket::sys_accept(a, b, c)),
@@ -178,7 +166,6 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         }
         SYS_SENDMMSG => Some(crate::syscall::sys_sendmmsg_impl(a, b, c as u32, d as u32)),
         SYS_RECVMMSG => Some(crate::syscall::sys_recvmmsg_impl(a, b, c as u32, d as u32, e)),
-        // ── pidfd ────────────────────────────────────────────────────────────
         SYS_PIDFD_SEND_SIGNAL => Some(crate::fs::pidfd::sys_pidfd_send_signal(a, b as u32, c, d as u32)),
         SYS_PIDFD_OPEN        => Some(crate::fs::pidfd::sys_pidfd_open(a, b as u32)),
         SYS_PIDFD_GETFD       => Some(crate::fs::pidfd::sys_pidfd_getfd(a, b, c as u32)),
@@ -186,7 +173,6 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
     }
 }
 
-// ── Process / thread / signal router ────────────────────────────────────────
 pub fn dispatch_process(ctx: &SyscallContext) -> Option<isize> {
     let (a, b, c, d, e, f) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
     match ctx.nr {
@@ -262,7 +248,6 @@ pub fn dispatch_process(ctx: &SyscallContext) -> Option<isize> {
         SYS_FUTEX           => Some(crate::proc::futex::sys_futex(a, b as u32, c as u32, d, e, f as u32)),
         SYS_SET_ROBUST_LIST => Some(crate::proc::futex::sys_set_robust_list(a, b)),
         SYS_GET_ROBUST_LIST => Some(crate::proc::futex::sys_get_robust_list(a, b, c)),
-        // ── uid / gid — read-only queries always succeed; writes are no-ops ──
         SYS_GETUID | SYS_GETEUID => {
             let pid = crate::proc::scheduler::current_pid();
             Some(crate::proc::scheduler::with_proc(pid, |p| p.uid).unwrap_or(0) as isize)
@@ -316,7 +301,6 @@ pub fn dispatch_process(ctx: &SyscallContext) -> Option<isize> {
     }
 }
 
-// ── Memory management router ──────────────────────────────────────────────────
 pub fn dispatch_memory(ctx: &SyscallContext) -> Option<isize> {
     let (a, b, c, d, e, f) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
     match ctx.nr {
@@ -337,14 +321,11 @@ pub fn dispatch_memory(ctx: &SyscallContext) -> Option<isize> {
     }
 }
 
-// ── IPC router (SysV shm/sem/msg + POSIX mq) ─────────────────────────────────
-//
 // futex, poll, and select live in dispatch_process / dispatch_filesystem
 // because they cross the IPC / blocking-wait boundary.
 pub fn dispatch_ipc(ctx: &SyscallContext) -> Option<isize> {
     let (a, b, c, d, e, _f) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
     match ctx.nr {
-        // ── SysV shared memory ────────────────────────────────────────────────
         SYS_SHMGET => Some(match crate::ipc::shm::shmget(a as i32, b, c as i32) {
             Ok(id) => id as isize, Err(e) => e,
         }),
@@ -353,20 +334,17 @@ pub fn dispatch_ipc(ctx: &SyscallContext) -> Option<isize> {
         }),
         SYS_SHMDT  => Some(match crate::ipc::shm::shmdt(a) { Ok(()) => 0, Err(e) => e }),
         SYS_SHMCTL => Some(crate::syscall::shmctl_dispatch(a as i32, b as i32, c)),
-        // ── SysV semaphores ───────────────────────────────────────────────────
         SYS_SEMGET => Some(match crate::ipc::sem::semget(a as i32, b as i32, c as i32) {
             Ok(id) => id as isize, Err(e) => e,
         }),
         SYS_SEMOP  => Some(crate::syscall::semop_dispatch(a as i32, b, c)),
         SYS_SEMCTL => Some(crate::syscall::semctl_dispatch(a as i32, b as i32, c as i32, d)),
-        // ── SysV message queues ───────────────────────────────────────────────
         SYS_MSGGET => Some(match crate::ipc::msg::msgget(a as i32, b as i32) {
             Ok(id) => id as isize, Err(e) => e,
         }),
         SYS_MSGSND => Some(crate::syscall::msgsnd_dispatch(a as i32, b, c, d as i32)),
         SYS_MSGRCV => Some(crate::syscall::msgrcv_dispatch(a as i32, b, c, d as i64, e as i32)),
         SYS_MSGCTL => Some(crate::syscall::msgctl_dispatch(a as i32, b as i32, c)),
-        // ── POSIX message queues ──────────────────────────────────────────────
         SYS_MQ_OPEN         => Some(crate::syscall::mq_open_dispatch(a, b as i32, c as u32, d)),
         SYS_MQ_UNLINK       => Some(crate::syscall::mq_unlink_dispatch(a)),
         SYS_MQ_TIMEDSEND    => Some(crate::syscall::mq_timedsend_dispatch(a as u64, b, c, d as u32)),
@@ -377,7 +355,6 @@ pub fn dispatch_ipc(ctx: &SyscallContext) -> Option<isize> {
     }
 }
 
-// ── Time router ──────────────────────────────────────────────────────────────
 pub fn dispatch_time(ctx: &SyscallContext) -> Option<isize> {
     let (a, b, c, d, _e, _f) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
     match ctx.nr {
@@ -415,8 +392,6 @@ pub fn dispatch_time(ctx: &SyscallContext) -> Option<isize> {
     }
 }
 
-// ── Kernel test router ───────────────────────────────────────────────────────
-//
 // Only active when the kernel is compiled with --features kmtest.
 // Uses a private NR range (0x8000_0000+) that can never collide with Linux.
 #[cfg(feature = "kmtest")]

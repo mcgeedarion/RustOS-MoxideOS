@@ -55,8 +55,6 @@ impl UtsNs {
         UtsNs { id: alloc_ns_id(), inner: Mutex::new(u) }
     }
 
-    // ── sethostname(2) ──────────────────────────────────────────────────────
-
     /// Set hostname.  Returns EINVAL if `name` exceeds HOST_NAME_MAX.
     pub fn set_hostname(&self, name: &str) -> Result<(), isize> {
         if name.len() > HOST_NAME_MAX { return Err(-22); }
@@ -66,8 +64,6 @@ impl UtsNs {
 
     pub fn hostname(&self) -> String { self.inner.lock().nodename.clone() }
 
-    // ── setdomainname(2) ────────────────────────────────────────────────────
-
     pub fn set_domainname(&self, name: &str) -> Result<(), isize> {
         if name.len() > HOST_NAME_MAX { return Err(-22); }
         self.inner.lock().domainname = String::from(name);
@@ -75,8 +71,6 @@ impl UtsNs {
     }
 
     pub fn domainname(&self) -> String { self.inner.lock().domainname.clone() }
-
-    // ── uname(2) ────────────────────────────────────────────────────────────
 
     /// Fill a caller-provided `Utsname` snapshot (for uname(2)).
     pub fn uname(&self) -> Utsname { self.inner.lock().clone() }

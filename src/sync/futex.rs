@@ -22,8 +22,6 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ── Types ──────────────────────────────────────────────────────────────────────
-
 #[derive(Clone)]
 struct FutexWaiter {
     pid:         usize,
@@ -34,8 +32,6 @@ struct FutexWaiter {
 
 static FUTEX_TABLE: Mutex<BTreeMap<usize, Vec<FutexWaiter>>> =
     Mutex::new(BTreeMap::new());
-
-// ── FUTEX_WAIT ─────────────────────────────────────────────────────────────────
 
 pub fn futex_wait(uaddr: usize, val: u32, bitset: u32, deadline_ns: u64) -> isize {
     if !crate::uaccess::validate_user_ptr(uaddr, 4) { return -14; }
@@ -82,8 +78,6 @@ pub fn futex_wait(uaddr: usize, val: u32, bitset: u32, deadline_ns: u64) -> isiz
     }
 }
 
-// ── FUTEX_WAKE ─────────────────────────────────────────────────────────────────
-
 pub fn futex_wake(uaddr: usize, n: u32, bitset: u32) -> isize {
     if uaddr < 0x1000 { return 0; }
 
@@ -105,8 +99,6 @@ pub fn futex_wake(uaddr: usize, n: u32, bitset: u32) -> isize {
 
     woken as isize
 }
-
-// ── FUTEX_REQUEUE / FUTEX_CMP_REQUEUE ────────────────────────────────────────────
 
 pub fn futex_requeue(
     uaddr:     usize,
@@ -162,8 +154,6 @@ pub fn futex_requeue(
     woken as isize
 }
 
-// ── FUTEX_WAKE_OP ──────────────────────────────────────────────────────────────────
-//
 // val3 encoding:
 //   bits 31-28: op    (0=set, 1=add, 2=or, 3=andn, 4=xor)
 //   bits 27-24: cmp   (0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge)
@@ -210,8 +200,6 @@ pub fn futex_wake_op(
 
     woken1 + woken2
 }
-
-// ── futex_clear_pid ───────────────────────────────────────────────────────────────
 
 /// Remove all waiter entries for `pid` from every queue in the table.
 /// Call this from do_exit to prevent leaks when a process exits while

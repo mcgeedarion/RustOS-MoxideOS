@@ -4,8 +4,6 @@
 extern crate alloc;
 use alloc::string::String;
 
-// ─── getrlimit / setrlimit / prlimit ─────────────────────────────────────────
-
 /// NR 97  getrlimit(resource, rlim_va)
 /// NR 162 getrlimit64 alias — same layout on x86-64.
 pub(super) fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
@@ -52,8 +50,6 @@ pub(super) fn sys_prlimit64_impl(
     }
 }
 
-// ─── getrusage ───────────────────────────────────────────────────────────────
-
 /// NR 98  getrusage(who, usage_va) — return zeroed struct rusage.
 pub(super) fn sys_getrusage_impl(_who: i32, usage_va: usize) -> isize {
     // struct rusage is 144 bytes on x86-64; zero-fill is valid.
@@ -61,8 +57,6 @@ pub(super) fn sys_getrusage_impl(_who: i32, usage_va: usize) -> isize {
     if crate::mm::uaccess::copy_to_user(usage_va, &buf).is_err() { return -14; }
     0
 }
-
-// ─── sysinfo ─────────────────────────────────────────────────────────────────
 
 /// NR 99  sysinfo(info_va)
 pub(super) fn sys_sysinfo_impl(info_va: usize) -> isize {
@@ -79,8 +73,6 @@ pub(super) fn sys_sysinfo_impl(info_va: usize) -> isize {
     0
 }
 
-// ─── times ───────────────────────────────────────────────────────────────────
-
 /// NR 100  times(tbuf_va) — return zeroed struct tms + monotonic tick count.
 pub(super) fn sys_times_impl(tbuf_va: usize) -> isize {
     if tbuf_va != 0 {
@@ -89,8 +81,6 @@ pub(super) fn sys_times_impl(tbuf_va: usize) -> isize {
     }
     crate::arch::time::monotonic_ticks() as isize
 }
-
-// ─── uname ───────────────────────────────────────────────────────────────────
 
 /// NR 63  uname(uname_va)
 /// struct utsname: 6 × 65-byte fields (sysname, nodename, release, version,
@@ -117,8 +107,6 @@ pub(super) fn sys_uname_impl(uname_va: usize) -> isize {
     if crate::mm::uaccess::copy_to_user(uname_va, &flat).is_err() { return -14; }
     0
 }
-
-// ─── prctl ───────────────────────────────────────────────────────────────────
 
 /// NR 157  prctl(op, a2, a3, a4, a5)
 pub(super) fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: usize) -> isize {
@@ -164,8 +152,6 @@ pub(super) fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: us
     }
 }
 
-// ─── arch_prctl ──────────────────────────────────────────────────────────────
-
 /// NR 158  arch_prctl(code, addr)
 #[cfg(target_arch = "x86_64")]
 pub(super) fn sys_arch_prctl_impl(code: i32, addr: usize) -> isize {
@@ -208,14 +194,10 @@ pub(super) fn sys_arch_prctl_impl(code: i32, addr: usize) -> isize {
 #[cfg(not(target_arch = "x86_64"))]
 pub(super) fn sys_arch_prctl_impl(_code: i32, _addr: usize) -> isize { -22 }
 
-// ─── ioctl ───────────────────────────────────────────────────────────────────
-
 /// NR 16  ioctl(fd, request, arg)
 pub(super) fn sys_ioctl_impl(fd: usize, request: u64, arg: usize) -> isize {
     crate::fs::ioctl::sys_ioctl(fd, request, arg)
 }
-
-// ─── iopl / ioperm ───────────────────────────────────────────────────────────
 
 /// NR 172  iopl / NR 173 ioperm — deny.
 pub(super) fn sys_iopl_impl(_level: i32) -> isize { -1 }
@@ -230,8 +212,6 @@ pub(super) fn sys_init_module_impl(_mod: usize, _len: usize, _opts: usize) -> is
 /// NR 176  delete_module — same rationale as init_module above.
 pub(super) fn sys_delete_module_impl(_name: usize, _flags: u32) -> isize { -38 }
 
-// ─── fallocate ───────────────────────────────────────────────────────────────
-
 /// NR 285  fallocate(fd, mode, offset, len)
 pub(super) fn sys_fallocate_impl(fd: usize, _mode: i32, offset: i64, len: i64) -> isize {
     if offset < 0 || len <= 0 { return -22; }
@@ -239,8 +219,6 @@ pub(super) fn sys_fallocate_impl(fd: usize, _mode: i32, offset: i64, len: i64) -
     crate::fs::vfs::truncate(fd, new_size);
     0
 }
-
-// ─── copy_file_range ─────────────────────────────────────────────────────────
 
 /// NR 326  copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)
 pub(super) fn sys_copy_file_range_impl(
@@ -250,8 +228,6 @@ pub(super) fn sys_copy_file_range_impl(
     crate::fs::io_syscalls::sys_copy_file_range(
         fd_in, off_in_va, fd_out, off_out_va, len)
 }
-
-// ─── sync / fsync / fdatasync ─────────────────────────────────────────────────────
 
 /// NR 162  fsync(fd)
 pub(super) fn sys_fsync_impl(fd: usize) -> isize {
@@ -269,12 +245,8 @@ pub(super) fn sys_syncfs_impl(_fd: usize) -> isize { 0 }
 /// NR 162 (alt)  sync() — no-op; no write-back queue yet.
 pub(super) fn sys_sync_impl() -> isize { 0 }
 
-// ─── personality ─────────────────────────────────────────────────────────────
-
 /// NR 135  personality(persona) — report PER_LINUX, accept silently.
 pub(super) fn sys_personality_impl(_persona: u32) -> isize { 0 }
-
-// ─── setpgid / getpgid / setsid / getsid ────────────────────────────────────────────
 
 pub(super) fn sys_setpgid_impl(pid: usize, pgid: usize) -> isize {
     crate::proc::session::set_pgid(pid, pgid)
@@ -289,13 +261,9 @@ pub(super) fn sys_getsid_impl(pid: usize) -> isize {
     crate::proc::session::get_sid(pid)
 }
 
-// ─── getpriority / setpriority / nice ──────────────────────────────────────────────
-
 pub(super) fn sys_getpriority_impl(_which: i32, _who: u32) -> isize { 20 }
 pub(super) fn sys_setpriority_impl(_which: i32, _who: u32, _prio: i32) -> isize { 0 }
 pub(super) fn sys_nice_impl(_inc: i32) -> isize { 0 }
-
-// ─── capget / capset ─────────────────────────────────────────────────────────────
 
 /// NR 125/126  capget/capset — report full capabilities (we run as root).
 pub(super) fn sys_capget_impl(hdr_va: usize, data_va: usize) -> isize {

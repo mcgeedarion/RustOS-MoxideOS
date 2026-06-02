@@ -23,8 +23,6 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-// ── IntrusiveList ─────────────────────────────────────────────────────────
-
 /// Embed this in any struct you want to insert into an [`IntrusiveList`].
 #[repr(C)]
 pub struct ListNode {
@@ -130,7 +128,6 @@ impl<T: Linkable> IntrusiveList<T> {
         // node_ptr(T) must point into T.  We walk the other direction by
         // searching — but that's O(n).  Instead we require that Linkable
         // impls store the node at offset 0 OR expose an inverse.
-        //
         // For now we expose a helper that each impl provides.
         Some(unsafe { NonNull::new_unchecked(T::from_node(first_ptr)) })
     }
@@ -146,8 +143,6 @@ pub unsafe trait Linkable: Sized {
     /// `node` must point to the node embedded inside a live `Self`.
     unsafe fn from_node(node: *mut ListNode) -> *mut Self;
 }
-
-// ── RingBuf<T> ────────────────────────────────────────────────────────────
 
 /// Fixed-capacity, lock-free SPSC ring buffer.
 ///

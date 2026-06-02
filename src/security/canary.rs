@@ -19,8 +19,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use crate::rand::arch_entropy;
 
-// ── Kernel canary guard (referenced by compiler-generated code) ───────────────
-
 #[no_mangle]
 pub static __stack_chk_guard: AtomicU64 = AtomicU64::new(0);
 
@@ -52,8 +50,6 @@ pub unsafe fn install_canary_in_tls(tls_base: *mut u8, canary: u64) {
     let ptr = tls_base.add(CANARY_TLS_OFFSET) as *mut u64;
     core::ptr::write_volatile(ptr, canary);
 }
-
-// ── __stack_chk_fail ──────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn __stack_chk_fail() -> ! {

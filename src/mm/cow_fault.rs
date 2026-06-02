@@ -9,8 +9,6 @@ use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
 
-// ── Physical-address → kernel-virtual translation ───────────────────────────
-//
 // Physical frames must be accessed through the kernel's physmap window.
 // Passing a raw physical address to copy_nonoverlapping() would fault or
 // alias an unrelated mapping.
@@ -40,8 +38,6 @@ fn to_virt(pa: usize) -> usize {
     crate::arch::aarch64::mem_layout::va48::phys_to_virt(pa)
 }
 
-// ── clone_for_fork ──────────────────────────────────────────────────────────
-
 /// Create a CoW copy of the parent's address space for a fork() child.
 /// Returns the child's CR3/SATP physical address, or 0 on OOM.
 pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) -> usize {
@@ -56,8 +52,6 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
     }
     child_cr3
 }
-
-// ── handle_cow_fault ────────────────────────────────────────────────────────
 
 /// Handle a write fault that may be a CoW page.
 /// Returns true if resolved; false if genuine access violation.
@@ -97,8 +91,6 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
 /// that held this process's address space loaded to dereference the freed
 /// page via its stale TLB entry, causing a use-after-free.
 pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
-    // ── Step 0: error-code check (arch-specific) ────────────────────────
-    //
     // Reject faults that cannot possibly be CoW:
     //   x86_64 → P=1, W=1, U=1 (bits 0-2 all set → mask 0x7)
     //   riscv64 → W=1, U=1     (bits 1 and 3 set → mask 0xA)
@@ -117,14 +109,12 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         return false;
     }
 
-    // ── Step 1: locate the current process's page table root ────────────
     let pid = scheduler::current_pid();
     let cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if cr3 == 0 {
         return false;
     }
 
-    // ── Step 2: read the leaf PTE (arch-specific walker) ────────────────
     let pte_val = match unsafe { pte_read(cr3, faulting_va) } {
         Some(v) => v,
         None => return false,
@@ -135,13 +125,11 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         return false;
     }
 
-    // ── Step 3: resolve the physical address of the old frame ───────────
     let old_pa = match <Arch as Paging>::virt_to_phys(cr3, faulting_va) {
         Some(pa) => pa,
         None => return false,
     };
 
-    // ── Step 4: allocate and populate the new private frame ─────────────
     let new_pa = match pmm::alloc_page() {
         Some(p) => p,
         None => return false,
@@ -156,7 +144,6 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         );
     }
 
-    // ── Step 5: remap, flush, shootdown, release old frame ──────────────
     let page_va = faulting_va & !0xFFF;
     let flags = PageFlags::PRESENT | PageFlags::WRITE | PageFlags::USER;
 
@@ -175,7 +162,6 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     );
 
     // 5d. Release our reference to the old frame.
-    //
     // put_page() decrements the PMM refcount and only calls buddy_free_page
     // when it reaches zero.  This is correct when multiple fork() children
     // share the same CoW source frame — the last one to fault frees it.
@@ -186,8 +172,6 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
     true
 }
 
-// ── Architecture-specific PTE walkers ────────────────────────────────────────
-//
 // Each walker returns the *leaf* PTE value (4 KiB granule only).
 // Large-page PTEs return None — they are not CoW-eligible.
 
@@ -196,8 +180,6 @@ const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT: u64 = 1;
 /// Bit 7 in a PDPTE/PDE: page-size flag (1 GiB / 2 MiB large page).
 const PAGE_SIZE_BIT: u64 = 1 << 7;
-
-// ── x86-64: 4-level paging (PML4 → PDPT → PD → PT) ─────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn pte_read(cr3: usize, va: usize) -> Option<u64> {
@@ -237,8 +219,6 @@ unsafe fn pte_read(cr3: usize, va: usize) -> Option<u64> {
     Some(*((pt_base + pti * 8) as *const u64))
 }
 
-// ── RISC-V: Sv39 paging (PGD → PMD → PT, 3 levels) ─────────────────────────
-//
 // Sv39 PTE physical address: bits [53:10] × 4096.
 // The page-size flag for large pages is V=1, R|W|X ≠ 0 at a non-leaf level.
 // We detect non-leaf levels by checking that R, W, and X are all zero
@@ -291,8 +271,6 @@ unsafe fn pte_read(satp_pa: usize, va: usize) -> Option<u64> {
     let pt_base = to_virt(rv_pte_to_pa(pmde));
     Some(*((pt_base + vpn0 * 8) as *const u64))
 }
-
-// ── Debug helper ─────────────────────────────────────────────────────────────
 
 /// Public alias used in debug assertions / unit tests.
 #[cfg(debug_assertions)]

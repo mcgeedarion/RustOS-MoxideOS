@@ -1,11 +1,8 @@
 // src/io_uring/ops/write.rs
-//
 // IORING_OP_WRITE handler.
-//
 // Writes up to `sqe.len` bytes from the buffer at virtual address `sqe.addr`
 // to the file/socket described by `sqe.fd`, starting at file offset `sqe.off`
 // (ignored for sockets/pipes).
-//
 // Returns the number of bytes written on success, or a negated errno on failure.
 
 use crate::io_uring::{cqe::errno, sqe::Sqe};
@@ -16,8 +13,6 @@ pub fn handle(sqe: &Sqe) -> i32 {
     let buf_va = sqe.addr;
     let len    = sqe.len as usize;
     let offset = sqe.off;
-
-    // ── Validate ─────────────────────────────────────────────────────────────────────
 
     if fd < 0 {
         log::warn!("[io_uring::write] invalid fd={}", fd);
@@ -40,8 +35,6 @@ pub fn handle(sqe: &Sqe) -> i32 {
     let _ = offset; // positional write support is wired via IORING_OP_WRITEV path later.
     crate::fs::io_syscalls::sys_write(fd as usize, buf_va as usize, len) as i32
 }
-
-// ── Future-layer wrapper ──────────────────────────────────────────────────────────────
 
 use core::{
     future::Future,

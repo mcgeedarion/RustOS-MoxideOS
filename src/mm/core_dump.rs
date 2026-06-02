@@ -28,8 +28,6 @@ use alloc::string::String;
 use crate::proc::rlimit::{RLIMIT_CORE, RLIM_INFINITY};
 use crate::proc::scheduler::{current_pid, with_proc};
 
-// ── ELF constants (64-bit) ────────────────────────────────────────────────────
-
 const ELFMAG:     [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64:  u8     = 2;
 const ELFDATA2LSB: u8     = 1;
@@ -51,20 +49,14 @@ const EM_MACHINE: u16 = 183; // EM_AARCH64
 #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
 const EM_MACHINE: u16 = 0;   // EM_NONE — unsupported arch
 
-// ── Note type numbers ────────────────────────────────────────────────────────
-
 const NT_PRSTATUS: u32 = 1;
 const NT_PRPSINFO: u32 = 3;
-
-// ── Serialisation helpers ─────────────────────────────────────────────────────
 
 fn push_u16(buf: &mut Vec<u8>, v: u16) { buf.extend_from_slice(&v.to_le_bytes()); }
 fn push_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_le_bytes()); }
 fn push_u64(buf: &mut Vec<u8>, v: u64) { buf.extend_from_slice(&v.to_le_bytes()); }
 fn push_zeros(buf: &mut Vec<u8>, n: usize) { buf.resize(buf.len() + n, 0); }
 fn align4(n: usize) -> usize { (n + 3) & !3 }
-
-// ── ELF Ehdr ─────────────────────────────────────────────────────────────────
 
 fn write_elf_header(buf: &mut Vec<u8>, phnum: u16) {
     buf.extend_from_slice(&ELFMAG);
@@ -89,8 +81,6 @@ fn write_elf_header(buf: &mut Vec<u8>, phnum: u16) {
     // total: 64 bytes
 }
 
-// ── ELF Phdr ─────────────────────────────────────────────────────────────────
-
 fn write_phdr(
     buf: &mut Vec<u8>,
     p_type:   u32,
@@ -112,8 +102,6 @@ fn write_phdr(
     // total: 56 bytes
 }
 
-// ── ELF Note ──────────────────────────────────────────────────────────────────
-//
 // Linux note layout (per elf(5)):
 //   u32  namesz  — length of name[] INCLUDING the NUL terminator
 //   u32  descsz  — length of desc[] in bytes (no padding counted)
@@ -135,8 +123,6 @@ fn write_note(buf: &mut Vec<u8>, name: &[u8], typ: u32, desc: &[u8]) {
     push_zeros(buf, align4(desc.len()) - desc.len()); // pad desc to 4B boundary
 }
 
-// ── NT_PRSTATUS ───────────────────────────────────────────────────────────────
-
 fn prstatus_note(pid: usize, signo: u32) -> Vec<u8> {
     let mut n = Vec::with_capacity(148);
     push_u32(&mut n, signo);         // pr_info.si_signo
@@ -157,8 +143,6 @@ fn prstatus_note(pid: usize, signo: u32) -> Vec<u8> {
     push_u32(&mut n, 0);             // pr_fpvalid
     n
 }
-
-// ── NT_PRPSINFO ───────────────────────────────────────────────────────────────
 
 fn prpsinfo_note(pid: usize, exe: &str) -> Vec<u8> {
     let mut n = Vec::with_capacity(124);
@@ -185,12 +169,9 @@ fn prpsinfo_note(pid: usize, exe: &str) -> Vec<u8> {
     n
 }
 
-// ── Safe page-by-page copy from user address space ───────────────────────────
-//
 // Reading VMA contents through raw user virtual addresses (the old approach)
 // is unsafe: pages may be swapped out, CoW-frozen, or absent at dump time.
 // A fault in kernel context would panic the kernel.
-//
 // Instead we copy one page at a time.  For each page we attempt the read; if
 // it faults (indicated by copy_from_user_page returning false) we substitute
 // PAGE_SIZE zero bytes.  This matches Linux's behaviour in fs/coredump.c.
@@ -225,8 +206,6 @@ fn copy_user_range(dst: &mut Vec<u8>, src_va: usize, size: usize) {
     }
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 /// Build an ELF core image for the current process and write it to the VFS.
 ///
 /// `signo` is the signal that caused the dump.  Returns the number of bytes
@@ -236,7 +215,6 @@ fn copy_user_range(dst: &mut Vec<u8>, src_va: usize, size: usize) {
 pub fn write_core_dump(signo: u32) -> isize {
     let pid = current_pid();
 
-    // ── Gate on RLIMIT_CORE ───────────────────────────────────────────────────
     let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_CORE))
         .unwrap_or((0, 0));
     if soft == 0 {
@@ -244,7 +222,6 @@ pub fn write_core_dump(signo: u32) -> isize {
     }
     let max_bytes: u64 = if soft == RLIM_INFINITY { u64::MAX } else { soft };
 
-    // ── Collect VMA snapshot ─────────────────────────────────────────────────
     struct VmaSnap { start: usize, end: usize, flags: u32 }
     let (vmas, exe_path): (Vec<VmaSnap>, String) = with_proc(pid, |p| {
         let snaps = p.vmas.iter().map(|v| VmaSnap {
@@ -261,19 +238,15 @@ pub fn write_core_dump(signo: u32) -> isize {
         (snaps, exe)
     }).unwrap_or_else(|| (Vec::new(), String::from("unknown")));
 
-    // ── Build note segment ───────────────────────────────────────────────────
     let mut notes: Vec<u8> = Vec::new();
     write_note(&mut notes, b"CORE\0", NT_PRSTATUS, &prstatus_note(pid, signo));
     write_note(&mut notes, b"CORE\0", NT_PRPSINFO, &prpsinfo_note(pid, &exe_path));
 
-    // ── Apply RLIMIT_CORE: drop trailing VMAs that would exceed the limit ─────
-    //
     // Truncating the raw buffer mid-segment (the old approach) produces a
     // structurally invalid ELF.  Instead we compute the total size up-front
     // and drop whole VMAs from the end until the projected size fits within
     // max_bytes.  This preserves a valid ELF structure and matches what Linux
     // does (fs/coredump.c: dump_skip / dump_truncate logic).
-    //
     // Header sizes:
     //   ELF ehdr:  64 bytes
     //   PT_NOTE phdr: 56 bytes  (1 always present)
@@ -304,13 +277,11 @@ pub fn write_core_dump(signo: u32) -> isize {
     }
     let vmas = &vmas[..included_vmas];
 
-    // ── Layout calculation ───────────────────────────────────────────────────
     let phnum    = 1 + vmas.len(); // PT_NOTE + PT_LOAD × N
     let phdrs_end = ehdr_size + phdr_size * phnum;
     let note_off  = phdrs_end;
     let mut data_off = note_off + note_size;
 
-    // ── Assemble ELF image ───────────────────────────────────────────────────
     let mut buf: Vec<u8> = Vec::new();
 
     // ELF header
@@ -340,7 +311,6 @@ pub fn write_core_dump(signo: u32) -> isize {
         copy_user_range(&mut buf, vma.start, size);
     }
 
-    // ── Write to VFS ─────────────────────────────────────────────────────────
     let core_path = with_proc(pid, |p| {
         let cwd = p.cwd().unwrap_or_else(|| "/".into());
         alloc::format!("{}/core", cwd)

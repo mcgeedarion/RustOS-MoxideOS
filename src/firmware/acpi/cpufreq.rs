@@ -19,8 +19,6 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use crate::console::println;
 use super::SdtHeader;
 
-// ── P-state table (up to 16 states) ──────────────────────────────────────
-
 const MAX_PSTATES: usize = 16;
 
 #[derive(Copy, Clone, Default, Debug)]
@@ -44,8 +42,6 @@ static mut PSTATE_TABLE: [Pstate; MAX_PSTATES] = [Pstate {
 static PSTATE_COUNT:   AtomicU8  = AtomicU8::new(0);
 static CURRENT_PSTATE: AtomicU8  = AtomicU8::new(0);
 static MAX_ALLOWED:    AtomicU8  = AtomicU8::new(0); // from _PPC
-
-// ── Intel SpeedStep MSR ───────────────────────────────────────────────────
 
 const IA32_PERF_CTL: u32 = 0x199;
 const IA32_PERF_STS: u32 = 0x198;
@@ -76,8 +72,6 @@ unsafe fn wrmsr(msr: u32, val: u64) {
         options(nomem, nostack)
     );
 }
-
-// ── AML byte-pattern scanner ──────────────────────────────────────────────
 
 /// Extract a DWORD from AML stream at `i` after an 0x0C (DWordPrefix).
 /// Returns the value and advances `i` by 5.
@@ -187,8 +181,6 @@ unsafe fn scan_ppc(aml: &[u8]) {
         i += 1;
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Parse the DSDT for P-state tables.
 ///

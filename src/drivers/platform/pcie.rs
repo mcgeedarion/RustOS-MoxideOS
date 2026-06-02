@@ -17,8 +17,6 @@ use crate::device::pci::msix::msix_configure as _msix_configure;
 extern crate alloc;
 use alloc::vec::Vec;
 
-// ---- ECAM base ---------------------------------------------------------------
-
 /// Initialise ECAM base address.  Delegates to `PciBus::init`.
 ///
 /// # Safety
@@ -26,8 +24,6 @@ use alloc::vec::Vec;
 pub unsafe fn set_ecam_base(base: u64) {
     ecam::set_base(base);
 }
-
-// ---- ECAM accessors (kept for drivers that call them directly) ---------------
 
 #[inline]
 pub fn cfg_read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
@@ -54,8 +50,6 @@ pub fn cfg_write16(bus: u8, dev: u8, func: u8, off: u16, val: u16) {
     ecam::cfg_write16(bus, dev, func, off, val)
 }
 
-// ---- Enumeration (kept for call-sites that call pcie::enumerate()) -----------
-
 /// Re-export `PciDevice` so callers using the legacy path need not
 /// change their `use` statements.
 pub use pci_bus::PciDevice as PciDevice;
@@ -74,8 +68,6 @@ pub fn devices() -> Vec<PciDevice> {
 pub fn find(vendor: u16, device_id: u16) -> Option<PciDevice> {
     pci_bus::find(vendor, device_id)
 }
-
-// ---- MSI-X -------------------------------------------------------------------
 
 /// Configure an MSI-X vector.  Delegates to `device::pci::msix`.
 pub fn msix_configure(

@@ -40,8 +40,6 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-// ─── CgroupId ────────────────────────────────────────────────────────────────
-
 pub type CgroupId = u32;
 pub const ROOT_CGROUP: CgroupId = 1;
 
@@ -50,8 +48,6 @@ static NEXT_CGID: AtomicU32 = AtomicU32::new(2);
 fn alloc_cgid() -> CgroupId {
     NEXT_CGID.fetch_add(1, Ordering::Relaxed)
 }
-
-// ─── Resource limits ─────────────────────────────────────────────────────────
 
 /// Per-cgroup resource configuration.
 #[derive(Clone, Debug)]
@@ -77,8 +73,6 @@ impl Default for CgroupLimits {
     }
 }
 
-// ─── Accounting ──────────────────────────────────────────────────────────────
-
 /// Live resource usage for a cgroup (sum over all member processes).
 #[derive(Clone, Debug, Default)]
 pub struct CgroupStat {
@@ -89,8 +83,6 @@ pub struct CgroupStat {
     /// CPU usage in nanoseconds (updated on context switch).
     pub cpu_usage_ns: u64,
 }
-
-// ─── CgroupNode ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct CgroupNode {
@@ -119,8 +111,6 @@ impl CgroupNode {
     }
 }
 
-// ─── CgroupTable ─────────────────────────────────────────────────────────────
-
 struct CgroupTable {
     nodes: BTreeMap<CgroupId, CgroupNode>,
 }
@@ -142,8 +132,6 @@ impl CgroupTable {
 }
 
 static CGROUPS: Mutex<CgroupTable> = Mutex::new(CgroupTable::new());
-
-// ─── Boot initialisation ──────────────────────────────────────────────────────
 
 /// Called once from `kernel_main` after `dhcp::init()` and before
 /// `proc::spawn_init()`.
@@ -183,8 +171,6 @@ pub fn init() {
 
     log::info!("cgroup: v2 unified hierarchy ready (root cgid={})", ROOT_CGROUP);
 }
-
-// ─── Public API — hierarchy management ──────────────────────────────────────
 
 /// Create a new child cgroup under `parent`.  Returns the new `CgroupId`,
 /// or `-ENOENT` if `parent` does not exist, or `-EEXIST` if a child with
@@ -266,8 +252,6 @@ pub fn cgroup_of(pid: usize) -> CgroupId {
         .unwrap_or(ROOT_CGROUP)
 }
 
-// ─── Public API — resource controller reads/writes ───────────────────────────
-
 /// Read a controller knob.  Returns a formatted string suitable for
 /// `/sys/fs/cgroup/<path>/<file>` reads.
 pub fn read_knob(id: CgroupId, file: &str) -> Option<String> {
@@ -331,8 +315,6 @@ pub fn write_knob(id: CgroupId, file: &str, value: &str) -> isize {
     }
 }
 
-// ─── Lifecycle hooks ─────────────────────────────────────────────────────────
-
 /// Called from `fork_syscall` / `clone` after the child `Pcb` is created.
 /// Places the child in the same cgroup as the parent and increments counters.
 pub fn cgroup_fork(parent_pid: usize, child_pid: usize) {
@@ -380,8 +362,6 @@ pub fn cgroup_exit(pid: usize) {
         }
     }
 }
-
-// ─── Accounting helpers ───────────────────────────────────────────────────────
 
 /// Add `delta_ns` CPU nanoseconds to pid's cgroup (and all ancestors).
 pub fn charge_cpu_ns(pid: usize, delta_ns: u64) {
@@ -450,8 +430,6 @@ pub fn check_pids_max(pid: usize) -> bool {
         }
     }
 }
-
-// ─── /sys/fs/cgroup path helpers ─────────────────────────────────────────────
 
 /// Resolve a cgroupfs path like `/sys/fs/cgroup/foo/bar` to a `CgroupId`.
 /// Returns `None` if the path does not exist.

@@ -5,27 +5,19 @@ use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 use crate::console::println;
 use super::SdtHeader;
 
-// ── PM1 Status register bits ──────────────────────────────────────────────
-
 const PM1_STS_PWRBTN: u16 = 1 << 8;
 const PM1_STS_SLPBTN: u16 = 1 << 9;
 const PM1_STS_RTC:    u16 = 1 << 10;
 const PM1_STS_WAK:    u16 = 1 << 15;
-
-// ── PM1 Enable register bits ──────────────────────────────────────────────
 
 const PM1_EN_PWRBTN: u16 = 1 << 8;
 const PM1_EN_SLPBTN: u16 = 1 << 9;
 const PM1_EN_RTC:    u16 = 1 << 10;
 const PM1_EN_WAK:    u16 = 1 << 15;
 
-// ── PM1 Control register bits ─────────────────────────────────────────────
-
 const PM1_CNT_SCI_EN:        u16 = 1 << 0;
 const PM1_CNT_SLP_EN:        u16 = 1 << 13;
 const PM1_CNT_SLP_TYP_SHIFT: u16 = 10;
-
-// ── FADT offsets ──────────────────────────────────────────────────────────
 
 const FADT_OFF_DSDT:         usize = 40;
 const FADT_OFF_SCI_INT:      usize = 46;

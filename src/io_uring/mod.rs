@@ -1,7 +1,5 @@
 // src/io_uring/mod.rs
-//
 // io_uring subsystem for RustOS.
-//
 // The implementation lives in ring.rs (per-ring structs, global ring table,
 // WaitQueue-based wakeup) and syscall.rs (sys_io_uring_setup / _enter / _register).
 // This file re-exports the public surface and owns the shared error type.
@@ -18,8 +16,6 @@ pub use ring::{
     alloc_ring, free_ring, with_ring, with_ring_mut, cq_wq_for, ring_idx_for_fd,
     IoUringRing, IoUringSqe, IoUringCqe, IoUringParams,
 };
-
-// ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoUringError {

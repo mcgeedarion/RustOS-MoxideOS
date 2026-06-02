@@ -21,8 +21,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ── Serial port ───────────────────────────────────────────────────────────
-
 const COM1: u16 = 0x3F8;
 
 #[inline] fn serial_write(b: u8) {
@@ -46,8 +44,6 @@ const COM1: u16 = 0x3F8;
         Some(d)
     }
 }
-
-// ── Termios (minimal) ────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 pub struct Termios {
@@ -85,8 +81,6 @@ impl Termios {
     pub fn echo_on(&self)    -> bool { self.c_lflag & 0x0008 != 0 } // ECHO
 }
 
-// ── Winsize ───────────────────────────────────────────────────────────────
-
 /// POSIX window size (struct winsize, <sys/ioctl.h>).
 /// Stored in TtyState so TIOCSWINSZ persists across calls and TIOCGWINSZ
 /// returns the last value set rather than a hardcoded constant.
@@ -104,8 +98,6 @@ impl Winsize {
     }
 }
 
-// ── State ─────────────────────────────────────────────────────────────────
-
 struct TtyState {
     line_buf:       Vec<u8>,
     termios:        Termios,
@@ -119,8 +111,6 @@ static TTY: Mutex<TtyState> = Mutex::new(TtyState {
     foreground_pid: 1,
     winsize:        Winsize::default(),
 });
-
-// ── Echo helpers ──────────────────────────────────────────────────────────
 
 fn echo(b: u8, tty: &Termios) {
     if !tty.echo_on() { return; }
@@ -142,8 +132,6 @@ fn echo_erase(tty: &Termios) {
         serial_write(0x08);
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Block until a full line is available, then copy up to buf.len() bytes.
 /// Returns bytes read, or 0 for EOF (^D), or negative errno.

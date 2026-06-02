@@ -21,8 +21,6 @@ use crate::proc::process::State;
 use crate::proc::scheduler;
 use crate::uaccess::copy_to_user;
 
-// ── wstatus encoding ──────────────────────────────────────────────────
-
 #[inline]
 pub fn encode_exit(code: i32) -> i32 { (code & 0xFF) << 8 }
 
@@ -38,14 +36,10 @@ pub fn encode_stop(stopsig: u32) -> i32 {
 
 pub const WSTATUS_CONTINUED: i32 = 0xFFFF;
 
-// ── option flags ─────────────────────────────────────────────────────
-
 pub const WNOHANG:    u32 = 1;
 pub const WUNTRACED:  u32 = 2;
 pub const WCONTINUED: u32 = 8;
 pub const WNOWAIT:    u32 = 0x01000000;
-
-// ── rusage ────────────────────────────────────────────────────────────
 
 const RUSAGE_SIZE: usize = 144;
 
@@ -65,8 +59,6 @@ fn write_rusage(va: usize, utime_ns: u64, stime_ns: u64) {
     let _ = copy_to_user(va, &buf);
 }
 
-// ── notify_exit ────────────────────────────────────────────────────────
-
 pub fn notify_exit(exited_pid: usize) {
     let (ppid, exit_signal) = scheduler::with_proc(exited_pid, |p| (p.ppid, p.exit_signal))
         .unwrap_or((0, 17));
@@ -85,8 +77,6 @@ pub fn notify_exit(exited_pid: usize) {
         crate::proc::signal::send_signal_group(parent_tgid, exit_signal as i32);
     }
 }
-
-// ── notify_stop ────────────────────────────────────────────────────────
 
 pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     scheduler::with_proc_mut(stopped_pid, |p, pl| {
@@ -116,8 +106,6 @@ pub fn notify_stop(stopped_pid: usize, stopsig: u32) {
     }
 }
 
-// ── notify_continue ─────────────────────────────────────────────────────
-
 pub fn notify_continue(cont_pid: usize) {
     scheduler::with_proc_mut(cont_pid, |p, pl| {
         p.exit_code = WSTATUS_CONTINUED;
@@ -126,8 +114,6 @@ pub fn notify_continue(cont_pid: usize) {
     let ppid = scheduler::with_proc(cont_pid, |p| p.ppid).unwrap_or(0);
     if ppid != 0 { scheduler::wake_pid(ppid); }
 }
-
-// ── pid / pgid match predicate ──────────────────────────────────────────
 
 #[inline]
 fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
@@ -139,8 +125,6 @@ fn matches_pid(p_pid: usize, p_pgid: usize, wait_pid: isize) -> bool {
     }
 }
 
-// ── WaitHit: result of one scan pass ──────────────────────────────────────
-
 enum WaitHit {
     Harvested { child_pid: usize, wstatus: i32, utime_ns: u64, stime_ns: u64 },
     /// Matching children exist but none are in a waitable state yet.
@@ -148,8 +132,6 @@ enum WaitHit {
     /// No child matches the requested pid/pgid at all.
     NoChild,
 }
-
-// ── sys_waitpid / sys_wait4 ───────────────────────────────────────────
 
 pub fn sys_waitpid(pid: isize, wstatus_va: usize, options: u32) -> isize {
     sys_wait4_impl(pid, wstatus_va, options, 0)
@@ -270,8 +252,6 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
         }
     }
 }
-
-// ── wstatus decode helpers ─────────────────────────────────────────────────
 
 #[inline] pub fn wifexited(ws: i32)    -> bool { (ws & 0x7F) == 0 }
 #[inline] pub fn wexitstatus(ws: i32)  -> i32  { (ws >> 8) & 0xFF }

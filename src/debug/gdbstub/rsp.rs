@@ -35,8 +35,6 @@ use crate::proc::ptrace::{
     UREG_CS, UREG_SS,
 };
 
-// ── RSP framing helpers ───────────────────────────────────────────────────────
-
 /// Wrap a response body in RSP `+$<body>#<checksum>`.
 pub fn rsp_packet(body: &str) -> String {
     let csum: u8 = body.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
@@ -85,7 +83,6 @@ fn parse_hex_u64(s: &str) -> u64 {
     u64::from_str_radix(s, 16).unwrap_or(0)
 }
 
-// ── GDB x86-64 register order (matches gdb's i386:x86-64 target.xml) ────────
 // 0-7: rax rcx rdx rbx rsp rbp rsi rdi
 // 8-15: r8..r15
 // 16: rip  17: eflags  18: cs  19: ss
@@ -107,8 +104,6 @@ fn gdb_reg_order() -> [usize; GDB_REG_COUNT] {
     ]
 }
 
-// ── Z/z helpers ───────────────────────────────────────────────────────────────
-
 /// Parse `<type>,<addr>,<len>` from a Z or z packet body (after the leading
 /// `Z`/`z` byte has been stripped).
 fn parse_zpacket(rest: &str) -> Option<(u8, u64, usize)> {
@@ -119,8 +114,6 @@ fn parse_zpacket(rest: &str) -> Option<(u8, u64, usize)> {
     Some((t, addr, len))
 }
 
-// ── Session state (breakpoint tables) ─────────────────────────────────────────
-//
 // `handle_packet` is stateless for every packet *except* Z/z which must
 // consult the per-session breakpoint tables.  Pass a `Session` alongside
 // the target so the tables survive across calls.
@@ -148,8 +141,6 @@ impl Session {
     }
 }
 
-// ── Packet dispatch ───────────────────────────────────────────────────────────
-
 /// Process one RSP packet body (without the `$` prefix and `#XX` suffix).
 /// Returns the response string (already framed with `rsp_packet`), or an
 /// empty string for packets where GDB expects no reply until the next stop
@@ -158,7 +149,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
     if body.is_empty() { return rsp_packet(""); }
 
     match body.as_bytes()[0] {
-        // ── ? — stop reason ──────────────────────────────────────────────────
         b'?' => {
             let status = target.poll_status();
             if status.starts_with('T') {
@@ -168,7 +158,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             }
         }
 
-        // ── g — read all registers ────────────────────────────────────────────
         b'g' => {
             let regs = target.read_regs();
             let order = gdb_reg_order();
@@ -180,7 +169,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             rsp_packet(&hex)
         }
 
-        // ── G — write all registers ───────────────────────────────────────────
         b'G' => {
             let hex = &body[1..];
             let bytes = decode_hex_bytes(hex);
@@ -196,7 +184,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             rsp_packet("OK")
         }
 
-        // ── m — read memory ───────────────────────────────────────────────────
         b'm' => {
             let rest = &body[1..];
             let mut parts = rest.splitn(2, ',');
@@ -206,7 +193,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             rsp_packet(&encode_hex_bytes(&data))
         }
 
-        // ── M — write memory ──────────────────────────────────────────────────
         b'M' => {
             let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
@@ -219,7 +205,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             rsp_packet("OK")
         }
 
-        // ── c — continue ──────────────────────────────────────────────────────
         b'c' => {
             let rest = &body[1..];
             if !rest.is_empty() {
@@ -232,7 +217,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             String::new() // no reply until next stop
         }
 
-        // ── s — single-step ───────────────────────────────────────────────────
         b's' => {
             let rest = &body[1..];
             if !rest.is_empty() {
@@ -245,14 +229,12 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             String::new() // no reply until next stop
         }
 
-        // ── k — kill ──────────────────────────────────────────────────────────
         b'k' => {
             session.detach(target);
             crate::proc::signal::send_signal(target.pid, 9);
             rsp_packet("OK")
         }
 
-        // ── Z — insert breakpoint / watchpoint ───────────────────────────────
         // Z0,addr,len  software breakpoint
         // Z1,addr,len  hardware execution breakpoint
         // Z2,addr,len  write watchpoint
@@ -271,7 +253,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             if ok { rsp_packet("OK") } else { rsp_packet("E01") }
         }
 
-        // ── z — remove breakpoint / watchpoint ───────────────────────────────
         b'z' => {
             let ok = match parse_zpacket(&body[1..]) {
                 None => false,
@@ -284,7 +265,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             if ok { rsp_packet("OK") } else { rsp_packet("E01") }
         }
 
-        // ── q — query packets ─────────────────────────────────────────────────
         b'q' => {
             if body.starts_with("qSupported") {
                 // Advertise Z/z support alongside PacketSize

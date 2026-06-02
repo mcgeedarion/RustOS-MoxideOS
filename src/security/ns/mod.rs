@@ -30,10 +30,6 @@ use alloc::sync::Arc;
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Clone / unshare flags  (match Linux UAPI)
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub const CLONE_NEWNS:   u64 = 0x0002_0000;
 pub const CLONE_NEWUTS:  u64 = 0x0400_0000;
 pub const CLONE_NEWIPC:  u64 = 0x0800_0000;
@@ -41,10 +37,6 @@ pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 pub const CLONE_NEWPID:  u64 = 0x2000_0000;
 pub const CLONE_NEWNET:  u64 = 0x4000_0000;
 pub const CLONE_NEWTIME: u64 = 0x0000_0080;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Namespace handle — Arc<NsHandle> is what a process holds
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Unique namespace ID (monotonically increasing).
 static NEXT_NS_ID: AtomicU64 = AtomicU64::new(1);

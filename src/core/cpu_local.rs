@@ -26,8 +26,6 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 
-// ── PerCpuBlock ────────────────────────────────────────────────────────────
-
 /// Maximum number of per-CPU slots.  Increase as subsystems register more.
 pub const MAX_CPU_LOCAL_SLOTS: usize = 64;
 
@@ -76,8 +74,6 @@ impl PerCpuBlock {
     }
 }
 
-// ── CpuLocalKey ───────────────────────────────────────────────────────────
-
 /// A compile-time-assigned index into the per-CPU slot array.
 ///
 /// Create one with the `cpu_local_key!` macro.
@@ -105,8 +101,6 @@ macro_rules! cpu_local_key {
         $crate::core::cpu_local::CpuLocalKey::new($idx)
     };
 }
-
-// ── CpuLocal<T> ───────────────────────────────────────────────────────────
 
 /// Zero-sized handle to a per-CPU value of type `T` stored in a slot.
 ///
@@ -150,8 +144,6 @@ impl<T: Copy + 'static> CpuLocal<T> {
         unsafe { (*block).write_slot(self.key.index, raw) };
     }
 }
-
-// ── Architecture-specific PerCpuBlock pointer ──────────────────────────────
 
 /// Retrieve the `PerCpuBlock` pointer for the executing CPU.
 ///

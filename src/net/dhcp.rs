@@ -33,19 +33,13 @@ use spin::Mutex;
 
 use crate::net::{ip, udp};
 
-// ── Ports ─────────────────────────────────────────────────────────────────────
-
 pub const DHCP_CLIENT_PORT: u16 = 68;
 pub const DHCP_SERVER_PORT: u16 = 67;
-
-// ── DHCP message type option values ──────────────────────────────────────────
 
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER:    u8 = 2;
 const DHCP_REQUEST:  u8 = 3;
 const DHCP_ACK:      u8 = 5;
-
-// ── Option tags ──────────────────────────────────────────────────────────────
 
 const OPT_SUBNET:   u8 = 1;
 const OPT_ROUTER:   u8 = 3;
@@ -56,18 +50,13 @@ const OPT_SERVERID: u8 = 54;
 const OPT_PRL:      u8 = 55;
 const OPT_END:      u8 = 255;
 
-// ── Magic cookie (RFC 2131 §3) ────────────────────────────────────────────────
-
 const MAGIC: [u8; 4] = [99, 130, 83, 99];
 
-// ── BOOTP/DHCP fixed header size (RFC 2131 §2) ───────────────────────────────
 //   op(1) htype(1) hlen(1) hops(1) xid(4) secs(2) flags(2)
 //   ciaddr(4) yiaddr(4) siaddr(4) giaddr(4) chaddr(16) sname(64) file(128)
 //   magic(4)  → 240 bytes total
 
 const BOOTP_HDR_LEN: usize = 240;
-
-// ── Lease state ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 pub struct Lease {
@@ -96,8 +85,6 @@ struct InboundMsg {
     xid:      u32,
 }
 
-// ── Public accessors ──────────────────────────────────────────────────────────
-
 /// Returns the currently leased IP, or 0 if no lease is held.
 pub fn leased_ip() -> u32 {
     LEASE.lock().map(|l| l.ip).unwrap_or(0)
@@ -112,8 +99,6 @@ pub fn leased_gateway() -> u32 {
 pub fn leased_mask() -> u32 {
     LEASE.lock().map(|l| l.mask).unwrap_or(0xFFFF_FF00)
 }
-
-// ── Packet builder ────────────────────────────────────────────────────────────
 
 /// Build a DHCP packet.
 ///
@@ -169,13 +154,10 @@ fn build_packet(xid: u32, msg_type: u8,
     pkt
 }
 
-// ── Packet sender ─────────────────────────────────────────────────────────────
-
 fn send_dhcp(pkt: &[u8]) {
     // Source IP 0.0.0.0, destination 255.255.255.255 (broadcast).
     // The IP layer normally routes via ARP; bypass that by temporarily
     // setting our IP to 0 and using the broadcast address.
-    //
     // `udp::send` calls `ip::send` which calls `arp::resolve`.  For the
     // broadcast address (0xFFFF_FFFF), eth::send should use FF:FF:FF:FF:FF:FF.
     // We force source to 0.0.0.0 via a temp override.
@@ -190,8 +172,6 @@ fn send_dhcp(pkt: &[u8]) {
     }
 }
 
-// ── Main init entrypoint ──────────────────────────────────────────────────────
-
 /// Run the full DORA handshake.  Blocks until a lease is obtained or the
 /// retry limit (8 attempts, ~4 s) is exhausted.  Updates the IP layer on
 /// success.
@@ -203,7 +183,6 @@ pub fn init() {
     );
 
     for attempt in 0..8u32 {
-        // ── DISCOVER ──────────────────────────────────────────────────────
         *PENDING.lock() = None;
         let disc = build_packet(xid.wrapping_add(attempt), DHCP_DISCOVER,
                                 None, None);
@@ -216,7 +195,6 @@ pub fn init() {
             None    => { continue; }
         };
 
-        // ── REQUEST ───────────────────────────────────────────────────────
         *PENDING.lock() = None;
         let req = build_packet(xid.wrapping_add(attempt), DHCP_REQUEST,
                                Some(offer.server),
@@ -251,8 +229,6 @@ pub fn init() {
     ip::set_ip(fallback);
 }
 
-// ── Wait helper ───────────────────────────────────────────────────────────────
-
 /// Busy-wait up to `timeout_ms` for a DHCP message of `expected_type` with
 /// the given `xid`.  Returns the parsed message or None on timeout.
 fn wait_for(expected_type: u8, xid: u32, timeout_ms: u64) -> Option<InboundMsg> {
@@ -272,8 +248,6 @@ fn wait_for(expected_type: u8, xid: u32, timeout_ms: u64) -> Option<InboundMsg> 
         crate::proc::scheduler::yield_now();
     }
 }
-
-// ── Receive path (called from udp demux) ─────────────────────────────────────
 
 /// Called by the UDP demux when a packet arrives on port 68 (DHCP client).
 pub fn receive(src_ip: u32, data: &[u8]) {

@@ -39,8 +39,6 @@ const ENOMEM: isize = -12;
 const EINVAL: isize = -22;
 const ESRCH:  isize = -3;
 
-// ── helpers ───────────────────────────────────────────────────────────────────────
-
 fn page_align_down(addr: usize) -> usize { addr & !(PAGE_SIZE - 1) }
 
 /// Page-align `len` upward.  Returns `None` on overflow.
@@ -87,8 +85,6 @@ fn discharge_lock_bytes(bytes: usize) {
     });
 }
 
-// ── mlock ────────────────────────────────────────────────────────────────────────────
-
 /// `sys_mlock(addr, len)` — NR 149
 pub fn sys_mlock(addr: usize, len: usize) -> isize {
     sys_mlock2(addr, len, 0)
@@ -107,7 +103,6 @@ pub fn sys_mlock2(addr: usize, len: usize, _flags: u32) -> isize {
     let pid = current_pid();
 
     // ── Step 1: dry run — count newly-lockable bytes without touching flags.
-    //
     // We check the limit BEFORE marking any VMAs so there is no window
     // where another observer sees locked==true on pages whose charge was
     // subsequently rejected (TOCTOU fix).
@@ -143,8 +138,6 @@ pub fn sys_mlock2(addr: usize, len: usize, _flags: u32) -> isize {
     0
 }
 
-// ── munlock ───────────────────────────────────────────────────────────────────────────
-
 /// `sys_munlock(addr, len)` — NR 150
 pub fn sys_munlock(addr: usize, len: usize) -> isize {
     let (base, plen) = match align_range(addr, len) {
@@ -172,8 +165,6 @@ pub fn sys_munlock(addr: usize, len: usize) -> isize {
     discharge_lock_bytes(freed);
     0
 }
-
-// ── mlockall ─────────────────────────────────────────────────────────────────────────
 
 /// `sys_mlockall(flags)` — NR 151
 pub fn sys_mlockall(flags: u32) -> isize {
@@ -225,8 +216,6 @@ pub fn sys_mlockall(flags: u32) -> isize {
     }
     0
 }
-
-// ── munlockall ─────────────────────────────────────────────────────────────────────
 
 /// `sys_munlockall()` — NR 152
 pub fn sys_munlockall() -> isize {

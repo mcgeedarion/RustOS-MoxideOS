@@ -36,8 +36,6 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ─── NsId ─────────────────────────────────────────────────────────────────────
-
 /// Opaque namespace identifier (equivalent to Linux nsfs inode number).
 pub type NsId = u64;
 
@@ -53,8 +51,6 @@ pub fn alloc_ns_id() -> NsId {
     *n += 1;
     id
 }
-
-// ─── NsSet ────────────────────────────────────────────────────────────────────
 
 /// The full set of namespace references carried by a process.
 #[derive(Clone, Copy, Debug)]
@@ -77,8 +73,6 @@ impl NsSet {
         }
     }
 }
-
-// ─── Mount namespace table ────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct MountEntry {
@@ -135,8 +129,6 @@ pub fn drop_mount_ns(ns: NsId) {
     MOUNT_NS_TABLE.lock().entries.remove(&ns);
 }
 
-// ─── UTS namespace table ────────────────────────────────────────────────────
-
 static UTS_NS_TABLE:    Mutex<BTreeMap<NsId, String>> = Mutex::new(BTreeMap::new());
 static UTS_DOMAIN_TABLE: Mutex<BTreeMap<NsId, String>> = Mutex::new(BTreeMap::new());
 
@@ -178,8 +170,6 @@ pub fn uts_domainname(ns: NsId) -> String {
 pub fn uts_set_domainname(ns: NsId, name: String) {
     UTS_DOMAIN_TABLE.lock().insert(ns, name);
 }
-
-// ── sethostname / gethostname / setdomainname syscall implementations ─────────
 
 /// NR 170  sethostname(name, len)
 ///
@@ -244,8 +234,6 @@ pub fn sys_gethostname(buf_va: usize, len: usize) -> isize {
     0
 }
 
-// ─── ns_id_of / ns_symlink ────────────────────────────────────────────────────
-
 /// Look up the NsId for namespace `name` of process `pid`.
 /// Returns None if `pid` doesn't exist or `name` is unrecognised.
 pub fn ns_id_of(pid: usize, name: &str) -> Option<NsId> {
@@ -270,8 +258,6 @@ pub fn ns_symlink(pid: usize, name: &str) -> Option<String> {
     ns_id_of(pid, name).map(|id| format!("{}:[{}]", name, id))
 }
 
-// ─── nsfd helpers ────────────────────────────────────────────────────────────
-
 /// Base fd value for namespace fds (above real fds).
 pub const NSFD_FD_BASE: usize = 0x7000_0000;
 
@@ -295,8 +281,6 @@ pub fn ns_fd_open(pid: usize, name: &str) -> Option<usize> {
 pub fn nsfd_to_ns_id(fd: usize) -> Option<(String, NsId)> {
     NSFD_TABLE.lock().get(&fd).cloned()
 }
-
-// ─── setns ───────────────────────────────────────────────────────────────────
 
 /// Apply a namespace change to process `pid`.
 pub fn setns_apply(pid: usize, name: &str, ns_id: NsId) -> isize {
@@ -325,8 +309,6 @@ pub fn sys_setns(fd: usize, _nstype: i32) -> isize {
     let pid = crate::proc::scheduler::current_pid();
     setns_apply(pid, &name, ns_id)
 }
-
-// ─── unshare ─────────────────────────────────────────────────────────────────
 
 /// Allocate a fresh namespace of type `name` and attach it to process `pid`.
 ///
@@ -363,8 +345,6 @@ pub fn unshare_ns(pid: usize, name: &str) -> isize {
     }
     setns_apply(pid, name, new_id)
 }
-
-// ─── CLONE_NEW* flag constants ──────────────────────────────────────────────────
 
 const CLONE_NEWNS:   usize = 0x0002_0000; // mount
 const CLONE_NEWUTS:  usize = 0x0400_0000; // UTS

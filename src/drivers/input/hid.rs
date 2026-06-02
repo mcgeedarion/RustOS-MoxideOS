@@ -14,10 +14,6 @@ use alloc::vec::Vec;
 
 use crate::drivers::input::evdev::{self, EV_KEY, EV_REL, REL_X, REL_Y, REL_WHEEL, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
 
-// ---------------------------------------------------------------------------
-// HID usage pages
-// ---------------------------------------------------------------------------
-
 const UP_GENERIC_DESKTOP: u16 = 0x01;
 const UP_KEYBOARD:        u16 = 0x07;
 const UP_BUTTON:          u16 = 0x09;
@@ -48,10 +44,6 @@ const INP_CONST:   u32 = 1 << 0;
 const INP_VAR:     u32 = 1 << 1;
 const INP_REL:     u32 = 1 << 2;
 
-// ---------------------------------------------------------------------------
-// Field descriptor (one logical field in a report)
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug)]
 struct Field {
     usage_page: u16,
@@ -71,10 +63,6 @@ pub struct HidReport {
     /// True if any field is a keyboard-style key array
     pub is_keyboard: bool,
 }
-
-// ---------------------------------------------------------------------------
-// Descriptor parser
-// ---------------------------------------------------------------------------
 
 pub fn parse_descriptor(desc: &[u8]) -> HidReport {
     let mut fields      = Vec::new();
@@ -146,10 +134,6 @@ pub fn parse_descriptor(desc: &[u8]) -> HidReport {
     HidReport { fields, is_mouse, is_keyboard }
 }
 
-// ---------------------------------------------------------------------------
-// Report dispatcher
-// ---------------------------------------------------------------------------
-
 /// Decode a raw HID report `data` according to `report` and push events.
 pub fn dispatch(report: &HidReport, data: &[u8]) {
     let mut bit_off = 0usize;
@@ -192,10 +176,6 @@ pub fn dispatch(report: &HidReport, data: &[u8]) {
     }
     evdev::sync();
 }
-
-// ---------------------------------------------------------------------------
-// Bit extraction helpers
-// ---------------------------------------------------------------------------
 
 fn extract_bits(data: &[u8], bit_off: usize, bits: usize) -> u32 {
     if bits == 0 { return 0; }

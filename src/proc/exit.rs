@@ -31,8 +31,6 @@ use crate::proc::{scheduler, thread, wait};
 use crate::proc::wait::encode_exit;
 use crate::uaccess::copy_to_user;
 
-// ── clear_child_tid ──────────────────────────────────────────────────
-
 fn clear_child_tid(pid: usize) {
     let va = scheduler::with_proc_mut(pid, |p, pl| {
         let va = p.clear_child_tid_va;
@@ -45,8 +43,6 @@ fn clear_child_tid(pid: usize) {
     futex_wake_addr(va, 1);
 }
 
-// ── is_last_live_thread ─────────────────────────────────────────────────
-
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     scheduler::with_procs_ro(|pl_vec| {
         !pl_vec.iter().any(|pl| {
@@ -57,8 +53,6 @@ fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     })
 }
 
-// ── ns_exit ──────────────────────────────────────────────────────
-//
 // Called only when the last live thread in a thread group exits.
 // Tears down any private (non-INIT_NS) namespaces that have no other
 // living process using them.
@@ -86,23 +80,18 @@ fn ns_exit(pid: usize) {
         })
     };
 
-    // ── Net namespace ────────────────────────────────────────────────────────
     if ns.net != INIT_NS && !shared_by_other(ns.net, |p| p.ns.net) {
         crate::proc::net_ns::destroy_net_ns(ns.net);
     }
 
-    // ── Mount namespace ───────────────────────────────────────────────────────
     if ns.mnt != INIT_NS && !shared_by_other(ns.mnt, |p| p.ns.mnt) {
         crate::proc::namespace::drop_mount_ns(ns.mnt);
     }
 
-    // ── UTS namespace ────────────────────────────────────────────────────────
     if ns.uts != INIT_NS && !shared_by_other(ns.uts, |p| p.ns.uts) {
         crate::proc::namespace::drop_uts_ns(ns.uts);
     }
 }
-
-// ── zombify ────────────────────────────────────────────────────────────
 
 fn zombify(pid: usize, code: i32) -> usize {
     let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p, pl| {
@@ -117,8 +106,6 @@ fn zombify(pid: usize, code: i32) -> usize {
     vfork_parent
 }
 
-// ── do_exit ────────────────────────────────────────────────────────────
-
 pub fn do_exit(pid: usize, code: i32) {
     let tgid = thread::tgid_of(pid);
 
@@ -132,7 +119,6 @@ pub fn do_exit(pid: usize, code: i32) {
 
     crate::fs::process_fd::proc_fd_free(pid);
 
-    // ── cgroup exit hook (every thread) ──────────────────────────────────────
     crate::proc::cgroup::cgroup_exit(pid);
 
     let last = is_last_live_thread(pid, tgid);
@@ -151,14 +137,10 @@ pub fn do_exit(pid: usize, code: i32) {
     loop { <Arch as Cpu>::halt(); }
 }
 
-// ── sys_exit [NR 60] ────────────────────────────────────────────────────────
-
 pub fn sys_exit(status: i32) -> isize {
     do_exit(scheduler::current_pid(), status);
     0
 }
-
-// ── sys_exit_group [NR 231] ───────────────────────────────────────────────────
 
 pub fn sys_exit_group(status: i32) -> isize {
     let pid  = scheduler::current_pid();

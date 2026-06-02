@@ -42,8 +42,6 @@ use std::{
     process::{Command, exit},
 };
 
-// ─── target JSON paths ───────────────────────────────────────────────────────────────
-
 fn target_json(root: &PathBuf, arch: Arch, boot: Boot) -> PathBuf {
     let name = match (arch, boot) {
         (Arch::X86_64,  Boot::Uefi) => "x86_64-uefi-loader.json",
@@ -74,8 +72,6 @@ fn efi_boot_filename(arch: Arch) -> &'static str {
         Arch::AArch64 => "BOOTAA64.EFI",
     }
 }
-
-// ─── helpers ──────────────────────────────────────────────────────────────────────
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -145,8 +141,6 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
     }
 }
 
-// ─── CLI parsing ─────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Arch { RiscV64, X86_64, AArch64 }
 
@@ -202,8 +196,6 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
     }
     opts
 }
-
-// ─── device node table ────────────────────────────────────────────────────────────
 
 struct DevNode {
     path:  &'static str,
@@ -283,8 +275,6 @@ fn libc_getuid() -> u32 {
 #[cfg(not(unix))]
 fn libc_getuid() -> u32 { 1000 }
 
-// ─── mkinitramfs ────────────────────────────────────────────────────────────────────
-
 pub fn mkinitramfs(root: &PathBuf, arch: Arch) {
     let arch_str = match arch {
         Arch::X86_64  => "x86_64",
@@ -347,8 +337,6 @@ fn mkinitramfs_step(root: &PathBuf, arch: Arch) {
     eprintln!("[xtask] --initrd: building initramfs for {arch:?}...");
     mkinitramfs(root, arch);
 }
-
-// ─── build actions ────────────────────────────────────────────────────────────────
 
 fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) {
     let profile     = if opts.debug { "debug" } else { "release" };
@@ -449,8 +437,6 @@ fn build_aarch64_kernel(root: &PathBuf, debug: bool, initrd: bool, features: Opt
         root.join(format!("target/aarch64-kernel/{profile}/rustos")).display());
     if initrd { mkinitramfs_step(root, Arch::AArch64); }
 }
-
-// ─── image action ─────────────────────────────────────────────────────────────────
 
 fn image(root: &PathBuf, opts: &BuildOpts) {
     require_tool(&["mformat"],
@@ -595,8 +581,6 @@ fn bench_kernel(root: &PathBuf) {
     eprintln!("[xtask][bench-kernel] TODO: add mmap-fault microbench");
     eprintln!("[xtask][bench-kernel] baseline workflow complete");
 }
-
-// ─── entrypoint ──────────────────────────────────────────────────────────────────────
 
 fn main() {
     let mut args = env::args().skip(1);

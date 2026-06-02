@@ -38,11 +38,7 @@ use alloc::{
 use spin::Mutex;
 use crate::fs::vfs_ops::{KStat, KStatfs, DirEntry};
 
-// ── Magic number (matches Linux TMPFS_MAGIC) ─────────────────────────────────
-
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
-
-// ── Inode kind ───────────────────────────────────────────────────────────────
 
 enum TmpfsKind {
     Regular { data: Vec<u8> },
@@ -73,8 +69,6 @@ impl TmpfsNode {
     fn is_dir(&self)  -> bool { matches!(self.kind, TmpfsKind::Dir { .. }) }
     fn is_symlink(&self) -> bool { matches!(self.kind, TmpfsKind::Symlink { .. }) }
 }
-
-// ── Per-mount state ──────────────────────────────────────────────────────────
 
 struct TmpfsMount {
     size_limit: usize,   // bytes; 0 = unlimited
@@ -135,12 +129,8 @@ impl TmpfsMount {
     }
 }
 
-// ── Global mount table ───────────────────────────────────────────────────────
-
 static MOUNTS: Mutex<BTreeMap<String, TmpfsMount>> =
     Mutex::new(BTreeMap::new());
-
-// ── Mount ────────────────────────────────────────────────────────────────────
 
 /// Register a new tmpfs instance at `mount_point`.
 /// `size_limit` = 0 means 50 % of physical RAM.
@@ -156,8 +146,6 @@ pub fn tmpfs_mount(mount_point: &str, size_limit: usize) {
         } else { size_limit }
     );
 }
-
-// ── Path → mount-point resolver ──────────────────────────────────────────────
 
 /// Find the longest-prefix mount that owns `path`.
 /// Returns (mount_point, subpath_within_mount).
@@ -224,8 +212,6 @@ fn subpath(mount_point: &str, full_path: &str) -> String {
     }
 }
 
-// ── read_all ─────────────────────────────────────────────────────────────────
-
 pub fn tmpfs_read_all(path: &str) -> Result<Vec<u8>, isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
     let sub = subpath(&mp, path);
@@ -238,8 +224,6 @@ pub fn tmpfs_read_all(path: &str) -> Result<Vec<u8>, isize> {
         _ => Err(-21), // EISDIR
     }
 }
-
-// ── write_all ────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
@@ -294,16 +278,12 @@ fn drop_and_create(fs: &mut TmpfsMount, sub: &str, data: &[u8]) -> Result<u64, i
     Ok(ino)
 }
 
-// ── pread ─────────────────────────────────────────────────────────────────────
-
 pub fn tmpfs_pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let data = tmpfs_read_all(path)?;
     if offset >= data.len() { return Ok(Vec::new()); }
     let end = (offset + len).min(data.len());
     Ok(data[offset..end].to_vec())
 }
-
-// ── pwrite ────────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_pwrite(path: &str, offset: usize, new: &[u8]) -> Result<usize, isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
@@ -328,8 +308,6 @@ pub fn tmpfs_pwrite(path: &str, offset: usize, new: &[u8]) -> Result<usize, isiz
     }
 }
 
-// ── truncate ──────────────────────────────────────────────────────────────────
-
 pub fn tmpfs_truncate(path: &str, len: usize) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
     let sub = subpath(&mp, path);
@@ -353,8 +331,6 @@ pub fn tmpfs_truncate(path: &str, len: usize) -> Result<(), isize> {
     }
 }
 
-// ── create ────────────────────────────────────────────────────────────────────
-
 pub fn tmpfs_create(path: &str) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
     let sub = subpath(&mp, path);
@@ -363,8 +339,6 @@ pub fn tmpfs_create(path: &str) -> Result<(), isize> {
     if fs.lookup(&sub).is_ok() { return Ok(()); } // already exists
     drop_and_create(fs, &sub, &[]).map(|_| ())
 }
-
-// ── mkdir ─────────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_mkdir(path: &str) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
@@ -391,8 +365,6 @@ pub fn tmpfs_mkdir(path: &str) -> Result<(), isize> {
     Ok(())
 }
 
-// ── rmdir ─────────────────────────────────────────────────────────────────────
-
 pub fn tmpfs_rmdir(path: &str) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
     let sub = subpath(&mp, path);
@@ -415,8 +387,6 @@ pub fn tmpfs_rmdir(path: &str) -> Result<(), isize> {
     }
     Ok(())
 }
-
-// ── unlink ────────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_unlink(path: &str) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
@@ -448,8 +418,6 @@ pub fn tmpfs_unlink(path: &str) -> Result<(), isize> {
     Ok(())
 }
 
-// ── link (hard link) ──────────────────────────────────────────────────────────
-
 pub fn tmpfs_link(existing: &str, new: &str) -> Result<(), isize> {
     let mp = resolve_mp(existing).ok_or(-2isize)?;
     let sub_e = subpath(&mp, existing);
@@ -471,8 +439,6 @@ pub fn tmpfs_link(existing: &str, new: &str) -> Result<(), isize> {
     }
     Ok(())
 }
-
-// ── rename ────────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_rename(old: &str, new: &str) -> Result<(), isize> {
     let mp = resolve_mp(old).ok_or(-2isize)?;
@@ -516,8 +482,6 @@ pub fn tmpfs_rename(old: &str, new: &str) -> Result<(), isize> {
     Ok(())
 }
 
-// ── symlink / readlink ────────────────────────────────────────────────────────
-
 pub fn tmpfs_symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let mp = resolve_mp(link_path).ok_or(-2isize)?;
     let sub = subpath(&mp, link_path);
@@ -557,8 +521,6 @@ pub fn tmpfs_readlink(path: &str) -> Result<String, isize> {
     }
 }
 
-// ── stat ─────────────────────────────────────────────────────────────────────
-
 pub fn tmpfs_stat(path: &str) -> Result<KStat, isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
     let sub = subpath(&mp, path);
@@ -582,8 +544,6 @@ pub fn tmpfs_stat(path: &str) -> Result<KStat, isize> {
         is_dir:  node.is_dir(),
     })
 }
-
-// ── readdir ───────────────────────────────────────────────────────────────────
 
 pub fn tmpfs_readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
@@ -612,8 +572,6 @@ pub fn tmpfs_readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
     }
 }
 
-// ── chmod / chown ─────────────────────────────────────────────────────────────
-
 pub fn tmpfs_chmod(path: &str, mode: u16) -> Result<(), isize> {
     let mp = resolve_mp(path).ok_or(-2isize)?;
     let sub = subpath(&mp, path);
@@ -639,8 +597,6 @@ pub fn tmpfs_chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     }
     Ok(())
 }
-
-// ── statfs ────────────────────────────────────────────────────────────────────
 
 /// Return filesystem statistics for a path on a tmpfs mount.
 /// Called by sys_statfs / sys_fstatfs via vfs_ops::statfs().

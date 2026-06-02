@@ -18,8 +18,6 @@
 
 use super::lsm::{LsmHooks, LsmVerdict, LsmCtx, SOCK_RAW};
 
-// ─── Capability bit positions ─────────────────────────────────────────────────
-
 const CAP_DAC_OVERRIDE:    u64 = 1 << 1;
 const CAP_DAC_READ_SEARCH: u64 = 1 << 2;
 const CAP_FOWNER:          u64 = 1 << 3;
@@ -28,8 +26,6 @@ const CAP_SETGID:          u64 = 1 << 6;
 const CAP_KILL:            u64 = 1 << 5;
 const CAP_NET_RAW:         u64 = 1 << 13;
 const CAP_SYS_ADMIN:       u64 = 1 << 21;
-
-// ─── Mode bits ────────────────────────────────────────────────────────────────
 
 const S_IRUSR: u16 = 0o0400;
 const S_IWUSR: u16 = 0o0200;
@@ -208,14 +204,10 @@ impl LsmHooks for DacModule {
 
 pub static DAC_MODULE: DacModule = DacModule;
 
-// ─── CapSet::exec_transform (H1 fix) ─────────────────────────────────────────
-//
 // The original exec_transform was on capset.rs/CapSet; the formula is
 // re-exposed here as a free function so callers that build LsmCtx can use it.
 // The correct POSIX/Linux formula for the new permitted set is:
-//
 //   P' = (F_permitted | (F_inheritable & P_inheritable)) & P_permitted
-//
 // where F = file caps, P = process caps.
 // The old code used (F_permitted | F_inheritable) & P_permitted which omitted
 // the intersection with P_inheritable, letting any file-inheritable cap slip

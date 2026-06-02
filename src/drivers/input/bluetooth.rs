@@ -27,17 +27,9 @@ use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 
-// ---------------------------------------------------------------------------
-// HCI packet type indicators
-// ---------------------------------------------------------------------------
-
 const HCI_CMD:   u8 = 0x01;
 const HCI_ACL:   u8 = 0x02;
 const HCI_EVENT: u8 = 0x04;
-
-// ---------------------------------------------------------------------------
-// HCI opcodes (OGF << 10 | OCF)
-// ---------------------------------------------------------------------------
 
 const HCI_RESET:               u16 = 0x0C03;
 const HCI_READ_BD_ADDR:        u16 = 0x1009;
@@ -45,10 +37,6 @@ const HCI_LE_SET_SCAN_PARAMS:  u16 = 0x2043;
 const HCI_LE_SET_SCAN_ENABLE:  u16 = 0x2044;
 const HCI_LE_CREATE_CONN:      u16 = 0x200D;
 const HCI_LE_SET_EVENT_MASK:   u16 = 0x2001;
-
-// ---------------------------------------------------------------------------
-// HCI event codes
-// ---------------------------------------------------------------------------
 
 const EVT_CMD_COMPLETE:     u8 = 0x0E;
 const EVT_CMD_STATUS:       u8 = 0x0F;
@@ -59,10 +47,6 @@ const EVT_NUM_COMP_PKTS:    u8 = 0x13;
 // LE Meta subevent codes
 const LE_ADV_REPORT:        u8 = 0x02;
 const LE_CONN_COMPLETE:     u8 = 0x01;
-
-// ---------------------------------------------------------------------------
-// UART MMIO layout (16550-compatible)
-// ---------------------------------------------------------------------------
 
 const UART_RBR: usize = 0x00;
 const UART_THR: usize = 0x00;
@@ -77,16 +61,8 @@ const UART_DLH: usize = 0x01; // when DLAB=1
 const LSR_DR:  u8 = 1 << 0; // data ready
 const LSR_THRE:u8 = 1 << 5; // transmitter holding register empty
 
-// ---------------------------------------------------------------------------
-// BD_ADDR
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BdAddr(pub [u8; 6]);
-
-// ---------------------------------------------------------------------------
-// Driver state
-// ---------------------------------------------------------------------------
 
 struct BtState {
     uart:       usize,   // MMIO base
@@ -102,10 +78,6 @@ struct BtState {
 }
 
 static BT: Mutex<Option<BtState>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Initialise the Bluetooth HCI over UART at `uart_base`.
 /// Performs controller reset and LE scan setup.
@@ -127,10 +99,6 @@ pub fn poll() {
 pub fn bd_addr() -> BdAddr {
     BT.lock().as_ref().map(|s| s.bd_addr).unwrap_or_default()
 }
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
 
 unsafe fn _init(uart: usize) {
     // Configure UART: 115200 baud, 8N1 (assumes 1.8432 MHz clock)
@@ -178,10 +146,6 @@ unsafe fn _init(uart: usize) {
         s.initialised = true;
     }
 }
-
-// ---------------------------------------------------------------------------
-// Polling
-// ---------------------------------------------------------------------------
 
 unsafe fn _poll() {
     loop {
@@ -272,10 +236,6 @@ fn handle_event(st: &mut BtState, pkt: &[u8]) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Command helpers
-// ---------------------------------------------------------------------------
-
 unsafe fn send_cmd(uart: usize, opcode: u16, params: &[u8]) {
     uart_putb(uart, HCI_CMD);
     uart_putb(uart, (opcode & 0xFF) as u8);
@@ -302,10 +262,6 @@ unsafe fn wait_cmd_complete(uart: usize, opcode: u16) {
         core::hint::spin_loop();
     }
 }
-
-// ---------------------------------------------------------------------------
-// UART helpers
-// ---------------------------------------------------------------------------
 
 #[inline]
 unsafe fn uart_read(base: usize, off: usize) -> u8 {

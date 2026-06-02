@@ -15,20 +15,12 @@
 extern crate alloc;
 use crate::drivers::input::evdev;
 
-// ---------------------------------------------------------------------------
-// i8042 port constants
-// ---------------------------------------------------------------------------
-
 const PS2_DATA:   u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;
 const PS2_CMD:    u16 = 0x64;
 
 const STATUS_OBF: u8 = 1 << 0; // output buffer full (data ready to read)
 const STATUS_IBF: u8 = 1 << 1; // input  buffer full (do not write yet)
-
-// ---------------------------------------------------------------------------
-// Scancode set 1 → HID keycode table
-// ---------------------------------------------------------------------------
 
 // Index = scancode (0x00..0x7F), value = HID usage id (or 0 = undefined).
 #[rustfmt::skip]
@@ -55,10 +47,6 @@ static SC1_EXT_TO_HID: [u16; 128] = [
  /*60*/ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
  /*70*/ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
-
-// ---------------------------------------------------------------------------
-// HID keycode → ASCII (printable, unshifted)
-// ---------------------------------------------------------------------------
 
 #[rustfmt::skip]
 static HID_TO_ASCII: [u8; 256] = [
@@ -93,10 +81,6 @@ static HID_TO_ASCII: [u8; 256] = [
   0, /* RMeta */
 ];
 
-// ---------------------------------------------------------------------------
-// Modifier tracking
-// ---------------------------------------------------------------------------
-
 use spin::Mutex;
 
 struct KbdState {
@@ -109,10 +93,6 @@ struct KbdState {
 static STATE: Mutex<KbdState> = Mutex::new(KbdState {
     extended: false, lshift: false, rshift: false, capslock: false,
 });
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Process one raw PS/2 scancode byte.
 /// Called from the keyboard IRQ handler (IRQ 1 on x86, PLIC source on RISC-V).
@@ -197,10 +177,6 @@ pub fn read_char() -> u8 {
         core::hint::spin_loop();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Low-level PS/2 I/O
-// ---------------------------------------------------------------------------
 
 #[inline]
 pub fn init() {

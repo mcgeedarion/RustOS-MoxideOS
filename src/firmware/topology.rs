@@ -35,7 +35,6 @@ pub fn set_boot_mpidr(mpidr: u64) {
 pub fn secondary_mpidrs() -> Vec<u64> {
     let boot = BOOT_MPIDR.load(Ordering::Relaxed) as u64;
 
-    // ─ ACPI MADT path ───────────────────────────────────────────────────
     let mut from_madt = Vec::new();
     unsafe {
         crate::firmware::acpi::walk_madt(|hdr, ptr| {
@@ -73,7 +72,6 @@ pub fn secondary_mpidrs() -> Vec<u64> {
         return from_madt;
     }
 
-    // ─ QEMU virt fallback: assume 4 CPUs, Aff0 = 0..3 ──────────────────────
     // CPU count can be overridden by calling set_cpu_count() from DTB parsing.
     let count = CPU_COUNT.load(Ordering::Relaxed);
     if count <= 1 {

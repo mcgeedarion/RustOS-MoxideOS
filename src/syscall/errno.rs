@@ -17,7 +17,6 @@
 //! return efault();
 //! ```
 
-// ── Standard POSIX errno values ──────────────────────────────────────────────────────────────────
 pub const EPERM:    i32 = 1;
 pub const ENOENT:   i32 = 2;
 pub const ESRCH:    i32 = 3;
@@ -44,8 +43,6 @@ pub const EMSGSIZE: i32 = 90;
 pub const EOVERFLOW: i32 = 75;
 pub const ENOTSUP:  i32 = 95;
 
-// ── Convenience isize helpers (used in dispatch return positions) ───────────────────────────────────
-//
 // These inline functions avoid the repetitive `-(EXXX as isize)` cast
 // pattern throughout the dispatcher.  Each is named after its errno.
 

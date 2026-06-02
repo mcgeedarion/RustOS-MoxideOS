@@ -17,10 +17,6 @@ use spin::Mutex;
 
 use crate::drivers::input::evdev::{self, InputEvent};
 
-// ---------------------------------------------------------------------------
-// Virtio MMIO register offsets
-// ---------------------------------------------------------------------------
-
 const MMIO_MAGIC:        usize = 0x000;
 const MMIO_VERSION:      usize = 0x004;
 const MMIO_DEVICE_ID:    usize = 0x008;
@@ -50,10 +46,6 @@ const DEVICE_ID_INPUT: u32 = 18;
 const MAGIC_VALUE:     u32 = 0x7472_6976;
 
 const QSZ: usize = 64;
-
-// ---------------------------------------------------------------------------
-// Virtqueue structures
-// ---------------------------------------------------------------------------
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
@@ -100,10 +92,6 @@ struct Vq {
     last_used: u16,
 }
 
-// ---------------------------------------------------------------------------
-// Per-device state
-// ---------------------------------------------------------------------------
-
 struct VirtioInput {
     base:  usize,
     eventq: Vq,
@@ -113,10 +101,6 @@ unsafe impl Send for VirtioInput {}
 unsafe impl Sync for VirtioInput {}
 
 static DEVS: Mutex<Vec<VirtioInput>> = Mutex::new(Vec::new());
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Initialise one virtio-input MMIO device at `mmio_base`.
 pub fn init(mmio_base: u64) {
@@ -133,10 +117,6 @@ pub fn poll() {
 pub fn is_initialised() -> bool {
     !DEVS.lock().is_empty()
 }
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
 
 unsafe fn _init(base: usize) {
     if read32(base, MMIO_MAGIC) != MAGIC_VALUE { return; }
@@ -160,10 +140,6 @@ unsafe fn _init(base: usize) {
     refill_eventq(&mut dev.eventq, base);
     DEVS.lock().push(dev);
 }
-
-// ---------------------------------------------------------------------------
-// Polling
-// ---------------------------------------------------------------------------
 
 unsafe fn _poll() {
     let mut devs = DEVS.lock();
@@ -192,10 +168,6 @@ unsafe fn _poll() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Virtqueue helpers
-// ---------------------------------------------------------------------------
 
 unsafe fn setup_queue(base: usize, q: u32) -> Vq {
     write32(base, MMIO_QUEUE_SEL, q);

@@ -40,10 +40,6 @@ pub enum DriverSysError {
     BadAddress       = -14,
 }
 
-// ---------------------------------------------------------------------------
-// sys_driver_bind
-// ---------------------------------------------------------------------------
-
 /// Claim ownership of a PCI device identified by its BDF (Bus/Device/Function)
 /// encoded as `(bus << 16) | (dev << 8) | func`.
 ///
@@ -88,10 +84,6 @@ pub fn sys_driver_bind(bdf: u32, cap_flags: u32) -> Result<DriverHandle, DriverS
                 proc.pid(), bdf, handle);
     Ok(handle)
 }
-
-// ---------------------------------------------------------------------------
-// sys_dma_alloc
-// ---------------------------------------------------------------------------
 
 /// Allocate a physically contiguous DMA buffer and map it into the calling
 /// process's address space.
@@ -143,10 +135,6 @@ pub fn sys_dma_alloc(
                 proc.pid(), size, phys, virt_user);
     Ok((virt_user, phys))
 }
-
-// ---------------------------------------------------------------------------
-// sys_irq_subscribe
-// ---------------------------------------------------------------------------
 
 /// Route hardware interrupts for `irq` as `IrqNotification` messages to
 /// `endpoint` instead of running a kernel ISR.

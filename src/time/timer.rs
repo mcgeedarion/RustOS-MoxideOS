@@ -39,10 +39,6 @@ use crate::time::{Timespec, read_monotonic_ns, NSEC_PER_SEC};
 /// to indicate the request time is an absolute deadline.
 pub const TIMER_ABSTIME: i32 = 1;
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Timer wheel
-// ───────────────────────────────────────────────────────────────────────────────
-
 pub type TimerCallback = fn(u64); // arg is the timer ID
 
 /// A pending kernel timer.
@@ -122,10 +118,6 @@ pub fn expire_timers() {
     if let Some(w) = WHEEL.lock().as_mut() { w.expire(now); }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// clock_nanosleep (kernel-internal helper)
-// ───────────────────────────────────────────────────────────────────────────────
-
 /// Kernel-internal helper: sleep until `deadline_ns` on CLOCK_MONOTONIC.
 ///
 /// Used by drivers and kernel threads that already have an absolute
@@ -151,10 +143,6 @@ pub fn clock_nanosleep(
 pub fn nanosleep(req: Timespec) -> Result<(), isize> {
     clock_nanosleep(crate::time::clock::CLOCK_MONOTONIC, 0, req)
 }
-
-// ───────────────────────────────────────────────────────────────────────────────
-// POSIX interval timers  (setitimer / getitimer)
-// ───────────────────────────────────────────────────────────────────────────────
 
 pub const ITIMER_REAL:    u32 = 0; // SIGALRM on expiry
 pub const ITIMER_VIRTUAL: u32 = 1; // SIGVTALRM (user-time only)

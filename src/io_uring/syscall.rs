@@ -42,8 +42,6 @@ use crate::sync::wait_queue::{WakeReason, CancellationToken};
 use crate::uaccess::{copy_from_user, copy_to_user};
 use alloc::sync::Arc;
 
-// ── IORING_REGISTER opcodes ───────────────────────────────────────────────────
-
 const IORING_REGISTER_BUFFERS:           u32 = 0;
 const IORING_UNREGISTER_BUFFERS:         u32 = 1;
 const IORING_REGISTER_FILES:             u32 = 2;
@@ -151,7 +149,6 @@ pub fn sys_io_uring_enter(
     let pid = scheduler::current_pid() as u32;
     let Some(ring_idx) = ring::ring_idx_for_fd(pid, fd) else { return -9; };
 
-    // ── Phase 1: submit SQEs ──────────────────────────────────────────────────
     let sqes          = ring::with_ring(ring_idx, |r| r.drain_sq()).unwrap_or_default();
     let submit_count  = (to_submit as usize).min(sqes.len());
     let mut submitted = 0u32;
@@ -163,7 +160,6 @@ pub fn sys_io_uring_enter(
         submitted += 1;
     }
 
-    // ── Phase 2: wait for completions (GETEVENTS) ─────────────────────────────
     if flags & ops::IORING_ENTER_GETEVENTS != 0 && min_complete > 0 {
         // Clone the wait queue Arc before entering the wait so we never hold
         // the RING_TABLE lock while sleeping.

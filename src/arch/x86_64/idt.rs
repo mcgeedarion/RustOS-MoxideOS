@@ -82,8 +82,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::spinlock::SpinLock;
 
-// ── Public frame type passed to every handler ─────────────────────────────
-
 /// CPU + GPR state at the time of an interrupt or exception.
 ///
 /// The struct is `repr(C)` and matches the exact stack layout described in
@@ -117,8 +115,6 @@ pub struct InterruptFrame {
     pub ss:     u64,
 }
 
-// ── Dynamic handler registry ──────────────────────────────────────────────
-
 pub type IrqHandler = fn(&mut InterruptFrame);
 
 static IRQ_HANDLERS: SpinLock<[Option<IrqHandler>; 256]> =
@@ -136,8 +132,6 @@ pub fn register_irq(vector: u8, handler: IrqHandler) {
 pub fn unregister_irq(vector: u8) {
     IRQ_HANDLERS.lock()[vector as usize] = None;
 }
-
-// ── Macro: full GPR save/restore ─────────────────────────────────────────
 
 macro_rules! push_all {
     () => { concat!(
@@ -179,8 +173,6 @@ macro_rules! pop_all {
     )}
 }
 
-// ── IDT gate descriptor (16 bytes, Intel SDM Vol.3 §6.14.1) ──────────────
-
 const GATE_INT:  u8 = 0x8E; // Present | DPL=0 | 64-bit interrupt gate (IF cleared)
 const GATE_TRAP: u8 = 0x8F; // Present | DPL=0 | 64-bit trap gate     (IF preserved)
 
@@ -221,8 +213,6 @@ struct IdtPointer { limit: u16, base: u64 }
 static mut IDT: [IdtEntry; 256] = [IdtEntry::zero(); 256];
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 
-// ── Public init ───────────────────────────────────────────────────────────
-
 /// Build and load the IDT on the BSP.
 ///
 /// **Must** be called after `gdt_init()` because the TSS (and therefore IST
@@ -231,7 +221,6 @@ static IDT_LOADED: AtomicBool = AtomicBool::new(false);
 pub fn idt_init() {
     if IDT_LOADED.swap(true, Ordering::SeqCst) { return; }
     unsafe {
-        // ── Exceptions without CPU-pushed error code (stub pushes 0) ────────
         IDT[ 0].set(exc_noerr_asm:: <0>  as usize, GATE_INT,  0); // #DE
         IDT[ 4].set(exc_noerr_asm:: <4>  as usize, GATE_INT,  0); // #OF
         IDT[ 5].set(exc_noerr_asm:: <5>  as usize, GATE_INT,  0); // #BR
@@ -242,7 +231,6 @@ pub fn idt_init() {
         IDT[19].set(exc_noerr_asm::<19>  as usize, GATE_INT,  0); // #XM
         IDT[20].set(exc_noerr_asm::<20>  as usize, GATE_INT,  0); // #VE
 
-        // ── Exceptions with CPU-pushed error code ─────────────────────────
         IDT[10].set(exc_err_asm::<10>    as usize, GATE_INT,  0); // #TS
         IDT[11].set(exc_err_asm::<11>    as usize, GATE_INT,  0); // #NP
         IDT[12].set(exc_err_asm::<12>    as usize, GATE_INT,  0); // #SS
@@ -250,7 +238,6 @@ pub fn idt_init() {
         IDT[17].set(exc_err_asm::<17>    as usize, GATE_INT,  0); // #AC
         IDT[21].set(exc_err_asm::<21>    as usize, GATE_INT,  0); // #CP
 
-        // ── Special / IST-switched exceptions ───────────────────────────
         IDT[ 1].set(db_asm              as usize, GATE_TRAP, 0); // #DB  (trap gate)
         IDT[ 2].set(nmi_asm             as usize, GATE_INT,  1); // #NMI IST1
         IDT[ 3].set(bp_asm              as usize, GATE_TRAP, 0); // #BP  (trap gate)
@@ -263,7 +250,6 @@ pub fn idt_init() {
             IDT[v as usize].set(exc_noerr_asm::<255> as usize, GATE_INT, 0);
         }
 
-        // ── IRQ vectors 32–239: generic per-vector stubs ─────────────────
         // Each stub bakes N into `mov rsi, N` so generic_irq_dispatch
         // receives the correct vector number.  The IPI range (0xF0–0xFE)
         // benefits from this: apic::register_ipi_handlers() uses
@@ -513,8 +499,6 @@ pub fn load() {
     }
 }
 
-// ── Generic IRQ dispatch (vectors 33–255) ─────────────────────────────────
-
 #[no_mangle]
 pub extern "C" fn generic_irq_dispatch(frame: &mut InterruptFrame, vector: u64) {
     let v = vector as usize;
@@ -526,8 +510,6 @@ pub extern "C" fn generic_irq_dispatch(frame: &mut InterruptFrame, vector: u64) 
         crate::arch::x86_64::apic::send_eoi();
     }
 }
-
-// ── Exception C handlers ──────────────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn generic_exception_handler(frame: &mut InterruptFrame, vector: u64) {
@@ -557,16 +539,13 @@ pub extern "C" fn nmi_handler(frame: &mut InterruptFrame) {
 }
 
 // ── #DB handler — single-step (RFLAGS.TF) and hardware breakpoints/watchpoints
-//
 // Called for:
 //   • Single-step: RFLAGS.TF was set by rsp_x86_64::step_set_tf()
 //   • Hardware BP/watchpoint: DR0–DR3 triggered via DR7
-//
 // When the gdbstub feature is active:
 //   1. Clear RFLAGS.TF from the *saved* frame so iretq does not re-arm it.
 //   2. Clear DR6 (status register) so the next #DB isn't a false positive.
 //   3. Notify the GDB session that the target has stopped.
-//
 // When gdbstub is not active fall through to generic_exception_handler.
 
 const RFLAGS_TF: u64 = 1 << 8;
@@ -598,7 +577,6 @@ pub unsafe extern "C" fn db_handler(frame: *mut InterruptFrame) {
 }
 
 // ── #BP handler — INT3 / software breakpoint (0xCC)
-//
 // The CPU does NOT decrement RIP after a trap-gate #BP — RIP already points
 // past the 0xCC byte.  We rewind by 1 so GDB sees the address of the
 // breakpoint instruction itself (matching the address stored in SwBreakpointTable).
@@ -649,8 +627,6 @@ pub extern "C" fn page_fault_handler(frame: &mut InterruptFrame, faulting_va: u6
     loop { crate::arch::api::Cpu::halt(); }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────
-
 fn dump_registers(f: &InterruptFrame) {
     crate::console::println!(
         "  rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}",
@@ -676,8 +652,6 @@ static EXCEPTION_NAMES: &[&str] = &[
     "DF",  "?9",  "TS",  "NP",  "SS",  "GP",  "PF",  "?15",
     "MF",  "AC",  "MC",  "XM",  "VE",  "CP",
 ];
-
-// ── ASM stubs ─────────────────────────────────────────────────────────────
 
 #[naked]
 unsafe extern "C" fn exc_noerr_asm<const N: u64>() {

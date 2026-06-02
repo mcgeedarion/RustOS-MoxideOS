@@ -37,7 +37,6 @@ fn strip_proc_pid(path: &str) -> Option<(usize, &str)> {
 fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
     let mut out = Vec::new();
 
-    // ── /proc/<pid>/ns  ──────────────────────────────────────────────────────────
     // Synthesise 7 symlink dirents for `ls /proc/self/ns/`.
     if let Some((pid, rest)) = strip_proc_pid(path) {
         if rest == "/ns" || rest == "/ns/" {
@@ -54,7 +53,6 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
         }
     }
 
-    // ── /proc/<N>  directory ────────────────────────────────────────────────
     // Emit a minimal set of well-known entries so that `ls /proc/self/`
     // returns something useful.
     if let Some((_pid, "")) = strip_proc_pid(path) {
@@ -68,7 +66,6 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
         return out;
     }
 
-    // ── ext2 real directory ────────────────────────────────────────────────────
     if let Some(ino) = crate::fs::ext2::stat(path) {
         if crate::fs::ext2::is_dir(path) {
             if let Some(entries) = crate::fs::ext2::readdir(ino) {
@@ -84,7 +81,6 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
         }
     }
 
-    // ── VFS fallback ─────────────────────────────────────────────────────────
     let prefix = if path == "/" { alloc::string::String::new() } else {
         alloc::format!("{}/", path.trim_end_matches('/'))
     };
