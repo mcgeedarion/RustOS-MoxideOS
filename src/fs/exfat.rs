@@ -22,8 +22,6 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Boot sector field offsets ─────────────────────────────────────────────────
-
 const BS_JUMP_BOOT:            usize = 0;    // 3 bytes
 const BS_OEM_NAME:             usize = 3;    // 8 bytes, must be "EXFAT   "
 const BS_BYTES_PER_SECTOR_POW: usize = 108;  // u8: 2^n bytes per sector (9..12)
@@ -54,8 +52,6 @@ const DENTRY_FILE_NAME:        u8 = 0xC1; // file name extension
 // File attribute bits (same as FAT)
 const ATTR_DIRECTORY: u16 = 0x0010;
 
-// ── Volume state ─────────────────────────────────────────────────────────────
-
 struct ExfatVol {
     data:             Vec<u8>,
     bytes_per_sector: usize,
@@ -67,8 +63,6 @@ struct ExfatVol {
 }
 
 static VOL: Mutex<Option<ExfatVol>> = Mutex::new(None);
-
-// ── Sector / cluster I/O ──────────────────────────────────────────────────────
 
 impl ExfatVol {
     fn sector_bytes(&self, sector: usize) -> Option<&[u8]> {
@@ -143,8 +137,6 @@ impl ExfatVol {
     }
 }
 
-// ── Directory entry parsing ───────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 struct DirEntry {
     name:          String,
@@ -215,8 +207,6 @@ fn parse_dir_entries(data: &[u8]) -> Vec<DirEntry> {
     entries
 }
 
-// ── Path resolution ───────────────────────────────────────────────────────────
-
 fn resolve_path(vol: &ExfatVol, path: &str) -> Option<DirEntry> {
     let components: Vec<&str> = path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     let mut cur_cluster = vol.root_cluster;
@@ -240,8 +230,6 @@ fn resolve_path(vol: &ExfatVol, path: &str) -> Option<DirEntry> {
     }
     None
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Mount an exFAT volume from a raw byte slice.
 /// Returns true if the boot sector OEM name is "EXFAT   ".

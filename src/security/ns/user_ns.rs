@@ -81,8 +81,6 @@ impl UserNs {
         }
     }
 
-    // ── uid_map write (/proc/self/uid_map) ──────────────────────────────────
-
     /// Write the uid_map.  Only allowed once, before any threads have been
     /// created in the namespace.
     pub fn write_uid_map(&self, entries: Vec<IdMapEntry>) -> Result<(), isize> {
@@ -105,8 +103,6 @@ impl UserNs {
 
     pub fn deny_setgroups(&self) { *self.setgroups_deny.lock() = true; }
     pub fn setgroups_denied(&self) -> bool { *self.setgroups_deny.lock() }
-
-    // ── ID translation ──────────────────────────────────────────────────────
 
     /// Translate a namespace-local UID to the host UID.
     pub fn ns_uid_to_host(&self, ns_uid: u32) -> Option<u32> {
@@ -135,8 +131,6 @@ impl UserNs {
         None
     }
 
-    // ── Capability check ────────────────────────────────────────────────────
-
     /// Check if processes inside this UserNs have a capability.
     /// `cap_bit` is the Linux capability index (0-63).
     pub fn has_cap(&self, cap_bit: u8) -> bool {
@@ -146,8 +140,6 @@ impl UserNs {
 
     pub fn caps(&self) -> CapSet { self.ns_caps.lock().clone() }
     pub fn set_caps(&self, caps: CapSet) { *self.ns_caps.lock() = caps; }
-
-    // ── /proc output helpers ────────────────────────────────────────────────
 
     pub fn uid_map_snapshot(&self) -> Vec<IdMapEntry> { self.uid_map.lock().clone() }
     pub fn gid_map_snapshot(&self) -> Vec<IdMapEntry> { self.gid_map.lock().clone() }

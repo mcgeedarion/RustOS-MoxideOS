@@ -44,8 +44,6 @@ fn shm_path(name: &str) -> Option<String> {
     Some(alloc::format!("/dev/shm/{}", name))
 }
 
-// ── shm_open ─────────────────────────────────────────────────────────────────────
-
 /// Open (or create) a POSIX shared memory object.
 ///
 /// Equivalent to `open("/dev/shm/<name>", oflag, mode)` with some
@@ -92,8 +90,6 @@ pub fn shm_open(name: &str, oflag: u32, _mode: u32) -> isize {
         Err(e)  => e as isize,
     }
 }
-
-// ── shm_unlink ───────────────────────────────────────────────────────────────────
 
 /// Remove a POSIX shared memory object.
 ///

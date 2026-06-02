@@ -18,7 +18,6 @@ use alloc::{string::String, vec::Vec};
 use spin::Mutex;
 use crate::security::ns::alloc_ns_id;
 
-// ─── IFF flags (match Linux UAPI) ────────────────────────────────────────────
 pub mod iff {
     pub const UP:        u32 = 1;
     pub const BROADCAST: u32 = 2;

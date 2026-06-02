@@ -28,10 +28,6 @@ use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Register offsets
-// ─────────────────────────────────────────────────────────────────────────────
-
 const GPIO_INPUT_VAL:  usize = 0x00;
 const GPIO_INPUT_EN:   usize = 0x04;
 const GPIO_OUTPUT_EN:  usize = 0x08;
@@ -48,19 +44,11 @@ const GPIO_IOF_EN:     usize = 0x30;
 const GPIO_IOF_SEL:    usize = 0x34;
 const GPIO_OUT_XOR:    usize = 0x38;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Maximum number of GPIO banks the driver manages.
 pub const MAX_BANKS: usize = 4;
 
 /// Pins per bank.
 pub const PINS_PER_BANK: u8 = 32;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Bank descriptor
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct GpioBank {
@@ -73,10 +61,6 @@ pub struct GpioBank {
 }
 
 static BANKS: Mutex<Vec<GpioBank>> = Mutex::new(Vec::new());
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Low-level helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[inline]
 unsafe fn gpio_read(base: usize, off: usize) -> u32 {
@@ -100,10 +84,6 @@ unsafe fn gpio_clear_bits(base: usize, off: usize, mask: u32) {
     gpio_write(base, off, v & !mask);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bank registration
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Register a GPIO bank.  Called at boot from the platform init code.
 /// Returns the bank index, or None if `MAX_BANKS` is exceeded.
 pub fn register_bank(bank: GpioBank) -> Option<usize> {
@@ -118,10 +98,6 @@ pub fn register_bank(bank: GpioBank) -> Option<usize> {
 pub fn banks() -> Vec<GpioBank> {
     BANKS.lock().clone()
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Pin direction
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Configure pin `pin` on `bank` as an output.
 pub fn set_output(bank: usize, pin: u8) {
@@ -155,10 +131,6 @@ pub fn set_iof(bank: usize, pin: u8, iof: u8) {
         gpio_set_bits(base, GPIO_IOF_EN, 1 << pin);
     });
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Output drive
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Drive pin `pin` on `bank` high.
 pub fn set_high(bank: usize, pin: u8) {
@@ -200,10 +172,6 @@ pub fn set_polarity_invert(bank: usize, pin: u8, invert: bool) {
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Input read
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Read the current level of pin `pin` on `bank`.
 /// Returns None if the bank index is invalid.
 pub fn read(bank: usize, pin: u8) -> Option<bool> {
@@ -219,10 +187,6 @@ pub fn read_all(bank: usize) -> Option<u32> {
     let b = banks.get(bank)?;
     Some(unsafe { gpio_read(b.mmio_base, GPIO_INPUT_VAL) })
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Interrupt control
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IrqTrigger {
@@ -281,10 +245,6 @@ pub fn irq_pending(bank: usize) -> Option<(u32, u32, u32, u32)> {
         Some((rise, fall, high, low))
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helper
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn with_bank<F: FnOnce(usize)>(bank: usize, f: F) {
     let banks = BANKS.lock();

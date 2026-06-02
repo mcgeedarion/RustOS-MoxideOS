@@ -37,8 +37,6 @@ use spin::Mutex;
 use crate::proc::scheduler::{current_pid, with_proc};
 use crate::proc::rlimit::{RLIMIT_LOCKS, RLIM_INFINITY};
 
-// ── Linux ABI constants ───────────────────────────────────────────────────────
-
 // flock(2) operations
 pub const LOCK_SH: i32 = 1;
 pub const LOCK_EX: i32 = 2;
@@ -55,8 +53,6 @@ pub const F_GETLK:  i32 = 5;
 pub const F_SETLK:  i32 = 6;
 pub const F_SETLKW: i32 = 7;
 
-// ── struct flock (Linux x86_64 ABI) ──────────────────────────────────────────
-
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Flock {
@@ -67,8 +63,6 @@ pub struct Flock {
     pub l_len:    i64,
     pub l_pid:    u32,
 }
-
-// ── Internal representation ───────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 struct LockEntry {
@@ -89,8 +83,6 @@ type InodeLocks = Vec<LockEntry>;
 // Global lock table: inode_id -> list of locks on that inode.
 static LOCK_TABLE: Mutex<BTreeMap<u64, InodeLocks>> = Mutex::new(BTreeMap::new());
 
-// ── RLIMIT_LOCKS accounting ───────────────────────────────────────────────────
-
 /// Returns the current lock count held by `pid` across all inodes.
 fn count_locks_for(pid: usize) -> usize {
     let tbl = LOCK_TABLE.lock();
@@ -107,8 +99,6 @@ fn check_lock_limit(pid: usize) -> isize {
     if current >= soft { -37 } else { 0 } // ENOLCK
 }
 
-// ── Conflict detection ────────────────────────────────────────────────────────
-
 /// True if `a` and `b` overlap in byte range.
 fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
     a_start < b_end && b_start < a_end
@@ -123,8 +113,6 @@ fn conflicts(entry: &LockEntry, pid: usize, ltype: i16, start: u64, end: u64) ->
     if entry.ltype == F_RDLCK && ltype == F_RDLCK { return false; }
     true
 }
-
-// ── flock(2) ──────────────────────────────────────────────────────────────────
 
 /// `sys_flock(fd, operation)` — NR 73
 ///
@@ -185,8 +173,6 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
         crate::proc::scheduler::schedule();
     }
 }
-
-// ── fcntl POSIX record locks ───────────────────────────────────────────────────
 
 /// Handle `fcntl(fd, F_GETLK / F_SETLK / F_SETLKW, flock_ptr)`.
 ///
@@ -290,8 +276,6 @@ pub fn release_bsd_lock(pid: usize, inode_id: u64) {
         list.retain(|e| !(e.pid == pid && e.is_bsd));
     }
 }
-
-// ── Range calculation ─────────────────────────────────────────────────────────
 
 fn lock_range(fl: &Flock) -> (u64, u64) {
     // For simplicity: treat l_whence=SEEK_SET (0) only.

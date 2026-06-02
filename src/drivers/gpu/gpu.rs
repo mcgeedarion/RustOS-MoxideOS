@@ -21,10 +21,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DisplayInfo {
     pub width:  u32,
@@ -32,10 +28,6 @@ pub struct DisplayInfo {
     pub pitch:  u32,   // bytes per row
     pub bpp:    u8,    // bits per pixel
 }
-
-// ---------------------------------------------------------------------------
-// Backend enum
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Backend {
@@ -47,10 +39,6 @@ enum Backend {
 }
 
 static BACKEND: Mutex<Backend> = Mutex::new(Backend::None);
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
 
 pub fn init_virtio(mmio_base: u64) {
     crate::drivers::gpu::virtio_gpu::init(mmio_base);
@@ -76,10 +64,6 @@ pub fn is_initialised() -> bool {
     *BACKEND.lock() != Backend::None
 }
 
-// ---------------------------------------------------------------------------
-// Display info
-// ---------------------------------------------------------------------------
-
 pub fn display_info() -> Option<DisplayInfo> {
     match *BACKEND.lock() {
         Backend::VirtioGpu => crate::drivers::gpu::virtio_gpu::display_info(),
@@ -89,10 +73,6 @@ pub fn display_info() -> Option<DisplayInfo> {
         Backend::None      => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Drawing primitives
-// ---------------------------------------------------------------------------
 
 /// Fill the entire framebuffer with `argb` colour.
 pub fn clear(argb: u32) {
@@ -145,10 +125,6 @@ pub fn draw_str(mut x: u32, y: u32, s: &str, fg: u32, bg: u32) {
         x += 8;
     }
 }
-
-// ---------------------------------------------------------------------------
-// 8x16 bitmap font (CP437 subset, first 128 glyphs)
-// ---------------------------------------------------------------------------
 
 fn font_glyph(c: u8) -> &'static [u8; 16] {
     &FONT8X16[c.min(127) as usize]

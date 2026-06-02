@@ -15,8 +15,6 @@ use super::signal_nr::{SIGKILL, SIGSTOP};
 
 pub(super) const AT_FDCWD_STUBS: i32 = -100;
 
-// ─── path resolution helper ──────────────────────────────────────────────────
-
 pub(super) fn resolve_at_path_for_stubs(dirfd: i32, path_va: usize) -> Result<String, isize> {
     crate::fs::at_path::resolve_at(dirfd, path_va)
 }
@@ -28,8 +26,6 @@ fn copy_to_user(dst_va: usize, src: &[u8]) -> Result<(), ()> {
 fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
     crate::mm::uaccess::copy_from_user(dst, src_va)
 }
-
-// ─── getcwd ──────────────────────────────────────────────────────────────────
 
 /// NR 79  getcwd(buf_va, size)
 pub(super) fn sys_getcwd_impl(buf_va: usize, size: usize) -> isize {
@@ -45,8 +41,6 @@ pub(super) fn sys_getcwd_impl(buf_va: usize, size: usize) -> isize {
     buf_va as isize
 }
 
-// ─── chdir / fchdir ──────────────────────────────────────────────────────────
-
 /// NR 80  chdir(path_va)
 pub(super) fn sys_chdir_impl(path_va: usize) -> isize {
     crate::fs::io_syscalls::sys_chdir(path_va)
@@ -56,8 +50,6 @@ pub(super) fn sys_chdir_impl(path_va: usize) -> isize {
 pub(super) fn sys_fchdir_impl(fd: usize) -> isize {
     crate::fs::io_syscalls::sys_fchdir(fd)
 }
-
-// ─── rename / renameat ───────────────────────────────────────────────────────
 
 /// NR 82  rename(old_va, new_va) — delegates to renameat with AT_FDCWD.
 pub(super) fn sys_rename_impl(old_va: usize, new_va: usize) -> isize {
@@ -89,8 +81,6 @@ pub(super) fn sys_renameat2_impl(
     }
     sys_renameat_impl(old_dirfd, old_va, new_dirfd, new_va)
 }
-
-// ─── mkdir / mkdirat ─────────────────────────────────────────────────────────
 
 /// NR 83  mkdir(path_va, mode)
 pub(super) fn sys_mkdir_impl(path_va: usize, mode: u32) -> isize {
@@ -177,8 +167,6 @@ pub(super) fn sys_unlink_impl(path_va: usize) -> isize {
     sys_unlinkat_impl(AT_FDCWD_STUBS, path_va, 0)
 }
 
-// ─── symlink / readlink ───────────────────────────────────────────────────────
-
 pub(super) fn sys_symlinkat_impl(target_va: usize, new_dirfd: i32, linkpath_va: usize) -> isize {
     let target = match crate::mm::uaccess::read_user_str(target_va, 4096) {
         Ok(s)  => s,
@@ -216,8 +204,6 @@ pub(super) fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsz: usize) -> 
     sys_readlinkat_impl(AT_FDCWD_STUBS, path_va, buf_va, bufsz)
 }
 
-// ─── link / linkat ───────────────────────────────────────────────────────────
-
 pub(super) fn sys_linkat_impl(
     old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize, _flags: i32,
 ) -> isize {
@@ -235,8 +221,6 @@ pub(super) fn sys_linkat_impl(
 pub(super) fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
     sys_linkat_impl(AT_FDCWD_STUBS, old_va, AT_FDCWD_STUBS, new_va, 0)
 }
-
-// ─── chmod / chown ───────────────────────────────────────────────────────────
 
 pub(super) fn sys_chmod_impl(path_va: usize, mode: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
@@ -262,16 +246,12 @@ pub(super) fn sys_lchown_impl(path_va: usize, uid: u32, gid: u32) -> isize {
     crate::fs::vfs_ops::lchown(&path, uid, gid)
 }
 
-// ─── umask ───────────────────────────────────────────────────────────────────
-
 pub(super) fn sys_umask_impl(mask: u32) -> isize {
     let pid = scheduler::current_pid();
     let old = scheduler::with_proc(pid, |p| p.umask).unwrap_or(0o022);
     scheduler::with_proc_mut(pid, |p, _| p.umask = mask & 0o777).unwrap_or(());
     old as isize
 }
-
-// ─── access / faccessat ──────────────────────────────────────────────────────
 
 pub(super) fn sys_faccessat_impl(dirfd: i32, path_va: usize, mode: i32, _flags: i32) -> isize {
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
@@ -285,8 +265,6 @@ pub(super) fn sys_access_impl(path_va: usize, mode: i32) -> isize {
     sys_faccessat_impl(AT_FDCWD_STUBS, path_va, mode, 0)
 }
 
-// ─── truncate ────────────────────────────────────────────────────────────────
-
 pub(super) fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
     if length < 0 { return einval(); }
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
@@ -295,8 +273,6 @@ pub(super) fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
     };
     crate::fs::vfs_ops::truncate_path(&path, length as u64)
 }
-
-// ─── statfs / fstatfs ────────────────────────────────────────────────────────
 
 pub(super) fn sys_statfs_impl(path_va: usize, buf_va: usize) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
@@ -310,13 +286,9 @@ pub(super) fn sys_fstatfs_impl(fd: usize, buf_va: usize) -> isize {
     crate::fs::stat_syscalls::sys_fstatfs(fd, buf_va)
 }
 
-// ─── getdents64 ──────────────────────────────────────────────────────────────
-
 pub(super) fn sys_getdents64_impl(fd: usize, buf_va: usize, count: usize) -> isize {
     crate::fs::io_syscalls::sys_getdents64(fd, buf_va, count)
 }
-
-// ─── fchownat / fchown ───────────────────────────────────────────────────────
 
 /// NR 260  fchownat(dirfd, path_va, uid, gid, flags)
 pub(super) fn sys_fchownat_impl(
@@ -354,8 +326,6 @@ pub(super) fn sys_fchown_impl(fd: usize, uid: u32, gid: u32) -> isize {
     }
 }
 
-// ─── fchmodat / fchmod ───────────────────────────────────────────────────────
-
 /// NR 268  fchmodat(dirfd, path_va, mode, flags)
 pub(super) fn sys_fchmodat_impl(dirfd: i32, path_va: usize, mode: u32, flags: i32) -> isize {
     const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
@@ -378,14 +348,10 @@ pub(super) fn sys_fchmod_impl(fd: usize, mode: u32) -> isize {
     }
 }
 
-// ─── remap_file_pages / kexec / bpf / userfaultfd ─────────────────────────────────────────────
-
 pub(super) fn sys_remap_file_pages_impl() -> isize { enosys() }
 pub(super) fn sys_kexec_file_load_impl()  -> isize { enosys() }
 pub(super) fn sys_bpf_impl()              -> isize { enosys() }
 pub(super) fn sys_userfaultfd_impl()      -> isize { enosys() }
-
-// ─── ptrace helpers ──────────────────────────────────────────────────────────
 
 /// Validate that `addr` is naturally aligned for a `usize` read/write.
 #[inline]
@@ -464,8 +430,6 @@ fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Resul
     if copy_to_user(va, &bytes).is_err() { return Err(efault()); }
     Ok(())
 }
-
-// ─── ptrace ──────────────────────────────────────────────────────────────────
 
 /// NR 101  ptrace(request, pid, addr, data)
 pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {

@@ -62,8 +62,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::mm::kstack::alloc_kstack;
 
-// ── Bit-field constants (Intel SDM Vol.3A §3.4.5, §7.2.3) ─────────────────
-
 /// Present | DPL=0 | S=1 | Executable | L=1 (64-bit code).
 const KCODE64: u64 = (1 << 47) | (1 << 44) | (1 << 43) | (1 << 53);
 /// Present | DPL=0 | S=1 | Writable (data).
@@ -72,8 +70,6 @@ const KDATA:   u64 = (1 << 47) | (1 << 44) | (1 << 41);
 const UCODE64: u64 = (1 << 47) | (3 << 45) | (1 << 44) | (1 << 43) | (1 << 53);
 /// Present | DPL=3 | S=1 | Writable (user data).
 const UDATA:   u64 = (1 << 47) | (3 << 45) | (1 << 44) | (1 << 41);
-
-// ── Selector constants (used by idt.rs, syscall.rs, gdbstub) ──────────────
 
 /// Kernel code segment selector (RPL=0).
 pub const SELECTOR_KERNEL_CS: u16 = 0x08;
@@ -86,8 +82,6 @@ pub const SELECTOR_USER_DS:   u16 = 0x23;
 /// TSS selector (RPL=0).
 pub const SELECTOR_TSS:       u16 = 0x28;
 
-// ── x86-64 TSS layout (Intel SDM Vol.3A §7.7) ─────────────────────────────
-//
 // The TSS must be 104 bytes and aligned to at least 4 bytes.
 // `iomap_base` is set to sizeof(Tss) so there is no I/O permission bitmap;
 // any I/O port access from ring 3 raises #GP.
@@ -123,8 +117,6 @@ impl Tss {
     }
 }
 
-// ── Per-CPU GDT bundle ─────────────────────────────────────────────────────
-//
 // Each logical CPU owns its own copy of the GDT and TSS so that RSP0/IST1
 // updates are lock-free (no cross-CPU cache line bouncing on context switch).
 // The GDT is 7 × 8 = 56 bytes; TSS is 104 bytes.
@@ -151,8 +143,6 @@ const MAX_CPUS: usize = 256;
 
 static mut PER_CPU_GDT: [PerCpuGdt; MAX_CPUS] = [const { PerCpuGdt::zero() }; MAX_CPUS];
 
-// ── GDT descriptor pointer (10-byte pseudo-descriptor, SDM §2.4.1) ─────────
-
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 pub struct GdtPointer {
@@ -160,13 +150,10 @@ pub struct GdtPointer {
     pub base:  u64,
 }
 
-// ── Per-CPU GSBASE struct ──────────────────────────────────────────────────
-//
 // Pointed to by IA32_GS_BASE (MSR 0xC000_0101).
 // KERNEL_GS_BASE (MSR 0xC000_0102) holds the same value so that `swapgs`
 // inside syscall_asm_entry swaps in the kernel struct and `swapgs` on exit
 // swaps it back out.
-//
 // Alignment: 64 bytes (one cache line) to avoid false sharing on SMP.
 
 #[repr(C, align(64))]
@@ -190,11 +177,7 @@ static mut PER_CPU_STRUCTS: [PerCpu; MAX_CPUS] = [const { PerCpu {
     kstack_rsp: 0, user_rsp_save: 0, cpu_id: 0, _pad0: 0, tss_rsp0_ptr: 0,
 }}; MAX_CPUS];
 
-// ── Global GDT pointer (written once at BSP init; APs lgdt this) ───────────
-
 static mut BSP_GDT_PTR: GdtPointer = GdtPointer { limit: 0, base: 0 };
-
-// ── Private helpers ────────────────────────────────────────────────────────
 
 /// Encode a 64-bit available TSS descriptor (two GDT slots).
 /// Intel SDM Vol.3A §7.2.3, Table 3-2.
@@ -301,8 +284,6 @@ unsafe fn write_trampoline_gdt(ptr: &GdtPointer) {
     core::ptr::write_volatile(dst, *ptr);
     core::sync::atomic::fence(Ordering::Release);
 }
-
-// ── Public API ─────────────────────────────────────────────────────────────
 
 /// Initialise the BSP's GDT, TSS, PerCpu struct, and GSBASE.
 ///

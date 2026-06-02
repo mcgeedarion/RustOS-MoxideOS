@@ -63,8 +63,6 @@ use crate::security::seccomp::FilterChain;
 use crate::proc::cgroup::CgroupId;
 use crate::proc::cgroup::ROOT_CGROUP;
 
-// ── State ──────────────────────────────────────────────────────────────────────────
-
 /// Process lifecycle state.
 ///
 /// Stored as a plain field inside `Pcb` (which is protected by `ProcLock`).
@@ -107,8 +105,6 @@ impl State {
     }
 }
 
-// ── ProcLock — per-process locking unit ──────────────────────────────────────────
-
 /// The entry stored in the global process table.
 ///
 /// `state_atom` is a lock-free snapshot of the state for scheduler fast-paths
@@ -149,8 +145,6 @@ impl ProcLock {
     }
 }
 
-// ── Pcb — per-process kernel control block ─────────────────────────────────────────
-
 /// Full process kernel state.  Always accessed through `ProcLock::inner`.
 #[derive(Clone)]
 pub struct Pcb {
@@ -165,7 +159,6 @@ pub struct Pcb {
     pub exit_code: i32,
     pub caps:      CapSet,
 
-    // ── Credentials ─────────────────────────────────────────────────────────
     pub uid:  u32,
     pub gid:  u32,
     pub euid: u32,
@@ -194,7 +187,6 @@ pub struct Pcb {
     // TLS
     pub tls_base: usize,
 
-    // ── Trampoline / trapframe (RISC-V) ──────────────────────────────────────
     /// Physical address of this process's trapframe page.
     /// Allocated by `map_trampoline_for_process` (or carved from the kstack
     /// for processes set up via `rebuild_trap_frame_riscv`).
@@ -255,16 +247,12 @@ pub struct Pcb {
     pub task:  *mut Task,
     pub sched: SchedEntity,
 
-    // ── cgroup membership ─────────────────────────────────────────────────
     pub cgroup_id: CgroupId,
 
-    // ── Group scheduling ─────────────────────────────────────────────────
     pub tg_id: usize,
 
-    // ── Priority inheritance ──────────────────────────────────────────────
     pub base_rt_priority: u8,
 
-    // ── Supplemental groups ───────────────────────────────────────────────
     pub supp_groups: Vec<u32>,
 }
 

@@ -6,8 +6,6 @@
 
 use crate::io_uring::ring::IoUringSqe;
 
-// ── Opcode constants ──────────────────────────────────────────────────────────
-
 pub const IORING_OP_NOP:             u8 =  0;
 pub const IORING_OP_READV:           u8 =  1;
 pub const IORING_OP_WRITEV:          u8 =  2;
@@ -41,7 +39,6 @@ pub const IORING_OP_SPLICE:          u8 = 29;
 pub const IORING_OP_PROVIDE_BUFFERS: u8 = 30;
 pub const IORING_OP_REMOVE_BUFFERS:  u8 = 31;
 
-// ── SQE flags ─────────────────────────────────────────────────────────────────
 pub const IOSQE_FIXED_FILE:    u8 = 1 << 0;
 pub const IOSQE_IO_DRAIN:      u8 = 1 << 1;
 pub const IOSQE_IO_LINK:       u8 = 1 << 2;
@@ -49,11 +46,8 @@ pub const IOSQE_IO_HARDLINK:   u8 = 1 << 3;
 pub const IOSQE_ASYNC:         u8 = 1 << 4;
 pub const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 
-// ── IORING_ENTER_* flags ──────────────────────────────────────────────────────
 pub const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 pub const IORING_ENTER_SQ_WAKEUP: u32 = 1 << 1;
-
-// ── Main dispatch ─────────────────────────────────────────────────────────────
 
 /// Execute one SQE synchronously in the context of the calling process.
 ///
@@ -143,8 +137,6 @@ pub fn dispatch(sqe: &IoUringSqe, ring_idx: usize) -> (i32, u32) {
 
     (res as i32, 0)
 }
-
-// ── Fixed-buffer helpers ──────────────────────────────────────────────────────
 
 /// Resolve a registered-buffer index to a kernel-virtual address.
 fn resolve_fixed_buf(ring_idx: usize, buf_index: usize, len: usize) -> Option<usize> {

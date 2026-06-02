@@ -6,8 +6,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ── IoUring fd table ──────────────────────────────────────────────────────────
-//
 // We reserve fd numbers in [URING_FD_BASE, URING_FD_BASE + MAX_URING_FDS) for
 // io_uring instances.  The number stored is the ring_idx into RING_TABLE.
 
@@ -56,16 +54,12 @@ pub fn is_uring_fd(fd: usize) -> bool {
     uring_fd_to_ring(fd).is_some()
 }
 
-// ── fsync via VFS ─────────────────────────────────────────────────────────────
-
 /// Flush dirty data for `fd` to backing storage.
 /// Delegates to the underlying VFS fd_sync if available; otherwise a no-op
 /// (returning 0) for in-memory filesystems where flushing is meaningless.
 pub fn fsync(fd: usize) -> isize {
     crate::fs::fcntl::fd_sync(fd)
 }
-
-// ── pread / pwrite with kernel slice (no user-copy) ───────────────────────────
 
 /// Positional read directly into a kernel slice — no user-space copy.
 /// Used by io_uring READ/READ_FIXED where the destination buffer is

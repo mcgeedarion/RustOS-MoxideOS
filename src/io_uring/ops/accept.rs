@@ -1,15 +1,11 @@
 // src/io_uring/ops/accept.rs
-//
 // IORING_OP_ACCEPT handler.
-//
 // Accepts an incoming connection on the listening socket `sqe.fd`.
-//
 // Field mapping:
 //   sqe.fd       → listening socket fd
 //   sqe.addr     → *mut sockaddr_storage (filled by the network stack)
 //   sqe.addr3    → *mut socklen_t        (updated with actual addr length)
 //   sqe.op_flags → accept4() flags (e.g. SOCK_NONBLOCK | SOCK_CLOEXEC)
-//
 // CQE result:
 //   res >= 0 → new connected socket fd
 //   res <  0 → negated errno (E_AGAIN if no connection pending)
@@ -46,8 +42,6 @@ pub fn handle(sqe: &Sqe) -> i32 {
         addrlen_va as usize,
     ) as i32
 }
-
-// ── Future-layer wrapper ──────────────────────────────────────────────────────
 
 use core::{
     future::Future,

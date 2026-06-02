@@ -15,10 +15,6 @@ use spin::Mutex;
 use crate::drivers::gpu::framebuffer::{Framebuffer, PixelFormat};
 use crate::drivers::gpu::gpu::DisplayInfo;
 
-// ---------------------------------------------------------------------------
-// VGA text mode constants
-// ---------------------------------------------------------------------------
-
 const VGA_TEXT_BASE:  usize = 0xB8000;
 const VGA_TEXT_COLS:  usize = 80;
 const VGA_TEXT_ROWS:  usize = 25;
@@ -46,10 +42,6 @@ pub mod color {
     pub fn attr(fg: u8, bg: u8) -> u8 { (bg << 4) | (fg & 0xF) }
 }
 
-// ---------------------------------------------------------------------------
-// VGA I/O ports
-// ---------------------------------------------------------------------------
-
 const VGA_CRTC_ADDR: u16 = 0x03D4;
 const VGA_CRTC_DATA: u16 = 0x03D5;
 const VGA_MISC_WRITE:u16 = 0x03C2;
@@ -61,10 +53,6 @@ const VGA_AC_ADDR:   u16 = 0x03C0;
 const VGA_AC_DATA_W: u16 = 0x03C0;
 const VGA_AC_DATA_R: u16 = 0x03C1;
 const VGA_STAT1:     u16 = 0x03DA; // Input Status Register 1 (resets AC flip-flop)
-
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
 
 enum VgaMode {
     Text,
@@ -79,10 +67,6 @@ struct VgaState {
 }
 
 static VGA: Mutex<Option<VgaState>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 pub fn init() {
     clear_text_buffer();
@@ -112,10 +96,6 @@ pub fn display_info() -> Option<DisplayInfo> {
         },
     })
 }
-
-// ---------------------------------------------------------------------------
-// Text output
-// ---------------------------------------------------------------------------
 
 /// Write a character at the current cursor position and advance.
 pub fn putchar(c: u8) {
@@ -148,10 +128,6 @@ pub fn set_attr(fg: u8, bg: u8) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Graphical framebuffer
-// ---------------------------------------------------------------------------
-
 pub fn clear(argb: u32) {
     let g = VGA.lock();
     if let Some(VgaState { mode: VgaMode::Lfb(fb), .. }) = g.as_ref() {
@@ -165,10 +141,6 @@ pub fn blit(x: u32, y: u32, width: u32, height: u32, pixels: &[u32]) {
         fb.blit(x, y, width, height, pixels);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
 
 fn text_write_at(col: usize, row: usize, c: u8, attr: u8) {
     let idx = (row * VGA_TEXT_COLS + col) * 2;

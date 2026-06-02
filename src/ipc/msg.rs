@@ -40,13 +40,9 @@ use alloc::{
 use spin::Mutex;
 use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
 pub const MSGMAX:  usize = 8192;
 pub const MSGMNB:  usize = 16384; // default max queue size in bytes
 pub const MSGMNI:  i32   = 32000; // system-wide queue limit
-
-// ── Data structures ──────────────────────────────────────────────────────────
 
 /// One queued message.
 struct Message {
@@ -68,8 +64,6 @@ struct MsgQueue {
     msg_ctime: u64,
 }
 
-// ── Global table ─────────────────────────────────────────────────────────────
-
 use alloc::collections::BTreeMap;
 static MSG_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<MsgQueue>>>> = Mutex::new(BTreeMap::new());
 static NEXT_ID:   spin::Mutex<i32>                           = spin::Mutex::new(1);
@@ -80,8 +74,6 @@ fn alloc_id() -> i32 {
     *id += 1;
     v
 }
-
-// ── msgget ───────────────────────────────────────────────────────────────────
 
 pub fn msgget(key: i32, msgflg: i32) -> Result<i32, isize> {
     let mut tbl = MSG_TABLE.lock();
@@ -132,8 +124,6 @@ pub fn msgget(key: i32, msgflg: i32) -> Result<i32, isize> {
     Ok(id)
 }
 
-// ── msgsnd ───────────────────────────────────────────────────────────────────
-
 pub fn msgsnd(msqid: i32, mtype: i64, data: Vec<u8>, msgflg: i32) -> Result<(), isize> {
     if mtype <= 0 { return Err(-22); } // EINVAL — mtype must be positive
     if data.len() > MSGMAX { return Err(-90); } // EMSGSIZE
@@ -160,8 +150,6 @@ pub fn msgsnd(msqid: i32, mtype: i64, data: Vec<u8>, msgflg: i32) -> Result<(), 
         return Ok(());
     }
 }
-
-// ── msgrcv ───────────────────────────────────────────────────────────────────
 
 pub fn msgrcv(
     msqid:   i32,
@@ -209,8 +197,6 @@ pub fn msgrcv(
         core::hint::spin_loop();
     }
 }
-
-// ── msgctl ───────────────────────────────────────────────────────────────────
 
 /// `IPC_RMID`: remove the queue.  Other commands are stubs.
 pub fn msgctl(msqid: i32, cmd: i32) -> Result<i32, isize> {

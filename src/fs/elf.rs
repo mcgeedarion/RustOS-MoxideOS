@@ -21,8 +21,6 @@ use crate::exec::elf::{
 };
 use crate::fs::vfs;
 
-// ── Magic check ───────────────────────────────────────────────────────────────
-
 /// Return `true` if the first 4 bytes of `data` are the ELF magic bytes.
 #[inline]
 pub fn is_elf( &[u8]) -> bool {
@@ -32,8 +30,6 @@ pub fn is_elf( &[u8]) -> bool {
         && data[EI_MAG2] == b'L'
         && data[EI_MAG3] == b'F'
 }
-
-// ── Header + phdr read from VFS path ─────────────────────────────────────────
 
 /// Read just the ELF header (64 bytes) from a file at `path`.
 /// Returns `None` if the file cannot be opened, is too small, or is not ELF.
@@ -65,8 +61,6 @@ pub fn read_phdrs(path: &str) -> Option<(Elf64Hdr, Vec<Elf64Phdr>)> {
     let phdrs = parse_phdrs_with_hdr(buf, &hdr)?;
     Some((hdr, phdrs))
 }
-
-// ── ELF note iteration ────────────────────────────────────────────────────────
 
 /// A single ELF note entry (from a PT_NOTE segment or `.note` section).
 #[derive(Debug, Clone)]
@@ -137,8 +131,6 @@ pub fn read_notes(path: &str) -> Vec<ElfNote> {
     vfs::close(fd);
     all_notes
 }
-
-// ── Build NT_FILE note payload ────────────────────────────────────────────────
 
 /// NT_FILE note entry: a mapped file region.
 #[derive(Debug, Clone)]

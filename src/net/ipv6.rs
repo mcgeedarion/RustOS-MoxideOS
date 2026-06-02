@@ -14,11 +14,7 @@ use spin::Mutex;
 
 use crate::net::{eth, icmpv6, tcp, udp};
 
-// ─── EtherType ────────────────────────────────────────────────────────────────
-
 pub const ETHERTYPE_IPV6: u16 = 0x86DD;
-
-// ─── Next-header values ───────────────────────────────────────────────────────
 
 pub const NH_HOPOPT:   u8 = 0;   // Hop-by-Hop options
 pub const NH_TCP:      u8 = 6;
@@ -29,11 +25,7 @@ pub const NH_ICMPV6:   u8 = 58;
 pub const NH_NONE:     u8 = 59;  // No Next Header
 pub const NH_DSTOPT:   u8 = 60;  // Destination options
 
-// ─── Base header length ───────────────────────────────────────────────────────
-
 pub const IPV6_HDR_LEN: usize = 40;
-
-// ─── IPv6 address type ────────────────────────────────────────────────────────
 
 pub type Addr6 = [u8; 16];
 
@@ -63,8 +55,6 @@ pub fn multicast_mac(addr: &Addr6) -> [u8; 6] {
     [0x33, 0x33, addr[12], addr[13], addr[14], addr[15]]
 }
 
-// ─── Interface address configuration ─────────────────────────────────────────
-
 static OUR_IP6:    Mutex<Addr6> = Mutex::new(UNSPECIFIED6);
 static GATEWAY6:   Mutex<Addr6> = Mutex::new(UNSPECIFIED6);
 static PREFIX_LEN: Mutex<u8>    = Mutex::new(64);
@@ -81,8 +71,6 @@ fn next_flow() -> u32 {
     *c = c.wrapping_add(1);
     f
 }
-
-// ─── Fragment reassembly ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct FragBuf {
@@ -153,8 +141,6 @@ fn frag_insert(src: Addr6, dst: Addr6, id: u32, nh: u8,
     Some((nh_out, out))
 }
 
-// ─── Extension header walker ──────────────────────────────────────────────────
-
 /// Walk IPv6 extension headers starting at `pkt[off]` with `nh`.
 /// Returns `(final_nh, payload_start)` where `payload_start` is the index
 /// of the first byte of the upper-layer payload, or `None` if the packet
@@ -207,8 +193,6 @@ fn walk_ext_headers(pkt: &[u8], mut off: usize, mut nh: u8)
     }
 }
 
-// ─── Upper-layer dispatch ─────────────────────────────────────────────────────
-
 fn receive6_upper(nh: u8, src: &Addr6, dst: &Addr6, payload: &[u8]) {
     match nh {
         NH_ICMPV6 => icmpv6::receive(src, dst, payload),
@@ -217,8 +201,6 @@ fn receive6_upper(nh: u8, src: &Addr6, dst: &Addr6, payload: &[u8]) {
         _         => {}
     }
 }
-
-// ─── Receive ──────────────────────────────────────────────────────────────────
 
 /// Called from `eth::receive` when EtherType == 0x86DD.
 pub fn receive6(frame: &[u8]) {
@@ -250,8 +232,6 @@ pub fn receive6(frame: &[u8]) {
 
     receive6_upper(upper_nh, &src, &dst, &ext_payload[upper_off..]);
 }
-
-// ─── Send ─────────────────────────────────────────────────────────────────────
 
 /// Build an IPv6 packet and transmit it.
 ///

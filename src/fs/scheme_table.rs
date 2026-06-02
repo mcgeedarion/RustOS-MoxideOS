@@ -43,10 +43,6 @@ use spin::RwLock;
 
 use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 
-// ---------------------------------------------------------------------------
-// Scheme trait
-// ---------------------------------------------------------------------------
-
 /// Trait that every scheme handler must implement.
 ///
 /// Methods that a handler does not support may return `Err(SchemeError::InvalidArg)`
@@ -114,10 +110,6 @@ pub trait Scheme: Send + Sync {
     ) -> Result<(), SchemeError>;
 }
 
-// ---------------------------------------------------------------------------
-// SchemeTable
-// ---------------------------------------------------------------------------
-
 pub struct SchemeTable {
     inner: RwLock<BTreeMap<String, Arc<dyn Scheme>>>,
 }
@@ -126,8 +118,6 @@ impl SchemeTable {
     pub const fn new() -> Self {
         Self { inner: RwLock::new(BTreeMap::new()) }
     }
-
-    // ── Registration ────────────────────────────────────────────────────────────
 
     /// Register a scheme handler under `name`.
     ///
@@ -143,8 +133,6 @@ impl SchemeTable {
     pub fn deregister(&self, name: &str) {
         self.inner.write().remove(name);
     }
-
-    // ── Introspection ────────────────────────────────────────────────────────────
 
     /// Return all registered scheme names in sorted (BTree) order.
     ///
@@ -163,8 +151,6 @@ impl SchemeTable {
     pub fn get(&self, name: &str) -> Option<Arc<dyn Scheme>> {
         self.inner.read().get(name).map(Arc::clone)
     }
-
-    // ── URL routing ──────────────────────────────────────────────────────────────
 
     /// Parse `url` as `<scheme>:<path>`, look up the handler, and call
     /// `handler.open(path, flags)`.
@@ -205,10 +191,6 @@ impl SchemeTable {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Global instance
-// ---------------------------------------------------------------------------
-
 /// Kernel-wide scheme registry.  Initialised at boot time.
 ///
 /// Drivers register themselves during their `init()` call:
@@ -221,10 +203,6 @@ impl SchemeTable {
 /// SCHEME_TABLE.register("tty",  Arc::new(TtyScheme::new()));
 /// ```
 pub static SCHEME_TABLE: SchemeTable = SchemeTable::new();
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

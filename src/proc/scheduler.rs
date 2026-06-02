@@ -107,8 +107,6 @@ use crate::proc::process::{State, ProcLock};
 use crate::proc::proc_table;
 use crate::proc::task_types::TaskRunState;
 
-// ── Constants ────────────────────────────────────────────────────────────────────────
-
 pub const TICK_NS:        u64 = 1_000_000;
 pub const NICE0_WEIGHT:   u64 = 1_024;
 pub const BALANCE_TICKS:  u64 = 10;
@@ -120,8 +118,6 @@ pub const IDLE_WEIGHT: u64 = 1;
 /// Maximum weight cap for SCHED_BATCH tasks so a nice(-20) batch task never
 /// outweighs a nice-0 normal task.
 pub const BATCH_WEIGHT_CAP: u64 = 820;
-
-// ── SchedPolicy ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -151,8 +147,6 @@ impl SchedPolicy {
         }
     }
 }
-
-// ── SchedEntity ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct SchedEntity {
@@ -212,8 +206,6 @@ impl SchedEntity {
     }
 }
 
-// ── Weight table ────────────────────────────────────────────────────────────────────
-
 pub(crate) fn nice_to_weight(nice: i8) -> u64 {
     let n = nice.clamp(-20, 19) as i64;
     let base: u64 = 1024;
@@ -237,8 +229,6 @@ pub fn effective_weight(policy: SchedPolicy, nice: i8) -> u64 {
     }
 }
 
-// ── CFS entry ───────────────────────────────────────────────────────────────────────
-
 #[derive(Eq, PartialEq)]
 pub struct CfsEntry {
     pub vruntime: u64,
@@ -256,8 +246,6 @@ impl PartialOrd for CfsEntry {
     }
 }
 unsafe impl Send for CfsEntry {}
-
-// ── RT entry ──────────────────────────────────────────────────────────────────────────
 
 #[derive(Eq, PartialEq)]
 struct RtEntry {
@@ -280,8 +268,6 @@ impl PartialOrd for RtEntry {
 }
 unsafe impl Send for RtEntry {}
 
-// ── Deadline entry ──────────────────────────────────────────────────────────────────
-
 #[derive(Eq, PartialEq)]
 struct DlEntry {
     abs_deadline: u64,
@@ -299,8 +285,6 @@ impl PartialOrd for DlEntry {
     }
 }
 unsafe impl Send for DlEntry {}
-
-// ── Per-CPU RunQueue ───────────────────────────────────────────────────────────────
 
 pub struct RunQueue {
     pub cfs_heap:            BinaryHeap<CfsEntry>,
@@ -541,8 +525,6 @@ impl RunQueue {
     }
 }
 
-// ── schedule() ───────────────────────────────────────────────────────────────────
-
 pub fn schedule() {
     let cpu = crate::smp::percpu::current_cpu_id();
     let blk = crate::smp::percpu::current_block();
@@ -639,14 +621,11 @@ fn schedule_early() {
     });
 }
 
-// ── tick() + load balance ───────────────────────────────────────────────────────────
-
 pub fn tick(cpu: u32) {
     let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu as usize] };
     blk.runqueue.tick_count += 1;
     let now = crate::time::clock::monotonic_ns();
 
-    // ── CPU time accounting ────────────────────────────────────────────────
     // Charge TICK_NS to the currently running task's process cpu_time_ns.
     // This is the source read by CLOCK_PROCESS_CPUTIME_ID / getrusage.
     let curr = blk.current_task;
@@ -668,7 +647,6 @@ pub fn tick(cpu: u32) {
         }
     }
 
-    // ── Deadline replenishment ─────────────────────────────────────────────
     proc_table::with_procs_ro(|pl_vec| {
         for pl in pl_vec.iter() {
             let s = pl.load_state();
@@ -697,7 +675,6 @@ pub fn tick(cpu: u32) {
         }
     });
 
-    // ── RR time-slice preemption ────────────────────────────────────────────
     let curr = blk.current_task;
     if !curr.is_null() {
         let t = unsafe { &mut *curr };
@@ -719,7 +696,6 @@ pub fn tick(cpu: u32) {
         }
     }
 
-    // ── RLIMIT_RTTIME enforcement ───────────────────────────────────────────
     if !curr.is_null() {
         let t = unsafe { &*curr };
         if matches!(t.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
@@ -742,7 +718,6 @@ pub fn tick(cpu: u32) {
         }
     }
 
-    // ── Load balance ─────────────────────────────────────────────────────────────
     if blk.runqueue.tick_count % BALANCE_TICKS == 0 {
         drop(blk);
         load_balance(cpu);
@@ -806,8 +781,6 @@ fn load_balance(this_cpu: u32) {
     }
 }
 
-// ── Enqueue helpers ───────────────────────────────────────────────────────────────
-
 pub fn enqueue_task(task: *mut crate::proc::task_types::Task) {
     if task.is_null() { return; }
     let t = unsafe { &mut *task };
@@ -856,8 +829,6 @@ pub fn schedule_on(task: *mut crate::proc::task_types::Task, cpu: u32) {
     crate::smp::ipi::send_reschedule(cpu);
 }
 
-// ── Blocking / waking ────────────────────────────────────────────────────────────
-
 pub fn block_current() {
     let pid = current_pid();
     if let Some(pl) = proc_table::find_proc_lock(pid as usize) {
@@ -902,8 +873,6 @@ pub fn suspend_current_until_child_exec(_child_pid: usize) {
     block_current();
 }
 
-// ── mm_lock helpers ─────────────────────────────────────────────────────────────
-
 pub struct MmReadGuard {
     _arc:   alloc::sync::Arc<spin::RwLock<()>>,
     _guard: spin::RwLockReadGuard<'static, ()>,
@@ -921,8 +890,6 @@ pub fn with_current_mm_read() -> MmReadGuard {
     };
     MmReadGuard { _arc: arc, _guard: guard }
 }
-
-// ── current_pid ───────────────────────────────────────────────────────────────────
 
 static CURRENT_PID: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);

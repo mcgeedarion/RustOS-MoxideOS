@@ -11,7 +11,6 @@ use crate::init::boot_info::{BootInfo, BootRange};
 use core::arch::global_asm;
 
 // Bare-metal entry point.
-//
 // Placed in .text.boot so the linker script positions it first in the image.
 // On entry (Armv8-A bare-metal convention):
 //   x0 = DTB physical address (if provided by firmware; 0 otherwise)
@@ -19,7 +18,6 @@ use core::arch::global_asm;
 //   SP is undefined — we set it immediately.
 //   MMU/caches are off.
 //   EL1 or EL2 (we do not handle EL3 here).
-//
 // We:
 //   1. Park all secondary CPUs (MPIDR Aff0 != 0) in a WFE loop.
 //   2. Set SP to __boot_stack_top (defined by linker_aarch64.ld).
@@ -33,7 +31,6 @@ global_asm!(
     "    mrs  x1, mpidr_el1",
     "    and  x1, x1, #0xff", // Aff0 field
     "    cbnz x1, .Lsecondary",
-    // Set up the boot stack.
     "    adr  x1, __boot_stack_top",
     "    mov  sp, x1",
     // Zero .bss: x2 = &__bss_start (= _kernel_start offset by linker), x3 = &_end.

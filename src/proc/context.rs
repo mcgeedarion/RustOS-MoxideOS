@@ -59,8 +59,6 @@
 //! (accessed via `Task::pcb_ctx_offset()`) and delegate to the
 //! arch-specific naked helper.
 
-// ── x86_64 context ────────────────────────────────────────────────────────────
-
 #[cfg(target_arch = "x86_64")]
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
@@ -83,8 +81,6 @@ impl Context {
         Self { r15:0, r14:0, r13:0, r12:0, rbp:0, rbx:0, rsp:0, rip:0, fs_base:0 }
     }
 }
-
-// ── RISC-V context ────────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 #[derive(Default, Clone, Copy)]
@@ -113,8 +109,6 @@ impl Context {
                s4:0, s5:0, s6:0, s7:0, s8:0, s9:0, s10:0, s11:0 }
     }
 }
-
-// ── x86_64 naked switch ───────────────────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 /// Save the current task into `old` and switch execution to `new`.
@@ -158,8 +152,6 @@ pub unsafe extern "C" fn switch_to(old: *mut Context, new: *const Context) {
         options(noreturn)
     );
 }
-
-// ── RISC-V naked switch ───────────────────────────────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 /// Save current hart's callee-saved registers into `old` and load from `new`.
@@ -238,8 +230,6 @@ pub unsafe extern "C" fn task_entry_trampoline() {
     );
 }
 
-// ── Arch-independent trampolines ──────────────────────────────────────────────
-//
 // `scheduler::schedule()` calls these with `*mut Task` so it doesn't need
 // to know the Task struct layout.  Both functions resolve `task.pcb.ctx`
 // through the Task → Pcb pointer and call the arch naked helper.

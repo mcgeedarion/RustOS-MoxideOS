@@ -15,10 +15,6 @@
 
 use spin::Mutex;
 
-// ---------------------------------------------------------------------------
-// Event type / code constants
-// ---------------------------------------------------------------------------
-
 pub const EV_SYN:  u16 = 0x00;
 pub const EV_KEY:  u16 = 0x01;
 pub const EV_REL:  u16 = 0x02;
@@ -44,10 +40,6 @@ pub const BTN_LEFT:     u16 = 0x110;
 pub const BTN_RIGHT:    u16 = 0x111;
 pub const BTN_MIDDLE:   u16 = 0x112;
 
-// ---------------------------------------------------------------------------
-// Event structure
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputEvent {
     pub time_sec:  u32,
@@ -56,10 +48,6 @@ pub struct InputEvent {
     pub code:      u16,
     pub value:     i32,
 }
-
-// ---------------------------------------------------------------------------
-// Ring buffer
-// ---------------------------------------------------------------------------
 
 const RING_CAP: usize = 512;
 
@@ -95,10 +83,6 @@ impl EventRing {
 }
 
 static RING: Mutex<EventRing> = Mutex::new(EventRing::new());
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Push one event into the evdev ring (called by driver ISRs / poll paths).
 pub fn push(ev: InputEvent) {

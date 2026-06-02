@@ -69,10 +69,6 @@ use crate::arch::{Arch, api::{Paging, PageFlags}};
 use crate::mm::pmm::{alloc_page, free_page};
 use crate::proc::scheduler;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 const PAGE_SIZE:    usize = 4096;
 const PAGE_MASK:    usize = !(PAGE_SIZE - 1);
 /// Maximum swap devices supported simultaneously.
@@ -84,10 +80,6 @@ const LRU_CAPACITY: usize = 65536;
 
 /// Magic written at swap slot 0 (offset 0) as a sanity header.
 const SWAP_MAGIC: u64 = 0x5257_4150_4D41_4743; // b"CGATPMAWS" reversed
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SwapSlot — opaque slot identifier
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// An allocated slot on a specific swap device.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,10 +126,6 @@ impl SwapSlot {
         self.slot as u64 * PAGE_SIZE as u64
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Swap device descriptor
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// I/O callbacks supplied by the block-device layer when a swap partition is
 /// registered.  Both functions are synchronous from the caller's perspective;
@@ -216,10 +204,6 @@ impl SwapDevice {
     fn free_slots(&self) -> u32 { self.free_count }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Global device table
-// ─────────────────────────────────────────────────────────────────────────────
-
 struct DevTable {
     devs: [Option<SwapDevice>; MAX_SWAP_DEVS],
     count: usize,
@@ -238,10 +222,6 @@ impl DevTable {
 }
 
 static DEV_TABLE: Mutex<DevTable> = Mutex::new(DevTable::new());
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LRU clock ring — tracks physical pages eligible for eviction
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 struct LruEntry {
@@ -323,10 +303,6 @@ static LRU: Once<Mutex<LruClock>> = Once::new();
 
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Statistics
-// ─────────────────────────────────────────────────────────────────────────────
-
 static STAT_SWAPOUT:    AtomicU64 = AtomicU64::new(0);
 static STAT_SWAPIN:     AtomicU64 = AtomicU64::new(0);
 static STAT_EVICT_FAIL: AtomicU64 = AtomicU64::new(0);
@@ -348,10 +324,6 @@ pub fn stats() -> SwapStats {
         free_slots:     STAT_FREE_SLOTS.load(Ordering::Relaxed),
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Public API — device registration
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Register a swap device.
 ///
@@ -402,10 +374,6 @@ pub fn is_enabled() -> bool {
     STAT_FREE_SLOTS.load(Ordering::Relaxed) > 0
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public API — LRU page tracking
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Call this every time a user page is mapped for the first time.
 ///
 /// The page is registered in the LRU clock ring and becomes eligible for
@@ -423,10 +391,6 @@ pub fn untrack_page(pa: usize) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Core: swapout — evict one physical page to the swap device
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Attempt to evict one page from the LRU clock ring to the swap device.
 ///
 /// On success the physical page is freed back to the PMM and its PTE in the
@@ -443,7 +407,6 @@ pub fn swapout_one() -> bool {
         None => return false,
     };
 
-    // ── 1. Pick a victim from the LRU clock ──────────────────────────────
     let victim = {
         let mut lru = lru_mutex.lock();
         let mut candidate = None;
@@ -477,7 +440,6 @@ pub fn swapout_one() -> bool {
         }
     };
 
-    // ── 2. Allocate a swap slot ───────────────────────────────────────────
     let slot = {
         let mut tbl = DEV_TABLE.lock();
         let mut found = None;
@@ -501,8 +463,6 @@ pub fn swapout_one() -> bool {
     };
     STAT_FREE_SLOTS.fetch_sub(1, Ordering::Relaxed);
 
-    // ── 3. Write the page to the swap device ─────────────────────────────
-    //
     // Extract the I/O function pointers and drop DEV_TABLE *before* calling
     // write_page.  Holding a spinlock across a synchronous block I/O write
     // would serialise all swap activity on all CPUs for the disk latency.
@@ -531,7 +491,6 @@ pub fn swapout_one() -> bool {
         return false;
     }
 
-    // ── 4. Replace the PTE with a swap-special and flush the TLB ─────────
     let cr3 = scheduler::with_proc(e.pid, |p| p.user_satp).unwrap_or(0);
     if cr3 != 0 {
         let swap_pte = slot.encode_pte();
@@ -539,16 +498,11 @@ pub fn swapout_one() -> bool {
         <Arch as Paging>::flush_va(e.va);
     }
 
-    // ── 5. Free the physical page and untrack it ──────────────────────────
     lru_mutex.lock().remove_pa(e.pa);
     free_page(e.pa);
     STAT_SWAPOUT.fetch_add(1, Ordering::Relaxed);
     true
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Core: swapin — handle a swap fault
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Handle a swap fault: read the page back from the swap device into a fresh
 /// physical page and update the PTE.
@@ -562,7 +516,6 @@ pub fn swapout_one() -> bool {
 pub fn swapin(pid: u32, faulting_va: usize) -> bool {
     let page_va = faulting_va & PAGE_MASK;
 
-    // ── 1. Read the swap-special out of the (not-present) PTE ────────────
     let cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
     if cr3 == 0 { return false; }
 
@@ -572,8 +525,6 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
         None    => return false, // not a swap PTE after all
     };
 
-    // ── 2. Allocate a fresh physical page ─────────────────────────────────
-    //
     // If the PMM is empty, try to free a page via swapout before retrying.
     let pa_ptr = alloc_page().or_else(|| {
         if swapout_one() { alloc_page() } else { None }
@@ -586,8 +537,6 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
         }
     };
 
-    // ── 3. Read the page from the swap device ─────────────────────────────
-    //
     // Same pattern as swapout_one: extract I/O pointers then drop the lock
     // before performing the I/O.
     let (read_fn, dev_priv, byte_offset) = {
@@ -610,7 +559,6 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
         return false;
     }
 
-    // ── 4. Free the swap slot ─────────────────────────────────────────────
     {
         let mut tbl = DEV_TABLE.lock();
         if let Some(ref mut dev) = tbl.devs[slot.dev as usize] {
@@ -619,7 +567,6 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
     }
     STAT_FREE_SLOTS.fetch_add(1, Ordering::Relaxed);
 
-    // ── 5. Map the page back in with the VMA's protection bits ────────────
     let prot = crate::mm::mmap::find_vma(pid, faulting_va)
         .map(|v| v.prot)
         .unwrap_or(crate::mm::mmap::PROT_READ);
@@ -627,15 +574,10 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
     <Arch as Paging>::map_page(cr3, page_va, pa as usize, flags);
     <Arch as Paging>::flush_va(page_va);
 
-    // ── 6. Track the page in the LRU ring ────────────────────────────────
     track_page(pa as usize, pid, page_va);
     STAT_SWAPIN.fetch_add(1, Ordering::Relaxed);
     true
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// try_free_page — called by page_fault when alloc_page() fails
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Called from `page_fault::handle_demand_fault` when `alloc_page()` returns
 /// `None`.  Attempts up to `retries` swapout passes before giving up.
@@ -649,10 +591,6 @@ pub fn try_free_page(retries: usize) -> bool {
     }
     freed
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// kswapd — background reclaim
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Watermarks: kswapd starts reclaiming below `LOW` and stops above `HIGH`.
 /// Units: number of free PMM pages.
@@ -687,10 +625,6 @@ pub fn kswapd_tick(max_per_tick: usize) {
         reclaimed += 1;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// sys_swapon / sys_swapoff  (syscall entry points)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// `swapon(2)` — activate a swap partition identified by block device fd.
 ///
@@ -770,10 +704,6 @@ fn drain_swap_device(dev_idx: u8) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// /proc/swaps support
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// One line of `/proc/swaps` output.
 pub struct SwapEntry {
     pub dev_idx:    usize,
@@ -797,35 +727,6 @@ pub fn proc_swaps() -> Vec<SwapEntry> {
     out
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Paging trait extensions required by this module
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// The following methods must be present on the `Paging` trait in
-// `src/arch/api.rs`:
-//
-//   /// Read the raw PTE for `va` in address space `cr3`.
-//   fn read_pte(cr3: usize, va: usize) -> usize;
-//
-//   /// Overwrite the PTE for `va` with `raw_pte` (does NOT flush TLB).
-//   fn set_pte(cr3: usize, va: usize, raw_pte: usize);
-//
-//   /// Return `true` if the accessed bit (x86 bit 5 / RISC-V bit A) is set.
-//   fn pte_accessed(cr3: usize, va: usize) -> bool;
-//
-//   /// Clear the accessed bit in the PTE for `va`.
-//   fn clear_accessed(cr3: usize, va: usize);
-//
-//   /// Walk all not-present PTEs in `cr3` that decode as valid SwapSlots.
-//   /// Calls `f(va, slot)` for each; stops early if `f` returns false.
-//   fn walk_swap_ptes(cr3: usize, f: impl FnMut(usize, SwapSlot) -> bool);
-//
-// `map_page` and `flush_va` are already required by the demand-paging path.
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Initialisation
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Initialise the swap subsystem.  Call once from `mm::init()` after the PMM
 /// and slab allocator are ready.
 ///
@@ -834,10 +735,6 @@ pub fn init() {
     LRU.call_once(|| Mutex::new(LruClock::new()));
     INITIALISED.store(true, Ordering::Release);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 use crate::mm::mmap::PROT_WRITE;
 // PROT_EXEC re-exported from mmap so we don't duplicate the constant.

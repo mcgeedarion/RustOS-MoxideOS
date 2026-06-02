@@ -29,8 +29,6 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use spin::Mutex as SpinMutex;
 
-// ── set_times ─────────────────────────────────────────────────────────────────
-
 /// Update the atime and/or mtime of the file at `path`.
 /// `None` means "leave this timestamp unchanged".
 pub fn set_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) {
@@ -39,8 +37,6 @@ pub fn set_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) {
         if let Some(m) = mtime_ns { inode.mtime_ns = m; }
     });
 }
-
-// ── sync_all / fsync / fdatasync ──────────────────────────────────────────────
 
 /// Flush every dirty buffer in the VFS page cache to persistent storage.
 /// Called by `sync(2)` and `syncfs(2)`.
@@ -58,8 +54,6 @@ pub fn fsync_fd(fd: usize) -> isize {
 pub fn fdatasync_fd(fd: usize) -> isize {
     crate::fs::vfs::flush_fd(fd, false /* data only */)
 }
-
-// ── flock ─────────────────────────────────────────────────────────────────────
 
 /// Lock operations for flock(2).
 #[repr(u8)]
@@ -187,8 +181,6 @@ pub fn flock_release_fd(fd: usize) {
         }
     }
 }
-
-// ── posix_fadvise ─────────────────────────────────────────────────────────────
 
 /// NR 221  posix_fadvise(fd, offset, len, advice)
 /// Accepted and ignored; we have no readahead or eviction policy yet.

@@ -101,8 +101,6 @@ pub unsafe fn xrstor_from(src: *const u8) {
     }
 }
 
-// ─── CPUID helpers ────────────────────────────────────────────────────────────
-
 fn cpuid_leaf1() -> (u32, u32) {
     let ecx: u32;
     let edx: u32;

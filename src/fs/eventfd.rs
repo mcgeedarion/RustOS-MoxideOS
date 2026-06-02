@@ -30,13 +30,9 @@
 use crate::core::fast_hash::KernelFastMap;
 use spin::Mutex;
 
-// ── flags ────────────────────────────────────────────────────────────────────
-
 pub const EFD_SEMAPHORE: u32 = 1;
 pub const EFD_CLOEXEC: u32 = 0o2000000; // same as O_CLOEXEC
 pub const EFD_NONBLOCK: u32 = 0o4000; // same as O_NONBLOCK
-
-// ── per-fd state ─────────────────────────────────────────────────────────────
 
 struct EventFd {
     counter: u64,
@@ -47,8 +43,6 @@ struct EventFd {
 /// Fast map is safe here: keys are kernel-assigned fd numbers and eventfd
 /// readiness is not exposed through deterministic iteration.
 static EVENTFDS: Mutex<KernelFastMap<usize, EventFd>> = Mutex::new(KernelFastMap::new());
-
-// ── kernel-internal helpers ───────────────────────────────────────────────────
 
 /// Attach eventfd state to an already-open VFS fd.
 pub fn eventfd_register(fd: usize, initval: u64, flags: u32) {
@@ -149,8 +143,6 @@ pub fn eventfd_poll(fd: usize) -> u32 {
     } // POLLOUT
     mask
 }
-
-// ── syscall entry points ──────────────────────────────────────────────────────
 
 /// `eventfd(initval)` — NR 284.  Equivalent to `eventfd2(initval, 0)`.
 pub fn sys_eventfd(initval: u32) -> isize {

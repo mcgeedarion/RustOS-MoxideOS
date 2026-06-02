@@ -47,10 +47,6 @@ pub enum SchemeSysError {
     NotFound         = -4,
 }
 
-// ---------------------------------------------------------------------------
-// sys_scheme_register
-// ---------------------------------------------------------------------------
-
 /// Register `endpoint` as the handler for scheme `name`.
 ///
 /// After this returns, any `open("<name>:...", ...)` call anywhere in the
@@ -96,10 +92,6 @@ pub fn sys_scheme_register(
                proc.pid(), name);
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// sys_scheme_unregister
-// ---------------------------------------------------------------------------
 
 /// Remove a scheme previously registered by the calling process.
 ///

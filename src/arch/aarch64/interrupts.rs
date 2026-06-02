@@ -61,8 +61,6 @@ pub unsafe fn init() {
     );
 }
 
-// ── Rust-side exception handlers ─────────────────────────────────────────────
-//
 // Called by the assembly trampolines in vectors.S.
 // Each receives a mutable reference to the saved register frame so that
 // signal delivery / syscall return can modify ELR / SPSR before eret.

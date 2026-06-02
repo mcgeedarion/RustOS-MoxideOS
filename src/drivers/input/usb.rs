@@ -17,10 +17,6 @@ use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 
-// ---------------------------------------------------------------------------
-// XHCI register offsets (relative to MMIO base)
-// ---------------------------------------------------------------------------
-
 const CAP_CAPLENGTH:   usize = 0x00;
 const CAP_HCSPARAMS1:  usize = 0x04;
 const CAP_HCCPARAMS1:  usize = 0x10;
@@ -77,10 +73,6 @@ const COMP_SUCCESS: u8 = 1;
 // Transfer Ring size (one page = 4096 / 16 = 256 TRBs)
 const TR_SIZE: usize = 256;
 
-// ---------------------------------------------------------------------------
-// TRB structure (all rings)
-// ---------------------------------------------------------------------------
-
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
 struct Trb {
@@ -95,10 +87,8 @@ fn trb_type(t: u32) -> u32 { t << 10 }
 #[inline]
 fn trb_cycle(c: u32) -> u32 { c }
 
-// ---------------------------------------------------------------------------
 // Device slot / endpoint context
 // (simplified, matches XHCI spec 6.2.2 / 6.2.3 64-byte variants)
-// ---------------------------------------------------------------------------
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Default)]
@@ -126,10 +116,6 @@ struct DevCtx {
     slot: SlotCtx,
     ep:   [EpCtx; 31],
 }
-
-// ---------------------------------------------------------------------------
-// Controller state
-// ---------------------------------------------------------------------------
 
 struct XhciCtrl {
     mmio:       usize,
@@ -167,10 +153,6 @@ unsafe impl Sync for XhciCtrl {}
 
 static CTRL: Mutex<Option<XhciCtrl>> = Mutex::new(None);
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 pub fn init(mmio_base: u64) {
     unsafe { _init(mmio_base as usize); }
 }
@@ -184,10 +166,6 @@ pub fn is_initialised() -> bool {
 pub fn poll() {
     unsafe { _poll(); }
 }
-
-// ---------------------------------------------------------------------------
-// Init
-// ---------------------------------------------------------------------------
 
 unsafe fn _init(mmio: usize) {
     let cap_len  = (read32(mmio, CAP_CAPLENGTH) & 0xFF) as usize;
@@ -300,10 +278,6 @@ unsafe fn _poll() {
         if c.evt_deq == 0 { c.evt_cycle ^= 1; }
     }
 }
-
-// ---------------------------------------------------------------------------
-// MMIO helpers
-// ---------------------------------------------------------------------------
 
 #[inline]
 unsafe fn read32(base: usize, off: usize) -> u32 {

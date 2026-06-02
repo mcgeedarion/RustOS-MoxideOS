@@ -8,7 +8,6 @@
 //! Naming convention: `SYS_<UPPERCASE_SYSCALL_NAME>`.
 //! All values are `usize` to match the `nr` argument in dispatch.
 
-// ── File I/O ────────────────────────────────────────────────────────────
 pub const SYS_READ:            usize = 0;
 pub const SYS_WRITE:           usize = 1;
 pub const SYS_OPEN:            usize = 2;
@@ -54,7 +53,6 @@ pub const SYS_LCHOWN:          usize = 93;
 pub const SYS_FCHOWN:          usize = 94;
 pub const SYS_UMASK:           usize = 95;
 
-// ── Memory ───────────────────────────────────────────────────────────────
 pub const SYS_MMAP:            usize = 9;
 pub const SYS_MPROTECT:        usize = 10;
 pub const SYS_MUNMAP:          usize = 11;
@@ -63,7 +61,6 @@ pub const SYS_MINCORE:         usize = 27;
 pub const SYS_MREMAP:          usize = 25;
 pub const SYS_MADVISE:         usize = 28;
 
-// ── Process / signals ────────────────────────────────────────────────
 pub const SYS_RT_SIGACTION:    usize = 13;
 pub const SYS_RT_SIGPROCMASK:  usize = 14;
 /// rt_sigreturn is intercepted at the arch entry point before dispatch;
@@ -87,7 +84,6 @@ pub const SYS_GETTID:          usize = 186;
 pub const SYS_CLONE3:          usize = 435;
 pub const SYS_EXIT_GROUP:      usize = 231;
 
-// ── uid / gid ─────────────────────────────────────────────────────────
 pub const SYS_GETUID:          usize = 102;
 pub const SYS_GETGID:          usize = 104;
 pub const SYS_GETEUID:         usize = 107;
@@ -96,20 +92,16 @@ pub const SYS_SETUID:          usize = 105;
 pub const SYS_SETGID:          usize = 106;
 pub const SYS_SETRESGID:       usize = 119;
 
-// ── Threading (NPTL) ─────────────────────────────────────────────────
 pub const SYS_FUTEX:           usize = 202;
 pub const SYS_TKILL:           usize = 200;
 pub const SYS_TGKILL:          usize = 234;
 pub const SYS_SET_ROBUST_LIST: usize = 273;
 pub const SYS_GET_ROBUST_LIST: usize = 274;
 
-// ── Security / namespaces ────────────────────────────────────────────
 pub const SYS_UNSHARE:         usize = 272;
 pub const SYS_SETNS:           usize = 308;
 pub const SYS_SECCOMP:         usize = 317;
 
-// ── Strict-mode allow-list (SECCOMP_SET_MODE_STRICT) ────────────────────
-//
 // Linux's strict mode only permits read(0), write(1), exit(60),
 // exit_group(231), and rt_sigreturn(15).  These constants are gathered
 // here so the seccomp module can reference them by name.
@@ -117,12 +109,9 @@ pub const STRICT_ALLOWLIST: &[usize] = &[
     SYS_READ, SYS_WRITE, SYS_RT_SIGRETURN, SYS_EXIT, SYS_EXIT_GROUP,
 ];
 
-// ── RustOS-private debug/test syscalls ───────────────────────────────────
-//
 // These numbers are in the 0x8000_0000+ range, well above any current or
 // planned Linux NR, so they can never collide.  They are compiled out in
 // release builds (only present when feature = "kmtest").
-//
 // SYS_KMTEST_LIST: returns the count of registered tests; optionally fills
 //                  a user-supplied buffer with NUL-terminated name strings.
 // SYS_KMTEST_RUN:  runs one test by index; streams pass/fail lines to the

@@ -19,8 +19,6 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── ISO 9660 constants ────────────────────────────────────────────────────────
-
 const SECTOR_SIZE:       usize = 2048;
 const PVD_SECTOR:        usize = 16;      // Primary Volume Descriptor lives at sector 16
 const PVD_MAGIC_OFFSET:  usize = 1;
@@ -38,8 +36,6 @@ const DR_NAME:           usize = 33;
 
 const FLAG_DIRECTORY:    u8    = 0x02;
 
-// ── In-memory image state ─────────────────────────────────────────────────────
-
 struct CdImage {
     data:     Vec<u8>,
     root_lba: u32,
@@ -47,8 +43,6 @@ struct CdImage {
 }
 
 static IMAGE: Mutex<Option<CdImage>> = Mutex::new(None);
-
-// ── Low-level helpers ─────────────────────────────────────────────────────────
 
 fn read_sector(img: &[u8], lba: u32) -> Option<&[u8]> {
     let off = lba as usize * SECTOR_SIZE;
@@ -124,8 +118,6 @@ fn resolve_path(img: &CdImage, path: &str) -> Option<(u32, u32, bool)> {
     }
     None
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Load an ISO image from a raw byte slice (e.g. from a virtio-blk cdrom device).
 /// Returns true if the image contains a valid ISO 9660 Primary Volume Descriptor.

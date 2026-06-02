@@ -32,8 +32,6 @@ use spin::Mutex;
 use crate::proc::namespace::{NsId, INIT_NS, alloc_ns_id};
 use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ─── IPC key type ─────────────────────────────────────────────────────────────
-
 pub type IpcKey = i32;
 pub const IPC_PRIVATE: IpcKey = 0;
 const IPC_CREAT:  u32 = 0o001000;
@@ -41,10 +39,6 @@ const IPC_EXCL:   u32 = 0o002000;
 const IPC_RMID:   i32 = 0;
 const IPC_STAT:   i32 = 2;
 const IPC_SET:    i32 = 1;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// System V Message Queues
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct MsgBuf {
@@ -175,10 +169,6 @@ pub fn sys_msgctl(msqid: i32, cmd: i32, _buf_va: usize) -> isize {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// System V Semaphores
-// ─────────────────────────────────────────────────────────────────────────────
-
 const GETVAL:  i32 = 12;
 const SETVAL:  i32 = 16;
 const GETALL:  i32 = 13;
@@ -272,10 +262,6 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> isize {
         _ => -22,
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// System V Shared Memory
-// ─────────────────────────────────────────────────────────────────────────────
 
 struct ShmRegion {
     data:   Vec<u8>,
@@ -372,10 +358,6 @@ pub fn sys_shmctl(shmid: i32, cmd: i32, _buf_va: usize) -> isize {
         _ => -22,
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// POSIX Message Queues
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct PosixMsg {
@@ -499,10 +481,6 @@ pub fn sys_mq_unlink(name_va: usize) -> isize {
         0
     } else { -2 }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// IPC namespace lifecycle
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Called by `unshare_ns("ipc")` / `clone(CLONE_NEWIPC)`.  No objects are
 /// copied into the new namespace — it starts empty, same as Linux.

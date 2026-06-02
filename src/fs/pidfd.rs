@@ -46,8 +46,6 @@ static PIDFD_TABLE: Mutex<KernelFastMap<usize, usize>> = Mutex::new(KernelFastMa
 /// signal cache is not an authorization or ordering boundary.
 static PENDING_SIGNAL: Mutex<KernelFastMap<usize, u32>> = Mutex::new(KernelFastMap::new());
 
-// ── scheme_bfd → PIDFD_TABLE fdno translation ───────────────────────────────────
-
 /// Translate a scheme backing fd to the PIDFD_TABLE fdno.
 /// Returns None if `scheme_bfd` is not a registered pidfd scheme fd.
 pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
@@ -62,8 +60,6 @@ pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
         None
     }
 }
-
-// ── PidFdScheme ────────────────────────────────────────────────────────────────────
 
 pub struct PidFdScheme;
 
@@ -95,8 +91,6 @@ impl Scheme for PidFdScheme {
         Ok(())
     }
 }
-
-// ── Allocation helpers (internal) ────────────────────────────────────────────────
 
 /// Allocate a raw PIDFD_TABLE fdno for `pid`. Returns fdno or -EMFILE.
 fn alloc_table_fdno(pid: usize) -> Result<usize, isize> {
@@ -136,8 +130,6 @@ fn resolve(table_fdno: usize) -> Option<usize> {
     }
 }
 
-// ── sys_pidfd_open [NR 434] ──────────────────────────────────────────────────────
-
 pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
     use crate::fs::process_fd::proc_fd_install;
     use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
@@ -159,18 +151,15 @@ pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
         return -3;
     } // ESRCH
 
-    // ── 1. Allocate raw PIDFD_TABLE entry ─────────────────────────────────────
     let table_fdno = match alloc_table_fdno(pid) {
         Ok(f) => f,
         Err(e) => return e,
     };
 
-    // ── 2. Register PidFdScheme ───────────────────────────────────────────────
     let scheme: Arc<dyn Scheme> = Arc::new(PidFdScheme);
     let scheme_bfd = alloc_scheme_backing_fd();
     scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
 
-    // ── 3. Install scheme bfd (pidfds are always FD_CLOEXEC per spec) ───
     let pid_caller = crate::proc::scheduler::current_pid();
     let nonblock_fl = if flags & PIDFD_NONBLOCK != 0 {
         PIDFD_NONBLOCK
@@ -188,8 +177,6 @@ pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
     user_fd as isize
 }
 
-// ── sys_pidfd_send_signal [NR 424] ───────────────────────────────────────────────
-//
 // The syscall dispatch resolves the user-visible fd to a scheme bfd before
 // calling this.  We translate to the PIDFD_TABLE fdno via
 // scheme_bfd_to_table_fdno.
@@ -249,8 +236,6 @@ pub fn sys_pidfd_send_signal(scheme_bfd: usize, sig: u32, _info_va: usize, flags
 pub fn check_pending_signal(pid: usize) -> u32 {
     PENDING_SIGNAL.lock().remove(&pid).unwrap_or(0)
 }
-
-// ── sys_pidfd_getfd [NR 438] ──────────────────────────────────────────────────────
 
 pub fn sys_pidfd_getfd(scheme_bfd: usize, targetfd: usize, flags: u32) -> isize {
     if flags != 0 {

@@ -30,19 +30,11 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cgroup identity
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct CgroupId(pub u64);
 
 static NEXT_CG_ID: AtomicU64 = AtomicU64::new(1);
 fn alloc_cg_id() -> CgroupId { CgroupId(NEXT_CG_ID.fetch_add(1, Ordering::SeqCst)) }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Cgroup node
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// One cgroup node in the hierarchy.
 pub struct Cgroup {
@@ -84,10 +76,6 @@ impl Cgroup {
     pub fn task_list(&self) -> Vec<u64> { self.tasks.lock().clone() }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Global hierarchy
-// ─────────────────────────────────────────────────────────────────────────────
-
 struct CgroupTree {
     groups: BTreeMap<CgroupId, Cgroup>,
     /// Task-id → cgroup assignment.
@@ -103,10 +91,6 @@ impl CgroupTree {
 }
 
 static CGTREE: Mutex<Option<CgroupTree>> = Mutex::new(None);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Public API
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn init() { *CGTREE.lock() = Some(CgroupTree::new()); }
 

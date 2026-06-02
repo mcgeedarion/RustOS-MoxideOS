@@ -31,15 +31,11 @@ use spin::Mutex;
 
 use crate::proc::namespace::{NsId, INIT_NS, alloc_ns_id};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 /// Maximum number of extents per uid_map or gid_map.  Linux allows 5.
 pub const MAX_ID_MAP_ENTRIES: usize = 5;
 
 /// Sentinel value returned when no mapping covers a given ID.
 pub const NO_MAP: u32 = u32::MAX;
-
-// ── IdMapEntry ────────────────────────────────────────────────────────────────
 
 /// One extent of a uid_map or gid_map.
 #[derive(Clone, Copy, Debug)]
@@ -72,8 +68,6 @@ impl IdMapEntry {
         }
     }
 }
-
-// ── UserNsData ────────────────────────────────────────────────────────────────
 
 /// Mapping state for one user namespace.
 #[derive(Clone, Debug)]
@@ -115,8 +109,6 @@ impl UserNsData {
     }
 }
 
-// ── Global table ──────────────────────────────────────────────────────────────
-
 struct UserNsTable {
     entries: BTreeMap<NsId, UserNsData>,
 }
@@ -150,8 +142,6 @@ pub fn drop_user_ns(ns: NsId) {
     if ns == INIT_NS { return; }
     USER_NS_TABLE.lock().entries.remove(&ns);
 }
-
-// ── ID translation ────────────────────────────────────────────────────────────
 
 /// Translate a namespace-local UID to the host UID.
 /// Returns `NO_MAP` if no mapping covers `ns_uid`.
@@ -198,8 +188,6 @@ pub fn host_to_ns_gid(ns_id: NsId, host_gid: u32) -> u32 {
     }
     NO_MAP
 }
-
-// ── Map writing ───────────────────────────────────────────────────────────────
 
 /// Errors returned by `write_uid_map` / `write_gid_map`.
 #[derive(Debug, PartialEq)]
@@ -307,8 +295,6 @@ fn write_map(
     Ok(())
 }
 
-// ── Map reading (for /proc/<pid>/uid_map output) ──────────────────────────────
-
 /// Render the uid_map for `ns_id` as a Linux-formatted string.
 /// Each line: "<ns_first>\t<host_first>\t<count>\n"
 /// Returns an empty string if the namespace does not exist or is unmapped.
@@ -341,8 +327,6 @@ fn format_map(ns_id: NsId, kind: MapKind) -> alloc::string::String {
     }
     out
 }
-
-// ── /proc write handler ───────────────────────────────────────────────────────
 
 /// Parse a Linux uid_map / gid_map write payload.
 ///

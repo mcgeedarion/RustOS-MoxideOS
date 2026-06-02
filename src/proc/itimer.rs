@@ -32,8 +32,6 @@ use alloc::collections::BTreeMap;
 use spin::Mutex as SpinMutex;
 use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ── per-process alarm state ────────────────────────────────────────────────────
-
 #[derive(Clone, Default)]
 struct AlarmState {
     /// Monotonic ns deadline; 0 means disarmed.
@@ -49,8 +47,6 @@ struct AlarmState {
 
 static ITIMER_TABLE: SpinMutex<BTreeMap<usize /* pid */, AlarmState>> =
     SpinMutex::new(BTreeMap::new());
-
-// ── helpers ─────────────────────────────────────────────────────────────────
 
 /// Read a `struct itimerval` from userspace.
 /// Layout: { timeval value_ns[2] } = { { i64 sec; i64 usec; } x2 }
@@ -97,8 +93,6 @@ fn remaining_real_ns(pid: usize) -> u64 {
     state.deadline_ns.saturating_sub(mono)
 }
 
-// ── alarm(2) ─────────────────────────────────────────────────────────────────
-//
 // alarm(seconds) schedules SIGALRM to be delivered to the calling process
 // after `seconds` seconds.  Any previously scheduled alarm is cancelled.
 // Returns the number of seconds remaining on any previous alarm (rounded up).
@@ -131,13 +125,10 @@ pub fn sys_alarm(seconds: u32) -> isize {
     prev_remaining_secs as isize
 }
 
-// ── setitimer(2) ─────────────────────────────────────────────────────────────
-//
 // setitimer(which, new_va, old_va)
 //   which: 0=ITIMER_REAL 1=ITIMER_VIRTUAL 2=ITIMER_PROF
 //   new_va: pointer to struct itimerval with new value (may be NULL)
 //   old_va: pointer to receive old value (may be NULL)
-//
 // Returns 0 on success, -EINVAL if `which` is out of range.
 
 pub fn sys_setitimer(which: i32, new_va: usize, old_va: usize) -> isize {
@@ -212,8 +203,6 @@ pub fn sys_setitimer(which: i32, new_va: usize, old_va: usize) -> isize {
     0
 }
 
-// ── getitimer(2) ─────────────────────────────────────────────────────────────
-//
 // getitimer(which, cur_va)
 // Writes the remaining time and reload interval into the userspace itimerval.
 
@@ -249,11 +238,8 @@ pub fn sys_getitimer(which: i32, cur_va: usize) -> isize {
     write_itimerval(cur_va, interval_ns, remaining_ns)
 }
 
-// ── check_itimers (scheduler tick integration) ────────────────────────────────
-//
 // Called from the scheduler tick path for the currently-running process.
 // Fires SIGALRM when the ITIMER_REAL deadline has elapsed.
-//
 // This function must be fast (it runs in interrupt context) and must not
 // block.  It does a non-blocking try_lock; if the table is already held
 // by another CPU it skips the check rather than deadlocking.

@@ -21,16 +21,12 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Boot sector offsets ────────────────────────────────────────────────────────
-
 const BS_BYTES_PER_SECTOR: usize = 0x0B; // u16 LE
 const BS_SECS_PER_CLUSTER: usize = 0x0D; // u8
 const BS_MFT_LCN:          usize = 0x30; // i64 LE: logical cluster of $MFT
 const BS_CLUSTERS_PER_MFT: usize = 0x40; // i8: positive=clusters, negative=2^|n|
 
 const NTFS_SIGNATURE:      &[u8] = b"NTFS    "; // at offset 3
-
-// ── MFT record constants ───────────────────────────────────────────────────────
 
 const MFT_RECORD_SIZE:  usize = 1024;
 const MFT_MAGIC:        &[u8] = b"FILE";
@@ -76,8 +72,6 @@ const FN_NAME:         usize = 66; // UTF-16LE name
 const MFT_REC_MFT:    u64 = 0;
 const MFT_REC_ROOT:   u64 = 5; // root directory
 
-// ── Volume state ──────────────────────────────────────────────────────────────
-
 struct NtfsVol {
     data:              Vec<u8>,
     bytes_per_sector:  usize,
@@ -87,8 +81,6 @@ struct NtfsVol {
 }
 
 static VOL: Mutex<Option<NtfsVol>> = Mutex::new(None);
-
-// ── Low-level helpers ─────────────────────────────────────────────────────────
 
 fn read_u16_le(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(buf[off..off+2].try_into().unwrap_or([0;2]))
@@ -279,8 +271,6 @@ impl NtfsVol {
         Some(cur_rec_no)
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Mount an NTFS volume from a raw byte slice.
 /// Returns true if the boot sector contains the NTFS OEM ID.

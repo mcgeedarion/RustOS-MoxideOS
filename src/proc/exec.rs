@@ -71,8 +71,6 @@ const INTERP_BASE: usize = 0x0060_0000;
 const STACK_MAX:   usize = 64 * 1024 * 1024;
 const STACK_MIN:   usize = PAGE;
 
-// ── spawn_user_process ────────────────────────────────────────────────────────
-//
 // Called from kernel_main to bootstrap PID 1.  Reads the ELF from VFS, builds
 // a fresh address space, allocates a kernel stack, fills a Pcb, and enqueues.
 // Returns true on success.
@@ -206,8 +204,6 @@ pub fn spawn_user_process_from_bytes(
     true
 }
 
-// ── do_execve (x86_64) ────────────────────────────────────────────────────────
-
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(
     pid:     usize,
@@ -295,8 +291,6 @@ pub fn do_execve(
     thread::set_run_state_cold(pid, final_entry, initial_rsp);
     0
 }
-
-// ── do_execve_riscv ───────────────────────────────────────────────────────────
 
 #[cfg(target_arch = "riscv64")]
 pub fn do_execve_riscv(
@@ -398,8 +392,6 @@ pub fn do_execve_riscv(
     0
 }
 
-// ── sys_execve dispatcher ─────────────────────────────────────────────────────
-
 pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
     let pid = scheduler::current_pid();
     #[cfg(target_arch = "x86_64")]
@@ -407,8 +399,6 @@ pub fn sys_execve(path_va: usize, argv_va: usize, envp_va: usize) -> isize {
     #[cfg(target_arch = "riscv64")]
     { do_execve_riscv(pid, path_va, argv_va, envp_va) }
 }
-
-// ── Userspace string helpers ──────────────────────────────────────────────────
 
 fn copy_cstr_from_user(va: usize) -> Option<String> {
     let mut buf = [0u8; 4096];
@@ -431,8 +421,6 @@ fn copy_strvec_from_user(vec_va: usize) -> Vec<String> {
     }
     out
 }
-
-// ── Stack allocation helper (x86_64) ─────────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 fn alloc_map_stack(cr3: usize, stack_top: usize) -> usize {

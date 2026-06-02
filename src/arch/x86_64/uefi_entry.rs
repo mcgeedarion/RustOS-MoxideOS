@@ -36,8 +36,6 @@
 use crate::init::boot_info::{BootInfo, BootRange, EfiMemoryMapInfo};
 use core::arch::asm;
 
-// ─── EFI types (bare-minimum subset) ─────────────────────────────────────────────
-
 type EfiStatus = usize;
 type EfiHandle = *mut core::ffi::c_void;
 
@@ -129,8 +127,6 @@ struct EfiConfigTable {
     table: *mut core::ffi::c_void,
 }
 
-// ─── LoadFile2 protocol for initramfs ───────────────────────────────────────────
-
 #[repr(C)]
 struct EfiLoadFile2Protocol {
     load_file: unsafe extern "efiapi" fn(
@@ -141,8 +137,6 @@ struct EfiLoadFile2Protocol {
         buffer: *mut core::ffi::c_void,
     ) -> EfiStatus,
 }
-
-// ─── Fixed offsets into EFI_BOOT_SERVICES ───────────────────────────────────────
 
 /// `EFI_BOOT_SERVICES.LocateHandleBuffer` at offset 0x0B0.
 const LOCATE_HANDLE_BUFFER_OFFSET: usize = 0x0B0;
@@ -169,15 +163,11 @@ type HandleProtocolFn = unsafe extern "efiapi" fn(
 const EXIT_BOOT_SERVICES_OFFSET: usize = 0x190;
 type ExitBootServicesFn = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 
-// ─── GUIDs ─────────────────────────────────────────────────────────────────
-
 // ACPI 2.0: {8868e871-e4f1-11d3-bc22-0080c73c8881}
 const ACPI2_GUID: [u64; 2] = [0x11d3_f1e4_71e8_6888, 0x8188_3cc7_8000_22bc];
 
 // EFI_INITRD_MEDIA_GUID: {5568e427-68fc-4f3d-ac74-ca555231cc68}
 const INITRD_MEDIA_GUID: [u64; 2] = [0x4f3d_fc68_27e4_6855, 0x68cc_3152_55ca_74ac];
-
-// ─── Globals set before kernel_main runs ───────────────────────────────────────
 
 /// Physical address of the RSDP (ACPI 2.0). 0 = not found.
 pub static mut RSDP_PHYS: u64 = 0;
@@ -189,8 +179,6 @@ pub static mut EFI_MAP_SIZE: usize = 0;
 pub static mut EFI_DESC_SIZE: usize = 0;
 
 static mut BOOT_INFO: BootInfo = BootInfo::empty();
-
-// ─── Entry point ────────────────────────────────────────────────────────────
 
 #[no_mangle]
 pub unsafe extern "efiapi" fn uefi_start(
@@ -299,7 +287,6 @@ pub unsafe extern "efiapi" fn uefi_start(
     };
 
     // 5b. ExitBootServices — with mandatory retry on EFI_INVALID_PARAMETER.
-    //
     // UEFI spec §7.4.6: firmware is permitted to add/remove descriptors
     // between GetMemoryMap and ExitBootServices, invalidating map_key.
     // When that happens ExitBootServices returns EFI_INVALID_PARAMETER.
@@ -366,8 +353,6 @@ pub unsafe extern "efiapi" fn uefi_start(
     );
 }
 
-// ─── LoadFile2 initramfs (real hardware / systemd-boot / GRUB2) ─────────────────
-
 unsafe fn load_initrd_via_loadfile2(
     boot_services: *mut core::ffi::c_void,
     bs_base: usize,
@@ -431,8 +416,6 @@ unsafe fn load_initrd_via_loadfile2(
     }
     None
 }
-
-// ─── EFI text output helper ──────────────────────────────────────────────────────
 
 unsafe fn efi_print(con_out: *mut EfiSimpleTextOutput, s: &str) {
     let mut buf = [0u16; 128];

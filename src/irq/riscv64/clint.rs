@@ -43,10 +43,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constants
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// QEMU virt machine CLINT MMIO base (also the default on many SiFive boards).
 pub const DEFAULT_BASE: usize = 0x0200_0000;
 
@@ -71,10 +67,6 @@ const SBI_IPI_SEND: usize = 0;
 /// Default tick interval in CLINT cycles (~10 ms at a 10 MHz timebase).
 pub const DEFAULT_INTERVAL_TICKS: u64 = 100_000;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Global state
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// CLINT MMIO base address (physical = kernel-virtual for identity map).
 static CLINT_BASE: AtomicUsize = AtomicUsize::new(DEFAULT_BASE);
 
@@ -90,10 +82,6 @@ static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Registered per-tick hook (called after scheduler + kswapd work).
 static TICK_HOOK: Mutex<Option<fn()>> = Mutex::new(None);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MMIO helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[inline]
 unsafe fn read64(addr: usize) -> u64 {
     core::ptr::read_volatile(addr as *const u64)
@@ -108,10 +96,6 @@ unsafe fn write64(addr: usize, val: u64) {
 unsafe fn write32(addr: usize, val: u32) {
     core::ptr::write_volatile(addr as *mut u32, val);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SBI ecall helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Issue an SBI ecall.  Returns (error, value).
 #[inline]
@@ -135,10 +119,6 @@ unsafe fn sbi_call(
     );
     (error, value)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Public configuration API
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Override the CLINT MMIO base (called from FDT walker or board init).
 ///
@@ -180,10 +160,6 @@ pub fn tick_count() -> u64 {
     TICK_COUNT.load(Ordering::Relaxed)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Initialisation
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Initialise the CLINT timer for the BSP (hart 0).
 ///
 /// Arms the first timer interrupt at `now + INTERVAL` ticks.
@@ -200,10 +176,6 @@ pub fn init() {
     crate::println!("clint: init OK (base {:#x}, interval {} cycles)",
         CLINT_BASE.load(Ordering::Relaxed), interval);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MTIME / MTIMECMP accessors
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Read the current MTIME counter.
 ///
@@ -265,10 +237,6 @@ pub fn ticks_until_irq(hart: usize) -> u64 {
     cmp.saturating_sub(now)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Timer IRQ handler — called from the trap handler
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Called from the supervisor trap handler on every timer interrupt
 /// (scause = 0x8000_0000_0000_0005 on RV64).
 ///
@@ -300,10 +268,6 @@ pub fn handle_timer_irq() {
     // User-registered hook.
     if let Some(f) = *TICK_HOOK.lock() { f(); }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MSIP — machine-mode software interrupts (IPI)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Send a software IPI to `target_hart`.
 ///
@@ -338,10 +302,6 @@ pub fn msip(hart: usize) -> u32 {
     { let _ = base; 0u32 }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Busy-wait delay
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Spin for at least `us` microseconds using MTIME.
 ///
 /// `timebase_hz` is the CLINT timebase frequency in Hz (e.g. 10_000_000 for
@@ -359,10 +319,6 @@ pub fn delay_us(us: u64, timebase_hz: u64) {
 pub fn delay_ms(ms: u64, timebase_hz: u64) {
     delay_us(ms * 1_000, timebase_hz);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Diagnostics
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Print CLINT status to the kernel log.
 pub fn print_status() {

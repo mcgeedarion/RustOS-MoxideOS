@@ -34,7 +34,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ── O_* constants ───────────────────────────────────────────────────────────────
 const O_RDONLY: i32 = 0;
 const O_WRONLY: i32 = 1;
 const O_RDWR: i32 = 2;
@@ -47,8 +46,6 @@ pub const O_CLOEXEC_FLAG: u32 = 0o2000000;
 
 // RLIMIT_NOFILE index
 const RLIMIT_NOFILE: usize = 7;
-
-// ── FdEntry ───────────────────────────────────────────────────────────────────
 
 /// One entry in a process's fd table.
 #[derive(Clone, Debug)]
@@ -87,8 +84,6 @@ impl FdEntry {
     }
 }
 
-// ── ProcFdTable ────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Default)]
 struct ProcFdTable {
     fds: BTreeMap<usize, FdEntry>,
@@ -123,8 +118,6 @@ impl ProcFdTable {
     }
 }
 
-// ── Global table: pid → ProcFdTable ─────────────────────────────────────────────────────
-
 /// Fast map is safe here: keys are kernel-assigned pids and the global table is
 /// not iterated for deterministic user-visible output.
 static PROC_FD_TABLES: Mutex<KernelFastMap<usize, ProcFdTable>> = Mutex::new(KernelFastMap::new());
@@ -134,14 +127,10 @@ fn current_pid() -> usize {
     crate::proc::scheduler::current_pid()
 }
 
-// ── RLIMIT_NOFILE check ─────────────────────────────────────────────────────────────
-
 fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
     crate::proc::scheduler::with_proc(pid, |p| p.rlimits.exceeds_nofile(table.len()))
         .unwrap_or(false)
 }
-
-// ── dup_backing ────────────────────────────────────────────────────────────────
 
 fn dup_backing(bfd: usize) -> usize {
     if crate::fs::pipe::is_pipe(bfd) {
@@ -178,8 +167,6 @@ fn dup_backing(bfd: usize) -> usize {
         }
     }
 }
-
-// ── Public lifecycle API ─────────────────────────────────────────────────────────────
 
 pub fn proc_fd_alloc(pid: usize, stdin_bfd: usize, stdout_bfd: usize, stderr_bfd: usize) {
     let mut table = ProcFdTable::default();
@@ -272,8 +259,6 @@ pub fn proc_fd_free(pid: usize) {
     }
 }
 
-// ── Public fd-operation API ─────────────────────────────────────────────────────────────
-
 pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     {
         let lock = PROC_FD_TABLES.lock();
@@ -285,7 +270,6 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     }
 
     let (bfd, stored_path): (isize, Option<String>) =
-        // ── Redox-style scheme routing: check before all POSIX paths ──────────
         // If the path looks like `scheme:rest` (no leading '/'), dispatch it
         // through the registered scheme table instead of the POSIX VFS.  This
         // is the core of Redox's "everything is a URL" model and lets drivers
@@ -514,8 +498,6 @@ pub fn proc_fd_install(
     fd
 }
 
-// ── Internal: close a backing fd through the right subsystem ─────────────────────
-
 fn close_backing(bfd: usize) {
     if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         crate::fs::devfs::close(bfd);
@@ -535,7 +517,6 @@ fn close_backing(bfd: usize) {
         crate::fs::pipe::sys_close_pipe(bfd);
     } else if crate::net::socket::is_socket_fd(bfd) {
         crate::net::socket::sys_close_socket(bfd);
-    // ── Scheme fds — must come after all other named fd types ────────────────
     // Backing fds in the 0x8000_0000+ range registered by proc_fd_open's
     // scheme-URL arm are closed here, forwarding the close() to the driver
     // via IpcProxyScheme.  Without this arm, closing a scheme fd was a no-op

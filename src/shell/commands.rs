@@ -26,8 +26,6 @@ fn cmd_info(mut parts: SplitWhitespace) {
     }
 }
 
-// ── info mem ─────────────────────────────────────────────────────────────
-
 fn cmd_info_mem() {
     let stats = crate::mm::pmm::stats();
     let free_kb  = stats.free_pages  * 4;
@@ -40,8 +38,6 @@ fn cmd_info_mem() {
     );
 }
 
-// ── info proc ────────────────────────────────────────────────────────────
-
 fn cmd_info_proc() {
     crate::shell::tty::write(b"PID   PPID  STATE       NAME\r\n");
     crate::proc::table::for_each(|p| {
@@ -53,8 +49,6 @@ fn cmd_info_proc() {
         );
     });
 }
-
-// ── bt ───────────────────────────────────────────────────────────────────
 
 /// Walk frame pointers from the current rbp / s0.
 /// Requires compilation with `-C force-frame-pointers=yes` in RUSTFLAGS.
@@ -81,8 +75,6 @@ fn cmd_bt() {
         depth += 1;
     }
 }
-
-// ── dump <addr> <len> ────────────────────────────────────────────────────
 
 fn cmd_dump(mut parts: SplitWhitespace) {
     let addr = parts
@@ -122,8 +114,6 @@ fn cmd_dump(mut parts: SplitWhitespace) {
         crate::shell::tty::write(line.as_bytes());
     }
 }
-
-// ── help ─────────────────────────────────────────────────────────────────
 
 fn print_help() {
     crate::shell::tty::write(

@@ -62,8 +62,6 @@ use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 use crate::sync::wait_queue::{WaitQueue, WakeReason, CancellationToken, ReadyMask};
 use crate::sync::poll_source::{PollSource, wait_any, AlwaysReady};
 
-// ── Poll event flags ────────────────────────────────────────────────────────────
-
 pub const POLLIN:       u32 = 0x0001;
 pub const POLLPRI:      u32 = 0x0002;
 pub const POLLOUT:      u32 = 0x0004;
@@ -74,8 +72,6 @@ pub const POLLRDNORM:   u32 = 0x0040;
 pub const POLLWRNORM:   u32 = 0x0100;
 pub const EPOLLONESHOT: u32 = 0x4000_0000;
 
-// ── fd namespace helper ─────────────────────────────────────────────────────────
-
 #[inline]
 fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     let pid = crate::proc::scheduler::current_pid();
@@ -83,8 +79,6 @@ fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     if r < 0 { None } else { Some(r as usize) }
 }
 
-// ── Stdio PollSource impls ────────────────────────────────────────────────────────
-//
 // stdin is backed by the serial TTY ring; reads from the actual tty WaitQueue
 // will be wired in once the PTY subsystem owns stdin.  For now poll() checks
 // the ring synchronously and the WaitQueue is a never-slept-on sentinel.
@@ -112,8 +106,6 @@ impl PollSource for StdinSource {
     }
     fn wait_queue(&self) -> &WaitQueue { &self.wq }
 }
-
-// ── PollSource dispatch ───────────────────────────────────────────────────────────
 
 /// Return an `Arc<dyn PollSource>` for any user-visible fd.
 ///

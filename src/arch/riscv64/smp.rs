@@ -15,8 +15,6 @@ static AP_STACKS: [AtomicUsize; MAX_APS] = {
     [ZERO; MAX_APS]
 };
 
-// ── SBI call helper ─────────────────────────────────────────────────────────────────
-
 #[inline]
 unsafe fn sbi_call(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize)
     -> (isize, usize)
@@ -64,8 +62,6 @@ pub fn send_ipi(target_hw_id: usize) {
     }
 }
 
-// ── AP naked entry stub ─────────────────────────────────────────────────────────────
-
 extern "C" { fn ap_entry(cpu_id: u32) -> !; }
 
 #[naked]
@@ -85,8 +81,6 @@ pub unsafe extern "C" fn ap_entry_riscv() -> ! {
         options(noreturn)
     );
 }
-
-// ── BSP: bring up all secondary harts ─────────────────────────────────────────────
 
 pub fn start_all_harts() {
     let total = crate::smp::num_cpus();
@@ -117,8 +111,6 @@ fn alloc_ap_stack() -> usize {
     unsafe { core::ptr::write_bytes(first as *mut u8, 0, SMP::AP_STACK_SIZE); }
     first
 }
-
-// ── Per-AP PLIC + trap init ───────────────────────────────────────────────────────
 
 pub unsafe fn ap_init_plic() {
     use crate::arch::riscv64::mem_layout::plic;

@@ -84,8 +84,6 @@ struct FdMeta {
 static FD_META: Mutex<BTreeMap<usize, FdMeta>> = Mutex::new(BTreeMap::new());
 static FD_LOCKS: Mutex<BTreeMap<usize, i16>> = Mutex::new(BTreeMap::new());
 
-// ── RLIMIT_NOFILE helpers ─────────────────────────────────────────────────────
-
 #[inline]
 fn count_open_fds() -> usize {
     FD_META.lock().len()
@@ -99,7 +97,6 @@ fn check_nofile_limit() -> isize {
     if would_exceed { -24 } else { 0 }
 }
 
-// ── cloexec / nonblock / fl_flags ──────────────────────────────────────────────
 pub fn set_cloexec(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().cloexec = val;
 }
@@ -117,7 +114,6 @@ pub fn close_fd_meta(fd: usize) {
     FD_META.lock().remove(&fd);
 }
 
-// ── fd ownership ─────────────────────────────────────────────────────────────
 pub fn set_fd_owner(fd: usize, pid: usize) {
     FD_META.lock().entry(fd).or_default().owner_pid = pid as i32;
 }
@@ -130,8 +126,6 @@ pub fn clear_fd_owner(fd: usize) {
     }
 }
 
-// ── fd debug names ──────────────────────────────────────────────────────────────
-
 pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
     FD_META.lock().entry(fd).or_default().debug_name = Some(name);
 }
@@ -139,8 +133,6 @@ pub fn fd_set_debug_name(fd: usize, name: alloc::string::String) {
 pub fn fd_get_debug_name(fd: usize) -> Option<alloc::string::String> {
     FD_META.lock().get(&fd).and_then(|m| m.debug_name.clone())
 }
-
-// ── close_on_exec ─────────────────────────────────────────────────────────────
 
 pub fn close_on_exec() {
     let cloexec_fds: Vec<usize> = {
@@ -181,8 +173,6 @@ fn sys_close_fd(fd: usize) {
     close_fd_no_meta(fd);
 }
 
-// ── fd_open ─────────────────────────────────────────────────────────────────
-
 pub fn fd_open(path: &str, flags: i32) -> Result<usize, isize> {
     let limit_check = check_nofile_limit();
     if limit_check < 0 { return Err(limit_check); }
@@ -222,17 +212,12 @@ pub fn fd_size(fd: usize) -> Option<usize> {
     vfs::size_of_raw(fd)
 }
 
-
-// ── VFS mutation compatibility wrappers ───────────────────────────────────
-
 pub fn fd_create(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::create(path) }
 pub fn fd_unlink(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::unlink(path) }
 pub fn fd_link(old: &str, new: &str) -> Result<(), isize> { crate::fs::vfs_ops::link(old, new) }
 pub fn fd_rmdir(path: &str) -> Result<(), isize> { crate::fs::vfs_ops::rmdir(path) }
 pub fn dup_as_raw(old_fd: usize, new_fd: usize) -> isize { vfs::dup_as_raw(old_fd, new_fd) }
 pub fn dup_from_raw(fd: usize, min_fd: usize) -> isize { vfs::dup_from_raw(fd, min_fd) }
-
-// ── sys_fcntl ────────────────────────────────────────────────────────────────
 
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     let pid = crate::proc::scheduler::current_pid();
@@ -323,8 +308,6 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     }
 }
 
-// ── dup2 / dup3 ──────────────────────────────────────────────────────────────
-
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
     if oldfd == newfd { return oldfd as isize; }
     let newfd_open = FD_META.lock().contains_key(&newfd);
@@ -348,8 +331,6 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     if r >= 0 && flags & O_CLOEXEC != 0 { set_cloexec(newfd, true); }
     r
 }
-
-// ── nonblock ────────────────────────────────────────────────────────────────
 
 pub fn set_nonblock(fd: usize, val: bool) {
     FD_META.lock().entry(fd).or_default().nonblock = val;

@@ -16,8 +16,6 @@ use spin::Mutex;
 
 use crate::net::ip;
 
-// ── TCP header constants ─────────────────────────────────────────────────────
-
 pub const TCP_HDR_MIN: usize = 20;
 
 pub const FIN: u8 = 0x01;
@@ -26,8 +24,6 @@ pub const RST: u8 = 0x04;
 pub const PSH: u8 = 0x08;
 pub const ACK: u8 = 0x10;
 pub const URG: u8 = 0x20;
-
-// ── Connection state ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
@@ -87,11 +83,7 @@ impl TcpConn {
     }
 }
 
-// ── Global connection table ────────────────────────────────────────────────────
-
 pub static TCP_CONNS: Mutex<Vec<TcpConn>> = Mutex::new(Vec::new());
-
-// ── Checksum ───────────────────────────────────────────────────────────────────
 
 pub fn tcp_checksum(src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
     let len = segment.len() as u32;
@@ -117,8 +109,6 @@ pub fn tcp_checksum(src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
-
-// ── Build and send ────────────────────────────────────────────────────────────────
 
 pub fn send_segment(
     src_ip: u32,  src_port: u16,
@@ -156,8 +146,6 @@ pub fn send_segment(
 fn send_rst(src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq: u32, ack: u32) {
     send_segment(src_ip, src_port, dst_ip, dst_port, seq, ack, RST | ACK, 0, &[]);
 }
-
-// ── Receive path ───────────────────────────────────────────────────────────────────
 
 pub fn receive(src_ip: u32, pkt: &[u8]) {
     if pkt.len() < TCP_HDR_MIN { return; }
@@ -285,8 +273,6 @@ fn is_between(lo: u32, x: u32, hi: u32) -> bool {
     if lo <= hi { lo <= x && x < hi }
     else        { lo <= x || x < hi }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Start an active TCP connection; returns connection index.
 pub fn connect(dst_ip: u32, dst_port: u16, src_port: u16) -> Result<usize, isize> {

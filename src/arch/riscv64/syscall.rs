@@ -8,10 +8,6 @@
 //!   a7 = NR,  a0–a5 = args,  a0 = return value.
 //!   sepc is advanced by 4 (ecall instruction size) before returning.
 
-// ─────────────────────────────────────────────────────────────────────────────
-// § 1  RISC-V Linux syscall numbers (matches musl / Linux 6.x riscv64)
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Raw RISC-V Linux ABI syscall numbers (`a7` register).
 ///
 /// These are the numbers that user-space musl / glibc places in `a7` before
@@ -317,10 +313,6 @@ pub mod nr {
     pub const process_mrelease:     usize = 448;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// § 2  SyscallArgs — thin wrapper extracted from TrapFrame by the caller
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// The six argument registers passed by the RISC-V Linux ABI (a0 … a5).
 ///
 /// `trap.rs` extracts these from the `TrapFrame` and passes them directly to
@@ -357,15 +349,10 @@ impl SyscallArgs {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// § 3  Inline-asm helpers for making *outgoing* ecalls from kernel Rust code
-// ─────────────────────────────────────────────────────────────────────────────
-//
 // These are *not* used for user→kernel system calls (those arrive as exceptions
 // via riscv_trap_entry).  They are used for:
 //   • SBI (Supervisor Binary Interface) calls to M-mode firmware
 //   • Self-test / debugging shims that need to drop an ecall from S-mode
-//
 // The RISC-V SBI calling convention mirrors the Linux syscall ABI:
 //   a7 = SBI extension id,  a6 = SBI function id,  a0–a5 = args.
 //   a0 = SBI error code (0 = success),  a1 = SBI return value.
@@ -436,10 +423,6 @@ pub unsafe fn sbi_call0(ext: usize, fid: usize) -> SbiRet {
     sbi_call(ext, fid, 0, 0, 0, 0, 0, 0)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// § 4  Well-known SBI extension / function IDs
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// SBI extension IDs (Chapter 4 of the SBI spec, v2.0).
 pub mod sbi_eid {
     pub const BASE:      usize = 0x10;   // SBI Base Extension
@@ -499,10 +482,6 @@ pub mod sbi_fid_dbcn {
     pub const CONSOLE_READ:       usize = 1;
     pub const CONSOLE_WRITE_BYTE: usize = 2;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// § 5  High-level SBI helpers used by the rest of the kernel
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Program the RISC-V timer via SBI TIME extension.
 ///
@@ -584,10 +563,6 @@ pub fn sbi_system_reset(reset_type: u32, reset_reason: u32) -> SbiRet {
 pub fn sbi_console_write_byte(byte: u8) -> SbiRet {
     unsafe { sbi_call1(sbi_eid::DBCN, sbi_fid_dbcn::CONSOLE_WRITE_BYTE, byte as usize) }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// § 6  Errno / negative-return helpers  (RISC-V Linux ABI compatible)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Convert a POSIX `errno` value into the negative `usize` return that the
 /// RISC-V Linux ABI places in `a0`.

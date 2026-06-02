@@ -46,8 +46,6 @@ use crate::proc::{scheduler, thread};
 use crate::sync::wait_queue::{WaitQueue, WakeReason, CancellationToken, ReadyMask};
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
 pub const FUTEX_WAIT:         u32 = 0;
 pub const FUTEX_WAKE:         u32 = 1;
 pub const FUTEX_FD:           u32 = 2;
@@ -71,8 +69,6 @@ const FUTEX_TID_MASK:   u32 = 0x3FFF_FFFF;
 /// Maximum PI boost chain depth (mirrors Linux MAX_LOCK_DEPTH).
 const PI_CHAIN_LIMIT: usize = 8;
 
-// ── Futex key ─────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct FutexKey {
     as_id: usize,
@@ -91,8 +87,6 @@ impl FutexKey {
         FutexKey { as_id: if tgid != 0 { tgid } else { pid }, uaddr }
     }
 }
-
-// ── Waiter / bucket ───────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct Waiter {
@@ -118,14 +112,10 @@ impl FutexBucket {
 
 static FUTEX_TABLE: Mutex<BTreeMap<FutexKey, FutexBucket>> = Mutex::new(BTreeMap::new());
 
-// ── Cancellation helper ───────────────────────────────────────────────────────
-
 #[inline]
 fn current_cancel() -> Option<Arc<CancellationToken>> {
     scheduler::task_cancel_token(scheduler::current_pid())
 }
-
-// ── Timeout helper ────────────────────────────────────────────────────────────
 
 /// Read a `struct timespec { i64 secs; i64 nsecs; }` from userspace and
 /// convert to a monotonic deadline.  Returns `None` if `va == 0`.
@@ -145,8 +135,6 @@ fn read_deadline(va: usize) -> Result<Option<u64>, isize> {
     Ok(Some(deadline))
 }
 
-// ── PI chain ──────────────────────────────────────────────────────────────────
-
 #[derive(Clone)]
 struct PiRecord {
     owner_pid: usize,
@@ -154,8 +142,6 @@ struct PiRecord {
 }
 
 static PI_CHAIN: Mutex<BTreeMap<FutexKey, PiRecord>> = Mutex::new(BTreeMap::new());
-
-// ── PI boost / unboost ────────────────────────────────────────────────────────
 
 fn pi_boost(mut owner_pid: usize, waiter_pid: usize) {
     let waiter_prio = scheduler::with_proc(waiter_pid, |p| p.sched.rt_priority)
@@ -210,8 +196,6 @@ fn pi_unboost(owner_pid: usize) {
         }
     });
 }
-
-// ── Low-level wait / wake ─────────────────────────────────────────────────────
 
 /// Sleep on a futex if `*addr == expected`.  Returns:
 ///   `Ok(())` on successful wakeup,
@@ -318,8 +302,6 @@ pub fn futex_wake_addr(addr: usize, count: usize) {
     futex_wake_bitset(addr, count, FUTEX_BITSET_MATCH_ANY);
 }
 
-// ── Requeue ───────────────────────────────────────────────────────────────────
-
 fn futex_requeue_inner(src: FutexKey, dst: FutexKey, requeue_count: usize) -> usize {
     let mut tbl = FUTEX_TABLE.lock();
     // Move waiters from src to dst.  The dst bucket gets a fresh WaitQueue
@@ -340,8 +322,6 @@ fn futex_requeue_inner(src: FutexKey, dst: FutexKey, requeue_count: usize) -> us
     }
     n
 }
-
-// ── PI futex lock / unlock ────────────────────────────────────────────────────
 
 /// FUTEX_LOCK_PI — acquire a PI-aware mutex.
 pub fn futex_lock_pi(addr: usize) -> isize {
@@ -517,8 +497,6 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
     0
 }
 
-// ── Clear all waiters for a dying thread ──────────────────────────────────────
-
 pub fn futex_clear_pid(pid: usize) {
     {
         let mut tbl = FUTEX_TABLE.lock();
@@ -536,8 +514,6 @@ pub fn futex_clear_pid(pid: usize) {
     }
     pi_unboost(pid);
 }
-
-// ── Robust list on-exit handler ───────────────────────────────────────────────
 
 const MAX_ROBUST: usize = 512;
 
@@ -617,8 +593,6 @@ fn wake_robust_futex(entry_va: usize, futex_offset: isize, tid: usize) {
         wq.wake(FUTEX_BITSET_MATCH_ANY as ReadyMask);
     }
 }
-
-// ── sys_futex [NR 202] ────────────────────────────────────────────────────────
 
 pub fn sys_futex(
     uaddr:            usize,
@@ -703,8 +677,6 @@ pub fn sys_futex(
         _ => -22,
     }
 }
-
-// ── sys_set_robust_list / sys_get_robust_list ─────────────────────────────────
 
 pub fn sys_set_robust_list(head: usize, len: usize) -> isize {
     if len != 16 && len != 24 { return -22; }

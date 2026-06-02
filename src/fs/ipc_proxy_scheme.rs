@@ -33,10 +33,6 @@ use crate::ipc::{
 
 use super::scheme_table::Scheme;
 
-// ---------------------------------------------------------------------------
-// IpcProxyScheme
-// ---------------------------------------------------------------------------
-
 /// A `Scheme` implementation that transparently proxies every call to a
 /// registered userspace driver process.
 pub struct IpcProxyScheme {
@@ -57,10 +53,6 @@ impl IpcProxyScheme {
             lock:     Mutex::new(()),
         }
     }
-
-    // ------------------------------------------------------------------
-    // Internal helpers
-    // ------------------------------------------------------------------
 
     /// Send `req` to the driver and wait for a `SchemeResponse`.
     fn call(&self, req: SchemeRequest) -> Result<SchemeResponse, SchemeError> {
@@ -163,9 +155,6 @@ impl Scheme for IpcProxyScheme {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Minimal wire encoding
-// ---------------------------------------------------------------------------
 // We use a simple tag-prefixed binary format rather than pulling in serde
 // inside the kernel.  Each message starts with a 1-byte discriminant
 // followed by field data.  This is intentionally minimal — swap in a
@@ -239,8 +228,6 @@ fn decode_response(buf: &[u8]) -> Option<SchemeResponse> {
         _          => None,
     }
 }
-
-// -- tiny binary helpers --
 
 fn push_u32(v: &mut Vec<u8>, n: u32) {
     v.extend_from_slice(&n.to_le_bytes());

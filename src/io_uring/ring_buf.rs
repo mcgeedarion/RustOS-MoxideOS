@@ -1,8 +1,6 @@
 // src/io_uring/ring_buf.rs
-//
 // Ring buffer sizing constants and the shared memory layout helpers used by
 // the SQ and CQ rings.
-//
 // Sizes must be powers of two so that masking (`index & (N - 1)`) works
 // instead of modulo, matching the Linux io_uring convention.
 
@@ -14,8 +12,6 @@ pub const CQ_ENTRIES: usize = 512;
 const _: () = assert!(SQ_ENTRIES.is_power_of_two(), "SQ_ENTRIES must be a power of two");
 const _: () = assert!(CQ_ENTRIES.is_power_of_two(), "CQ_ENTRIES must be a power of two");
 const _: () = assert!(CQ_ENTRIES >= SQ_ENTRIES, "CQ must be at least as large as SQ");
-
-// ── RingBuffer helper ─────────────────────────────────────────────────────────
 
 /// Lightweight wrapper that enforces the power-of-two masking contract and
 /// tracks available/used capacity without touching the atomics directly.

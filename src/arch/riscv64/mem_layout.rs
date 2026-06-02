@@ -20,8 +20,6 @@
 //!   - [`uart`]         — NS16550-compatible UART (QEMU virt default)
 //!   - [`smp`]          — AP stack and hart limits
 
-// ── Page constants (Sv39 uses 4 KiB pages) ─────────────────────────────────────
-
 pub mod page {
     pub const SIZE:          usize = 4096;
     pub const SHIFT:         usize = 12;
@@ -36,10 +34,7 @@ pub mod page {
     #[inline] pub const fn align_down(n: usize) -> usize { n & !MASK }
 }
 
-// ── Sv39 PTE field layout ────────────────────────────────────────────────────────
-
 pub mod sv39 {
-    // ── PTE flags (bit positions) ───────────────────────────────────────────
     /// PTE Valid bit.
     pub const PTE_V: usize = 1 << 0;
     /// PTE Readable.
@@ -57,7 +52,6 @@ pub mod sv39 {
     /// PTE Dirty.
     pub const PTE_D: usize = 1 << 7;
 
-    // ── PTE PPN field ───────────────────────────────────────────────────────────
     /// PPN is stored in PTE bits [53:10].  Shift left 10 to get PTE value.
     pub const PPN_SHIFT: usize = 10;
 
@@ -73,7 +67,6 @@ pub mod sv39 {
         ((pa >> super::page::SHIFT) << PPN_SHIFT) | flags | PTE_V
     }
 
-    // ── Virtual address VPN decomposition ───────────────────────────────────────
     /// Extract VPN[0] (PT index, bits [20:12]).
     #[inline] pub const fn vpn0(va: usize) -> usize { (va >> 12) & 0x1FF }
     /// Extract VPN[1] (PD index, bits [29:21]).
@@ -85,8 +78,6 @@ pub mod sv39 {
     pub const SATP_PPN_MASK: usize = 0x0FFF_FFFF_FFFF;
 }
 
-// ── SATP register modes ────────────────────────────────────────────────────────────
-
 pub mod satp {
     /// Bare mode: no address translation.
     pub const MODE_BARE: usize = 0 << 60;
@@ -95,8 +86,6 @@ pub mod satp {
     /// Sv48 four-level page table (MODE field = 9).
     pub const MODE_SV48: usize = 9 << 60;
 }
-
-// ── sstatus CSR bits ──────────────────────────────────────────────────────────────
 
 pub mod sstatus {
     /// SIE: Supervisor Interrupt Enable (bit 1).
@@ -116,8 +105,6 @@ pub mod sstatus {
     pub const SRET_CLEAR_MASK: usize = SPP | SPIE;
 }
 
-// ── sie / sip interrupt bits ───────────────────────────────────────────────────────
-
 pub mod sie {
     /// SSIE: Supervisor Software Interrupt Enable (bit 1).
     /// Also the bit to clear in `sip` to acknowledge an S-mode software interrupt.
@@ -130,13 +117,10 @@ pub mod sie {
     pub const ALL:  usize = SSIE | STIE | SEIE;
 }
 
-// ── scause codes ──────────────────────────────────────────────────────────────────
-
 pub mod scause {
     /// Bit 63 set in scause means it is an interrupt, not an exception.
     pub const INTERRUPT_BIT: usize = 1 << 63;
 
-    // ── Interrupt codes (scause with bit 63 set) ───────────────────────────
     /// Supervisor software interrupt (IPI via SBI).
     pub const INT_S_SOFTWARE:  usize = 1;
     /// Supervisor timer interrupt.
@@ -144,7 +128,6 @@ pub mod scause {
     /// Supervisor external interrupt (PLIC).
     pub const INT_S_EXTERNAL:  usize = 9;
 
-    // ── Exception codes (scause with bit 63 clear) ─────────────────────────
     /// Instruction address misaligned.
     pub const EXC_INSN_MISALIGN:   usize = 0;
     /// Instruction access fault.
@@ -173,8 +156,6 @@ pub mod scause {
     pub const EXC_STORE_PAGE_FAULT: usize = 15;
 }
 
-// ── Trap frame ────────────────────────────────────────────────────────────────────
-
 pub mod trap {
     /// Number of 8-byte slots saved in the trap frame (32 GPRs + sepc + sstatus + pad).
     pub const FRAME_SLOTS: usize = 34;
@@ -195,10 +176,7 @@ pub mod trap {
     pub const INSN_SIZE:   usize = 4;
 }
 
-// ── SBI (Supervisor Binary Interface) ────────────────────────────────────────────
-
 pub mod sbi {
-    // ── Extension IDs (EID) ──────────────────────────────────────────────────
     /// SBI base extension (spec version, impl ID, etc.).
     pub const EID_BASE:    usize = 0x10;
     /// SBI Timer extension (replaces legacy `sbi_set_timer`).
@@ -214,24 +192,19 @@ pub mod sbi {
     /// SBI debug console extension (OpenSBI >= 1.0).
     pub const EID_DBCN:    usize = 0x4442_434E; // ASCII "DBCN"
 
-    // ── Function IDs (FID) — HSM ───────────────────────────────────────────
     pub const FID_HSM_HART_START:  usize = 0;
     pub const FID_HSM_HART_STOP:   usize = 1;
     pub const FID_HSM_HART_STATUS: usize = 2;
 
-    // ── Function IDs (FID) — Timer ───────────────────────────────────────────
     /// Set the next timer event (sbi_set_timer).
     pub const FID_TIMER_SET: usize = 0;
 
-    // ── Function IDs (FID) — IPI ──────────────────────────────────────────────
     /// Send software IPI to a hart mask.
     pub const FID_IPI_SEND: usize = 0;
 
-    // ── Function IDs (FID) — RFENCE ──────────────────────────────────────────
     pub const FID_RFENCE_SFENCE_VMA:       usize = 1;
     pub const FID_RFENCE_SFENCE_VMA_ASID:  usize = 2;
 
-    // ── SBI error codes ─────────────────────────────────────────────────────────
     pub const ERR_SUCCESS:            isize =  0;
     pub const ERR_FAILED:             isize = -1;
     pub const ERR_NOT_SUPPORTED:      isize = -2;
@@ -243,8 +216,6 @@ pub mod sbi {
     pub const ERR_ALREADY_STOPPED:    isize = -8;
 }
 
-// ── CLINT (Core Local Interruptor) ──────────────────────────────────────────────
-//
 // NOTE: On QEMU `virt` the CLINT is present at 0x0200_0000.  On OpenSBI
 // platforms the SBI Timer extension (EID_TIMER) should be preferred for
 // setting timer events so that M-mode and S-mode timers don't conflict.
@@ -261,8 +232,6 @@ pub mod clint {
     /// MTIME register (global 64-bit counter): `BASE + MTIME_OFF`.
     pub const MTIME_OFF:   usize = 0xBFF8;
 }
-
-// ── PLIC (Platform-Level Interrupt Controller) ─────────────────────────────────
 
 pub mod plic {
     /// PLIC MMIO base on the QEMU `virt` machine.
@@ -287,8 +256,6 @@ pub mod plic {
     pub const fn s_mode_context(hart_id: usize) -> usize { hart_id * 2 + 1 }
 }
 
-// ── NS16550-compatible UART (QEMU virt default) ───────────────────────────────
-//
 // MMIO-mapped, unlike the x86 ISA-port-mapped 16550.  Register width is
 // 1 byte per cell, accessed as `u8` at naturally-aligned MMIO addresses.
 
@@ -323,8 +290,6 @@ pub mod uart {
     /// FCR: enable + clear both FIFOs + 14-byte trigger.
     pub const FCR_ENABLE_CLEAR_14: u8 = 0xC7;
 }
-
-// ── SMP constants ───────────────────────────────────────────────────────────────────
 
 pub mod smp {
     /// Number of 4 KiB pages per AP kernel stack (64 KiB).

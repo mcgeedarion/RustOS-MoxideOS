@@ -18,14 +18,10 @@ use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use crate::console::println;
 use super::SdtHeader;
 
-// ── Battery status flags (_BST `battery_state` field) ────────────────────
-
 pub const BST_DISCHARGING:  u32 = 1 << 0;
 pub const BST_CHARGING:     u32 = 1 << 1;
 pub const BST_CRITICAL:     u32 = 1 << 2;
 pub const BST_CHARGE_LIMIT: u32 = 1 << 3;
-
-// ── Static battery information from _BIF ─────────────────────────────────
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct BatteryInfo {
@@ -41,8 +37,6 @@ pub struct BatteryInfo {
     pub capacity_granularity2: u32,
 }
 
-// ── Dynamic battery status from _BST ─────────────────────────────────────
-
 #[derive(Copy, Clone, Debug, Default)]
 pub struct BatteryStatus {
     /// Bitmask: BST_DISCHARGING | BST_CHARGING | BST_CRITICAL.
@@ -54,8 +48,6 @@ pub struct BatteryStatus {
     /// Present voltage in mV.
     pub present_voltage:    u32,
 }
-
-// ── Atomics for lock-free reads from any context ─────────────────────────
 
 static BST_STATE:    AtomicU32 = AtomicU32::new(0);
 static BST_RATE:     AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
@@ -69,8 +61,6 @@ static BIF_VOLTAGE:  AtomicU32 = AtomicU32::new(0xFFFF_FFFF);
 static BIF_TECH:     AtomicU32 = AtomicU32::new(0);
 
 static BATTERY_PRESENT: AtomicBool = AtomicBool::new(false);
-
-// ── AML scanner helpers ───────────────────────────────────────────────────
 
 unsafe fn read_dword(aml: &[u8], i: usize) -> Option<u32> {
     // AML DWordPrefix = 0x0C followed by LE u32.
@@ -148,8 +138,6 @@ unsafe fn scan_bst(aml: &[u8]) {
         return;
     }
 }
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Discover battery and parse initial `_BIF`/`_BST`.
 pub unsafe fn init() {

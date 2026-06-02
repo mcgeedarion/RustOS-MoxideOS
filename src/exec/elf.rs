@@ -1,9 +1,7 @@
 // src/exec/elf.rs
-//
 // ELF64 loader for RustOS.
 // Parses an ELF image, validates it, maps PT_LOAD segments into the
 // virtual address space, and returns the entry-point address.
-//
 // Assumes:
 //   - The binary blob is already in kernel memory (e.g. loaded from
 //     a ramdisk or passed by the bootloader).
@@ -14,11 +12,9 @@
 
 use core::mem;
 
-// ── re-export your memory primitives ────────────────────────────────────────
 use crate::memory::pmm::alloc_frame;
 use crate::memory::vmm::{map_page, PageFlags};
 
-// ── constants ────────────────────────────────────────────────────────────────
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8      = 2;
 const ELFDATA2LSB: u8     = 1;   // little-endian
@@ -35,8 +31,6 @@ const PF_W: u32 = 0x2;   // write
 const PF_R: u32 = 0x4;   // read
 
 const PAGE_SIZE: u64 = 4096;
-
-// ── ELF64 on-disk structures (repr(C, packed) to match the spec) ─────────────
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -70,8 +64,6 @@ pub struct Elf64Phdr {
     pub p_align:  u64,   // alignment (power of 2)
 }
 
-// ── error type ───────────────────────────────────────────────────────────────
-
 #[derive(Debug)]
 pub enum ElfError {
     TooSmall,
@@ -86,8 +78,6 @@ pub enum ElfError {
     AllocFailed,
     UnalignedSegment,
 }
-
-// ── public API ───────────────────────────────────────────────────────────────
 
 /// Load an ELF64 image from `data` into the current page table.
 ///
@@ -117,8 +107,6 @@ pub unsafe fn load_elf(data: &[u8]) -> Result<u64, ElfError> {
 
     Ok({ header.e_entry })
 }
-
-// ── header parsing & validation ──────────────────────────────────────────────
 
 fn parse_header(data: &[u8]) -> Result<Elf64Header, ElfError> {
     if data.len() < mem::size_of::<Elf64Header>() {
@@ -153,8 +141,6 @@ fn validate_header(hdr: &Elf64Header) -> Result<(), ElfError> {
     Ok(())
 }
 
-// ── program header iterator ──────────────────────────────────────────────────
-
 fn program_headers<'a>(
     data: &'a [u8],
     hdr: &Elf64Header,
@@ -183,15 +169,11 @@ fn program_headers<'a>(
     Ok(iter)
 }
 
-// ── PT_INTERP check ──────────────────────────────────────────────────────────
-
 fn has_interpreter(data: &[u8], hdr: &Elf64Header) -> bool {
     // If program_headers fails we conservatively return false.
     let Ok(phdrs) = program_headers(data, hdr) else { return false; };
     phdrs.any(|ph| { ph.p_type } == PT_INTERP)
 }
-
-// ── segment mapping ──────────────────────────────────────────────────────────
 
 /// Map a single PT_LOAD segment.
 ///
@@ -302,8 +284,6 @@ unsafe fn copy_file_bytes_into_frame(
 
     core::ptr::copy_nonoverlapping(src, dst, copy_len);
 }
-
-// ── helpers ──────────────────────────────────────────────────────────────────
 
 #[inline]
 fn align_down(addr: u64, align: u64) -> u64 {

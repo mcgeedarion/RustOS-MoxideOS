@@ -11,8 +11,6 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     crate::arch::init(boot_info)
 }
 
-// ── Panic handler ─────────────────────────────────────────────────────────────
-
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     crate::serial_println!("KERNEL PANIC: {}", info);

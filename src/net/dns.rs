@@ -30,8 +30,6 @@ use spin::Mutex;
 
 use crate::net::{dhcp, udp};
 
-// ── Constants ────────────────────────────────────────────────────────────────
-
 pub const DNS_PORT:    u16 = 53;
 const MAX_CNAME_HOPS: usize = 8;
 const MAX_RETRIES:    u32  = 3;
@@ -42,8 +40,6 @@ const QTYPE_A:    u16 = 1;
 const QTYPE_AAAA: u16 = 28;
 const QTYPE_CNAME: u16 = 5;
 const QCLASS_IN:  u16 = 1;
-
-// ── Cache ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct DnsEntry {
@@ -99,15 +95,11 @@ impl DnsCache {
 
 static DNS_CACHE: Mutex<DnsCache> = Mutex::new(DnsCache::new());
 
-// ── Pending reply storage (set by receive(), read by resolve()) ─────────────────
-
 struct PendingReply {
     txid: u16,
     data: Vec<u8>,
 }
 static PENDING: Mutex<Option<PendingReply>> = Mutex::new(None);
-
-// ── Public API ────────────────────────────────────────────────────────────────
 
 /// Resolve a hostname to an IPv4 address.  Returns `None` on failure.
 /// Results are cached; repeated calls for the same name return instantly.
@@ -133,8 +125,6 @@ pub fn resolve_aaaa(name: &str) -> Option<u128> {
     }
     query_and_cache(name, QTYPE_AAAA).and_then(|e| e.ipv6)
 }
-
-// ── Query engine ───────────────────────────────────────────────────────────────
 
 fn query_and_cache(name: &str, qtype: u16) -> Option<DnsEntry> {
     let dns_ip = dhcp::leased_dns();
@@ -187,8 +177,6 @@ fn query_and_cache(name: &str, qtype: u16) -> Option<DnsEntry> {
     result
 }
 
-// ── Packet builder ────────────────────────────────────────────────────────────────
-
 /// Build a DNS query packet for `name` with the given QTYPE.
 fn build_query(txid: u16, name: &str, qtype: u16) -> Vec<u8> {
     let mut pkt: Vec<u8> = Vec::with_capacity(64);
@@ -221,8 +209,6 @@ fn encode_name(name: &str, out: &mut Vec<u8>) {
     }
     out.push(0); // root label
 }
-
-// ── Response parser ─────────────────────────────────────────────────────────────
 
 struct PartialEntry {
     ipv4: Option<u32>,
@@ -299,8 +285,6 @@ fn parse_response(pkt: &[u8], qtype: u16) -> ParseResult {
     ParseResult::Fail
 }
 
-// ── Name codec helpers ─────────────────────────────────────────────────────────────
-
 /// Skip a DNS-encoded name at `pos`, returning the position after it.
 /// Handles pointer compression (0xC0 prefix).
 fn skip_name(pkt: &[u8], mut pos: usize) -> Option<usize> {
@@ -355,8 +339,6 @@ impl core::ops::Try for Option<usize> {
 // (The parse_response function already handles None via early-return pattern;
 //  skip_name returns Option<usize> and we match on it inline.)
 
-// ── Wait for DNS reply ───────────────────────────────────────────────────────────
-
 fn wait_reply(txid: u16, timeout_ms: u64) -> Option<Vec<u8>> {
     let deadline = crate::time::monotonic_ms() + timeout_ms;
     loop {
@@ -373,8 +355,6 @@ fn wait_reply(txid: u16, timeout_ms: u64) -> Option<Vec<u8>> {
     }
 }
 
-// ── Receive path (called from udp demux on the ephemeral src port) ────────────
-
 /// Called by the UDP demux when a reply arrives on a DNS ephemeral port.
 pub fn receive(_src_ip: u32, data: &[u8]) {
     if data.len() < 12 { return; }
@@ -388,8 +368,6 @@ pub fn receive(_src_ip: u32, data: &[u8]) {
         });
     }
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────────
 
 /// Generate a pseudo-random transaction ID from the name + monotonic time.
 fn txid_for(name: &str) -> u16 {

@@ -29,7 +29,6 @@ use crate::fs::ext4::{
     Ext4Stat,
 };
 
-// ── errno shorthand ────────────────────────────────────────────────────────
 const ENOENT: i32 = -2;
 const EIO:    i32 = -5;
 const EEXIST: i32 = -17;
@@ -39,8 +38,6 @@ const EINVAL: i32 = -22;
 const EROFS:  i32 = -30;
 const EPERM:  i32 = -1;
 
-// ── dirty-block tracker ────────────────────────────────────────────────────
-//
 // We keep a list of block numbers that have been modified since the last
 // flush.  flush_dirty() writes each one back to the block device in order.
 
@@ -98,8 +95,6 @@ fn write_block(blkno: u64) -> Result<(), ()> {
     Ok(())
 }
 
-// ── bitmap helpers ─────────────────────────────────────────────────────────
-
 /// Allocate a free bit in a bitmap block; return bit index or None.
 fn alloc_bit(data: &mut Vec<u8>, blk_off: usize, count: usize) -> Option<usize> {
     for i in 0..count {
@@ -120,8 +115,6 @@ fn free_bit(data: &mut Vec<u8>, blk_off: usize, idx: usize) {
         data[byte] &= !(1 << bit);
     }
 }
-
-// ── public write API ───────────────────────────────────────────────────────
 
 /// Write `buf` to the file at `path` starting at `offset`.
 /// Creates the file if it does not exist (O_CREAT | O_WRONLY semantics).
@@ -201,8 +194,6 @@ pub fn utimens(path: &str, atime_ns: u64, mtime_ns: u64) -> i32 {
 pub fn fsync(_path: &str) -> i32 {
     flush_dirty()
 }
-
-// ── xattr ──────────────────────────────────────────────────────────────────
 
 /// Get the value of extended attribute `name` on `path`.
 /// Returns the raw byte value or a negative errno.

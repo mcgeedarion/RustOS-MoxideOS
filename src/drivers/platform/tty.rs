@@ -13,15 +13,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration
-// ─────────────────────────────────────────────────────────────────────────────
-
 const BUF_CAP: usize = 4096;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal state
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TtyMode {
@@ -43,10 +35,6 @@ impl TtyState {
 }
 
 static TTY: Mutex<TtyState> = Mutex::new(TtyState::new());
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Input side (called from keyboard / serial ISR)
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Feed a raw byte from the keyboard or serial port into the TTY.
 pub fn tty_input(byte: u8) {
@@ -101,10 +89,6 @@ pub fn tty_input(byte: u8) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Output side (called from read(2))
-// ─────────────────────────────────────────────────────────────────────────────
-
 /// Read up to `buf.len()` bytes from the TTY into `buf`.
 ///
 /// - Canonical mode: blocks until at least one complete line is available,
@@ -153,10 +137,6 @@ pub fn tty_poll() -> bool {
         TtyMode::Canonical => tty.lines > 0,
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Mode control
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn set_mode(mode: TtyMode) {
     TTY.lock().mode = mode;

@@ -40,8 +40,6 @@
 use crate::proc::process::Pcb;
 use crate::proc::scheduler::SchedEntity;
 
-// ── TaskRunState ──────────────────────────────────────────────────────────────
-
 /// Lifecycle state of a task's CPU context.
 ///
 /// The scheduler matches on this to decide whether to call
@@ -66,8 +64,6 @@ impl Default for TaskRunState {
         TaskRunState::Live
     }
 }
-
-// ── Task ──────────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 pub struct Task {

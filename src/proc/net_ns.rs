@@ -24,8 +24,6 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use crate::proc::namespace::{NsId, INIT_NS};
 
-// ─── Interface descriptor ─────────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 pub struct NetIface {
     /// Interface name ("lo", "eth0", "veth0", …)
@@ -51,8 +49,6 @@ impl NetIface {
         }
     }
 }
-
-// ─── Per-ns interface table ──────────────────────────────────────────────────
 
 struct NetNs {
     ifaces: Vec<NetIface>,
@@ -81,8 +77,6 @@ impl NetNs {
     }
 }
 
-// ─── Global registry ────────────────────────────────────────────────────────
-
 struct NetNsTable {
     entries: BTreeMap<NsId, NetNs>,
 }
@@ -104,8 +98,6 @@ impl NetNsTable {
 }
 
 static NET_NS_TABLE: Mutex<NetNsTable> = Mutex::new(NetNsTable::new());
-
-// ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Initialise the INIT_NS net-ns with the loopback interface.
 /// Called from kernel init after network subsystem is ready.

@@ -19,10 +19,6 @@ use alloc::{string::String, vec::Vec};
 
 use bitflags::bitflags;
 
-// ---------------------------------------------------------------------------
-// Primitive ID types
-// ---------------------------------------------------------------------------
-
 /// A scheme-local file handle.  Opaque to the kernel; meaning is defined
 /// by each individual scheme handler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,10 +37,6 @@ pub struct IpcEndpoint(pub u64);
 #[repr(transparent)]
 pub struct DriverHandle(pub u64);
 
-// ---------------------------------------------------------------------------
-// OpenFlags
-// ---------------------------------------------------------------------------
-
 bitflags! {
     /// Flags for the `open` system call / scheme `open` method.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,10 +52,6 @@ bitflags! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SeekWhence
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SeekWhence {
@@ -74,10 +62,6 @@ pub enum SeekWhence {
     /// Seek from the end.
     End = 2,
 }
-
-// ---------------------------------------------------------------------------
-// SchemeError
-// ---------------------------------------------------------------------------
 
 /// Error codes returned by scheme handlers and propagated back to callers
 /// as errno values by the kernel.
@@ -117,10 +101,6 @@ impl SchemeError {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// IPC messages: SchemeRequest / SchemeResponse
-// ---------------------------------------------------------------------------
 
 /// A request sent *from* the kernel proxy *to* a userspace driver scheme.
 #[derive(Debug)]
@@ -169,10 +149,6 @@ pub enum SchemeResponse {
     Err(SchemeError),
 }
 
-// ---------------------------------------------------------------------------
-// IrqNotification — sent by the kernel to a subscribed driver endpoint
-// ---------------------------------------------------------------------------
-
 /// Message posted to a driver's IPC endpoint when its subscribed IRQ fires.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -183,10 +159,6 @@ pub struct IrqNotification {
     pub irq: u32,
     pub timestamp_ns: u64,
 }
-
-// ---------------------------------------------------------------------------
-// URL parsing helper
-// ---------------------------------------------------------------------------
 
 /// Parse a scheme URL of the form `"scheme:path"` and return
 /// `Some((scheme, path))`, or `None` if the input is not a scheme URL.

@@ -46,7 +46,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use crate::ipc::{msg, sem, shm, mq};
 
-// ── Named constant sub-modules ───────────────────────────────────────────────
 pub mod nr;
 pub mod errno;
 pub mod signal_nr;
@@ -101,8 +100,6 @@ fn arg_i32(v: usize) -> Option<i32> {
     }
 }
 
-// ── Small inline helpers ─────────────────────────────────────────────────────
-
 pub(crate) fn sys_epoll_create1(flags: u32) -> isize {
     let fd = crate::fs::poll::sys_epoll_create(0);
     if fd >= 0 && flags & EPOLL_CLOEXEC != 0 {
@@ -111,7 +108,6 @@ pub(crate) fn sys_epoll_create1(flags: u32) -> isize {
     fd
 }
 
-// ── NR 118 / 119: getresgid / getresgid32 ────────────────────────────────────
 // Deduplicated into a single helper; both NRs route here.
 #[inline]
 pub(crate) fn copy_gid_to_user(a: usize, b: usize, c: usize) -> isize {
@@ -124,7 +120,6 @@ pub(crate) fn copy_gid_to_user(a: usize, b: usize, c: usize) -> isize {
     0
 }
 
-// ── NR 165: getresuid ────────────────────────────────────────────────────────
 // Mirrors copy_gid_to_user; extracted from the inline arm in dispatch_process.
 #[inline]
 pub(crate) fn copy_uid_to_user(a: usize, b: usize, c: usize) -> isize {
@@ -136,8 +131,6 @@ pub(crate) fn copy_uid_to_user(a: usize, b: usize, c: usize) -> isize {
     if c != 0 { let _ = crate::uaccess::copy_to_user(c, &bytes); }
     0
 }
-
-// ── IPC user-copy helpers ────────────────────────────────────────────────────
 
 fn copy_msgbuf_from_user(msgp_va: usize, msgsz: usize) -> Option<(i64, Vec<u8>)> {
     if msgp_va == 0 || msgsz > msg::MSGMAX { return None; }
@@ -172,8 +165,6 @@ fn copy_sembuf_from_user(sops_va: usize, nsops: usize) -> Option<Vec<sem::Sembuf
     }
     Some(ops)
 }
-
-// ── Safe IPC struct parsers ───────────────────────────────────────────────────
 
 fn parse_shmid_ds(buf: &[u8]) -> Option<shm::ShmidDs> {
     use core::mem::size_of;
@@ -281,8 +272,6 @@ fn copy_mq_attr_to_user(va: usize, attr: &mq::MqAttr) -> bool {
     crate::uaccess::copy_to_user(va, &buf).is_ok()
 }
 
-// ── Entry points ─────────────────────────────────────────────────────────────
-
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize,
                 d: usize, e: usize, f: usize) -> isize {
     dispatch_with_rip(nr, a, b, c, d, e, f, 0)
@@ -304,7 +293,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
                          d: usize, e: usize, f: usize,
                          saved_rip: u64) -> isize {
 
-    // ── trace: syscall entry ──────────────────────────────────────────────
     #[cfg(feature = "debug")]
     {
         use crate::debug::trace::{emit, TraceEvent, TraceKind};
@@ -316,7 +304,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         });
     }
 
-    // ── seccomp pre-check ─────────────────────────────────────────────────
     let is_exit = nr == SYS_EXIT || nr == SYS_EXIT_GROUP;
     match crate::security::seccomp::seccomp_check(nr, &[a, b, c, d, e, f], saved_rip) {
         crate::security::seccomp::SeccompVerdict::Allow  => {}
@@ -334,7 +321,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
         }
     }
 
-    // ── subsystem routers ─────────────────────────────────────────────────
     // Tried in call-frequency order (fs > proc > memory > ipc > time).
     // kmtest is last: private NR range, only active under --features kmtest.
     // Each returns Some(retval) when it owns the nr.
@@ -348,7 +334,6 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
     else if let Some(r) = routers::dispatch_kmtest(&ctx)     { ret = r; }
     else { ret = enosys(); }
 
-    // ── trace: syscall exit ───────────────────────────────────────────────
     #[cfg(feature = "debug")]
     {
         use crate::debug::trace::{emit, TraceEvent, TraceKind};
@@ -363,11 +348,9 @@ pub fn dispatch_with_rip(nr: usize, a: usize, b: usize, c: usize,
     ret
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
 // IPC dispatch helpers — thin named wrappers so routers.rs stays readable.
 // Each function contains exactly the logic that was previously an inline
 // match arm in dispatch_with_rip.
-// ═══════════════════════════════════════════════════════════════════════════
 
 pub(crate) fn shmctl_dispatch(shmid: i32, cmd: i32, buf_va: usize) -> isize {
     if cmd == crate::ipc::IPC_SET {
@@ -519,8 +502,6 @@ pub(crate) fn mq_getsetattr_dispatch(mqd: u64, new_va: usize, old_va: usize) -> 
         }
     }
 }
-
-// ── Side-table cleanup (called from do_exit) ──────────────────────────────────
 
 pub fn altstack_clear_pid(pid: usize) {
     crate::proc::signal::altstack_clear_pid(pid);

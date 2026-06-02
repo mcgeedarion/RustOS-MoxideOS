@@ -21,8 +21,6 @@ use crate::time::{Timespec, NSEC_PER_SEC,
                   realtime_offset_ns, tai_offset_s, MONO_NS};
 use core::sync::atomic::Ordering;
 
-// ── Clock ID constants ─────────────────────────────────────────────────────────────────
-
 pub const CLOCK_REALTIME:           i32 = 0;
 pub const CLOCK_MONOTONIC:          i32 = 1;
 pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
@@ -34,8 +32,6 @@ pub const CLOCK_BOOTTIME:           i32 = 7;
 pub const CLOCK_REALTIME_ALARM:     i32 = 8;
 pub const CLOCK_BOOTTIME_ALARM:     i32 = 9;
 pub const CLOCK_TAI:                i32 = 11;
-
-// ── clock_gettime ──────────────────────────────────────────────────────────────────────
 
 /// Kernel implementation of `clock_gettime(2)`.
 /// `clk_id` is the POSIX clock ID; returns `Timespec` or EINVAL.
@@ -70,8 +66,6 @@ pub fn clock_gettime(clk_id: i32) -> Result<Timespec, isize> {
         _ => Err(-22), // EINVAL
     }
 }
-
-// ── clock_settime ─────────────────────────────────────────────────────────────────────
 
 /// Kernel implementation of `clock_settime(2)`.
 ///
@@ -109,8 +103,6 @@ pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
     }
 }
 
-// ── clock_getres ─────────────────────────────────────────────────────────────────────
-
 /// Returns the resolution of the given clock.
 /// TSC/CLINT clocks have 1 ns resolution; tick-based have HZ resolution.
 pub fn clock_getres(clk_id: i32) -> Result<Timespec, isize> {
@@ -127,8 +119,6 @@ pub fn clock_getres(clk_id: i32) -> Result<Timespec, isize> {
         _ => Err(-22),
     }
 }
-
-// ── CPU-time clocks ─────────────────────────────────────────────────────────────────────
 
 /// Read the current process's accumulated CPU time from the process table.
 ///
@@ -154,13 +144,9 @@ fn get_thread_cputime() -> Timespec {
     get_process_cputime()
 }
 
-// ── monotonic_ns re-export ─────────────────────────────────────────────────────────
-
 /// Convenience re-export used by the scheduler and other crates that import
 /// `clock::monotonic_ns` directly instead of `time::read_monotonic_ns`.
 pub use crate::time::read_monotonic_ns as monotonic_ns;
-
-// ── gettimeofday / time(2) convenience wrappers ──────────────────────────────
 
 use crate::time::Timeval;
 

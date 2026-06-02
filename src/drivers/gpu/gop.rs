@@ -17,10 +17,6 @@ use spin::Mutex;
 use crate::drivers::gpu::framebuffer::{Framebuffer, PixelFormat};
 use crate::drivers::gpu::gpu::DisplayInfo;
 
-// ---------------------------------------------------------------------------
-// GOP state
-// ---------------------------------------------------------------------------
-
 struct GopState {
     fb:     Framebuffer,
     format: GopPixelFormat,
@@ -34,10 +30,6 @@ enum GopPixelFormat {
 }
 
 static GOP: Mutex<Option<GopState>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Initialise from values supplied by the bootloader.
 pub fn init(fb_base: u64, width: u32, height: u32, pitch_bytes: u32) {
@@ -82,10 +74,6 @@ pub fn blit(x: u32, y: u32, width: u32, height: u32, pixels: &[u32]) {
 pub fn fb_phys() -> Option<u64> {
     GOP.lock().as_ref().map(|g| g.fb.phys)
 }
-
-// ---------------------------------------------------------------------------
-// Colour conversion
-// ---------------------------------------------------------------------------
 
 #[inline]
 fn argb_to_gopfmt(argb: u32, fmt: GopPixelFormat) -> u32 {

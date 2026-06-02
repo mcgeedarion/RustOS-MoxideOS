@@ -130,8 +130,6 @@ pub fn build_auxv(
     sp
 }
 
-// ── ELF mapping helpers ───────────────────────────────────────────────────────
-
 fn map_elf_phdrs(elf: &[u8]) -> Result<usize, isize> {
     if elf.len() < 64 { return Err(-8); }
     if &elf[0..4] != b"\x7FELF" { return Err(-8); }

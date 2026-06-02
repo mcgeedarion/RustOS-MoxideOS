@@ -25,10 +25,6 @@
 // Re-export the proc-macro so callers only need `kmtest` in Cargo.toml.
 pub use kmtest_macros::kernel_test;
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
 /// A short, static description of a test failure.
 pub type KmTestError = &'static str;
 
@@ -53,20 +49,9 @@ pub struct KmTestEntry {
 // SAFETY: KmTestEntry only holds &'static str + fn pointer — both Send+Sync.
 unsafe impl Sync for KmTestEntry {}
 
-// ---------------------------------------------------------------------------
-// Test registry (linker-section trick)
-// ---------------------------------------------------------------------------
-//
 // The linker script must place `.kmtest_registry` between the two symbols
-// below.  Add to your linker script (x86_64 and riscv variants):
-//
-//   .kmtest_registry : {
-//       __kmtest_start = .;
-//       KEEP(*(.kmtest_registry))
-//       __kmtest_end = .;
-//   }
-//
-// The extern symbols are declared below; `run_all` derives a slice from them.
+// below. The extern symbols are declared below; `run_all` derives a slice
+// from them.
 
 extern "C" {
     static __kmtest_start: KmTestEntry;
@@ -84,10 +69,6 @@ unsafe fn registry() -> &'static [KmTestEntry] {
     let len   = (end as usize - start as usize) / core::mem::size_of::<KmTestEntry>();
     core::slice::from_raw_parts(start, len)
 }
-
-// ---------------------------------------------------------------------------
-// Summary type
-// ---------------------------------------------------------------------------
 
 /// Aggregate result returned by `run_all()`.
 #[derive(Copy, Clone)]
@@ -115,10 +96,6 @@ impl core::fmt::Display for KmTestSummary {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// run_all
-// ---------------------------------------------------------------------------
 
 /// Run every registered kernel test and return a summary.
 ///

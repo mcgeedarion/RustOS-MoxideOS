@@ -41,42 +41,33 @@ use crate::uaccess::{copy_to_user, validate_user_ptr};
 /// value at the lowest stack address after all pushes (= r15).
 #[repr(C)]
 pub struct SyscallFrame {
-    // ── callee-saved GPRs (pushed last, so lowest addr) ──────────────────
     pub r15: usize,
     pub r14: usize,
     pub r13: usize,
     pub r12: usize,
     pub rbp: usize,
     pub rbx: usize,
-    // ── syscall number / return value ────────────────────────────────────
     pub rax: usize,
-    // ── syscall args (SysV: rdi rsi rdx r10 r8 r9) ──────────────────────
     pub rdi: usize,
     pub rsi: usize,
     pub rdx: usize,
     pub r10: usize,
     pub r8:  usize,
     pub r9:  usize,
-    // ── SYSCALL-saved fields ─────────────────────────────────────────────
     pub rip:    usize,   // saved from RCX by the SYSCALL instruction
     pub rflags: usize,   // saved from R11 by the SYSCALL instruction
     pub rsp:    usize,   // user stack pointer (saved explicitly by stub)
 }
 
-// ── SYSCALL entry stub ────────────────────────────────────────────────────────
-//
 // Registered as MSR_LSTAR.  On entry:
 //   RCX = user RIP  (SYSCALL saves it here)
 //   R11 = user RFLAGS (SYSCALL saves it here)
 //   RSP still points at user stack
-//
 // We immediately switch to the per-CPU kernel stack (stored in GS or
 // simply use the current RSP which is already valid kernel RSP at ring-0
 // for a basic single-stack model), save all GPRs as a SyscallFrame,
 // and call rust_syscall_handler.
-//
 // Stack layout after all pushes (RSP+0 = r15, RSP+128 = rsp_user):
-//
 //   RSP+0   r15
 //   RSP+8   r14
 //   RSP+16  r13
@@ -93,13 +84,11 @@ pub struct SyscallFrame {
 //   RSP+104 rcx   (user RIP)
 //   RSP+112 r11   (user RFLAGS)
 //   RSP+120 rsp_user  ← pushed first → highest address
-//
 // After the call, rax is restored from frame.rax (set by rust_syscall_handler).
 
 global_asm!(
     ".global syscall_asm_entry",
     "syscall_asm_entry:",
-    // ── 1. Save user RSP, then build the frame on the kernel stack. ────────
     //  We use a simple model: no stack-switch (the kernel stack is already
     //  active for ring-0 SYSCALL in this bare-metal environment because we
     //  don't use the syscall IST/TSS stack pointer.  If/when a proper per-CPU
@@ -119,7 +108,6 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // ── 2. Pass &frame as first argument. ─────────────────────────────────
     "mov rdi, rsp",
     // ── 3. Save user RSP into SyscallFrame.rsp.
     //  rsp is NOT one of the pushed regs above; we need to record the
@@ -140,17 +128,13 @@ global_asm!(
     "mov [rsp + 120], rax",  // store into SyscallFrame.rsp slot
     //  NOTE: rax will be overwritten by rust_syscall_handler's return value;
     //  that's fine — we load rax from frame.rax on exit.
-    // ── 4. Enable interrupts while in kernel (SYSCALL clears IF). ─────────
     "sti",
-    // ── 5. Call the Rust handler. ─────────────────────────────────────────
     "call rust_syscall_handler",
-    // ── 6. Disable interrupts before SYSRETQ. ─────────────────────────────
     "cli",
     // ── 7. Restore user RFLAGS→r11 and RIP→rcx from the (possibly modified)
     //       frame (signal delivery may have changed rip/rflags/rsp). ───────
     "mov r11, [rsp + 112]",  // frame.rflags
     "mov rcx, [rsp + 104]",  // frame.rip
-    // ── 8. Pop all saved GPRs. ────────────────────────────────────────────
     "pop r15",
     "pop r14",
     "pop r13",
@@ -171,8 +155,6 @@ global_asm!(
 );
 
 extern "C" { pub fn syscall_asm_entry(); }
-
-// ── Rust-side syscall handler ─────────────────────────────────────────────────
 
 /// Called from `syscall_asm_entry` with a pointer to the SyscallFrame on the
 /// kernel stack.  We handle NR 15 (rt_sigreturn) in-line here because it needs
@@ -214,8 +196,6 @@ pub extern "C" fn rust_syscall_handler(frame: &mut SyscallFrame) {
     // Deliver any pending signals before returning to userspace.
     crate::proc::signal::check_and_deliver(frame);
 }
-
-// ── Supporting syscalls ───────────────────────────────────────────────────────
 
 /// syscall_setup: configure SYSCALL/SYSRET MSRs.
 pub fn syscall_setup() {

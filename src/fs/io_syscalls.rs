@@ -55,11 +55,8 @@ use crate::fs::process_fd::{proc_fd_backing, proc_fd_close, proc_fd_dup2,
 use crate::proc::exec::read_cstr_safe;
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
 
-// ── Current pid shorthand ────────────────────────────────────────────────────
 #[inline(always)]
 fn cpid() -> usize { crate::proc::scheduler::current_pid() }
-
-// ── Seek-offset table for procfs / sysfs synthetic fds ──────────────────────
 
 use spin::Mutex;
 static SYNTH_OFFSET: Mutex<alloc::collections::BTreeMap<usize, usize>> =
@@ -78,18 +75,13 @@ fn synth_offset_remove(bfd: usize) {
     SYNTH_OFFSET.lock().remove(&bfd);
 }
 
-// ── Translate user fd → backing fd ──────────────────────────────────────────
-
 #[inline]
 fn resolve(fd: usize) -> isize {
     if fd <= 2 { return fd as isize; }
     proc_fd_backing(cpid(), fd)
 }
 
-// ── O_APPEND constant (matches process_fd.rs) ────────────────────────────────
 const O_APPEND: i32 = 0o2000;
-
-// ── RLIMIT_FSIZE helper ──────────────────────────────────────────────────────
 
 const RLIMIT_FSIZE: usize = 1;
 const RLIM_INFINITY: u64 = u64::MAX;
@@ -108,8 +100,6 @@ fn check_fsize_limit(bfd: usize, count: usize) -> Result<usize, isize> {
     }
     Ok(count)
 }
-
-// ── sys_read ─────────────────────────────────────────────────────────────────
 
 /// sys_read(fd, buf_va, count)  [NR 0]
 pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
@@ -160,8 +150,6 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     n
 }
 
-// ── sys_write ────────────────────────────────────────────────────────────────
-
 /// sys_write(fd, buf_va, count)  [NR 1]
 pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     if count == 0 { return 0; }
@@ -211,8 +199,6 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     vfs::write(bfd, &kbuf[..safe_count])
 }
 
-// ── sys_open ─────────────────────────────────────────────────────────────────
-
 /// sys_open(path_va, flags, mode)  [NR 2]
 pub fn sys_open(path_va: usize, flags: u32, mode: u32) -> isize {
     let path = match read_cstr_safe(path_va) {
@@ -246,8 +232,6 @@ pub fn sys_openat(dirfd: i32, path_va: usize, flags: u32, mode: u32) -> isize {
     proc_fd_open(pid, &full, flags, mode)
 }
 
-// ── sys_close ────────────────────────────────────────────────────────────────
-
 /// sys_close(fd)  [NR 3]
 pub fn sys_close(fd: usize) -> isize {
     if fd > 2 {
@@ -270,8 +254,6 @@ pub fn sys_close(fd: usize) -> isize {
     }
     proc_fd_close(cpid(), fd)
 }
-
-// ── sys_dup / sys_dup2 / sys_dup3 ────────────────────────────────────────────
 
 /// sys_dup(fd)  [NR 32]
 pub fn sys_dup(fd: usize) -> isize {
@@ -312,8 +294,6 @@ pub fn sys_dup3(old_fd: usize, new_fd: usize, flags: u32) -> isize {
     r
 }
 
-// ── sys_pread64 ──────────────────────────────────────────────────────────────
-
 /// sys_pread64(fd, buf_va, count, offset)  [NR 17]
 pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
     if count == 0 { return 0; }
@@ -326,8 +306,6 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
     if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() { return -14; }
     n
 }
-
-// ── sys_pwrite64 ─────────────────────────────────────────────────────────────
 
 /// sys_pwrite64(fd, buf_va, count, offset)  [NR 18]
 pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize {
@@ -351,8 +329,6 @@ pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isiz
 
     vfs::pwrite(bfd, kbuf.as_ptr(), count, offset)
 }
-
-// ── sys_writev ────────────────────────────────────────────────────────────────
 
 #[repr(C)]
 struct IoVec { base: usize, len: usize }
@@ -427,8 +403,6 @@ pub fn sys_readv(fd: usize, iov_va: usize, iovcnt: usize) -> isize {
     total
 }
 
-// ── Internal bfd-direct read/write ──────────────────────────────────────────
-
 fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     if !validate_user_ptr(buf_va, count) { return -14; }
     let mut kbuf = alloc::vec![0u8; count];
@@ -492,8 +466,6 @@ fn write_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     vfs::write(bfd, &kbuf)
 }
 
-// ── ftruncate ────────────────────────────────────────────────────────────────
-
 /// sys_ftruncate(fd, length)  [NR 77]
 pub fn sys_ftruncate(fd: usize, length: i64) -> isize {
     if length < 0 { return -22; }
@@ -509,8 +481,6 @@ pub fn sys_ftruncate(fd: usize, length: i64) -> isize {
         Err(e)  => e,
     }
 }
-
-// ── link / rmdir / mkdir ─────────────────────────────────────────────────────
 
 /// sys_link(oldpath_va, newpath_va)  [NR 86]
 pub fn sys_link(old_va: usize, new_va: usize) -> isize {

@@ -23,18 +23,10 @@ use spin::Mutex;
 
 use crate::drivers::net::nic::{MacAddr, NicStats};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PCI IDs
-// ─────────────────────────────────────────────────────────────────────────────
-
 pub const VENDOR_INTEL: u16 = 0x8086;
 pub const DEV_82574L:   u16 = 0x10D3;
 pub const DEV_82574L2:  u16 = 0x10F6;
 pub const DEV_82583V:   u16 = 0x150C;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MMIO register offsets
-// ─────────────────────────────────────────────────────────────────────────────
 
 const CTRL:      usize = 0x0000;
 const STATUS:    usize = 0x0008;
@@ -85,10 +77,6 @@ const RX_DESC_COUNT: usize = 256;
 const TX_DESC_COUNT: usize = 256;
 const RX_BUF_SIZE:   usize = 2048;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Descriptor formats (legacy)
-// ─────────────────────────────────────────────────────────────────────────────
-
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 struct RxDesc {
@@ -118,10 +106,6 @@ const TXD_CMD_IFCS:u8 = 1 << 1;
 const TXD_CMD_RS:  u8 = 1 << 3;
 const TXD_STAT_DD: u8 = 1 << 0;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Driver state
-// ─────────────────────────────────────────────────────────────────────────────
-
 struct E1000e {
     mmio:        usize,
     rx_descs:    *mut RxDesc,
@@ -138,10 +122,6 @@ unsafe impl Send for E1000e {}
 unsafe impl Sync for E1000e {}
 
 static NIC: Mutex<Option<E1000e>> = Mutex::new(None);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Public API
-// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn init(mmio_base: u64) {
     unsafe { _init(mmio_base as usize); }
@@ -166,10 +146,6 @@ pub fn send(frame: &[u8]) -> Result<(), &'static str> {
 pub fn recv(out: &mut [u8]) -> Option<usize> {
     unsafe { _recv(out) }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Init
-// ─────────────────────────────────────────────────────────────────────────────
 
 unsafe fn _init(mmio: usize) {
     // Global reset.
@@ -239,10 +215,6 @@ unsafe fn _init(mmio: usize) {
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RX/TX paths
-// ─────────────────────────────────────────────────────────────────────────────
-
 unsafe fn _send(frame: &[u8]) -> Result<(), &'static str> {
     let mut nic_g = NIC.lock();
     let nic = nic_g.as_mut().ok_or("e1000e not initialised")?;
@@ -297,10 +269,6 @@ unsafe fn _recv(out: &mut [u8]) -> Option<usize> {
     nic.stats.rx_bytes += len as u64;
     Some(n)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 unsafe fn read_mac(mmio: usize) -> MacAddr {
     let ral = read32(mmio, RAL0);

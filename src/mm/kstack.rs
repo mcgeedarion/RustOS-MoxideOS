@@ -22,8 +22,6 @@ use crate::arch::{
 
 const PAGE: usize = 4096;
 
-// ── Physical-to-virtual translation (physmap window) ──────────────────────────
-//
 // Kernel stack frames are accessed through the same flat-offset physmap used
 // by heap.rs and cow_fault.rs.  No separate map_page() call is needed for
 // the data pages on either architecture because the physmap covers all of
@@ -52,8 +50,6 @@ fn phys_to_virt(pa: usize) -> usize {
     crate::arch::aarch64::mem_layout::va48::phys_to_virt(pa)
 }
 
-// ── Public types ───────────────────────────────────────────────────────────────────
-
 /// Opaque handle returned by `alloc_kstack`.
 ///
 /// Records both the physical addresses (needed by `pmm::free_page`) and the
@@ -73,8 +69,6 @@ pub struct KstackInfo {
     pa0: usize,
     pa1: usize,
 }
-
-// ── Public API ───────────────────────────────────────────────────────────────────
 
 /// Allocate a new kernel stack with a guard page.
 /// Returns `None` on OOM.

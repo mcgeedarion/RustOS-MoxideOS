@@ -25,8 +25,6 @@ use spin::Mutex;
 use crate::net::ipv6::{self, Addr6, ALL_NODES_LL, ALL_ROUTERS_LL, UNSPECIFIED6, NH_ICMPV6};
 use crate::net::eth;
 
-// ─── ICMPv6 type codes ────────────────────────────────────────────────────────
-
 const TYPE_DST_UNREACH:  u8 = 1;
 const TYPE_ECHO_REQ:     u8 = 128;
 const TYPE_ECHO_REPLY:   u8 = 129;
@@ -40,8 +38,6 @@ const TYPE_REDIRECT:     u8 = 137;
 const OPT_SLLA: u8 = 1; // Source Link-Layer Address
 const OPT_TLLA: u8 = 2; // Target Link-Layer Address
 const OPT_PIO:  u8 = 3; // Prefix Information
-
-// ─── NDP neighbor cache ───────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct NdpEntry {
@@ -71,8 +67,6 @@ pub fn ndp_learn(addr: &Addr6, mac: [u8; 6]) {
     let mut cache = NDP_CACHE.lock();
     cache.insert(*addr, NdpEntry { mac, created: crate::time::monotonic_ticks() });
 }
-
-// ─── ICMPv6 checksum (RFC 4443 §2.3) ─────────────────────────────────────────
 
 /// Compute the ICMPv6 checksum using an IPv6 pseudo-header.
 /// `src` and `dst` are the packet's IPv6 src/dst addresses.
@@ -116,8 +110,6 @@ fn make_icmpv6(src: &Addr6, dst: &Addr6, typ: u8, code: u8, body: &[u8]) -> Vec<
     pkt
 }
 
-// ─── Echo request / reply ─────────────────────────────────────────────────────
-
 fn handle_echo_request(src: &Addr6, dst: &Addr6, payload: &[u8]) {
     if payload.len() < 4 { return; }
     // Reply: flip type to 129, copy identifier+sequence+data.
@@ -139,8 +131,6 @@ fn handle_echo_request(src: &Addr6, dst: &Addr6, payload: &[u8]) {
     ipv6::send6(src, NH_ICMPV6, &full);
 }
 
-// ─── Destination Unreachable ──────────────────────────────────────────────────
-
 /// Send ICMPv6 Destination Unreachable, code 4 = Port Unreachable.
 pub fn port_unreachable6(dst: &Addr6, original_hdr: &[u8], original_payload: &[u8]) {
     let src = ipv6::our_ip6();
@@ -152,8 +142,6 @@ pub fn port_unreachable6(dst: &Addr6, original_hdr: &[u8], original_payload: &[u
     let pkt = make_icmpv6(&src, dst, TYPE_DST_UNREACH, 4, &body);
     ipv6::send6(dst, NH_ICMPV6, &pkt);
 }
-
-// ─── NDP: Neighbor Solicitation (outgoing) ────────────────────────────────────
 
 /// Send a Neighbor Solicitation to resolve `target`.
 /// `src` is our link-local or global address.
@@ -170,8 +158,6 @@ pub fn send_neighbor_solicitation(src: &Addr6, target: &Addr6) {
     let pkt = make_icmpv6(src, &sol_node, TYPE_NS, 0, &body);
     ipv6::send6(&sol_node, NH_ICMPV6, &pkt);
 }
-
-// ─── NDP: Neighbor Solicitation (incoming) ────────────────────────────────────
 
 fn handle_ns(src: &Addr6, dst: &Addr6, payload: &[u8]) {
     if payload.len() < 24 { return; } // 4 reserved + 16 target
@@ -201,8 +187,6 @@ fn send_neighbor_advertisement(dst: &Addr6, target: &Addr6) {
     ipv6::send6(dst, NH_ICMPV6, &pkt);
 }
 
-// ─── NDP: Neighbor Advertisement (incoming) ───────────────────────────────────
-
 fn handle_na(payload: &[u8]) {
     if payload.len() < 20 { return; }
     let target: Addr6 = payload[4..20].try_into().unwrap();
@@ -211,8 +195,6 @@ fn handle_na(payload: &[u8]) {
         ndp_learn(&target, mac);
     }
 }
-
-// ─── NDP: Router Solicitation (outgoing) ─────────────────────────────────────
 
 /// Send a Router Solicitation.  Called when the interface comes up.
 pub fn send_router_solicitation() {
@@ -226,8 +208,6 @@ pub fn send_router_solicitation() {
     let pkt = make_icmpv6(&src, &ALL_ROUTERS_LL, TYPE_RS, 0, &body);
     ipv6::send6(&ALL_ROUTERS_LL, NH_ICMPV6, &pkt);
 }
-
-// ─── NDP: Router Advertisement (incoming) ────────────────────────────────────
 
 fn handle_ra(payload: &[u8]) {
     // RA fixed body: cur_hop_limit(1) + flags(1) + router_lifetime(2) +
@@ -281,8 +261,6 @@ fn handle_ra(payload: &[u8]) {
     // Gateway is set by the receive() function below.
 }
 
-// ─── Redirect (type 137) ─────────────────────────────────────────────────────
-
 fn handle_redirect(payload: &[u8]) {
     // Redirect body: 4 reserved + target addr (16) + dest addr (16) + options
     if payload.len() < 36 { return; }
@@ -292,8 +270,6 @@ fn handle_redirect(payload: &[u8]) {
         ndp_learn(&target, mac);
     }
 }
-
-// ─── Option parser helper ─────────────────────────────────────────────────────
 
 fn parse_lladdr_option(opts: &[u8]) -> Option<[u8; 6]> {
     let mut off = 0;
@@ -309,8 +285,6 @@ fn parse_lladdr_option(opts: &[u8]) -> Option<[u8; 6]> {
     }
     None
 }
-
-// ─── Main receive dispatcher ──────────────────────────────────────────────────
 
 /// Dispatch an incoming ICMPv6 message.
 /// `payload` starts at the ICMPv6 type byte.

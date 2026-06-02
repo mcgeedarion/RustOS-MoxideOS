@@ -31,7 +31,6 @@ pub const TRAMPOLINE_VADDR: usize = 0xFFFF_FFFF_FFFF_F000;
 /// VA of the per-process trapframe page (one page below the trampoline).
 pub const TRAPFRAME_VADDR: usize = TRAMPOLINE_VADDR - page::SIZE;
 
-// ── Linker symbols ───────────────────────────────────────────────────────────
 extern "C" {
     static _trampoline_start: u8;
     static _trampoline_end:   u8;
@@ -84,8 +83,6 @@ pub fn map_trampoline_for_process(user_root_pa: usize) -> usize {
     tf_pa
 }
 
-// ── Save-area helpers ────────────────────────────────────────────────────────
-
 /// Byte offset of the save area within the trapframe page.
 pub const SAVE_AREA_OFF: usize = 272; // = 34 * 8  (after 34-slot TrapFrame)
 
@@ -124,8 +121,6 @@ pub unsafe fn fill_save_area(
 unsafe fn w(addr: usize, val: usize) {
     core::ptr::write_volatile(addr as *mut usize, val);
 }
-
-// ── Internal helper ──────────────────────────────────────────────────────────
 
 /// Return the physical root PA of the current kernel page table.
 fn kernel_satp_root() -> usize {

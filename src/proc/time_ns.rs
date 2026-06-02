@@ -19,8 +19,6 @@ use crate::uaccess::{copy_from_user, copy_to_user};
 const UTIME_NOW:  i64 = 0x3fff_ffff;
 const UTIME_OMIT: i64 = 0x3fff_fffe;
 
-// ── helpers ─────────────────────────────────────────────────────────────────────────────────
-
 /// Read a `struct timespec { i64 tv_sec; i64 tv_nsec; }` from userspace.
 #[inline]
 fn read_timespec(va: usize) -> Option<(i64, i64)> {
@@ -56,8 +54,6 @@ fn mono_ns_for_current() -> u64 {
 fn cpu_ns(pid: usize) -> u64 {
     crate::proc::scheduler::with_proc(pid, |p| p.cpu_time_ns).unwrap_or(0)
 }
-
-// ── sys_clock_gettime ─────────────────────────────────────────────────────────────────────────
 
 pub fn sys_clock_gettime(clkid: u32, tp_va: usize) -> isize {
     if tp_va == 0 { return -14; }
@@ -99,8 +95,6 @@ pub fn sys_clock_gettime(clkid: u32, tp_va: usize) -> isize {
     write_timespec(tp_va, sec, nsec)
 }
 
-// ── sys_clock_settime ─────────────────────────────────────────────────────────────────────────
-
 pub fn sys_clock_settime(clkid: u32, tp_va: usize) -> isize {
     match clkid {
         // CLOCK_REALTIME only – other clocks cannot be set.
@@ -121,8 +115,6 @@ pub fn sys_clock_settime(clkid: u32, tp_va: usize) -> isize {
     }
 }
 
-// ── sys_settimeofday ─────────────────────────────────────────────────────────────────────────
-
 /// settimeofday(tv: *const timeval, tz: *const timezone)
 ///
 /// Sets CLOCK_REALTIME by computing offset = new_real_ns - mono_ns.
@@ -140,8 +132,6 @@ pub fn sys_settimeofday(tv_va: usize, _tz_va: usize) -> isize {
     crate::time::set_realtime_offset_ns(offset);
     0
 }
-
-// ── utime / utimes / utimensat ───────────────────────────────────────────────────────────────────
 
 /// Return current realtime in nanoseconds.
 fn now_real_ns() -> u64 {

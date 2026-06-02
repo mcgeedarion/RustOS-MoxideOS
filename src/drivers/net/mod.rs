@@ -27,8 +27,6 @@ pub mod nic;
 pub mod virtio_net;
 pub mod virtio_net_mmio;
 
-// ── PCI IDs ──────────────────────────────────────────────────────────────────
-
 const VENDOR_INTEL:       u16 = 0x8086;
 const DEV_E1000E_82574L:  u16 = 0x10D3;
 const DEV_E1000E_82574L2: u16 = 0x10F6;
@@ -43,7 +41,6 @@ const DEV_VIRTIO_NET_T:   u16 = 0x1041;   // transitional (virtio 1.x)
 /// Called once from `kernel_main` after `pci::init()` (x86_64) or
 /// `fdt_phase2()` (RISC-V).  Safe to call before the scheduler is running.
 pub fn init() {
-    // ── x86_64: PCI scan + inline BAR extraction ──────────────────────────────
     #[cfg(target_arch = "x86_64")]
     {
         use crate::device::pci;
@@ -85,7 +82,6 @@ pub fn init() {
         crate::serial_println!("[nic] no supported NIC found on PCI bus");
     }
 
-    // ── RISC-V: virtio-net MMIO (base already found by fdt_phase2) ───────────
     #[cfg(target_arch = "riscv64")]
     {
         crate::drivers::net::virtio_net_mmio::init();

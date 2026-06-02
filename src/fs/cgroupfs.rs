@@ -29,8 +29,6 @@ use spin::Mutex;
 
 use crate::proc::cgroup;
 
-// ── Knob filenames present in every cgroup directory ─────────────────────────
-
 const KNOB_FILES: &[&str] = &[
     "cgroup.procs",
     "cgroup.children",
@@ -42,8 +40,6 @@ const KNOB_FILES: &[&str] = &[
     "pids.current",
     "io.weight",
 ];
-
-// ── Synthetic fd table ────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct CgFd {
@@ -65,8 +61,6 @@ fn next_cgfs_fd() -> usize {
 pub fn is_cgroupfs_fd(fdno: usize) -> bool {
     CGFS_FDS.lock().contains_key(&fdno)
 }
-
-// ── open ─────────────────────────────────────────────────────────────────────
 
 /// Open a cgroupfs knob file and return a synthetic fd, or negative errno.
 /// `path` is an absolute path like `/sys/fs/cgroup/foo/cpu.weight`.
@@ -101,8 +95,6 @@ pub fn cgroupfs_open(path: &str) -> isize {
     fdno as isize
 }
 
-// ── read ─────────────────────────────────────────────────────────────────────
-
 /// Read bytes from a cgroupfs synthetic fd.
 pub fn cgroupfs_read(fdno: usize, buf: &mut [u8]) -> isize {
     let mut guard = CGFS_FDS.lock();
@@ -118,14 +110,10 @@ pub fn cgroupfs_read(fdno: usize, buf: &mut [u8]) -> isize {
     n as isize
 }
 
-// ── close ────────────────────────────────────────────────────────────────────
-
 /// Release a cgroupfs synthetic fd.
 pub fn cgroupfs_close(fdno: usize) {
     CGFS_FDS.lock().remove(&fdno);
 }
-
-// ── exists (stat helper) ──────────────────────────────────────────────────────
 
 /// Check whether `path` exists under cgroupfs.
 /// Returns `Some(true)` for directories, `Some(false)` for knob files,
@@ -170,8 +158,6 @@ pub fn cgroupfs_exists(path: &str) -> Option<bool> {
     }
 }
 
-// ── readdir ───────────────────────────────────────────────────────────────────
-
 /// A single directory entry returned by `cgroupfs_list_dir_by_path`.
 pub struct CgDirEntry {
     pub name:   String,
@@ -202,8 +188,6 @@ pub fn cgroupfs_list_dir_by_path(path: &str) -> Option<Vec<CgDirEntry>> {
     Some(entries)
 }
 
-// ── mkdir ─────────────────────────────────────────────────────────────────────
-
 /// Create a new child cgroup by mkdir on the cgroupfs path.
 /// Returns 0 on success, negative errno on failure.
 pub fn cgroupfs_mkdir(path: &str) -> isize {
@@ -228,8 +212,6 @@ pub fn cgroupfs_mkdir(path: &str) -> isize {
     }
 }
 
-// ── rmdir ─────────────────────────────────────────────────────────────────────
-
 /// Remove a cgroup by rmdir on the cgroupfs path.
 /// Returns 0 on success, negative errno on failure.
 pub fn cgroupfs_rmdir(path: &str) -> isize {
@@ -239,8 +221,6 @@ pub fn cgroupfs_rmdir(path: &str) -> isize {
     };
     cgroup::remove_cgroup(cgid)
 }
-
-// ── internal helpers ──────────────────────────────────────────────────────────
 
 /// Build a newline-separated directory listing byte string for a cgroup dir.
 fn dir_listing_bytes(cgid: cgroup::CgroupId) -> Vec<u8> {

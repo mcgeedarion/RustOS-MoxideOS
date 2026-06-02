@@ -39,10 +39,6 @@ use core::{
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-// ---------------------------------------------------------------------------
-// Event type / code constants (Linux uapi/linux/input-event-codes.h)
-// ---------------------------------------------------------------------------
-
 pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -66,10 +62,6 @@ pub const BTN_MIDDLE: u16 = 0x112;
 /// ceil((KEY_MAX+1)/8) = 96 bytes.  Standard for a full PC keyboard.
 pub const KEY_MAX: u16 = 767;
 
-// ---------------------------------------------------------------------------
-// Wire-format InputEvent  (= Linux `struct input_event`, 24 bytes on x86-64)
-// ---------------------------------------------------------------------------
-
 /// `struct input_event` wire format.  Must stay `repr(C)` and 24 bytes so
 /// userspace can `read(fd, buf, 24*N)` and get exactly N events.
 #[derive(Clone, Copy, Debug, Default)]
@@ -89,10 +81,6 @@ pub struct InputEvent {
 }
 
 const _: () = assert!(core::mem::size_of::<InputEvent>() == 24);
-
-// ---------------------------------------------------------------------------
-// EvdevRingBuf — power-of-2 SPSC lock-free ring
-// ---------------------------------------------------------------------------
 
 const RING_CAP: usize = 256; // must be power of two
 const RING_MASK: u32  = (RING_CAP - 1) as u32;
@@ -177,10 +165,6 @@ impl EvdevRingBuf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DeviceInfo — metadata returned by EVIOCGID / EVIOCGNAME ioctls
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     /// Kernel-visible name, e.g. "RustOS Virtual Keyboard"
@@ -214,10 +198,6 @@ impl DeviceInfo {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Capability bitmasks
-// ---------------------------------------------------------------------------
-
 /// Evdev capability bitmask for `EVIOCGBIT`.
 ///
 /// Each bit N being set means the device can generate that event code.
@@ -241,10 +221,6 @@ impl CapBits {
 
     pub fn as_bytes(&self) -> &[u8] { &self.0 }
 }
-
-// ---------------------------------------------------------------------------
-// InputDevice — one registered hardware/virtual device
-// ---------------------------------------------------------------------------
 
 pub struct InputDevice {
     pub info:     DeviceInfo,
@@ -323,10 +299,6 @@ impl InputDevice {
     }
 }
 
-// ---------------------------------------------------------------------------
-// InputDeviceRegistry — global device table
-// ---------------------------------------------------------------------------
-
 const MAX_DEVICES: usize = 16;
 
 /// Indices into `REGISTRY` for the two synthetic devices registered during
@@ -383,10 +355,6 @@ pub fn device_count() -> usize {
     unsafe { REGISTRY.count }
 }
 
-// ---------------------------------------------------------------------------
-// Public dispatch API — these are the call-sites used by drivers / arch code
-// ---------------------------------------------------------------------------
-
 /// Dispatch a raw keyboard scancode to `/dev/input/event0` (KBD_MINOR).
 ///
 /// `scancode` is the raw evdev key code (XT scancode translated to evdev).
@@ -430,10 +398,6 @@ pub fn dispatch_mouse(dx: i8, dy: i8, buttons: u8) {
     });
     dev.waitq.wake_all();
 }
-
-// ---------------------------------------------------------------------------
-// EventNode — FileOps implementation for /dev/input/eventN
-// ---------------------------------------------------------------------------
 
 /// A file-description backed by one `InputDevice`.  One `EventNode` is
 /// created per `open()` so each fd has its own read position (they all
@@ -609,10 +573,6 @@ impl FileOps for EventNode {
 
     fn close(&self) { /* nothing to do; per-fd ring isolation not yet implemented */ }
 }
-
-// ---------------------------------------------------------------------------
-// init — called once from kernel init before devfs is registered
-// ---------------------------------------------------------------------------
 
 /// Register the two synthetic input devices (keyboard + mouse) and return
 /// their minor indices.  Called from `kernel_main` before `devfs::init()`.

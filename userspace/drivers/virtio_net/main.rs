@@ -39,13 +39,10 @@ use scheme_api::{
     SchemeRequest, SchemeResponse,
 };
 
-// ---------------------------------------------------------------------------
 // Kernel syscall stubs
-// 
 // In a real build these are thin wrappers around `syscall` instructions.
 // We declare them as `extern "C"` here; the linker resolves them from the
 // syscall shim library built alongside the kernel.
-// ---------------------------------------------------------------------------
 
 extern "C" {
     fn sys_driver_bind(bdf: u32, cap_flags: u32) -> i64;
@@ -58,10 +55,6 @@ extern "C" {
     fn sys_irq_ack(handle: u64, irq: u32) -> i64;
     fn sys_exit(code: i32) -> !;
 }
-
-// ---------------------------------------------------------------------------
-// Virtio-net MMIO layout (virtio spec 1.2, section 4.1)
-// ---------------------------------------------------------------------------
 
 /// Magic value at offset 0x000: must equal 0x74726976 ("virt").
 const VIRTIO_MAGIC:           u32 = 0x74726976;
@@ -91,10 +84,6 @@ const TX_QUEUE_IDX:  u32 = 1;
 const QUEUE_SIZE:    u16 = 256;
 const MAX_FRAME_LEN: usize = 1526; // 1500 + 14 (Ethernet) + 12 (virtio header)
 
-// ---------------------------------------------------------------------------
-// Virtqueue descriptor / available / used ring structures (spec 2.7)
-// ---------------------------------------------------------------------------
-
 #[repr(C)]
 struct VirtqDesc {
     addr:  u64,   // physical address of buffer
@@ -122,10 +111,6 @@ struct VirtqUsed {
     idx:   u16,
     ring:  [VirtqUsedElem; QUEUE_SIZE as usize],
 }
-
-// ---------------------------------------------------------------------------
-// Driver state
-// ---------------------------------------------------------------------------
 
 struct NetDriver {
     mmio_base:    *mut u8,
@@ -155,9 +140,6 @@ unsafe impl Send for NetDriver {}
 unsafe impl Sync for NetDriver {}
 
 impl NetDriver {
-    // ------------------------------------------------------------------
-    // Initialisation
-    // ------------------------------------------------------------------
 
     unsafe fn init(mmio_base: *mut u8, handle: DriverHandle, irq: u32) -> Self {
         // Verify magic and device type.
@@ -166,7 +148,6 @@ impl NetDriver {
         let dev_id = mmio_read32(mmio_base, VIRTIO_MMIO_DEVICE_ID);
         assert_eq!(dev_id, 1, "device is not virtio-net (id={})", dev_id);
 
-        // Reset and set status.
         mmio_write32(mmio_base, VIRTIO_MMIO_STATUS, 0);
         mmio_write32(mmio_base, VIRTIO_MMIO_STATUS,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER);
@@ -175,15 +156,12 @@ impl NetDriver {
         mmio_write32(mmio_base, VIRTIO_MMIO_STATUS,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK);
 
-        // Set up RX queue (index 0).
         let (rx_desc, rx_avail, rx_used, rx_bufs) =
             Self::setup_rx_queue(handle, mmio_base);
 
-        // Set up TX queue (index 1).
         let (tx_desc, tx_avail, tx_used, tx_free) =
             Self::setup_tx_queue(handle, mmio_base);
 
-        // Driver is ready.
         mmio_write32(mmio_base, VIRTIO_MMIO_STATUS,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK);
 
@@ -209,7 +187,6 @@ impl NetDriver {
         mmio_write32(base, VIRTIO_MMIO_QUEUE_SEL, RX_QUEUE_IDX);
         mmio_write32(base, VIRTIO_MMIO_QUEUE_NUM, QUEUE_SIZE as u32);
 
-        // Allocate descriptor table.
         let desc_size  = core::mem::size_of::<VirtqDesc>()  * QUEUE_SIZE as usize;
         let avail_size = core::mem::size_of::<VirtqAvail>();
         let used_size  = core::mem::size_of::<VirtqUsed>();
@@ -285,10 +262,6 @@ impl NetDriver {
         (desc, avail, used, tx_free)
     }
 
-    // ------------------------------------------------------------------
-    // IRQ handler
-    // ------------------------------------------------------------------
-
     unsafe fn handle_irq(&mut self) {
         // Acknowledge the interrupt in the device.
         let status = mmio_read32(self.mmio_base, VIRTIO_MMIO_INT_STATUS);
@@ -313,7 +286,6 @@ impl NetDriver {
             let desc_idx = elem.id as usize;
             let len = elem.len as usize;
 
-            // Copy frame data out of DMA buffer.
             let (virt_buf, _) = self.rx_bufs[desc_idx];
             let frame = core::slice::from_raw_parts(virt_buf, len.min(MAX_FRAME_LEN));
             self.rx_pending.push_back(frame.to_vec());
@@ -327,7 +299,6 @@ impl NetDriver {
 
             self.rx_last_used = self.rx_last_used.wrapping_add(1);
         }
-        // Notify device of new avail descriptors.
         mmio_write32(self.mmio_base, VIRTIO_MMIO_QUEUE_NOTIFY, RX_QUEUE_IDX);
     }
 
@@ -344,10 +315,6 @@ impl NetDriver {
             }
         }
     }
-
-    // ------------------------------------------------------------------
-    // Scheme request handler
-    // ------------------------------------------------------------------
 
     /// Decode one `SchemeRequest` from `buf` and return the encoded response.
     unsafe fn handle_scheme_request(&mut self, buf: &[u8]) -> Vec<u8> {
@@ -422,15 +389,10 @@ impl NetDriver {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         avail.idx = avail.idx.wrapping_add(1);
 
-        // Kick the device.
         mmio_write32(self.mmio_base, VIRTIO_MMIO_QUEUE_NOTIFY, TX_QUEUE_IDX);
         n
     }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 /// Virtio-net PCI BDF used in QEMU: bus=0, dev=3, func=0  →  0x000300
 const VIRTIO_NET_BDF: u32 = 0x0003_00;
@@ -481,10 +443,6 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MMIO helpers
-// ---------------------------------------------------------------------------
-
 unsafe fn mmio_read32(base: *mut u8, offset: usize) -> u32 {
     let ptr = base.add(offset) as *const u32;
     core::ptr::read_volatile(ptr)
@@ -497,10 +455,6 @@ unsafe fn mmio_write64(base: *mut u8, offset: usize, val: u64) {
     let ptr = base.add(offset) as *mut u64;
     core::ptr::write_volatile(ptr, val);
 }
-
-// ---------------------------------------------------------------------------
-// Response encoding helpers (mirrors ipc_proxy_scheme decode)
-// ---------------------------------------------------------------------------
 
 fn encode_fd(id: u64) -> Vec<u8> {
     let mut v = vec![0x80u8];

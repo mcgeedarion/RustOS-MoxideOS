@@ -1,14 +1,10 @@
 // src/io_uring/sqe.rs
-//
 // Submission Queue Entry (SQE) — mirrors the Linux io_uring_sqe layout
 // but trimmed to the opcodes RustOS actually dispatches.
-//
 // Field layout follows the Linux ABI so the struct is compatible with any
 // virtio or pass-through mechanism we might add later.
 
 use core::mem;
-
-// ── Opcode constants (Linux ABI values) ───────────────────────────────────────
 
 pub mod op {
     pub const NOP:     u8 = 0;
@@ -22,8 +18,6 @@ pub mod op {
     pub const TIMEOUT: u8 = 11; // IORING_OP_TIMEOUT
 }
 
-// ── Flags ─────────────────────────────────────────────────────────────────────
-
 pub mod sqe_flags {
     /// Use fixed (pre-registered) file descriptor index.
     pub const FIXED_FILE: u8 = 1 << 0;
@@ -36,8 +30,6 @@ pub mod sqe_flags {
     /// Always perform the operation asynchronously.
     pub const ASYNC:      u8 = 1 << 4;
 }
-
-// ── SQE struct ────────────────────────────────────────────────────────────────
 
 /// One entry in the submission queue.
 ///
@@ -92,8 +84,6 @@ impl Sqe {
         // SAFETY: Sqe is repr(C) with no non-zero-valid constraints.
         unsafe { mem::zeroed() }
     }
-
-    // ── Builders ──────────────────────────────────────────────────────────────
 
     /// Prepare a fixed-buffer READ: read `len` bytes from `fd` at `offset`
     /// into the buffer at virtual address `buf_addr`.

@@ -25,8 +25,6 @@
 //!                                                                  reset on voluntary block via block_current();
 //!                                                                  reset on sched policy change)
 
-// ── Resource indices ─────────────────────────────────────────────────────────
-
 pub const RLIMIT_CPU:       usize = 0;
 pub const RLIMIT_FSIZE:     usize = 1;
 pub const RLIMIT_DATA:      usize = 2;
@@ -48,8 +46,6 @@ pub const RLIMIT_NLIMITS:   usize = 16;
 /// Sentinel: unlimited (RLIM_INFINITY).
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
-// ── Defaults ─────────────────────────────────────────────────────────────────
-
 const DEFAULTS: [(u64, u64); RLIMIT_NLIMITS] = [
     (RLIM_INFINITY, RLIM_INFINITY), // CPU
     (RLIM_INFINITY, RLIM_INFINITY), // FSIZE
@@ -68,8 +64,6 @@ const DEFAULTS: [(u64, u64); RLIMIT_NLIMITS] = [
     (0, 0),                         // RTPRIO: 0 = no RT without CAP_SYS_NICE
     (RLIM_INFINITY, RLIM_INFINITY), // RTTIME: unlimited
 ];
-
-// ── RlimitSet ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct RlimitSet {
@@ -126,8 +120,6 @@ impl RlimitSet {
         heap_size > soft
     }
 }
-
-// ── Syscall helpers ───────────────────────────────────────────────────────────
 
 pub fn getrlimit_for(pid: usize, resource: usize) -> (u64, u64) {
     if pid == 0 {

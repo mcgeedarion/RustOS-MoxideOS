@@ -28,8 +28,6 @@
 
 use spin::Mutex;
 
-// ── PLIC register layout constants ──────────────────────────────────────────
-
 const PLIC_PRIORITY_BASE:  usize = 0x0000_0000;
 const PLIC_ENABLE_BASE:    usize = 0x0000_2000;
 const PLIC_ENABLE_STRIDE:  usize = 0x0000_0080; // per context
@@ -39,8 +37,6 @@ const PLIC_CTX_THRESHOLD:  usize = 0x0000;
 const PLIC_CTX_CLAIM:      usize = 0x0004;
 
 const MAX_IRQ: usize = 128;
-
-// ── State ────────────────────────────────────────────────────────────
 
 type IrqHandler = fn();
 
@@ -60,8 +56,6 @@ static PLIC: Mutex<PlicState> = Mutex::new(PlicState {
     handlers: [None; MAX_IRQ],
 });
 
-// ── MMIO helpers ────────────────────────────────────────────────────────────
-
 #[inline]
 unsafe fn r32(addr: usize) -> u32 {
     core::ptr::read_volatile(addr as *const u32)
@@ -71,15 +65,11 @@ unsafe fn w32(addr: usize, val: u32) {
     core::ptr::write_volatile(addr as *mut u32, val);
 }
 
-// ── FDT callback ────────────────────────────────────────────────────────────
-
 /// Called by `fdt::init_from_fdt` when it encounters the `/soc/plic` node.
 pub fn set_base(base: usize) {
     PLIC.lock().base = base;
     crate::println!("plic: MMIO base {:#x}", base);
 }
-
-// ── BSP init ────────────────────────────────────────────────────────────
 
 /// Initialise the PLIC for the S-mode context on hart 0 (BSP).
 /// Returns `false` if no PLIC base was found in the FDT.
@@ -122,8 +112,6 @@ pub fn init_context(ctx: usize) {
     crate::println!("plic: AP context {} initialised", ctx);
 }
 
-// ── IRQ registration ────────────────────────────────────────────────────────
-
 pub fn enable_irq(irq: u32, handler: IrqHandler) {
     if irq == 0 || irq as usize >= MAX_IRQ { return; }
     let mut state = PLIC.lock();
@@ -153,8 +141,6 @@ pub fn disable_irq(irq: u32) {
     }
 }
 
-// ── IRQ dispatch ────────────────────────────────────────────────────────────
-
 pub fn handle_irq() {
     let base = PLIC.lock().base;
     if base == 0 { return; }
@@ -166,7 +152,6 @@ pub fn handle_irq() {
         let irq = unsafe { r32(claim_addr) };
         if irq == 0 { break; }
 
-        // ── trace: IRQ dispatch ──────────────────────────────────────────
         #[cfg(feature = "debug")]
         {
             use crate::debug::trace::{emit, TraceEvent, TraceKind};

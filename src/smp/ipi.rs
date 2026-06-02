@@ -67,8 +67,6 @@ static mut SHOOTDOWN_REQS: [ShootdownReq; MAX_CPUS] = [ShootdownReq {
 
 static SHOOTDOWN_ACK: AtomicU64 = AtomicU64::new(0);
 
-// ── Internal: set pending bit on target CPU ────────────────────────────────────
-
 #[inline]
 fn set_pending(cpu: u32, kind: IpiKind) {
     unsafe {
@@ -77,8 +75,6 @@ fn set_pending(cpu: u32, kind: IpiKind) {
             .fetch_or(1 << (kind as u8), Ordering::Release);
     }
 }
-
-// ── Send ──────────────────────────────────────────────────────────────────────
 
 /// Send an IPI to a single target CPU.
 ///
@@ -142,8 +138,6 @@ pub fn send_reschedule(target_cpu: u32) {
 #[inline]
 pub fn reschedule(target_cpu: u32) { send_reschedule(target_cpu); }
 
-// ── Receive dispatch ───────────────────────────────────────────────────────────────
-
 /// Called from the supervisor software interrupt handler (RISC-V scause = 1)
 /// after SIP.SSIP has been cleared.  Atomically drains all pending IPI bits
 /// and dispatches each one.
@@ -171,8 +165,6 @@ pub fn dispatch(cpu_id: u32) {
         }
     }
 }
-
-// ── TLB shootdown ─────────────────────────────────────────────────────────────────
 
 /// Flush `[start, end)` on all CPUs that may have `asid` mapped.
 /// Blocks until all CPUs acknowledge via `SHOOTDOWN_ACK`.

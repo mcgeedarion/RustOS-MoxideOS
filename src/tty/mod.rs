@@ -41,10 +41,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use pty::PtyPair;
 
-// ───────────────────────────────────────────────────────────────────────────
-// Global PTY index registry
-// ───────────────────────────────────────────────────────────────────────────
-
 /// Maximum simultaneous PTY pairs (matches Linux default pts_max).
 pub const PTY_MAX: u32 = 4096;
 
@@ -91,8 +87,6 @@ pub fn free_pty(idx: u32) {
     }
 }
 
-// ── Console output abstraction ───────────────────────────────────────────────
-//
 // Drivers that want to emit bytes to a physical console implement this trait
 // instead of calling arch serial functions directly.  This keeps src/tty/
 // free of arch ifdefs everywhere output is needed.
@@ -116,8 +110,6 @@ impl ConsoleOutput for SerialConsole {
     }
 }
 
-// ── Keyboard → console PTY input ────────────────────────────────────────────
-//
 // Call this from the keyboard ISR or a periodic timer tick.
 // Drains `keyboard::read_char()` and injects ASCII bytes into the
 // PTY-0 master (the system console).  If PTY-0 hasn't been allocated

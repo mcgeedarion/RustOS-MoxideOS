@@ -25,8 +25,6 @@ use crate::proc::ptrace::UREG_COUNT;
 // O_RDWR
 const O_RDWR: u32 = 2;
 
-// ── GdbTarget ────────────────────────────────────────────────────────────────
-
 pub struct GdbTarget {
     pub pid:     usize,
     pub mem_fd:  usize,
@@ -68,8 +66,6 @@ impl GdbTarget {
         })
     }
 
-    // ── memory ───────────────────────────────────────────────────────────────
-
     /// Read `len` bytes from the target's virtual address space at `vaddr`.
     pub fn read_mem(&self, vaddr: u64, len: usize) -> Vec<u8> {
         use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_read};
@@ -95,8 +91,6 @@ impl GdbTarget {
         let n = proc_debug_write(bfd, data, vaddr as usize);
         if n < 0 { 0 } else { n as usize }
     }
-
-    // ── registers ────────────────────────────────────────────────────────────
 
     /// Read the full `user_regs_struct` for the target (x86-64, 27 × u64).
     pub fn read_regs(&self) -> [u64; UREG_COUNT] {
@@ -129,8 +123,6 @@ impl GdbTarget {
         }
         proc_debug_write(bfd, &buf, 0);
     }
-
-    // ── control ──────────────────────────────────────────────────────────────
 
     /// Send a control command to the target ("stop", "cont", "step").
     pub fn ctl(&self, cmd: &str) {

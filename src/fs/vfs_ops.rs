@@ -31,8 +31,6 @@ use crate::fs::mount::{self, FsType, OverlayOpts};
 use crate::fs::overlayfs::OverlayMount;
 use crate::fs::dcache;
 
-// ── Stat result (kernel-internal) ───────────────────────────────────────────────
-
 #[derive(Clone, Debug, Default)]
 pub struct KStat {
     pub ino:     u64,
@@ -48,8 +46,6 @@ pub struct KStat {
     pub blocks:  u64,
     pub is_dir:  bool,
 }
-
-// ── Statfs result (kernel-internal) ───────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
 pub struct KStatfs {
@@ -72,14 +68,10 @@ const FSTYPE_PROC:    u64 = 0x9fa0;
 const FSTYPE_SYSFS:   u64 = 0x6265_6572;
 const FSTYPE_CGROUP2: u64 = 0x6367_7270;
 
-// ── Cgroupfs path prefix ──────────────────────────────────────────────────────
-
 #[inline(always)]
 fn is_cgroupfs_path(path: &str) -> bool {
     path.starts_with("/sys/fs/cgroup")
 }
-
-// ── read_all / write_all ─────────────────────────────────────────────────
 
 pub fn read_all(path: &str) -> Result<Vec<u8>, isize> {
     if is_cgroupfs_path(path) {
@@ -179,8 +171,6 @@ pub fn write_all(path: &str, data: &[u8]) -> Result<(), isize> {
     result
 }
 
-// ── pread / pwrite ─────────────────────────────────────────────────────────
-
 pub fn pread(path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     let h = mount::resolve(path)?;
     match h.fstype {
@@ -228,8 +218,6 @@ pub fn pwrite(path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     result
 }
 
-// ── truncate ──────────────────────────────────────────────────────────────
-
 pub fn truncate(path: &str, len: usize) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
@@ -262,8 +250,6 @@ pub fn truncate_fd(bfd: usize, len: usize) -> Result<(), isize> {
     truncate(&path, len)
 }
 
-// ── create ────────────────────────────────────────────────────────────────
-
 pub fn create(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
     if h.is_readonly() { return Err(-30); }
@@ -290,8 +276,6 @@ pub fn create(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── link ────────────────────────────────────────────────────────────────
-
 pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     let h_e = mount::resolve(existing)?;
     let h_n = mount::resolve(new)?;
@@ -314,8 +298,6 @@ pub fn link(existing: &str, new: &str) -> Result<(), isize> {
     }
     result
 }
-
-// ── mkdir ────────────────────────────────────────────────────────────────
 
 pub fn mkdir(path: &str) -> Result<(), isize> {
     if is_cgroupfs_path(path) {
@@ -345,8 +327,6 @@ pub fn mkdir(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── rmdir ────────────────────────────────────────────────────────────────
-
 pub fn rmdir(path: &str) -> Result<(), isize> {
     if is_cgroupfs_path(path) {
         let rc = crate::fs::cgroupfs::cgroupfs_rmdir(path);
@@ -370,8 +350,6 @@ pub fn rmdir(path: &str) -> Result<(), isize> {
     if result.is_ok() { dcache::invalidate(path); }
     result
 }
-
-// ── unlink ───────────────────────────────────────────────────────────────
 
 pub fn unlink(path: &str) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -397,8 +375,6 @@ pub fn unlink(path: &str) -> Result<(), isize> {
     result
 }
 
-// ── rename ──────────────────────────────────────────────────────────────
-
 pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     let h_o = mount::resolve(old)?;
     let h_n = mount::resolve(new)?;
@@ -421,8 +397,6 @@ pub fn rename(old: &str, new: &str) -> Result<(), isize> {
     }
     result
 }
-
-// ── stat / lstat ───────────────────────────────────────────────────────────
 
 pub fn stat(path: &str) -> Result<KStat, isize> { stat_impl(path, false) }
 pub fn lstat(path: &str) -> Result<KStat, isize> { stat_impl(path, true) }
@@ -517,8 +491,6 @@ fn stat_impl(path: &str, lstat: bool) -> Result<KStat, isize> {
     result
 }
 
-// ── utimens ──────────────────────────────────────────────────────────────
-
 pub fn utimens(path: &str, atime_ns: u64, mtime_ns: u64) -> Result<(), isize> {
     if is_cgroupfs_path(path) { return Ok(()); }
 
@@ -555,14 +527,10 @@ pub fn utimens(path: &str, atime_ns: u64, mtime_ns: u64) -> Result<(), isize> {
     result
 }
 
-// ── get_times ─────────────────────────────────────────────────────────────
-
 pub fn get_times(path: &str) -> Result<(u64, u64), isize> {
     let st = stat(path)?;
     Ok((st.atime, st.mtime))
 }
-
-// ── statfs ─────────────────────────────────────────────────────────────
 
 pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     if is_cgroupfs_path(path) {
@@ -646,8 +614,6 @@ pub fn statfs(path: &str) -> Result<KStatfs, isize> {
     }
 }
 
-// ── readdir ──────────────────────────────────────────────────────────────
-
 #[derive(Clone, Debug)]
 pub struct DirEntry {
     pub name:   String,
@@ -713,8 +679,6 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, isize> {
     }
 }
 
-// ── symlink / readlink ─────────────────────────────────────────────────────
-
 pub fn symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let h = mount::resolve(link_path)?;
     if h.is_readonly() { return Err(-30); }
@@ -749,8 +713,6 @@ pub fn readlink(path: &str) -> Result<String, isize> {
         _             => Err(-22),
     }
 }
-
-// ── chmod / chown ──────────────────────────────────────────────────────────
 
 pub fn chmod(path: &str, mode: u16) -> Result<(), isize> {
     let h = mount::resolve(path)?;
@@ -792,8 +754,6 @@ pub fn chown(path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     result
 }
 
-// ── open (VFS-level) ────────────────────────────────────────────────────────
-
 pub fn open(path: &str, flags: u32) -> Result<usize, isize> {
     crate::fs::vfs::open_raw(path, flags)
 }
@@ -805,8 +765,6 @@ pub fn fd_path(fd: usize) -> Option<String> {
 pub fn file_size(fd: usize) -> usize {
     crate::fs::fcntl::fd_size(fd).unwrap_or(0)
 }
-
-// ── mount / overlay helpers ───────────────────────────────────────────────────────
 
 fn overlay_mount(h: &mount::FsHandle) -> Result<OverlayMount, isize> {
     let mounts = crate::fs::overlayfs::OVERLAY_MOUNTS.lock();

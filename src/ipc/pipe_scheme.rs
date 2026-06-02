@@ -54,10 +54,6 @@ use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 use crate::fs::scheme_table::Scheme;
 use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
 
-// ---------------------------------------------------------------------------
-// Ring buffer
-// ---------------------------------------------------------------------------
-
 struct PipeBuf {
     ring:    Vec<u8>,
     head:    usize,
@@ -104,10 +100,6 @@ impl PipeBuf {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Global pipe table
-// ---------------------------------------------------------------------------
-//
 // Keyed by the *write-end* fid (always even).  The read-end fid is
 // write_fid + 1 (always odd); both share the same `PipeBuf`.
 
@@ -120,10 +112,6 @@ fn alloc_pipe_id() -> u32 {
     // Increment by 2 to keep write-end IDs always even.
     PIPE_CTR.fetch_add(2, Ordering::Relaxed)
 }
-
-// ---------------------------------------------------------------------------
-// PipeScheme
-// ---------------------------------------------------------------------------
 
 pub struct PipeScheme;
 
@@ -200,10 +188,6 @@ impl Scheme for PipeScheme {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Syscall-layer helper
-// ---------------------------------------------------------------------------
-
 /// Allocate a (read_backing_fd, write_backing_fd) pair backed by a fresh
 /// `PipeBuf` and register both ends in `SCHEME_FD_STORE`.
 ///
@@ -219,12 +203,9 @@ impl Scheme for PipeScheme {
 pub fn create_pipe() -> Result<(usize, usize), SchemeError> {
     let scheme: Arc<dyn Scheme> = Arc::new(PipeScheme);
 
-    // open() allocates the ring buffer and returns the write-end fid.
     let wfid = scheme.open("", OpenFlags::RDWR)?;
-    // Read-end fid is write_fid + 1 by convention.
     let rfid = SchemeFileId(wfid.0 + 1);
 
-    // Allocate two synthetic backing-fd numbers from the free-list allocator.
     let write_bfd = alloc_scheme_backing_fd();
     let read_bfd  = alloc_scheme_backing_fd();
 
@@ -237,10 +218,6 @@ pub fn create_pipe() -> Result<(usize, usize), SchemeError> {
     // fds[0] = read end, fds[1] = write end.
     Ok((read_bfd, write_bfd))
 }
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

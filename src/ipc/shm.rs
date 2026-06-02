@@ -32,15 +32,11 @@ use alloc::{
 use spin::Mutex;
 use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
-// ── SHM_* flags ──────────────────────────────────────────────────────────────
-
 pub const SHM_RDONLY: i32 = 0o10000;
 pub const SHM_RND:    i32 = 0o20000;
 pub const SHM_EXEC:   i32 = 0o100000;
 
 const PAGE_SIZE: usize = 4096;
-
-// ── Data structures ──────────────────────────────────────────────────────────
 
 /// Kernel-side shared memory segment.
 struct ShmSegment {
@@ -52,8 +48,6 @@ struct ShmSegment {
     lpid:    u32,
     removed: bool,       // IPC_RMID was issued; free on last detach
 }
-
-// ── Global tables ────────────────────────────────────────────────────────────
 
 use alloc::sync::Arc;
 static SHM_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<ShmSegment>>>> = Mutex::new(BTreeMap::new());
@@ -69,8 +63,6 @@ fn alloc_id() -> i32 {
     *id += 1;
     v
 }
-
-// ── shmget ───────────────────────────────────────────────────────────────────
 
 pub fn shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, isize> {
     if size == 0 { return Err(-22); } // EINVAL
@@ -112,8 +104,6 @@ pub fn shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, isize> {
     Ok(id)
 }
 
-// ── shmat ────────────────────────────────────────────────────────────────────
-
 pub fn shmat(shmid: i32, shmaddr: usize, shmflg: i32) -> Result<usize, isize> {
     let arc = {
         let tbl = SHM_TABLE.lock();
@@ -149,8 +139,6 @@ pub fn shmat(shmid: i32, shmaddr: usize, shmflg: i32) -> Result<usize, isize> {
     Ok(va)
 }
 
-// ── shmdt ────────────────────────────────────────────────────────────────────
-
 pub fn shmdt(shmaddr: usize) -> Result<(), isize> {
     let pid = crate::proc::scheduler::current_pid();
     let shmid = ATTACH_TABLE.lock().remove(&(pid, shmaddr)).ok_or(-22isize)?;
@@ -177,8 +165,6 @@ pub fn shmdt(shmaddr: usize) -> Result<(), isize> {
     Ok(())
 }
 
-// ── shmctl ───────────────────────────────────────────────────────────────────
-
 pub fn shmctl(shmid: i32, cmd: i32) -> Result<i32, isize> {
     let arc = {
         let tbl = SHM_TABLE.lock();
@@ -199,8 +185,6 @@ pub fn shmctl(shmid: i32, cmd: i32) -> Result<i32, isize> {
         _ => Err(-22),
     }
 }
-
-// ── Physical frame allocator helper ──────────────────────────────────────────
 
 fn alloc_frames(n: usize) -> Result<Vec<usize>, isize> {
     let mut frames = Vec::with_capacity(n);

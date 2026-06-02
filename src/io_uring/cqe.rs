@@ -1,7 +1,5 @@
 // src/io_uring/cqe.rs
-//
 // Completion Queue Entry (CQE).
-//
 // Linux io_uring_cqe layout: { user_data: u64, res: i32, flags: u32 }
 // We carry that layout verbatim so it is compatible with any future
 // pass-through to a real kernel.
@@ -32,8 +30,6 @@ impl Cqe {
     pub const fn zeroed() -> Self {
         Cqe { user_data: 0, res: 0, flags: 0 }
     }
-
-    // ── Result helpers ─────────────────────────────────────────────────────
 
     /// Returns `Ok(res as usize)` for success, or maps the negated errno to
     /// an `IoUringError` for failure.
@@ -66,8 +62,6 @@ impl Cqe {
     }
 }
 
-// ── Named errno constants ─────────────────────────────────────────────────────
-//
 // Negated Linux errno values most relevant to network / file I/O.
 // Prefixed `E_` to avoid collision with any future `std::io::ErrorKind` mirror.
 

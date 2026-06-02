@@ -28,16 +28,12 @@ use spin::Mutex;
 
 use crate::net::eth;
 
-// ── Wire constants ────────────────────────────────────────────────────────────
-
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IP:  u16 = 0x0800;
 const HW_ETHER:      u16 = 0x0001;
 const PROTO_IP:      u16 = 0x0800;
 const OP_REQUEST:    u16 = 0x0001;
 const OP_REPLY:      u16 = 0x0002;
-
-// ── ARP cache ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Default)]
 pub struct ArpEntry {
@@ -78,8 +74,6 @@ pub fn insert(ip: u32, mac: [u8; 6]) {
     };
     cache[idx] = ArpEntry { ip, mac, valid: true };
 }
-
-// ── Pending-packet queue ──────────────────────────────────────────────────────────
 
 const PENDING_TOTAL:  usize = 32;
 const PENDING_PER_IP: usize = 4;
@@ -153,8 +147,6 @@ impl PendingQueue {
 
 static PENDING: Mutex<PendingQueue> = Mutex::new(PendingQueue::new());
 
-// ── Public resolve API ────────────────────────────────────────────────────────────
-
 /// Resolve `ip` to a MAC address.
 ///
 /// * If the MAC is already cached, return it immediately.
@@ -185,8 +177,6 @@ pub fn resolve_or_queue(ip: u32, pkt: Vec<u8>) -> bool {
     send_request(ip);
     false
 }
-
-// ── ARP send / receive ────────────────────────────────────────────────────────────
 
 /// Build and send an ARP request for `target_ip`.
 pub fn send_request(target_ip: u32) {

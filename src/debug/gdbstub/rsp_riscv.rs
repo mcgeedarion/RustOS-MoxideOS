@@ -41,8 +41,6 @@ fn unpack_gdb_regs(gdb_regs: &[u64; RISCV_REG_COUNT]) -> [u64; 33] {
     frame
 }
 
-// ── helpers (same as rsp.rs) ─────────────────────────────────────────────────
-
 fn from_hex(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
@@ -87,12 +85,9 @@ fn rsp_packet(body: &str) -> String {
     alloc::format!("+${}#{:02x}", body, csum)
 }
 
-// ── RISC-V ebreak single-step injection ──────────────────────────────────────
-//
 // RISC-V has no hardware trap-flag. Single-step is implemented by injecting
 // an `ebreak` (0x00100073) at the current PC, executing it, then restoring
 // the original word and decrementing PC back by 4.
-//
 // The GDB stub calls step_inject_ebreak before "cont" and
 // step_restore_ebreak in the SIGTRAP handler.
 
@@ -133,17 +128,13 @@ fn read_raw_regs(target: &GdbTarget) -> [u64; 33] {
     frame
 }
 
-// ── Z/z packet handler ───────────────────────────────────────────────────────
-//
 // GDB breakpoint / watchpoint kinds over RISC-V triggers (tselect/tdata):
-//
 //   Z0 / z0  software breakpoint  — ebreak injection (existing mechanism)
 //             also installs a type-2 EXEC trigger as hw-assist if available
 //   Z1 / z1  hardware exec BP     — EXEC trigger
 //   Z2 / z2  write watchpoint     — STORE trigger
 //   Z3 / z3  read watchpoint      — LOAD trigger
 //   Z4 / z4  access watchpoint    — LOAD | STORE triggers
-//
 // Note: RISC-V does not guarantee trigger availability on all implementations.
 // riscv_add_trigger returns false if all 4 slots are occupied; GDB will then
 // fall back to software breakpoints automatically when we reply E01.
@@ -225,8 +216,6 @@ fn handle_z_packet_riscv(body: &str, target: &mut GdbTarget) -> String {
         _ => rsp_packet(""),
     }
 }
-
-// ── Packet dispatch ───────────────────────────────────────────────────────────
 
 pub fn handle_packet(body: &str, target: &mut GdbTarget) -> String {
     if body.is_empty() { return rsp_packet(""); }

@@ -174,8 +174,6 @@ pub struct Ext2Fs {
 /// Global mounted ext2 filesystem (one partition for now).
 pub static FS: Mutex<Option<Ext2Fs>> = Mutex::new(None);
 
-// ── Low-level block/inode I/O ─────────────────────────────────────────────
-
 #[inline]
 fn read_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off+4].try_into().unwrap_or([0;4]))

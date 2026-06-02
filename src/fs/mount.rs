@@ -34,8 +34,6 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Filesystem type discriminant ──────────────────────────────────────────────────
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum FsType {
     Ext2,
@@ -93,8 +91,6 @@ impl FsType {
     }
 }
 
-// ── Mount flags (mirrors Linux MS_* bits) ─────────────────────────────────────
-
 pub const MS_RDONLY:      u64 = 1 << 0;
 pub const MS_NOSUID:      u64 = 1 << 1;
 pub const MS_NODEV:       u64 = 1 << 2;
@@ -109,8 +105,6 @@ pub const MNT_FORCE:      u32 = 1;
 pub const MNT_DETACH:     u32 = 2;
 pub const MNT_EXPIRE:     u32 = 4;
 
-// ── Per-entry overlay options ─────────────────────────────────────────────────────
-
 /// Extra parameters carried for overlayfs mounts.
 #[derive(Clone, Debug)]
 pub struct OverlayOpts {
@@ -118,8 +112,6 @@ pub struct OverlayOpts {
     pub upper:   String,   // upper (read-write) directory
     pub work:    String,   // work directory (must be on same fs as upper)
 }
-
-// ── MountEntry ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct MountEntry {
@@ -129,8 +121,6 @@ pub struct MountEntry {
     pub flags:      u64,
     pub overlay:    Option<OverlayOpts>,
 }
-
-// ── FsHandle — returned to vfs_ops callers ────────────────────────────────────────────
 
 /// Identifies which filesystem owns a path and the mount-relative sub-path.
 #[derive(Clone, Debug)]
@@ -147,8 +137,6 @@ impl FsHandle {
         self.flags & MS_RDONLY != 0
     }
 }
-
-// ── Global mount table ────────────────────────────────────────────────────────────────
 
 pub struct MountTable {
     entries: Vec<MountEntry>,
@@ -248,8 +236,6 @@ impl MountTable {
     }
 }
 
-// ── Global instance ────────────────────────────────────────────────────────────────────────
-
 static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable::new());
 
 pub fn kernel_mount(
@@ -269,8 +255,6 @@ pub fn resolve(path: &str) -> Result<FsHandle, isize> {
 pub fn list_mounts() -> Vec<MountEntry> {
     MOUNT_TABLE.lock().list()
 }
-
-// ── Kernel boot mounts ────────────────────────────────────────────────────────────────
 
 /// Called once from the kernel main entry point after the PMM is ready.
 /// Registers canonical virtual/pseudo filesystems and detects the root
@@ -320,8 +304,6 @@ pub fn init_mounts() {
 
     tbl.sort();
 }
-
-// ── sys_mount / sys_umount2 ────────────────────────────────────────────────────────────
 
 pub fn sys_mount(
     source:   &str,

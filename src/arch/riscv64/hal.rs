@@ -23,10 +23,6 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SBI raw ecall
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Return value from every SBI ecall: an error code and a return value.
 ///
 /// The SBI calling convention places these in `a0` and `a1` after the `ecall`.
@@ -86,8 +82,6 @@ pub unsafe fn sbi_call(
     SbiRet { error, value }
 }
 
-// ─── SBI error codes ──────────────────────────────────────────────────────────
-
 pub const SBI_SUCCESS: isize = 0;
 pub const SBI_ERR_FAILED: isize = -1;
 pub const SBI_ERR_NOT_SUPPORTED: isize = -2;
@@ -97,8 +91,6 @@ pub const SBI_ERR_INVALID_ADDRESS: isize = -5;
 pub const SBI_ERR_ALREADY_AVAILABLE: isize = -6;
 pub const SBI_ERR_ALREADY_STARTED: isize = -7;
 pub const SBI_ERR_ALREADY_STOPPED: isize = -8;
-
-// ─── SBI Extension IDs (EIDs) ────────────────────────────────────────────────
 
 // Legacy (<= SBI v0.1) — a6 is ignored; a7 is EID == FID.
 pub const SBI_EID_LEGACY_SET_TIMER: usize = 0x00;
@@ -158,14 +150,8 @@ pub const SBI_SRST_TYPE_WARM_REBOOT: usize = 2;
 pub const SBI_SRST_REASON_NONE: usize = 0;
 pub const SBI_SRST_REASON_SYSTEM_FAILURE: usize = 1;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SBI convenience wrappers
-// ═══════════════════════════════════════════════════════════════════════════════
-
 pub mod sbi {
     use super::*;
-
-    // ── Base ─────────────────────────────────────────────────────────────────
 
     /// Probe for a SBI extension by EID.  Returns `true` if supported.
     #[inline]
@@ -202,8 +188,6 @@ pub mod sbi {
         }
     }
 
-    // ── Console (legacy) ─────────────────────────────────────────────────────
-
     /// Transmit a byte over the SBI debug console (legacy EID 0x01).
     ///
     /// Blocks until the implementation has accepted the byte.
@@ -237,8 +221,6 @@ pub mod sbi {
         }
     }
 
-    // ── Timer ────────────────────────────────────────────────────────────────
-
     /// Program the next supervisor timer interrupt.
     ///
     /// `stime_value` is an absolute value of the `time` CSR.  When the counter
@@ -269,8 +251,6 @@ pub mod sbi {
         }
     }
 
-    // ── IPI ──────────────────────────────────────────────────────────────────
-
     /// Send a supervisor software IPI to the harts described by the mask.
     ///
     /// `hart_mask`      — bitmask (bit *i* = hart `hart_mask_base + i`).
@@ -287,8 +267,6 @@ pub mod sbi {
             )
         }
     }
-
-    // ── RFENCE ───────────────────────────────────────────────────────────────
 
     /// Issue a remote `SFENCE.VMA` covering `[vaddr, vaddr+size)` on harts in
     /// `hart_mask`.
@@ -351,8 +329,6 @@ pub mod sbi {
         }
     }
 
-    // ── HSM ──────────────────────────────────────────────────────────────────
-
     /// Start a stopped hart at `start_addr` (supervisor-mode physical address).
     ///
     /// The hart receives `hartid` in `a0` and `opaque` in `a1` at entry,
@@ -409,8 +385,6 @@ pub mod sbi {
         }
     }
 
-    // ── System Reset ─────────────────────────────────────────────────────────
-
     /// Perform a platform reset (shutdown or reboot) via SBI SRST.
     ///
     /// Does not return on success.
@@ -427,10 +401,6 @@ pub mod sbi {
         }
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CSR read / write helpers
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Read a CSR by literal name.
 macro_rules! csr_read {
@@ -489,12 +459,6 @@ macro_rules! csr_clear {
     }};
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// CSR bit-field constants
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// ─── sstatus ─────────────────────────────────────────────────────────────────
-
 /// Supervisor Interrupt Enable.
 pub const SSTATUS_SIE: usize = 1 << 1;
 /// Supervisor Previous Interrupt Enable.
@@ -524,16 +488,12 @@ pub const FS_INITIAL: usize = 1 << 13;
 pub const FS_CLEAN: usize = 2 << 13;
 pub const FS_DIRTY: usize = 3 << 13;
 
-// ─── sie / sip ───────────────────────────────────────────────────────────────
-
 /// Supervisor Software Interrupt Enable / Pending.
 pub const SI_SSI: usize = 1 << 1;
 /// Supervisor Timer Interrupt Enable / Pending.
 pub const SI_STI: usize = 1 << 5;
 /// Supervisor External Interrupt Enable / Pending.
 pub const SI_SEI: usize = 1 << 9;
-
-// ─── satp ────────────────────────────────────────────────────────────────────
 
 pub const SATP_MODE_BARE: usize = 0usize << 60;
 pub const SATP_MODE_SV39: usize = 8usize << 60;
@@ -542,8 +502,6 @@ pub const SATP_MODE_SV57: usize = 10usize << 60;
 pub const SATP_ASID_SHIFT: usize = 44;
 pub const SATP_ASID_MASK: usize = 0xffff << 44;
 pub const SATP_PPN_MASK: usize = (1 << 44) - 1;
-
-// ─── scause ──────────────────────────────────────────────────────────────────
 
 /// Set in `scause` when the cause is an interrupt (not an exception).
 pub const SCAUSE_INTERRUPT_BIT: usize = 1 << 63;
@@ -568,16 +526,10 @@ pub const CAUSE_INSTR_PAGE_FAULT: usize = 12;
 pub const CAUSE_LOAD_PAGE_FAULT: usize = 13;
 pub const CAUSE_STORE_PAGE_FAULT: usize = 15;
 
-// ─── stvec ───────────────────────────────────────────────────────────────────
-
 /// Direct mode — all traps jump to BASE.
 pub const STVEC_MODE_DIRECT: usize = 0;
 /// Vectored mode — exceptions → BASE; interrupts → BASE + 4*cause.
 pub const STVEC_MODE_VECTORED: usize = 1;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CSR accessors
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Read `sstatus`.
 #[inline]
@@ -702,10 +654,6 @@ pub fn read_instret() -> u64 {
     csr_read!("instret") as u64
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Interrupt control
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Enable supervisor-mode interrupts (`sstatus.SIE = 1`).
 ///
 /// # Safety
@@ -781,10 +729,6 @@ pub unsafe fn enable_all_interrupt_sources() {
     enable_interrupt_sources(SI_SSI | SI_STI | SI_SEI);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Trap vector
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Install a supervisor trap handler.
 ///
 /// In `DIRECT` mode `handler` must be 4-byte aligned.  In `VECTORED` mode it
@@ -800,10 +744,6 @@ pub unsafe fn set_stvec(handler: usize, mode: usize) {
     );
     csr_write!("stvec", (handler & !0x3) | (mode & 0x3));
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TLB management
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Flush all TLB entries on this hart (`sfence.vma` with rs1=rs2=zero).
 #[inline]
@@ -875,10 +815,6 @@ pub fn tlb_flush_asid_all_harts(
     sbi::remote_sfence_vma_asid(hart_mask, hart_mask_base, vaddr, size, asid);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Paging (satp) helpers
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Build an `satp` value for Sv39 (39-bit virtual addressing).
 ///
 /// `ppn`  — physical page number of the L2 root page table.  
@@ -940,10 +876,6 @@ pub unsafe fn activate_bare() {
     write_satp(SATP_MODE_BARE);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Floating-point unit
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Enable the FPU by setting `sstatus.FS = Initial`.
 ///
 /// Must be called before executing any floating-point instruction in
@@ -977,10 +909,6 @@ pub fn fpu_is_dirty() -> bool {
     read_sstatus() & SSTATUS_FS == FS_DIRTY
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Wait-for-interrupt
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Execute the `wfi` instruction.
 ///
 /// Suspends the hart until an interrupt is pending.  Used by idle threads and
@@ -989,10 +917,6 @@ pub fn fpu_is_dirty() -> bool {
 pub fn wait_for_interrupt() {
     unsafe { asm!("wfi", options(nostack, nomem)) }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GDB stub — single-step support
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Per-hart single-step flag, read by the trap handler after every instruction
 /// trap when `gdbstub` is active.
@@ -1022,10 +946,6 @@ pub fn set_single_step(enable: bool) {
 pub fn single_step_enabled() -> bool {
     SINGLE_STEP.load(Ordering::Acquire)
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Hart ID
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Boot-hart ID cached during `early_init`.
 ///
@@ -1065,10 +985,6 @@ pub fn current_hart_id() -> usize {
     // whose first field is also the hartid, so reading sscratch is always safe.
     read_sscratch()
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SMP
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Bring up a secondary hart.
 ///
@@ -1115,10 +1031,6 @@ pub fn send_ipi_to(hartid: usize) {
 pub fn send_ipi_mask(mask: usize, base: usize) {
     sbi::send_ipi(mask, base);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Timer
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Return the current hardware time counter value (ticks at the platform
 /// reference clock; 10 MHz on QEMU virt, typically).
@@ -1171,10 +1083,6 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
     ns.saturating_mul(timer_frequency_hz()) / 1_000_000_000
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Early console (SBI legacy putchar / getchar)
-// ═══════════════════════════════════════════════════════════════════════════════
-
 /// Transmit a byte on the SBI debug console.
 ///
 /// Available before the NS16550/UART driver is initialised.  Also used as the
@@ -1197,10 +1105,6 @@ pub fn puts(s: &str) {
 pub fn getchar() -> Option<u8> {
     sbi::console_getchar()
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Shutdown / reboot
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Power off the platform.
 ///
@@ -1225,10 +1129,6 @@ pub fn reboot() -> ! {
         wait_for_interrupt();
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Platform initialisation
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Perform early HAL initialisation on the boot hart.
 ///
@@ -1292,8 +1192,6 @@ pub unsafe fn secondary_init(hartid: usize) {
     enable_fpu();
     enable_all_interrupt_sources();
 }
-
-// ─── Debug-only console helpers ──────────────────────────────────────────────
 
 /// Print an unsigned decimal number via the SBI console (debug builds only).
 #[cfg(debug_assertions)]

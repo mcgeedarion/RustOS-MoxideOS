@@ -25,8 +25,6 @@ use spin::Mutex;
 
 pub const UDP_HDR_LEN: usize = 8;
 
-// ── Port registry ──────────────────────────────────────────────────────────────
-
 /// Sentinel value stored in `sock_idx` for ephemeral (kernel-internal) ports.
 const EPHEMERAL_MARKER: usize = usize::MAX;
 
@@ -106,8 +104,6 @@ pub fn is_ephemeral(port: u16) -> bool {
     reg.iter().any(|e| e.valid && e.ephemeral && e.port == port)
 }
 
-// ── Checksum ────────────────────────────────────────────────────────────────────
-
 fn udp_checksum(src_ip: u32, dst_ip: u32, payload_and_hdr: &[u8]) -> u16 {
     let len = payload_and_hdr.len() as u32;
     let mut pseudo = [0u8; 12];
@@ -132,8 +128,6 @@ fn udp_checksum(src_ip: u32, dst_ip: u32, payload_and_hdr: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
-
-// ── Send / receive ────────────────────────────────────────────────────────────────
 
 /// Send a UDP datagram.
 /// `src_port` is the local source port (bound or ephemeral).

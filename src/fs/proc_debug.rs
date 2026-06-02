@@ -20,12 +20,8 @@ use crate::arch::Arch;
 use crate::proc::ptrace::{apply_user_regs_pub, build_user_regs_pub, UREG_COUNT};
 use crate::proc::scheduler;
 
-// ── fd range ────────────────────────────────────────────────────────────────
-
 pub const PROC_DEBUG_FD_BASE: usize = 512;
 pub const PROC_DEBUG_FD_END: usize = 768;
-
-// ── ProcDebugKind ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 pub enum ProcDebugKind {
@@ -43,8 +39,6 @@ struct DebugFd {
 /// Fast map is safe here: keys are bounded synthetic debug fd numbers assigned
 /// by the kernel; ptrace permission checks remain separate from hashing.
 static PROC_DEBUG_FDS: Mutex<KernelFastMap<usize, DebugFd>> = Mutex::new(KernelFastMap::new());
-
-// ── helpers ───────────────────────────────────────────────────────────────
 
 pub fn is_proc_debug_fd(fdno: usize) -> bool {
     fdno >= PROC_DEBUG_FD_BASE
@@ -104,8 +98,6 @@ fn may_mutate_debuggee(caller: usize, target: usize) -> bool {
         .unwrap_or(false)
 }
 
-// ── open ─────────────────────────────────────────────────────────────────
-
 /// Called from `procfs_open` for paths it recognises as debug paths.
 /// Returns a new synthetic fd ≥ PROC_DEBUG_FD_BASE, or a negative errno.
 pub fn proc_debug_open(opener: usize, path: &str) -> isize {
@@ -134,8 +126,6 @@ pub fn proc_debug_open(opener: usize, path: &str) -> isize {
 pub fn proc_debug_close(fdno: usize) {
     PROC_DEBUG_FDS.lock().remove(&fdno);
 }
-
-// ── read ──────────────────────────────────────────────────────────────────
 
 /// pread64-style: `offset` is the virtual address for Mem fds;
 /// ignored (treated as 0) for Regs and Ctl fds.
@@ -218,8 +208,6 @@ fn read_ctl(pid: usize, buf: &mut [u8]) -> isize {
     buf[..n].copy_from_slice(&msg[..n]);
     n as isize
 }
-
-// ── write ─────────────────────────────────────────────────────────────────
 
 /// pwrite64-style: `offset` is the target virtual address for Mem fds.
 pub fn proc_debug_write(fdno: usize, data: &[u8], offset: usize) -> isize {
@@ -362,8 +350,6 @@ fn write_ctl(pid: usize, data: &[u8]) -> isize {
         _ => -22, // EINVAL
     }
 }
-
-// ── path parser ───────────────────────────────────────────────────────────
 
 /// Parse "/proc/<pid>/mem|regs|ctl" → Some((pid, "mem"|"regs"|"ctl"))
 fn parse_debug_path(path: &str) -> Option<(usize, &str)> {

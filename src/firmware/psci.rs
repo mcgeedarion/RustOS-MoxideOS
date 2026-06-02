@@ -21,7 +21,6 @@
 
 use core::arch::asm;
 
-// ── PSCI function IDs (SMCCC 64-bit) ──────────────────────────────────────────────
 pub const CPU_ON:      u64 = 0xC400_0003;
 pub const CPU_OFF:     u64 = 0x8400_0002;
 pub const CPU_SUSPEND: u64 = 0xC400_0001;
@@ -29,7 +28,6 @@ pub const SYSTEM_OFF:  u64 = 0x8400_0008;
 pub const SYSTEM_RESET:u64 = 0x8400_0009;
 pub const PSCI_VERSION:u64 = 0x8400_0000;
 
-// ── PSCI return codes ────────────────────────────────────────────────────────────────
 pub const SUCCESS:          i64 = 0;
 pub const NOT_SUPPORTED:    i64 = -1;
 pub const INVALID_PARAMS:   i64 = -2;
@@ -72,8 +70,6 @@ impl PsciError {
     }
 }
 
-// ── Raw SMCCC call via HVC ────────────────────────────────────────────────────────
-
 /// Invoke SMCCC via `hvc #0`.  x0 = function_id, x1/x2/x3 = args.
 /// Returns (x0, x1, x2, x3).
 #[inline]
@@ -110,8 +106,6 @@ pub unsafe fn smc_call(fid: u64, a1: u64, a2: u64, a3: u64) -> (i64, u64, u64, u
     );
     (r0, r1, r2, r3)
 }
-
-// ── Public PSCI API ────────────────────────────────────────────────────────────────────
 
 /// Power on a secondary CPU.
 ///

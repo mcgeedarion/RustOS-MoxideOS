@@ -61,8 +61,6 @@ fn resolve_fs_tree_root(fs: &BtrfsFs) -> Option<u64> {
     Some(ri.bytenr)
 }
 
-// ─── Public VFS wrappers ────────────────────────────────────────────────────
-
 fn with_fs<T, F: FnOnce(&BtrfsFs) -> T>(subpath: &str, f: F) -> Result<T, isize> {
     let mounts = BTRFS_MOUNTS.lock();
     let fs = mounts.get(subpath).ok_or(-19isize)?;

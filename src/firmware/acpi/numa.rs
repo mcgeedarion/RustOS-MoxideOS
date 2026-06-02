@@ -18,19 +18,13 @@
 use crate::console::println;
 use super::SdtHeader;
 
-// ── Limits ────────────────────────────────────────────────────────────────
-
 pub const MAX_NODES:        usize = 8;
 const MAX_MEM_RANGES:       usize = 16;
 const SRAT_DISTANCE_LOCAL:  u8    = 10;
 
-// ── SRAT entry types ──────────────────────────────────────────────────────
-
 const SRAT_TYPE_LAPIC:      u8 = 0;
 const SRAT_TYPE_MEM:        u8 = 1;
 const SRAT_TYPE_X2APIC:     u8 = 2;
-
-// ── Memory range within a NUMA node ──────────────────────────────────────
 
 #[derive(Copy, Clone, Default, Debug)]
 pub struct MemRange {
@@ -41,8 +35,6 @@ pub struct MemRange {
     /// Non-volatile / persistent memory (SRAT flag bit 2).
     pub persistent: bool,
 }
-
-// ── NUMA node ─────────────────────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug)]
 pub struct NumaNode {
@@ -69,8 +61,6 @@ impl NumaNode {
     }
 }
 
-// ── Global topology tables ────────────────────────────────────────────────
-
 static mut NODES: [NumaNode; MAX_NODES] = [NumaNode::empty(); MAX_NODES];
 static mut NODE_COUNT: usize = 0;
 
@@ -86,8 +76,6 @@ static mut DISTANCES: [[u8; MAX_NODES]; MAX_NODES] = {
     }
     d
 };
-
-// ── Helper: find or insert a proximity domain ─────────────────────────────
 
 unsafe fn node_for_domain(domain: u32) -> Option<&'static mut NumaNode> {
     // Look for existing entry.
@@ -106,8 +94,6 @@ unsafe fn node_for_domain(domain: u32) -> Option<&'static mut NumaNode> {
     NODES[idx].present = true;
     Some(&mut NODES[idx])
 }
-
-// ── SRAT parser ───────────────────────────────────────────────────────────
 
 #[repr(C, packed)]
 struct SratLapic {
@@ -243,8 +229,6 @@ pub unsafe fn parse_srat() {
     }
 }
 
-// ── SLIT parser ───────────────────────────────────────────────────────────
-
 pub unsafe fn parse_slit() {
     let hdr = match super::find_table(b"SLIT") {
         Some(p) => p,
@@ -290,8 +274,6 @@ fn print_distance_row(node: usize, row: &[u8]) {
     }
     println!();
 }
-
-// ── Public API ────────────────────────────────────────────────────────────
 
 /// Initialise NUMA topology (must be called after `super::init()`).
 pub unsafe fn init() {

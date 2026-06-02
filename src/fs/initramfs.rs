@@ -58,12 +58,10 @@ pub fn mount_initramfs() {
         let file_type = mode & 0o170000;
 
         match file_type {
-            // ── directory ───────────────────────────────────────────────
             0o040000 => {
                 vfs::mkdir(&path);
             }
 
-            // ── regular file ─────────────────────────────────────────────
             0o100000 => {
                 // Ensure parent directory exists first.
                 if let Some(parent) = parent_of(&path) {
@@ -72,7 +70,6 @@ pub fn mount_initramfs() {
                 vfs::create_file(&path, entry.data);
             }
 
-            // ── symbolic link ─────────────────────────────────────────────
             0o120000 => {
                 // The symlink target is stored in the file data as a
                 // NUL-terminated (or plain) string.
@@ -90,7 +87,6 @@ pub fn mount_initramfs() {
                 }
             }
 
-            // ── everything else: skip ──────────────────────────────────────
             _ => {}
         }
     }
@@ -98,8 +94,6 @@ pub fn mount_initramfs() {
     MOUNTED.store(true, Ordering::Release);
     crate::println!("initramfs: mounted {} entries into VFS", count_entries(&handle));
 }
-
-// ── helpers ───────────────────────────────────────────────────────────────
 
 /// Return the parent directory path of `path`, or None for top-level entries.
 fn parent_of(path: &str) -> Option<String> {

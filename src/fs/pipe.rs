@@ -93,8 +93,6 @@ use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 
 use crate::fs::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLRDNORM, POLLWRNORM};
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
 /// Capacity of every pipe's ring buffer (bytes).
 pub const PIPE_BUF_SIZE: usize = 65536;
 
@@ -111,8 +109,6 @@ const EPIPE: isize = -32;
 const EFAULT: isize = -14;
 const EMFILE: isize = -24;
 const SIGPIPE: u32 = 13;
-
-// ── Ring-buffer (data only, no blocking state) ────────────────────────────────
 
 struct PipeInner {
     buf: alloc::vec::Vec<u8>,
@@ -168,8 +164,6 @@ impl PipeInner {
     }
 }
 
-// ── PipeState: data mutex + wait queues ───────────────────────────────────────
-//
 // WaitQueues live OUTSIDE the data mutex so they can be woken without
 // holding the lock (avoids priority inversion and lock ordering issues).
 
@@ -190,8 +184,6 @@ impl PipeState {
         }
     }
 }
-
-// ── Pipe table: backing_fd → Arc<PipeState> ───────────────────────────────────
 
 struct PipeTable {
     map: KernelFastMap<usize, Arc<PipeState>>,
@@ -227,8 +219,6 @@ fn alloc_pipe_fds() -> (usize, usize) {
     (PIPE_FD_BASE + off, PIPE_FD_BASE + off + 1)
 }
 
-// ── Public predicates ─────────────────────────────────────────────────────────
-
 #[inline]
 pub fn is_pipe(bfd: usize) -> bool {
     if bfd < PIPE_FD_BASE {
@@ -245,8 +235,6 @@ pub fn is_pipe_fd(user_fd: usize) -> bool {
     }
     is_pipe(bfd as usize)
 }
-
-// ── Poll readiness ────────────────────────────────────────────────────────────
 
 /// Legacy readiness oracle — called by poll::fd_ready().
 pub fn pipe_poll(user_fd: usize, events: u32) -> u32 {
@@ -290,8 +278,6 @@ fn pipe_ready(inner: &PipeInner, bfd: usize, events: u32) -> u32 {
     }
 }
 
-// ── PollSource impls ──────────────────────────────────────────────────────────
-
 pub struct PipeReadSource(Arc<PipeState>, usize /* read_bfd */);
 pub struct PipeWriteSource(Arc<PipeState>, usize /* write_bfd */);
 
@@ -326,8 +312,6 @@ pub fn pipe_poll_source(bfd: usize) -> Option<Arc<dyn PollSource>> {
     }
 }
 
-// ── Dup ───────────────────────────────────────────────────────────────────────
-
 pub fn pipe_dup(bfd: usize) {
     if bfd < PIPE_FD_BASE {
         return;
@@ -343,8 +327,6 @@ pub fn pipe_dup(bfd: usize) {
         inner.write_open = inner.write_open.saturating_add(1);
     }
 }
-
-// ── Read ──────────────────────────────────────────────────────────────────────
 
 /// Read up to `buf.len()` bytes from the read end of a pipe.
 ///
@@ -367,7 +349,6 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
     let cancel = crate::proc::scheduler::task_cancel_token(pid);
 
     loop {
-        // ── Try to consume data under the lock ──────────────────────────────
         let (got_data, is_eof, nonblock) = {
             let mut inner = state.inner.lock();
             if !inner.is_empty() {
@@ -389,7 +370,6 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
             return EAGAIN;
         }
 
-        // ── Block until data arrives, HUP, or cancellation ─────────────────
         let reason = state
             .read_wq
             .wait(POLLIN | POLLHUP, cancel.as_deref(), None);
@@ -399,8 +379,6 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
         // WakeReason::Ready or Timeout (no timeout set) → re-check loop.
     }
 }
-
-// ── Write ─────────────────────────────────────────────────────────────────────
 
 /// Write `buf` to the write end of a pipe.
 ///
@@ -428,7 +406,6 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
         let atomic = remaining.len() <= PIPE_BUF;
 
         loop {
-            // ── Try to write under the lock ──────────────────────────────────
             let (wrote_chunk, broken_pipe, nonblock) = {
                 let mut inner = state.inner.lock();
 
@@ -482,7 +459,6 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
                 };
             }
 
-            // ── Block until space opens or read end closes ───────────────────
             let reason = state.write_wq.wait(POLLOUT, cancel.as_deref(), None);
             if reason == WakeReason::Cancelled {
                 return if written == 0 {
@@ -496,8 +472,6 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
 
     written as isize
 }
-
-// ── Close ─────────────────────────────────────────────────────────────────────
 
 /// Called by `PipeScheme::close` when a pipe-end fd closes.
 ///
@@ -531,8 +505,6 @@ pub fn sys_close_pipe(bfd: usize) {
 
     PIPE_TABLE.lock().remove(bfd);
 }
-
-// ── PipeScheme ────────────────────────────────────────────────────────────────
 
 pub struct PipeScheme {
     ring_bfd: usize,
@@ -586,8 +558,6 @@ impl Scheme for PipeScheme {
         Ok(())
     }
 }
-
-// ── sys_pipe / sys_pipe2 ──────────────────────────────────────────────────────
 
 /// NR 22.
 pub fn sys_pipe(pipefd_va: usize) -> isize {

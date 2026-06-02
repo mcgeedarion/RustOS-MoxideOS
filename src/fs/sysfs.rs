@@ -43,8 +43,6 @@ extern crate alloc;
 use alloc::{string::String, vec::Vec};
 use spin::Mutex;
 
-// ─── Synthetic fd table ─────────────────────────────────────────────────────
-
 pub const SYSFS_FD_BASE: usize = 0x7000_0000;
 
 struct SysEntry {
@@ -105,8 +103,6 @@ pub fn sysfs_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
-// ─── getdents support ───────────────────────────────────────────────────────
-
 pub struct DirEntry {
     pub name:   String,
     pub is_dir: bool,
@@ -118,8 +114,6 @@ pub fn sysfs_list_dir(path: &str) -> Option<Vec<DirEntry>> {
     let entries = static_children(path)?;
     Some(entries)
 }
-
-// ─── PCI helpers ────────────────────────────────────────────────────────────
 
 /// Build "0000:BB:DD.F" BDF strings for every enumerated PCI device.
 fn pci_list_devices() -> Vec<String> {
@@ -165,8 +159,6 @@ fn pci_sysfs_attr(path: &str) -> Option<Vec<u8>> {
     }
 }
 
-// ─── Block device helpers ────────────────────────────────────────────────────
-//
 // No separate block registry exists yet; derive block device names from the
 // PCI class code.  PCI mass-storage class is 0x01xx (upper byte 0x01).
 // We name them vda, vdb, … in enumeration order (VirtIO convention).
@@ -185,16 +177,12 @@ fn block_list_devices() -> Vec<String> {
     names
 }
 
-// ─── Content / directory generator ─────────────────────────────────────────
-
 /// Returns (content_bytes, is_dir).  None → ENOENT.
 fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
-    // ── /sys root ───────────────────────────────────────────────────────────
     if path == "/sys" || path == "/sys/" {
         return Some((Vec::new(), true));
     }
 
-    // ── /sys/kernel/* ───────────────────────────────────────────────────────
     if path == "/sys/kernel" {
         return Some((Vec::new(), true));
     }
@@ -227,7 +215,6 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
         return Some((b"2\n".to_vec(), false));
     }
 
-    // ── /sys/devices/system/cpu/* ────────────────────────────────────────────
     if path == "/sys/devices"
         || path == "/sys/devices/system"
         || path == "/sys/devices/system/cpu" {
@@ -245,7 +232,6 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
         return Some((mask.into_bytes(), false));
     }
 
-    // ── /sys/bus/pci* ───────────────────────────────────────────────────────
     if path == "/sys/bus"
         || path == "/sys/bus/pci"
         || path == "/sys/bus/pci/devices" {
@@ -265,7 +251,6 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
         return None;
     }
 
-    // ── /sys/class/net/* ────────────────────────────────────────────────────
     if path == "/sys/class"
         || path == "/sys/class/net"
         || path == "/sys/class/net/lo"
@@ -285,7 +270,6 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
         return Some((b"1500\n".to_vec(), false));
     }
 
-    // ── /sys/block ──────────────────────────────────────────────────────────
     if path == "/sys/block" {
         return Some((Vec::new(), true));
     }
@@ -297,7 +281,6 @@ fn generate(path: &str) -> Option<(Vec<u8>, bool)> {
         return None;
     }
 
-    // ── /sys/power/* ────────────────────────────────────────────────────────
     if path == "/sys/power" {
         return Some((Vec::new(), true));
     }
@@ -362,8 +345,6 @@ fn static_children(path: &str) -> Option<Vec<DirEntry>> {
     };
     Some(entries)
 }
-
-// ─── Helper: CPU count from ACPI or fallback 1 ──────────────────────────────
 
 fn cpu_count() -> usize {
     let mut n = 0usize;

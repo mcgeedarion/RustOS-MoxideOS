@@ -24,12 +24,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use crate::uaccess::{copy_from_user, copy_to_user};
 
-// ── helpers ───────────────────────────────────────────────────────────
-
 #[inline]
 fn current_pid() -> usize { crate::proc::scheduler::current_pid() }
-
-// ── getuid / geteuid / getgid / getegid ──────────────────────────────
 
 pub fn sys_getuid() -> isize {
     crate::proc::scheduler::with_proc(current_pid(), |p| p.uid as isize)
@@ -51,8 +47,6 @@ pub fn sys_getegid() -> isize {
         .unwrap_or(0)
 }
 
-// ── setreuid / setresgid ─────────────────────────────────────────────
-//
 // Linux setreuid(ruid, euid) semantics (POSIX §8.1):
 //   - If euid is not -1, it becomes the new effective UID.
 //   - If ruid is not -1, it becomes the new real UID.
@@ -61,7 +55,6 @@ pub fn sys_getegid() -> isize {
 //       * euid != -1 and euid != old ruid
 //   - Unprivileged (euid != 0): new ruid must be old ruid, euid, or suid;
 //     new euid must be old ruid, euid, or suid.
-//
 // We are a single-user-root kernel so euid==0 is always privileged.
 
 pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {
@@ -105,8 +98,6 @@ pub fn sys_setregid(rgid: u32, egid: u32) -> isize {
     }).unwrap_or(-1)
 }
 
-// ── setresuid / setresgid ────────────────────────────────────────────
-//
 // setresuid(ruid, euid, suid): all three independently settable.
 // -1 means "leave unchanged".
 // Unprivileged: each new value must be one of old {ruid, euid, suid}.
@@ -147,8 +138,6 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
     }).unwrap_or(-1)
 }
 
-// ── getresuid / getresgid ────────────────────────────────────────────
-
 pub fn sys_getresuid(ruid_va: usize, euid_va: usize, suid_va: usize) -> isize {
     let (r, e, s) = crate::proc::scheduler::with_proc(current_pid(), |p| {
         (p.uid, p.euid, p.suid)
@@ -169,8 +158,6 @@ pub fn sys_getresgid(rgid_va: usize, egid_va: usize, sgid_va: usize) -> isize {
     0
 }
 
-// ── setuid / setgid (single-value shortcuts) ─────────────────────────
-//
 // POSIX setuid(uid):
 //   - If euid == 0: sets all of ruid, euid, suid to uid.
 //   - Otherwise: sets only euid (and ruid if uid == ruid or suid).
@@ -202,8 +189,6 @@ pub fn sys_setgid(gid: u32) -> isize {
         0isize
     }).unwrap_or(-1)
 }
-
-// ── getgroups / setgroups ────────────────────────────────────────────
 
 pub fn sys_getgroups(size: i32, list_va: usize) -> isize {
     let groups: Vec<u32> = crate::proc::scheduler::with_proc(current_pid(), |p| {
@@ -242,8 +227,6 @@ pub fn sys_setgroups(size: i32, list_va: usize) -> isize {
     }).unwrap_or(-1)
 }
 
-// ── setsid ───────────────────────────────────────────────────────────
-//
 // Create a new session.
 //   - Fails with EPERM if the caller is already a process-group leader.
 //   - The caller becomes the session leader; sid = pid = pgid.
@@ -261,15 +244,11 @@ pub fn sys_setsid() -> isize {
     }).unwrap_or(-1)
 }
 
-// ── getsid ───────────────────────────────────────────────────────────
-
 pub fn sys_getsid(target_pid: u32) -> isize {
     let pid = if target_pid == 0 { current_pid() } else { target_pid as usize };
     crate::proc::scheduler::with_proc(pid, |p| p.sid as isize)
         .unwrap_or(-3) // ESRCH
 }
-
-// ── getpgrp / setpgid ───────────────────────────────────────────────
 
 pub fn sys_getpgrp() -> isize {
     crate::proc::scheduler::with_proc(current_pid(), |p| p.pgid as isize)

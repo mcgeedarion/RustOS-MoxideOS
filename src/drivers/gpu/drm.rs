@@ -27,10 +27,6 @@ use spin::Mutex;
 
 use crate::drivers::gpu::framebuffer::{Framebuffer, PixelFormat};
 
-// ---------------------------------------------------------------------------
-// Display mode
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DisplayMode {
     pub hdisplay:    u16,
@@ -75,10 +71,6 @@ impl DisplayMode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Connector types
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectorType {
     HDMI,
@@ -97,10 +89,6 @@ pub struct Connector {
     pub crtc_id:    Option<u32>,
 }
 
-// ---------------------------------------------------------------------------
-// CRTC
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug)]
 pub struct Crtc {
     pub id:       u32,
@@ -110,10 +98,6 @@ pub struct Crtc {
     pub y:        u32,
     pub enabled:  bool,
 }
-
-// ---------------------------------------------------------------------------
-// Plane
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaneType { Primary, Overlay, Cursor }
@@ -134,10 +118,6 @@ pub struct Plane {
     pub crtc_h:    u32,
 }
 
-// ---------------------------------------------------------------------------
-// GEM buffer
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug)]
 pub struct GemBo {
     pub handle:  u32,
@@ -149,10 +129,6 @@ pub struct GemBo {
     pub format:  PixelFormat,
 }
 
-// ---------------------------------------------------------------------------
-// DRM device
-// ---------------------------------------------------------------------------
-
 struct DrmDevice {
     crtcs:      Vec<Crtc>,
     connectors: Vec<Connector>,
@@ -162,10 +138,6 @@ struct DrmDevice {
 }
 
 static DRM: Mutex<Option<DrmDevice>> = Mutex::new(None);
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Initialise the DRM subsystem with one CRTC, one connector and two planes.
 pub fn init() {
@@ -191,10 +163,6 @@ pub fn init() {
 }
 
 pub fn is_initialised() -> bool { DRM.lock().is_some() }
-
-// ---------------------------------------------------------------------------
-// GEM operations
-// ---------------------------------------------------------------------------
 
 /// Allocate a GEM buffer object.  Returns handle or None on OOM.
 pub fn gem_alloc(width: u32, height: u32, format: PixelFormat) -> Option<u32> {
@@ -228,10 +196,6 @@ pub fn gem_info(handle: u32) -> Option<GemBo> {
 pub fn gem_map(handle: u32) -> Option<*mut u32> {
     gem_info(handle).map(|b| b.phys as *mut u32)
 }
-
-// ---------------------------------------------------------------------------
-// Modesetting
-// ---------------------------------------------------------------------------
 
 /// Atomic commit: attach `fb_handle` to `crtc_id` with `mode`.
 /// Updates connector and primary plane state.
@@ -271,10 +235,6 @@ pub fn atomic_commit(crtc_id: u32, connector_id: u32, mode: &DisplayMode, fb_han
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Connector / CRTC queries
-// ---------------------------------------------------------------------------
-
 pub fn connectors() -> Vec<Connector> {
     DRM.lock().as_ref().map(|d| d.connectors.clone()).unwrap_or_default()
 }
@@ -286,10 +246,6 @@ pub fn crtcs() -> Vec<Crtc> {
 pub fn planes() -> Vec<Plane> {
     DRM.lock().as_ref().map(|d| d.planes.clone()).unwrap_or_default()
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn alloc_dma(size: usize, align: usize) -> Option<u64> {
     let pages = (size + 0xFFF) / 0x1000;

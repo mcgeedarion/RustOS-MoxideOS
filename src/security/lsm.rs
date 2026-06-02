@@ -33,8 +33,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::spinlock::SpinLock;
 
-// ─── Verdict ─────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LsmVerdict {
     Allow,
@@ -56,8 +54,6 @@ impl LsmVerdict {
     }
 }
 
-// ─── Per-hook context ─────────────────────────────────────────────────────────
-
 pub type Mode = u16;
 
 pub const SOCK_STREAM: u32 = 1;
@@ -67,20 +63,17 @@ pub const SOCK_RAW:    u32 = 3;
 /// Context passed to every LSM hook.
 #[derive(Clone)]
 pub struct LsmCtx {
-    // ── task credentials ─────────────────────────────────────────────────
     pub pid:   usize,
     pub euid:  u32,
     pub egid:  u32,
     pub caps:  u64,
     pub supp_groups: Vec<u32>,
 
-    // ── inode identity ───────────────────────────────────────────────────
     pub inode_uid:  u32,
     pub inode_gid:  u32,
     pub inode_mode: Mode,
     pub path: &'static str,
 
-    // ── hook-specific fields ─────────────────────────────────────────────
     pub signo: i32,
     pub arg0:  u64,
     pub arg1:  u64,
@@ -130,8 +123,6 @@ impl LsmCtx {
     }
 }
 
-// ─── Hook enum ────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hook {
     FileOpen, FileRead, FileWrite, FileExec,
@@ -142,8 +133,6 @@ pub enum Hook {
     IpcPermission,
     SbMount,
 }
-
-// ─── LsmHooks trait ──────────────────────────────────────────────────────────
 
 pub trait LsmHooks: Send + Sync {
     fn name(&self) -> &'static str;
@@ -169,8 +158,6 @@ pub trait LsmHooks: Send + Sync {
     fn ipc_permission(&self, ctx: &LsmCtx) -> LsmVerdict { LsmVerdict::Allow }
     fn sb_mount      (&self, ctx: &LsmCtx) -> LsmVerdict { LsmVerdict::Allow }
 }
-
-// ─── Registry ─────────────────────────────────────────────────────────────────
 
 const MAX_LSM_MODULES: usize = 8;
 

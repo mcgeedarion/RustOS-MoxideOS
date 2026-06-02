@@ -24,8 +24,6 @@ const AT_FDCWD:             i32 = -100;
 const AT_EMPTY_PATH:        u32 = 0x1000;
 const AT_SYMLINK_NOFOLLOW:  u32 = 0x100;
 
-// ── helpers ────────────────────────────────────────────────────────────────────────
-
 #[inline]
 fn read_path(va: usize) -> Option<String> {
     if va == 0 || va >= USER_SPACE_END { return None; }
@@ -117,8 +115,6 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFBLK: u32 = 0o060000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFSOCK: u32 = 0o140000;
-
-// ── stat family ────────────────────────────────────────────────────────────────────
 
 pub fn sys_stat(path_va: usize, stat_va: usize) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
@@ -313,13 +309,9 @@ fn is_proc_dir(path: &str) -> bool {
     }
 }
 
-// ── sys_lseek ───────────────────────────────────────────────────────────────────────
-
 pub fn sys_lseek(fd: usize, offset: i64, whence: i32) -> isize {
     vfs::lseek(fd, offset, whence)
 }
-
-// ── sys_getcwd ──────────────────────────────────────────────────────────────────────
 
 /// sys_getcwd(buf_va, size) [NR 79]
 ///
@@ -338,8 +330,6 @@ pub fn sys_getcwd(buf_va: usize, size: usize) -> isize {
     if copy_to_user(buf_va, &kbuf).is_err() { return -14; }
     buf_va as isize
 }
-
-// ── sys_chdir / sys_fchdir ────────────────────────────────────────────────────────────
 
 /// sys_chdir(path_va) [NR 80]
 ///
@@ -401,8 +391,6 @@ fn commit_cwd(new_cwd: String) -> isize {
     0
 }
 
-// ── sys_access / sys_faccessat ──────────────────────────────────────────────────────
-
 pub fn sys_access(path_va: usize, _mode: u32) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
     if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
@@ -414,8 +402,6 @@ pub fn sys_access(path_va: usize, _mode: u32) -> isize {
 pub fn sys_faccessat(_dirfd: i32, path_va: usize, mode: u32) -> isize {
     sys_access(path_va, mode)
 }
-
-// ── sys_readlink / sys_readlinkat ──────────────────────────────────────────────────────
 
 pub fn sys_readlink(path_va: usize, buf_va: usize, bufsz: usize) -> isize {
     if buf_va == 0 || bufsz == 0 { return -14; }
@@ -443,8 +429,6 @@ pub fn sys_readlinkat(_dirfd: i32, path_va: usize, buf_va: usize, bufsz: usize) 
     sys_readlink(path_va, buf_va, bufsz)
 }
 
-// ── sys_rename / sys_mkdir / sys_unlink ────────────────────────────────────────────────
-
 pub fn sys_rename(old_va: usize, new_va: usize) -> isize {
     let old = match read_path(old_va) { Some(p) => p, None => return -14 };
     let new = match read_path(new_va) { Some(p) => p, None => return -14 };
@@ -465,8 +449,6 @@ pub fn sys_unlink(path_va: usize) -> isize {
     if vfs::unlink(&path) { 0 } else { -2 }
 }
 
-// ── sys_truncate ───────────────────────────────────────────────────────────────────────────
-
 pub fn sys_truncate(path_va: usize, length: i64) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
     if length < 0 { return -22; }
@@ -475,8 +457,6 @@ pub fn sys_truncate(path_va: usize, length: i64) -> isize {
         Err(e)  => e,
     }
 }
-
-// ── sys_chmod / sys_fchmod / sys_chown / sys_fchown ──────────────────────────────
 
 pub fn sys_chmod(path_va: usize, mode: u32) -> isize {
     let path = match read_path(path_va) { Some(p) => p, None => return -14 };
@@ -511,8 +491,6 @@ pub fn sys_fchown(fd: usize, uid: u32, gid: u32) -> isize {
         Err(e)  => e,
     }
 }
-
-// ── sys_newfstatat ─────────────────────────────────────────────────────────────────────
 
 pub fn sys_newfstatat(dirfd: i32, path_va: usize, stat_va: usize, flags: u32) -> isize {
     if path_va == 0 {

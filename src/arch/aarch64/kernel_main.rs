@@ -113,8 +113,6 @@ pub fn init(boot_info: &'static BootInfo) -> ! {
     }
 }
 
-// ── Storage backend (mirrors x86_64/kernel_main.rs) ───────────────────────────
-
 enum StorageBackend {
     VirtioBlk,
     None,

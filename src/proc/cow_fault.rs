@@ -28,8 +28,6 @@ use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
 
-// ── clone_for_fork ────────────────────────────────────────────────────────
-
 /// Create a CoW copy of the parent's address space for a fork() child.
 /// Returns the child's CR3 / SATP physical address, or 0 on OOM.
 pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) -> usize {
@@ -44,8 +42,6 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
     }
     child_cr3
 }
-
-// ── handle_cow_fault ──────────────────────────────────────────────────────
 
 /// Handle a write fault that may be a CoW page.
 /// Returns true if resolved; false if genuine access violation.
@@ -100,8 +96,6 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
 
     true
 }
-
-// ── low-level PTE read (x86-64 4-level / RISC-V Sv39 compatible) ─────────
 
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const PRESENT:   u64 = 1;

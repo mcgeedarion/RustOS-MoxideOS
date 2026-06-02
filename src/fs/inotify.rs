@@ -25,8 +25,6 @@ use spin::Mutex;
 use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 use crate::fs::scheme_table::Scheme;
 
-// ── Public event mask constants ────────────────────────────────────────────────────────────────
-
 pub const IN_ACCESS:        u32 = 0x0000_0001;
 pub const IN_MODIFY:        u32 = 0x0000_0002;
 pub const IN_ATTRIB:        u32 = 0x0000_0004;
@@ -60,8 +58,6 @@ const MAX_QUEUE: usize = 16384;
 
 pub const INOTIFY_FD_BASE: usize = 0x8000_0000;
 
-// ── Internal structures ──────────────────────────────────────────────────────────────
-
 struct QueuedEvent {
     wd:     i32,
     mask:   u32,
@@ -88,8 +84,6 @@ static TABLE: Mutex<BTreeMap<usize, InotifyInstance>> =
 static COUNTER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-// ── scheme_bfd → TABLE fdno translation ───────────────────────────────────────────
-
 /// Translate a scheme backing fd to the inotify TABLE fdno.
 pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
     let (_, fid) = crate::fs::scheme_fd::scheme_fd_get_fid(scheme_bfd)?;
@@ -100,8 +94,6 @@ pub fn scheme_bfd_to_table_fdno(scheme_bfd: usize) -> Option<usize> {
         None
     }
 }
-
-// ── InotifyScheme ───────────────────────────────────────────────────────────────────
 
 pub struct InotifyScheme;
 
@@ -138,14 +130,11 @@ impl Scheme for InotifyScheme {
     }
 }
 
-// ── sys_inotify_init1 [NR 294] ──────────────────────────────────────────────────────
-
 pub fn sys_inotify_init1(flags: u32) -> isize {
     use alloc::sync::Arc;
     use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
     use crate::fs::process_fd::proc_fd_install;
 
-    // ── 1. Allocate raw TABLE entry ────────────────────────────────────────────
     let id       = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let table_fdno = INOTIFY_FD_BASE + id;
     TABLE.lock().insert(table_fdno, InotifyInstance {
@@ -155,20 +144,16 @@ pub fn sys_inotify_init1(flags: u32) -> isize {
         next_wd:  1,
     });
 
-    // ── 2. Register InotifyScheme ───────────────────────────────────────────────
     let scheme: Arc<dyn Scheme> = Arc::new(InotifyScheme);
     let scheme_bfd = alloc_scheme_backing_fd();
     scheme_fd_register(scheme_bfd, scheme, SchemeFileId(table_fdno as u64));
 
-    // ── 3. Install scheme bfd ──────────────────────────────────────────────────
     let pid = crate::proc::scheduler::current_pid();
     let install_flags = if flags & IN_CLOEXEC != 0 { IN_CLOEXEC } else { 0 };
     let user_fd = proc_fd_install(pid, scheme_bfd, None, install_flags, None);
     user_fd as isize
 }
 
-// ── sys_inotify_add_watch [NR 254] ──────────────────────────────────────────────────
-//
 // Called with the scheme bfd (already resolved from user fd).
 
 pub fn sys_inotify_add_watch(scheme_bfd: usize, path_va: usize, mask: u32) -> isize {
@@ -207,8 +192,6 @@ pub fn sys_inotify_add_watch(scheme_bfd: usize, path_va: usize, mask: u32) -> is
     wd as isize
 }
 
-// ── sys_inotify_rm_watch [NR 255] ───────────────────────────────────────────────────
-
 pub fn sys_inotify_rm_watch(scheme_bfd: usize, wd: i32) -> isize {
     let fdno = match scheme_bfd_to_table_fdno(scheme_bfd) {
         Some(f) => f,
@@ -227,8 +210,6 @@ pub fn sys_inotify_rm_watch(scheme_bfd: usize, wd: i32) -> isize {
     }
     0
 }
-
-// ── read (called via InotifyScheme::read) ─────────────────────────────────────────
 
 pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
     const HDR: usize = 16;
@@ -272,19 +253,13 @@ pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
     }
 }
 
-// ── close ──────────────────────────────────────────────────────────────────────
-
 pub fn inotify_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
-// ── Predicate ────────────────────────────────────────────────────────────────────
-
 pub fn is_inotify_fd(fdno: usize) -> bool {
     fdno >= INOTIFY_FD_BASE && TABLE.lock().contains_key(&fdno)
 }
-
-// ── poll readiness ─────────────────────────────────────────────────────────────
 
 pub fn inotify_poll(fdno: usize, events: u32) -> u32 {
     let tbl = TABLE.lock();
@@ -297,8 +272,6 @@ pub fn inotify_poll(fdno: usize, events: u32) -> u32 {
         }
     }
 }
-
-// ── Kernel-internal event emission ──────────────────────────────────────────────────
 
 pub fn inotify_emit(path: &str, mask: u32, cookie: u32, name: Option<&str>) {
     let parent: &str = match path.rfind('/') {
