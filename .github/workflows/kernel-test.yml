@@ -215,6 +215,7 @@ jobs:
       - name: QEMU smoke test (x86_64)
         if: inputs.run_smoke && inputs.arch == 'x86_64'
         run: |
+          mkdir -p logs/x86_64
           cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
           timeout 10 qemu-system-x86_64 \
             -machine q35 \
@@ -227,11 +228,12 @@ jobs:
             -device virtio-net-pci,netdev=net0,id=nic0 \
             -serial stdio -display none -no-reboot \
             -d guest_errors,cpu_reset \
-            2>&1 | tee "qemu-${{ inputs.arch }}.log" || true
+            2>&1 | tee logs/x86_64/serial.log qemu-${{ inputs.arch }}.log || true
 
       - name: QEMU smoke test (aarch64)
         if: inputs.run_smoke && inputs.arch == 'aarch64'
         run: |
+          mkdir -p logs/aarch64
           timeout 15 qemu-system-aarch64 \
             -machine virt \
             -cpu cortex-a72 \
@@ -241,11 +243,12 @@ jobs:
             -device virtio-net-device,netdev=net0,id=nic0 \
             -serial stdio -display none -no-reboot \
             -d guest_errors,cpu_reset \
-            2>&1 | tee "qemu-${{ inputs.arch }}.log" || true
+            2>&1 | tee logs/aarch64/serial.log qemu-${{ inputs.arch }}.log || true
 
       - name: QEMU smoke test (riscv64)
         if: inputs.run_smoke && inputs.arch == 'riscv64'
         run: |
+          mkdir -p logs/riscv64
           timeout 15 qemu-system-riscv64 \
             -machine virt \
             -cpu rv64 \
@@ -257,7 +260,7 @@ jobs:
             -device virtio-net-device,netdev=net0,id=nic0 \
             -serial stdio -display none -no-reboot \
             -d guest_errors,cpu_reset \
-            2>&1 | tee "qemu-${{ inputs.arch }}.log" || true
+            2>&1 | tee logs/riscv64/serial.log qemu-${{ inputs.arch }}.log || true
 
       - name: Assert smoke markers
         if: inputs.run_smoke
@@ -294,6 +297,15 @@ jobs:
               { echo "  ❌ ${t}"; FAILED=$((FAILED+1)); }
           done
           [ $FAILED -eq 0 ] || exit 1
+
+      # ── Arch test validation (runs after smoke captures serial.log) ───────────
+      - name: Run arch-specific tests and collect logs
+        if: inputs.run_smoke && always()
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          chmod +x scripts/ci/collect-logs.sh
+          scripts/ci/collect-logs.sh
 
       # ════════════════════════════════════════════════════════════════════════
       # KMTEST MODE  — userspace runner + initramfs + kernel self-test harness
@@ -411,6 +423,9 @@ jobs:
           path: |
             build-${{ inputs.arch }}.log
             qemu-${{ inputs.arch }}.log
+            logs/${{ inputs.arch }}/serial.log
+            artifacts/${{ inputs.arch }}/test-report.txt
+            artifacts/${{ inputs.arch }}/
 
       - name: Upload kmtest logs
         if: inputs.run_kmtest && always()
