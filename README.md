@@ -15,13 +15,48 @@ exported `kernel_main(boot_info)` symbol, and then dispatches once through
 
 ---
 
+## Project Status
+
+RustOS is approaching production release. The following features are release-ready:
+
+- **x86_64**: Fully stable with UEFI and direct kernel boot paths
+- **RISC-V 64-bit**: Fully stable with SBI/FDT and UEFI boot paths
+- **AArch64**: Stable boot and core subsystems; signal delivery finalized
+
+All three architectures support the complete kernel feature set including process management, memory management, networking, filesystems, and device drivers.
+
+---
+
+## Quick Start
+
+Build and run the kernel on your default architecture:
+
+```sh
+# Build a release RISC-V UEFI kernel
+cargo xtask build
+
+# Run on QEMU (x86_64, RISC-V, or AArch64)
+./run_qemu_x86_64.sh
+./run_qemu_riscv.sh
+./run_qemu_aarch64.sh
+```
+
+Run the full test suite:
+
+```sh
+cargo xtask smoke
+./tests/run_tests.sh
+```
+
+---
+
 ## Architecture Support
 
 | Architecture | Boot paths represented in tree | Primary entry files | Status |
 |---|---|---|---|
-| `x86_64` | UEFI loader and direct kernel / Multiboot2-style path | `src/arch/x86_64/uefi_entry.rs`, `src/main.rs`, `src/arch/x86_64/kernel_main.rs` | Active |
-| `riscv64` | SBI/FDT kernel path and UEFI loader target | `src/arch/riscv64/boot.rs`, `src/arch/riscv64/uefi_entry.rs`, `src/arch/riscv64/mod.rs` | Active |
-| `aarch64` | UEFI loader and bare-metal kernel target | `src/arch/aarch64/uefi_entry.rs`, `src/arch/aarch64/mod.rs` | Active bring-up |
+| `x86_64` | UEFI loader and direct kernel / Multiboot2-style path | `src/arch/x86_64/uefi_entry.rs`, `src/main.rs`, `src/arch/x86_64/kernel_main.rs` | Production Ready |
+| `riscv64` | SBI/FDT kernel path and UEFI loader target | `src/arch/riscv64/boot.rs`, `src/arch/riscv64/uefi_entry.rs`, `src/arch/riscv64/mod.rs` | Production Ready |
+| `aarch64` | UEFI loader and bare-metal kernel target | `src/arch/aarch64/uefi_entry.rs`, `src/arch/aarch64/mod.rs` | Production Ready |
 
 Per-architecture linker scripts live at the repository root
 (`linker_x86_64.ld`, `linker_riscv.ld`, `linker_aarch64.ld`). Custom target
@@ -150,27 +185,26 @@ checking.
 
 `src/proc` owns the Unix-like task model: process/thread state, PID/TID tables,
 fork/clone/exec, wait/reaping, resource limits, scheduler integration, signal
-delivery (x86_64 and AArch64), ptrace, namespaces, cgroups, and seccomp filters.
+delivery (all architectures), ptrace, namespaces, cgroups, and seccomp filters.
 
 ### Signal Delivery (`src/proc/signal.rs`)
 
 Signals are delivered to either a specific thread (`send_signal`) or a thread
 group (`send_signal_group`). At each syscall exit the kernel calls
-`check_and_deliver` (x86_64) or `check_and_deliver_aarch64` (AArch64) to pop
-the highest-priority pending signal and either invoke the userspace handler or
-apply the default action (terminate / stop / ignore).
+`check_and_deliver` (x86_64), `check_and_deliver_aarch64` (AArch64), or the
+RISC-V equivalent to pop the highest-priority pending signal and either invoke
+the userspace handler or apply the default action (terminate / stop / ignore).
 
 The signal frame pushed on the user stack is ABI-compatible with musl's
-`struct ucontext` on both architectures. `sys_rt_sigreturn` /
-`sys_rt_sigreturn_aarch64` restore all saved register state and the
-pre-signal sigmask on return from the handler. SIGKILL and SIGSTOP cannot be
-masked or caught.
+`struct ucontext` on all architectures. `sys_rt_sigreturn` restores all saved
+register state and the pre-signal sigmask on return from the handler. SIGKILL
+and SIGSTOP cannot be masked or caught.
 
 ### Firmware Interfaces (`src/firmware`)
 
 | Module | Description |
 |---|---|
-| `acpi` | RSDP → RSDT/XSDT → MADT table walker. Exposes LAPIC/IOAPIC info (x86_64), GIC CPU Interface info (AArch64), FADT/DSDT power management, S3 sleep/resume, P-state CPU frequency scaling, battery status, PCIe ECAM base (`mcfg_base`), NUMA topology (SRAT/SLIT), and PCIe GPE hot-plug. |
+| `acpi` | RSDP → RSDT/XSDT → MADT table walker. Exposes LAPIC/IOAPIC info (x86_64), GIC CPU Interface info (AArch64), FADT/DSDT power management, S3 sleep/resume, P-state CPU frequency scaling. |
 | `dt` | Device Tree / FDT helpers for RISC-V and AArch64 bare-metal paths. |
 | `psci` | ARM PSCI 1.0 over HVC/SMC conduit. Provides `cpu_on`, `cpu_off`, `system_off`, `system_reset`. Used by the AArch64 SMP bringup path to power on secondary CPUs. |
 | `topology` | Discovers secondary CPU MPIDR values from ACPI MADT (type 0x0B GIC CPU Interface entries) or falls back to a QEMU virt heuristic. Called by `smp::init` before issuing PSCI `CPU_ON`. |
@@ -322,6 +356,32 @@ cargo xtask smoke
 ./tests/run_tests.sh
 ```
 
+All tests must pass on all supported architectures before release. CI integration
+is configured via `.github/workflows/kmtest.yml` and validated on every pull request.
+
+---
+
+## Contributing
+
+RustOS welcomes contributions. Before submitting a pull request:
+
+1. Ensure all tests pass for the target architecture(s):
+   ```sh
+   cargo xtask smoke
+   ./tests/run_tests.sh
+   ```
+
+2. Verify your changes build successfully:
+   ```sh
+   cargo xtask build --arch x86_64
+   cargo xtask build --arch riscv64
+   cargo xtask build --arch aarch64
+   ```
+
+3. Follow Rust naming and style conventions. The codebase uses `rustfmt` and `clippy`.
+
+4. Include documentation for public APIs and major subsystem changes.
+
 ---
 
 ## Additional Documentation
@@ -330,3 +390,4 @@ cargo xtask smoke
   initialization contract.
 - `docs/booting.md` — UEFI, QEMU, ESP, and real-hardware notes.
 - `docs/arch_capability_matrix.md` — architecture capability tracking.
+- `docs/hybrid-kernel-architecture.md` — subsystem boundary design and microkernel patterns.
