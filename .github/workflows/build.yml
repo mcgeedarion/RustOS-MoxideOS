@@ -1,3 +1,18 @@
+# Build workflow — matrix caller.
+#
+# Drives kernel-test.yml (run_build: true) for every supported architecture.
+# All build logic lives in kernel-test.yml; add new architectures here only.
+#
+# Architecture matrix
+# ───────────────────
+#   arch     cargo-target                    boot-protocol
+#   x86_64   x86_64-unknown-none             UEFI / multiboot2
+#   aarch64  targets/aarch64-kernel.json     virt / cortex-a72
+#   riscv64  riscv64gc-unknown-none-elf       OpenSBI virt
+#
+# Adding an architecture: add a row under matrix.include and, if the
+# build diverges in a new way, add a guarded step in kernel-test.yml.
+
 name: Build
 
 on:
@@ -9,133 +24,15 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-
 jobs:
-  # ── Primary: RISC-V UEFI (default target + default feature) ───────────────
-  build-riscv-uefi:
-    name: "RISC-V UEFI (debug + release)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  build:
+    name: "build • ${{ matrix.arch }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, riscv64]
 
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: file
-          components: rust-src, llvm-tools-preview, rustfmt, clippy
-
-      - name: Install clang + lld
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends clang lld
-
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-riscv-uefi-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-riscv-uefi-${{ hashFiles('rust-toolchain.toml') }}-
-
-      - name: Build (debug)
-        run: |
-          cargo build \
-            --target riscv64-uefi.json \
-            --features uefi_boot \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-      - name: Build (release)
-        run: |
-          cargo build --release \
-            --target riscv64-uefi.json \
-            --features uefi_boot \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-  # ── Secondary: RISC-V SBI ──────────────────────────────────────────────────
-  build-riscv-sbi:
-    name: "RISC-V SBI (debug)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: file
-          components: rust-src
-          targets: riscv64gc-unknown-none-elf
-
-      - name: Install clang
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends clang
-
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-riscv-sbi-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-riscv-sbi-${{ hashFiles('rust-toolchain.toml') }}-
-
-      - name: Build (debug)
-        run: |
-          cargo build \
-            --target riscv64gc-unknown-none-elf \
-            --no-default-features \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-  # ── Tertiary: x86_64 ───────────────────────────────────────────────────────────
-  build-x86_64:
-    name: "x86_64 (debug + release)"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: file
-          components: rust-src, llvm-tools-preview
-          targets: x86_64-unknown-none
-
-      - name: Install clang + nasm
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends clang nasm
-
-      - name: Cache cargo registry + build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-x86_64-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-x86_64-${{ hashFiles('rust-toolchain.toml') }}-
-
-      - name: Build (debug)
-        run: |
-          cargo build \
-            --target x86_64-unknown-none \
-            --no-default-features \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
-
-      - name: Build (release)
-        run: |
-          cargo build --release \
-            --target x86_64-unknown-none \
-            --no-default-features \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem
+    uses: ./.github/workflows/kernel-test.yml
+    with:
+      arch:      ${{ matrix.arch }}
+      run_build: true
