@@ -1,3 +1,29 @@
 max_width = 100
 tab_spaces = 4
 edition = "2021"
+
+# Function formatting
+fn_single_line = false
+fn_args_layout = "Tall"
+
+# Import organization
+reorder_imports = true
+reorder_modules = true
+
+# Trailing commas
+trailing_comma = "Vertical"
+
+# Comment formatting
+wrap_comments = true
+comment_width = 80
+
+# Match formatting
+match_block_trailing_comma = true
+normalize_comments = true
+
+# Spacing
+space_after_colon = true
+space_before_colon = false
+
+# Remove control
+remove_nested_parens = true
