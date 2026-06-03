@@ -9,6 +9,7 @@
 # Usage:
 #   make              # build x86_64 binaries (default)
 #   make ARCH=riscv64 # build RISC-V binaries
+#   make help         # show available targets
 #
 # Output layout (matches build_initramfs.sh staging expectations):
 #   build/<arch>/init               → staged as /init        (PID 1)
@@ -32,36 +33,78 @@ else
   $(error Unsupported ARCH=$(ARCH). Use x86_64 or riscv64)
 endif
 
+# Wayland compositor requires special CFLAGS for security and compatibility.
+# See wayland target comments below for detailed rationale.
+WAYLAND_CFLAGS := -static -O2 -D_GNU_SOURCE -fstack-protector-strong \
+                  -Wall -Wextra -std=c11
+
 # List every subdirectory that contains a C program here.
-PROGRAMS := init hello wayland smoke kmtest
+PROGRAMS := init hello smoke kmtest wayland
 
-.PHONY: all clean install $(PROGRAMS)
+.PHONY: all clean install help check-tools $(PROGRAMS)
 
-all: $(PROGRAMS)
+# ============================================================================
+# Default target and tool validation
+# ============================================================================
+
+all: check-tools $(PROGRAMS)
+
+help:
+	@echo "RustOS Userspace Build System"
+	@echo ""
+	@echo "Usage: make [ARCH=x86_64|riscv64] [target]"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  all      - Build all userspace binaries (default)"
+	@echo "  install  - Install binaries to DESTDIR (default: build/<arch>/rootfs)"
+	@echo "  clean    - Remove all build artifacts"
+	@echo "  help     - Show this help message"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make                              # Build x86_64 binaries"
+	@echo "  make ARCH=riscv64                 # Build RISC-V binaries"
+	@echo "  make install DESTDIR=/tmp/rootfs  # Install to custom location"
+
+check-tools:
+	@command -v $(CC) >/dev/null 2>&1 || { \
+		echo "Error: $(CC) not found. Please install the required toolchain."; \
+		echo "For x86_64: apt install musl-tools"; \
+		echo "For RISC-V: Build musl from source or apt install gcc-riscv64-linux-gnu musl-dev"; \
+		exit 1; \
+	}
+
+# ============================================================================
+# Build directory setup
+# ============================================================================
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-init: $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/init init/init.c
+# ============================================================================
+# Program build rules (generic pattern + special cases)
+# ============================================================================
 
-hello: $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/hello hello/hello.c
+# Standard build rule for simple programs
+$(BUILD_DIR)/init: init/init.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/hello: hello/hello.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
 
 # Minimal QEMU smoke binary:
 #   - prints a well-known marker to the serial console
 #   - returns 0 on success
 #   - can be extended later with basic invariants (e.g. /proc/1 exists).
-smoke: $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/smoke smoke/smoke.c
+$(BUILD_DIR)/smoke: smoke/smoke.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
 
 # Kernel test runner:
 #   - calls SYS_KMTEST_LIST to discover registered tests
 #   - calls SYS_KMTEST_RUN per test (or a named subset from argv)
 #   - exits non-zero on any failure, making it CI-friendly
 #   - _GNU_SOURCE required for snprintf in strict -std=c11 mode with musl
-kmtest: $(BUILD_DIR)
-	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $(BUILD_DIR)/kmtest kmtest/kmtest.c
+$(BUILD_DIR)/kmtest: kmtest/kmtest.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ $<
 
 # The Wayland compositor is a privileged userspace process.
 # It is installed as /usr/bin/rustos-compositor in the initramfs.
@@ -72,11 +115,26 @@ kmtest: $(BUILD_DIR)
 #     compositor handles untrusted data from Wayland clients.
 #   _GNU_SOURCE               — required for epoll_create1, SOCK_CLOEXEC,
 #     accept4, and the seccomp BPF headers.
-wayland: $(BUILD_DIR)
-	$(CC) -static -O2 -D_GNU_SOURCE -fstack-protector-strong \
-	      -Wall -Wextra -std=c11 \
-	      -o $(BUILD_DIR)/rustos-compositor \
-	      wayland/compositor.c
+$(BUILD_DIR)/rustos-compositor: wayland/compositor.c | $(BUILD_DIR)
+	$(CC) $(WAYLAND_CFLAGS) -o $@ $<
+
+# ============================================================================
+# Convenience targets (map to actual binaries)
+# ============================================================================
+
+init: $(BUILD_DIR)/init
+
+hello: $(BUILD_DIR)/hello
+
+smoke: $(BUILD_DIR)/smoke
+
+kmtest: $(BUILD_DIR)/kmtest
+
+wayland: $(BUILD_DIR)/rustos-compositor
+
+# ============================================================================
+# Installation and cleanup
+# ============================================================================
 
 # Copies built binaries into a staging rootfs tree whose layout matches
 # what build_initramfs.sh expects when it packs the CPIO archive:
