@@ -1,4 +1,18 @@
-name: QEMU Smoke Build & CL Test
+# QEMU Smoke workflow — matrix caller.
+#
+# Drives kernel-test.yml (run_smoke: true) for every supported architecture.
+# Boots the kernel under QEMU, probes the VirtIO NIC, and asserts serial
+# markers for boot, NIC registration, and arch-specific subsystems (SMP/PLIC
+# on riscv64).  The CL self-test markers (alloc_smoke, trap_smoke,
+# uart_smoke) are also validated on every arch.
+#
+# Architecture notes
+# ──────────────────────────────────────────────────────────────────────────
+#   x86_64   OVMF UEFI pflash, q35, virtio-net-pci
+#   aarch64  virt/cortex-a72, virtio-net-device (MMIO)  [NEW]
+#   riscv64  OpenSBI virt, -smp 2, virtio-net-device (MMIO), PLIC + SMP checks
+
+name: QEMU Smoke
 
 on:
   push:
@@ -9,190 +23,15 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  # ──────────────────────────────────────────────────────────────────────────
-  # RISC-V: OpenSBI → _start (boot.rs) → kernel_main
-  # -smp 2 exercises the SBI HSM bringup path: BSP calls sbi_hart_start for
-  # hart 1, which runs ap_entry_riscv → ap_entry → percpu_init →
-  # init_hart (stvec + SEIE) → ap_init_plic → scheduler::ap_idle.
-  # virtio-net-device (VirtIO-MMIO + SLIRP NAT) exercises the MMIO NIC
-  # driver probe path and PLIC IRQ delivery on every CI run.
-  # ──────────────────────────────────────────────────────────────────────────
-  riscv-smoke:
-    name: RISC-V Build + QEMU SMP Boot
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  smoke:
+    name: "smoke • ${{ matrix.arch }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, riscv64]
 
-    steps:
-      - uses: actions/checkout@v4
-
-      # Pin to the same nightly as rust-toolchain.toml so a nightly
-      # regression cannot break smoke without also breaking the build job.
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: file
-          targets: riscv64gc-unknown-none-elf
-          components: rust-src, llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: riscv64-debug-${{ hashFiles('rust-toolchain.toml') }}
-
-      - name: Install QEMU (RISC-V)
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends qemu-system-riscv64
-
-      - name: Build rustos (RISC-V debug)
-        run: |
-          cargo build \
-            --target riscv64gc-unknown-none-elf \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem \
-            2>&1 | tee build-riscv.log
-          tail -20 build-riscv.log
-          test -f target/riscv64gc-unknown-none-elf/debug/rustos || \
-            { echo "ELF not found"; exit 1; }
-          file target/riscv64gc-unknown-none-elf/debug/rustos
-
-      - name: QEMU SMP + NIC smoke test (RISC-V)
-        run: |
-          timeout 15 qemu-system-riscv64 \
-            -machine virt \
-            -cpu rv64 \
-            -smp 2 \
-            -m 256M \
-            -bios default \
-            -kernel target/riscv64gc-unknown-none-elf/debug/rustos \
-            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
-            -device virtio-net-device,netdev=net0,id=nic0 \
-            -serial stdio \
-            -display none \
-            -no-reboot \
-            -d guest_errors,cpu_reset \
-            2>&1 | tee qemu-riscv.log || true
-          cat qemu-riscv.log
-
-          grep -q 'kernel_main reached' qemu-riscv.log && \
-            echo "✅ BOOT SMOKE TEST PASSED" || \
-            { echo "❌ BOOT SMOKE TEST FAILED"; exit 1; }
-
-          grep -q 'virtio_net_mmio: device ready' qemu-riscv.log && \
-            echo "✅ RISC-V NIC PROBE PASSED" || \
-            { echo "❌ RISC-V NIC PROBE FAILED"; exit 1; }
-
-          grep -q 'nic: registered device 0' qemu-riscv.log && \
-            echo "✅ RISC-V NIC REGISTERED" || \
-            { echo "❌ RISC-V NIC REGISTER FAILED"; exit 1; }
-
-          grep -q 'smp: all 2 harts online' qemu-riscv.log && \
-            echo "✅ SMP: hart 1 online" || \
-            { echo "❌ SMP: hart 1 did not come online"; exit 1; }
-
-          grep -q 'plic: AP context 3 initialised' qemu-riscv.log && \
-            echo "✅ PLIC: AP context 3 initialised" || \
-            { echo "❌ PLIC: AP context not initialised"; exit 1; }
-
-      - name: CL test pass
-        run: |
-          FAILED=0
-          for t in "alloc_smoke" "trap_smoke" "uart_smoke"; do
-            grep -q "TEST PASS: ${t}" qemu-riscv.log && \
-              echo "  ✅ ${t}" || \
-              { echo "  ❌ ${t}"; FAILED=$((FAILED+1)); }
-          done
-          [ $FAILED -eq 0 ] || exit 1
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: riscv-logs
-          path: |
-            build-riscv.log
-            qemu-riscv.log
-
-  # ──────────────────────────────────────────────────────────────────────────
-  # x86_64: OVMF (UEFI) → uefi_start → kernel_main
-  # ──────────────────────────────────────────────────────────────────────────
-  x86-smoke:
-    name: x86_64 Build + QEMU UEFI Boot
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: file
-          targets: x86_64-unknown-none
-          components: rust-src, llvm-tools-preview
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: x86_64-debug-${{ hashFiles('rust-toolchain.toml') }}
-
-      - name: Install QEMU (x86) + OVMF
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 ovmf
-
-      - name: Build rustos (x86_64 debug)
-        run: |
-          cargo build \
-            --target x86_64-unknown-none \
-            -Z build-std=core,alloc,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem \
-            2>&1 | tee build-x86.log
-          tail -20 build-x86.log
-          test -f target/x86_64-unknown-none/debug/rustos || \
-            { echo "ELF not found"; exit 1; }
-          file target/x86_64-unknown-none/debug/rustos
-
-      - name: QEMU UEFI boot + NIC probe smoke test
-        run: |
-          cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
-
-          timeout 10 qemu-system-x86_64 \
-            -machine q35 \
-            -cpu qemu64 \
-            -m 256M \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
-            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
-            -kernel target/x86_64-unknown-none/debug/rustos \
-            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
-            -device virtio-net-pci,netdev=net0,id=nic0 \
-            -serial stdio \
-            -display none \
-            -no-reboot \
-            -d guest_errors,cpu_reset \
-            2>&1 | tee qemu-x86.log || true
-          cat qemu-x86.log
-
-          grep -q 'kernel_main reached' qemu-x86.log && \
-            echo "✅ x86 BOOT SMOKE TEST PASSED" || \
-            { echo "❌ x86 BOOT SMOKE TEST FAILED"; exit 1; }
-
-          grep -q 'virtio_net: device ready' qemu-x86.log && \
-            echo "✅ NIC PROBE PASSED" || \
-            { echo "❌ NIC PROBE FAILED"; exit 1; }
-
-          grep -q 'nic: registered device 0' qemu-x86.log && \
-            echo "✅ NIC REGISTERED" || \
-            { echo "❌ NIC REGISTER FAILED"; exit 1; }
-
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: x86-logs
-          path: |
-            build-x86.log
-            qemu-x86.log
+    uses: ./.github/workflows/kernel-test.yml
+    with:
+      arch:      ${{ matrix.arch }}
+      run_smoke: true
