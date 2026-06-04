@@ -146,6 +146,39 @@ pub fn write_sectors(
         true,
     )
 }
+
+// ── BlockDev impl ─────────────────────────────────────────────────────────────
+
+pub struct NvmeBlockDev {
+    pub ns: usize,
+}
+
+impl crate::block::BlockDev for NvmeBlockDev {
+    fn read(&self, lba: u64, buf: &mut [u8]) {
+        let info = match disk_info(self.ns) {
+            Some(i) => i,
+            None => return,
+        };
+        let count = (buf.len() / info.sector_size as usize) as u32;
+        let _ = read_sectors(self.ns, lba, count, buf);
+    }
+    fn write(&self, lba: u64, buf: &[u8]) {
+        let info = match disk_info(self.ns) {
+            Some(i) => i,
+            None => return,
+        };
+        let count = (buf.len() / info.sector_size as usize) as u32;
+        let _ = write_sectors(self.ns, lba, count, buf);
+    }
+    fn sector_size(&self) -> usize {
+        disk_info(self.ns)
+            .map(|i| i.sector_size as usize)
+            .unwrap_or(512)
+    }
+}
+
+// ── Internals (unchanged from prior implementation) ───────────────────────────
+
 unsafe fn _init(bar0: u64) {
     let cap = mmio_read64(bar0, NVME_CAP);
     let dstrd_bits =
@@ -227,7 +260,7 @@ unsafe fn _init(bar0: u64) {
     cmd.cdw10 = 0x07;
     cmd.cdw11 = 0x0001_0001;
     admin_submit(cmd);
-    admin_complete()?;
+    if admin_complete().is_err() { return; }
     // CREATE IO CQ
     let iocq_pa =
         CTRL.lock().as_ref().unwrap().iocq_phys;
@@ -240,7 +273,7 @@ unsafe fn _init(bar0: u64) {
         ((IO_DEPTH as u32 - 1) << 16) | 1;
     cmd.cdw11 = 1;
     admin_submit(cmd);
-    admin_complete()?;
+    if admin_complete().is_err() { return; }
     // CREATE IO SQ
     let iosq_pa =
         CTRL.lock().as_ref().unwrap().iosq_phys;
@@ -254,7 +287,7 @@ unsafe fn _init(bar0: u64) {
     cmd.cdw11 =
         (1 << 16) | 1;
     admin_submit(cmd);
-    admin_complete()?;
+    if admin_complete().is_err() { return; }
     // IDENTIFY NAMESPACE
     let dma_pa =
         CTRL.lock().as_ref().unwrap().dma_phys;
@@ -271,7 +304,7 @@ unsafe fn _init(bar0: u64) {
     cmd.prp1 = dma_pa;
     cmd.cdw10 = CNS_NAMESPACE;
     admin_submit(cmd);
-    admin_complete()?;
+    if admin_complete().is_err() { return; }
     let id_ns =
         core::slice::from_raw_parts(
             dma_pa as *const u8,
@@ -300,7 +333,7 @@ unsafe fn _init(bar0: u64) {
     cmd.prp1 = dma_pa;
     cmd.cdw10 = CNS_CONTROLLER;
     admin_submit(cmd);
-    admin_complete()?;
+    if admin_complete().is_err() { return; }
     let id_ctrl =
         core::slice::from_raw_parts(
             dma_pa as *const u8,
