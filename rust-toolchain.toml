@@ -1,4 +1,7 @@
-# Pinned nightly toolchain for rustos.
+# ⚠️  CRITICAL: Keep this file synchronized with:
+#   - Dockerfile (ARG NIGHTLY_DATE)
+#   - flake.nix (rustToolchain = ...)
+# Mismatches will cause subtle build failures.
 #
 # WHY NIGHTLY — unstable features in use:
 #   naked_functions      — zero-overhead asm entry points (boot, trap vectors,
@@ -13,28 +16,27 @@
 #                          riscv64-uefi.json and x86_64-unknown-none.
 #
 # UPGRADING:
-#   1. Update `channel` below.
+#   1. Update `channel` below (format: nightly-YYYY-MM-DD).
 #   2. Sync NIGHTLY_DATE in Dockerfile and flake.nix to the same date.
 #   3. Run `cargo build` for each target and fix any API churn.
 #   4. Update CHANGELOG with the new pin and reason.
+#   5. Verify all three files match before merging.
 #
-# These three files must always agree on the pin date:
-#   rust-toolchain.toml  (this file)
-#   Dockerfile           (ARG NIGHTLY_DATE)
-#   flake.nix            (rustToolchain = ...)
+# TODO: Track stabilization of required features to move to stable channel.
+# Current blockers: naked_functions (tracked above), abi_x86_interrupt
 
 [toolchain]
 channel = "nightly-2025-05-15"
+profile = "minimal"
 components = [
-  "rust-src",           # required by -Z build-std
-  "llvm-tools-preview", # required by cargo-objcopy / llvm-strip
-  "rustfmt",            # enforced by fmt.yml CI
-  "clippy",             # optional: cargo clippy --target ...
+  "rust-src",            # required by -Z build-std
+  "llvm-tools-preview",  # required by cargo-objcopy / llvm-strip
+  "rustfmt",             # enforced by fmt.yml CI
+  "clippy",              # optional: cargo clippy --target
 ]
 # Targets pre-installed locally; CI installs only what it needs.
 targets = [
-  "riscv64gc-unknown-none-elf", # SBI / bare RISC-V boot
-  "x86_64-unknown-none",        # x86_64 bare-metal
-  # riscv64-uefi.json and aarch64-uefi-loader.json are custom targets — not listed here.
-  # Used via --target <json> with -Z build-std.
+  "riscv64gc-unknown-none-elf",  # SBI / bare RISC-V boot
+  "x86_64-unknown-none",         # x86_64 bare-metal
 ]
+# Custom targets (riscv64-uefi.json, aarch64-uefi-loader.json) use --target <json> with -Z build-std
