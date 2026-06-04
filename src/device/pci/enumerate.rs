@@ -29,15 +29,32 @@ pub fn scan_all() {
                 let class = cfg_read16(bus, dev, func, PCI_CLASS);
                 let hdr   = cfg_read8 (bus, dev, func, PCI_HDR_TYPE);
 
-                // Decode BAR0 — check the 64-bit prefetchable bit.
-                let bar0_raw = cfg_read32(bus, dev, func, PCI_BAR0);
-                let bar0_lo  = (bar0_raw & !0xF) as u64;
-                let bar0_hi  = if bar0_raw & 0x4 != 0 {
-                    cfg_read32(bus, dev, func, PCI_BAR0 + 4) as u64
-                } else {
-                    0
-                };
-                let bar0 = bar0_lo | (bar0_hi << 32);
+                // Decode all 6 BARs (config offsets 0x10–0x24).
+                // A 64-bit BAR occupies two consecutive slots; we advance
+                // the index by 2 and leave the upper slot as 0.
+                let mut bars = [0u64; 6];
+                let mut i = 0usize;
+                while i < 6 {
+                    let off = PCI_BAR0 + (i as u16) * 4;
+                    let raw = cfg_read32(bus, dev, func, off);
+                    if raw & 0x1 != 0 {
+                        // I/O-space BAR — not useful for MMIO drivers.
+                        bars[i] = 0;
+                        i += 1;
+                        continue;
+                    }
+                    let is_64bit = (raw & 0x6) == 0x4;
+                    let lo = (raw & !0xFu32) as u64;
+                    if is_64bit && i + 1 < 6 {
+                        let hi = cfg_read32(bus, dev, func, off + 4) as u64;
+                        bars[i]     = lo | (hi << 32);
+                        bars[i + 1] = 0; // upper half consumed
+                        i += 2;
+                    } else {
+                        bars[i] = lo;
+                        i += 1;
+                    }
+                }
 
                 // Enable bus-master + memory-space decode.
                 let cmd = cfg_read16(bus, dev, func, PCI_COMMAND);
@@ -63,7 +80,7 @@ pub fn scan_all() {
                 devs.push(PciDevice {
                     bus, dev, func,
                     vendor: vid, device: did, class,
-                    bar0, msix_cap,
+                    bars, msix_cap,
                 });
 
                 // Single-function device — skip remaining functions.

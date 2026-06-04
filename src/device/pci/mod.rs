@@ -35,8 +35,10 @@ pub struct PciDevice {
     pub vendor:   u16,
     pub device:   u16,
     pub class:    u16,
-    /// BAR0 base address (MMIO, 64-bit decoded).
-    pub bar0:     u64,
+    /// BAR0–BAR5 base addresses (MMIO, 64-bit decoded).
+    /// Index = BAR number (0–5). I/O BARs and the upper half of 64-bit
+    /// BARs are stored as 0.
+    pub bars:     [u64; 6],
     /// Offset of the MSI-X capability record, or 0 if not present.
     pub msix_cap: u8,
 }
