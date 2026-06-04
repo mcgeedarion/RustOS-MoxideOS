@@ -172,18 +172,18 @@ impl crate::block::BlockDev for AhciBlockDev {
 /// Wire MSI-X vector 0 of the AHCI HBA to `AHCI_IRQ_VECTOR` on the BSP
 /// LAPIC, then enable per-port interrupts and the global HBA interrupt.
 ///
-/// Safe to call when no MSI-X capability is present — the function returns
-/// early and the driver remains in polling mode.
+/// Uses `crate::device::pci::find_by_class_progif` which bridges into the
+/// arch-level registry — guaranteed non-empty after `pci::init()` runs.
+///
+/// Safe to call when no MSI-X capability is present — returns early and
+/// the driver remains in polling mode.
 fn wire_msix(bar5_virt: usize) {
     use crate::device::pci;
     use crate::device::pci::msix::msix_configure;
     use crate::arch::x86_64::{apic, idt};
 
-    // AHCI class code = 0x0106 (Mass Storage Controller, SATA controller).
-    let dev = match pci::devices()
-        .into_iter()
-        .find(|d| d.class == 0x0106)
-    {
+    // AHCI: class=0x01, subclass=0x06, prog_if=0x01
+    let dev = match pci::find_by_class_progif(0x01, 0x06, 0x01) {
         Some(d) => d,
         None    => return,
     };

@@ -209,6 +209,9 @@ impl crate::block::BlockDev for NvmeBlockDev {
 /// Wire MSI-X vectors 0 and 1 (Admin CQ and IO CQ) to `NVME_IRQ_VECTOR`
 /// on the BSP LAPIC and register the ISR in the IDT.
 ///
+/// Uses `crate::device::pci::find_by_class_progif` which bridges into the
+/// arch-level registry — guaranteed non-empty after `pci::init()` runs.
+///
 /// Safe to call when no MSI-X capability is present — returns early and
 /// the driver remains in polling mode.
 fn wire_nvme_msix() {
@@ -216,11 +219,8 @@ fn wire_nvme_msix() {
     use crate::device::pci::msix::msix_configure;
     use crate::arch::x86_64::{apic, idt};
 
-    // NVMe class code = 0x0108 (Mass Storage Controller, NVM Express).
-    let dev = match pci::devices()
-        .into_iter()
-        .find(|d| d.class == 0x0108)
-    {
+    // NVMe: class=0x01, subclass=0x08, prog_if=0x02
+    let dev = match pci::find_by_class_progif(0x01, 0x08, 0x02) {
         Some(d) => d,
         None    => return,
     };

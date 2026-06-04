@@ -1,8 +1,17 @@
-//! PCI subsystem — types, registry, and public re-exports.
+//! PCI subsystem — types, canonical registry, and public helpers.
+//!
+//! ## Scan ownership
+//! The PCI bus scan is performed **once** by `crate::arch::x86_64::pci::init()`
+//! (Type-1 I/O-port access).  That function populates both its own legacy
+//! fixed-array registry *and* `DEVICES` here via `register_device()`.  There
+//! is no second scan; `enumerate.rs` has been removed.
+//!
+//! ## `class` field encoding
+//! `PciDevice::class` stores `(class_byte << 8) | subclass_byte` so that
+//! common comparisons like `d.class == 0x0106` (AHCI) work naturally.
 
 pub mod bus;
 pub mod ecam;
-pub mod enumerate;
 pub mod msix;
 
 pub use bus::PciBus;
@@ -27,6 +36,8 @@ pub(crate) const STATUS_CAP_LIST: u16 = 1 << 4;
 pub(crate) const CAP_MSIX:        u8  = 0x11;
 
 /// A single PCI function discovered during bus enumeration.
+///
+/// `class` encodes `(class_byte << 8) | subclass_byte`, e.g. `0x0106` = AHCI.
 #[derive(Clone, Debug)]
 pub struct PciDevice {
     pub bus:      u8,
@@ -34,16 +45,17 @@ pub struct PciDevice {
     pub func:     u8,
     pub vendor:   u16,
     pub device:   u16,
+    /// `(class_byte << 8) | subclass_byte`
     pub class:    u16,
-    /// BAR0–BAR5 base addresses (MMIO, 64-bit decoded).
-    /// Index = BAR number (0–5). I/O BARs and the upper half of 64-bit
-    /// BARs are stored as 0.
+    /// BAR0–BAR5 base addresses (MMIO, 64-bit decoded, cached at scan time).
+    /// I/O BARs, absent BARs, and the upper dword of a consumed 64-bit pair
+    /// are stored as 0.
     pub bars:     [u64; 6],
-    /// Offset of the MSI-X capability record, or 0 if not present.
+    /// Config-space byte offset of the MSI-X capability record, or 0.
     pub msix_cap: u8,
 }
 
-pub(crate) static DEVICES: Mutex<Vec<PciDevice>> = Mutex::new(Vec::new());
+pub static DEVICES: Mutex<Vec<PciDevice>> = Mutex::new(Vec::new());
 
 /// Return a snapshot of every enumerated PCI device.
 pub fn devices() -> Vec<PciDevice> {
@@ -56,4 +68,31 @@ pub fn find(vendor: u16, device_id: u16) -> Option<PciDevice> {
         .iter()
         .find(|d| d.vendor == vendor && d.device == device_id)
         .cloned()
+}
+
+/// Find the first device matching `(class_byte, subclass_byte)`.
+///
+/// Matches against the combined `class` field: `(class_byte << 8) | subclass_byte`.
+pub fn find_by_class_sub(class: u8, subclass: u8) -> Option<PciDevice> {
+    let target = (class as u16) << 8 | subclass as u16;
+    DEVICES.lock().iter().find(|d| d.class == target).cloned()
+}
+
+/// Find the first device matching `(class_byte, subclass_byte, prog_if)`.
+///
+/// `prog_if` is not stored in the canonical struct, so this bridges into
+/// the arch-level registry which retains the full triple.
+/// Returns a canonical `PciDevice` (with `bars` and `msix_cap`) on match.
+pub fn find_by_class_progif(class: u8, subclass: u8, prog_if: u8) -> Option<PciDevice> {
+    crate::arch::x86_64::pci::find_class_progif(class, subclass, prog_if)
+        .map(|d| PciDevice {
+            bus:      d.bus,
+            dev:      d.dev,
+            func:     d.func,
+            vendor:   d.vendor,
+            device:   d.device,
+            class:    (d.class as u16) << 8 | d.subclass as u16,
+            bars:     d.bars,
+            msix_cap: d.msix_cap,
+        })
 }

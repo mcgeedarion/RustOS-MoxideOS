@@ -1,8 +1,13 @@
 //! x86_64 PCI bus enumerator — Type-1 (I/O port) configuration space access.
 //!
 //! `pci::init()` performs a full bus/device/function scan and populates
-//! `PCI_DEVICES`.  All subsequent drivers call `pci::find_device()` or
-//! `pci::find_class()` rather than performing their own config-space walks.
+//! both `PCI_DEVICES` (legacy fixed-array registry used by `probe_ahci` /
+//! `probe_nvme`) and `crate::device::pci::DEVICES` (canonical heap registry
+//! used by MSI-X wiring and the rest of the driver stack).
+//!
+//! This is the **single** PCI scan in the kernel — `device::pci::enumerate`
+//! has been removed.  All consumers should call the appropriate lookup helper
+//! in either this module or `crate::device::pci`.
 //!
 //! ## Config-space I/O ports
 //!   0xCF8  CONFIG_ADDRESS (write)  — [31]=enable, [23:16]=bus, [15:11]=dev,
@@ -17,6 +22,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA:    u16 = 0xCFC;
+
+/// Capability ID for MSI-X.
+const CAP_MSIX: u8 = 0x11;
 
 /// PCI mass-storage, SATA, AHCI 1.0  (class=0x01, sub=0x06, prog_if=0x01)
 pub const PCI_CLASS_STORAGE_AHCI: (u8, u8, u8) = (0x01, 0x06, 0x01);
@@ -72,24 +80,20 @@ pub struct PciDevice {
     pub prog_if:  u8,
     pub irq_line: u8,
     pub irq_pin:  u8,
+    /// MMIO base addresses for BARs 0–5 (decoded at scan time).
+    /// I/O BARs, absent BARs, and the upper dword of a consumed 64-bit
+    /// pair are stored as 0.
+    pub bars:     [u64; 6],
+    /// Config-space byte offset of the MSI-X capability record, or 0.
+    pub msix_cap: u8,
 }
 
 impl PciDevice {
-    /// Read a 32-bit BAR, decode it as a 64-bit MMIO address (handles 64-bit BARs).
-    /// Returns `None` if the BAR is I/O space or zero.
+    /// Return the cached MMIO base address for `bar_index` (0–5).
+    /// Returns `None` if the BAR is absent, I/O-space, or out of range.
     pub fn bar_mmio(&self, bar_index: u8) -> Option<u64> {
-        let offset = 0x10 + bar_index * 4;
-        let lo = config_read_u32(self.bus, self.dev, self.func, offset);
-        if lo & 1 != 0 { return None; } // I/O BAR
-        let base_lo = (lo & !0xF) as u64;
-        if base_lo == 0 { return None; }
-        // Type field bits [2:1]: 0x2 = 64-bit BAR
-        if (lo >> 1) & 3 == 2 {
-            let hi = config_read_u32(self.bus, self.dev, self.func, offset + 4) as u64;
-            Some(base_lo | (hi << 32))
-        } else {
-            Some(base_lo)
-        }
+        let v = self.bars.get(bar_index as usize).copied().unwrap_or(0);
+        if v == 0 { None } else { Some(v) }
     }
 
     /// Enable bus-mastering and MMIO decoding for this device.
@@ -101,20 +105,107 @@ impl PciDevice {
     }
 }
 
+// ── BAR decode helper ─────────────────────────────────────────────────────────
+
+/// Decode all 6 BARs into a `[u64; 6]` array.
+///
+/// 64-bit BARs consume two consecutive config slots; the lower slot receives
+/// the full 64-bit address, the upper slot is left as 0.  I/O BARs and BARs
+/// that probe as zero are also stored as 0.
+fn decode_bars(bus: u8, dev: u8, func: u8) -> [u64; 6] {
+    let mut bars = [0u64; 6];
+    let mut i = 0usize;
+    while i < 6 {
+        let off = (0x10 + i * 4) as u8;
+        let raw = config_read_u32(bus, dev, func, off);
+        if raw & 0x1 != 0 {
+            // I/O BAR — not useful for MMIO drivers.
+            i += 1;
+            continue;
+        }
+        let lo = (raw & !0xFu32) as u64;
+        if lo == 0 {
+            // Unimplemented or disabled BAR.
+            i += 1;
+            continue;
+        }
+        if (raw >> 1) & 3 == 2 && i + 1 < 6 {
+            // 64-bit BAR: combine with the next config dword.
+            let hi = config_read_u32(bus, dev, func, off + 4) as u64;
+            bars[i] = lo | (hi << 32);
+            // bars[i + 1] stays 0 — upper dword consumed.
+            i += 2;
+        } else {
+            bars[i] = lo;
+            i += 1;
+        }
+    }
+    bars
+}
+
+// ── MSI-X capability walk ─────────────────────────────────────────────────────
+
+/// Walk the PCI capability linked-list and return the config-space byte
+/// offset of the MSI-X capability (ID 0x11), or 0 if not present.
+fn find_msix_cap(bus: u8, dev: u8, func: u8) -> u8 {
+    // Bit 4 of the Status register signals that a cap list is present.
+    let status = config_read_u16(bus, dev, func, 0x06);
+    if status & (1 << 4) == 0 {
+        return 0;
+    }
+    let mut ptr = config_read_u8(bus, dev, func, 0x34) & 0xFC;
+    for _ in 0..48 {
+        if ptr < 0x40 {
+            break;
+        }
+        let cap_id = config_read_u8(bus, dev, func, ptr);
+        if cap_id == CAP_MSIX {
+            return ptr;
+        }
+        ptr = config_read_u8(bus, dev, func, ptr + 1) & 0xFC;
+        if ptr == 0 {
+            break;
+        }
+    }
+    0
+}
+
+// ── Registries ────────────────────────────────────────────────────────────────
+
 static mut PCI_DEVICES: [PciDevice; MAX_DEVICES] = [PciDevice {
     bus: 0, dev: 0, func: 0,
     vendor: 0, device: 0,
     class: 0, subclass: 0, prog_if: 0,
     irq_line: 0, irq_pin: 0,
+    bars: [0u64; 6],
+    msix_cap: 0,
 }; MAX_DEVICES];
 static PCI_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Populate both the legacy fixed-array registry and the canonical heap
+/// registry (`crate::device::pci::DEVICES`) from a single scan entry.
 fn register_device(d: PciDevice) {
+    // ── Legacy fixed-array (used by probe_ahci / probe_nvme in kernel_main) ──
     let idx = PCI_COUNT.fetch_add(1, Ordering::Relaxed) as usize;
     if idx < MAX_DEVICES {
         unsafe { PCI_DEVICES[idx] = d; }
     }
+
+    // ── Canonical heap registry (used by MSI-X wiring, device::pci::*) ──
+    // class field in canonical struct = (class_byte << 8 | subclass_byte)
+    crate::device::pci::DEVICES.lock().push(crate::device::pci::PciDevice {
+        bus:      d.bus,
+        dev:      d.dev,
+        func:     d.func,
+        vendor:   d.vendor,
+        device:   d.device,
+        class:    (d.class as u16) << 8 | d.subclass as u16,
+        bars:     d.bars,
+        msix_cap: d.msix_cap,
+    });
 }
+
+// ── Public lookup helpers ─────────────────────────────────────────────────────
 
 /// Find a device by vendor + device ID.
 pub fn find_device(vendor: u16, device_id: u16) -> Option<PciDevice> {
@@ -150,6 +241,8 @@ pub fn find_device_by_class(tuple: (u8, u8, u8)) -> Option<PciDevice> {
     find_class_progif(tuple.0, tuple.1, tuple.2)
 }
 
+// ── Bus scan ──────────────────────────────────────────────────────────────────
+
 pub fn init() {
     let mut count = 0u32;
 
@@ -173,13 +266,23 @@ pub fn init() {
                 let irq_line= (dword15 & 0xFF) as u8;
                 let irq_pin = ((dword15 >> 8) & 0xFF) as u8;
 
-                register_device(PciDevice { bus, dev, func, vendor, device: device_id,
-                                            class, subclass, prog_if, irq_line, irq_pin });
+                // Decode BARs and locate MSI-X cap at scan time so every
+                // consumer shares one cached result.
+                let bars     = decode_bars(bus, dev, func);
+                let msix_cap = find_msix_cap(bus, dev, func);
+
+                register_device(PciDevice {
+                    bus, dev, func,
+                    vendor, device: device_id,
+                    class, subclass, prog_if,
+                    irq_line, irq_pin,
+                    bars, msix_cap,
+                });
                 count += 1;
 
                 crate::println!(
-                    "pci: {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}/{:02x}/{:02x} irq {}",
-                    bus, dev, func, vendor, device_id, class, subclass, prog_if, irq_line
+                    "pci: {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}/{:02x}/{:02x} irq {} msix_cap={:#x}",
+                    bus, dev, func, vendor, device_id, class, subclass, prog_if, irq_line, msix_cap
                 );
 
                 if func == 0 {
