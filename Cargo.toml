@@ -11,13 +11,25 @@ resolver = "2"
 name = "rustos-kernel"
 version = "0.1.0"
 edition = "2021"
+authors = ["Darion McGee <mcgeedarion@example.com>"]
+description = "A Rust-based operating system kernel with UEFI and debugging support"
+license = "MIT"
+repository = "https://github.com/mcgeedarion/RustOS-MoxideOS"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 kmtest = { path = "crates/kmtest", optional = true }
 
-# existing deps...
+# Add your kernel dependencies here
+# Examples:
+# x86_64 = "0.15"
+# uart_16550 = "0.3"
 
 [features]
+default = []
+
 # Build as a UEFI loader/application.
 uefi_boot = []
 
@@ -35,3 +47,15 @@ trace = []
 # Enable in-kernel test harness.  Build with:
 #   cargo build --features kmtest --target x86_64-unknown-none
 kmtest = ["dep:kmtest"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = false
+
+[profile.dev]
+opt-level = 0
+
+[package.metadata.docs.rs]
+all-features = true
