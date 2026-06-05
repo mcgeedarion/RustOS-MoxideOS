@@ -1,5 +1,5 @@
 //! Kernel entry point — called from uefi_start() (primary) or
-//! multiboot2_entry() (legacy, feature = "multiboot2_boot") after the CPU is
+//! multiboot2_start() (legacy, feature = "multiboot2_boot") after the CPU is
 //! in 64-bit long mode with interrupts disabled.
 //!
 //! ## Boot sequence
@@ -42,25 +42,12 @@ use core::arch::asm;
 
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
-#[cfg(feature = "multiboot2_boot")]
-pub static mut MBI_PTR: usize = 0;
-
 // GDB stub uses its own SerialPort instance on COM1 (separate from the
 // console which is write-only).  Guarded so it isn't compiled in at all
 // unless the `gdbstub` feature is active.
 #[cfg(feature = "gdbstub")]
 static mut GDBSTUB_SERIAL: crate::debug::gdbstub::serial::SerialPort =
     unsafe { crate::debug::gdbstub::serial::SerialPort::new() };
-
-#[cfg(feature = "multiboot2_boot")]
-#[no_mangle]
-pub unsafe extern "C" fn multiboot2_entry(magic: u32, info_phys: u32) -> ! {
-    static mut BOOT_INFO: BootInfo = BootInfo::empty();
-    if magic == 0x36d7_6289 {
-        MBI_PTR = info_phys as usize;
-    }
-    crate::kernel_main::kernel_main(&BOOT_INFO)
-}
 
 pub fn init(_boot_info: &'static BootInfo) -> ! {
     serial::early_init();
@@ -104,17 +91,6 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
         crate::mm::pmm::init_from_regions(&regions);
     }
     crate::mm::memmap::memmap_init();
-
-    #[cfg(feature = "multiboot2_boot")]
-    {
-        let mbi = unsafe { MBI_PTR };
-        if mbi != 0 {
-            unsafe {
-                crate::arch::x86_64::multiboot2::parse_mbi(mbi);
-            }
-            serial_println!("mb2: MBI at {:#x} parsed", mbi);
-        }
-    }
 
     crate::time::init();
     serial_println!("time: clocksource={:?}", crate::time::clocksource());
@@ -161,7 +137,6 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
     }
 
     // 12b. GDB stub — init after devfs is live (initramfs::mount sets up /dev).
-    // Initialises COM1 for RSP and registers /dev/gdbstub.
     #[cfg(feature = "gdbstub")]
     unsafe {
         crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL);
@@ -188,8 +163,6 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
         crate::proc::scheduler::schedule();
     }
 }
-
-// StorageBackend and helpers unchanged...
 
 enum StorageBackend {
     Ahci,
