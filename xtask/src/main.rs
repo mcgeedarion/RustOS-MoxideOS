@@ -1,13 +1,13 @@
 //! cargo xtask — build automation for RustOS.
 //!
 //! Usage:
-//!   cargo xtask build                               # riscv64, uefi, release (default)
-//!   cargo xtask build --arch riscv64 --boot uefi
+//!   cargo xtask build                               # x86_64, uefi, release (default)
+//!   cargo xtask build --arch x86_64 --boot uefi
+//!   cargo xtask build --arch x86_64 --boot sbi
+//!   cargo xtask build --arch x86_64 --initrd
+//!   cargo xtask build --arch riscv64               # riscv64 UEFI loader
 //!   cargo xtask build --arch riscv64 --boot sbi
-//!   cargo xtask build --arch x86_64                # x86_64 kernel (ELF, no UEFI wrapper)
-//!   cargo xtask build --arch x86_64 --boot uefi    # x86_64 UEFI loader (PE32+)
-//!   cargo xtask build --arch x86_64 --boot uefi --initrd
-//!   cargo xtask build --arch aarch64               # AArch64 UEFI loader (default)
+//!   cargo xtask build --arch aarch64               # AArch64 UEFI loader
 //!   cargo xtask build --arch aarch64 --boot sbi    # AArch64 bare-metal ELF
 //!
 //!   cargo xtask mkinitramfs                         # x86_64 initramfs (default)
@@ -47,7 +47,7 @@ use std::{
 // Constants
 // ============================================================================
 
-const DEFAULT_ARCH: Arch = Arch::RiscV64;
+const DEFAULT_ARCH: Arch = Arch::X86_64;
 const DEFAULT_BOOT: Boot = Boot::Uefi;
 const DEFAULT_IMAGE_ARCH: Arch = Arch::X86_64;
 
@@ -764,7 +764,7 @@ fn main() {
                 "  bench-kernel  Run baseline smoke flow + benchmark placeholders\n",
                 "\n",
                 "Build options (build / image):\n",
-                "  --arch <riscv64|x86_64|aarch64>  Target architecture  (image default: x86_64)\n",
+                "  --arch <riscv64|x86_64|aarch64>  Target architecture  (default: x86_64)\n",
                 "  --boot <uefi|sbi>                Boot mode            (default: uefi)\n",
                 "                                   aarch64+sbi = bare-metal ELF via _start\n",
                 "  --features <feat>                Cargo features to enable\n",
