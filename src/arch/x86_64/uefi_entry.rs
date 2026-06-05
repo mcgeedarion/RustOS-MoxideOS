@@ -1,5 +1,7 @@
 //! UEFI firmware entry point — `uefi_start`.
 //!
+//! ## Boot priority: PRIMARY (x86_64 — default boot target)
+//!
 //! The UEFI firmware calls `uefi_start(image_handle, system_table)` in
 //! 64-bit long mode with flat 1:1-mapped memory and interrupts disabled.
 //!
@@ -189,8 +191,8 @@ pub unsafe extern "efiapi" fn uefi_start(
     let bs = &*st.boot_services;
     let bs_base = st.boot_services as usize;
 
-    // 1. Banner.
-    efi_print(st.con_out, "RustOS (x86_64) booting via UEFI...\r\n");
+    // 1. Banner — identifies this as the PRIMARY (x86_64) boot target.
+    efi_print(st.con_out, "RustOS [PRIMARY] x86_64 booting via UEFI...\r\n");
 
     // 2. Capture GOP framebuffer — graceful fallback if firmware has no GOP.
     let gop_ok =

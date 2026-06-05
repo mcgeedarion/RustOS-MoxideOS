@@ -1,5 +1,7 @@
 //! RISC-V SBI boot entry.
 //!
+//! ## Boot priority: TERTIARY (RISC-V — tertiary boot target)
+//!
 //! OpenSBI hands off to us in S-mode with:
 //!   a0 = hart ID
 //!   a1 = pointer to FDT (device tree blob)
@@ -7,6 +9,14 @@
 //! We stash both registers in globals, set up the boot stack (sp = BOOT_STACK_TOP,
 //! the highest address of the 32 KiB .bss boot stack region), then call
 //! kernel_main(&BOOT_INFO).
+//!
+//! ## Boot chain
+//!   ROM → OpenSBI (M-mode runtime) → _start (S-mode) → kernel_main
+//!
+//! On QEMU `virt` pass `-bios opensbi-riscv64-generic-fw_dynamic.bin` and
+//! `-kernel rustos-riscv64.elf`; OpenSBI will load us as the next-stage payload.
+//! On real hardware (e.g. HiFive Unmatched, StarFive VisionFive 2) flash
+//! OpenSBI with `FW_PAYLOAD_PATH` pointing to this kernel binary.
 //!
 //! ## Stack layout
 //!

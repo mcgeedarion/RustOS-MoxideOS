@@ -81,6 +81,30 @@ impl FramebufferInfo {
     }
 }
 
+/// Boot priority of the running architecture.
+///
+/// Determined at compile time from `target_arch`. The common kernel entry
+/// emits this in its banner so every boot log is self-documenting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum BootPriority {
+    /// x86_64 — default boot target.
+    Primary = 1,
+    /// aarch64 — secondary boot target.
+    Secondary = 2,
+    /// RISC-V — tertiary boot target.
+    Tertiary = 3,
+}
+
+impl BootPriority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary   => "PRIMARY",
+            Self::Secondary => "SECONDARY",
+            Self::Tertiary  => "TERTIARY",
+        }
+    }
+}
+
 /// Firmware/bare-metal payload passed to the single common kernel entry point.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,5 +129,19 @@ impl BootInfo {
             fdt: BootRange::empty(),
             boot_hart_id: 0,
         }
+    }
+
+    /// Returns the compile-time boot priority for the current architecture.
+    pub const fn priority() -> BootPriority {
+        #[cfg(target_arch = "x86_64")]    { BootPriority::Primary }
+        #[cfg(target_arch = "aarch64")]   { BootPriority::Secondary }
+        #[cfg(target_arch = "riscv64")]   { BootPriority::Tertiary }
+        // Fallback for any future architecture not yet assigned a priority.
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+        )))]
+        { BootPriority::Tertiary }
     }
 }
