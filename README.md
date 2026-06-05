@@ -36,9 +36,9 @@ Build and run the kernel on your default architecture:
 cargo xtask build
 
 # Run on QEMU (x86_64, RISC-V, or AArch64)
-./run_qemu_x86_64.sh
-./run_qemu_riscv.sh
-./run_qemu_aarch64.sh
+ARCH=x86_64 ./scripts/ci/qemu-run.sh
+ARCH=riscv64 ./scripts/ci/qemu-run.sh
+ARCH=aarch64 ./scripts/ci/qemu-run.sh
 ```
 
 Run the full test suite:
@@ -302,16 +302,17 @@ cargo xtask image --arch aarch64 --boot uefi
 
 ### QEMU helpers
 
-Repository-root wrappers build and launch common QEMU configurations:
+A single unified launcher handles all architectures. Set `ARCH` and run:
 
 ```sh
-./run_qemu_x86_64.sh
-./run_qemu_riscv.sh
-./run_qemu_aarch64.sh
+ARCH=x86_64  ./scripts/ci/qemu-run.sh
+ARCH=riscv64 ./scripts/ci/qemu-run.sh
+ARCH=aarch64 ./scripts/ci/qemu-run.sh
 ```
 
-The x86_64 and AArch64 wrappers include GDB/test modes; see each script header
-for the supported flags.
+Common options: `--boot uefi|multiboot|sbi`, `--release`, `--gdb`, `--gpu`,
+`--no-net`, `--smoke`, `--test`, `--timeout N`. See the script header for
+the full flag reference.
 
 ---
 
