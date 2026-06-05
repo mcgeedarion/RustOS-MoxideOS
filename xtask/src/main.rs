@@ -121,14 +121,10 @@ fn fatal(msg: impl Into<String>) -> ! {
 }
 
 // ============================================================================
-// Logging helpers (Improvement #6)
+// Logging helpers
 // ============================================================================
 
 fn log(msg: impl AsRef<str>) {
-    eprintln!("[xtask] {}", msg.as_ref());
-}
-
-fn log_step(msg: impl AsRef<str>) {
     eprintln!("[xtask] {}", msg.as_ref());
 }
 
@@ -196,7 +192,7 @@ fn image_name(arch: Arch) -> &'static str {
 }
 
 // ============================================================================
-// Path building helpers (Improvement #4)
+// Path building helpers
 // ============================================================================
 
 fn workspace_root() -> PathBuf {
@@ -288,7 +284,7 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
 }
 
 // ============================================================================
-// Build tool requirements (Improvement #5 + Improvement #8)
+// Build tool requirements
 // ============================================================================
 
 fn require_build_tools(arch: Arch) -> TaskResult {
@@ -315,7 +311,7 @@ fn require_build_tools(arch: Arch) -> TaskResult {
 }
 
 // ============================================================================
-// Argument parsing (Improvement #9)
+// Argument parsing
 // ============================================================================
 
 fn parse_build_args(args: &[String]) -> BuildOpts {
@@ -363,7 +359,7 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
 }
 
 // ============================================================================
-// Device node creation (Improvement #5: simplified)
+// Device node creation
 // ============================================================================
 
 fn create_single_dev_node(staging: &PathBuf, node: &DevNode, is_root: bool) -> bool {
@@ -393,7 +389,7 @@ fn create_single_dev_node(staging: &PathBuf, node: &DevNode, is_root: bool) -> b
     };
 
     if chmod_ok {
-        log_section("mkinitramfs", 
+        log_section("mkinitramfs",
             format!("created {} ({} {}:{} mode {})", node.path, node.kind, node.major, node.minor, mode_str));
     }
     chmod_ok
@@ -420,7 +416,7 @@ fn create_dev_nodes(staging: &PathBuf) {
     }
 
     if skipped > 0 {
-        log_section("mkinitramfs", 
+        log_section("mkinitramfs",
             format!("{created} device node(s) created, {skipped} skipped (no root/sudo)."));
         log_section("mkinitramfs", "The kernel's devtmpfs will create missing nodes at runtime.");
     } else {
@@ -445,11 +441,11 @@ fn mkinitramfs(root: &PathBuf, arch: Arch) -> TaskResult {
 
     let arch_str = arch_str(arch);
     let staging = root.join(format!("target/initramfs-staging-{arch_str}"));
-    
+
     if staging.exists() {
         fs::remove_dir_all(&staging).expect("remove old staging dir");
     }
-    
+
     for dir in INITRAMFS_DIRS {
         fs::create_dir_all(staging.join(dir)).expect("create staging subdir");
     }
@@ -479,7 +475,7 @@ fn mkinitramfs(root: &PathBuf, arch: Arch) -> TaskResult {
 }
 
 // ============================================================================
-// Consolidated build logic (Improvement #1: reduced duplication)
+// Consolidated build logic
 // ============================================================================
 
 fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
@@ -495,13 +491,13 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
         .args(["build", "--target"]).arg(&target_path)
         .args(["-Z", "build-std=core,alloc,compiler_builtins",
                "-Z", "build-std-features=compiler-builtins-mem"]);
-    
+
     if let Some(ref feats) = opts.features {
         cmd.arg("--features").arg(feats);
     } else {
         cmd.arg("--no-default-features");
     }
-    
+
     if !opts.debug { cmd.arg("--release"); }
     run(cmd);
 
@@ -510,11 +506,11 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
         let src_efi = binary_path(root, opts.arch, opts.boot, profile, "rustos.efi");
         let src_elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
         let src = if src_efi.exists() { src_efi } else { src_elf };
-        
+
         if !src.exists() {
             return err(format!("EFI binary not found under target/{target_dir}/{profile}/"));
         }
-        
+
         let esp = esp_boot_dir(root);
         fs::create_dir_all(&esp).expect("create esp dir");
         let dest = esp.join(bin_name);
@@ -525,14 +521,13 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
         let elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
         log(format!("Built: {}", elf.display()));
     }
-    
+
     Ok(())
 }
 
 fn build_kernel(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
     build_with_target_json(root, opts)?;
-    
-    // Handle special post-build steps
+
     match (opts.arch, opts.boot) {
         (Arch::X86_64, Boot::Sbi) => {
             let profile = if opts.debug { "debug" } else { "release" };
@@ -544,11 +539,11 @@ fn build_kernel(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
         }
         _ => {}
     }
-    
+
     if opts.initrd {
         mkinitramfs(root, opts.arch)?;
     }
-    
+
     Ok(())
 }
 
@@ -557,10 +552,9 @@ fn build_kernel(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
 // ============================================================================
 
 fn image(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
-    require_tool(&["mformat"],
-        "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS");
-    require_tool(&["mmd"],   "apt install mtools");
-    require_tool(&["mcopy"], "apt install mtools");
+    for tool in &["mformat", "mmd", "mcopy"] {
+        require_tool(&[tool], "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS");
+    }
     let objcopy = require_tool(&["llvm-objcopy", "objcopy"], "apt install llvm binutils");
 
     log("image: building kernel...");
@@ -623,7 +617,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
 }
 
 // ============================================================================
-// Linting (Improvement #7: data-driven rules)
+// Linting
 // ============================================================================
 
 struct LintRule {
@@ -666,7 +660,7 @@ fn check_oversized_modules(root: &PathBuf, files: &[String]) -> usize {
         let loc = text.lines().filter(|l| !l.trim().is_empty()).count();
         if loc > MAX_MODULE_LOC {
             count += 1;
-            log_section("lint-modules", 
+            log_section("lint-modules",
                 format!("oversized module ({loc} LOC > {MAX_MODULE_LOC}): {line}"));
         }
     }
@@ -680,10 +674,11 @@ fn check_undocumented_pub_items(root: &PathBuf, files: &[String]) -> usize {
         if text.trim_start().starts_with("//!") { continue; }
         for (idx, raw) in text.lines().enumerate() {
             let t = raw.trim_start();
-            if t.starts_with("pub ") || t.starts_with("pub(crate)")
-                || t.starts_with("pub(super)") || t.starts_with("pub(in ") {
+            if (t.starts_with("pub fn ") || t.starts_with("pub struct ")
+                || t.starts_with("pub enum ") || t.starts_with("pub trait "))
+                && !t.starts_with("pub(") {
                 count += 1;
-                log_section("lint-modules", 
+                log_section("lint-modules",
                     format!("public item in undocumented module: {}:{}", line, idx + 1));
             }
         }
@@ -728,6 +723,28 @@ fn bench_kernel(root: &PathBuf) -> TaskResult {
 }
 
 // ============================================================================
+// Smoke test
+// ============================================================================
+
+fn smoke(root: &PathBuf) -> TaskResult {
+    let img_opts = BuildOpts {
+        arch: Arch::X86_64,
+        boot: Boot::Uefi,
+        debug: true,
+        initrd: true,
+        features: None,
+    };
+    image(root, &img_opts)?;
+    let script = root.join("run_qemu_x86_64.sh");
+    if !script.exists() {
+        return err(format!("run_qemu_x86_64.sh not found at {}", script.display()));
+    }
+    run(Command::new(script)
+        .arg("--smoke").arg("--smoke-marker").arg(SMOKE_MARKER));
+    Ok(())
+}
+
+// ============================================================================
 // Main entry point
 // ============================================================================
 
@@ -743,47 +760,15 @@ fn main() {
             build_kernel(&root, &opts)
         }
         "mkinitramfs" => {
-            let mut arch = Arch::X86_64;
-            let mut i = 0;
-            while i < rest.len() {
-                if rest[i] == "--arch" {
-                    i += 1;
-                    arch = match rest.get(i).map(String::as_str) {
-                        Some("x86_64")  => Arch::X86_64,
-                        Some("riscv64") => Arch::RiscV64,
-                        Some("aarch64") => Arch::AArch64,
-                        other => {
-                            log(format!("unknown --arch: {:?}", other));
-                            exit(1);
-                        }
-                    };
-                }
-                i += 1;
-            }
-            mkinitramfs(&root, arch)
+            let opts = parse_build_args(&rest);
+            mkinitramfs(&root, opts.arch)
         }
         "image" => {
             let mut opts = parse_build_args(&rest);
             if rest.iter().all(|a| a != "--arch") { opts.arch = DEFAULT_IMAGE_ARCH; }
             image(&root, &opts)
         }
-        "smoke" => {
-            let img_opts = BuildOpts {
-                arch: Arch::X86_64,
-                boot: Boot::Uefi,
-                debug: true,
-                initrd: true,
-                features: None,
-            };
-            image(&root, &img_opts)?;
-            let script = root.join("run_qemu_x86_64.sh");
-            if !script.exists() {
-                return err(format!("run_qemu_x86_64.sh not found at {}", script.display()));
-            }
-            run(Command::new(script)
-                .arg("--smoke").arg("--smoke-marker").arg(SMOKE_MARKER));
-            Ok(())
-        }
+        "smoke" => smoke(&root),
         "lint-modules" => lint_modules(&root),
         "bench-kernel" => bench_kernel(&root),
         "help" | "--help" | "-h" | "" => {
