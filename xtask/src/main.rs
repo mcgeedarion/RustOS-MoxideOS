@@ -38,7 +38,7 @@
 use std::{
     env, fs,
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, exit},
 };
 
@@ -111,10 +111,6 @@ impl Default for BuildOpts {
 
 type TaskResult = Result<(), String>;
 
-fn err(msg: impl Into<String>) -> TaskResult {
-    Err(msg.into())
-}
-
 fn fatal(msg: impl Into<String>) -> ! {
     eprintln!("[xtask] ERROR: {}", msg.into());
     exit(1);
@@ -152,7 +148,7 @@ fn arch_str(arch: Arch) -> &'static str {
     }
 }
 
-fn target_json(root: &PathBuf, arch: Arch, boot: Boot) -> PathBuf {
+fn target_json(root: &Path, arch: Arch, boot: Boot) -> PathBuf {
     let name = match (arch, boot) {
         (Arch::X86_64,  Boot::Uefi) => "x86_64-uefi-loader.json",
         (Arch::X86_64,  Boot::Sbi)  => "x86_64-kernel.json",
@@ -201,15 +197,15 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn build_output_path(root: &PathBuf, arch: Arch, boot: Boot, profile: &str) -> PathBuf {
+fn build_output_path(root: &Path, arch: Arch, boot: Boot, profile: &str) -> PathBuf {
     root.join(format!("target/{}/{}", target_dir_name(arch, boot), profile))
 }
 
-fn binary_path(root: &PathBuf, arch: Arch, boot: Boot, profile: &str, name: &str) -> PathBuf {
+fn binary_path(root: &Path, arch: Arch, boot: Boot, profile: &str, name: &str) -> PathBuf {
     build_output_path(root, arch, boot, profile).join(name)
 }
 
-fn esp_boot_dir(root: &PathBuf) -> PathBuf {
+fn esp_boot_dir(root: &Path) -> PathBuf {
     root.join("esp/EFI/BOOT")
 }
 
@@ -362,7 +358,7 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
 // Device node creation
 // ============================================================================
 
-fn create_single_dev_node(staging: &PathBuf, node: &DevNode, is_root: bool) -> bool {
+fn create_single_dev_node(staging: &Path, node: &DevNode, is_root: bool) -> bool {
     let full_path = staging.join(node.path);
     let type_str  = node.kind.to_string();
     let major_str = node.major.to_string();
@@ -395,7 +391,7 @@ fn create_single_dev_node(staging: &PathBuf, node: &DevNode, is_root: bool) -> b
     chmod_ok
 }
 
-fn create_dev_nodes(staging: &PathBuf) {
+fn create_dev_nodes(staging: &Path) {
     if which_first(&["mknod"]).is_none() {
         log_warn("mknod not found — skipping device nodes");
         log_warn("Install with: apt install coreutils");
@@ -436,7 +432,7 @@ fn libc_getuid() -> u32 { 1000 }
 // Build functions
 // ============================================================================
 
-fn mkinitramfs(root: &PathBuf, arch: Arch) -> TaskResult {
+fn mkinitramfs(root: &Path, arch: Arch) -> TaskResult {
     require_build_tools(arch)?;
 
     let arch_str = arch_str(arch);
@@ -478,7 +474,7 @@ fn mkinitramfs(root: &PathBuf, arch: Arch) -> TaskResult {
 // Consolidated build logic
 // ============================================================================
 
-fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
+fn build_with_target_json(root: &Path, opts: &BuildOpts) -> TaskResult {
     let profile     = if opts.debug { "debug" } else { "release" };
     let target_path = target_json(root, opts.arch, opts.boot);
     let target_dir  = target_dir_name(opts.arch, opts.boot);
@@ -508,7 +504,7 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
         let src = if src_efi.exists() { src_efi } else { src_elf };
 
         if !src.exists() {
-            return err(format!("EFI binary not found under target/{target_dir}/{profile}/"));
+            return Err(format!("EFI binary not found under target/{target_dir}/{profile}/"));
         }
 
         let esp = esp_boot_dir(root);
@@ -525,7 +521,7 @@ fn build_with_target_json(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
     Ok(())
 }
 
-fn build_kernel(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
+fn build_kernel(root: &Path, opts: &BuildOpts) -> TaskResult {
     build_with_target_json(root, opts)?;
 
     match (opts.arch, opts.boot) {
@@ -551,7 +547,7 @@ fn build_kernel(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
 // Image building
 // ============================================================================
 
-fn image(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
+fn image(root: &Path, opts: &BuildOpts) -> TaskResult {
     for tool in &["mformat", "mmd", "mcopy"] {
         require_tool(&[tool], "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS");
     }
@@ -569,7 +565,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
     if opts.arch == Arch::X86_64 && opts.boot == Boot::Sbi {
         let elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
         if !elf.exists() {
-            return err(format!("kernel ELF not found at {}", elf.display()));
+            return Err(format!("kernel ELF not found at {}", elf.display()));
         }
         fs::create_dir_all(esp_boot_dir(root)).expect("create esp dir");
         run(Command::new(&objcopy)
@@ -587,7 +583,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
     }
 
     if !efi_path.exists() {
-        return err(format!("EFI binary not found at {}\nDid the build step succeed?", efi_path.display()));
+        return Err(format!("EFI binary not found at {}\nDid the build step succeed?", efi_path.display()));
     }
 
     let img_path = root.join(img_name);
@@ -620,12 +616,7 @@ fn image(root: &PathBuf, opts: &BuildOpts) -> TaskResult {
 // Linting
 // ============================================================================
 
-struct LintRule {
-    name: &'static str,
-    check: fn(&PathBuf, &[String]) -> usize,
-}
-
-fn check_duplicates(root: &PathBuf, files: &[String]) -> usize {
+fn check_duplicates(_root: &Path, files: &[String]) -> usize {
     let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for line in files.iter().filter(|l| l.ends_with(".rs")) {
         if let Some(name) = std::path::Path::new(line).file_name().and_then(|n| n.to_str()) {
@@ -641,10 +632,10 @@ fn check_duplicates(root: &PathBuf, files: &[String]) -> usize {
     count
 }
 
-fn check_missing_docs(_root: &PathBuf, _files: &[String]) -> usize {
+fn check_missing_docs(root: &Path, _files: &[String]) -> usize {
     let mut count = 0usize;
     for module in CORE_MODULES {
-        let text = fs::read_to_string(module).unwrap_or_default();
+        let text = fs::read_to_string(root.join(module)).unwrap_or_default();
         if !text.trim_start().starts_with("//!") {
             count += 1;
             log_section("lint-modules", format!("missing module docs header in {module}"));
@@ -653,7 +644,7 @@ fn check_missing_docs(_root: &PathBuf, _files: &[String]) -> usize {
     count
 }
 
-fn check_oversized_modules(root: &PathBuf, files: &[String]) -> usize {
+fn check_oversized_modules(root: &Path, files: &[String]) -> usize {
     let mut count = 0usize;
     for line in files.iter().filter(|l| l.ends_with(".rs")) {
         let text = fs::read_to_string(root.join(line)).unwrap_or_default();
@@ -667,7 +658,7 @@ fn check_oversized_modules(root: &PathBuf, files: &[String]) -> usize {
     count
 }
 
-fn check_undocumented_pub_items(root: &PathBuf, files: &[String]) -> usize {
+fn check_undocumented_pub_items(root: &Path, files: &[String]) -> usize {
     let mut count = 0usize;
     for line in files.iter().filter(|l| l.ends_with(".rs")) {
         let text = fs::read_to_string(root.join(line)).unwrap_or_default();
@@ -686,7 +677,7 @@ fn check_undocumented_pub_items(root: &PathBuf, files: &[String]) -> usize {
     count
 }
 
-fn lint_modules(root: &PathBuf) -> TaskResult {
+fn lint_modules(root: &Path) -> TaskResult {
     let files_output = run_capture({
         let mut c = Command::new("rg");
         c.current_dir(root).args(["--files", "src"]);
@@ -694,7 +685,7 @@ fn lint_modules(root: &PathBuf) -> TaskResult {
     });
     let files: Vec<String> = files_output.lines().map(|s| s.to_string()).collect();
 
-    let rules = vec![
+    let results = vec![
         ("duplicate basenames", check_duplicates(root, &files)),
         ("missing core module docs", check_missing_docs(root, &files)),
         ("oversized modules", check_oversized_modules(root, &files)),
@@ -702,7 +693,7 @@ fn lint_modules(root: &PathBuf) -> TaskResult {
     ];
 
     log_section("lint-modules", "done:");
-    for (name, count) in rules {
+    for (name, count) in results {
         log_section("lint-modules", format!("  {name}={}", count));
     }
     Ok(())
@@ -712,7 +703,7 @@ fn lint_modules(root: &PathBuf) -> TaskResult {
 // Benchmarking
 // ============================================================================
 
-fn bench_kernel(root: &PathBuf) -> TaskResult {
+fn bench_kernel(root: &Path) -> TaskResult {
     log_section("bench-kernel", "baseline workflow starting");
     run(Command::new("cargo").current_dir(root).args(["xtask", "smoke"]));
     log_section("bench-kernel", "TODO: add scheduler-latency microbench");
@@ -726,7 +717,7 @@ fn bench_kernel(root: &PathBuf) -> TaskResult {
 // Smoke test
 // ============================================================================
 
-fn smoke(root: &PathBuf) -> TaskResult {
+fn smoke(root: &Path) -> TaskResult {
     let img_opts = BuildOpts {
         arch: Arch::X86_64,
         boot: Boot::Uefi,
@@ -737,7 +728,7 @@ fn smoke(root: &PathBuf) -> TaskResult {
     image(root, &img_opts)?;
     let script = root.join("run_qemu_x86_64.sh");
     if !script.exists() {
-        return err(format!("run_qemu_x86_64.sh not found at {}", script.display()));
+        return Err(format!("run_qemu_x86_64.sh not found at {}", script.display()));
     }
     run(Command::new(script)
         .arg("--smoke").arg("--smoke-marker").arg(SMOKE_MARKER));
