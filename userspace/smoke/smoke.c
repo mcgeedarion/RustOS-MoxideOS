@@ -2,27 +2,32 @@
 // Minimal QEMU smoke-test helper.
 //
 // Responsibilities:
-//   - Print a well-known marker to the serial console.
-//   - Exit(0) on success.
+//   - Run basic userspace invariant checks.
+//   - Print SMOKE OK on success, SMOKE FAIL:<name> on failure.
+//   - Exit(0) on success, Exit(1) on any failure.
 //   - Kept deliberately tiny so it is safe to run very early in boot.
 //
 // This is invoked from init(8) or a simple shell script during
 // CI/QEMU smoke tests; see run_qemu_x86_64.sh --smoke.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
-#include <sys/types.h>
+#include <fcntl.h>
+
+static int check(const char *name, int ok) {
+    if (!ok) fprintf(stderr, "SMOKE FAIL: %s\n", name);
+    return ok;
+}
 
 int main(void) {
-    // Flush stdio directly to the serial console.
-    printf("SMOKE OK: userspace_smoke\n");
+    int pass = 1;
+
+    pass &= check("getpid >= 2", getpid() >= 2);
+    pass &= check("/dev/null",   open("/dev/null", O_RDONLY) >= 0);
+
+    if (pass)
+        printf("SMOKE OK: userspace_smoke\n");
     fflush(stdout);
-
-    // In the future this can grow basic invariants, e.g.:
-    //   - verify getpid() == 2 or higher
-    //   - check /proc/1 exists
-    //   - open("/dev/null")
-    (void)getpid();
-
-    return 0;
+    return pass ? 0 : 1;
 }
