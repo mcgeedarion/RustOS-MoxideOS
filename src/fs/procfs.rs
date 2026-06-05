@@ -16,6 +16,7 @@
 //!   /proc/perf_core_count   → count of online Performance-class cores
 //!   /proc/slabinfo          → slab allocator cache statistics
 //!   /proc/schemes           → one registered scheme name per line (Redox-style)
+//!   /proc/sys/fs/binfmt_misc/*  → delegated to procfs_binfmt
 //!
 //! ## Debug fds  (/proc/<pid>/mem|regs|ctl)
 //!   Delegated to proc_debug.rs — see that file for details.
@@ -51,6 +52,8 @@ pub fn is_procfs_fd(fdno: usize) -> bool {
 struct ProcFd {
     content: Vec<u8>,
     offset:  usize,
+    /// When `Some`, writes to this fd are forwarded to procfs_binfmt.
+    write_path: Option<alloc::string::String>,
 }
 
 static PROCFS_FDS: Mutex<BTreeMap<usize, ProcFd>> = Mutex::new(BTreeMap::new());
@@ -67,6 +70,24 @@ pub fn procfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
     let n = avail.len().min(buf.len());
     buf[..n].copy_from_slice(&avail[..n]);
     n as isize
+}
+
+/// Write bytes to a procfs fd.  Only synthetic write targets (currently the
+/// binfmt_misc sub-tree) are supported; all others return -EBADF (-9).
+pub fn procfs_write(fdno: usize, data: &[u8]) -> isize {
+    // Snapshot the write_path so we don't hold the lock across the
+    // potentially-allocating procfs_binfmt::write call.
+    let write_path = {
+        let guard = PROCFS_FDS.lock();
+        guard.get(&fdno).and_then(|p| p.write_path.clone())
+    };
+    match write_path {
+        Some(ref path) => match crate::fs::procfs_binfmt::write(path, data) {
+            Ok(n)  => n as isize,
+            Err(e) => e,
+        },
+        None => -9, // EBADF — fd exists but is read-only
+    }
 }
 
 pub fn procfs_close(fdno: usize) {
@@ -173,6 +194,14 @@ fn gen_cpuinfo() -> Vec<u8> {
 }
 
 fn generate(path: &str) -> Option<Vec<u8>> {
+    // ── binfmt_misc sub-tree ──────────────────────────────────────────────
+    // Must be checked before the generic /proc/<pid>/... matchers because
+    // the path starts with "/proc/sys" which has no pid component.
+    if crate::fs::procfs_binfmt::owns_path(path) {
+        return crate::fs::procfs_binfmt::read(path)
+            .map(|s| s.into_bytes());
+    }
+
     let pid = crate::proc::scheduler::current_pid();
     let norm = norm_self(path, pid);
     let p = norm.as_ref();
@@ -263,16 +292,6 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     if p == "/proc/slabinfo" {
         return Some(gen_slabinfo().into_bytes());
     }
-    // Redox-inspired: expose all currently-registered scheme names so that
-    // userspace service managers can poll this file to discover which drivers
-    // are live.  Format: one bare scheme name per line (no colon suffix),
-    // alphabetically sorted (BTreeMap order from SchemeTable::list).
-    // Example contents after blk + net + tcp drivers register:
-    //   blk
-    //   file
-    //   net
-    //   tcp
-    //   tty
     if p == "/proc/schemes" {
         let names = crate::fs::scheme_table::SCHEME_TABLE.list();
         let mut out = String::new();
@@ -484,6 +503,19 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
         return crate::fs::proc_debug::proc_debug_open(cur_pid, path);
     }
 
+    // ── binfmt_misc: open with write-back support ────────────────────────
+    // Writable paths (register, status, per-entry) get a write_path so that
+    // procfs_write() can forward data back to procfs_binfmt::write().
+    if crate::fs::procfs_binfmt::owns_path(path) {
+        let content = crate::fs::procfs_binfmt::read(path)
+            .map(|s| s.into_bytes())
+            .unwrap_or_default();
+        let write_path = Some(alloc::string::String::from(path));
+        let fdno = next_procfs_fd();
+        PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0, write_path });
+        return fdno as isize;
+    }
+
     let norm = norm_self(path, cur_pid);
     let p = norm.as_ref();
     if let Some((tpid, rest)) = strip_pid_prefix(p, "/ns/") {
@@ -494,7 +526,11 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
             if let Some(ns_id) = crate::proc::namespace::ns_id_of(tpid, name) {
                 let content = crate::proc::namespace::ns_symlink(name, ns_id)
                     .into_bytes();
-                PROCFS_FDS.lock().insert(ns_fd as usize, ProcFd { content, offset: 0 });
+                PROCFS_FDS.lock().insert(ns_fd as usize, ProcFd {
+                    content,
+                    offset: 0,
+                    write_path: None,
+                });
             }
             return ns_fd;
         }
@@ -503,7 +539,7 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
     match generate(path) {
         Some(content) => {
             let fdno = next_procfs_fd();
-            PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0 });
+            PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0, write_path: None });
             fdno as isize
         }
         None => -2,
@@ -511,13 +547,10 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
 }
 
 fn is_debug_path(path: &str) -> bool {
-    // Quickly check if the leaf is mem/regs/ctl under /proc/<N>/
     let p = if path.starts_with("/proc/self/") {
-        // norm_self not needed for this check
         let leaf = path.trim_start_matches("/proc/self/");
         matches!(leaf, "mem" | "regs" | "ctl")
     } else {
-        // /proc/<digits>/<leaf>
         if let Some(after) = path.strip_prefix("/proc/") {
             if let Some(slash) = after.find('/') {
                 let maybe_pid = &after[..slash];

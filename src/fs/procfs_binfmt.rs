@@ -33,7 +33,7 @@ pub fn is_globally_enabled() -> bool {
     *BINFMT_ENABLED.lock()
 }
 
-// ── VFS entry points ──────────────────────────────────────────────────────
+// ── VFS entry points ────────────────────────────────────────────────────────
 
 /// Decide whether `path` is inside our sub-tree.
 pub fn owns_path(path: &str) -> bool {
@@ -127,7 +127,7 @@ pub fn write(path: &str, data: &[u8]) -> Result<usize, isize> {
     }
 }
 
-// ── Per-entry rendering ───────────────────────────────────────────────────
+// ── Per-entry rendering ─────────────────────────────────────────────────────
 
 fn render_entry(e: &BinfmtEntry) -> String {
     let state = if e.enabled { "enabled" } else { "disabled" };

@@ -32,7 +32,7 @@ use alloc::{
 };
 use spin::Mutex;
 
-// ── Flags ─────────────────────────────────────────────────────────────────
+// ── Flags ──────────────────────────────────────────────────────────────────
 
 /// `O` — pass binary as an open fd (fd is appended after `--` in argv).
 pub const FLAG_OPEN_BINARY: u8 = 1 << 0;
@@ -41,7 +41,7 @@ pub const FLAG_CREDENTIALS: u8 = 1 << 1;
 /// `F` — "fix binary": entry survives `mount --bind` remounts.
 pub const FLAG_FIX_BINARY:  u8 = 1 << 2;
 
-// ── Entry type ────────────────────────────────────────────────────────────
+// ── Entry type ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MatchType {
@@ -68,7 +68,7 @@ pub struct BinfmtEntry {
     pub enabled:     bool,
 }
 
-// ── Table ─────────────────────────────────────────────────────────────────
+// ── Table ──────────────────────────────────────────────────────────────────
 
 pub struct BinfmtTable {
     entries: Vec<BinfmtEntry>,
@@ -142,7 +142,7 @@ fn probe_magic(header: &[u8], offset: usize, magic: &[u8], mask: &[u8]) -> bool 
     true
 }
 
-// ── Global instance ───────────────────────────────────────────────────────
+// ── Global instance ────────────────────────────────────────────────────────
 
 static BINFMT_TABLE: Mutex<BinfmtTable> = Mutex::new(BinfmtTable::new());
 
@@ -172,7 +172,7 @@ pub fn list() -> Vec<BinfmtEntry> {
     BINFMT_TABLE.lock().entries()
 }
 
-// ── Registration-string parser ────────────────────────────────────────────
+// ── Registration-string parser ─────────────────────────────────────────────
 //
 // Accepts the Linux-compatible format:
 //   :name:type:offset:magic:mask:interpreter:flags

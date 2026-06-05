@@ -6,6 +6,7 @@
 //! - Mount and scheme routing decisions are mediated via `mount`, `scheme_table`, and `scheme_fd`.
 //! - Syscall-facing modules (`*_syscalls`, `ioctl`, `poll`, etc.) must preserve VFS locking/order constraints.
 
+pub mod binfmt_misc;
 pub mod btrfs;
 pub mod cdfs;
 pub mod cgroupfs;
@@ -38,8 +39,9 @@ pub mod pipe;
 pub mod poll;
 pub mod poll_ext;
 pub mod proc_debug;
-pub mod process_fd;
 pub mod procfs;
+pub mod procfs_binfmt;
+pub mod process_fd;
 pub mod ramfs;
 pub mod scheme_fd;      // new: scheme backing-fd store + dispatch helpers
 pub mod scheme_table;
