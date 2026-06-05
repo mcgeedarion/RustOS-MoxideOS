@@ -45,7 +45,7 @@ struct VirtioBlkReqHeader {
 #[repr(C, align(512))]
 struct VirtioBlkReq {
     header: VirtioBlkReqHeader,
-       [u8; SECTOR_SIZE],
+    data:   [u8; SECTOR_SIZE],
     status: u8,
 }
 
@@ -53,7 +53,7 @@ impl VirtioBlkReq {
     const fn new() -> Self {
         Self {
             header: VirtioBlkReqHeader { req_type: 0, _reserved: 0, sector: 0 },
-               [0u8; SECTOR_SIZE],
+            data:   [0u8; SECTOR_SIZE],
             status: 0xFF, // sentinel: not-yet-written
         }
     }
