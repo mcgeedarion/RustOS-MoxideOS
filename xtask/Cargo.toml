@@ -8,6 +8,4 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-# No external deps — everything uses std::process::Command.
-# Keep it that way: xtask must build with a vanilla `cargo` even before
-# the toolchain file has been applied to the workspace.
+anyhow = "1"

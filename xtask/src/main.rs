@@ -35,6 +35,7 @@
 //! In rootless CI containers the mknod calls are skipped with a warning;
 //! the kernel's devtmpfs populates /dev at runtime regardless.
 
+use anyhow::{Context, Result, bail};
 use std::{
     env, fs,
     collections::BTreeMap,
@@ -103,17 +104,6 @@ impl Default for BuildOpts {
             features: None,
         }
     }
-}
-
-// ============================================================================
-// Error and Result types
-// ============================================================================
-
-type TaskResult = Result<(), String>;
-
-fn fatal(msg: impl Into<String>) -> ! {
-    eprintln!("[xtask] ERROR: {}", msg.into());
-    exit(1);
 }
 
 // ============================================================================
@@ -218,13 +208,13 @@ fn cargo() -> Command {
     Command::new(cargo)
 }
 
-fn run(mut cmd: Command) {
+fn run(mut cmd: Command) -> Result<()> {
     log(format!("running: {:?}", cmd));
-    let status = cmd.status().expect("failed to spawn command");
+    let status = cmd.status().context("failed to spawn command")?;
     if !status.success() {
-        log(format!("command failed with {status}"));
-        exit(status.code().unwrap_or(1));
+        bail!("command failed with {status}");
     }
+    Ok(())
 }
 
 fn run_optional(mut cmd: Command) -> bool {
@@ -242,14 +232,13 @@ fn run_optional(mut cmd: Command) -> bool {
     }
 }
 
-fn run_capture(mut cmd: Command) -> String {
+fn run_capture(mut cmd: Command) -> Result<String> {
     log(format!("running (capture): {:?}", cmd));
-    let output = cmd.output().expect("failed to spawn command");
+    let output = cmd.output().context("failed to spawn command")?;
     if !output.status.success() {
-        log(format!("command failed with {}", output.status));
-        exit(output.status.code().unwrap_or(1));
+        bail!("command failed with {}", output.status);
     }
-    String::from_utf8_lossy(&output.stdout).to_string()
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 // ============================================================================
@@ -283,7 +272,7 @@ fn require_tool(names: &[&str], install_hint: &str) -> String {
 // Build tool requirements
 // ============================================================================
 
-fn require_build_tools(arch: Arch) -> TaskResult {
+fn require_build_tools(arch: Arch) -> Result<()> {
     match arch {
         Arch::X86_64 => {
             require_tool(&["musl-gcc"], "apt install musl-tools");
@@ -432,18 +421,18 @@ fn libc_getuid() -> u32 { 1000 }
 // Build functions
 // ============================================================================
 
-fn mkinitramfs(root: &Path, arch: Arch) -> TaskResult {
+fn mkinitramfs(root: &Path, arch: Arch) -> Result<()> {
     require_build_tools(arch)?;
 
     let arch_str = arch_str(arch);
     let staging = root.join(format!("target/initramfs-staging-{arch_str}"));
 
     if staging.exists() {
-        fs::remove_dir_all(&staging).expect("remove old staging dir");
+        fs::remove_dir_all(&staging).context("remove old staging dir")?;
     }
 
     for dir in INITRAMFS_DIRS {
-        fs::create_dir_all(staging.join(dir)).expect("create staging subdir");
+        fs::create_dir_all(staging.join(dir)).context("create staging subdir")?;
     }
 
     log_section("mkinitramfs", "creating device nodes...");
@@ -453,17 +442,17 @@ fn mkinitramfs(root: &Path, arch: Arch) -> TaskResult {
     run(Command::new("make")
         .current_dir(root.join("userspace"))
         .args(["-j4", &format!("ARCH={arch_str}"),
-               &format!("DESTDIR={}", staging.display()), "install"]));
+               &format!("DESTDIR={}", staging.display()), "install"]))?;
 
     fs::write(staging.join("etc/os-release"), OS_RELEASE_CONTENT)
-        .expect("write os-release");
+        .context("write os-release")?;
 
     let cpio_out = root.join("initramfs.cpio");
     log_section("mkinitramfs", format!("packing {}...", cpio_out.display()));
     run(Command::new("sh").current_dir(&staging).args([
         "-c",
         &format!("find . | sort | cpio --create --format=newc --quiet > {}", cpio_out.display()),
-    ]));
+    ]))?;
 
     let size = fs::metadata(&cpio_out).map(|m| m.len()).unwrap_or(0);
     log_section("mkinitramfs", format!("{} bytes → {}", size, cpio_out.display()));
@@ -474,7 +463,7 @@ fn mkinitramfs(root: &Path, arch: Arch) -> TaskResult {
 // Consolidated build logic
 // ============================================================================
 
-fn build_with_target_json(root: &Path, opts: &BuildOpts) -> TaskResult {
+fn build_with_target_json(root: &Path, opts: &BuildOpts) -> Result<()> {
     let profile     = if opts.debug { "debug" } else { "release" };
     let target_path = target_json(root, opts.arch, opts.boot);
     let target_dir  = target_dir_name(opts.arch, opts.boot);
@@ -495,7 +484,7 @@ fn build_with_target_json(root: &Path, opts: &BuildOpts) -> TaskResult {
     }
 
     if !opts.debug { cmd.arg("--release"); }
-    run(cmd);
+    run(cmd)?;
 
     if opts.boot == Boot::Uefi {
         let bin_name = efi_boot_filename(opts.arch);
@@ -504,13 +493,13 @@ fn build_with_target_json(root: &Path, opts: &BuildOpts) -> TaskResult {
         let src = if src_efi.exists() { src_efi } else { src_elf };
 
         if !src.exists() {
-            return Err(format!("EFI binary not found under target/{target_dir}/{profile}/"));
+            bail!("EFI binary not found under target/{target_dir}/{profile}/");
         }
 
         let esp = esp_boot_dir(root);
-        fs::create_dir_all(&esp).expect("create esp dir");
+        fs::create_dir_all(&esp).context("create esp dir")?;
         let dest = esp.join(bin_name);
-        fs::copy(&src, &dest).expect("copy EFI binary");
+        fs::copy(&src, &dest).context("copy EFI binary")?;
         log(format!("Built:     {}", src.display()));
         log(format!("Installed: {}", dest.display()));
     } else {
@@ -521,7 +510,7 @@ fn build_with_target_json(root: &Path, opts: &BuildOpts) -> TaskResult {
     Ok(())
 }
 
-fn build_kernel(root: &Path, opts: &BuildOpts) -> TaskResult {
+fn build_kernel(root: &Path, opts: &BuildOpts) -> Result<()> {
     build_with_target_json(root, opts)?;
 
     match (opts.arch, opts.boot) {
@@ -530,7 +519,7 @@ fn build_kernel(root: &Path, opts: &BuildOpts) -> TaskResult {
             let elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
             let bin = root.join("kernel.bin");
             let objcopy = require_tool(&["llvm-objcopy", "objcopy"], "apt install llvm binutils");
-            run(Command::new(&objcopy).args(["-O", "binary"]).arg(&elf).arg(&bin));
+            run(Command::new(&objcopy).args(["-O", "binary"]).arg(&elf).arg(&bin))?;
             log(format!("Flat binary: {}", bin.display()));
         }
         _ => {}
@@ -547,7 +536,7 @@ fn build_kernel(root: &Path, opts: &BuildOpts) -> TaskResult {
 // Image building
 // ============================================================================
 
-fn image(root: &Path, opts: &BuildOpts) -> TaskResult {
+fn image(root: &Path, opts: &BuildOpts) -> Result<()> {
     for tool in &["mformat", "mmd", "mcopy"] {
         require_tool(&[tool], "apt install mtools   # Debian/Ubuntu\nbrew install mtools  # macOS");
     }
@@ -565,12 +554,12 @@ fn image(root: &Path, opts: &BuildOpts) -> TaskResult {
     if opts.arch == Arch::X86_64 && opts.boot == Boot::Sbi {
         let elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
         if !elf.exists() {
-            return Err(format!("kernel ELF not found at {}", elf.display()));
+            bail!("kernel ELF not found at {}", elf.display());
         }
-        fs::create_dir_all(esp_boot_dir(root)).expect("create esp dir");
+        fs::create_dir_all(esp_boot_dir(root)).context("create esp dir")?;
         run(Command::new(&objcopy)
             .args(["--target", "efi-app-x86-64", "--subsystem", "10"])
-            .arg(&elf).arg(&efi_path));
+            .arg(&elf).arg(&efi_path))?;
     }
 
     // AArch64 bare-metal: image subcommand only makes sense for UEFI.
@@ -583,23 +572,23 @@ fn image(root: &Path, opts: &BuildOpts) -> TaskResult {
     }
 
     if !efi_path.exists() {
-        return Err(format!("EFI binary not found at {}\nDid the build step succeed?", efi_path.display()));
+        bail!("EFI binary not found at {}\nDid the build step succeed?", efi_path.display());
     }
 
     let img_path = root.join(img_name);
     run(Command::new("mformat")
         .args(["-C", "-F", "-h", "64", "-s", "32", "-t", "64", "-i"])
-        .arg(&img_path).arg("::"));
-    run(Command::new("mmd").args(["-i"]).arg(&img_path).args(["::/EFI", "::/EFI/BOOT"]));
+        .arg(&img_path).arg("::"))?;
+    run(Command::new("mmd").args(["-i"]).arg(&img_path).args(["::/EFI", "::/EFI/BOOT"]))?;
     run(Command::new("mcopy")
         .args(["-i"]).arg(&img_path).arg(&efi_path)
-        .arg(format!("::/EFI/BOOT/{efi_name}")));
+        .arg(format!("::/EFI/BOOT/{efi_name}")))?;
 
     if opts.initrd {
         let cpio = root.join("initramfs.cpio");
         if cpio.exists() {
             run(Command::new("mcopy")
-                .args(["-i"]).arg(&img_path).arg(&cpio).arg("::/initramfs.cpio"));
+                .args(["-i"]).arg(&img_path).arg(&cpio).arg("::/initramfs.cpio"))?;
             log(format!("Embedded initramfs: {}", cpio.display()));
         } else {
             log_warn("--initrd specified but initramfs.cpio not found.");
@@ -677,12 +666,12 @@ fn check_undocumented_pub_items(root: &Path, files: &[String]) -> usize {
     count
 }
 
-fn lint_modules(root: &Path) -> TaskResult {
+fn lint_modules(root: &Path) -> Result<()> {
     let files_output = run_capture({
         let mut c = Command::new("rg");
         c.current_dir(root).args(["--files", "src"]);
         c
-    });
+    })?;
     let files: Vec<String> = files_output.lines().map(|s| s.to_string()).collect();
 
     let results = vec![
@@ -703,9 +692,9 @@ fn lint_modules(root: &Path) -> TaskResult {
 // Benchmarking
 // ============================================================================
 
-fn bench_kernel(root: &Path) -> TaskResult {
+fn bench_kernel(root: &Path) -> Result<()> {
     log_section("bench-kernel", "baseline workflow starting");
-    run(Command::new("cargo").current_dir(root).args(["xtask", "smoke"]));
+    run(Command::new("cargo").current_dir(root).args(["xtask", "smoke"]))?;
     log_section("bench-kernel", "TODO: add scheduler-latency microbench");
     log_section("bench-kernel", "TODO: add pipe-throughput microbench");
     log_section("bench-kernel", "TODO: add mmap-fault microbench");
@@ -717,7 +706,7 @@ fn bench_kernel(root: &Path) -> TaskResult {
 // Smoke test
 // ============================================================================
 
-fn smoke(root: &Path) -> TaskResult {
+fn smoke(root: &Path) -> Result<()> {
     let img_opts = BuildOpts {
         arch: Arch::X86_64,
         boot: Boot::Uefi,
@@ -728,10 +717,10 @@ fn smoke(root: &Path) -> TaskResult {
     image(root, &img_opts)?;
     let script = root.join("run_qemu_x86_64.sh");
     if !script.exists() {
-        return Err(format!("run_qemu_x86_64.sh not found at {}", script.display()));
+        bail!("run_qemu_x86_64.sh not found at {}", script.display());
     }
     run(Command::new(script)
-        .arg("--smoke").arg("--smoke-marker").arg(SMOKE_MARKER));
+        .arg("--smoke").arg("--smoke-marker").arg(SMOKE_MARKER))?;
     Ok(())
 }
 
@@ -745,7 +734,7 @@ fn main() {
     let rest: Vec<String> = args.collect();
     let root = workspace_root();
 
-    let result = match subcommand.as_str() {
+    let result: Result<()> = match subcommand.as_str() {
         "build" => {
             let opts = parse_build_args(&rest);
             build_kernel(&root, &opts)
@@ -794,6 +783,7 @@ fn main() {
     };
 
     if let Err(e) = result {
-        fatal(e);
+        eprintln!("[xtask] ERROR: {e:#}");
+        exit(1);
     }
 }
