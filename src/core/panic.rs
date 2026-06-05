@@ -92,7 +92,7 @@ pub unsafe fn do_panic(ctx: &PanicContext<'_>) -> ! {
 /// kernel_panic!("unexpected trap", &trap_frame_bytes);
 /// ```
 #[macro_export]
-macro_rules! kernel_panic {
+macros! kernel_panic {
     ($msg:expr) => {{
         unsafe {
             $crate::core::panic::do_panic(&$crate::core::panic::PanicContext {
@@ -124,11 +124,22 @@ unsafe fn arch_halt() -> ! {
         #[cfg(target_arch = "x86_64")]
         core::arch::asm!("cli; hlt", options(nomem, nostack));
 
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!(
+            "msr daifset, #0xf",  // mask all interrupts (D, A, I, F)
+            "wfi",
+            options(nomem, nostack)
+        );
+
         #[cfg(target_arch = "riscv64")]
         core::arch::asm!("wfi", options(nomem, nostack));
 
         // Unknown architecture: busy-loop.
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+        )))]
         core::hint::spin_loop();
     }
 }
