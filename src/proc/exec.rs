@@ -4,6 +4,8 @@
 //!
 //!   1.  vfs::open(path) → fd; read entire file → Vec<u8>; vfs::close
 //!   2.  elf::parse_elf_header + elf::parse_phdrs_with_hdr
+//!   2b. binfmt_misc probe — if machine type != native arch AND a matching
+//!       binfmt_misc entry exists, re-exec under the registered interpreter.
 //!   3.  alloc fresh address space (new_cr3) — old space untouched until step 8
 //!   4.  elf::load_elf_into(new_cr3, data, &hdr, &phdrs) → entry VA
 //!   5.  elf::end_of_bss(phdrs, bias) → set_brk_base_compute
@@ -70,6 +72,21 @@ const STACK_TOP:   usize = 0x0000_7FFF_FF00_0000;
 const INTERP_BASE: usize = 0x0060_0000;
 const STACK_MAX:   usize = 64 * 1024 * 1024;
 const STACK_MIN:   usize = PAGE;
+
+// ── Native machine type constant ───────────────────────────────────────────
+// Mirrors ELF e_machine values.  Only the native arch is loaded directly;
+// every other value is eligible for binfmt_misc re-dispatch.
+#[cfg(target_arch = "x86_64")]
+const NATIVE_EM: u16 = 62;  // EM_X86_64
+#[cfg(target_arch = "riscv64")]
+const NATIVE_EM: u16 = 243; // EM_RISCV
+#[cfg(target_arch = "aarch64")]
+const NATIVE_EM: u16 = 183; // EM_AARCH64
+
+// ── Minimum header bytes forwarded to binfmt_misc probe ────────────────────
+// 256 bytes covers all common magic-byte positions (e.g. .class at 0, PE at 0,
+// ELF e_machine at offset 18).
+const BINFMT_PROBE_BYTES: usize = 256;
 
 // Called from kernel_main to bootstrap PID 1.  Reads the ELF from VFS, builds
 // a fresh address space, allocates a kernel stack, fills a Pcb, and enqueues.
@@ -204,6 +221,53 @@ pub fn spawn_user_process_from_bytes(
     true
 }
 
+// ── binfmt_misc redispatch helper ─────────────────────────────────────────
+//
+// When the ELF header carries a non-native e_machine AND a binfmt_misc entry
+// matches the file's magic bytes, we rebuild argv with the interpreter
+// prepended and tail-call back into do_execve / do_execve_riscv.
+//
+// Layout of the new argv:
+//   [interpreter, original_argv[0], original_argv[1], ...]
+//
+// If the FLAG_OPEN_BINARY flag is set the kernel opens the target binary,
+// passes the fd number as an extra string argument ("--\0<fdnum>"), and
+// marks it for close-on-exec.  Userland interpreters that honour this flag
+// (e.g. qemu-user with -execfd) use it to avoid a second open().
+
+fn binfmt_dispatch_needed(e_machine: u16) -> bool {
+    e_machine != NATIVE_EM
+}
+
+/// Build a new argv `Vec<String>` with `interp` prepended.
+/// If `open_binary` is true, append `"--"` and the decimal fd number.
+fn prepend_interpreter(
+    interp:       &str,
+    orig_argv:    &[String],
+    open_binary:  bool,
+    bin_path:     &str,
+) -> Vec<String> {
+    let mut new_argv: Vec<String> = Vec::new();
+    new_argv.push(String::from(interp));
+    if open_binary {
+        // Open the binary and pass its fd as "--%fd%".
+        // The fd is kept open across exec; the interpreter is responsible
+        // for closing it.  We insert it right after the interpreter path
+        // so that standard option parsing in the interpreter is unaffected.
+        let fd = crate::fs::vfs::open(bin_path, 0, 0);
+        if fd >= 0 {
+            new_argv.push(String::from("--"));
+            new_argv.push(alloc::format!("{}", fd as usize));
+            // Mark close-on-exec so the fd is not inherited by grandchildren.
+            let _ = crate::fs::vfs::set_cloexec(fd as usize);
+        }
+    }
+    // Append original argv (argv[0] is the binary path — keep it so that
+    // /proc/self/cmdline remains meaningful).
+    new_argv.extend_from_slice(orig_argv);
+    new_argv
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn do_execve(
     pid:     usize,
@@ -221,6 +285,36 @@ pub fn do_execve(
     data.resize(size, 0u8);
     if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return -5; }
     vfs::close(fd);
+
+    // ── binfmt_misc probe ──────────────────────────────────────────────────
+    // Check this BEFORE the full ELF parse so that non-ELF formats (e.g.
+    // Java .class, Windows PE) are also intercepted.  We still do a quick
+    // e_machine check for ELF files to avoid calling the probe for every
+    // native binary.
+    {
+        let probe_len = data.len().min(BINFMT_PROBE_BYTES);
+        let hdr_bytes = &data[..probe_len];
+
+        // Fast-path: if this looks like an ELF with native arch, skip probe.
+        let is_native_elf = data.len() >= 20
+            && &data[0..4] == b"\x7fELF"
+            && u16::from_le_bytes([data[18], data[19]]) == NATIVE_EM;
+
+        if !is_native_elf && crate::fs::procfs_binfmt::is_globally_enabled() {
+            if let Some((interp_path, flags)) = crate::fs::binfmt_misc::probe_header(hdr_bytes) {
+                // Rebuild argv with interpreter prepended.
+                let open_bin = flags & crate::fs::binfmt_misc::FLAG_OPEN_BINARY != 0;
+                let new_argv = prepend_interpreter(&interp_path, &argv, open_bin, &path);
+                let new_argv_refs: Vec<&str> = new_argv.iter().map(|s| s.as_str()).collect();
+                let envp_refs:     Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+                // Recurse: exec the interpreter with new_argv.
+                // Safety: this is a tail-call; the current frame is abandoned
+                // when do_execve returns to the syscall dispatcher.
+                return do_execve_from_vecs(pid, &interp_path, &new_argv_refs, &envp_refs);
+            }
+        }
+    }
+    // ── End binfmt_misc probe ──────────────────────────────────────────────
 
     let hdr   = match elf::parse_elf_header(&data)          { Some(h) => h, None => return -8 };
     let phdrs = match elf::parse_phdrs_with_hdr(&data, &hdr) { Some(p) => p, None => return -8 };
@@ -292,6 +386,88 @@ pub fn do_execve(
     0
 }
 
+/// Internal helper: run do_execve when we already have the path and argv/envp
+/// as Rust string slices (used by the binfmt_misc re-dispatch path).
+#[cfg(target_arch = "x86_64")]
+fn do_execve_from_vecs(
+    pid:   usize,
+    path:  &str,
+    argv:  &[&str],
+    envp:  &[&str],
+) -> isize {
+    let fd = match vfs::open(path, 0, 0) { fd if fd >= 0 => fd as usize, e => return e };
+    let size = match vfs::fsize(fd) { Some(s) => s, None => { vfs::close(fd); return -2; } };
+    let mut data = Vec::with_capacity(size);
+    data.resize(size, 0u8);
+    if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return -5; }
+    vfs::close(fd);
+
+    let hdr   = match elf::parse_elf_header(&data)          { Some(h) => h, None => return -8 };
+    let phdrs = match elf::parse_phdrs_with_hdr(&data, &hdr) { Some(p) => p, None => return -8 };
+
+    let new_cr3  = paging::alloc_root_page_table();
+    let entry_va = match elf::load_elf_into(new_cr3, &data, &hdr, &phdrs) {
+        Some(e) => e,
+        None    => { pmm::free_page_table(new_cr3); return -12; }
+    };
+    let brk_base = elf::end_of_bss(&phdrs, 0);
+
+    let (final_entry, interp_bias) =
+        if let Some(interp_path) = crate::proc::dynlink::find_interp(&data) {
+            match crate::proc::dynlink::load_interp(&interp_path) {
+                Ok((ie, bias)) => (ie, bias),
+                Err(e)         => { pmm::free_page_table(new_cr3); return e; }
+            }
+        } else {
+            (entry_va, 0)
+        };
+
+    let user_sp_top = alloc_map_stack(new_cr3, STACK_TOP);
+    let (initial_rsp, new_vmas) = crate::auxv::build_stack(
+        new_cr3, user_sp_top, argv, envp,
+        &hdr, &phdrs, entry_va, interp_bias, brk_base,
+    );
+
+    let kstack_top = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        mmap::clear_vmas(p);
+        unsafe { paging::free_user_page_table(p.user_satp); }
+        unsafe { paging::load_cr3(new_cr3); }
+        update_rsp0(p.kstack_top);
+    });
+
+    use crate::arch::x86_64::syscall::patch_syscall_frame;
+    patch_syscall_frame(kstack_top, final_entry, 0x202, initial_rsp);
+
+    let new_ctx = crate::proc::context::Context {
+        rip: crate::proc::context::task_entry_trampoline as usize,
+        rsp: kstack_top - 17 * 8,
+        ..crate::proc::context::Context::zero()
+    };
+
+    let old_handlers = scheduler::with_proc(pid, |p| p.signal_handlers.lock().clone()).unwrap();
+    let vfork_parent = scheduler::with_proc(pid, |p| p.vfork_parent).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        p.user_satp       = new_cr3;
+        p.pc              = final_entry;
+        p.sp              = initial_rsp;
+        p.ctx             = new_ctx;
+        p.brk_base        = brk_base;
+        p.brk             = brk_base;
+        p.vmas            = new_vmas;
+        p.exe_path        = Some(String::from(path));
+        p.signal_handlers = alloc::sync::Arc::new(spin::Mutex::new(old_handlers.exec_reset()));
+        p.pending_signals.clear();
+        p.vfork_parent    = 0;
+    });
+
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
+    thread::set_run_state_cold(pid, final_entry, initial_rsp);
+    0
+}
+
 #[cfg(target_arch = "riscv64")]
 pub fn do_execve_riscv(
     pid:     usize,
@@ -313,6 +489,27 @@ pub fn do_execve_riscv(
     data.resize(size, 0u8);
     if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return -5; }
     vfs::close(fd);
+
+    // ── binfmt_misc probe ──────────────────────────────────────────────────
+    {
+        let probe_len = data.len().min(BINFMT_PROBE_BYTES);
+        let hdr_bytes = &data[..probe_len];
+
+        let is_native_elf = data.len() >= 20
+            && &data[0..4] == b"\x7fELF"
+            && u16::from_le_bytes([data[18], data[19]]) == NATIVE_EM;
+
+        if !is_native_elf && crate::fs::procfs_binfmt::is_globally_enabled() {
+            if let Some((interp_path, flags)) = crate::fs::binfmt_misc::probe_header(hdr_bytes) {
+                let open_bin = flags & crate::fs::binfmt_misc::FLAG_OPEN_BINARY != 0;
+                let new_argv = prepend_interpreter(&interp_path, &argv, open_bin, &path);
+                let new_argv_refs: Vec<&str> = new_argv.iter().map(|s| s.as_str()).collect();
+                let envp_refs:     Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+                return do_execve_riscv_from_vecs(pid, &interp_path, &new_argv_refs, &envp_refs);
+            }
+        }
+    }
+    // ── End binfmt_misc probe ──────────────────────────────────────────────
 
     let hdr   = match elf::parse_elf_header(&data)          { Some(h) => h, None => return -8 };
     let phdrs = match elf::parse_phdrs_with_hdr(&data, &hdr) { Some(p) => p, None => return -8 };
@@ -388,6 +585,98 @@ pub fn do_execve_riscv(
 
     if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
 
+    thread::set_run_state_cold(pid, final_entry, initial_sp);
+    0
+}
+
+/// Internal helper used by the binfmt_misc re-dispatch path on riscv64.
+#[cfg(target_arch = "riscv64")]
+fn do_execve_riscv_from_vecs(
+    pid:   usize,
+    path:  &str,
+    argv:  &[&str],
+    envp:  &[&str],
+) -> isize {
+    use crate::arch::riscv64::trap::{rebuild_trap_frame_riscv, TRAP_FRAME_SIZE};
+    use crate::arch::riscv64::paging::alloc_root_page_table;
+    use crate::arch::riscv64::uentry::alloc_user_stack;
+
+    let fd = match vfs::open(path, 0, 0) { fd if fd >= 0 => fd as usize, e => return e };
+    let size = match vfs::fsize(fd) { Some(s) => s, None => { vfs::close(fd); return -2; } };
+    let mut data = Vec::with_capacity(size);
+    data.resize(size, 0u8);
+    if vfs::read(fd, &mut data) != size as isize { vfs::close(fd); return -5; }
+    vfs::close(fd);
+
+    let hdr   = match elf::parse_elf_header(&data)          { Some(h) => h, None => return -8 };
+    let phdrs = match elf::parse_phdrs_with_hdr(&data, &hdr) { Some(p) => p, None => return -8 };
+
+    let new_root_ppn = alloc_root_page_table() >> 12;
+    let new_cr3      = new_root_ppn << 12;
+
+    let entry_va = match elf::load_elf_into(new_cr3, &data, &hdr, &phdrs) {
+        Some(e) => e,
+        None    => { pmm::free_page_table(new_cr3); return -12; }
+    };
+    let brk_base = elf::end_of_bss(&phdrs, 0);
+
+    let (final_entry, interp_bias) =
+        if let Some(interp_path) = crate::proc::dynlink::find_interp(&data) {
+            match crate::proc::dynlink::load_interp(&interp_path) {
+                Ok((ie, bias)) => (ie, bias),
+                Err(e)         => { pmm::free_page_table(new_cr3); return e; }
+            }
+        } else {
+            (entry_va, 0)
+        };
+
+    let user_sp_top = match alloc_user_stack(new_root_ppn) {
+        Some(sp) => sp,
+        None     => { pmm::free_page_table(new_cr3); return -12; }
+    };
+
+    let (initial_sp, new_vmas) = crate::auxv::build_stack(
+        new_cr3, user_sp_top, argv, envp,
+        &hdr, &phdrs, entry_va, interp_bias, brk_base,
+    );
+
+    let kstack_top = scheduler::with_proc(pid, |p| p.kstack_top).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        mmap::clear_vmas(p);
+        crate::arch::riscv64::paging::free_user_page_table(p.user_satp);
+    });
+
+    rebuild_trap_frame_riscv(kstack_top, final_entry, initial_sp, 0);
+    let trapframe_pa = kstack_top - TRAP_FRAME_SIZE;
+
+    let new_ctx = crate::proc::context::Context {
+        ra:  crate::proc::context::task_entry_trampoline as usize,
+        sp:  trapframe_pa,
+        s0:  0,
+        ..crate::proc::context::Context::zero()
+    };
+
+    let old_handlers = scheduler::with_proc(pid, |p| p.signal_handlers.lock().clone()).unwrap();
+    let vfork_parent = scheduler::with_proc(pid, |p| p.vfork_parent).unwrap_or(0);
+
+    scheduler::with_proc_mut(pid, |p, _pl| {
+        p.user_satp       = new_cr3;
+        p.pc              = final_entry;
+        p.sp              = initial_sp;
+        p.ctx             = new_ctx;
+        p.trapframe_pa    = trapframe_pa;
+        p.trapframe_virt  = TRAPFRAME_VADDR;
+        p.brk_base        = brk_base;
+        p.brk             = brk_base;
+        p.vmas            = new_vmas;
+        p.exe_path        = Some(String::from(path));
+        p.signal_handlers = alloc::sync::Arc::new(spin::Mutex::new(old_handlers.exec_reset()));
+        p.pending_signals.clear();
+        p.vfork_parent    = 0;
+    });
+
+    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
     thread::set_run_state_cold(pid, final_entry, initial_sp);
     0
 }
