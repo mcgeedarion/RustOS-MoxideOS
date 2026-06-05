@@ -23,6 +23,16 @@ pub static ONLINE_CPUS: AtomicU32 = AtomicU32::new(0);
 /// Set to true by BSP once all subsystems are ready for APs to proceed.
 pub static AP_GO: AtomicBool = AtomicBool::new(false);
 
+/// Heterogeneous core classification (big.LITTLE / Intel P+E).
+/// Populated from MADT GICC cpu-capacity (ARM64) or CPUID (x86 hybrid).
+/// Defaults to `Performance` on homogeneous platforms so
+/// `perf_core_count()` always returns a useful value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreType {
+    Performance,
+    Efficiency,
+}
+
 /// Per-CPU descriptor held in the global topology table.
 #[derive(Debug, Clone)]
 pub struct CpuInfo {
@@ -34,6 +44,8 @@ pub struct CpuInfo {
     pub node: u32,
     pub online: bool,
     pub is_bsp: bool,
+    /// Core type for heterogeneous platforms; defaults to Performance.
+    pub core_type: CoreType,
 }
 
 /// Global CPU topology table populated during `init()`.
@@ -51,7 +63,19 @@ pub fn register_cpu(hw_id: u32, node: u32, is_bsp: bool) -> u32 {
             node,
             online: is_bsp,
             is_bsp,
+            core_type: CoreType::Performance,
         });
+    }
+    cpu_id
+}
+
+/// Register a CPU with an explicit core type (ARM64 big.LITTLE, x86 hybrid).
+pub fn register_cpu_typed(hw_id: u32, node: u32, is_bsp: bool, core_type: CoreType) -> u32 {
+    let cpu_id = register_cpu(hw_id, node, is_bsp);
+    unsafe {
+        if let Some(info) = CPU_TABLE[cpu_id as usize].as_mut() {
+            info.core_type = core_type;
+        }
     }
     cpu_id
 }
@@ -69,6 +93,26 @@ pub fn num_cpus() -> u32 {
 /// Total CPUs currently online.
 pub fn num_online_cpus() -> u32 {
     ONLINE_CPUS.load(Ordering::Relaxed)
+}
+
+/// Number of online Performance-class cores.
+/// On homogeneous platforms (all cores default to Performance) this equals
+/// `num_online_cpus()`. On hybrid platforms it returns only the P-cores,
+/// which is the right value to use when sizing VFS / IO worker pools to
+/// avoid pinning work on slow E-cores.
+pub fn perf_core_count() -> u32 {
+    let total = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    let mut count = 0u32;
+    for i in 0..total {
+        if let Some(info) = unsafe { CPU_TABLE[i].as_ref() } {
+            if info.online && info.core_type == CoreType::Performance {
+                count += 1;
+            }
+        }
+    }
+    // Always return at least 1 so callers never divide by zero during early
+    // boot before any CPU has been registered.
+    count.max(1)
 }
 
 /// Called by each AP once it has finished its own percpu init.

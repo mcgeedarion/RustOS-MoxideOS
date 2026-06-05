@@ -12,7 +12,8 @@
 //!   /proc/<pid>/limits      → per-process resource limits (ulimit -a format)
 //!   /proc/uptime            → uptime in seconds
 //!   /proc/meminfo           → basic memory figures
-//!   /proc/cpuinfo           → single-CPU stub
+//!   /proc/cpuinfo           → per-CPU info (one block per logical CPU)
+//!   /proc/perf_core_count   → count of online Performance-class cores
 //!   /proc/slabinfo          → slab allocator cache statistics
 //!   /proc/schemes           → one registered scheme name per line (Redox-style)
 //!
@@ -150,6 +151,27 @@ fn copy_link(src: &[u8], buf: &mut [u8]) -> isize {
     n as isize
 }
 
+fn gen_cpuinfo() -> Vec<u8> {
+    let total = crate::smp::num_cpus();
+    let mut out = String::new();
+    for i in 0..total {
+        if let Some(info) = crate::smp::cpu_info(i) {
+            let core_type = match info.core_type {
+                crate::smp::CoreType::Performance => "performance",
+                crate::smp::CoreType::Efficiency  => "efficiency",
+            };
+            out.push_str(&format!(
+                "processor\t: {}\nhw_id\t\t: {}\nnode\t\t: {}\ncore_type\t: {}\nonline\t\t: {}\n\n",
+                info.cpu_id, info.hw_id, info.node, core_type, info.online,
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("processor\t: 0\nmodel name\t: rustos virtual CPU\ncore_type\t: performance\n");
+    }
+    out.into_bytes()
+}
+
 fn generate(path: &str) -> Option<Vec<u8>> {
     let pid = crate::proc::scheduler::current_pid();
     let norm = norm_self(path, pid);
@@ -206,7 +228,11 @@ fn generate(path: &str) -> Option<Vec<u8>> {
         ).into_bytes());
     }
     if p == "/proc/cpuinfo" {
-        return Some(b"processor\t: 0\nmodel name\t: rustos virtual CPU\n".to_vec());
+        return Some(gen_cpuinfo());
+    }
+    if p == "/proc/perf_core_count" {
+        let count = crate::smp::perf_core_count();
+        return Some(format!("{count}\n").into_bytes());
     }
     if p == "/proc/self/cmdline" || p.ends_with("/cmdline") {
         let exe = crate::proc::scheduler::exe_path_of(pid)
