@@ -10,6 +10,7 @@ pub mod kernel_main;
 pub mod mem_layout;
 pub mod memory;
 pub mod multiboot2;
+pub mod multiboot2_entry;
 pub mod paging;
 pub mod pci;
 pub mod serial;
