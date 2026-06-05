@@ -16,6 +16,7 @@
 //!   `mlock`      — `mlock`/`munlock` syscall implementation.
 //!   `mmap`       — `mmap`/`munmap`/`mprotect` syscall implementation.
 //!   `page_fault` — Architecture-independent page-fault dispatch.
+//!   `phys`       — `virt_to_phys` / `phys_to_virt` for the kernel direct map.
 //!   `pmm`        — Physical memory manager (free-list of 4 KiB frames).
 //!   `rss`        — Resident Set Size tracking per-process.
 //!   `slab`       — Slab allocator (8 size classes, 8 B – 1024 B).
@@ -31,6 +32,7 @@ pub mod memmap;
 pub mod mlock;
 pub mod mmap;
 pub mod page_fault;
+pub mod phys;
 pub mod pmm;
 pub mod rss;
 pub mod slab;
