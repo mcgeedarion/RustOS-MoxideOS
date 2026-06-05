@@ -27,7 +27,7 @@
 
   /*
    * "small" code model: all symbols within a 4 GiB range.
-   * Matches the static kernel image assumption in linker_aarch64.ld and
+   * Matches the static kernel image assumption in linker/aarch64.ld and
    * consistent with aarch64-uefi-loader.json.
    */
   "code-model": "small",
@@ -49,7 +49,7 @@
 
   "pre-link-args": {
     "ld.lld": [
-      "--script=linker_aarch64.ld"
+      "--script=linker/aarch64.ld"
     ]
   }
 }
