@@ -9,6 +9,7 @@
 pub mod context;
 pub mod cwd;
 pub mod exec;
+pub mod pid;
 pub mod fork;
 pub mod fork_syscall;
 pub mod clone;

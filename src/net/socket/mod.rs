@@ -18,6 +18,11 @@ pub mod tcp;
 pub mod udp;
 pub mod unix;
 
+/// Re-export the UDP demux entry point at the socket-module path so
+/// callers can write `crate::net::socket::demux_udp(…)` without going
+/// through `udp::`.
+pub use udp::demux_udp;
+
 pub use types::{Socket, SockAddr, SocketState, AF_INET, AF_INET6, AF_UNIX,
                 SOCK_STREAM, SOCK_DGRAM, SOCK_RAW,
                 SOL_SOCKET, SO_REUSEADDR, SO_KEEPALIVE, SO_ERROR,

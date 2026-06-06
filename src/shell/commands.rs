@@ -43,7 +43,7 @@ fn cmd_info_proc() {
     crate::proc::table::for_each(|p| {
         crate::shell::tty::write(
             format!(
-                "  {:4}  {:4}  {:?:<10}  {}\r\n",
+                "  {:4}  {:4}  {:<10?}  {}\r\n",
                 p.pid, p.ppid, p.state, p.name
             ).as_bytes()
         );

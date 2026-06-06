@@ -21,6 +21,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 kmtest = { path = "crates/kmtest", optional = true }
+scheme-api = { path = "crates/scheme-api" }
 
 # Synchronisation primitives. `crate::sync::mutex` re-exports `spin::Mutex`,
 # and many subsystems use `spin::Mutex` / `spin::Once` directly.

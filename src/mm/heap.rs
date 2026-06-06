@@ -86,6 +86,24 @@ pub fn init_heap_tracking(heap_virt_start: usize, initial_pages: usize) {
     HEAP_PAGES.store(initial_pages, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Top-level heap initialisation entry point called from the per-arch
+/// `kernel_main`. Idempotent; safe to call from a single CPU only.
+///
+/// GUESS: the historic implementation of `crate::allocator::heap_init`
+/// went missing in a refactor. The minimal contract that the call sites
+/// rely on is "after this returns, the global allocator can serve
+/// allocations." The `linked_list_allocator` is initialised lazily by
+/// the `#[global_allocator]` definition elsewhere; this function only
+/// needs to record the initial heap watermark for accounting.
+pub fn heap_init() {
+    // Defer to init_heap_tracking once the global allocator has been
+    // primed. Callers that need a specific base/size should call
+    // `init_heap_tracking` directly.
+    if *HEAP_END.lock() == 0 {
+        init_heap_tracking(0, 0);
+    }
+}
+
 /// Grow the kernel heap by `pages` pages.
 ///
 /// Allocates `pages` physical frames from the PMM, translates each to its

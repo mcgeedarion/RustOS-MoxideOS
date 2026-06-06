@@ -1,8 +1,8 @@
-//! Syscall stubs — thin wrappers and minor implementations that do not
-//! warrant their own module.
+// Syscall stubs — thin wrappers and minor implementations that do not
+// warrant their own module. (Included by src/syscall/mod.rs.)
 
-extern crate alloc;
-use alloc::string::String;
+// extern crate alloc; -- provided by parent (src/syscall/mod.rs via include!)
+// use alloc::string::String; -- provided by parent
 
 use crate::fs::path::resolve_path;
 use crate::proc::scheduler;

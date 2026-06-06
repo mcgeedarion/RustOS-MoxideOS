@@ -52,7 +52,7 @@ pub const TRAP_FRAME_SIZE: usize = TF::FRAME_SIZE;
 pub use crate::arch::riscv64::mem_layout::sstatus::{SSTATUS_SPP  = SPP};
 pub use crate::arch::riscv64::mem_layout::sstatus::{SSTATUS_SPIE = SPIE};
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn riscv_trap_entry() {
     asm!(
@@ -273,7 +273,7 @@ pub fn trap_init() {
     csrw!("sstatus", sstatus | SS::SIE);
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn sret_trampoline() -> ! {
     asm!(

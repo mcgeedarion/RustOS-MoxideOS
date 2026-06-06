@@ -53,3 +53,8 @@ impl Framebuffer {
         self.pitch as u64 * self.height as u64
     }
 }
+
+/// Public alias for the framebuffer description type. `display::console`
+/// imports `FramebufferDesc`; this matches that name without changing
+/// callers downstream.
+pub type FramebufferDesc = Framebuffer;

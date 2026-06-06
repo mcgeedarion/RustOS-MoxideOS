@@ -174,6 +174,14 @@ pub struct Ext2Fs {
 /// Global mounted ext2 filesystem (one partition for now).
 pub static FS: Mutex<Option<Ext2Fs>> = Mutex::new(None);
 
+/// Public alias for the directory-entry type. Imported as
+/// `Ext2DirEntry` by `directory.rs` / `inode.rs`.
+pub type Ext2DirEntry = DirEntry;
+
+/// POSIX errno: no space left on device. Surfaced from the bitmap
+/// allocator (`bitmap.rs`) when no free block/inode is available.
+pub const ENOSPC: i32 = 28;
+
 #[inline]
 fn read_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(b[off..off+4].try_into().unwrap_or([0;4]))

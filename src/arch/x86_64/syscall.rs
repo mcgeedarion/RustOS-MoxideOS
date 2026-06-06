@@ -319,3 +319,88 @@ pub extern "C" fn child_first_run_hook() {
         }
     }
 }
+
+// ====================================================================
+// Public helpers re-exported for callers under the `crate::arch::x86_64::syscall`
+// path. The actual logic for these helpers historically lived inside
+// `proc::clone` / `proc::fork_syscall` as file-local `fn` items; the
+// versions below are minimal entry points that match the call sites in
+// `proc::exec` (and avoid the cross-module privacy issue).
+// ====================================================================
+
+// Selector constants must match those used in proc::clone::push_syscall_frame.
+const USER_CS_PUB: usize = 0x23;
+const USER_SS_PUB: usize = 0x1b;
+
+/// Build a fresh SYSRET-shaped stack frame at the top of `kstack_top`.
+///
+/// Layout (top-of-stack-down, 17×u64 of which only the bottom 5 are
+/// load-bearing): `[user_ss, user_sp, rflags, user_cs, rip, 0, 0, ...]`.
+/// This mirrors the same routine that previously lived inside
+/// `proc::clone::push_syscall_frame` and is referenced from
+/// `proc::exec::install_exec_image` on the freshly-exec'd path.
+///
+/// # Safety
+/// `kstack_top` must point to the top of a 17×u64-or-larger kernel stack
+/// region that the caller currently owns.
+#[cfg(target_arch = "x86_64")]
+pub fn push_syscall_frame(
+    kstack_top: usize,
+    pc:         usize,
+    rflags:     usize,
+    user_sp:    usize,
+) {
+    // SAFETY: requirement is documented on the function.
+    let frame = unsafe {
+        core::slice::from_raw_parts_mut(
+            (kstack_top - 17 * 8) as *mut usize,
+            17,
+        )
+    };
+    frame.iter_mut().for_each(|x| *x = 0);
+    frame[0] = USER_SS_PUB;
+    frame[1] = if user_sp != 0 { user_sp } else { kstack_top };
+    frame[2] = rflags;
+    frame[3] = USER_CS_PUB;
+    frame[4] = pc;
+}
+
+/// In-place edit of an already-pushed SYSRET frame to repoint it at
+/// `(pc, user_sp)`. Used by `execve` paths that reuse the calling
+/// task's kernel stack instead of building a fresh one.
+///
+/// # Safety
+/// `kstack_top` must point to the same stack region used in the
+/// matching [`push_syscall_frame`] call.
+#[cfg(target_arch = "x86_64")]
+pub fn patch_syscall_frame(
+    kstack_top: usize,
+    pc:         usize,
+    user_sp:    usize,
+) {
+    // SAFETY: see [`push_syscall_frame`].
+    let frame = unsafe {
+        core::slice::from_raw_parts_mut(
+            (kstack_top - 17 * 8) as *mut usize,
+            17,
+        )
+    };
+    frame[1] = if user_sp != 0 { user_sp } else { kstack_top };
+    frame[4] = pc;
+}
+
+/// First-instruction landing pad for a freshly-cloned/exec'd task. The
+/// real assembly trampoline is `syscall_asm_entry`'s SYSRET tail; this
+/// symbol is exposed only so that callers like `proc::clone` can hand a
+/// stable function pointer into the per-task PCB.
+///
+/// Calling this from kernel code is a logic bug — the trampoline is
+/// only legal as a context-switch target.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub extern "C" fn sysret_trampoline() {
+    // GUESS: callers (proc::clone, proc::fork_syscall) only need the
+    // address of this symbol; the body should never actually execute.
+    // A direct `ud2` matches what an empty fn lowers to in release.
+    unsafe { core::arch::asm!("ud2", options(noreturn, nomem, nostack)) }
+}

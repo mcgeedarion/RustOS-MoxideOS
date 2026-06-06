@@ -9,8 +9,18 @@
 
 use crate::device::pci::{
     self as pci_bus,
-    PciDevice,
     ecam,
+};
+pub use crate::device::pci::PciDevice;
+
+// Legacy class-tuple constants + class lookup live in the x86_64 PCI
+// driver. Re-export so callers can use the `drivers::pcie::*` path.
+#[cfg(target_arch = "x86_64")]
+pub use crate::arch::x86_64::pci::{
+    PCI_CLASS_STORAGE_AHCI,
+    PCI_CLASS_STORAGE_NVME,
+    PCI_CLASS_NETWORK_ETH,
+    find_device_by_class,
 };
 use crate::device::pci::msix::msix_configure as _msix_configure;
 
@@ -50,9 +60,11 @@ pub fn cfg_write16(bus: u8, dev: u8, func: u8, off: u16, val: u16) {
     ecam::cfg_write16(bus, dev, func, off, val)
 }
 
-/// Re-export `PciDevice` so callers using the legacy path need not
-/// change their `use` statements.
-pub use pci_bus::PciDevice as PciDevice;
+// PciDevice is already brought into scope at the top via `use crate::device::pci::PciDevice;`
+// (it is public by virtue of being defined in a pub module and re-exporting it
+//  here as a second `pub use` would shadow itself; downstream callers can use
+//  either `crate::drivers::platform::pcie::PciDevice` (via the `use` above) or
+//  `crate::device::pci::PciDevice` directly).
 
 /// Run full bus enumeration.  Delegates to `PciBus::rescan()`.
 pub fn enumerate() {

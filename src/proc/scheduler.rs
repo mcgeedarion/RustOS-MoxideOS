@@ -823,7 +823,7 @@ pub fn schedule_on(task: *mut crate::proc::task_types::Task, cpu: u32) {
     t.sched.cpumask  = 1u64 << cpu;
     t.sched.last_cpu = cpu;
     unsafe {
-        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]\
+        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
             .runqueue.enqueue(task);
     }
     crate::smp::ipi::send_reschedule(cpu);

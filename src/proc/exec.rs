@@ -650,6 +650,12 @@ fn copy_cstr_from_user(va: usize) -> Option<String> {
     core::str::from_utf8(&buf[..end]).ok().map(String::from)
 }
 
+/// Public, safe variant of [`copy_cstr_from_user`] used by fs syscalls
+/// that want to keep a single name across the tree.
+pub fn read_cstr_safe(va: usize) -> Option<String> {
+    copy_cstr_from_user(va)
+}
+
 fn copy_strvec_from_user(vec_va: usize) -> Vec<String> {
     let mut out = Vec::new();
     if vec_va == 0 { return out; }

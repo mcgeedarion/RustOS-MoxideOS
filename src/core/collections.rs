@@ -41,9 +41,7 @@ impl ListNode {
 /// # Safety
 /// `node_ptr` must return a stable pointer to a `ListNode` embedded inside
 /// `Self`.  The node must live exactly as long as `Self`.
-pub unsafe trait Linkable {
-    fn node_ptr(this: *mut Self) -> *mut ListNode;
-}
+// Linkable trait declared below (combined definition includes `from_node`).
 
 /// Intrusive doubly-linked list.
 ///
