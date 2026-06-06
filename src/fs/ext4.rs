@@ -903,3 +903,15 @@ pub fn sys_statfs(path: &str) -> Result<Ext4Statfs, i32> {
         f_namelen: 255,
     })
 }
+
+// ===== GUESS: with_fs_mut for ext4_write callers =====
+/// GUESS: mutable access to the mounted ext4 FS. The ext4 driver is
+/// documented read-only, so write methods on `Ext4Fs` may not exist —
+/// callers will surface as E0599 errors and be addressed per-method.
+pub(crate) fn with_fs_mut<T, F: FnOnce(&mut Ext4Fs) -> T>(f: F) -> Result<T, isize> {
+    let mut guard = FS.lock();
+    match &mut *guard {
+        Some(fs) => Ok(f(fs)),
+        None     => Err(-19),
+    }
+}

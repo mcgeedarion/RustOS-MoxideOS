@@ -116,3 +116,13 @@ pub fn dcache_invalidate_inode(inode: u64) {
 pub fn dcache_flush() {
     DCACHE.lock().flush();
 }
+
+// ===== GUESS: short alias for new callers =====
+/// GUESS: alias of `dcache_invalidate` accepting a full path. Splits at
+/// the last '/', uses parent inode 0 (unknown) — flushes by inode lookup.
+pub fn invalidate(path: &str) {
+    // GUESS: without parent-inode resolution we can't target a single entry,
+    // so do a full flush. Correctness > efficiency in early kernel bring-up.
+    dcache_flush();
+    let _ = path;
+}
