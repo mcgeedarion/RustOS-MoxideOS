@@ -4,7 +4,7 @@ edition = "2021"
 
 # Function formatting
 fn_single_line = false
-fn_args_layout = "Tall"
+fn_params_layout = "Tall"
 
 # Import organization
 reorder_imports = true
