@@ -837,3 +837,76 @@ pub fn parse_size(s: &str) -> Option<usize> {
     }
     s.parse::<usize>().ok()
 }
+
+// ====================================================================
+// FileOps trait + PollFlags
+// --------------------------------------------------------------------
+// Reverse-engineered from the canonical impl block at
+// `src/input/mod.rs:420` (`impl FileOps for EventNode`). Method
+// signatures are taken verbatim so EventNode continues to compile;
+// other fd types are expected to grow `impl FileOps` blocks of their
+// own as they get migrated to the trait-based dispatch path.
+// ====================================================================
+
+use crate::mm::UserBuffer;
+
+/// Poll readiness bitmask. Wraps the raw `u32` constants from
+/// `crate::fs::poll` so callers get an opaque type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PollFlags { bits: u32 }
+
+impl PollFlags {
+    pub const POLLIN:     Self = Self { bits: crate::fs::poll::POLLIN };
+    pub const POLLPRI:    Self = Self { bits: crate::fs::poll::POLLPRI };
+    pub const POLLOUT:    Self = Self { bits: crate::fs::poll::POLLOUT };
+    pub const POLLERR:    Self = Self { bits: crate::fs::poll::POLLERR };
+    pub const POLLHUP:    Self = Self { bits: crate::fs::poll::POLLHUP };
+    pub const POLLNVAL:   Self = Self { bits: crate::fs::poll::POLLNVAL };
+    pub const POLLRDNORM: Self = Self { bits: crate::fs::poll::POLLRDNORM };
+    pub const POLLWRNORM: Self = Self { bits: crate::fs::poll::POLLWRNORM };
+
+    #[inline] pub const fn empty() -> Self { Self { bits: 0 } }
+    #[inline] pub const fn bits(self) -> u32 { self.bits }
+    #[inline] pub const fn contains(self, other: Self) -> bool {
+        (self.bits & other.bits) == other.bits
+    }
+}
+
+impl core::ops::BitOr for PollFlags {
+    type Output = Self;
+    #[inline] fn bitor(self, rhs: Self) -> Self { Self { bits: self.bits | rhs.bits } }
+}
+impl core::ops::BitAnd for PollFlags {
+    type Output = Self;
+    #[inline] fn bitand(self, rhs: Self) -> Self { Self { bits: self.bits & rhs.bits } }
+}
+impl core::ops::BitOrAssign for PollFlags {
+    #[inline] fn bitor_assign(&mut self, rhs: Self) { self.bits |= rhs.bits; }
+}
+
+/// Per-fd file-operation vtable. Implemented by every fd kind that needs
+/// to participate in the unified read / write / poll / ioctl path.
+///
+/// Errno convention: returned `i32` values are negative POSIX errno codes
+/// (e.g. `-EAGAIN = -11`). Positive returns from `read` / `write` are
+/// byte counts. Positive returns from `ioctl` are operation-specific.
+pub trait FileOps: Send + Sync {
+    /// Read into the user-space buffer. `flags` carries open-time
+    /// modifiers such as `O_NONBLOCK`.
+    fn read(&self, buf: &mut UserBuffer, flags: u32) -> Result<usize, i32>;
+
+    /// Write from the user-space buffer.
+    fn write(&self, buf: &UserBuffer, flags: u32) -> Result<usize, i32>;
+
+    /// Snapshot readiness. Must not block.
+    fn poll(&self) -> PollFlags;
+
+    /// Device-specific control. `request` is the ioctl number; `arg` is
+    /// the third syscall argument (typically a user-space pointer cast
+    /// to usize). On success returns a non-negative value; on failure
+    /// returns a negative POSIX errno.
+    fn ioctl(&self, request: u32, arg: usize) -> Result<i32, i32>;
+
+    /// Called when the last fd referring to this object is closed.
+    fn close(&self);
+}
