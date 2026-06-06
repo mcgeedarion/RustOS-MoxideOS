@@ -1,19 +1,21 @@
-//! SchemeFdStore — maps kernel backing-fd numbers to (Arc<dyn Scheme>, SchemeFileId)
-//! so that read / write / close / seek can dispatch without re-hitting the
-//! scheme table or re-parsing the URL.
+//! SchemeFdStore — maps kernel backing-fd numbers to (Arc<dyn Scheme>,
+//! SchemeFileId) so that read / write / close / seek can dispatch without
+//! re-hitting the scheme table or re-parsing the URL.
 //!
 //! # Design
 //!
 //! When `proc_fd_open` resolves a scheme URL it:
-//! 1. Calls `SCHEME_TABLE.open(url, flags)` → `(Arc<dyn Scheme>, SchemeFileId)`.
+//! 1. Calls `SCHEME_TABLE.open(url, flags)` → `(Arc<dyn Scheme>,
+//!    SchemeFileId)`.
 //! 2. Calls `alloc_scheme_backing_fd()` to get a synthetic backing-fd number.
 //! 3. Inserts `(scheme, fid)` into `SCHEME_FD_STORE` keyed by that backing fd.
 //! 4. Stores the backing fd in the process `FdEntry` as usual.
 //!
 //! All subsequent I/O on the user-visible fd flows through
 //! `scheme_fd_read` / `scheme_fd_write` / `scheme_fd_seek` / `scheme_fd_ioctl`.
-//! `close_backing` calls `scheme_fd_close` which forwards to the scheme handler,
-//! removes the entry from the store, and *returns the fd to the free list*.
+//! `close_backing` calls `scheme_fd_close` which forwards to the scheme
+//! handler, removes the entry from the store, and *returns the fd to the free
+//! list*.
 //!
 //! # Backing-fd allocator
 //!
@@ -62,7 +64,8 @@ pub fn alloc_scheme_backing_fd() -> usize {
 /// Return a synthetic backing-fd to the free list.
 ///
 /// Called automatically by `scheme_fd_close`.  May also be called directly
-/// if a backing fd is recycled via a code path that does not use `scheme_fd_close`.
+/// if a backing fd is recycled via a code path that does not use
+/// `scheme_fd_close`.
 pub fn free_scheme_backing_fd(fd: usize) {
     FREE_SCHEME_FDS.lock().push(fd);
 }

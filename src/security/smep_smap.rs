@@ -30,8 +30,8 @@ pub fn cpuid_cr4_features() -> (bool, bool, bool) {
             options(nostack)
         );
     }
-    let smep = (ebx >>  7) & 1 != 0;
-    let umip = (ebx >>  2) & 1 != 0; // C4 fix: was never checked
+    let smep = (ebx >> 7) & 1 != 0;
+    let umip = (ebx >> 2) & 1 != 0; // C4 fix: was never checked
     let smap = (ebx >> 20) & 1 != 0;
     (smep, smap, umip)
 }
@@ -73,7 +73,12 @@ pub unsafe fn enforce() {
         log::warn!("smep_smap: CPU does not support UMIP - skipping");
     }
     core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
-    log::info!("smep_smap: CR4 updated: SMEP={} SMAP={} UMIP={}", has_smep, has_smap, has_umip);
+    log::info!(
+        "smep_smap: CR4 updated: SMEP={} SMAP={} UMIP={}",
+        has_smep,
+        has_smap,
+        has_umip
+    );
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -96,9 +101,11 @@ pub unsafe fn clac() {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[inline(always)] pub unsafe fn stac() {}
+#[inline(always)]
+pub unsafe fn stac() {}
 #[cfg(not(target_arch = "x86_64"))]
-#[inline(always)] pub unsafe fn clac() {}
+#[inline(always)]
+pub unsafe fn clac() {}
 
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 #[inline]
@@ -118,25 +125,27 @@ pub unsafe fn assert_smep_smap_set() {
 pub unsafe fn assert_smep_smap_set() {}
 
 pub mod pfec {
-    pub const PRESENT:      u64 = 1 << 0;
-    pub const WRITE:        u64 = 1 << 1;
-    pub const USER:         u64 = 1 << 2;
-    pub const RSVD:         u64 = 1 << 3;
-    pub const INSTR_FETCH:  u64 = 1 << 4;
-    pub const PK:           u64 = 1 << 5;
+    pub const PRESENT: u64 = 1 << 0;
+    pub const WRITE: u64 = 1 << 1;
+    pub const USER: u64 = 1 << 2;
+    pub const RSVD: u64 = 1 << 3;
+    pub const INSTR_FETCH: u64 = 1 << 4;
+    pub const PK: u64 = 1 << 5;
     pub const SHADOW_STACK: u64 = 1 << 6;
-    pub const SGX:          u64 = 1 << 15;
+    pub const SGX: u64 = 1 << 15;
 }
 
 pub fn classify_violation(error_code: u64, fault_va: u64) -> Option<&'static str> {
     use pfec::*;
     if error_code & (PRESENT | INSTR_FETCH) == (PRESENT | INSTR_FETCH)
-        && error_code & USER == 0 && fault_va < 0x0000_8000_0000_0000
+        && error_code & USER == 0
+        && fault_va < 0x0000_8000_0000_0000
     {
         return Some("SMEP");
     }
     if error_code & (PRESENT | USER) == PRESENT
-        && error_code & INSTR_FETCH == 0 && fault_va < 0x0000_8000_0000_0000
+        && error_code & INSTR_FETCH == 0
+        && fault_va < 0x0000_8000_0000_0000
     {
         return Some("SMAP");
     }

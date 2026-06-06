@@ -1,9 +1,12 @@
 //! Address Space Layout Randomisation (ASLR).
 //!
 //! Produces per-process random offsets for:
-//!   - stack base     (`aslr_stack_offset`)  — randomised in full [STACK_MIN, STACK_TOP)
-//!   - heap base      (`aslr_heap_base`)     — randomised in [HEAP_MIN, HEAP_MAX)
-//!   - mmap region    (`aslr_mmap_base`)     — randomised in [MMAP_MIN, MMAP_MAX)
+//!   - stack base     (`aslr_stack_offset`)  — randomised in full [STACK_MIN,
+//!     STACK_TOP)
+//!   - heap base      (`aslr_heap_base`)     — randomised in [HEAP_MIN,
+//!     HEAP_MAX)
+//!   - mmap region    (`aslr_mmap_base`)     — randomised in [MMAP_MIN,
+//!     MMAP_MAX)
 //!   - vDSO / vvar    (`aslr_vdso_base`)     — 1-page slot inside mmap window
 //!
 //! ## Entropy
@@ -104,7 +107,12 @@ impl AslrLayout {
         let heap_base = aslr_heap_base();
         let mmap_base = aslr_mmap_base();
         let vdso_base = aslr_vdso_base(mmap_base);
-        AslrLayout { stack_top, heap_base, mmap_base, vdso_base }
+        AslrLayout {
+            stack_top,
+            heap_base,
+            mmap_base,
+            vdso_base,
+        }
     }
 
     /// Fixed layout for the kernel-thread / idle process (no user stack).

@@ -14,12 +14,12 @@
 //!   - `entry` is a valid mapped EL0 virtual address.
 //!   - `user_sp` points to a writable mapped user stack page.
 //!   - `ttbr0` is the physical address of the process L0 page table.
-//!   - Interrupts are disabled on entry (they re-enable when SPSR.I = 0
-//!     is restored by eret).
+//!   - Interrupts are disabled on entry (they re-enable when SPSR.I = 0 is
+//!     restored by eret).
 //!   - This function never returns to the caller.
 
-use core::arch::asm;
 use crate::mm::pmm;
+use core::arch::asm;
 
 /// 16 KiB user stack (4 pages).
 const USER_STACK_PAGES: usize = 4;
@@ -39,12 +39,18 @@ pub fn alloc_user_stack(ttbr0: usize) -> Option<usize> {
 
     for i in 0..USER_STACK_PAGES {
         let pa = pmm::alloc_page()?;
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE); }
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
+        }
         let va = base + i * PAGE;
-        let flags = paging::PTE_VALID | paging::PTE_TABLE
-                  | paging::PTE_USER  | paging::PTE_AF
-                  | paging::PTE_SH_INNER;
-        unsafe { paging::map_page(ttbr0, va, pa, flags); }
+        let flags = paging::PTE_VALID
+            | paging::PTE_TABLE
+            | paging::PTE_USER
+            | paging::PTE_AF
+            | paging::PTE_SH_INNER;
+        unsafe {
+            paging::map_page(ttbr0, va, pa, flags);
+        }
     }
 
     Some(USER_STACK_TOP)

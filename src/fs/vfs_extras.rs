@@ -33,8 +33,12 @@ use spin::Mutex as SpinMutex;
 /// `None` means "leave this timestamp unchanged".
 pub fn set_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) {
     crate::fs::vfs::with_inode_mut(path, |inode| {
-        if let Some(a) = atime_ns { inode.atime_ns = a; }
-        if let Some(m) = mtime_ns { inode.mtime_ns = m; }
+        if let Some(a) = atime_ns {
+            inode.atime_ns = a;
+        }
+        if let Some(m) = mtime_ns {
+            inode.mtime_ns = m;
+        }
     });
 }
 
@@ -59,10 +63,10 @@ pub fn fdatasync_fd(fd: usize) -> isize {
 #[repr(u8)]
 #[allow(dead_code)]
 enum FlockOp {
-    SharedLock    = 1,
+    SharedLock = 1,
     ExclusiveLock = 2,
-    Unlock        = 8,
-    NonBlock      = 4,
+    Unlock = 8,
+    NonBlock = 4,
 }
 
 /// Advisory lock entry: (inode_id) → (holder_fd, shared_count, exclusive)
@@ -81,18 +85,18 @@ static FLOCK_TABLE: SpinMutex<BTreeMap<u64 /* inode_id */, AdvisoryLock>> =
 /// Returns 0 on success, -EWOULDBLOCK (-11) if LOCK_NB is set and the lock
 /// cannot be acquired, or -EINVAL (-22) for unknown operations.
 pub fn sys_flock(fd: usize, operation: i32) -> isize {
-    const LOCK_SH: i32  = 1;
-    const LOCK_EX: i32  = 2;
-    const LOCK_NB: i32  = 4;
-    const LOCK_UN: i32  = 8;
+    const LOCK_SH: i32 = 1;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    const LOCK_UN: i32 = 8;
 
-    let op_bits  = operation & !(LOCK_NB);
+    let op_bits = operation & !(LOCK_NB);
     let nonblock = (operation & LOCK_NB) != 0;
 
     // Resolve fd → inode id.
     let inode_id = match crate::fs::vfs::inode_id_of_fd(fd) {
         Some(id) => id,
-        None     => return -9, // EBADF
+        None => return -9, // EBADF
     };
 
     let mut table = FLOCK_TABLE.lock();
@@ -107,16 +111,19 @@ pub fn sys_flock(fd: usize, operation: i32) -> isize {
                 entry.shared_count -= 1;
             }
             0
-        }
+        },
         x if x == LOCK_SH => {
             // Shared lock: allowed unless an exclusive lock is held.
             if entry.exclusive_fd != 0 && entry.exclusive_fd != fd {
-                if nonblock { return -11; } // EWOULDBLOCK
-                // Blocking: spin-wait (advisory only, simple implementation).
+                if nonblock {
+                    return -11;
+                } // EWOULDBLOCK
+                  // Blocking: spin-wait (advisory only, simple implementation).
                 drop(table);
                 while crate::fs::vfs::inode_id_of_fd(fd)
                     .map(|id| {
-                        FLOCK_TABLE.lock()
+                        FLOCK_TABLE
+                            .lock()
                             .get(&id)
                             .map(|e| e.exclusive_fd != 0 && e.exclusive_fd != fd)
                             .unwrap_or(false)
@@ -132,25 +139,31 @@ pub fn sys_flock(fd: usize, operation: i32) -> isize {
                 entry.shared_count += 1;
             }
             0
-        }
+        },
         x if x == LOCK_EX => {
             // Exclusive: allowed only when no other lock is held.
-            let blocked = entry.exclusive_fd != 0 && entry.exclusive_fd != fd
-                       || entry.shared_count > 0;
+            let blocked =
+                entry.exclusive_fd != 0 && entry.exclusive_fd != fd || entry.shared_count > 0;
             if blocked {
-                if nonblock { return -11; }
+                if nonblock {
+                    return -11;
+                }
                 drop(table);
                 loop {
                     let free = crate::fs::vfs::inode_id_of_fd(fd)
                         .map(|id| {
                             let t = FLOCK_TABLE.lock();
-                            t.get(&id).map(|e| {
-                                (e.exclusive_fd == 0 || e.exclusive_fd == fd)
-                                    && e.shared_count == 0
-                            }).unwrap_or(true)
+                            t.get(&id)
+                                .map(|e| {
+                                    (e.exclusive_fd == 0 || e.exclusive_fd == fd)
+                                        && e.shared_count == 0
+                                })
+                                .unwrap_or(true)
                         })
                         .unwrap_or(true);
-                    if free { break; }
+                    if free {
+                        break;
+                    }
                     crate::proc::scheduler::schedule();
                 }
                 table = FLOCK_TABLE.lock();
@@ -160,7 +173,7 @@ pub fn sys_flock(fd: usize, operation: i32) -> isize {
                 entry.exclusive_fd = fd;
             }
             0
-        }
+        },
         _ => -22, // EINVAL
     }
 }
@@ -170,7 +183,7 @@ pub fn flock_release_fd(fd: usize) {
     let mut table = FLOCK_TABLE.lock();
     let inode_id = match crate::fs::vfs::inode_id_of_fd(fd) {
         Some(id) => id,
-        None     => return,
+        None => return,
     };
     if let Some(entry) = table.get_mut(&inode_id) {
         if entry.exclusive_fd == fd {
@@ -186,12 +199,12 @@ pub fn flock_release_fd(fd: usize) {
 /// Accepted and ignored; we have no readahead or eviction policy yet.
 /// Returns 0 (success) for all valid advice values.
 pub fn sys_posix_fadvise(_fd: usize, _offset: i64, _len: i64, advice: i32) -> isize {
-    const POSIX_FADV_NORMAL:     i32 = 0;
+    const POSIX_FADV_NORMAL: i32 = 0;
     const POSIX_FADV_SEQUENTIAL: i32 = 2;
-    const POSIX_FADV_RANDOM:     i32 = 1;
-    const POSIX_FADV_NOREUSE:    i32 = 5;
-    const POSIX_FADV_WILLNEED:   i32 = 3;
-    const POSIX_FADV_DONTNEED:   i32 = 4;
+    const POSIX_FADV_RANDOM: i32 = 1;
+    const POSIX_FADV_NOREUSE: i32 = 5;
+    const POSIX_FADV_WILLNEED: i32 = 3;
+    const POSIX_FADV_DONTNEED: i32 = 4;
     match advice {
         POSIX_FADV_NORMAL
         | POSIX_FADV_SEQUENTIAL

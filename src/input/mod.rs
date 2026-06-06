@@ -3,9 +3,9 @@
 //! # Feature gate
 //!
 //! This module is compiled only when `--features input_events` is passed.
-//! The gate is applied at `src/lib.rs` (`#[cfg(feature = "input_events")] pub mod input`).
-//! When `kernel-drivers` is split into its own crate this becomes a native
-//! feature of that crate, re-exported from the root as:
+//! The gate is applied at `src/lib.rs` (`#[cfg(feature = "input_events")] pub
+//! mod input`). When `kernel-drivers` is split into its own crate this becomes
+//! a native feature of that crate, re-exported from the root as:
 //!
 //! ```toml
 //! input_events = ["kernel-drivers/input_events"]
@@ -33,11 +33,11 @@
 
 #![allow(dead_code)]
 
-use core::{
-    sync::atomic::{AtomicU32, Ordering},
-    cell::UnsafeCell,
-};
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 pub const EV_SYN: u16 = 0x00;
 pub const EV_KEY: u16 = 0x01;
@@ -47,15 +47,15 @@ pub const EV_MSC: u16 = 0x04;
 pub const EV_LED: u16 = 0x11;
 pub const EV_MAX: u16 = 0x1f;
 
-pub const SYN_REPORT:    u16 = 0;
-pub const SYN_DROPPED:   u16 = 3;
+pub const SYN_REPORT: u16 = 0;
+pub const SYN_DROPPED: u16 = 3;
 
-pub const REL_X:  u16 = 0x00;
-pub const REL_Y:  u16 = 0x01;
+pub const REL_X: u16 = 0x00;
+pub const REL_Y: u16 = 0x01;
 pub const REL_WHEEL: u16 = 0x08;
 
-pub const BTN_LEFT:   u16 = 0x110;
-pub const BTN_RIGHT:  u16 = 0x111;
+pub const BTN_LEFT: u16 = 0x110;
+pub const BTN_RIGHT: u16 = 0x111;
 pub const BTN_MIDDLE: u16 = 0x112;
 
 /// KEY_MAX — highest key code; bitmask sent by EVIOCGBIT(EV_KEY) is
@@ -69,21 +69,21 @@ pub const KEY_MAX: u16 = 767;
 pub struct InputEvent {
     /// Seconds component of timestamp.  Set to 0 at the kernel layer;
     /// userspace that cares can stamp with `clock_gettime(CLOCK_MONOTONIC)`.
-    pub tv_sec:  i64,
+    pub tv_sec: i64,
     /// Microseconds component of timestamp.
     pub tv_usec: i64,
     /// Event type (EV_KEY, EV_REL, …)
-    pub r#type:  u16,
+    pub r#type: u16,
     /// Event code (key scancode, REL_X, …)
-    pub code:    u16,
+    pub code: u16,
     /// Event value (1 = press, 0 = release, ±delta for relative axes)
-    pub value:   i32,
+    pub value: i32,
 }
 
 const _: () = assert!(core::mem::size_of::<InputEvent>() == 24);
 
 const RING_CAP: usize = 256; // must be power of two
-const RING_MASK: u32  = (RING_CAP - 1) as u32;
+const RING_MASK: u32 = (RING_CAP - 1) as u32;
 
 /// Single-producer (driver/IRQ), single-consumer (reader task) ring buffer.
 ///
@@ -92,12 +92,12 @@ const RING_MASK: u32  = (RING_CAP - 1) as u32;
 /// `SYN_DROPPED` event is prepended to the next batch so userspace knows it
 /// missed events.
 pub struct EvdevRingBuf {
-    buf:      [UnsafeCell<InputEvent>; RING_CAP],
+    buf: [UnsafeCell<InputEvent>; RING_CAP],
     /// Index of the next slot to write (producer owns)
-    head:     AtomicU32,
+    head: AtomicU32,
     /// Index of the next slot to read (consumer owns)
-    tail:     AtomicU32,
-    dropped:  AtomicU32,
+    tail: AtomicU32,
+    dropped: AtomicU32,
 }
 
 // SAFETY: The ring is accessed only through the atomic head/tail protocol.
@@ -109,11 +109,11 @@ impl EvdevRingBuf {
     pub const fn new() -> Self {
         // SAFETY: InputEvent is POD; zero-init is valid.
         Self {
-            buf:     unsafe {
+            buf: unsafe {
                 core::mem::transmute([0u8; core::mem::size_of::<InputEvent>() * RING_CAP])
             },
-            head:    AtomicU32::new(0),
-            tail:    AtomicU32::new(0),
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
             dropped: AtomicU32::new(0),
         }
     }
@@ -132,7 +132,9 @@ impl EvdevRingBuf {
         let slot = (head & RING_MASK) as usize;
         // SAFETY: slot is within bounds; no other writer touches this slot
         // because head is owned by the producer.
-        unsafe { *self.buf[slot].get() = ev; }
+        unsafe {
+            *self.buf[slot].get() = ev;
+        }
         self.head.fetch_add(1, Ordering::Release);
     }
 
@@ -168,10 +170,10 @@ impl EvdevRingBuf {
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     /// Kernel-visible name, e.g. "RustOS Virtual Keyboard"
-    pub name:    String,
+    pub name: String,
     /// Input bus type (BUS_VIRTUAL = 0x06)
     pub bustype: u16,
-    pub vendor:  u16,
+    pub vendor: u16,
     pub product: u16,
     pub version: u16,
 }
@@ -179,9 +181,9 @@ pub struct DeviceInfo {
 impl DeviceInfo {
     pub fn keyboard() -> Self {
         Self {
-            name:    String::from("RustOS Virtual Keyboard"),
+            name: String::from("RustOS Virtual Keyboard"),
             bustype: 0x06, // BUS_VIRTUAL
-            vendor:  0x0001,
+            vendor: 0x0001,
             product: 0x0001,
             version: 0x0111, // evdev protocol version
         }
@@ -189,9 +191,9 @@ impl DeviceInfo {
 
     pub fn mouse() -> Self {
         Self {
-            name:    String::from("RustOS Virtual Mouse"),
+            name: String::from("RustOS Virtual Mouse"),
             bustype: 0x06,
-            vendor:  0x0001,
+            vendor: 0x0001,
             product: 0x0002,
             version: 0x0111,
         }
@@ -213,27 +215,29 @@ impl CapBits {
 
     pub fn set(&mut self, code: u16) {
         let byte = (code / 8) as usize;
-        let bit  = code % 8;
+        let bit = code % 8;
         if byte < self.0.len() {
             self.0[byte] |= 1 << bit;
         }
     }
 
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 pub struct InputDevice {
-    pub info:     DeviceInfo,
-    pub ring:     EvdevRingBuf,
+    pub info: DeviceInfo,
+    pub ring: EvdevRingBuf,
     /// Bitmask of supported event types (bit N = EV_* code N is supported)
-    pub ev_bits:  CapBits,
+    pub ev_bits: CapBits,
     /// Supported key codes (EVIOCGBIT(EV_KEY, …))
     pub key_bits: CapBits,
     /// Supported relative axes (EVIOCGBIT(EV_REL, …))
     pub rel_bits: CapBits,
     /// WaitQueue: readers that called `poll()` or blocking `read()` sleep
     /// here until the producer calls `wake_all()`.
-    pub waitq:    crate::sync::WaitQueue,
+    pub waitq: crate::sync::WaitQueue,
 }
 
 impl InputDevice {
@@ -247,16 +251,20 @@ impl InputDevice {
         // function keys, media keys, and BTN_MISC range so xkbcommon does
         // not complain about missing capabilities.
         let mut key = CapBits::new((KEY_MAX + 1) as usize);
-        for k in 1u16..=248 { key.set(k); }  // KEY_ESC … KEY_MICMUTE
-        for k in 256u16..=767 { key.set(k); } // BTN_MISC … KEY_MAX
+        for k in 1u16..=248 {
+            key.set(k);
+        } // KEY_ESC … KEY_MICMUTE
+        for k in 256u16..=767 {
+            key.set(k);
+        } // BTN_MISC … KEY_MAX
 
         Self {
-            info:     DeviceInfo::keyboard(),
-            ring:     EvdevRingBuf::new(),
-            ev_bits:  ev,
+            info: DeviceInfo::keyboard(),
+            ring: EvdevRingBuf::new(),
+            ev_bits: ev,
             key_bits: key,
             rel_bits: CapBits::new(0),
-            waitq:    crate::sync::WaitQueue::new(),
+            waitq: crate::sync::WaitQueue::new(),
         }
     }
 
@@ -277,12 +285,12 @@ impl InputDevice {
         rel.set(REL_WHEEL);
 
         Self {
-            info:     DeviceInfo::mouse(),
-            ring:     EvdevRingBuf::new(),
-            ev_bits:  ev,
+            info: DeviceInfo::mouse(),
+            ring: EvdevRingBuf::new(),
+            ev_bits: ev,
             key_bits: key,
             rel_bits: rel,
-            waitq:    crate::sync::WaitQueue::new(),
+            waitq: crate::sync::WaitQueue::new(),
         }
     }
 
@@ -294,8 +302,18 @@ impl InputDevice {
 
     /// Convenience: push a typed event then a SYN_REPORT.
     pub fn push_and_sync(&self, r#type: u16, code: u16, value: i32) {
-        self.push_event(InputEvent { r#type, code, value, ..Default::default() });
-        self.push_event(InputEvent { r#type: EV_SYN, code: SYN_REPORT, value: 0, ..Default::default() });
+        self.push_event(InputEvent {
+            r#type,
+            code,
+            value,
+            ..Default::default()
+        });
+        self.push_event(InputEvent {
+            r#type: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+            ..Default::default()
+        });
     }
 }
 
@@ -304,20 +322,20 @@ const MAX_DEVICES: usize = 16;
 /// Indices into `REGISTRY` for the two synthetic devices registered during
 /// `init()`.  Exposed so the compositor's `WAYLAND_INPUT_FD` can open
 /// `/dev/input/event0` (keyboard) and `/dev/input/event1` (mouse) by name.
-pub const KBD_MINOR:   usize = 0;
+pub const KBD_MINOR: usize = 0;
 pub const MOUSE_MINOR: usize = 1;
 
 struct Registry {
     devices: [Option<InputDevice>; MAX_DEVICES],
-    count:   usize,
+    count: usize,
 }
 
 impl Registry {
     const fn empty() -> Self {
         Self {
             devices: [
-                None, None, None, None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+                None, None,
             ],
             count: 0,
         }
@@ -369,16 +387,22 @@ pub fn dispatch_key(scancode: u8, pressed: bool) {
 ///
 /// `buttons` is a bitmask: bit 0 = left, bit 1 = right, bit 2 = middle.
 pub fn dispatch_mouse(dx: i8, dy: i8, buttons: u8) {
-    let Some(dev) = device(MOUSE_MINOR) else { return };
+    let Some(dev) = device(MOUSE_MINOR) else {
+        return;
+    };
     if dx != 0 {
         dev.push_event(InputEvent {
-            r#type: EV_REL, code: REL_X, value: dx as i32,
+            r#type: EV_REL,
+            code: REL_X,
+            value: dx as i32,
             ..Default::default()
         });
     }
     if dy != 0 {
         dev.push_event(InputEvent {
-            r#type: EV_REL, code: REL_Y, value: dy as i32,
+            r#type: EV_REL,
+            code: REL_Y,
+            value: dy as i32,
             ..Default::default()
         });
     }
@@ -387,13 +411,17 @@ pub fn dispatch_mouse(dx: i8, dy: i8, buttons: u8) {
     for (i, &code) in btn_codes.iter().enumerate() {
         let pressed = (buttons >> i) & 1;
         dev.push_event(InputEvent {
-            r#type: EV_KEY, code, value: pressed as i32,
+            r#type: EV_KEY,
+            code,
+            value: pressed as i32,
             ..Default::default()
         });
     }
     // Terminating SYN_REPORT
     dev.push_event(InputEvent {
-        r#type: EV_SYN, code: SYN_REPORT, value: 0,
+        r#type: EV_SYN,
+        code: SYN_REPORT,
+        value: 0,
         ..Default::default()
     });
     dev.waitq.wake_all();
@@ -411,7 +439,9 @@ pub struct EventNode {
 }
 
 impl EventNode {
-    pub fn new(minor: usize) -> Self { Self { minor } }
+    pub fn new(minor: usize) -> Self {
+        Self { minor }
+    }
 }
 
 use crate::fs::vfs_ops::{FileOps, PollFlags};
@@ -440,14 +470,12 @@ impl FileOps for EventNode {
         if dropped > 0 {
             let syn_drop = InputEvent {
                 r#type: EV_SYN,
-                code:   SYN_DROPPED,
-                value:  dropped as i32,
+                code: SYN_DROPPED,
+                value: dropped as i32,
                 ..Default::default()
             };
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &syn_drop as *const _ as *const u8, EV_SIZE)
-            };
+            let bytes =
+                unsafe { core::slice::from_raw_parts(&syn_drop as *const _ as *const u8, EV_SIZE) };
             if buf.remaining() >= EV_SIZE {
                 buf.write_bytes(bytes)?;
                 n_written += EV_SIZE;
@@ -458,10 +486,8 @@ impl FileOps for EventNode {
         loop {
             while dev.ring.is_readable() && buf.remaining() >= EV_SIZE {
                 let ev = dev.ring.pop().unwrap();
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &ev as *const _ as *const u8, EV_SIZE)
-                };
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(&ev as *const _ as *const u8, EV_SIZE) };
                 buf.write_bytes(bytes)?;
                 n_written += EV_SIZE;
             }
@@ -482,8 +508,7 @@ impl FileOps for EventNode {
     /// Returns `POLLIN | POLLRDNORM` when the ring has data, zero otherwise.
     fn poll(&self) -> PollFlags {
         match device(self.minor) {
-            Some(dev) if dev.ring.is_readable() =>
-                PollFlags::POLLIN | PollFlags::POLLRDNORM,
+            Some(dev) if dev.ring.is_readable() => PollFlags::POLLIN | PollFlags::POLLRDNORM,
             _ => PollFlags::empty(),
         }
     }
@@ -514,10 +539,15 @@ impl FileOps for EventNode {
             EVIOCGID => {
                 // struct input_id { bustype, vendor, product, version } (4×u16)
                 #[repr(C)]
-                struct InputId { bustype: u16, vendor: u16, product: u16, version: u16 }
+                struct InputId {
+                    bustype: u16,
+                    vendor: u16,
+                    product: u16,
+                    version: u16,
+                }
                 let id = InputId {
                     bustype: dev.info.bustype,
-                    vendor:  dev.info.vendor,
+                    vendor: dev.info.vendor,
                     product: dev.info.product,
                     version: dev.info.version,
                 };
@@ -526,42 +556,34 @@ impl FileOps for EventNode {
                     dst.write(id);
                 }
                 Ok(0)
-            }
+            },
             r if (r & 0xffff) == EVIOCGNAME_BASE => {
                 let max_len = ((r >> 16) & 0x3fff) as usize;
                 let name = dev.info.name.as_bytes();
                 let copy_len = name.len().min(max_len.saturating_sub(1));
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        name.as_ptr(),
-                        arg as *mut u8,
-                        copy_len,
-                    );
+                    core::ptr::copy_nonoverlapping(name.as_ptr(), arg as *mut u8, copy_len);
                     *((arg + copy_len) as *mut u8) = 0; // NUL terminator
                 }
                 Ok((copy_len + 1) as i32)
-            }
+            },
             r if (r & 0xffff) >= EVIOCGBIT_BASE
                 && (r & 0xffff) <= EVIOCGBIT_BASE + EV_MAX as u32 =>
             {
                 let ev_type = (r & 0xffff) - EVIOCGBIT_BASE;
                 let max_bytes = ((r >> 16) & 0x3fff) as usize;
                 let bits: &[u8] = match ev_type as u16 {
-                    0            => dev.ev_bits.as_bytes(),
-                    EV_KEY       => dev.key_bits.as_bytes(),
-                    EV_REL       => dev.rel_bits.as_bytes(),
-                    _            => return Err(-ENOTTY),
+                    0 => dev.ev_bits.as_bytes(),
+                    EV_KEY => dev.key_bits.as_bytes(),
+                    EV_REL => dev.rel_bits.as_bytes(),
+                    _ => return Err(-ENOTTY),
                 };
                 let copy_len = bits.len().min(max_bytes);
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        bits.as_ptr(),
-                        arg as *mut u8,
-                        copy_len,
-                    );
+                    core::ptr::copy_nonoverlapping(bits.as_ptr(), arg as *mut u8, copy_len);
                 }
                 Ok(copy_len as i32)
-            }
+            },
             _ => Err(-ENOTTY),
         }
     }
@@ -571,16 +593,22 @@ impl FileOps for EventNode {
         Err(-1) // EPERM
     }
 
-    fn close(&self) { /* nothing to do; per-fd ring isolation not yet implemented */ }
+    fn close(&self) { // nothing to do; per-fd ring isolation not yet
+                      // implemented
+    }
 }
 
 /// Register the two synthetic input devices (keyboard + mouse) and return
 /// their minor indices.  Called from `kernel_main` before `devfs::init()`.
 pub fn init() {
-    let kbd_minor   = register_device(InputDevice::new_keyboard());
+    let kbd_minor = register_device(InputDevice::new_keyboard());
     let mouse_minor = register_device(InputDevice::new_mouse());
-    assert_eq!(kbd_minor,   KBD_MINOR);
+    assert_eq!(kbd_minor, KBD_MINOR);
     assert_eq!(mouse_minor, MOUSE_MINOR);
-    log::info!("input: registered {} devices (kbd=event{}, mouse=event{})",
-        device_count(), KBD_MINOR, MOUSE_MINOR);
+    log::info!(
+        "input: registered {} devices (kbd=event{}, mouse=event{})",
+        device_count(),
+        KBD_MINOR,
+        MOUSE_MINOR
+    );
 }

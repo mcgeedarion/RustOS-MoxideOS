@@ -9,11 +9,11 @@
 //!   Byte 1: X movement delta (2’s complement)
 //!   Byte 2: Y movement delta (2’s complement, positive = up)
 
+use crate::drivers::input::evdev::{self, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, REL_X, REL_Y};
 use spin::Mutex;
-use crate::drivers::input::evdev::{self, REL_X, REL_Y, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE};
 
 struct MouseState {
-    buf:   [u8; 3],
+    buf: [u8; 3],
     phase: usize,
 }
 
@@ -51,17 +51,25 @@ fn decode_packet(b0: u8, b1: u8, b2: u8) {
     let ys = (b0 & 0x20) != 0;
     let mut dx = b1 as i32;
     let mut dy = b2 as i32;
-    if xs { dx -= 256; }
-    if ys { dy -= 256; }
+    if xs {
+        dx -= 256;
+    }
+    if ys {
+        dy -= 256;
+    }
     // PS/2 Y is inverted vs evdev convention.
     dy = -dy;
 
-    if dx != 0 { evdev::push_rel(REL_X, dx); }
-    if dy != 0 { evdev::push_rel(REL_Y, dy); }
+    if dx != 0 {
+        evdev::push_rel(REL_X, dx);
+    }
+    if dy != 0 {
+        evdev::push_rel(REL_Y, dy);
+    }
 
     // Buttons.
-    evdev::push_key(BTN_LEFT,   (b0 & 0x01) as i32);
-    evdev::push_key(BTN_RIGHT,  (b0 & 0x02) as i32 >> 1);
+    evdev::push_key(BTN_LEFT, (b0 & 0x01) as i32);
+    evdev::push_key(BTN_RIGHT, (b0 & 0x02) as i32 >> 1);
     evdev::push_key(BTN_MIDDLE, (b0 & 0x04) as i32 >> 2);
 
     evdev::sync();

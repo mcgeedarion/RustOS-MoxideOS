@@ -1,6 +1,6 @@
 //! Network interface ioctl handlers (SIOC*).
-use crate::uaccess::{copy_from_user, copy_to_user};
 use super::consts::*;
+use crate::uaccess::{copy_from_user, copy_to_user};
 
 pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
     match req {
@@ -8,12 +8,12 @@ pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
             // arg is ifreq: first 16 bytes = ifr_name, next bytes = ifr_ifindex
             let mut ifr = [0u8; 40];
             copy_from_user(arg, &mut ifr);
-            let idx = u32::from_ne_bytes(ifr[16..20].try_into().unwrap_or([0;4]));
+            let idx = u32::from_ne_bytes(ifr[16..20].try_into().unwrap_or([0; 4]));
             let name: &[u8] = if idx == 1 { b"eth0\0" } else { b"lo\0" };
             ifr[..name.len()].copy_from_slice(name);
             copy_to_user(arg, &ifr);
             0
-        }
+        },
         SIOCGIFFLAGS => {
             let mut ifr = [0u8; 40];
             copy_from_user(arg, &mut ifr);
@@ -22,7 +22,7 @@ pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
             ifr[16..18].copy_from_slice(&flags.to_ne_bytes());
             copy_to_user(arg, &ifr);
             0
-        }
+        },
         SIOCSIFFLAGS => 0,
         SIOCGIFADDR => {
             let mut ifr = [0u8; 40];
@@ -34,7 +34,7 @@ pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
             ifr[20..24].copy_from_slice(&our_ip.to_be_bytes());
             copy_to_user(arg, &ifr);
             0
-        }
+        },
         SIOCSIFADDR => 0,
         SIOCGIFNETMASK => {
             let mut ifr = [0u8; 40];
@@ -43,7 +43,7 @@ pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
             ifr[20..24].copy_from_slice(&mask.to_be_bytes());
             copy_to_user(arg, &ifr);
             0
-        }
+        },
         SIOCSIFNETMASK => 0,
         SIOCGIFHWADDR => {
             let mut ifr = [0u8; 40];
@@ -51,27 +51,27 @@ pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
             ifr[16..22].copy_from_slice(&mac);
             copy_to_user(arg, &ifr);
             0
-        }
+        },
         SIOCGIFMTU => {
             let mut ifr = [0u8; 40];
             let mtu: u32 = 1500;
             ifr[16..20].copy_from_slice(&mtu.to_ne_bytes());
             copy_to_user(arg, &ifr);
             0
-        }
-        SIOCSIFMTU  => 0,
+        },
+        SIOCSIFMTU => 0,
         SIOCGIFINDEX => {
             let mut ifr = [0u8; 40];
             let idx: u32 = 1;
             ifr[16..20].copy_from_slice(&idx.to_ne_bytes());
             copy_to_user(arg, &ifr);
             0
-        }
+        },
         SIOCGIFCONF => {
             // ifconf: ifc_len(i32) + ifc_buf ptr
             let mut ifc = [0u8; 16];
             copy_from_user(arg, &mut ifc);
-            let buf_va  = usize::from_ne_bytes(ifc[8..16].try_into().unwrap_or([0;8]));
+            let buf_va = usize::from_ne_bytes(ifc[8..16].try_into().unwrap_or([0; 8]));
             // Write one ifreq for eth0
             if buf_va != 0 {
                 let mut ifr = [0u8; 40];
@@ -85,9 +85,9 @@ pub fn sioc_ioctl(req: usize, arg: usize) -> isize {
             ifc[..4].copy_from_slice(&count.to_ne_bytes());
             copy_to_user(arg, &ifc);
             0
-        }
+        },
         SIOCADDRT | SIOCDELRT => 0,
-        SIOCGARP  | SIOCSARP  | SIOCDARP => 0,
+        SIOCGARP | SIOCSARP | SIOCDARP => 0,
         SIOCETHTOOL => 0,
         _ => -25,
     }

@@ -22,12 +22,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TraceKind {
-    SyscallEnter  = 0,
-    SyscallExit   = 1,
-    IrqDispatch   = 2,
-    SchedSwitch   = 3,
-    FuncEnter     = 4,
-    FuncExit      = 5,
+    SyscallEnter = 0,
+    SyscallExit = 1,
+    IrqDispatch = 2,
+    SchedSwitch = 3,
+    FuncEnter = 4,
+    FuncExit = 5,
 }
 
 /// A single trace record written into the ring buffer.
@@ -35,11 +35,12 @@ pub enum TraceKind {
 #[repr(C)]
 pub struct TraceEvent {
     /// Event category.
-    pub kind:  TraceKind,
+    pub kind: TraceKind,
     /// Context-dependent ID: syscall number, IRQ number, or PID.
-    pub id:    u32,
-    /// Context-dependent payload: return value, target PID, or function address.
-    pub arg:   u64,
+    pub id: u32,
+    /// Context-dependent payload: return value, target PID, or function
+    /// address.
+    pub arg: u64,
     /// Hardware timestamp (RISC-V `cycle` CSR or x86_64 `rdtsc`).
     pub ticks: u64,
 }
@@ -53,14 +54,16 @@ const RING_SIZE: usize = 4096;
 struct RingBuf([core::cell::UnsafeCell<TraceEvent>; RING_SIZE]);
 unsafe impl Sync for RingBuf {}
 
-static RING: RingBuf = RingBuf([const {
-    core::cell::UnsafeCell::new(TraceEvent {
-        kind:  TraceKind::SyscallEnter,
-        id:    0,
-        arg:   0,
-        ticks: 0,
-    })
-}; RING_SIZE]);
+static RING: RingBuf = RingBuf(
+    [const {
+        core::cell::UnsafeCell::new(TraceEvent {
+            kind: TraceKind::SyscallEnter,
+            id: 0,
+            arg: 0,
+            ticks: 0,
+        })
+    }; RING_SIZE],
+);
 
 /// Monotonically-increasing tail (producer cursor).
 static TAIL: AtomicUsize = AtomicUsize::new(0);

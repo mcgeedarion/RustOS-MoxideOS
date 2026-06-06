@@ -15,22 +15,19 @@
 //! 3. Driver calls `sys_scheme_register("blk", ep)`.
 //! 4. Kernel wraps `ep` in an `IpcProxyScheme` and inserts it into
 //!    `SCHEME_TABLE` under the key `"blk"`.
-//! 5. Any process that calls `open("blk:vda", ...)` now routes through
-//!    the driver transparently.
-//! 6. When the driver exits (or calls `sys_scheme_unregister`), the
-//!    kernel removes the entry; subsequent opens return `ENOENT`.
+//! 5. Any process that calls `open("blk:vda", ...)` now routes through the
+//!    driver transparently.
+//! 6. When the driver exits (or calls `sys_scheme_unregister`), the kernel
+//!    removes the entry; subsequent opens return `ENOENT`.
 
 use alloc::sync::Arc;
 
 use scheme_api::IpcEndpoint;
 
 use crate::{
-    proc::current_process,
+    fs::{ipc_proxy_scheme::IpcProxyScheme, scheme_table::SCHEME_TABLE},
     kernel::capabilities::Capability,
-    fs::{
-        scheme_table::SCHEME_TABLE,
-        ipc_proxy_scheme::IpcProxyScheme,
-    },
+    proc::current_process,
 };
 
 /// Error codes for scheme syscalls.
@@ -40,11 +37,11 @@ pub enum SchemeSysError {
     /// Caller does not hold `CAP_DRIVER` (required to register a scheme).
     PermissionDenied = -1,
     /// `name` contains illegal characters or is empty.
-    InvalidName      = -2,
+    InvalidName = -2,
     /// A scheme with this name is already registered by a different process.
-    AlreadyExists    = -3,
+    AlreadyExists = -3,
     /// No scheme with this name is registered by the calling process.
-    NotFound         = -4,
+    NotFound = -4,
 }
 
 /// Register `endpoint` as the handler for scheme `name`.
@@ -58,13 +55,10 @@ pub enum SchemeSysError {
 /// its endpoint (e.g. after a restart).
 ///
 /// # Arguments
-/// - `name`     — scheme prefix, e.g. `"blk"` or `"net"`.  ASCII
-///               alphanumeric + `_` + `-` only; must not contain `':'`.
+/// - `name`     — scheme prefix, e.g. `"blk"` or `"net"`.  ASCII alphanumeric +
+///   `_` + `-` only; must not contain `':'`.
 /// - `endpoint` — IPC endpoint that will receive `SchemeRequest` messages.
-pub fn sys_scheme_register(
-    name:     &str,
-    endpoint: IpcEndpoint,
-) -> Result<(), SchemeSysError> {
+pub fn sys_scheme_register(name: &str, endpoint: IpcEndpoint) -> Result<(), SchemeSysError> {
     let proc = current_process();
 
     // Only privileged (driver) processes may publish schemes.
@@ -75,7 +69,9 @@ pub fn sys_scheme_register(
     // Validate the name.
     if name.is_empty()
         || name.contains(':')
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err(SchemeSysError::InvalidName);
     }
@@ -88,8 +84,11 @@ pub fn sys_scheme_register(
     // auto-unregister the scheme when the process exits.
     proc.register_owned_scheme(alloc::string::String::from(name));
 
-    log::info!("[scheme] process {} registered scheme \"{}\"\n",
-               proc.pid(), name);
+    log::info!(
+        "[scheme] process {} registered scheme \"{}\"\n",
+        proc.pid(),
+        name
+    );
     Ok(())
 }
 
@@ -110,7 +109,10 @@ pub fn sys_scheme_unregister(name: &str) -> Result<(), SchemeSysError> {
     SCHEME_TABLE.unregister(name);
     proc.unregister_owned_scheme(name);
 
-    log::info!("[scheme] process {} unregistered scheme \"{}\"\n",
-               proc.pid(), name);
+    log::info!(
+        "[scheme] process {} unregistered scheme \"{}\"\n",
+        proc.pid(),
+        name
+    );
     Ok(())
 }

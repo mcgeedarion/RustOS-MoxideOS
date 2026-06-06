@@ -7,14 +7,14 @@
 use core::mem;
 
 pub mod op {
-    pub const NOP:     u8 = 0;
-    pub const READV:   u8 = 1;
-    pub const WRITEV:  u8 = 2;
-    pub const READ:    u8 = 22; // IORING_OP_READ   (fixed-buffer variant)
-    pub const WRITE:   u8 = 23; // IORING_OP_WRITE
-    pub const ACCEPT:  u8 = 13; // IORING_OP_ACCEPT
+    pub const NOP: u8 = 0;
+    pub const READV: u8 = 1;
+    pub const WRITEV: u8 = 2;
+    pub const READ: u8 = 22; // IORING_OP_READ   (fixed-buffer variant)
+    pub const WRITE: u8 = 23; // IORING_OP_WRITE
+    pub const ACCEPT: u8 = 13; // IORING_OP_ACCEPT
     pub const CONNECT: u8 = 16; // IORING_OP_CONNECT
-    pub const CLOSE:   u8 = 19; // IORING_OP_CLOSE
+    pub const CLOSE: u8 = 19; // IORING_OP_CLOSE
     pub const TIMEOUT: u8 = 11; // IORING_OP_TIMEOUT
 }
 
@@ -22,13 +22,13 @@ pub mod sqe_flags {
     /// Use fixed (pre-registered) file descriptor index.
     pub const FIXED_FILE: u8 = 1 << 0;
     /// Drain all previously submitted SQEs before issuing this one.
-    pub const IO_DRAIN:   u8 = 1 << 1;
+    pub const IO_DRAIN: u8 = 1 << 1;
     /// Link this SQE to the next; the next runs only if this succeeds.
-    pub const IO_LINK:    u8 = 1 << 2;
+    pub const IO_LINK: u8 = 1 << 2;
     /// Perform the operation on a hardlink; fail-safe variant of IO_LINK.
     pub const IO_HARDLINK: u8 = 1 << 3;
     /// Always perform the operation asynchronously.
-    pub const ASYNC:      u8 = 1 << 4;
+    pub const ASYNC: u8 = 1 << 4;
 }
 
 /// One entry in the submission queue.

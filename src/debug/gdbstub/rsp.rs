@@ -20,19 +20,15 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::target::GdbTarget;
 use super::breakpoints::{
-    SwBreakpointTable, HwBreakpointTable, WatchpointTable, WatchKind,
-    riscv_add_trigger, riscv_remove_trigger,
-    RISCV_TRIG_EXEC, RISCV_TRIG_STORE, RISCV_TRIG_LOAD,
+    riscv_add_trigger, riscv_remove_trigger, HwBreakpointTable, SwBreakpointTable, WatchKind,
+    WatchpointTable, RISCV_TRIG_EXEC, RISCV_TRIG_LOAD, RISCV_TRIG_STORE,
 };
+use super::target::GdbTarget;
 use crate::proc::ptrace::{
-    UREG_COUNT, UREG_RIP, UREG_RSP, UREG_EFLAGS,
-    UREG_RAX, UREG_RBX, UREG_RCX, UREG_RDX,
-    UREG_RSI, UREG_RDI, UREG_RBP,
-    UREG_R8, UREG_R9, UREG_R10, UREG_R11,
-    UREG_R12, UREG_R13, UREG_R14, UREG_R15,
-    UREG_CS, UREG_SS,
+    UREG_COUNT, UREG_CS, UREG_EFLAGS, UREG_R10, UREG_R11, UREG_R12, UREG_R13, UREG_R14, UREG_R15,
+    UREG_R8, UREG_R9, UREG_RAX, UREG_RBP, UREG_RBX, UREG_RCX, UREG_RDI, UREG_RDX, UREG_RIP,
+    UREG_RSI, UREG_RSP, UREG_SS,
 };
 
 /// Wrap a response body in RSP `+$<body>#<checksum>`.
@@ -56,7 +52,7 @@ fn decode_hex_bytes(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len() / 2);
     let mut i = 0;
     while i + 1 < b.len() {
-        if let (Some(hi), Some(lo)) = (from_hex(b[i]), from_hex(b[i+1])) {
+        if let (Some(hi), Some(lo)) = (from_hex(b[i]), from_hex(b[i + 1])) {
             out.push((hi << 4) | lo);
         }
         i += 2;
@@ -92,15 +88,39 @@ const GDB_REG_COUNT: usize = 32;
 
 fn gdb_reg_order() -> [usize; GDB_REG_COUNT] {
     [
-        UREG_RAX, UREG_RCX, UREG_RDX, UREG_RBX,
-        UREG_RSP, UREG_RBP, UREG_RSI, UREG_RDI,
-        UREG_R8,  UREG_R9,  UREG_R10, UREG_R11,
-        UREG_R12, UREG_R13, UREG_R14, UREG_R15,
-        UREG_RIP, UREG_EFLAGS, UREG_CS, UREG_SS,
+        UREG_RAX,
+        UREG_RCX,
+        UREG_RDX,
+        UREG_RBX,
+        UREG_RSP,
+        UREG_RBP,
+        UREG_RSI,
+        UREG_RDI,
+        UREG_R8,
+        UREG_R9,
+        UREG_R10,
+        UREG_R11,
+        UREG_R12,
+        UREG_R13,
+        UREG_R14,
+        UREG_R15,
+        UREG_RIP,
+        UREG_EFLAGS,
+        UREG_CS,
+        UREG_SS,
         // regs 20-31: fs/gs/ds/es + 8 padding
-        UREG_COUNT, UREG_COUNT, UREG_COUNT, UREG_COUNT,
-        UREG_COUNT, UREG_COUNT, UREG_COUNT, UREG_COUNT,
-        UREG_COUNT, UREG_COUNT, UREG_COUNT, UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
+        UREG_COUNT,
     ]
 }
 
@@ -108,9 +128,9 @@ fn gdb_reg_order() -> [usize; GDB_REG_COUNT] {
 /// `Z`/`z` byte has been stripped).
 fn parse_zpacket(rest: &str) -> Option<(u8, u64, usize)> {
     let mut it = rest.splitn(3, ',');
-    let t    = u8::from_str_radix(it.next()?, 16).ok()?;
+    let t = u8::from_str_radix(it.next()?, 16).ok()?;
     let addr = parse_hex_u64(it.next()?);
-    let len  = usize::from_str_radix(it.next()?, 16).unwrap_or(1);
+    let len = usize::from_str_radix(it.next()?, 16).unwrap_or(1);
     Some((t, addr, len))
 }
 
@@ -119,16 +139,16 @@ fn parse_zpacket(rest: &str) -> Option<(u8, u64, usize)> {
 // the target so the tables survive across calls.
 
 pub struct Session {
-    pub sw_bps:  SwBreakpointTable,
-    pub hw_bps:  HwBreakpointTable,
+    pub sw_bps: SwBreakpointTable,
+    pub hw_bps: HwBreakpointTable,
     pub watches: WatchpointTable,
 }
 
 impl Session {
     pub fn new() -> Self {
         Session {
-            sw_bps:  SwBreakpointTable::new(),
-            hw_bps:  HwBreakpointTable::new(),
+            sw_bps: SwBreakpointTable::new(),
+            hw_bps: HwBreakpointTable::new(),
             watches: WatchpointTable::new(),
         }
     }
@@ -146,7 +166,9 @@ impl Session {
 /// empty string for packets where GDB expects no reply until the next stop
 /// event (e.g. `c`, `s`).
 pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) -> String {
-    if body.is_empty() { return rsp_packet(""); }
+    if body.is_empty() {
+        return rsp_packet("");
+    }
 
     match body.as_bytes()[0] {
         b'?' => {
@@ -156,7 +178,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             } else {
                 rsp_packet("T05")
             }
-        }
+        },
 
         b'g' => {
             let regs = target.read_regs();
@@ -167,7 +189,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
                 hex.push_str(&u64_le_hex(val));
             }
             rsp_packet(&hex)
-        }
+        },
 
         b'G' => {
             let hex = &body[1..];
@@ -175,35 +197,43 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             let order = gdb_reg_order();
             let mut regs = target.read_regs();
             for (i, &idx) in order.iter().enumerate() {
-                if idx >= UREG_COUNT { continue; }
+                if idx >= UREG_COUNT {
+                    continue;
+                }
                 let off = i * 8;
-                if off + 8 > bytes.len() { break; }
-                regs[idx] = u64::from_le_bytes(bytes[off..off+8].try_into().unwrap());
+                if off + 8 > bytes.len() {
+                    break;
+                }
+                regs[idx] = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
             }
             target.write_regs(&regs);
             rsp_packet("OK")
-        }
+        },
 
         b'm' => {
             let rest = &body[1..];
             let mut parts = rest.splitn(2, ',');
             let addr = parse_hex_u64(parts.next().unwrap_or(""));
-            let len  = parse_hex_u64(parts.next().unwrap_or("")) as usize;
+            let len = parse_hex_u64(parts.next().unwrap_or("")) as usize;
             let data = target.read_mem(addr, len);
             rsp_packet(&encode_hex_bytes(&data))
-        }
+        },
 
         b'M' => {
             let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
             let addr_len = &rest[..colon];
-            let hex_data = if colon < rest.len() { &rest[colon+1..] } else { "" };
+            let hex_data = if colon < rest.len() {
+                &rest[colon + 1..]
+            } else {
+                ""
+            };
             let mut al = addr_len.splitn(2, ',');
             let addr = parse_hex_u64(al.next().unwrap_or(""));
             let data = decode_hex_bytes(hex_data);
             target.write_mem(addr, &data);
             rsp_packet("OK")
-        }
+        },
 
         b'c' => {
             let rest = &body[1..];
@@ -215,7 +245,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             }
             target.ctl("cont");
             String::new() // no reply until next stop
-        }
+        },
 
         b's' => {
             let rest = &body[1..];
@@ -227,13 +257,13 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             }
             target.ctl("step");
             String::new() // no reply until next stop
-        }
+        },
 
         b'k' => {
             session.detach(target);
             crate::proc::signal::send_signal(target.pid, 9);
             rsp_packet("OK")
-        }
+        },
 
         // Z0,addr,len  software breakpoint
         // Z1,addr,len  hardware execution breakpoint
@@ -245,25 +275,34 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
                 None => false,
                 Some((0, addr, _len)) => session.sw_bps.add(target, addr),
                 Some((1, addr, _len)) => session.hw_bps.add_exec(target, addr),
-                Some((2, addr, len))  => session.watches.add(target, addr, len, WatchKind::Write),
-                Some((3, addr, len))  => session.watches.add(target, addr, len, WatchKind::Read),
-                Some((4, addr, len))  => session.watches.add(target, addr, len, WatchKind::Access),
+                Some((2, addr, len)) => session.watches.add(target, addr, len, WatchKind::Write),
+                Some((3, addr, len)) => session.watches.add(target, addr, len, WatchKind::Read),
+                Some((4, addr, len)) => session.watches.add(target, addr, len, WatchKind::Access),
                 Some(_) => false,
             };
-            if ok { rsp_packet("OK") } else { rsp_packet("E01") }
-        }
+            if ok {
+                rsp_packet("OK")
+            } else {
+                rsp_packet("E01")
+            }
+        },
 
         b'z' => {
             let ok = match parse_zpacket(&body[1..]) {
                 None => false,
-                Some((0, addr, _))   => session.sw_bps.remove(target, addr),
-                Some((1, addr, _))   => session.hw_bps.remove(target, addr),
-                Some((2, addr, _)) | Some((3, addr, _)) | Some((4, addr, _))
-                                     => session.watches.remove(target, addr),
+                Some((0, addr, _)) => session.sw_bps.remove(target, addr),
+                Some((1, addr, _)) => session.hw_bps.remove(target, addr),
+                Some((2, addr, _)) | Some((3, addr, _)) | Some((4, addr, _)) => {
+                    session.watches.remove(target, addr)
+                },
                 Some(_) => false,
             };
-            if ok { rsp_packet("OK") } else { rsp_packet("E01") }
-        }
+            if ok {
+                rsp_packet("OK")
+            } else {
+                rsp_packet("E01")
+            }
+        },
 
         b'q' => {
             if body.starts_with("qSupported") {
@@ -277,7 +316,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             } else {
                 rsp_packet("") // unsupported query
             }
-        }
+        },
 
         _ => rsp_packet(""), // unsupported
     }

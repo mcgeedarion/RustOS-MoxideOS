@@ -25,33 +25,32 @@
 //! (integration point: replace with `vmm::find_free_region`).
 
 extern crate alloc;
-use alloc::{
-    collections::BTreeMap,
-    vec::Vec,
+use crate::ipc::{
+    check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT,
 };
+use alloc::{collections::BTreeMap, vec::Vec};
 use spin::Mutex;
-use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
 pub const SHM_RDONLY: i32 = 0o10000;
-pub const SHM_RND:    i32 = 0o20000;
-pub const SHM_EXEC:   i32 = 0o100000;
+pub const SHM_RND: i32 = 0o20000;
+pub const SHM_EXEC: i32 = 0o100000;
 
 const PAGE_SIZE: usize = 4096;
 
 /// Kernel-side shared memory segment.
 struct ShmSegment {
-    perm:    IpcPerm,
-    size:    usize,
-    frames:  Vec<usize>, // physical page addresses
-    nattch:  usize,      // number of current attaches
-    cpid:    u32,
-    lpid:    u32,
-    removed: bool,       // IPC_RMID was issued; free on last detach
+    perm: IpcPerm,
+    size: usize,
+    frames: Vec<usize>, // physical page addresses
+    nattch: usize,      // number of current attaches
+    cpid: u32,
+    lpid: u32,
+    removed: bool, // IPC_RMID was issued; free on last detach
 }
 
 use alloc::sync::Arc;
 static SHM_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<ShmSegment>>>> = Mutex::new(BTreeMap::new());
-static NEXT_ID:   Mutex<i32>                                    = Mutex::new(1);
+static NEXT_ID: Mutex<i32> = Mutex::new(1);
 
 /// Per-process attach table: `(shmid, va)` pairs.
 static ATTACH_TABLE: Mutex<BTreeMap<(usize, usize), i32>> = Mutex::new(BTreeMap::new());
@@ -65,42 +64,54 @@ fn alloc_id() -> i32 {
 }
 
 pub fn shmget(key: i32, size: usize, shmflg: i32) -> Result<i32, isize> {
-    if size == 0 { return Err(-22); } // EINVAL
+    if size == 0 {
+        return Err(-22);
+    } // EINVAL
     let pages = size.div_ceil(PAGE_SIZE);
     let mut tbl = SHM_TABLE.lock();
 
     if key == IPC_PRIVATE {
         let frames = alloc_frames(pages)?;
         let id = alloc_id();
-        tbl.insert(id, Arc::new(Mutex::new(ShmSegment {
-            perm:    IpcPerm::new(IPC_PRIVATE, 0, 0, (shmflg & 0o777) as u16),
-            size:    pages * PAGE_SIZE,
-            frames,
-            nattch:  0,
-            cpid:    crate::proc::scheduler::current_pid() as u32,
-            lpid:    0,
-            removed: false,
-        })));
+        tbl.insert(
+            id,
+            Arc::new(Mutex::new(ShmSegment {
+                perm: IpcPerm::new(IPC_PRIVATE, 0, 0, (shmflg & 0o777) as u16),
+                size: pages * PAGE_SIZE,
+                frames,
+                nattch: 0,
+                cpid: crate::proc::scheduler::current_pid() as u32,
+                lpid: 0,
+                removed: false,
+            })),
+        );
         return Ok(id);
     }
 
     if let Some((&id, _)) = tbl.iter().find(|(_, s)| s.lock().perm.key == key) {
-        if shmflg & IPC_CREAT != 0 && shmflg & IPC_EXCL != 0 { return Err(-17); } // EEXIST
+        if shmflg & IPC_CREAT != 0 && shmflg & IPC_EXCL != 0 {
+            return Err(-17);
+        } // EEXIST
         return Ok(id);
     }
-    if shmflg & IPC_CREAT == 0 { return Err(-2); } // ENOENT
+    if shmflg & IPC_CREAT == 0 {
+        return Err(-2);
+    } // ENOENT
 
     let frames = alloc_frames(pages)?;
     let id = alloc_id();
-    tbl.insert(id, Arc::new(Mutex::new(ShmSegment {
-        perm:    IpcPerm::new(key, 0, 0, (shmflg & 0o777) as u16),
-        size:    pages * PAGE_SIZE,
-        frames,
-        nattch:  0,
-        cpid:    crate::proc::scheduler::current_pid() as u32,
-        lpid:    0,
-        removed: false,
-    })));
+    tbl.insert(
+        id,
+        Arc::new(Mutex::new(ShmSegment {
+            perm: IpcPerm::new(key, 0, 0, (shmflg & 0o777) as u16),
+            size: pages * PAGE_SIZE,
+            frames,
+            nattch: 0,
+            cpid: crate::proc::scheduler::current_pid() as u32,
+            lpid: 0,
+            removed: false,
+        })),
+    );
     Ok(id)
 }
 
@@ -111,7 +122,12 @@ pub fn shmat(shmid: i32, shmaddr: usize, shmflg: i32) -> Result<usize, isize> {
     };
     let mut seg = arc.lock();
 
-    if !check_perm(&seg.perm, 0, 0, if shmflg & SHM_RDONLY != 0 { 0o4 } else { 0o6 }) {
+    if !check_perm(
+        &seg.perm,
+        0,
+        0,
+        if shmflg & SHM_RDONLY != 0 { 0o4 } else { 0o6 },
+    ) {
         return Err(-13); // EACCES
     }
 
@@ -124,15 +140,17 @@ pub fn shmat(shmid: i32, shmaddr: usize, shmflg: i32) -> Result<usize, isize> {
     let hint = if shmaddr == 0 {
         crate::proc::scheduler::current_mmap_base()
     } else {
-        if shmflg & SHM_RND != 0 { shmaddr & !(65536 - 1) } else { shmaddr }
+        if shmflg & SHM_RND != 0 {
+            shmaddr & !(65536 - 1)
+        } else {
+            shmaddr
+        }
     };
 
-    let va = crate::mm::vmm::map_range(
-        hint, seg.size, prot, &seg.frames,
-    )?;
+    let va = crate::mm::vmm::map_range(hint, seg.size, prot, &seg.frames)?;
 
     seg.nattch += 1;
-    seg.lpid    = crate::proc::scheduler::current_pid() as u32;
+    seg.lpid = crate::proc::scheduler::current_pid() as u32;
 
     let pid = crate::proc::scheduler::current_pid();
     ATTACH_TABLE.lock().insert((pid, va), shmid);
@@ -141,7 +159,10 @@ pub fn shmat(shmid: i32, shmaddr: usize, shmflg: i32) -> Result<usize, isize> {
 
 pub fn shmdt(shmaddr: usize) -> Result<(), isize> {
     let pid = crate::proc::scheduler::current_pid();
-    let shmid = ATTACH_TABLE.lock().remove(&(pid, shmaddr)).ok_or(-22isize)?;
+    let shmid = ATTACH_TABLE
+        .lock()
+        .remove(&(pid, shmaddr))
+        .ok_or(-22isize)?;
 
     crate::mm::vmm::unmap_range(shmaddr);
 
@@ -150,7 +171,7 @@ pub fn shmdt(shmaddr: usize) -> Result<(), isize> {
         let arc = tbl.get(&shmid).ok_or(-22isize)?;
         let mut seg = arc.lock();
         seg.nattch = seg.nattch.saturating_sub(1);
-        seg.lpid   = pid as u32;
+        seg.lpid = pid as u32;
         seg.removed && seg.nattch == 0
     };
 
@@ -158,7 +179,9 @@ pub fn shmdt(shmaddr: usize) -> Result<(), isize> {
         if let Some(arc) = SHM_TABLE.lock().remove(&shmid) {
             let seg = arc.lock();
             for &pa in &seg.frames {
-                unsafe { crate::mm::pmm::free_page(pa as *mut u8); }
+                unsafe {
+                    crate::mm::pmm::free_page(pa as *mut u8);
+                }
             }
         }
     }
@@ -179,9 +202,9 @@ pub fn shmctl(shmid: i32, cmd: i32) -> Result<i32, isize> {
                 SHM_TABLE.lock().remove(&shmid);
             }
             Ok(0)
-        }
+        },
         c if c == IPC_STAT => Ok(0),
-        c if c == IPC_SET  => Ok(0),
+        c if c == IPC_SET => Ok(0),
         _ => Err(-22),
     }
 }

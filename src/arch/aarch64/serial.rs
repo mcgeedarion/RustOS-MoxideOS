@@ -18,24 +18,24 @@ use super::mem_layout::uart;
 use core::ptr::{read_volatile, write_volatile};
 
 // PL011 register offsets (u32-indexed).
-const DR:   usize = 0x000; // Data register
-const FR:   usize = 0x018; // Flag register
+const DR: usize = 0x000; // Data register
+const FR: usize = 0x018; // Flag register
 const IBRD: usize = 0x024; // Integer baud-rate divisor
 const FBRD: usize = 0x028; // Fractional baud-rate divisor
-const LCR_H:usize = 0x02C; // Line control
-const CR:   usize = 0x030; // Control
+const LCR_H: usize = 0x02C; // Line control
+const CR: usize = 0x030; // Control
 const IMSC: usize = 0x038; // Interrupt mask set/clear
-const ICR:  usize = 0x044; // Interrupt clear
+const ICR: usize = 0x044; // Interrupt clear
 
 const FR_TXFF: u32 = 1 << 5; // TX FIFO full
 const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
 
-const LCR_FEN:  u32 = 1 << 4; // FIFO enable
+const LCR_FEN: u32 = 1 << 4; // FIFO enable
 const LCR_8BIT: u32 = 0b11 << 5;
 
 const CR_UARTEN: u32 = 1 << 0;
-const CR_TXE:    u32 = 1 << 8;
-const CR_RXE:    u32 = 1 << 9;
+const CR_TXE: u32 = 1 << 8;
+const CR_RXE: u32 = 1 << 9;
 
 #[inline]
 fn reg(offset: usize) -> *mut u32 {

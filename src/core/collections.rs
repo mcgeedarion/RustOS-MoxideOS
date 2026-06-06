@@ -14,8 +14,8 @@
 //! Both collections work with raw pointers because:
 //! 1. The kernel frequently holds mutable references to a list **and** to
 //!    individual nodes simultaneously (scheduler run-queue mutations).
-//! 2. Intrusive links by definition span the lifetime of the owning
-//!    allocation, which the compiler cannot verify statically.
+//! 2. Intrusive links by definition span the lifetime of the owning allocation,
+//!    which the compiler cannot verify statically.
 //!
 //! Callers are responsible for ensuring pointer validity and exclusive
 //! access during mutations.  In practice this means holding a spinlock.
@@ -32,7 +32,10 @@ pub struct ListNode {
 
 impl ListNode {
     pub const fn new() -> Self {
-        Self { prev: None, next: None }
+        Self {
+            prev: None,
+            next: None,
+        }
     }
 }
 
@@ -49,7 +52,7 @@ impl ListNode {
 /// inside objects allocated elsewhere.
 pub struct IntrusiveList<T: Linkable> {
     head: ListNode,
-    len:  usize,
+    len: usize,
     _marker: core::marker::PhantomData<*mut T>,
 }
 
@@ -68,11 +71,15 @@ impl<T: Linkable> IntrusiveList<T> {
 
     /// Number of elements currently in the list.
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     /// Returns `true` if the list contains no elements.
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Push `node` to the **back** of the list.
     ///
@@ -154,8 +161,8 @@ pub unsafe trait Linkable: Sized {
 /// let ring = RingBuf::from_raw(unsafe { &mut BUF_MEM });
 /// ```
 pub struct RingBuf<T> {
-    buf:   *mut core::mem::MaybeUninit<T>,
-    cap:   usize,
+    buf: *mut core::mem::MaybeUninit<T>,
+    cap: usize,
     /// Producer write index (mod cap).
     head: AtomicUsize,
     /// Consumer read index (mod cap).
@@ -175,10 +182,13 @@ impl<T> RingBuf<T> {
     /// # Safety
     /// `buf` must remain valid for the lifetime of this `RingBuf`.
     pub unsafe fn from_raw(buf: &'static mut [core::mem::MaybeUninit<T>]) -> Self {
-        debug_assert!(buf.len().is_power_of_two(), "RingBuf capacity must be a power of two");
+        debug_assert!(
+            buf.len().is_power_of_two(),
+            "RingBuf capacity must be a power of two"
+        );
         Self {
-            buf:  buf.as_mut_ptr(),
-            cap:  buf.len(),
+            buf: buf.as_mut_ptr(),
+            cap: buf.len(),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }

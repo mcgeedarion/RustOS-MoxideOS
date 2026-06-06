@@ -6,7 +6,8 @@
 //!   net/      — e1000e, NIC abstraction, virtio-net (PCIe + MMIO)
 //!   block/    — AHCI, NVMe, virtio-blk
 //!   platform/ — GPIO, PCIe ECAM
-//!   virtio/   — MMIO transport and split virtqueue (shared by all virtio drivers)
+//!   virtio/   — MMIO transport and split virtqueue (shared by all virtio
+//! drivers)
 //!
 //! Terminal semantics (line discipline, PTY, termios) live in `crate::tty`.
 //! Interrupt controllers (PLIC, CLINT) live in `crate::irq::riscv64`.

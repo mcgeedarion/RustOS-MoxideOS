@@ -19,7 +19,7 @@ use core::arch::asm;
 /// Saved NEON / FP register state for one task.
 #[repr(C, align(16))]
 pub struct FpState {
-    pub q:    [u128; 32],
+    pub q: [u128; 32],
     pub fpsr: u32,
     pub fpcr: u32,
     pub _pad: u64,
@@ -27,7 +27,12 @@ pub struct FpState {
 
 impl FpState {
     pub const fn new() -> Self {
-        Self { q: [0u128; 32], fpsr: 0, fpcr: 0, _pad: 0 }
+        Self {
+            q: [0u128; 32],
+            fpsr: 0,
+            fpcr: 0,
+            _pad: 0,
+        }
     }
 }
 

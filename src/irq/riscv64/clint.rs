@@ -47,11 +47,11 @@ use spin::Mutex;
 pub const DEFAULT_BASE: usize = 0x0200_0000;
 
 /// MTIME offset from CLINT base.
-const MTIME_OFFSET:    usize = 0x0000_BFF8;
+const MTIME_OFFSET: usize = 0x0000_BFF8;
 /// MTIMECMP base offset; add `hart * 8` for the correct hart.
 const MTIMECMP_OFFSET: usize = 0x0000_4000;
 /// MSIP base offset; add `hart * 4`.
-const MSIP_OFFSET:     usize = 0x0000_0000;
+const MSIP_OFFSET: usize = 0x0000_0000;
 
 /// Maximum number of harts this driver supports.
 const MAX_HARTS: usize = 8;
@@ -99,13 +99,7 @@ unsafe fn write32(addr: usize, val: u32) {
 
 /// Issue an SBI ecall.  Returns (error, value).
 #[inline]
-unsafe fn sbi_call(
-    ext:  usize,
-    fid:  usize,
-    a0:   usize,
-    a1:   usize,
-    a2:   usize,
-) -> (isize, usize) {
+unsafe fn sbi_call(ext: usize, fid: usize, a0: usize, a1: usize, a2: usize) -> (isize, usize) {
     let error: isize;
     let value: usize;
     core::arch::asm!(
@@ -173,8 +167,11 @@ pub fn init() {
         // sie.STIE = bit 5
         core::arch::asm!("csrs sie, {}", in(reg) 1usize << 5, options(nostack));
     }
-    crate::println!("clint: init OK (base {:#x}, interval {} cycles)",
-        CLINT_BASE.load(Ordering::Relaxed), interval);
+    crate::println!(
+        "clint: init OK (base {:#x}, interval {} cycles)",
+        CLINT_BASE.load(Ordering::Relaxed),
+        interval
+    );
 }
 
 /// Read the current MTIME counter.
@@ -203,11 +200,14 @@ pub fn mtime() -> u64 {
 
 /// Program the MTIMECMP register for `hart`, using SBI if available.
 pub fn set_timecmp(hart: usize, deadline: u64) {
-    if hart >= MAX_HARTS { return; }
+    if hart >= MAX_HARTS {
+        return;
+    }
     if USE_SBI_TIMER.load(Ordering::Relaxed) {
         unsafe {
             sbi_call(
-                SBI_EXT_TIMER, SBI_TIMER_SET_TIMER,
+                SBI_EXT_TIMER,
+                SBI_TIMER_SET_TIMER,
                 deadline as usize,
                 (deadline >> 32) as usize,
                 0,
@@ -215,19 +215,28 @@ pub fn set_timecmp(hart: usize, deadline: u64) {
         }
     } else {
         let base = CLINT_BASE.load(Ordering::Relaxed);
-        unsafe { write64(base + MTIMECMP_OFFSET + hart * 8, deadline); }
+        unsafe {
+            write64(base + MTIMECMP_OFFSET + hart * 8, deadline);
+        }
     }
 }
 
 /// Read the MTIMECMP for `hart` directly from MMIO (bypass SBI).
 /// Returns 0 on non-RISC-V targets.
 pub fn timecmp(hart: usize) -> u64 {
-    if hart >= MAX_HARTS { return 0; }
+    if hart >= MAX_HARTS {
+        return 0;
+    }
     let base = CLINT_BASE.load(Ordering::Relaxed);
     #[cfg(target_arch = "riscv64")]
-    unsafe { read64(base + MTIMECMP_OFFSET + hart * 8) }
+    unsafe {
+        read64(base + MTIMECMP_OFFSET + hart * 8)
+    }
     #[cfg(not(target_arch = "riscv64"))]
-    { let _ = base; 0u64 }
+    {
+        let _ = base;
+        0u64
+    }
 }
 
 /// Number of CLINT cycles remaining until the next timer interrupt on `hart`.
@@ -245,7 +254,9 @@ pub fn handle_timer_irq() {
     let interval = INTERVAL.load(Ordering::Relaxed);
     let hart: usize;
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("mv {}, tp", out(reg) hart, options(nostack, nomem)); }
+    unsafe {
+        core::arch::asm!("mv {}, tp", out(reg) hart, options(nostack, nomem));
+    }
     #[cfg(not(target_arch = "riscv64"))]
     let hart = 0usize;
 
@@ -266,7 +277,9 @@ pub fn handle_timer_irq() {
     crate::drivers::drm::vblank_tick_head(0);
 
     // User-registered hook.
-    if let Some(f) = *TICK_HOOK.lock() { f(); }
+    if let Some(f) = *TICK_HOOK.lock() {
+        f();
+    }
 }
 
 /// Send a software IPI to `target_hart`.
@@ -274,32 +287,50 @@ pub fn handle_timer_irq() {
 /// Uses SBI `SEND_IPI` ecall when SBI is available; falls back to direct
 /// MSIP MMIO write otherwise.
 pub fn send_ipi(target_hart: usize) {
-    if target_hart >= MAX_HARTS { return; }
+    if target_hart >= MAX_HARTS {
+        return;
+    }
     if USE_SBI_TIMER.load(Ordering::Relaxed) {
         // SBI IPI: a0 = hart_mask, a1 = hart_mask_base
         let mask = 1usize << target_hart;
-        unsafe { sbi_call(SBI_EXT_IPI, SBI_IPI_SEND, mask, 0, 0); }
+        unsafe {
+            sbi_call(SBI_EXT_IPI, SBI_IPI_SEND, mask, 0, 0);
+        }
     } else {
         let base = CLINT_BASE.load(Ordering::Relaxed);
-        unsafe { write32(base + MSIP_OFFSET + target_hart * 4, 1); }
+        unsafe {
+            write32(base + MSIP_OFFSET + target_hart * 4, 1);
+        }
     }
 }
 
-/// Clear the MSIP latch for `hart` (call from the IPI handler after processing).
+/// Clear the MSIP latch for `hart` (call from the IPI handler after
+/// processing).
 pub fn clear_ipi(hart: usize) {
-    if hart >= MAX_HARTS { return; }
+    if hart >= MAX_HARTS {
+        return;
+    }
     let base = CLINT_BASE.load(Ordering::Relaxed);
-    unsafe { write32(base + MSIP_OFFSET + hart * 4, 0); }
+    unsafe {
+        write32(base + MSIP_OFFSET + hart * 4, 0);
+    }
 }
 
 /// Read the raw MSIP register for `hart` (bit 0 = pending).
 pub fn msip(hart: usize) -> u32 {
-    if hart >= MAX_HARTS { return 0; }
+    if hart >= MAX_HARTS {
+        return 0;
+    }
     let base = CLINT_BASE.load(Ordering::Relaxed);
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::ptr::read_volatile((base + MSIP_OFFSET + hart * 4) as *const u32) }
+    unsafe {
+        core::ptr::read_volatile((base + MSIP_OFFSET + hart * 4) as *const u32)
+    }
     #[cfg(not(target_arch = "riscv64"))]
-    { let _ = base; 0u32 }
+    {
+        let _ = base;
+        0u32
+    }
 }
 
 /// Spin for at least `us` microseconds using MTIME.
@@ -307,7 +338,11 @@ pub fn msip(hart: usize) -> u32 {
 /// `timebase_hz` is the CLINT timebase frequency in Hz (e.g. 10_000_000 for
 /// the QEMU virt machine).  Pass 0 to use the default of 10 MHz.
 pub fn delay_us(us: u64, timebase_hz: u64) {
-    let hz = if timebase_hz == 0 { 10_000_000 } else { timebase_hz };
+    let hz = if timebase_hz == 0 {
+        10_000_000
+    } else {
+        timebase_hz
+    };
     let ticks = (us * hz) / 1_000_000;
     let start = mtime();
     while mtime().wrapping_sub(start) < ticks {
@@ -322,13 +357,17 @@ pub fn delay_ms(ms: u64, timebase_hz: u64) {
 
 /// Print CLINT status to the kernel log.
 pub fn print_status() {
-    let base     = CLINT_BASE.load(Ordering::Relaxed);
+    let base = CLINT_BASE.load(Ordering::Relaxed);
     let interval = INTERVAL.load(Ordering::Relaxed);
-    let use_sbi  = USE_SBI_TIMER.load(Ordering::Relaxed);
-    let ticks    = TICK_COUNT.load(Ordering::Relaxed);
-    let now      = mtime();
+    let use_sbi = USE_SBI_TIMER.load(Ordering::Relaxed);
+    let ticks = TICK_COUNT.load(Ordering::Relaxed);
+    let now = mtime();
     crate::println!(
         "clint: base={:#x} interval={} sbi={} ticks={} mtime={}",
-        base, interval, use_sbi, ticks, now
+        base,
+        interval,
+        use_sbi,
+        ticks,
+        now
     );
 }

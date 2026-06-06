@@ -29,10 +29,10 @@ pub fn ecam_init(base: usize) {
 #[inline]
 fn cfg_addr(bus: u8, dev: u8, fun: u8, off: u16) -> *mut u32 {
     let base = ECAM_BASE.load(Ordering::Relaxed);
-    let offset = ((bus  as usize) << 20)
-               | ((dev  as usize) << 15)
-               | ((fun  as usize) << 12)
-               | ((off  as usize) & !0x3);
+    let offset = ((bus as usize) << 20)
+        | ((dev as usize) << 15)
+        | ((fun as usize) << 12)
+        | ((off as usize) & !0x3);
     (base + offset) as *mut u32
 }
 
@@ -60,7 +60,11 @@ pub unsafe fn write32(bus: u8, dev: u8, fun: u8, off: u16, val: u32) {
 #[inline]
 pub unsafe fn read16(bus: u8, dev: u8, fun: u8, off: u16) -> u16 {
     let word = read32(bus, dev, fun, off & !2);
-    if off & 2 != 0 { (word >> 16) as u16 } else { word as u16 }
+    if off & 2 != 0 {
+        (word >> 16) as u16
+    } else {
+        word as u16
+    }
 }
 
 /// Read an 8-bit config register.
@@ -88,16 +92,20 @@ pub unsafe fn enumerate(mut f: impl FnMut(u8, u8, u8, PciId, u8, u8)) {
     for bus in 0u8..=255 {
         for dev in 0u8..32 {
             let id0 = read32(bus, dev, 0, 0x00);
-            if id0 == 0xffff_ffff { continue; }
+            if id0 == 0xffff_ffff {
+                continue;
+            }
 
             let hdr = read8(bus, dev, 0, 0x0e);
             let max_fun: u8 = if hdr & 0x80 != 0 { 8 } else { 1 };
 
             for fun in 0..max_fun {
                 let id_reg = read32(bus, dev, fun, 0x00);
-                if id_reg == 0xffff_ffff { continue; }
+                if id_reg == 0xffff_ffff {
+                    continue;
+                }
                 let class_reg = read32(bus, dev, fun, 0x08);
-                let class  = (class_reg >> 24) as u8;
+                let class = (class_reg >> 24) as u8;
                 let subclass = (class_reg >> 16) as u8;
                 let id = PciId {
                     vendor: id_reg as u16,

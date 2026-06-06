@@ -84,7 +84,7 @@ pub fn alloc_kstack() -> Option<KstackInfo> {
         None => {
             crate::mm::pmm::free_page(pa_guard);
             return None;
-        }
+        },
     };
     let pa1 = match crate::mm::pmm::alloc_page() {
         Some(p) => p,
@@ -92,7 +92,7 @@ pub fn alloc_kstack() -> Option<KstackInfo> {
             crate::mm::pmm::free_page(pa_guard);
             crate::mm::pmm::free_page(pa0);
             return None;
-        }
+        },
     };
 
     // Derive kernel-virtual addresses through the physmap window.

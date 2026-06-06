@@ -131,7 +131,8 @@ pub mod sctlr {
     pub const I: u64 = 1 << 12;
 }
 
-/// QEMU `virt` defaults used as fallback when ACPI/DT has not supplied GIC MMIO.
+/// QEMU `virt` defaults used as fallback when ACPI/DT has not supplied GIC
+/// MMIO.
 pub mod gic {
     pub const GICV2_DIST_BASE: usize = 0x0800_0000;
     pub const GICV2_CPU_BASE: usize = 0x0801_0000;

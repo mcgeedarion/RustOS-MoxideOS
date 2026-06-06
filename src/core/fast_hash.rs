@@ -19,8 +19,9 @@ const FX_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
 /// Fast FxHash-style hasher for trusted kernel bookkeeping keys.
 ///
 /// This is not cryptographic and is not collision-DoS resistant. Do not use it
-/// for attacker-controlled strings, paths, protocol fields, authorization state,
-/// ASLR, canaries, checksums, or any persistent/wire-format integrity value.
+/// for attacker-controlled strings, paths, protocol fields, authorization
+/// state, ASLR, canaries, checksums, or any persistent/wire-format integrity
+/// value.
 #[derive(Clone)]
 pub struct KernelFastHasher {
     hash: u64,

@@ -22,18 +22,18 @@
 //! Because we don't have a full AML interpreter we model the GPE handler as a
 //! simple callback that calls out to `crate::drivers::pcie::rescan()`.
 
-use core::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use crate::console::println;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-const FADT_OFF_GPE0_BLK:     usize = 80;
-const FADT_OFF_GPE1_BLK:     usize = 84;
+const FADT_OFF_GPE0_BLK: usize = 80;
+const FADT_OFF_GPE1_BLK: usize = 84;
 const FADT_OFF_GPE0_BLK_LEN: usize = 92;
 const FADT_OFF_GPE1_BLK_LEN: usize = 93;
-const FADT_OFF_GPE1_BASE:    usize = 94;
+const FADT_OFF_GPE1_BASE: usize = 94;
 
 static GPE0_STS_PORT: AtomicU8 = AtomicU8::new(0); // low byte of I/O port
-static GPE0_EN_PORT:  AtomicU8 = AtomicU8::new(0);
-static GPE0_LEN:      AtomicU8 = AtomicU8::new(0); // bytes per half-block
+static GPE0_EN_PORT: AtomicU8 = AtomicU8::new(0);
+static GPE0_LEN: AtomicU8 = AtomicU8::new(0); // bytes per half-block
 static HOTPLUG_GPE_BIT: AtomicU8 = AtomicU8::new(0xFF); // 0xFF = none found
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -52,13 +52,15 @@ unsafe fn outb(port: u16, val: u8) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn inb(_port: u16) -> u8 { 0 }
+unsafe fn inb(_port: u16) -> u8 {
+    0
+}
 #[cfg(not(target_arch = "x86_64"))]
 unsafe fn outb(_port: u16, _val: u8) {}
 
-pub const NOTIFY_BUS_CHECK:    u8 = 0x00; // re-enumerate
+pub const NOTIFY_BUS_CHECK: u8 = 0x00; // re-enumerate
 pub const NOTIFY_DEVICE_CHECK: u8 = 0x01; // specific device added/removed
-pub const NOTIFY_EJECT_REQ:    u8 = 0x03; // user pressed eject button
+pub const NOTIFY_EJECT_REQ: u8 = 0x03; // user pressed eject button
 
 /// Initialise the ACPI hot-plug GPE handler.
 ///
@@ -70,7 +72,7 @@ pub unsafe fn init() {
         None => {
             println!("acpi/hotplug: FADT not found");
             return;
-        }
+        },
     };
 
     let fadt_len = (*(fadt as *const super::SdtHeader)).len as usize;
@@ -102,8 +104,10 @@ pub unsafe fn init() {
     // Enable the hot-plug GPE.
     enable_gpe_bit(hp_bit);
     INITIALIZED.store(true, Ordering::Relaxed);
-    println!("acpi/hotplug: GPE0 @ {:#06x} len={}  hp_gpe_bit={}",
-        gpe0_blk, gpe0_len, hp_bit);
+    println!(
+        "acpi/hotplug: GPE0 @ {:#06x} len={}  hp_gpe_bit={}",
+        gpe0_blk, gpe0_len, hp_bit
+    );
 }
 
 /// Scan the DSDT for a PCIe root bridge and the associated GPE method to
@@ -111,9 +115,13 @@ pub unsafe fn init() {
 unsafe fn discover_hotplug_gpe_bit() -> Option<u8> {
     let fadt = super::find_table(b"FACP")? as *const u8;
     let dsdt_phys = (fadt.add(40) as *const u32).read_unaligned() as usize;
-    if dsdt_phys == 0 { return None; }
+    if dsdt_phys == 0 {
+        return None;
+    }
     let dsdt = &*(dsdt_phys as *const super::SdtHeader);
-    if &dsdt.sig != b"DSDT" { return None; }
+    if &dsdt.sig != b"DSDT" {
+        return None;
+    }
     let off = core::mem::size_of::<super::SdtHeader>();
     let len = (dsdt.len as usize).saturating_sub(off);
     let aml = core::slice::from_raw_parts((dsdt_phys + off) as *const u8, len);
@@ -132,11 +140,16 @@ unsafe fn discover_hotplug_gpe_bit() -> Option<u8> {
 /// Enable a single GPE bit in the GPE0 enable register.
 pub unsafe fn enable_gpe_bit(bit: u8) {
     let half = GPE0_LEN.load(Ordering::Relaxed) as u16;
-    if half == 0 { return; }
+    if half == 0 {
+        return;
+    }
     let byte_off = (bit / 8) as u16;
-    if byte_off >= half { return; }
-    let en_port = (GPE0_EN_PORT.load(Ordering::Relaxed) as u16).wrapping_add(byte_off)
-                   .wrapping_add((GPE0_STS_PORT.load(Ordering::Relaxed) as u16) & 0xFF00);
+    if byte_off >= half {
+        return;
+    }
+    let en_port = (GPE0_EN_PORT.load(Ordering::Relaxed) as u16)
+        .wrapping_add(byte_off)
+        .wrapping_add((GPE0_STS_PORT.load(Ordering::Relaxed) as u16) & 0xFF00);
     let cur = inb(en_port);
     outb(en_port, cur | (1 << (bit % 8)));
 }
@@ -144,8 +157,7 @@ pub unsafe fn enable_gpe_bit(bit: u8) {
 /// Clear a pending GPE status bit (write-1-to-clear).
 pub unsafe fn ack_gpe_bit(bit: u8) {
     let byte_off = (bit / 8) as u16;
-    let sts_base = GPE0_STS_PORT.load(Ordering::Relaxed) as u16
-                   & 0x00FF; // keep low byte; high byte comes from gpe0_blk
+    let sts_base = GPE0_STS_PORT.load(Ordering::Relaxed) as u16 & 0x00FF; // keep low byte; high byte comes from gpe0_blk
     outb(sts_base + byte_off, 1 << (bit % 8));
 }
 
@@ -155,7 +167,9 @@ pub unsafe fn ack_gpe_bit(bit: u8) {
 /// PCIe bus-check or eject handler.
 pub unsafe fn handle_gpe_event(bit: u8, notify_code: u8) {
     let hp_bit = HOTPLUG_GPE_BIT.load(Ordering::Relaxed);
-    if hp_bit == 0xFF || bit != hp_bit { return; }
+    if hp_bit == 0xFF || bit != hp_bit {
+        return;
+    }
 
     ack_gpe_bit(bit);
 
@@ -165,15 +179,15 @@ pub unsafe fn handle_gpe_event(bit: u8, notify_code: u8) {
             // Delegate to the PCIe driver; it handles ECAM re-enumeration.
             #[cfg(feature = "pcie")]
             crate::drivers::pcie::rescan();
-        }
+        },
         NOTIFY_EJECT_REQ => {
             println!("acpi/hotplug: eject-request notify — quiescing device");
             #[cfg(feature = "pcie")]
             crate::drivers::pcie::handle_eject_request();
-        }
+        },
         _ => {
             println!("acpi/hotplug: unknown notify code {:#04x}", notify_code);
-        }
+        },
     }
 }
 

@@ -8,25 +8,25 @@
 //!   char d_name[]   (offset 19, NUL-terminated)
 
 extern crate alloc;
-use alloc::vec::Vec;
 use crate::uaccess::{copy_to_user, validate_user_ptr};
+use alloc::vec::Vec;
 
 pub const DT_UNKNOWN: u8 = 0;
-pub const DT_DIR:     u8 = 4;
-pub const DT_REG:     u8 = 8;
-pub const DT_LNK:     u8 = 10;
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 10;
 
 // Maximum name length we will encode; names longer than this are skipped.
 const MAX_NAME_LEN: usize = 255;
 
 struct Dent {
-    ino:   u64,
-    name:  alloc::string::String,
+    ino: u64,
+    name: alloc::string::String,
     dtype: u8,
 }
 
-/// Parse a "/proc/<N>/..." prefix from `path` and return (pid, rest_after_prefix).
-/// Returns None if the path doesn't match /proc/<decimal>/.
+/// Parse a "/proc/<N>/..." prefix from `path` and return (pid,
+/// rest_after_prefix). Returns None if the path doesn't match /proc/<decimal>/.
 fn strip_proc_pid(path: &str) -> Option<(usize, &str)> {
     let rest = path.strip_prefix("/proc/")?;
     let slash = rest.find('/').unwrap_or(rest.len());
@@ -44,8 +44,8 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
                 let ns_id = crate::proc::namespace::ns_id_of(pid, name)
                     .unwrap_or(crate::proc::namespace::INIT_NS);
                 out.push(Dent {
-                    ino:   ns_id,
-                    name:  alloc::string::String::from(*name),
+                    ino: ns_id,
+                    name: alloc::string::String::from(*name),
                     dtype: DT_LNK,
                 });
             }
@@ -56,11 +56,17 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
     // Emit a minimal set of well-known entries so that `ls /proc/self/`
     // returns something useful.
     if let Some((_pid, "")) = strip_proc_pid(path) {
-        for name in &["ns", "fd", "exe", "maps", "stat", "status", "limits", "cmdline"] {
+        for name in &[
+            "ns", "fd", "exe", "maps", "stat", "status", "limits", "cmdline",
+        ] {
             out.push(Dent {
-                ino:   0,
-                name:  alloc::string::String::from(*name),
-                dtype: if *name == "ns" || *name == "fd" { DT_DIR } else { DT_LNK },
+                ino: 0,
+                name: alloc::string::String::from(*name),
+                dtype: if *name == "ns" || *name == "fd" {
+                    DT_DIR
+                } else {
+                    DT_LNK
+                },
             });
         }
         return out;
@@ -81,15 +87,17 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
         }
     }
 
-    let prefix = if path == "/" { alloc::string::String::new() } else {
+    let prefix = if path == "/" {
+        alloc::string::String::new()
+    } else {
         alloc::format!("{}/", path.trim_end_matches('/'))
     };
     if let Some(entries) = crate::fs::vfs::list_dir(fdno) {
         for e in entries {
-            let leaf = e.name.strip_prefix(&*prefix)
-                .unwrap_or(&e.name)
-                .to_string();
-            if leaf.contains('/') { continue; }
+            let leaf = e.name.strip_prefix(&*prefix).unwrap_or(&e.name).to_string();
+            if leaf.contains('/') {
+                continue;
+            }
             out.push(Dent {
                 ino: 0,
                 name: leaf,
@@ -102,25 +110,35 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
 
 /// sys_getdents64(fd, dirp, count)  [NR 217]
 pub fn sys_getdents64(fdno: usize, dirp: usize, count: usize) -> isize {
-    if dirp == 0 || count < 24 { return -22; } // EINVAL
-    if !validate_user_ptr(dirp, count) { return -14; } // EFAULT
+    if dirp == 0 || count < 24 {
+        return -22;
+    } // EINVAL
+    if !validate_user_ptr(dirp, count) {
+        return -14;
+    } // EFAULT
 
     let path = crate::fs::vfs::fd_to_path(fdno);
     let path = path.as_deref().unwrap_or("/");
     let entries = gather_entries(fdno, path);
-    if entries.is_empty() { return 0; }
+    if entries.is_empty() {
+        return 0;
+    }
 
     let mut written = 0usize;
     for e in &entries {
         let name_bytes = e.name.as_bytes();
-        let name_len   = name_bytes.len();
-        if name_len > MAX_NAME_LEN { continue; }
+        let name_len = name_bytes.len();
+        if name_len > MAX_NAME_LEN {
+            continue;
+        }
 
-        let raw    = 19 + name_len + 1;
+        let raw = 19 + name_len + 1;
         let reclen = (raw + 7) & !7;
         debug_assert!(reclen <= u16::MAX as usize);
 
-        if written + reclen > count { break; }
+        if written + reclen > count {
+            break;
+        }
 
         let mut rec = alloc::vec![0u8; reclen];
         rec[0..8].copy_from_slice(&e.ino.to_le_bytes());
@@ -129,7 +147,9 @@ pub fn sys_getdents64(fdno: usize, dirp: usize, count: usize) -> isize {
         rec[18] = e.dtype;
         rec[19..19 + name_len].copy_from_slice(name_bytes);
 
-        if copy_to_user(dirp + written, &rec).is_err() { return -14; }
+        if copy_to_user(dirp + written, &rec).is_err() {
+            return -14;
+        }
         written += reclen;
     }
     written as isize

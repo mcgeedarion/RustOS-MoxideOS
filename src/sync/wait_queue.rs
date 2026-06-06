@@ -33,7 +33,7 @@ pub type ReadyMask = u32;
 /// Sentinel bits used internally for timeout and cancellation wakeups.
 /// Never leaked to callers — masked out before returning from wait().
 pub(crate) const WAKE_TIMEOUT: ReadyMask = 1 << 30;
-pub(crate) const WAKE_CANCEL:  ReadyMask = 1 << 31;
+pub(crate) const WAKE_CANCEL: ReadyMask = 1 << 31;
 
 /// Why a call to WaitQueue::wait() returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,13 +47,13 @@ pub enum WakeReason {
 }
 
 struct Waiter {
-    task_id:  usize,
+    task_id: usize,
     interest: ReadyMask,
 }
 
 // Forwarding entry: when this WaitQueue fires, also wake `target`.
 struct Forwarder {
-    target:   *const WaitQueue,
+    target: *const WaitQueue,
     interest: ReadyMask,
 }
 
@@ -65,8 +65,8 @@ unsafe impl Send for Forwarder {}
 pub struct WaitQueue {
     /// Current readiness bits — published atomically by device/IRQ side.
     /// Readable without the lock for fast-path poll().
-    ready:      AtomicU32,
-    waiters:    Mutex<VecDeque<Waiter>>,
+    ready: AtomicU32,
+    waiters: Mutex<VecDeque<Waiter>>,
     forwarders: Mutex<Vec<Forwarder>>,
 }
 
@@ -76,8 +76,8 @@ unsafe impl Send for WaitQueue {}
 impl WaitQueue {
     pub const fn new() -> Self {
         Self {
-            ready:      AtomicU32::new(0),
-            waiters:    Mutex::new(VecDeque::new()),
+            ready: AtomicU32::new(0),
+            waiters: Mutex::new(VecDeque::new()),
             forwarders: Mutex::new(Vec::new()),
         }
     }
@@ -134,9 +134,9 @@ impl WaitQueue {
     /// Calls `block_current()` exactly once per invocation.
     pub fn wait(
         &self,
-        interest:  ReadyMask,
-        cancel:    Option<&CancellationToken>,
-        deadline:  Option<u64>,
+        interest: ReadyMask,
+        cancel: Option<&CancellationToken>,
+        deadline: Option<u64>,
     ) -> WakeReason {
         if self.ready.load(Ordering::Acquire) & interest != 0 {
             return WakeReason::Ready;
@@ -172,7 +172,10 @@ impl WaitQueue {
                 }
                 return WakeReason::Ready;
             }
-            waiters.push_back(Waiter { task_id, interest: full_interest });
+            waiters.push_back(Waiter {
+                task_id,
+                interest: full_interest,
+            });
         }
 
         if let Some(ct) = cancel {
@@ -211,7 +214,10 @@ impl WaitQueue {
         // Deduplicate: only one forwarder per (target, interest) pair.
         let ptr = target as *const WaitQueue;
         if !fwds.iter().any(|f| f.target == ptr) {
-            fwds.push(Forwarder { target: ptr, interest });
+            fwds.push(Forwarder {
+                target: ptr,
+                interest,
+            });
         }
     }
 
@@ -228,7 +234,9 @@ impl WaitQueue {
         let waiters = self.waiters.lock();
         let mut woken = 0u32;
         for w in waiters.iter() {
-            if woken >= n { break; }
+            if woken >= n {
+                break;
+            }
             if w.interest & bits != 0 {
                 crate::proc::scheduler::wake_pid(w.task_id);
                 woken += 1;
@@ -248,11 +256,11 @@ impl WaitQueue {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
-    None    = 0,
-    Signal  = 1,
+    None = 0,
+    Signal = 1,
     Timeout = 2,
-    Closed  = 3,
-    Exit    = 4,
+    Closed = 3,
+    Exit = 4,
     Explicit = 5,
 }
 
@@ -262,7 +270,9 @@ pub struct CancellationToken {
 
 impl CancellationToken {
     pub const fn new() -> Self {
-        Self { state: AtomicU32::new(CancelReason::None as u32) }
+        Self {
+            state: AtomicU32::new(CancelReason::None as u32),
+        }
     }
 
     /// Fire the token and wake the task sleeping on `wq`.
@@ -295,6 +305,7 @@ impl CancellationToken {
 
     /// Reset after handling — call at syscall re-entry after EINTR.
     pub fn reset(&self) {
-        self.state.store(CancelReason::None as u32, Ordering::Relaxed);
+        self.state
+            .store(CancelReason::None as u32, Ordering::Relaxed);
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! `SyscallContext` is passed by reference to each dispatch sub-function
 //! so that the callee can read all six argument registers and the saved
-//! RIP without an 8-argument signature (which trips `clippy::too_many_arguments`).
+//! RIP without an 8-argument signature (which trips
+//! `clippy::too_many_arguments`).
 
 /// Saved state from the kernel entry stub, forwarded to every syscall handler.
 #[derive(Copy, Clone, Debug)]
@@ -21,10 +22,28 @@ impl SyscallContext {
         Self { nr, args, rip }
     }
     // Convenience accessors to avoid positional errors at call sites.
-    #[inline(always)] pub fn a0(&self) -> usize { self.args[0] }
-    #[inline(always)] pub fn a1(&self) -> usize { self.args[1] }
-    #[inline(always)] pub fn a2(&self) -> usize { self.args[2] }
-    #[inline(always)] pub fn a3(&self) -> usize { self.args[3] }
-    #[inline(always)] pub fn a4(&self) -> usize { self.args[4] }
-    #[inline(always)] pub fn a5(&self) -> usize { self.args[5] }
+    #[inline(always)]
+    pub fn a0(&self) -> usize {
+        self.args[0]
+    }
+    #[inline(always)]
+    pub fn a1(&self) -> usize {
+        self.args[1]
+    }
+    #[inline(always)]
+    pub fn a2(&self) -> usize {
+        self.args[2]
+    }
+    #[inline(always)]
+    pub fn a3(&self) -> usize {
+        self.args[3]
+    }
+    #[inline(always)]
+    pub fn a4(&self) -> usize {
+        self.args[4]
+    }
+    #[inline(always)]
+    pub fn a5(&self) -> usize {
+        self.args[5]
+    }
 }

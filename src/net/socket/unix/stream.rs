@@ -1,18 +1,20 @@
 //! AF_UNIX SOCK_STREAM implementation.
 extern crate alloc;
+use super::super::buffer::{PendingUnix, UnixConn, UnixListener};
+use super::super::core::SOCKETS;
+use super::super::types::{SockAddr, SocketState, AF_UNIX, SOCK_STREAM};
 use alloc::string::String;
 use alloc::sync::Arc;
 use spin::Mutex;
-use super::super::types::{SocketState, SockAddr, AF_UNIX, SOCK_STREAM};
-use super::super::buffer::{UnixConn, UnixListener, PendingUnix};
-use super::super::core::SOCKETS;
 
 static UNIX_BINDS: spin::Mutex<alloc::collections::BTreeMap<String, usize>> =
     spin::Mutex::new(alloc::collections::BTreeMap::new());
 
 pub fn unix_bind(fd: usize, path: String) -> isize {
     let mut binds = UNIX_BINDS.lock();
-    if binds.contains_key(&path) { return -98; } // EADDRINUSE
+    if binds.contains_key(&path) {
+        return -98;
+    } // EADDRINUSE
     binds.insert(path.clone(), fd);
     drop(binds);
     let mut sockets = SOCKETS.lock();
@@ -38,12 +40,18 @@ pub fn unix_listen(fd: usize, backlog: usize) -> isize {
 pub fn unix_accept(fd: usize) -> isize {
     let listener = {
         let sockets = SOCKETS.lock();
-        let Some(Some(s)) = sockets.get(fd) else { return -9; };
+        let Some(Some(s)) = sockets.get(fd) else {
+            return -9;
+        };
         s.unix_listener.clone()
     };
-    let Some(ul) = listener else { return -22; };
+    let Some(ul) = listener else {
+        return -22;
+    };
     let pending = ul.lock().backlog.pop_front();
-    let Some(p) = pending else { return -11; }; // EAGAIN
+    let Some(p) = pending else {
+        return -11;
+    }; // EAGAIN
     let mut sockets = SOCKETS.lock();
     for (i, slot) in sockets.iter_mut().enumerate() {
         if slot.is_none() {
@@ -59,16 +67,24 @@ pub fn unix_accept(fd: usize) -> isize {
 
 pub fn unix_connect(fd: usize, path: &str) -> isize {
     let server_fd = *UNIX_BINDS.lock().get(path).unwrap_or(&usize::MAX);
-    if server_fd == usize::MAX { return -2; }
+    if server_fd == usize::MAX {
+        return -2;
+    }
     let (client_conn, server_conn) = UnixConn::new_pair();
     let listener = {
         let sockets = SOCKETS.lock();
-        let Some(Some(s)) = sockets.get(server_fd) else { return -111; };
+        let Some(Some(s)) = sockets.get(server_fd) else {
+            return -111;
+        };
         s.unix_listener.clone()
     };
-    let Some(ul) = listener else { return -111; };
+    let Some(ul) = listener else {
+        return -111;
+    };
     let mut ul_guard = ul.lock();
-    if ul_guard.backlog.len() >= ul_guard.max_backlog { return -111; }
+    if ul_guard.backlog.len() >= ul_guard.max_backlog {
+        return -111;
+    }
     ul_guard.backlog.push_back(PendingUnix { server_conn });
     drop(ul_guard);
     let mut sockets = SOCKETS.lock();

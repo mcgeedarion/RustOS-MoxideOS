@@ -5,10 +5,10 @@
 //!   CLOSE_RANGE_CLOEXEC (1<<2) — set FD_CLOEXEC instead of closing.
 
 extern crate alloc;
-use alloc::vec::Vec;
-use crate::fs::fcntl::{close_fd_meta, close_fd_no_meta, cloexec_range};
+use crate::fs::fcntl::{cloexec_range, close_fd_meta, close_fd_no_meta};
 use crate::fs::process_fd;
 use crate::proc::scheduler;
+use alloc::vec::Vec;
 
 pub const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 pub const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;

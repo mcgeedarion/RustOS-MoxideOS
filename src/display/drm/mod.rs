@@ -10,9 +10,9 @@
 //! The Wayland compositor (`crate::display::wayland`) interfaces with this
 //! subsystem to perform display output and buffer presentation.
 
+pub mod connector;
 pub mod crtc;
 pub mod encoder;
-pub mod connector;
 pub mod framebuffer;
 pub mod gem;
 pub mod plane;

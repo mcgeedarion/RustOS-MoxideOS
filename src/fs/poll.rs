@@ -40,9 +40,10 @@
 //!
 //! ## select / pselect6 differences
 //!
-//!   `select`  uses `struct timeval`  (seconds + microseconds, 2×i64 on x86-64).
-//!   `pselect6` uses `struct timespec` (seconds + nanoseconds,  2×i64 on x86-64).
-//!   `pselect6` 6th argument is `{ const sigset_t *ss; size_t ss_len; }`.
+//!   `select`  uses `struct timeval`  (seconds + microseconds, 2×i64 on
+//! x86-64).   `pselect6` uses `struct timespec` (seconds + nanoseconds,  2×i64
+//! on x86-64).   `pselect6` 6th argument is `{ const sigset_t *ss; size_t
+//! ss_len; }`.
 //!
 //! ## Timeout writeback
 //!
@@ -51,32 +52,37 @@
 //!
 //! ## epoll
 //!
-//!   Epoll instance fds live in EPOLL_TABLE in [EPOLL_FD_BASE, EPOLL_FD_BASE+MAX_EPOLLS).
-//!   EPOLLONESHOT entries are disarmed after firing; re-arm with EPOLL_CTL_MOD.
+//!   Epoll instance fds live in EPOLL_TABLE in [EPOLL_FD_BASE,
+//! EPOLL_FD_BASE+MAX_EPOLLS).   EPOLLONESHOT entries are disarmed after firing;
+//! re-arm with EPOLL_CTL_MOD.
 
 extern crate alloc;
-use alloc::vec::Vec;
-use alloc::sync::Arc;
-use spin::Mutex;
+use crate::sync::poll_source::{wait_any, AlwaysReady, PollSource};
+use crate::sync::wait_queue::{CancellationToken, ReadyMask, WaitQueue, WakeReason};
 use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
-use crate::sync::wait_queue::{WaitQueue, WakeReason, CancellationToken, ReadyMask};
-use crate::sync::poll_source::{PollSource, wait_any, AlwaysReady};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use spin::Mutex;
 
-pub const POLLIN:       u32 = 0x0001;
-pub const POLLPRI:      u32 = 0x0002;
-pub const POLLOUT:      u32 = 0x0004;
-pub const POLLERR:      u32 = 0x0008;
-pub const POLLHUP:      u32 = 0x0010;
-pub const POLLNVAL:     u32 = 0x0020;
-pub const POLLRDNORM:   u32 = 0x0040;
-pub const POLLWRNORM:   u32 = 0x0100;
+pub const POLLIN: u32 = 0x0001;
+pub const POLLPRI: u32 = 0x0002;
+pub const POLLOUT: u32 = 0x0004;
+pub const POLLERR: u32 = 0x0008;
+pub const POLLHUP: u32 = 0x0010;
+pub const POLLNVAL: u32 = 0x0020;
+pub const POLLRDNORM: u32 = 0x0040;
+pub const POLLWRNORM: u32 = 0x0100;
 pub const EPOLLONESHOT: u32 = 0x4000_0000;
 
 #[inline]
 fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     let pid = crate::proc::scheduler::current_pid();
     let r = crate::fs::process_fd::proc_fd_backing(pid, user_fd);
-    if r < 0 { None } else { Some(r as usize) }
+    if r < 0 {
+        None
+    } else {
+        Some(r as usize)
+    }
 }
 
 // stdin is backed by the serial TTY ring; reads from the actual tty WaitQueue
@@ -88,15 +94,17 @@ struct StdinSource {
 }
 
 impl StdinSource {
-    fn new() -> Self { Self { wq: WaitQueue::new() } }
+    fn new() -> Self {
+        Self {
+            wq: WaitQueue::new(),
+        }
+    }
 }
 
 impl PollSource for StdinSource {
     fn poll(&self, interest: ReadyMask) -> ReadyMask {
         let mut r = 0u32;
-        if interest & (POLLIN | POLLRDNORM) != 0
-            && crate::tty::serial::bytes_available() > 0
-        {
+        if interest & (POLLIN | POLLRDNORM) != 0 && crate::tty::serial::bytes_available() > 0 {
             r |= POLLIN | POLLRDNORM;
         }
         if interest & (POLLOUT | POLLWRNORM) != 0 {
@@ -104,7 +112,9 @@ impl PollSource for StdinSource {
         }
         r
     }
-    fn wait_queue(&self) -> &WaitQueue { &self.wq }
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wq
+    }
 }
 
 /// Return an `Arc<dyn PollSource>` for any user-visible fd.

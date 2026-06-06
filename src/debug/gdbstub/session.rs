@@ -58,9 +58,9 @@ fn recv_packet(serial: &mut SerialPort) -> Option<String> {
         // Skip until '$'
         let b = unsafe { serial.read_byte() };
         match b {
-            0x03 => return None, // Ctrl-C interrupt
+            0x03 => return None,     // Ctrl-C interrupt
             b'+' | b'-' => continue, // stray ACK/NAK from previous exchange
-            b'$' => {}
+            b'$' => {},
             _ => continue,
         }
 
@@ -68,7 +68,9 @@ fn recv_packet(serial: &mut SerialPort) -> Option<String> {
         let mut body = Vec::with_capacity(64);
         loop {
             let c = unsafe { serial.read_byte() };
-            if c == b'#' { break; }
+            if c == b'#' {
+                break;
+            }
             body.push(c);
         }
 
@@ -147,7 +149,7 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
             let err = rsp_packet("E01");
             send_response(serial, &err);
             return;
-        }
+        },
     };
 
     let mut session = Session::new();
@@ -163,7 +165,7 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
                 target.ctl("stop");
                 let stop = rsp_packet("T02"); // SIGINT
                 send_response(serial, &stop);
-            }
+            },
             Some(body) => {
                 let resp = handle_packet(&body, &mut target, &mut session);
 
@@ -171,8 +173,9 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
                 // the target stops before sending the next stop reply.
                 if resp.is_empty() {
                     // Check if this was a continue/step (not kill)
-                    if !body.is_empty() && (body.as_bytes()[0] == b'c' ||
-                                            body.as_bytes()[0] == b's') {
+                    if !body.is_empty()
+                        && (body.as_bytes()[0] == b'c' || body.as_bytes()[0] == b's')
+                    {
                         wait_and_notify(serial, &mut target);
                     }
                     // 'k' sends "OK" then we're done — handled by the Ok branch
@@ -185,7 +188,7 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
                         break;
                     }
                 }
-            }
+            },
         }
     }
 }

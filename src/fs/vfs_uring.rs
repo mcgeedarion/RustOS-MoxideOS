@@ -9,11 +9,10 @@ use spin::Mutex;
 // We reserve fd numbers in [URING_FD_BASE, URING_FD_BASE + MAX_URING_FDS) for
 // io_uring instances.  The number stored is the ring_idx into RING_TABLE.
 
-const URING_FD_BASE:    usize = 0x5000_0000;
-const MAX_URING_FDS:    usize = 256;
+const URING_FD_BASE: usize = 0x5000_0000;
+const MAX_URING_FDS: usize = 256;
 
-static URING_FD_TABLE: Mutex<[Option<usize>; MAX_URING_FDS]> =
-    Mutex::new([None; MAX_URING_FDS]);
+static URING_FD_TABLE: Mutex<[Option<usize>; MAX_URING_FDS]> = Mutex::new([None; MAX_URING_FDS]);
 
 /// Allocate a new fd that refers to `ring_idx`.  Returns -ENFILE on overflow.
 pub fn alloc_fd_for_uring(ring_idx: usize) -> Option<usize> {
@@ -65,11 +64,18 @@ pub fn fsync(fd: usize) -> isize {
 /// Used by io_uring READ/READ_FIXED where the destination buffer is
 /// kernel-mapped registered memory.
 pub fn pread_buf(fd: usize, buf: &mut [u8], offset: i64) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
     let saved = crate::fs::vfs::seek(fd, 0, crate::fs::vfs::SEEK_CUR);
-    if saved < 0 { return saved; }
+    if saved < 0 {
+        return saved;
+    }
     let s = crate::fs::vfs::seek(fd, offset, crate::fs::vfs::SEEK_SET);
-    if s < 0 { crate::fs::vfs::seek(fd, saved, crate::fs::vfs::SEEK_SET); return s; }
+    if s < 0 {
+        crate::fs::vfs::seek(fd, saved, crate::fs::vfs::SEEK_SET);
+        return s;
+    }
     let n = crate::fs::vfs::read(fd, buf);
     crate::fs::vfs::seek(fd, saved, crate::fs::vfs::SEEK_SET);
     n
@@ -77,11 +83,18 @@ pub fn pread_buf(fd: usize, buf: &mut [u8], offset: i64) -> isize {
 
 /// Positional write from a kernel slice — no user-space copy.
 pub fn pwrite_buf(fd: usize, buf: &[u8], offset: i64) -> isize {
-    if buf.is_empty() { return 0; }
+    if buf.is_empty() {
+        return 0;
+    }
     let saved = crate::fs::vfs::seek(fd, 0, crate::fs::vfs::SEEK_CUR);
-    if saved < 0 { return saved; }
+    if saved < 0 {
+        return saved;
+    }
     let s = crate::fs::vfs::seek(fd, offset, crate::fs::vfs::SEEK_SET);
-    if s < 0 { crate::fs::vfs::seek(fd, saved, crate::fs::vfs::SEEK_SET); return s; }
+    if s < 0 {
+        crate::fs::vfs::seek(fd, saved, crate::fs::vfs::SEEK_SET);
+        return s;
+    }
     let n = crate::fs::vfs::write(fd, buf);
     crate::fs::vfs::seek(fd, saved, crate::fs::vfs::SEEK_SET);
     n

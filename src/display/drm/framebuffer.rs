@@ -46,7 +46,14 @@ impl Framebuffer {
             return Err(DrmError::InvalidFramebuffer);
         }
         let pitch = width * format.bpp();
-        Ok(Self { id, width, height, pitch, format, paddr })
+        Ok(Self {
+            id,
+            width,
+            height,
+            pitch,
+            format,
+            paddr,
+        })
     }
 
     pub fn size_bytes(&self) -> u64 {

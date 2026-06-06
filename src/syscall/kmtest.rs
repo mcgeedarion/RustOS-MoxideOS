@@ -30,7 +30,8 @@ use crate::syscall::errno::{efault, einval};
 /// # Safety
 /// `buf_ptr` must be a valid userspace pointer when non-zero.
 pub fn sys_kmtest_list(buf_ptr: usize, buf_len: usize) -> isize {
-    // SAFETY: linker symbols were validated at harness init; see kmtest::registry().
+    // SAFETY: linker symbols were validated at harness init; see
+    // kmtest::registry().
     let tests = unsafe { kmtest::registry_slice() };
 
     if buf_ptr == 0 {
@@ -77,10 +78,11 @@ pub fn sys_kmtest_run(index: usize) -> isize {
     }
 }
 
-// Run tests[start..end], print results to serial, return failure count as isize.
+// Run tests[start..end], print results to serial, return failure count as
+// isize.
 fn run_range(tests: &[kmtest::KmTestEntry], start: usize, end: usize) -> isize {
     let mut failures = 0usize;
-    let mut total    = 0usize;
+    let mut total = 0usize;
 
     for entry in &tests[start..end] {
         let result = (entry.run)();
@@ -88,11 +90,11 @@ fn run_range(tests: &[kmtest::KmTestEntry], start: usize, end: usize) -> isize {
         match result {
             Ok(()) => {
                 serial_println!("KMTEST  PASS  {}", entry.name);
-            }
+            },
             Err(msg) => {
                 serial_println!("KMTEST  FAIL  {} \u{2014} {}", entry.name, msg);
                 failures += 1;
-            }
+            },
         }
     }
 

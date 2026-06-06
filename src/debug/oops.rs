@@ -52,7 +52,7 @@ pub fn resolve_symbol(addr: usize) -> &'static str {
         return "<unknown>";
     }
     match SYMBOLS.binary_search_by_key(&addr, |&(a, _)| a) {
-        Ok(i)  => SYMBOLS[i].1,
+        Ok(i) => SYMBOLS[i].1,
         Err(0) => "<unknown>",
         Err(i) => SYMBOLS[i - 1].1,
     }
@@ -87,7 +87,8 @@ pub unsafe fn backtrace_from(fp: usize) {
     crate::serial_println!("--- end backtrace ---");
 }
 
-/// Capture the current frame pointer via inline asm and call [`backtrace_from`].
+/// Capture the current frame pointer via inline asm and call
+/// [`backtrace_from`].
 pub fn backtrace() {
     let fp: usize;
     #[cfg(target_arch = "x86_64")]
@@ -104,9 +105,17 @@ pub fn backtrace() {
         // x29 is the frame pointer register on AArch64.
         core::arch::asm!("mov {}, x29", out(reg) fp);
     }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
-    { fp = 0; }
-    unsafe { backtrace_from(fp); }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )))]
+    {
+        fp = 0;
+    }
+    unsafe {
+        backtrace_from(fp);
+    }
 }
 
 /// Print all general-purpose registers for an x86_64 trap frame.
@@ -116,18 +125,42 @@ pub fn backtrace() {
 #[cfg(target_arch = "x86_64")]
 pub fn dump_regs_x86_64(regs: &crate::arch::x86_64::TrapFrame) {
     crate::serial_println!("--- registers (x86_64) ---");
-    crate::serial_println!("  rax={:#018x}  rbx={:#018x}  rcx={:#018x}",
-        regs.rax, regs.rbx, regs.rcx);
-    crate::serial_println!("  rdx={:#018x}  rsi={:#018x}  rdi={:#018x}",
-        regs.rdx, regs.rsi, regs.rdi);
-    crate::serial_println!("  r8 ={:#018x}  r9 ={:#018x}  r10={:#018x}",
-        regs.r8,  regs.r9,  regs.r10);
-    crate::serial_println!("  r11={:#018x}  r12={:#018x}  r13={:#018x}",
-        regs.r11, regs.r12, regs.r13);
-    crate::serial_println!("  r14={:#018x}  r15={:#018x}  rbp={:#018x}",
-        regs.r14, regs.r15, regs.rbp);
-    crate::serial_println!("  rip={:#018x}  rsp={:#018x}  rflags={:#018x}",
-        regs.rip, regs.rsp, regs.rflags);
+    crate::serial_println!(
+        "  rax={:#018x}  rbx={:#018x}  rcx={:#018x}",
+        regs.rax,
+        regs.rbx,
+        regs.rcx
+    );
+    crate::serial_println!(
+        "  rdx={:#018x}  rsi={:#018x}  rdi={:#018x}",
+        regs.rdx,
+        regs.rsi,
+        regs.rdi
+    );
+    crate::serial_println!(
+        "  r8 ={:#018x}  r9 ={:#018x}  r10={:#018x}",
+        regs.r8,
+        regs.r9,
+        regs.r10
+    );
+    crate::serial_println!(
+        "  r11={:#018x}  r12={:#018x}  r13={:#018x}",
+        regs.r11,
+        regs.r12,
+        regs.r13
+    );
+    crate::serial_println!(
+        "  r14={:#018x}  r15={:#018x}  rbp={:#018x}",
+        regs.r14,
+        regs.r15,
+        regs.rbp
+    );
+    crate::serial_println!(
+        "  rip={:#018x}  rsp={:#018x}  rflags={:#018x}",
+        regs.rip,
+        regs.rsp,
+        regs.rflags
+    );
     crate::serial_println!("--- end registers ---");
 }
 
@@ -135,20 +168,43 @@ pub fn dump_regs_x86_64(regs: &crate::arch::x86_64::TrapFrame) {
 #[cfg(target_arch = "riscv64")]
 pub fn dump_regs_riscv(regs: &crate::arch::riscv64::TrapFrame) {
     crate::serial_println!("--- registers (riscv64) ---");
-    crate::serial_println!("  ra ={:#018x}  sp ={:#018x}  gp ={:#018x}",
-        regs.ra, regs.sp, regs.gp);
-    crate::serial_println!("  tp ={:#018x}  t0 ={:#018x}  t1 ={:#018x}",
-        regs.tp, regs.t0, regs.t1);
-    crate::serial_println!("  t2 ={:#018x}  s0 ={:#018x}  s1 ={:#018x}",
-        regs.t2, regs.s0, regs.s1);
-    crate::serial_println!("  a0 ={:#018x}  a1 ={:#018x}  a2 ={:#018x}",
-        regs.a0, regs.a1, regs.a2);
-    crate::serial_println!("  a3 ={:#018x}  a4 ={:#018x}  a5 ={:#018x}",
-        regs.a3, regs.a4, regs.a5);
-    crate::serial_println!("  a6 ={:#018x}  a7 ={:#018x}",
-        regs.a6, regs.a7);
-    crate::serial_println!("  sepc={:#018x}  scause={:#018x}  stval={:#018x}",
-        regs.sepc, regs.scause, regs.stval);
+    crate::serial_println!(
+        "  ra ={:#018x}  sp ={:#018x}  gp ={:#018x}",
+        regs.ra,
+        regs.sp,
+        regs.gp
+    );
+    crate::serial_println!(
+        "  tp ={:#018x}  t0 ={:#018x}  t1 ={:#018x}",
+        regs.tp,
+        regs.t0,
+        regs.t1
+    );
+    crate::serial_println!(
+        "  t2 ={:#018x}  s0 ={:#018x}  s1 ={:#018x}",
+        regs.t2,
+        regs.s0,
+        regs.s1
+    );
+    crate::serial_println!(
+        "  a0 ={:#018x}  a1 ={:#018x}  a2 ={:#018x}",
+        regs.a0,
+        regs.a1,
+        regs.a2
+    );
+    crate::serial_println!(
+        "  a3 ={:#018x}  a4 ={:#018x}  a5 ={:#018x}",
+        regs.a3,
+        regs.a4,
+        regs.a5
+    );
+    crate::serial_println!("  a6 ={:#018x}  a7 ={:#018x}", regs.a6, regs.a7);
+    crate::serial_println!(
+        "  sepc={:#018x}  scause={:#018x}  stval={:#018x}",
+        regs.sepc,
+        regs.scause,
+        regs.stval
+    );
     crate::serial_println!("--- end registers ---");
 }
 
@@ -159,30 +215,68 @@ pub fn dump_regs_riscv(regs: &crate::arch::riscv64::TrapFrame) {
 #[cfg(target_arch = "aarch64")]
 pub fn dump_regs_aarch64(regs: &crate::arch::aarch64::TrapFrame) {
     crate::serial_println!("--- registers (aarch64) ---");
-    crate::serial_println!("  x0 ={:#018x}  x1 ={:#018x}  x2 ={:#018x}",
-        regs.x0,  regs.x1,  regs.x2);
-    crate::serial_println!("  x3 ={:#018x}  x4 ={:#018x}  x5 ={:#018x}",
-        regs.x3,  regs.x4,  regs.x5);
-    crate::serial_println!("  x6 ={:#018x}  x7 ={:#018x}  x8 ={:#018x}",
-        regs.x6,  regs.x7,  regs.x8);
-    crate::serial_println!("  x9 ={:#018x}  x10={:#018x}  x11={:#018x}",
-        regs.x9,  regs.x10, regs.x11);
-    crate::serial_println!("  x12={:#018x}  x13={:#018x}  x14={:#018x}",
-        regs.x12, regs.x13, regs.x14);
-    crate::serial_println!("  x15={:#018x}  x16={:#018x}  x17={:#018x}",
-        regs.x15, regs.x16, regs.x17);
-    crate::serial_println!("  x18={:#018x}  x19={:#018x}  x20={:#018x}",
-        regs.x18, regs.x19, regs.x20);
-    crate::serial_println!("  x21={:#018x}  x22={:#018x}  x23={:#018x}",
-        regs.x21, regs.x22, regs.x23);
-    crate::serial_println!("  x24={:#018x}  x25={:#018x}  x26={:#018x}",
-        regs.x24, regs.x25, regs.x26);
-    crate::serial_println!("  x27={:#018x}  x28={:#018x}  x29={:#018x}",
-        regs.x27, regs.x28, regs.x29);
-    crate::serial_println!("  x30={:#018x}  sp ={:#018x}",
-        regs.x30, regs.sp);
-    crate::serial_println!("  pc ={:#018x}  spsr={:#018x}",
-        regs.pc,  regs.spsr);
+    crate::serial_println!(
+        "  x0 ={:#018x}  x1 ={:#018x}  x2 ={:#018x}",
+        regs.x0,
+        regs.x1,
+        regs.x2
+    );
+    crate::serial_println!(
+        "  x3 ={:#018x}  x4 ={:#018x}  x5 ={:#018x}",
+        regs.x3,
+        regs.x4,
+        regs.x5
+    );
+    crate::serial_println!(
+        "  x6 ={:#018x}  x7 ={:#018x}  x8 ={:#018x}",
+        regs.x6,
+        regs.x7,
+        regs.x8
+    );
+    crate::serial_println!(
+        "  x9 ={:#018x}  x10={:#018x}  x11={:#018x}",
+        regs.x9,
+        regs.x10,
+        regs.x11
+    );
+    crate::serial_println!(
+        "  x12={:#018x}  x13={:#018x}  x14={:#018x}",
+        regs.x12,
+        regs.x13,
+        regs.x14
+    );
+    crate::serial_println!(
+        "  x15={:#018x}  x16={:#018x}  x17={:#018x}",
+        regs.x15,
+        regs.x16,
+        regs.x17
+    );
+    crate::serial_println!(
+        "  x18={:#018x}  x19={:#018x}  x20={:#018x}",
+        regs.x18,
+        regs.x19,
+        regs.x20
+    );
+    crate::serial_println!(
+        "  x21={:#018x}  x22={:#018x}  x23={:#018x}",
+        regs.x21,
+        regs.x22,
+        regs.x23
+    );
+    crate::serial_println!(
+        "  x24={:#018x}  x25={:#018x}  x26={:#018x}",
+        regs.x24,
+        regs.x25,
+        regs.x26
+    );
+    crate::serial_println!(
+        "  x27={:#018x}  x28={:#018x}  x29={:#018x}",
+        regs.x27,
+        regs.x28,
+        regs.x29
+    );
+    crate::serial_println!("  x30={:#018x}  sp ={:#018x}", regs.x30, regs.sp);
+    crate::serial_println!("  pc ={:#018x}  spsr={:#018x}", regs.pc, regs.spsr);
     crate::serial_println!("--- end registers ---");
 }
 
@@ -206,7 +300,10 @@ pub fn dump_regs_aarch64(regs: &crate::arch::aarch64::TrapFrame) {
 /// ```
 pub fn oops(msg: &str) {
     // Prevent recursive oops storms.
-    if IN_OOPS.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    if IN_OOPS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return;
     }
     crate::serial_println!("\n!!! KERNEL OOPS !!!");
@@ -218,7 +315,10 @@ pub fn oops(msg: &str) {
     crate::debug::trace::drain(|ev| {
         crate::serial_println!(
             "  trace [{:?}] id={} arg={:#x} ticks={}",
-            ev.kind, ev.id, ev.arg, ev.ticks
+            ev.kind,
+            ev.id,
+            ev.arg,
+            ev.ticks
         );
     });
 }

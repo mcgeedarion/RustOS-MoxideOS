@@ -15,15 +15,15 @@ use crate::io_uring::{cqe::errno, sqe::Sqe};
 // Mirrored from Linux <sys/socket.h>
 pub mod sock_flags {
     pub const SOCK_NONBLOCK: u32 = 0o0004000;
-    pub const SOCK_CLOEXEC:  u32 = 0o2000000;
+    pub const SOCK_CLOEXEC: u32 = 0o2000000;
 }
 
 /// Synchronous kernel-side handler for IORING_OP_ACCEPT.
 pub fn handle(sqe: &Sqe) -> i32 {
-    let listen_fd  = sqe.fd;
-    let addr_va    = sqe.addr;
+    let listen_fd = sqe.fd;
+    let addr_va = sqe.addr;
     let addrlen_va = sqe.addr3;
-    let flags      = sqe.op_flags;
+    let flags = sqe.op_flags;
 
     if listen_fd < 0 {
         log::warn!("[io_uring::accept] invalid listen_fd={}", listen_fd);
@@ -32,23 +32,24 @@ pub fn handle(sqe: &Sqe) -> i32 {
 
     log::trace!(
         "[io_uring::accept] listen_fd={} addr={:#x} addrlen={:#x} flags={:#x} token={:#x}",
-        listen_fd, addr_va, addrlen_va, flags, sqe.user_data
+        listen_fd,
+        addr_va,
+        addrlen_va,
+        flags,
+        sqe.user_data
     );
 
     let _ = flags;
-    crate::net::socket::core::sys_accept(
-        listen_fd as usize,
-        addr_va as usize,
-        addrlen_va as usize,
-    ) as i32
+    crate::net::socket::core::sys_accept(listen_fd as usize, addr_va as usize, addrlen_va as usize)
+        as i32
 }
 
+use crate::io_uring::{ring::IoUringSqe, with_ring_mut, IoUringError};
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use crate::io_uring::{IoUringError, with_ring_mut, ring::IoUringSqe};
 
 /// Async wrapper around IORING_OP_ACCEPT.
 ///
@@ -63,13 +64,13 @@ use crate::io_uring::{IoUringError, with_ring_mut, ring::IoUringSqe};
 /// let client_fd = IoAccept::new(ring_idx, listen_fd, addr_va, addrlen_va, 0, token).await?;
 /// ```
 pub struct IoAccept {
-    ring_idx:   usize,
-    fd:         i32,
-    addr_va:    u64,
+    ring_idx: usize,
+    fd: i32,
+    addr_va: u64,
     addrlen_va: u64,
-    flags:      u32,
-    token:      u64,
-    submitted:  bool,
+    flags: u32,
+    token: u64,
+    submitted: bool,
 }
 
 impl IoAccept {
@@ -80,14 +81,22 @@ impl IoAccept {
     /// addresses that must remain valid and pinned for the lifetime of this
     /// future.
     pub fn new(
-        ring_idx:   usize,
-        fd:         i32,
-        addr_va:    u64,
+        ring_idx: usize,
+        fd: i32,
+        addr_va: u64,
         addrlen_va: u64,
-        flags:      u32,
-        token:      u64,
+        flags: u32,
+        token: u64,
     ) -> Self {
-        IoAccept { ring_idx, fd, addr_va, addrlen_va, flags, token, submitted: false }
+        IoAccept {
+            ring_idx,
+            fd,
+            addr_va,
+            addrlen_va,
+            flags,
+            token,
+            submitted: false,
+        }
     }
 }
 
@@ -105,9 +114,9 @@ impl Future for IoAccept {
             ));
             let result = with_ring_mut(self.ring_idx, |r| r.push_sqe(wire_sqe));
             match result {
-                None        => return Poll::Ready(Err(IoUringError::InvalidRing)),
+                None => return Poll::Ready(Err(IoUringError::InvalidRing)),
                 Some(false) => return Poll::Ready(Err(IoUringError::SqFull)),
-                Some(true)  => {}
+                Some(true) => {},
             }
             self.submitted = true;
         }

@@ -23,7 +23,7 @@ pub fn dispatch(sqe: &Sqe) -> i32 {
         op::NOP => {
             log::trace!("[io_uring] NOP token={:#x}", sqe.user_data);
             0
-        }
+        },
 
         op::READ => read::handle(sqe),
 
@@ -42,7 +42,7 @@ pub fn dispatch(sqe: &Sqe) -> i32 {
                 sqe.user_data
             );
             errno::E_NOSYS
-        }
+        },
     }
 }
 

@@ -4,14 +4,14 @@
 //!
 //!   `allocator`  — Global heap allocator: linked-list + buddy system.
 //!                  The `#[global_allocator]` registration lives in
-//!                  `allocator/mod.rs`. Sub-modules: `buddy`, `fixed_size_block`,
-//!                  `stats`, `tests`.
+//!                  `allocator/mod.rs`. Sub-modules: `buddy`,
+//! `fixed_size_block`,                  `stats`, `tests`.
 //!
 //!   `core_dump`  — ELF core-dump generation on fatal signals.
 //!   `cow_fault`  — Copy-on-write page-fault handler.
 //!   `heap`       — Linked-list allocator bootstrap over PMM frames.
-//!   `kasan`      — KASAN-lite shadow-memory poisoning/checking for heap debug builds.
-//!   `kstack`     — Per-CPU kernel stack allocator and guard pages.
+//!   `kasan`      — KASAN-lite shadow-memory poisoning/checking for heap debug
+//! builds.   `kstack`     — Per-CPU kernel stack allocator and guard pages.
 //!   `memmap`     — Physical memory map parsing (E820 / UEFI memory map).
 //!   `mlock`      — `mlock`/`munlock` syscall implementation.
 //!   `mmap`       — `mmap`/`munmap`/`mprotect` syscall implementation.
@@ -23,13 +23,13 @@
 //!   `swap`       — Swap subsystem: anonymous page eviction and reclaim.
 
 pub mod allocator;
+pub mod boot_memory;
 pub mod core_dump;
 pub mod cow_fault;
 pub mod heap;
 pub mod kasan;
 pub mod kstack;
 pub mod memmap;
-pub mod boot_memory;
 pub mod mlock;
 pub mod mmap;
 pub mod page_fault;
@@ -42,11 +42,11 @@ pub mod swap;
 /// Initialise memory subsystems that require explicit boot-time setup.
 ///
 /// Call order (enforced by kernel_main):
-///   1. pmm::init() / pmm::pmm_add_efi_map() / memmap::memmap_init()
-///      — physical frames must be available before slab can grow.
+///   1. pmm::init() / pmm::pmm_add_efi_map() / memmap::memmap_init() — physical
+///      frames must be available before slab can grow.
 ///   2. heap::init_heap_tracking()  — linked_list_allocator bootstrap.
-///   3. mm::init()                  — THIS function; pre-warms slab caches
-///                                    and initialises the swap subsystem.
+///   3. mm::init()                  — THIS function; pre-warms slab caches and
+///      initialises the swap subsystem.
 ///
 /// After this returns, `slab::slab_alloc`, `slab::slab_free`,
 /// `slab::slab_shrink`, `slab::slab_stats`, and all `swap::` functions
@@ -74,8 +74,8 @@ pub fn init() {
 /// SMAP-gated through `crate::kernel::uaccess`.
 pub struct UserBuffer {
     base: *mut u8,
-    len:  usize,
-    cur:  usize,
+    len: usize,
+    cur: usize,
 }
 
 // Safe to send across CPU boundaries because the underlying user-space
@@ -98,7 +98,9 @@ impl UserBuffer {
     /// Bytes still available between the cursor and the end of the
     /// user-space range.
     #[inline]
-    pub fn remaining(&self) -> usize { self.len - self.cur }
+    pub fn remaining(&self) -> usize {
+        self.len - self.cur
+    }
 
     /// Append `src` to the user-space buffer at the current cursor. Fails
     /// with `-EFAULT (-14)` if the copy would overflow `remaining()`, and
@@ -112,7 +114,9 @@ impl UserBuffer {
         // src/fs/ioctl/net.rs (`copy_to_user(arg, &ifr)`). Definition is
         // written in kernel/uaccess.rs in this same patch.
         let n = unsafe { crate::kernel::uaccess::copy_to_user_raw(dst, src.as_ptr(), src.len()) };
-        if n != src.len() { return Err(-14); }
+        if n != src.len() {
+            return Err(-14);
+        }
         self.cur += src.len();
         Ok(())
     }
@@ -124,10 +128,11 @@ impl UserBuffer {
             return Err(-14);
         }
         let src = unsafe { self.base.add(self.cur) };
-        let n = unsafe {
-            crate::kernel::uaccess::copy_from_user_raw(dst.as_mut_ptr(), src, dst.len())
-        };
-        if n != dst.len() { return Err(-14); }
+        let n =
+            unsafe { crate::kernel::uaccess::copy_from_user_raw(dst.as_mut_ptr(), src, dst.len()) };
+        if n != dst.len() {
+            return Err(-14);
+        }
         self.cur += dst.len();
         Ok(())
     }

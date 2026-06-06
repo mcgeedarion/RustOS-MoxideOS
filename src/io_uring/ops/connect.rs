@@ -5,8 +5,8 @@
 // CQE result:
 //   res == 0  → connected (or connection in progress for non-blocking sockets)
 //   res <  0  → negated errno
-//     -EINPROGRESS (-115): non-blocking connect is in flight (poll/epoll to complete)
-//     -ECONNREFUSED (-111): remote refused
+//     -EINPROGRESS (-115): non-blocking connect is in flight (poll/epoll to
+// complete)     -ECONNREFUSED (-111): remote refused
 //     -ETIMEDOUT   (-110): connection timed out
 //     -EADDRINUSE  (-98):  local address already in use
 
@@ -14,9 +14,9 @@ use crate::io_uring::{cqe::errno, sqe::Sqe};
 
 /// Synchronous kernel-side handler for IORING_OP_CONNECT.
 pub fn handle(sqe: &Sqe) -> i32 {
-    let sock_fd   = sqe.fd;
-    let addr_va   = sqe.addr;
-    let addrlen   = sqe.len;
+    let sock_fd = sqe.fd;
+    let addr_va = sqe.addr;
+    let addrlen = sqe.len;
 
     if sock_fd < 0 {
         log::warn!("[io_uring::connect] invalid sock_fd={}", sock_fd);
@@ -34,18 +34,21 @@ pub fn handle(sqe: &Sqe) -> i32 {
 
     log::trace!(
         "[io_uring::connect] sock_fd={} addr={:#x} addrlen={} token={:#x}",
-        sock_fd, addr_va, addrlen, sqe.user_data
+        sock_fd,
+        addr_va,
+        addrlen,
+        sqe.user_data
     );
 
     crate::net::socket::core::sys_connect(sock_fd as usize, addr_va as usize, addrlen) as i32
 }
 
+use crate::io_uring::{self as ring, IoUringError};
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use crate::io_uring::{self as ring, IoUringError};
 
 /// Async wrapper around IORING_OP_CONNECT.
 ///
@@ -67,7 +70,13 @@ pub struct IoConnect {
 
 impl IoConnect {
     pub fn new(fd: i32, addr_va: u64, addrlen: u32, token: u64) -> Self {
-        IoConnect { fd, addr_va, addrlen, token, submitted: false }
+        IoConnect {
+            fd,
+            addr_va,
+            addrlen,
+            token,
+            submitted: false,
+        }
     }
 }
 
@@ -78,12 +87,8 @@ impl Future for IoConnect {
         ring::register_waker(self.token, cx.waker().clone());
 
         if !self.submitted {
-            let sqe = crate::io_uring::sqe::Sqe::connect(
-                self.fd,
-                self.addr_va,
-                self.addrlen,
-                self.token,
-            );
+            let sqe =
+                crate::io_uring::sqe::Sqe::connect(self.fd, self.addr_va, self.addrlen, self.token);
             ring::submit(sqe)?;
             self.submitted = true;
         }

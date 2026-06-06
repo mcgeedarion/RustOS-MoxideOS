@@ -20,10 +20,10 @@ pub mod capset;
 pub use capset::CapSet;
 pub mod dac;
 pub mod lsm;
+pub mod ns;
 pub mod pti;
 pub mod seccomp;
 pub mod smep_smap;
-pub mod ns;
 
 #[cfg(feature = "cgroups")]
 pub mod cgroups;

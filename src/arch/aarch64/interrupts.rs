@@ -25,20 +25,20 @@ use core::arch::asm;
 #[repr(C)]
 pub struct ExceptionFrame {
     pub x: [u64; 31],
-    pub sp_el0:   u64,
-    pub elr_el1:  u64,
+    pub sp_el0: u64,
+    pub elr_el1: u64,
     pub spsr_el1: u64,
 }
 
 // Exception Syndrome Register — Class field.
 const ESR_EC_SHIFT: u64 = 26;
-const ESR_EC_MASK:  u64 = 0x3f;
+const ESR_EC_MASK: u64 = 0x3f;
 
-const EC_SVC64:            u64 = 0x15; // SVC from AArch64
+const EC_SVC64: u64 = 0x15; // SVC from AArch64
 const EC_INST_ABORT_LOWER: u64 = 0x20; // instruction abort from EL0
-const EC_INST_ABORT_SAME:  u64 = 0x21; // instruction abort from EL1
+const EC_INST_ABORT_SAME: u64 = 0x21; // instruction abort from EL1
 const EC_DATA_ABORT_LOWER: u64 = 0x24; // data abort from EL0
-const EC_DATA_ABORT_SAME:  u64 = 0x25; // data abort from EL1
+const EC_DATA_ABORT_SAME: u64 = 0x25; // data abort from EL1
 
 extern "C" {
     /// Defined in `vectors.S`; must be 2 KiB-aligned.
@@ -71,22 +71,17 @@ extern "C" fn aarch64_sync_handler(frame: &mut ExceptionFrame) {
     match (esr >> ESR_EC_SHIFT) & ESR_EC_MASK {
         EC_SVC64 => {
             super::syscall::handle(frame);
-        }
-        EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME |
-        EC_INST_ABORT_LOWER | EC_INST_ABORT_SAME => {
+        },
+        EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME | EC_INST_ABORT_LOWER | EC_INST_ABORT_SAME => {
             let far = super::hal::read_far_el1();
-            crate::mm::page_fault::handle(
-                far,
-                esr as usize,
-                frame.elr_el1 as usize,
-            );
-        }
+            crate::mm::page_fault::handle(far, esr as usize, frame.elr_el1 as usize);
+        },
         ec => {
             panic!(
                 "aarch64: unhandled exception ec={:#x} esr={:#x} elr={:#x}",
                 ec, esr, frame.elr_el1
             );
-        }
+        },
     }
 }
 

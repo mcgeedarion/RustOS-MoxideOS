@@ -4,11 +4,11 @@
 //! descriptor slots; for simplicity we issue one chain at a time (synchronous
 //! I/O) and never have more than one in-flight request.
 
-use core::sync::atomic::{AtomicU16, Ordering};
 use crate::mm::phys::virt_to_phys;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 // Descriptor flags
-pub const VIRTQ_DESC_F_NEXT:  u16 = 1;
+pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 2; // device-writable
 
 // ---------------------------------------------------------------------------
@@ -19,18 +19,18 @@ pub const VIRTQ_DESC_F_WRITE: u16 = 2; // device-writable
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct VirtqDesc {
-    pub addr:  u64,
-    pub len:   u32,
+    pub addr: u64,
+    pub len: u32,
     pub flags: u16,
-    pub next:  u16,
+    pub next: u16,
 }
 
 /// Available ring (driver → device).
 #[repr(C)]
 struct VirtqAvail<const N: usize> {
     flags: u16,
-    idx:   u16,
-    ring:  [u16; N],
+    idx: u16,
+    ring: [u16; N],
     used_event: u16,
 }
 
@@ -38,7 +38,7 @@ struct VirtqAvail<const N: usize> {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct VirtqUsedElem {
-    id:  u32,
+    id: u32,
     len: u32,
 }
 
@@ -46,8 +46,8 @@ struct VirtqUsedElem {
 #[repr(C)]
 struct VirtqUsed<const N: usize> {
     flags: u16,
-    idx:   u16,
-    ring:  [VirtqUsedElem; N],
+    idx: u16,
+    ring: [VirtqUsedElem; N],
     avail_event: u16,
 }
 
@@ -61,34 +61,55 @@ struct VirtqUsed<const N: usize> {
 /// addresses are stable for the lifetime of the driver.
 #[repr(C, align(4096))]
 pub struct Virtqueue<const N: usize> {
-    desc:  [VirtqDesc; N],
+    desc: [VirtqDesc; N],
     avail: VirtqAvail<N>,
     // 4 KiB alignment between avail and used rings (spec §2.6)
-    _pad:  [u8; 4096],
-    used:  VirtqUsed<N>,
+    _pad: [u8; 4096],
+    used: VirtqUsed<N>,
 
     // Driver-side bookkeeping (not mapped to device)
     last_used_idx: u16,
-    next_free:     u16,
+    next_free: u16,
 }
 
 impl<const N: usize> Virtqueue<N> {
     pub const fn new() -> Self {
         Self {
-            desc:  [VirtqDesc { addr: 0, len: 0, flags: 0, next: 0 }; N],
-            avail: VirtqAvail { flags: 0, idx: 0, ring: [0u16; N], used_event: 0 },
-            _pad:  [0u8; 4096],
-            used:  VirtqUsed  { flags: 0, idx: 0, ring: [VirtqUsedElem { id: 0, len: 0 }; N], avail_event: 0 },
+            desc: [VirtqDesc {
+                addr: 0,
+                len: 0,
+                flags: 0,
+                next: 0,
+            }; N],
+            avail: VirtqAvail {
+                flags: 0,
+                idx: 0,
+                ring: [0u16; N],
+                used_event: 0,
+            },
+            _pad: [0u8; 4096],
+            used: VirtqUsed {
+                flags: 0,
+                idx: 0,
+                ring: [VirtqUsedElem { id: 0, len: 0 }; N],
+                avail_event: 0,
+            },
             last_used_idx: 0,
-            next_free:     0,
+            next_free: 0,
         }
     }
 
     // --- physical address accessors for VirtioMmio::init_queue ---
 
-    pub fn desc_phys(&self)  -> u64 { virt_to_phys(self.desc.as_ptr()  as usize) as u64 }
-    pub fn avail_phys(&self) -> u64 { virt_to_phys(&self.avail as *const _ as usize) as u64 }
-    pub fn used_phys(&self)  -> u64 { virt_to_phys(&self.used  as *const _ as usize) as u64 }
+    pub fn desc_phys(&self) -> u64 {
+        virt_to_phys(self.desc.as_ptr() as usize) as u64
+    }
+    pub fn avail_phys(&self) -> u64 {
+        virt_to_phys(&self.avail as *const _ as usize) as u64
+    }
+    pub fn used_phys(&self) -> u64 {
+        virt_to_phys(&self.used as *const _ as usize) as u64
+    }
 
     // --- descriptor chain management ---
 

@@ -32,12 +32,18 @@ pub(super) fn sys_getcwd_impl(buf_va: usize, size: usize) -> isize {
     let pid = scheduler::current_pid();
     let cwd = match scheduler::with_proc(pid, |p| p.cwd.clone()) {
         Some(s) => s,
-        None    => return einval(),
+        None => return einval(),
     };
     let bytes = cwd.as_bytes();
-    if bytes.len() + 1 > size { return erange(); }
-    if copy_to_user(buf_va, bytes).is_err() { return efault(); }
-    if copy_to_user(buf_va + bytes.len(), &[0u8]).is_err() { return efault(); }
+    if bytes.len() + 1 > size {
+        return erange();
+    }
+    if copy_to_user(buf_va, bytes).is_err() {
+        return efault();
+    }
+    if copy_to_user(buf_va + bytes.len(), &[0u8]).is_err() {
+        return efault();
+    }
     buf_va as isize
 }
 
@@ -58,14 +64,17 @@ pub(super) fn sys_rename_impl(old_va: usize, new_va: usize) -> isize {
 
 /// NR 264  renameat(old_dirfd, old_va, new_dirfd, new_va)
 pub(super) fn sys_renameat_impl(
-    old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize,
+    old_dirfd: i32,
+    old_va: usize,
+    new_dirfd: i32,
+    new_va: usize,
 ) -> isize {
     let old = match resolve_at_path_for_stubs(old_dirfd, old_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     let new = match resolve_at_path_for_stubs(new_dirfd, new_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::rename(&old, &new)
@@ -73,7 +82,11 @@ pub(super) fn sys_renameat_impl(
 
 /// NR 316  renameat2(old_dirfd, old_va, new_dirfd, new_va, flags)
 pub(super) fn sys_renameat2_impl(
-    old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize, flags: u32,
+    old_dirfd: i32,
+    old_va: usize,
+    new_dirfd: i32,
+    new_va: usize,
+    flags: u32,
 ) -> isize {
     if flags != 0 {
         // RENAME_NOREPLACE / RENAME_EXCHANGE / RENAME_WHITEOUT not yet implemented.
@@ -95,39 +108,33 @@ pub(super) fn sys_mkdirat_impl(dirfd: i32, path_va: usize, mode: u32) -> isize {
 ///
 /// Supported node types:
 ///   S_IFIFO  (0o010000) — create a named pipe via the VFS pipe layer.
-///   S_IFSOCK (0o014000) — create a UNIX-domain socket node (AF_UNIX bind path).
-///   S_IFCHR / S_IFBLK   — pass through to vfs_ops::mknod; returns EPERM if
-///                          the driver table has no entry for (major, minor).
-///   S_IFREG  with dev=0 — semantically equivalent to creat(2).
+///   S_IFSOCK (0o014000) — create a UNIX-domain socket node (AF_UNIX bind
+/// path).   S_IFCHR / S_IFBLK   — pass through to vfs_ops::mknod; returns EPERM
+/// if                          the driver table has no entry for (major,
+/// minor).   S_IFREG  with dev=0 — semantically equivalent to creat(2).
 ///   S_IFDIR  and other  — EINVAL per POSIX.
 pub(super) fn sys_mknodat_impl(dirfd: i32, path_va: usize, mode: u32, dev: u64) -> isize {
-    const S_IFMT:   u32 = 0o170000;
-    const S_IFREG:  u32 = 0o100000;
-    const S_IFCHR:  u32 = 0o020000;
-    const S_IFBLK:  u32 = 0o060000;
-    const S_IFIFO:  u32 = 0o010000;
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFCHR: u32 = 0o020000;
+    const S_IFBLK: u32 = 0o060000;
+    const S_IFIFO: u32 = 0o010000;
     const S_IFSOCK: u32 = 0o140000;
 
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
 
     match mode & S_IFMT {
-        S_IFIFO => {
-            crate::fs::pipe::create_named_pipe(&path, mode & !S_IFMT)
-        }
-        S_IFSOCK => {
-            crate::fs::vfs_ops::create_socket_node(&path, mode & !S_IFMT)
-        }
-        S_IFREG if dev == 0 => {
-            crate::fs::vfs_ops::create_regular(&path, mode & !S_IFMT)
-        }
+        S_IFIFO => crate::fs::pipe::create_named_pipe(&path, mode & !S_IFMT),
+        S_IFSOCK => crate::fs::vfs_ops::create_socket_node(&path, mode & !S_IFMT),
+        S_IFREG if dev == 0 => crate::fs::vfs_ops::create_regular(&path, mode & !S_IFMT),
         S_IFCHR | S_IFBLK => {
             let major = ((dev >> 8) & 0xfff) as u32;
             let minor = ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32;
             crate::fs::vfs_ops::mknod(&path, mode, major, minor)
-        }
+        },
         _ => einval(),
     }
 }
@@ -143,9 +150,11 @@ pub(super) fn sys_newfstatat_impl(dirfd: i32, path_va: usize, stat_va: usize, fl
 
 pub(super) fn sys_unlinkat_impl(dirfd: i32, path_va: usize, flags: u32) -> isize {
     const AT_REMOVEDIR: u32 = 0x200;
-    if flags & !AT_REMOVEDIR != 0 { return einval(); }
+    if flags & !AT_REMOVEDIR != 0 {
+        return einval();
+    }
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     if flags & AT_REMOVEDIR != 0 {
@@ -157,7 +166,7 @@ pub(super) fn sys_unlinkat_impl(dirfd: i32, path_va: usize, flags: u32) -> isize
 
 pub(super) fn sys_rmdir_impl(path_va: usize) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::rmdir(&path)
@@ -169,11 +178,11 @@ pub(super) fn sys_unlink_impl(path_va: usize) -> isize {
 
 pub(super) fn sys_symlinkat_impl(target_va: usize, new_dirfd: i32, linkpath_va: usize) -> isize {
     let target = match crate::mm::uaccess::read_user_str(target_va, 4096) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return efault(),
     };
     let link = match resolve_at_path_for_stubs(new_dirfd, linkpath_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::symlink(&target, &link)
@@ -184,19 +193,24 @@ pub(super) fn sys_symlink_impl(target_va: usize, linkpath_va: usize) -> isize {
 }
 
 pub(super) fn sys_readlinkat_impl(
-    dirfd: i32, path_va: usize, buf_va: usize, bufsz: usize,
+    dirfd: i32,
+    path_va: usize,
+    buf_va: usize,
+    bufsz: usize,
 ) -> isize {
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     let target = match crate::fs::vfs_ops::readlink(&path) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => return e,
     };
     let bytes = target.as_bytes();
     let n = bytes.len().min(bufsz);
-    if copy_to_user(buf_va, &bytes[..n]).is_err() { return efault(); }
+    if copy_to_user(buf_va, &bytes[..n]).is_err() {
+        return efault();
+    }
     n as isize
 }
 
@@ -205,14 +219,18 @@ pub(super) fn sys_readlink_impl(path_va: usize, buf_va: usize, bufsz: usize) -> 
 }
 
 pub(super) fn sys_linkat_impl(
-    old_dirfd: i32, old_va: usize, new_dirfd: i32, new_va: usize, _flags: i32,
+    old_dirfd: i32,
+    old_va: usize,
+    new_dirfd: i32,
+    new_va: usize,
+    _flags: i32,
 ) -> isize {
     let old = match resolve_at_path_for_stubs(old_dirfd, old_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     let new = match resolve_at_path_for_stubs(new_dirfd, new_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::link(&old, &new)
@@ -224,7 +242,7 @@ pub(super) fn sys_link_impl(old_va: usize, new_va: usize) -> isize {
 
 pub(super) fn sys_chmod_impl(path_va: usize, mode: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::chmod(&path, mode & 0o7777)
@@ -232,7 +250,7 @@ pub(super) fn sys_chmod_impl(path_va: usize, mode: u32) -> isize {
 
 pub(super) fn sys_chown_impl(path_va: usize, uid: u32, gid: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::chown(&path, uid, gid)
@@ -240,7 +258,7 @@ pub(super) fn sys_chown_impl(path_va: usize, uid: u32, gid: u32) -> isize {
 
 pub(super) fn sys_lchown_impl(path_va: usize, uid: u32, gid: u32) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::lchown(&path, uid, gid)
@@ -255,7 +273,7 @@ pub(super) fn sys_umask_impl(mask: u32) -> isize {
 
 pub(super) fn sys_faccessat_impl(dirfd: i32, path_va: usize, mode: i32, _flags: i32) -> isize {
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::access(&path, mode)
@@ -266,9 +284,11 @@ pub(super) fn sys_access_impl(path_va: usize, mode: i32) -> isize {
 }
 
 pub(super) fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
-    if length < 0 { return einval(); }
+    if length < 0 {
+        return einval();
+    }
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::truncate_path(&path, length as u64)
@@ -276,7 +296,7 @@ pub(super) fn sys_truncate_impl(path_va: usize, length: i64) -> isize {
 
 pub(super) fn sys_statfs_impl(path_va: usize, buf_va: usize) -> isize {
     let path = match resolve_at_path_for_stubs(AT_FDCWD_STUBS, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::stat_syscalls::sys_statfs_path(&path, buf_va)
@@ -292,21 +312,25 @@ pub(super) fn sys_getdents64_impl(fd: usize, buf_va: usize, count: usize) -> isi
 
 /// NR 260  fchownat(dirfd, path_va, uid, gid, flags)
 pub(super) fn sys_fchownat_impl(
-    dirfd: i32, path_va: usize, uid: u32, gid: u32, flags: i32,
+    dirfd: i32,
+    path_va: usize,
+    uid: u32,
+    gid: u32,
+    flags: i32,
 ) -> isize {
-    const AT_EMPTY_PATH:       i32 = 0x1000;
+    const AT_EMPTY_PATH: i32 = 0x1000;
     const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 
     if flags & AT_EMPTY_PATH != 0 && path_va == 0 {
         let pid = crate::proc::scheduler::current_pid();
         match crate::fs::process_fd::proc_fd_path(pid, dirfd as usize) {
             Some(p) => return crate::fs::vfs_ops::chown(&p, uid, gid),
-            None    => return ebadf(),
+            None => return ebadf(),
         }
     }
 
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
 
@@ -322,7 +346,7 @@ pub(super) fn sys_fchown_impl(fd: usize, uid: u32, gid: u32) -> isize {
     let pid = crate::proc::scheduler::current_pid();
     match crate::fs::process_fd::proc_fd_path(pid, fd) {
         Some(p) => crate::fs::vfs_ops::chown(&p, uid, gid),
-        None    => ebadf(),
+        None => ebadf(),
     }
 }
 
@@ -333,7 +357,7 @@ pub(super) fn sys_fchmodat_impl(dirfd: i32, path_va: usize, mode: u32, flags: i3
         return enotsup();
     }
     let path = match resolve_at_path_for_stubs(dirfd, path_va) {
-        Ok(p)  => p,
+        Ok(p) => p,
         Err(e) => return e,
     };
     crate::fs::vfs_ops::chmod(&path, mode & 0o7777)
@@ -344,14 +368,22 @@ pub(super) fn sys_fchmod_impl(fd: usize, mode: u32) -> isize {
     let pid = crate::proc::scheduler::current_pid();
     match crate::fs::process_fd::proc_fd_path(pid, fd) {
         Some(p) => crate::fs::vfs_ops::chmod(&p, mode & 0o7777),
-        None    => ebadf(),
+        None => ebadf(),
     }
 }
 
-pub(super) fn sys_remap_file_pages_impl() -> isize { enosys() }
-pub(super) fn sys_kexec_file_load_impl()  -> isize { enosys() }
-pub(super) fn sys_bpf_impl()              -> isize { enosys() }
-pub(super) fn sys_userfaultfd_impl()      -> isize { enosys() }
+pub(super) fn sys_remap_file_pages_impl() -> isize {
+    enosys()
+}
+pub(super) fn sys_kexec_file_load_impl() -> isize {
+    enosys()
+}
+pub(super) fn sys_bpf_impl() -> isize {
+    enosys()
+}
+pub(super) fn sys_userfaultfd_impl() -> isize {
+    enosys()
+}
 
 /// Validate that `addr` is naturally aligned for a `usize` read/write.
 #[inline]
@@ -381,11 +413,11 @@ fn ptrace_resolve_remote_pa(pid: i32, addr: usize) -> Result<usize, isize> {
     use crate::mm::pmm::PAGE_SIZE;
     let cr3 = match crate::proc::scheduler::with_proc(pid as usize, |p| p.cr3) {
         Some(cr3) => cr3,
-        None      => return Err(esrch()),
+        None => return Err(esrch()),
     };
     match Paging::virt_to_phys_cr3(cr3, addr) {
         Some(pa) => Ok(pa + (addr & (PAGE_SIZE - 1))),
-        None     => Err(efault()),
+        None => Err(efault()),
     }
 }
 
@@ -396,10 +428,12 @@ fn ptrace_resolve_remote_pa(pid: i32, addr: usize) -> Result<usize, isize> {
 #[inline]
 fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> {
     use super::errno::eperm;
-    if target_pid as usize == caller { return Err(eperm()); }
+    if target_pid as usize == caller {
+        return Err(eperm());
+    }
     match crate::proc::scheduler::with_proc(target_pid as usize, |_| ()) {
         Some(_) => Ok(()),
-        None    => Err(esrch()),
+        None => Err(esrch()),
     }
 }
 
@@ -409,7 +443,9 @@ fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> 
 #[inline]
 fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isize> {
     let mut bytes = [0u8; N * 8];
-    if copy_from_user(&mut bytes, va).is_err() { return Err(efault()); }
+    if copy_from_user(&mut bytes, va).is_err() {
+        return Err(efault());
+    }
     let mut regs = [0u64; N];
     for i in 0..N {
         let off = i * 8;
@@ -427,7 +463,9 @@ fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Resul
         let off = i * 8;
         bytes[off..off + 8].copy_from_slice(&reg.to_le_bytes());
     }
-    if copy_to_user(va, &bytes).is_err() { return Err(efault()); }
+    if copy_to_user(va, &bytes).is_err() {
+        return Err(efault());
+    }
     Ok(())
 }
 
@@ -435,18 +473,14 @@ fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Resul
 pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
     use crate::mm::pmm::PAGE_SIZE;
     use crate::proc::ptrace::{
-        PtraceState,
-        PTRACE_TRACEME, PTRACE_PEEKTEXT, PTRACE_PEEKDATA, PTRACE_PEEKUSER,
-        PTRACE_POKETEXT, PTRACE_POKEDATA, PTRACE_POKEUSER,
-        PTRACE_CONT, PTRACE_KILL, PTRACE_SINGLESTEP,
-        PTRACE_GETREGS, PTRACE_SETREGS,
-        PTRACE_ATTACH, PTRACE_DETACH, PTRACE_SYSCALL,
-        PTRACE_SETOPTIONS, PTRACE_GETEVENTMSG,
-        PTRACE_O_MASK, UREG_COUNT, FRAME_SZ,
-        build_user_regs_pub, apply_user_regs_pub,
+        apply_user_regs_pub, build_user_regs_pub, PtraceState, FRAME_SZ, PTRACE_ATTACH,
+        PTRACE_CONT, PTRACE_DETACH, PTRACE_GETEVENTMSG, PTRACE_GETREGS, PTRACE_KILL, PTRACE_O_MASK,
+        PTRACE_PEEKDATA, PTRACE_PEEKTEXT, PTRACE_PEEKUSER, PTRACE_POKEDATA, PTRACE_POKETEXT,
+        PTRACE_POKEUSER, PTRACE_SETOPTIONS, PTRACE_SETREGS, PTRACE_SINGLESTEP, PTRACE_SYSCALL,
+        PTRACE_TRACEME, UREG_COUNT,
     };
     const PTRACE_GETSIGINFO: i32 = 0x4202;
-    const USER_REGS_BYTES:  usize = UREG_COUNT * 8;
+    const USER_REGS_BYTES: usize = UREG_COUNT * 8;
 
     let caller = crate::proc::scheduler::current_pid();
 
@@ -455,60 +489,77 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             let ppid = crate::proc::scheduler::current_ppid();
             crate::proc::scheduler::with_proc_mut(caller, |p, _| {
                 p.ptrace_state = PtraceState::Tracee {
-                    tracer: ppid, options: 0, in_syscall_stop: false,
+                    tracer: ppid,
+                    options: 0,
+                    in_syscall_stop: false,
                 };
-            }).unwrap_or(());
+            })
+            .unwrap_or(());
             0
-        }
+        },
 
         PTRACE_ATTACH => {
-            if let Err(e) = ptrace_check_permission(caller, pid) { return e; }
+            if let Err(e) = ptrace_check_permission(caller, pid) {
+                return e;
+            }
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
                 p.ptrace_state = PtraceState::Tracee {
-                    tracer: caller, options: 0, in_syscall_stop: false,
+                    tracer: caller,
+                    options: 0,
+                    in_syscall_stop: false,
                 };
-            }).unwrap_or(());
+            })
+            .unwrap_or(());
             crate::proc::signal::send_signal(pid as usize, SIGSTOP);
             0
-        }
+        },
 
         PTRACE_DETACH => {
             let target = pid as usize;
             crate::proc::scheduler::with_proc_mut(target, |p, _| {
                 p.ptrace_state = PtraceState::None;
-            }).unwrap_or(());
+            })
+            .unwrap_or(());
             if data != 0 {
                 crate::proc::signal::send_signal(target, data as i32);
             }
             crate::proc::scheduler::wake(target);
             0
-        }
+        },
 
         PTRACE_CONT | PTRACE_SYSCALL => {
             let target = pid as usize;
             crate::proc::scheduler::with_proc_mut(target, |p, _| {
                 let (tracer, options) = match p.ptrace_state {
-                    PtraceState::Stopped { tracer, options, .. } => (tracer, options),
-                    PtraceState::Tracee  { tracer, options, .. } => (tracer, options),
+                    PtraceState::Stopped {
+                        tracer, options, ..
+                    } => (tracer, options),
+                    PtraceState::Tracee {
+                        tracer, options, ..
+                    } => (tracer, options),
                     PtraceState::None => return,
                 };
                 let in_syscall = request == PTRACE_SYSCALL;
                 p.ptrace_state = PtraceState::Tracee {
-                    tracer, options, in_syscall_stop: in_syscall,
+                    tracer,
+                    options,
+                    in_syscall_stop: in_syscall,
                 };
                 #[cfg(target_arch = "x86_64")]
                 if let Some(kstack) = p.kstack_top {
                     let f = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            (kstack - FRAME_SZ) as *mut usize, 17)
+                        core::slice::from_raw_parts_mut((kstack - FRAME_SZ) as *mut usize, 17)
                     };
                     f[14] &= !(1usize << 8);
                 }
-            }).unwrap_or(());
-            if data != 0 { crate::proc::signal::send_signal(pid as usize, data as i32); }
+            })
+            .unwrap_or(());
+            if data != 0 {
+                crate::proc::signal::send_signal(pid as usize, data as i32);
+            }
             crate::proc::scheduler::wake(pid as usize);
             0
-        }
+        },
 
         PTRACE_SINGLESTEP => {
             let target = pid as usize;
@@ -516,73 +567,96 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
                 #[cfg(target_arch = "x86_64")]
                 if let Some(kstack) = p.kstack_top {
                     let f = unsafe {
-                        core::slice::from_raw_parts_mut(
-                            (kstack - FRAME_SZ) as *mut usize, 17)
+                        core::slice::from_raw_parts_mut((kstack - FRAME_SZ) as *mut usize, 17)
                     };
                     f[14] |= 1usize << 8;
                 }
                 let (tracer, options) = match p.ptrace_state {
-                    PtraceState::Stopped { tracer, options, .. } => (tracer, options),
-                    PtraceState::Tracee  { tracer, options, .. } => (tracer, options),
+                    PtraceState::Stopped {
+                        tracer, options, ..
+                    } => (tracer, options),
+                    PtraceState::Tracee {
+                        tracer, options, ..
+                    } => (tracer, options),
                     PtraceState::None => return,
                 };
                 p.ptrace_state = PtraceState::Tracee {
-                    tracer, options, in_syscall_stop: false,
+                    tracer,
+                    options,
+                    in_syscall_stop: false,
                 };
-            }).unwrap_or(());
-            if data != 0 { crate::proc::signal::send_signal(pid as usize, data as i32); }
+            })
+            .unwrap_or(());
+            if data != 0 {
+                crate::proc::signal::send_signal(pid as usize, data as i32);
+            }
             crate::proc::scheduler::wake(pid as usize);
             0
-        }
+        },
 
         PTRACE_KILL => {
             crate::proc::signal::send_signal(pid as usize, SIGKILL);
             0
-        }
+        },
 
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
-            if let Err(e) = ptrace_validate_word_addr(addr) { return e; }
+            if let Err(e) = ptrace_validate_word_addr(addr) {
+                return e;
+            }
             let phys = match ptrace_resolve_remote_pa(pid, addr) {
-                Ok(pa)  => pa,
-                Err(e)  => return e,
+                Ok(pa) => pa,
+                Err(e) => return e,
             };
             let word: usize = unsafe { core::ptr::read(phys as *const usize) };
             if data != 0 {
-                if copy_to_user(data, &word.to_le_bytes()).is_err() { return efault(); }
+                if copy_to_user(data, &word.to_le_bytes()).is_err() {
+                    return efault();
+                }
             }
             word as isize
-        }
+        },
 
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
-            if let Err(e) = ptrace_validate_word_addr(addr) { return e; }
+            if let Err(e) = ptrace_validate_word_addr(addr) {
+                return e;
+            }
             let phys = match ptrace_resolve_remote_pa(pid, addr) {
-                Ok(pa)  => pa,
-                Err(e)  => return e,
+                Ok(pa) => pa,
+                Err(e) => return e,
             };
             unsafe { core::ptr::write(phys as *mut usize, data) };
             0
-        }
+        },
 
         PTRACE_PEEKUSER => {
             let slot = match ptrace_validate_ureg_slot(addr, USER_REGS_BYTES) {
-                Ok(s)  => s,
+                Ok(s) => s,
                 Err(e) => return e,
             };
             let val = crate::proc::scheduler::with_proc(pid as usize, |p| {
-                p.kstack_top.map(|ks| {
-                    let regs = build_user_regs_pub(ks, p.fs_base);
-                    if slot < UREG_COUNT { regs[slot] } else { 0 }
-                }).unwrap_or(0)
-            }).unwrap_or(0);
+                p.kstack_top
+                    .map(|ks| {
+                        let regs = build_user_regs_pub(ks, p.fs_base);
+                        if slot < UREG_COUNT {
+                            regs[slot]
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
             if data != 0 {
-                if copy_to_user(data, &val.to_le_bytes()).is_err() { return efault(); }
+                if copy_to_user(data, &val.to_le_bytes()).is_err() {
+                    return efault();
+                }
             }
             val as isize
-        }
+        },
 
         PTRACE_POKEUSER => {
             let slot = match ptrace_validate_ureg_slot(addr, USER_REGS_BYTES) {
-                Ok(s)  => s,
+                Ok(s) => s,
                 Err(e) => return e,
             };
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
@@ -593,61 +667,68 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
                         apply_user_regs_pub(ks, &regs);
                     }
                 }
-            }).unwrap_or(());
+            })
+            .unwrap_or(());
             0
-        }
+        },
 
         PTRACE_GETREGS => {
             let regs_opt = crate::proc::scheduler::with_proc(pid as usize, |p| {
                 p.kstack_top.map(|ks| build_user_regs_pub(ks, p.fs_base))
             });
             match regs_opt {
-                Some(Some(regs)) => {
-                    match ptrace_copy_regs_to_user::<UREG_COUNT>(data, &regs) {
-                        Ok(())  => 0,
-                        Err(e)  => e,
-                    }
-                }
+                Some(Some(regs)) => match ptrace_copy_regs_to_user::<UREG_COUNT>(data, &regs) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                },
                 _ => esrch(),
             }
-        }
+        },
 
         PTRACE_SETREGS => {
             let regs = match ptrace_copy_regs_from_user::<UREG_COUNT>(data) {
-                Ok(r)  => r,
+                Ok(r) => r,
                 Err(e) => return e,
             };
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
                 if let Some(ks) = p.kstack_top {
                     apply_user_regs_pub(ks, &regs);
                 }
-            }).unwrap_or(());
+            })
+            .unwrap_or(());
             0
-        }
+        },
 
         PTRACE_SETOPTIONS => {
             let opts = (data as u64) & PTRACE_O_MASK;
             crate::proc::scheduler::with_proc_mut(pid as usize, |p, _| {
-                if let PtraceState::Tracee { ref mut options, .. } = p.ptrace_state {
+                if let PtraceState::Tracee {
+                    ref mut options, ..
+                } = p.ptrace_state
+                {
                     *options = opts;
                 }
-            }).unwrap_or(());
+            })
+            .unwrap_or(());
             0
-        }
+        },
 
         PTRACE_GETEVENTMSG => {
-            let msg = crate::proc::scheduler::with_proc(pid as usize, |p| {
-                p.ptrace_event_msg
-            }).unwrap_or(0);
-            if copy_to_user(data, &msg.to_le_bytes()).is_err() { return efault(); }
+            let msg = crate::proc::scheduler::with_proc(pid as usize, |p| p.ptrace_event_msg)
+                .unwrap_or(0);
+            if copy_to_user(data, &msg.to_le_bytes()).is_err() {
+                return efault();
+            }
             0
-        }
+        },
 
         PTRACE_GETSIGINFO => {
             let si = crate::proc::signal::get_pending_siginfo(pid as usize);
-            if copy_to_user(data, &si).is_err() { return efault(); }
+            if copy_to_user(data, &si).is_err() {
+                return efault();
+            }
             0
-        }
+        },
 
         _ => einval(),
     }

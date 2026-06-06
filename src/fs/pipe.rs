@@ -53,12 +53,12 @@
 //!
 //! ## POSIX guarantees
 //!
-//! - Writes ≤ PIPE_BUF (4096) are atomic: the mutex is held for the
-//!   entire write so no other writer can interleave.
-//! - `pipe_write` delivers SIGPIPE + returns -EPIPE when all readers
-//!   have closed.
-//! - `pipe_read` returns 0 (EOF) when all writers have closed and the
-//!   buffer is empty.
+//! - Writes ≤ PIPE_BUF (4096) are atomic: the mutex is held for the entire
+//!   write so no other writer can interleave.
+//! - `pipe_write` delivers SIGPIPE + returns -EPIPE when all readers have
+//!   closed.
+//! - `pipe_read` returns 0 (EOF) when all writers have closed and the buffer is
+//!   empty.
 //! - `pipe2` honours O_CLOEXEC and O_NONBLOCK.
 //!
 //! ## Poll / select / epoll readiness
@@ -488,10 +488,12 @@ pub fn sys_close_pipe(bfd: usize) {
         let mut inner = state.inner.lock();
         if bfd & 1 == 0 {
             inner.read_open = inner.read_open.saturating_sub(1);
-            (false, inner.read_open == 0) // last reader gone → POLLERR for writers
+            (false, inner.read_open == 0) // last reader gone → POLLERR for
+                                          // writers
         } else {
             inner.write_open = inner.write_open.saturating_sub(1);
-            (inner.write_open == 0, false) // last writer gone → POLLHUP for readers
+            (inner.write_open == 0, false) // last writer gone → POLLHUP for
+                                           // readers
         }
     };
 

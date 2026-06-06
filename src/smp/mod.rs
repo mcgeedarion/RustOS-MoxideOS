@@ -1,18 +1,19 @@
 //! SMP subsystem — CPU topology, AP bringup, per-CPU orchestration.
 //!
 //! Boot sequence (x86_64):
-//!   BSP: kernel_main → smp::init() → enumerate MADTs → ap_boot::start_all_aps()
-//!   AP:  trampoline (real→long) → ap_entry() → percpu_init() → scheduler::ap_idle()
+//!   BSP: kernel_main → smp::init() → enumerate MADTs →
+//! ap_boot::start_all_aps()   AP:  trampoline (real→long) → ap_entry() →
+//! percpu_init() → scheduler::ap_idle()
 //!
 //! Boot sequence (RISC-V):
 //!   Hart 0: kernel_main → smp::init() → sbi_hsm_hart_start() per hart
 //!   AP hart: ap_entry() → percpu_init() → scheduler::ap_idle()
 
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-pub mod percpu;
 pub mod ipi;
+pub mod percpu;
 
 /// Maximum CPUs this build supports.
 pub const MAX_CPUS: usize = 256;

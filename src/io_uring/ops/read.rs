@@ -14,9 +14,9 @@ use crate::io_uring::{cqe::errno, sqe::Sqe};
 
 /// Synchronous kernel-side handler for IORING_OP_READ.
 pub fn handle(sqe: &Sqe) -> i32 {
-    let fd     = sqe.fd;
+    let fd = sqe.fd;
     let buf_va = sqe.addr;
-    let len    = sqe.len as usize;
+    let len = sqe.len as usize;
     let offset = sqe.off;
 
     if fd < 0 {
@@ -34,7 +34,11 @@ pub fn handle(sqe: &Sqe) -> i32 {
 
     log::trace!(
         "[io_uring::read] fd={} buf={:#x} len={} off={} token={:#x}",
-        fd, buf_va, len, offset, sqe.user_data
+        fd,
+        buf_va,
+        len,
+        offset,
+        sqe.user_data
     );
 
     // Core read dispatch now routes through the shared VFS/io path so io_uring
@@ -46,12 +50,12 @@ pub fn handle(sqe: &Sqe) -> i32 {
 // Callers should use `IoRead` instead of submitting SQEs directly.
 // It encapsulates the submit → poll → wake cycle.
 
+use crate::io_uring::{self as ring, IoUringError};
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use crate::io_uring::{self as ring, IoUringError};
 
 /// Async wrapper around IORING_OP_READ.
 ///
@@ -70,7 +74,13 @@ pub struct IoRead<'a> {
 
 impl<'a> IoRead<'a> {
     pub fn new(fd: i32, buf: &'a mut [u8], offset: u64, token: u64) -> Self {
-        IoRead { fd, buf, offset, token, submitted: false }
+        IoRead {
+            fd,
+            buf,
+            offset,
+            token,
+            submitted: false,
+        }
     }
 }
 

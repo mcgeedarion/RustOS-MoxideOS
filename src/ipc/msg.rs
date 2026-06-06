@@ -31,31 +31,28 @@
 //! | < 0      | First message with `mtype <= abs(msgtyp)` |
 
 extern crate alloc;
-use alloc::{
-    collections::VecDeque,
-    string::String,
-    sync::Arc,
-    vec::Vec,
+use crate::ipc::{
+    check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT,
 };
+use alloc::{collections::VecDeque, string::String, sync::Arc, vec::Vec};
 use spin::Mutex;
-use crate::ipc::{check_perm, IpcPerm, IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT};
 
-pub const MSGMAX:  usize = 8192;
-pub const MSGMNB:  usize = 16384; // default max queue size in bytes
-pub const MSGMNI:  i32   = 32000; // system-wide queue limit
+pub const MSGMAX: usize = 8192;
+pub const MSGMNB: usize = 16384; // default max queue size in bytes
+pub const MSGMNI: i32 = 32000; // system-wide queue limit
 
 /// One queued message.
 struct Message {
     mtype: i64,
-    data:  Vec<u8>,
+    data: Vec<u8>,
 }
 
 /// Kernel-side message queue.
 struct MsgQueue {
-    perm:      IpcPerm,
-    messages:  VecDeque<Message>,
+    perm: IpcPerm,
+    messages: VecDeque<Message>,
     msg_cbytes: usize, // current bytes in queue
-    msg_qnum:  usize,
+    msg_qnum: usize,
     msg_qbytes: usize, // max bytes allowed
     msg_lspid: u32,
     msg_lrpid: u32,
@@ -66,7 +63,7 @@ struct MsgQueue {
 
 use alloc::collections::BTreeMap;
 static MSG_TABLE: Mutex<BTreeMap<i32, Arc<Mutex<MsgQueue>>>> = Mutex::new(BTreeMap::new());
-static NEXT_ID:   spin::Mutex<i32>                           = spin::Mutex::new(1);
+static NEXT_ID: spin::Mutex<i32> = spin::Mutex::new(1);
 
 fn alloc_id() -> i32 {
     let mut id = NEXT_ID.lock();
@@ -81,17 +78,17 @@ pub fn msgget(key: i32, msgflg: i32) -> Result<i32, isize> {
     // IPC_PRIVATE — always create a new private queue.
     if key == IPC_PRIVATE {
         let id = alloc_id();
-        let q  = MsgQueue {
-            perm:       IpcPerm::new(IPC_PRIVATE, 0, 0, (msgflg & 0o777) as u16),
-            messages:   VecDeque::new(),
+        let q = MsgQueue {
+            perm: IpcPerm::new(IPC_PRIVATE, 0, 0, (msgflg & 0o777) as u16),
+            messages: VecDeque::new(),
             msg_cbytes: 0,
-            msg_qnum:   0,
+            msg_qnum: 0,
             msg_qbytes: MSGMNB,
-            msg_lspid:  0,
-            msg_lrpid:  0,
-            msg_stime:  0,
-            msg_rtime:  0,
-            msg_ctime:  0,
+            msg_lspid: 0,
+            msg_lrpid: 0,
+            msg_stime: 0,
+            msg_rtime: 0,
+            msg_ctime: 0,
         };
         tbl.insert(id, Arc::new(Mutex::new(q)));
         return Ok(id);
@@ -105,28 +102,34 @@ pub fn msgget(key: i32, msgflg: i32) -> Result<i32, isize> {
         return Ok(id);
     }
 
-    if msgflg & IPC_CREAT == 0 { return Err(-2); } // ENOENT
+    if msgflg & IPC_CREAT == 0 {
+        return Err(-2);
+    } // ENOENT
 
     let id = alloc_id();
-    let q  = MsgQueue {
-        perm:       IpcPerm::new(key, 0, 0, (msgflg & 0o777) as u16),
-        messages:   VecDeque::new(),
+    let q = MsgQueue {
+        perm: IpcPerm::new(key, 0, 0, (msgflg & 0o777) as u16),
+        messages: VecDeque::new(),
         msg_cbytes: 0,
-        msg_qnum:   0,
+        msg_qnum: 0,
         msg_qbytes: MSGMNB,
-        msg_lspid:  0,
-        msg_lrpid:  0,
-        msg_stime:  0,
-        msg_rtime:  0,
-        msg_ctime:  0,
+        msg_lspid: 0,
+        msg_lrpid: 0,
+        msg_stime: 0,
+        msg_rtime: 0,
+        msg_ctime: 0,
     };
     tbl.insert(id, Arc::new(Mutex::new(q)));
     Ok(id)
 }
 
 pub fn msgsnd(msqid: i32, mtype: i64, data: Vec<u8>, msgflg: i32) -> Result<(), isize> {
-    if mtype <= 0 { return Err(-22); } // EINVAL — mtype must be positive
-    if data.len() > MSGMAX { return Err(-90); } // EMSGSIZE
+    if mtype <= 0 {
+        return Err(-22);
+    } // EINVAL — mtype must be positive
+    if data.len() > MSGMAX {
+        return Err(-90);
+    } // EMSGSIZE
 
     loop {
         let arc = {
@@ -135,28 +138,28 @@ pub fn msgsnd(msqid: i32, mtype: i64, data: Vec<u8>, msgflg: i32) -> Result<(), 
         };
         let mut q = arc.lock();
 
-        if !check_perm(&q.perm, 0, 0, 0o2) { return Err(-13); } // EACCES
+        if !check_perm(&q.perm, 0, 0, 0o2) {
+            return Err(-13);
+        } // EACCES
 
         let needed = data.len();
         if q.msg_cbytes + needed > q.msg_qbytes {
-            if msgflg & IPC_NOWAIT != 0 { return Err(-11); } // EAGAIN
+            if msgflg & IPC_NOWAIT != 0 {
+                return Err(-11);
+            } // EAGAIN
             drop(q);
-            core::hint::spin_loop(); continue;
+            core::hint::spin_loop();
+            continue;
         }
         q.msg_cbytes += needed;
-        q.msg_qnum   += 1;
-        q.msg_lspid   = crate::proc::scheduler::current_pid() as u32;
+        q.msg_qnum += 1;
+        q.msg_lspid = crate::proc::scheduler::current_pid() as u32;
         q.messages.push_back(Message { mtype, data });
         return Ok(());
     }
 }
 
-pub fn msgrcv(
-    msqid:   i32,
-    msgsz:   usize,
-    msgtyp:  i64,
-    msgflg:  i32,
-) -> Result<(i64, Vec<u8>), isize> {
+pub fn msgrcv(msqid: i32, msgsz: usize, msgtyp: i64, msgflg: i32) -> Result<(i64, Vec<u8>), isize> {
     loop {
         let arc = {
             let tbl = MSG_TABLE.lock();
@@ -164,16 +167,24 @@ pub fn msgrcv(
         };
         let mut q = arc.lock();
 
-        if !check_perm(&q.perm, 0, 0, 0o4) { return Err(-13); } // EACCES
+        if !check_perm(&q.perm, 0, 0, 0o4) {
+            return Err(-13);
+        } // EACCES
 
         // Find the target message index.
         let idx = if msgtyp == 0 {
-            if q.messages.is_empty() { None } else { Some(0) }
+            if q.messages.is_empty() {
+                None
+            } else {
+                Some(0)
+            }
         } else if msgtyp > 0 {
             q.messages.iter().position(|m| m.mtype == msgtyp)
         } else {
             let abs_typ = (-msgtyp) as i64;
-            q.messages.iter().enumerate()
+            q.messages
+                .iter()
+                .enumerate()
                 .filter(|(_, m)| m.mtype <= abs_typ)
                 .min_by_key(|(_, m)| m.mtype)
                 .map(|(i, _)| i)
@@ -187,12 +198,14 @@ pub fn msgrcv(
                 return Err(-90);
             }
             q.msg_cbytes = q.msg_cbytes.saturating_sub(msg.data.len());
-            q.msg_qnum   = q.msg_qnum.saturating_sub(1);
-            q.msg_lrpid  = crate::proc::scheduler::current_pid() as u32;
+            q.msg_qnum = q.msg_qnum.saturating_sub(1);
+            q.msg_lrpid = crate::proc::scheduler::current_pid() as u32;
             return Ok((msg.mtype, msg.data));
         }
 
-        if msgflg & IPC_NOWAIT != 0 { return Err(-11); } // ENOMSG
+        if msgflg & IPC_NOWAIT != 0 {
+            return Err(-11);
+        } // ENOMSG
         drop(q);
         core::hint::spin_loop();
     }
@@ -204,9 +217,9 @@ pub fn msgctl(msqid: i32, cmd: i32) -> Result<i32, isize> {
         c if c == IPC_RMID => {
             MSG_TABLE.lock().remove(&msqid).ok_or(-43isize)?;
             Ok(0)
-        }
+        },
         c if c == IPC_STAT => Ok(0), // caller must copy msqid_ds themselves
-        c if c == IPC_SET  => Ok(0),
+        c if c == IPC_SET => Ok(0),
         _ => Err(-22),
     }
 }

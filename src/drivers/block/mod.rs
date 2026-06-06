@@ -9,7 +9,8 @@ pub mod ahci;
 pub mod nvme;
 pub mod virtio_blk;
 
-// ===== GUESS: multi-sector helpers wrapping virtio_blk's single-sector API =====
+// ===== GUESS: multi-sector helpers wrapping virtio_blk's single-sector API
+// =====
 
 /// GUESS: read `count` 512-byte sectors starting at `lba` into `buf`.
 /// Buf must be at least `count * 512` bytes.

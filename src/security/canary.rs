@@ -16,8 +16,8 @@
 //! overwrites `__stack_chk_guard` without also corrupting `CANARY_EXPECTED`
 //! is now detectable.
 
-use core::sync::atomic::{AtomicU64, Ordering};
 use crate::rand::arch_entropy;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[no_mangle]
 pub static __stack_chk_guard: AtomicU64 = AtomicU64::new(0);
@@ -31,8 +31,8 @@ struct CanaryExpected(AtomicU64);
 static CANARY_EXPECTED: CanaryExpected = CanaryExpected(AtomicU64::new(0));
 
 pub fn init_kernel_canary() {
-    let raw    = arch_entropy();
-    let canary = raw & !0xFF;  // zero LSB: stops strcpy-style overwrites
+    let raw = arch_entropy();
+    let canary = raw & !0xFF; // zero LSB: stops strcpy-style overwrites
     __stack_chk_guard.store(canary, Ordering::Relaxed);
     // H4 fix: persist expected value in the *separate* static so the audit
     // function has a ground truth that is distinct from the live guard.
@@ -67,16 +67,23 @@ pub extern "C" fn __stack_chk_fail() -> ! {
         in_kernel = (sstatus >> 8) & 1 == 1;
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-    { let in_kernel = true; }
+    {
+        let in_kernel = true;
+    }
 
     if in_kernel {
         panic!("KERNEL STACK CANARY CORRUPTION DETECTED — HALTING");
     } else {
         let pid = crate::proc::scheduler::current_pid();
-        log::error!("canary: stack smashing detected in pid={} — sending SIGABRT", pid);
+        log::error!(
+            "canary: stack smashing detected in pid={} — sending SIGABRT",
+            pid
+        );
         crate::proc::signal::send_signal(pid, 6 /* SIGABRT */);
         crate::proc::scheduler::schedule();
-        loop { core::hint::spin_loop(); }
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -88,13 +95,12 @@ pub extern "C" fn __stack_chk_fail() -> ! {
 pub fn audit_kernel_canary() {
     let expected = CANARY_EXPECTED.0.load(Ordering::Relaxed);
     // read_volatile so the compiler cannot CSE this with the store path.
-    let actual = unsafe {
-        core::ptr::read_volatile(
-            &__stack_chk_guard as *const AtomicU64 as *const u64
-        )
-    };
+    let actual =
+        unsafe { core::ptr::read_volatile(&__stack_chk_guard as *const AtomicU64 as *const u64) };
     if expected != actual {
-        panic!("KERNEL CANARY AUDIT FAILED: expected={:#018x} actual={:#018x}",
-               expected, actual);
+        panic!(
+            "KERNEL CANARY AUDIT FAILED: expected={:#018x} actual={:#018x}",
+            expected, actual
+        );
     }
 }

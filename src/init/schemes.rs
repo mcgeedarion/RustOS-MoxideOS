@@ -23,33 +23,36 @@ use crate::fs::scheme_table::SCHEME_TABLE;
 pub fn init() {
     // Registered early so schemes that open config files (e.g. /etc/resolv.conf)
     // can use open_url before network init.
-    SCHEME_TABLE.register("blk",  Arc::new(crate::block::BlkScheme::new()));
+    SCHEME_TABLE.register("blk", Arc::new(crate::block::BlkScheme::new()));
     SCHEME_TABLE.register("file", Arc::new(crate::fs::vfs::VfsScheme::new()));
 
-    SCHEME_TABLE.register("tty",  Arc::new(crate::tty::TtyScheme::new()));
+    SCHEME_TABLE.register("tty", Arc::new(crate::tty::TtyScheme::new()));
 
     // devfs must come before procfs/sysfs because /proc and /sys may emit
     // references to devices that userspace resolves through /dev.
-    SCHEME_TABLE.register("dev",  Arc::new(crate::fs::devfs::DevFs::new()));
+    SCHEME_TABLE.register("dev", Arc::new(crate::fs::devfs::DevFs::new()));
     SCHEME_TABLE.register("proc", Arc::new(crate::fs::procfs::ProcFs::new()));
-    SCHEME_TABLE.register("sys",  Arc::new(crate::fs::sysfs::SysFs::new()));
+    SCHEME_TABLE.register("sys", Arc::new(crate::fs::sysfs::SysFs::new()));
 
     // ramfs is the simpler, unbounded variant used as an early-boot root overlay
     // or initrd scratch space; tmpfs adds size limits and swap backing.
     SCHEME_TABLE.register("ram", Arc::new(crate::fs::ramfs::RamFs::new()));
     SCHEME_TABLE.register("tmp", Arc::new(crate::fs::tmpfs::TmpFs::new()));
 
-    SCHEME_TABLE.register("net",  Arc::new(crate::net::NetScheme::new()));
-    SCHEME_TABLE.register("tcp",  Arc::new(crate::net::tcp::TcpScheme::new()));
-    SCHEME_TABLE.register("udp",  Arc::new(crate::net::udp::UdpScheme::new()));
+    SCHEME_TABLE.register("net", Arc::new(crate::net::NetScheme::new()));
+    SCHEME_TABLE.register("tcp", Arc::new(crate::net::tcp::TcpScheme::new()));
+    SCHEME_TABLE.register("udp", Arc::new(crate::net::udp::UdpScheme::new()));
 
     // NFS client: registered after the network stack is online so that the
     // scheme constructor can probe the default NIC/route if needed.
-    SCHEME_TABLE.register("nfs",  Arc::new(crate::fs::nfs::NfsScheme::new()));
+    SCHEME_TABLE.register("nfs", Arc::new(crate::fs::nfs::NfsScheme::new()));
 
     // ipc_proxy_scheme provides the kernel-side endpoint for cross-process
     // message-passing; pipe is the simpler, anonymous half-duplex variant.
-    SCHEME_TABLE.register("ipc",  Arc::new(crate::fs::ipc_proxy_scheme::IpcProxyScheme::new()));
+    SCHEME_TABLE.register(
+        "ipc",
+        Arc::new(crate::fs::ipc_proxy_scheme::IpcProxyScheme::new()),
+    );
     SCHEME_TABLE.register("pipe", Arc::new(crate::ipc::pipe_scheme::PipeScheme));
 
     // Registered after IPC because cgroup controllers may publish their state

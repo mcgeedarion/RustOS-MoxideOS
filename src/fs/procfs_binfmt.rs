@@ -24,7 +24,9 @@ use alloc::{
 };
 use spin::Mutex;
 
-use crate::fs::binfmt_misc::{self, BinfmtEntry, MatchType, FLAG_CREDENTIALS, FLAG_FIX_BINARY, FLAG_OPEN_BINARY};
+use crate::fs::binfmt_misc::{
+    self, BinfmtEntry, MatchType, FLAG_CREDENTIALS, FLAG_FIX_BINARY, FLAG_OPEN_BINARY,
+};
 
 // Global "master" switch — mirrors `echo 0 > /proc/sys/fs/binfmt_misc/status`.
 static BINFMT_ENABLED: Mutex<bool> = Mutex::new(true);
@@ -56,21 +58,25 @@ pub fn read(path: &str) -> Option<String> {
                 out.push('\n');
             }
             Some(out)
-        }
+        },
         "register" => {
             // Write-only; reading returns an empty string rather than ENOENT.
             Some(String::new())
-        }
+        },
         "status" => {
-            let s = if is_globally_enabled() { "enabled\n" } else { "disabled\n" };
+            let s = if is_globally_enabled() {
+                "enabled\n"
+            } else {
+                "disabled\n"
+            };
             Some(s.to_string())
-        }
+        },
         name => {
             // Per-entry file.
             let entries = binfmt_misc::list();
             let entry = entries.iter().find(|e| e.name == name)?;
             Some(render_entry(entry))
-        }
+        },
     }
 }
 
@@ -84,11 +90,10 @@ pub fn write(path: &str, data: &[u8]) -> Result<usize, isize> {
 
     match rel {
         "register" => {
-            let entry = binfmt_misc::parse_register_string(text)
-                .map_err(|_| -22isize)?; // EINVAL
+            let entry = binfmt_misc::parse_register_string(text).map_err(|_| -22isize)?; // EINVAL
             binfmt_misc::register(entry);
             Ok(data.len())
-        }
+        },
         "status" => {
             match text {
                 "enable" | "1" => *BINFMT_ENABLED.lock() = true,
@@ -96,7 +101,7 @@ pub fn write(path: &str, data: &[u8]) -> Result<usize, isize> {
                 _ => return Err(-22),
             }
             Ok(data.len())
-        }
+        },
         name if !name.is_empty() => {
             match text {
                 "1" => {
@@ -105,24 +110,24 @@ pub fn write(path: &str, data: &[u8]) -> Result<usize, isize> {
                     } else {
                         Err(-2) // ENOENT
                     }
-                }
+                },
                 "0" => {
                     if binfmt_misc::set_enabled(name, false) {
                         Ok(data.len())
                     } else {
                         Err(-2)
                     }
-                }
+                },
                 "-1" => {
                     if binfmt_misc::remove(name) {
                         Ok(data.len())
                     } else {
                         Err(-2)
                     }
-                }
+                },
                 _ => Err(-22), // EINVAL
             }
-        }
+        },
         _ => Err(-2), // ENOENT
     }
 }
@@ -133,11 +138,15 @@ fn render_entry(e: &BinfmtEntry) -> String {
     let state = if e.enabled { "enabled" } else { "disabled" };
     let flags = render_flags(e.flags);
     let match_info = match &e.match_type {
-        MatchType::Magic { offset, magic, mask } => {
+        MatchType::Magic {
+            offset,
+            magic,
+            mask,
+        } => {
             let magic_hex: String = magic.iter().map(|b| format!("{:02x}", b)).collect();
-            let mask_hex:  String = mask .iter().map(|b| format!("{:02x}", b)).collect();
+            let mask_hex: String = mask.iter().map(|b| format!("{:02x}", b)).collect();
             format!("magic offset {offset}\nmagic        {magic_hex}\nmask         {mask_hex}\n")
-        }
+        },
         MatchType::Extension(ext) => format!("extension    {ext}\n"),
     };
     format!(
@@ -148,9 +157,17 @@ fn render_entry(e: &BinfmtEntry) -> String {
 
 fn render_flags(f: u8) -> String {
     let mut out = String::new();
-    if f & FLAG_OPEN_BINARY  != 0 { out.push('O'); }
-    if f & FLAG_CREDENTIALS  != 0 { out.push('C'); }
-    if f & FLAG_FIX_BINARY   != 0 { out.push('F'); }
-    if out.is_empty() { out.push('-'); }
+    if f & FLAG_OPEN_BINARY != 0 {
+        out.push('O');
+    }
+    if f & FLAG_CREDENTIALS != 0 {
+        out.push('C');
+    }
+    if f & FLAG_FIX_BINARY != 0 {
+        out.push('F');
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
     out
 }

@@ -30,8 +30,8 @@
 //!   `context::switch()`.  The stored `pc`/`sp` are the initial user-mode
 //!   instruction and stack pointers.
 //!
-//! - `Live` — task has been scheduled at least once.  Its `Pcb::ctx` holds
-//!   a valid saved register file.  `schedule()` calls `context::switch()`.
+//! - `Live` — task has been scheduled at least once.  Its `Pcb::ctx` holds a
+//!   valid saved register file.  `schedule()` calls `context::switch()`.
 //!
 //! This replaces the previous implicit convention where a zeroed `ctx` meant
 //! "never scheduled", which the switcher worked around by allocating a dummy
@@ -68,12 +68,12 @@ impl Default for TaskRunState {
 #[repr(C)]
 pub struct Task {
     /// Back-pointer to the owning `Pcb`.
-    pub pcb:       *mut Pcb,
+    pub pcb: *mut Pcb,
     /// Cached pid — avoids an extra pointer deref in hot paths.
-    pub pid:       u32,
-    pub _pad:      u32,
+    pub pid: u32,
+    pub _pad: u32,
     /// Scheduling metadata (vruntime, deadlines, cpumask, policy …).
-    pub sched:     SchedEntity,
+    pub sched: SchedEntity,
     /// Whether this task needs first-time entry or a normal context switch.
     pub run_state: TaskRunState,
 }
@@ -90,7 +90,7 @@ impl Task {
             pcb,
             pid,
             _pad: 0,
-            sched:     SchedEntity::new(0),
+            sched: SchedEntity::new(0),
             run_state: TaskRunState::Cold { pc, sp },
         }
     }

@@ -3,15 +3,16 @@
 // Writes up to `sqe.len` bytes from the buffer at virtual address `sqe.addr`
 // to the file/socket described by `sqe.fd`, starting at file offset `sqe.off`
 // (ignored for sockets/pipes).
-// Returns the number of bytes written on success, or a negated errno on failure.
+// Returns the number of bytes written on success, or a negated errno on
+// failure.
 
 use crate::io_uring::{cqe::errno, sqe::Sqe};
 
 /// Synchronous kernel-side handler for IORING_OP_WRITE.
 pub fn handle(sqe: &Sqe) -> i32 {
-    let fd     = sqe.fd;
+    let fd = sqe.fd;
     let buf_va = sqe.addr;
-    let len    = sqe.len as usize;
+    let len = sqe.len as usize;
     let offset = sqe.off;
 
     if fd < 0 {
@@ -28,7 +29,11 @@ pub fn handle(sqe: &Sqe) -> i32 {
 
     log::trace!(
         "[io_uring::write] fd={} buf={:#x} len={} off={} token={:#x}",
-        fd, buf_va, len, offset, sqe.user_data
+        fd,
+        buf_va,
+        len,
+        offset,
+        sqe.user_data
     );
 
     // Core write dispatch now routes through shared VFS/io syscalls.
@@ -36,12 +41,12 @@ pub fn handle(sqe: &Sqe) -> i32 {
     crate::fs::io_syscalls::sys_write(fd as usize, buf_va as usize, len) as i32
 }
 
+use crate::io_uring::{self as ring, IoUringError};
 use core::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use crate::io_uring::{self as ring, IoUringError};
 
 /// Async wrapper around IORING_OP_WRITE.
 ///
@@ -59,7 +64,13 @@ pub struct IoWrite<'a> {
 
 impl<'a> IoWrite<'a> {
     pub fn new(fd: i32, buf: &'a [u8], offset: u64, token: u64) -> Self {
-        IoWrite { fd, buf, offset, token, submitted: false }
+        IoWrite {
+            fd,
+            buf,
+            offset,
+            token,
+            submitted: false,
+        }
     }
 }
 

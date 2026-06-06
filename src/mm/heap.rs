@@ -9,20 +9,19 @@
 //! This module extends that scheme by letting the kernel heap grow on demand:
 //!
 //!   1. `init_heap_tracking(start, initial_pages)` — called once from the
-//!      arch-level kernel init.  Sets `HEAP_END` to
-//!      `start + initial_pages * PAGE`.
+//!      arch-level kernel init.  Sets `HEAP_END` to `start + initial_pages *
+//!      PAGE`.
 //!
-//!   2. `grow(pages)` — called from the global allocator's OOM handler (or
-//!      any kernel path that needs more heap).  Allocates `pages` physical
-//!      pages from the PMM, derives their kernel-virtual addresses through the
+//!   2. `grow(pages)` — called from the global allocator's OOM handler (or any
+//!      kernel path that needs more heap).  Allocates `pages` physical pages
+//!      from the PMM, derives their kernel-virtual addresses through the
 //!      architecture's direct physmap, and hands that region to the
 //!      linked_list_allocator via `add_free_region`.
 //!
-//!   3. On both supported architectures the kernel direct map covers the
-//!      entire physical address space in the higher half (x86-64:
-//!      `PHYS_OFFSET + pa`; RISC-V: `KERNEL_PHYS_BASE + pa`).  Newly
-//!      allocated pages are therefore immediately addressable without any
-//!      additional `map_page()` call.
+//!   3. On both supported architectures the kernel direct map covers the entire
+//!      physical address space in the higher half (x86-64: `PHYS_OFFSET + pa`;
+//!      RISC-V: `KERNEL_PHYS_BASE + pa`).  Newly allocated pages are therefore
+//!      immediately addressable without any additional `map_page()` call.
 //!
 //! ## Safety invariants
 //! * `HEAP_END` is **not** used as the base address handed to
@@ -79,8 +78,9 @@ static HEAP_END: Mutex<usize> = Mutex::new(0);
 static HEAP_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Called once at boot after the linked_list_allocator has been initialised.
-/// `heap_virt_start` is the virtual address passed to `ALLOCATOR.lock().init()`;
-/// `initial_pages` is how many pages were given at init.
+/// `heap_virt_start` is the virtual address passed to
+/// `ALLOCATOR.lock().init()`; `initial_pages` is how many pages were given at
+/// init.
 pub fn init_heap_tracking(heap_virt_start: usize, initial_pages: usize) {
     *HEAP_END.lock() = heap_virt_start + initial_pages * PAGE;
     HEAP_PAGES.store(initial_pages, core::sync::atomic::Ordering::Relaxed);
@@ -137,7 +137,7 @@ pub fn grow(pages: usize) -> Option<usize> {
                     crate::mm::pmm::free_page(*pa);
                 }
                 return None;
-            }
+            },
         }
     }
 

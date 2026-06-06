@@ -4,7 +4,8 @@
 //!
 //! Each entry is a triple `(ns_first, host_first, count)` meaning:
 //!
-//!     ns_uid ∈ [ns_first, ns_first+count)  →  host_uid = host_first + (ns_uid - ns_first)
+//!     ns_uid ∈ [ns_first, ns_first+count)  →  host_uid = host_first + (ns_uid
+//! - ns_first)
 //!
 //! At most `MAX_ID_MAP_ENTRIES` (5) triples per map, matching the Linux limit.
 //! Entries must not overlap; writing the map is a one-shot, irreversible
@@ -17,10 +18,10 @@
 //!
 //! ## ID translation
 //!
-//! * `ns_to_host_uid(ns_id, ns_uid)` — convert a UID seen inside `ns_id`
-//!   to the host UID stored in the PCB.
-//! * `host_to_ns_uid(ns_id, host_uid)` — reverse mapping (for getuid(2)
-//!   inside a container).
+//! * `ns_to_host_uid(ns_id, ns_uid)` — convert a UID seen inside `ns_id` to the
+//!   host UID stored in the PCB.
+//! * `host_to_ns_uid(ns_id, host_uid)` — reverse mapping (for getuid(2) inside
+//!   a container).
 //!
 //! Both return `u32::MAX` (overflow UID, -1 on Linux) when no mapping exists.
 
@@ -29,7 +30,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::proc::namespace::{NsId, INIT_NS, alloc_ns_id};
+use crate::proc::namespace::{alloc_ns_id, NsId, INIT_NS};
 
 /// Maximum number of extents per uid_map or gid_map.  Linux allows 5.
 pub const MAX_ID_MAP_ENTRIES: usize = 5;
@@ -41,11 +42,11 @@ pub const NO_MAP: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug)]
 pub struct IdMapEntry {
     /// First UID/GID in the child namespace.
-    pub ns_first:   u32,
+    pub ns_first: u32,
     /// Corresponding first UID/GID on the host side.
     pub host_first: u32,
     /// Number of IDs in this extent.
-    pub count:      u32,
+    pub count: u32,
 }
 
 impl IdMapEntry {
@@ -87,7 +88,11 @@ pub struct UserNsData {
 impl UserNsData {
     /// Identity map covering the full 32-bit UID space.  Used for INIT_NS.
     fn identity() -> Self {
-        let entry = IdMapEntry { ns_first: 0, host_first: 0, count: u32::MAX };
+        let entry = IdMapEntry {
+            ns_first: 0,
+            host_first: 0,
+            count: u32::MAX,
+        };
         UserNsData {
             uid_map: alloc::vec![entry],
             gid_map: alloc::vec![entry],
@@ -114,14 +119,19 @@ struct UserNsTable {
 }
 
 impl UserNsTable {
-    const fn new() -> Self { UserNsTable { entries: BTreeMap::new() } }
+    const fn new() -> Self {
+        UserNsTable {
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 static USER_NS_TABLE: Mutex<UserNsTable> = Mutex::new(UserNsTable::new());
 
 /// Seed INIT_NS with an identity mapping.  Called once from kernel init.
 pub fn init_user_ns() {
-    USER_NS_TABLE.lock()
+    USER_NS_TABLE
+        .lock()
         .entries
         .entry(INIT_NS)
         .or_insert_with(UserNsData::identity);
@@ -132,14 +142,19 @@ pub fn init_user_ns() {
 /// The new namespace starts with empty (unmapped) uid/gid maps.
 pub fn create_user_ns(parent: NsId) -> NsId {
     let new_id = alloc_ns_id();
-    USER_NS_TABLE.lock().entries.insert(new_id, UserNsData::empty(parent));
+    USER_NS_TABLE
+        .lock()
+        .entries
+        .insert(new_id, UserNsData::empty(parent));
     new_id
 }
 
 /// Destroy a user namespace when it is no longer referenced.
 /// No-op for INIT_NS.
 pub fn drop_user_ns(ns: NsId) {
-    if ns == INIT_NS { return; }
+    if ns == INIT_NS {
+        return;
+    }
     USER_NS_TABLE.lock().entries.remove(&ns);
 }
 
@@ -149,7 +164,9 @@ pub fn ns_to_host_uid(ns_id: NsId, ns_uid: u32) -> u32 {
     let tbl = USER_NS_TABLE.lock();
     if let Some(data) = tbl.entries.get(&ns_id) {
         for e in &data.uid_map {
-            if let Some(h) = e.ns_to_host(ns_uid) { return h; }
+            if let Some(h) = e.ns_to_host(ns_uid) {
+                return h;
+            }
         }
     }
     NO_MAP
@@ -161,7 +178,9 @@ pub fn host_to_ns_uid(ns_id: NsId, host_uid: u32) -> u32 {
     let tbl = USER_NS_TABLE.lock();
     if let Some(data) = tbl.entries.get(&ns_id) {
         for e in &data.uid_map {
-            if let Some(n) = e.host_to_ns(host_uid) { return n; }
+            if let Some(n) = e.host_to_ns(host_uid) {
+                return n;
+            }
         }
     }
     NO_MAP
@@ -172,7 +191,9 @@ pub fn ns_to_host_gid(ns_id: NsId, ns_gid: u32) -> u32 {
     let tbl = USER_NS_TABLE.lock();
     if let Some(data) = tbl.entries.get(&ns_id) {
         for e in &data.gid_map {
-            if let Some(h) = e.ns_to_host(ns_gid) { return h; }
+            if let Some(h) = e.ns_to_host(ns_gid) {
+                return h;
+            }
         }
     }
     NO_MAP
@@ -183,7 +204,9 @@ pub fn host_to_ns_gid(ns_id: NsId, host_gid: u32) -> u32 {
     let tbl = USER_NS_TABLE.lock();
     if let Some(data) = tbl.entries.get(&ns_id) {
         for e in &data.gid_map {
-            if let Some(n) = e.host_to_ns(host_gid) { return n; }
+            if let Some(n) = e.host_to_ns(host_gid) {
+                return n;
+            }
         }
     }
     NO_MAP
@@ -233,7 +256,10 @@ pub fn write_gid_map(
 }
 
 #[derive(Clone, Copy)]
-enum MapKind { Uid, Gid }
+enum MapKind {
+    Uid,
+    Gid,
+}
 
 fn write_map(
     ns_id: NsId,
@@ -241,14 +267,22 @@ fn write_map(
     writer_host_uid: u32,
     kind: MapKind,
 ) -> Result<(), MapWriteError> {
-    if entries.len() > MAX_ID_MAP_ENTRIES { return Err(MapWriteError::TooManyEntries); }
+    if entries.len() > MAX_ID_MAP_ENTRIES {
+        return Err(MapWriteError::TooManyEntries);
+    }
 
     // Validate individual entries.
     for e in entries {
-        if e.count == 0 { return Err(MapWriteError::ZeroCount); }
+        if e.count == 0 {
+            return Err(MapWriteError::ZeroCount);
+        }
         // Overflow check: ns_first + count must not wrap u32.
-        if e.ns_first.checked_add(e.count).is_none() { return Err(MapWriteError::ZeroCount); }
-        if e.host_first.checked_add(e.count).is_none() { return Err(MapWriteError::ZeroCount); }
+        if e.ns_first.checked_add(e.count).is_none() {
+            return Err(MapWriteError::ZeroCount);
+        }
+        if e.host_first.checked_add(e.count).is_none() {
+            return Err(MapWriteError::ZeroCount);
+        }
         // Unprivileged writers may only map their own single UID.
         if writer_host_uid != 0 {
             if e.host_first != writer_host_uid || e.count != 1 {
@@ -282,15 +316,19 @@ fn write_map(
 
     match kind {
         MapKind::Uid => {
-            if data.uid_map_written { return Err(MapWriteError::AlreadyWritten); }
+            if data.uid_map_written {
+                return Err(MapWriteError::AlreadyWritten);
+            }
             data.uid_map = entries.to_vec();
             data.uid_map_written = true;
-        }
+        },
         MapKind::Gid => {
-            if data.gid_map_written { return Err(MapWriteError::AlreadyWritten); }
+            if data.gid_map_written {
+                return Err(MapWriteError::AlreadyWritten);
+            }
             data.gid_map = entries.to_vec();
             data.gid_map_written = true;
-        }
+        },
     }
     Ok(())
 }
@@ -312,7 +350,7 @@ fn format_map(ns_id: NsId, kind: MapKind) -> alloc::string::String {
     let tbl = USER_NS_TABLE.lock();
     let data = match tbl.entries.get(&ns_id) {
         Some(d) => d,
-        None    => return alloc::string::String::new(),
+        None => return alloc::string::String::new(),
     };
     let entries = match kind {
         MapKind::Uid => &data.uid_map,
@@ -322,7 +360,9 @@ fn format_map(ns_id: NsId, kind: MapKind) -> alloc::string::String {
     for e in entries {
         out.push_str(&alloc::format!(
             "{}\t{}\t{}\n",
-            e.ns_first, e.host_first, e.count
+            e.ns_first,
+            e.host_first,
+            e.count
         ));
     }
     out
@@ -338,14 +378,18 @@ pub fn parse_id_map(text: &str) -> Result<Vec<IdMapEntry>, MapWriteError> {
     let mut entries = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let mut parts = line.split_whitespace();
-        let ns_first   = parts.next().and_then(|s| s.parse::<u32>().ok());
+        let ns_first = parts.next().and_then(|s| s.parse::<u32>().ok());
         let host_first = parts.next().and_then(|s| s.parse::<u32>().ok());
-        let count      = parts.next().and_then(|s| s.parse::<u32>().ok());
+        let count = parts.next().and_then(|s| s.parse::<u32>().ok());
         match (ns_first, host_first, count) {
             (Some(n), Some(h), Some(c)) => entries.push(IdMapEntry {
-                ns_first: n, host_first: h, count: c,
+                ns_first: n,
+                host_first: h,
+                count: c,
             }),
             _ => return Err(MapWriteError::ZeroCount), // reuse as parse error
         }
@@ -362,35 +406,34 @@ pub fn parse_id_map(text: &str) -> Result<Vec<IdMapEntry>, MapWriteError> {
 /// privilege checks).  Returns 0 on success, negative errno on error.
 pub fn procfs_write_id_map(
     target_pid: usize,
-    kind: &str,          // "uid_map" or "gid_map"
+    kind: &str, // "uid_map" or "gid_map"
     buf: &[u8],
     writer_pid: usize,
 ) -> isize {
     let text = match core::str::from_utf8(buf) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return -22, // EINVAL
     };
     let entries = match parse_id_map(text) {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(_) => return -22,
     };
     // Look up the target process's user namespace.
     let ns_id = match crate::proc::scheduler::with_proc(target_pid, |p| p.ns.user) {
         Some(id) => id,
-        None     => return -3, // ESRCH
+        None => return -3, // ESRCH
     };
     // Writer's host UID (privilege check).
-    let writer_uid = crate::proc::scheduler::with_proc(writer_pid, |p| p.uid)
-        .unwrap_or(0);
+    let writer_uid = crate::proc::scheduler::with_proc(writer_pid, |p| p.uid).unwrap_or(0);
     let result = match kind {
         "uid_map" => write_uid_map(ns_id, &entries, writer_uid),
         "gid_map" => write_gid_map(ns_id, &entries, writer_uid),
-        _         => return -22,
+        _ => return -22,
     };
     match result {
-        Ok(())                              => 0,
-        Err(MapWriteError::AlreadyWritten)  => -16, // EBUSY
+        Ok(()) => 0,
+        Err(MapWriteError::AlreadyWritten) => -16, // EBUSY
         Err(MapWriteError::PermissionDenied) => -1, // EPERM
-        Err(_)                              => -22, // EINVAL
+        Err(_) => -22,                             // EINVAL
     }
 }

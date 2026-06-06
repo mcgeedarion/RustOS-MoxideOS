@@ -1,6 +1,6 @@
 //! Generic file-descriptor ioctl helpers.
+use super::consts::{FIONBIO, FIONREAD};
 use crate::uaccess::copy_to_user;
-use super::consts::{FIONREAD, FIONBIO};
 
 pub fn vfs_fionread(fd: usize, arg: usize) -> isize {
     let n: u32 = crate::fs::vfs::vfs_fionread(fd).unwrap_or(0) as u32;

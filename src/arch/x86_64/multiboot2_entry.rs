@@ -71,12 +71,14 @@ pub unsafe extern "C" fn multiboot2_start(magic: u32, mbi_ptr: usize) -> ! {
     kernel_main(&BOOT_INFO)
 }
 
-/// 16 KiB boot stack used until `gdt::init()` allocates a proper per-CPU kstack.
+/// 16 KiB boot stack used until `gdt::init()` allocates a proper per-CPU
+/// kstack.
 #[link_section = ".bss"]
 static mut BOOT_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
 
 /// Top-of-stack symbol — RSP is pointed here by `_start`.
-/// Linker places this immediately after `BOOT_STACK` in `.bss`; stack grows down.
+/// Linker places this immediately after `BOOT_STACK` in `.bss`; stack grows
+/// down.
 #[no_mangle]
 #[link_section = ".bss"]
 static BOOT_STACK_TOP: [u8; 0] = [];

@@ -2,7 +2,8 @@
 //!
 //! Mirrors src/arch/x86_64/uefi_entry.rs with the following differences:
 //!   - Final stack-switch uses RISC-V inline assembly.
-//!   - Entry ABI is `extern "efiapi"` (maps to standard RISC-V C calling convention).
+//!   - Entry ABI is `extern "efiapi"` (maps to standard RISC-V C calling
+//!     convention).
 //!   - GOP fallback message is omitted (RISC-V UEFI firmware often has no
 //!     ConOut text output after firmware init; UART is the debug channel).
 //!

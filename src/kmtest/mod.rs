@@ -10,11 +10,11 @@
 //! 2. Add `pub mod <suite>;` below.
 //! 3. Call `<suite>::register()` inside `init()`.
 
+pub mod fs;
+pub mod ipc;
 pub mod mm;
 pub mod proc;
-pub mod fs;
 pub mod sync;
-pub mod ipc;
 
 /// Register all suites with the kmtest harness.
 /// Called once from kernel_main when `feature = "kmtest"` is active.

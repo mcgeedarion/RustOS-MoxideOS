@@ -10,14 +10,9 @@
 //! SMP load tests are annotated but gated behind a separate feature
 //! flag (`smp_tests`) so they only run on multi-CPU QEMU instances.
 
-use kmtest::{register, KmTestResult};
-use crate::sync::{
-    spinlock::SpinLock,
-    mutex::Mutex,
-    rwlock::RwLock,
-    semaphore::Semaphore,
-};
 use crate::proc::futex::sys_futex;
+use crate::sync::{mutex::Mutex, rwlock::RwLock, semaphore::Semaphore, spinlock::SpinLock};
+use kmtest::{register, KmTestResult};
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
@@ -72,7 +67,9 @@ fn sync_mutex_value() -> KmTestResult {
 /// Semaphore: down() decrements count; up() increments; count never < 0.
 fn sync_semaphore_counting() -> KmTestResult {
     let sem = Semaphore::new(5);
-    for _ in 0..5 { sem.down(); }
+    for _ in 0..5 {
+        sem.down();
+    }
     // Count is now 0; try_down must fail.
     if sem.try_down() {
         return Err("semaphore try_down succeeded at count 0");
@@ -117,15 +114,16 @@ fn sync_rwlock_write_blocks_reader() -> KmTestResult {
     Ok(())
 }
 
-/// Futex: FUTEX_WAIT on a word whose value mismatches returns -EAGAIN immediately.
+/// Futex: FUTEX_WAIT on a word whose value mismatches returns -EAGAIN
+/// immediately.
 fn sync_futex_wait_mismatch() -> KmTestResult {
     let word: u32 = 0;
     // Wait for word == 1, but word == 0: must return -EAGAIN (-11).
     let ret = sys_futex(
         &word as *const u32 as usize,
         FUTEX_WAIT,
-        1,        // expected value (won't match)
-        0,        // timeout ptr = NULL
+        1, // expected value (won't match)
+        0, // timeout ptr = NULL
         0,
         0,
     );
@@ -136,11 +134,14 @@ fn sync_futex_wait_mismatch() -> KmTestResult {
 }
 
 pub fn register() {
-    register!("sync_spinlock_basic",           sync_spinlock_basic);
-    register!("sync_mutex_trylock",            sync_mutex_trylock);
-    register!("sync_mutex_value",              sync_mutex_value);
-    register!("sync_semaphore_counting",       sync_semaphore_counting);
-    register!("sync_rwlock_readers_writers",   sync_rwlock_readers_writers);
-    register!("sync_rwlock_write_blocks_reader",sync_rwlock_write_blocks_reader);
-    register!("sync_futex_wait_mismatch",      sync_futex_wait_mismatch);
+    register!("sync_spinlock_basic", sync_spinlock_basic);
+    register!("sync_mutex_trylock", sync_mutex_trylock);
+    register!("sync_mutex_value", sync_mutex_value);
+    register!("sync_semaphore_counting", sync_semaphore_counting);
+    register!("sync_rwlock_readers_writers", sync_rwlock_readers_writers);
+    register!(
+        "sync_rwlock_write_blocks_reader",
+        sync_rwlock_write_blocks_reader
+    );
+    register!("sync_futex_wait_mismatch", sync_futex_wait_mismatch);
 }

@@ -6,13 +6,15 @@
 //!
 //! Exit sequence:
 //!   1. robust_list_on_exit  — wake futex waiters on robust mutexes
-//!   2. clear_child_tid      — zero futex word + FUTEX_WAKE (unblocks pthread_join)
+//!   2. clear_child_tid      — zero futex word + FUTEX_WAKE (unblocks
+//!      pthread_join)
 //!   3. unregister_thread
 //!   4. altstack_clear_pid + proc_name_clear + futex_clear_pid
 //!   5. proc_fd_free         — close all open fds
 //!   6. cgroup_exit          — remove PID from cgroup, maybe free cgroup
 //!   7. free_address_space (last thread in group only)
-//!   8. group_pending_clear (last thread in group only) — drain GROUP_PENDING[tgid]
+//!   8. group_pending_clear (last thread in group only) — drain
+//!      GROUP_PENDING[tgid]
 //!   9. ns_exit (last thread in group only) — tear down private namespaces
 //!  10. free_kstack + State -> Zombie + exit_code = encode_exit(code)
 //!  11. wake vfork_parent
@@ -27,8 +29,8 @@ use crate::mm::kstack::free_kstack;
 use crate::mm::mmap::free_address_space;
 use crate::proc::futex::{futex_wake_addr, robust_list_on_exit};
 use crate::proc::process::State;
-use crate::proc::{scheduler, thread, wait};
 use crate::proc::wait::encode_exit;
+use crate::proc::{scheduler, thread, wait};
 use crate::uaccess::copy_to_user;
 
 fn clear_child_tid(pid: usize) {
@@ -37,8 +39,11 @@ fn clear_child_tid(pid: usize) {
         p.clear_child_tid_va = 0;
         let _ = pl;
         va
-    }).unwrap_or(0);
-    if va == 0 { return; }
+    })
+    .unwrap_or(0);
+    if va == 0 {
+        return;
+    }
     let _ = copy_to_user(va, &0u32.to_ne_bytes());
     futex_wake_addr(va, 1);
 }
@@ -46,9 +51,7 @@ fn clear_child_tid(pid: usize) {
 fn is_last_live_thread(pid: usize, tgid: usize) -> bool {
     scheduler::with_procs_ro(|pl_vec| {
         !pl_vec.iter().any(|pl| {
-            pl.pid as usize != pid
-                && pl.tgid as usize == tgid
-                && pl.load_state() != State::Zombie
+            pl.pid as usize != pid && pl.tgid as usize == tgid && pl.load_state() != State::Zombie
         })
     })
 }
@@ -62,23 +65,23 @@ fn ns_exit(pid: usize) {
 
     let ns = match scheduler::with_proc(pid, |p| p.ns.clone()) {
         Some(n) => n,
-        None    => return,
+        None => return,
     };
 
     // Helper: returns true if any *other* live process shares the given NsId
     // for the field identified by `getter`.
-    let shared_by_other = |ns_id: crate::proc::namespace::NsId,
-                            getter: fn(&crate::proc::process::Process)
-                                -> crate::proc::namespace::NsId| -> bool {
-        scheduler::with_procs_ro(|pl_vec| {
-            pl_vec.iter().any(|pl| {
-                pl.pid as usize != pid
-                    && pl.load_state() != State::Zombie
-                    && scheduler::with_proc(pl.pid as usize, getter)
-                           .unwrap_or(INIT_NS) == ns_id
+    let shared_by_other =
+        |ns_id: crate::proc::namespace::NsId,
+         getter: fn(&crate::proc::process::Process) -> crate::proc::namespace::NsId|
+         -> bool {
+            scheduler::with_procs_ro(|pl_vec| {
+                pl_vec.iter().any(|pl| {
+                    pl.pid as usize != pid
+                        && pl.load_state() != State::Zombie
+                        && scheduler::with_proc(pl.pid as usize, getter).unwrap_or(INIT_NS) == ns_id
+                })
             })
-        })
-    };
+        };
 
     if ns.net != INIT_NS && !shared_by_other(ns.net, |p| p.ns.net) {
         crate::proc::net_ns::destroy_net_ns(ns.net);
@@ -97,12 +100,15 @@ fn zombify(pid: usize, code: i32) -> usize {
     let (kstack_top, vfork_parent) = scheduler::with_proc_mut(pid, |p, pl| {
         let ks = p.kstack_top;
         p.kstack_top = 0;
-        p.exit_code  = encode_exit(code);
+        p.exit_code = encode_exit(code);
         pl.set_state(p, State::Zombie);
         (ks, p.vfork_parent)
-    }).unwrap_or((0, 0));
+    })
+    .unwrap_or((0, 0));
 
-    if kstack_top != 0 { free_kstack(kstack_top); }
+    if kstack_top != 0 {
+        free_kstack(kstack_top);
+    }
     vfork_parent
 }
 
@@ -130,11 +136,15 @@ pub fn do_exit(pid: usize, code: i32) {
     }
 
     let vfork_parent = zombify(pid, code);
-    if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
+    if vfork_parent != 0 {
+        scheduler::wake_pid(vfork_parent);
+    }
     wait::notify_exit(pid);
     scheduler::schedule();
 
-    loop { <Arch as Cpu>::halt(); }
+    loop {
+        <Arch as Cpu>::halt();
+    }
 }
 
 pub fn sys_exit(status: i32) -> isize {
@@ -143,11 +153,12 @@ pub fn sys_exit(status: i32) -> isize {
 }
 
 pub fn sys_exit_group(status: i32) -> isize {
-    let pid  = scheduler::current_pid();
+    let pid = scheduler::current_pid();
     let tgid = thread::tgid_of(pid);
 
     let siblings: alloc::vec::Vec<usize> = scheduler::with_procs_ro(|pl_vec| {
-        pl_vec.iter()
+        pl_vec
+            .iter()
             .filter(|pl| pl.pid as usize != pid && pl.tgid as usize == tgid)
             .map(|pl| pl.pid as usize)
             .collect()
@@ -163,7 +174,9 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::fs::process_fd::proc_fd_free(sibling);
         crate::proc::cgroup::cgroup_exit(sibling); // ← cgroup hook
         let vfork_parent = zombify(sibling, status);
-        if vfork_parent != 0 { scheduler::wake_pid(vfork_parent); }
+        if vfork_parent != 0 {
+            scheduler::wake_pid(vfork_parent);
+        }
         wait::notify_exit(sibling);
     }
 

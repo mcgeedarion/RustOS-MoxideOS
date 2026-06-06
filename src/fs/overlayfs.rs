@@ -1,4 +1,5 @@
-//! OverlayFS — union filesystem with lower (read-only) and upper (read-write) layers.
+//! OverlayFS — union filesystem with lower (read-only) and upper (read-write)
+//! layers.
 //!
 //! ## Architecture
 //! ```
@@ -30,9 +31,9 @@
 
 extern crate alloc;
 use alloc::{
+    format,
     string::{String, ToString},
     vec::Vec,
-    format,
 };
 
 use crate::fs::mount::{self, FsType};
@@ -41,13 +42,13 @@ use spin::Mutex;
 pub static OVERLAY_MOUNTS: Mutex<alloc::collections::BTreeMap<String, OverlayMount>> =
     Mutex::new(alloc::collections::BTreeMap::new());
 
-const ENOENT:  isize = -2;
-const EIO:     isize = -5;
-const EACCES:  isize = -13;
+const ENOENT: isize = -2;
+const EIO: isize = -5;
+const EACCES: isize = -13;
 const ENOTDIR: isize = -20;
-const EISDIR:  isize = -21;
-const ENOSPC:  isize = -28;
-const EINVAL:  isize = -22;
+const EISDIR: isize = -21;
+const ENOSPC: isize = -28;
+const EINVAL: isize = -22;
 
 const WH_PREFIX: &str = ".wh.";
 
@@ -59,29 +60,35 @@ const SYMLINK_SUFFIX: &str = ".ovl_symlink";
 /// Options extracted from the mount table for a given overlayfs mount.
 #[derive(Clone, Debug)]
 pub struct OverlayMount {
-    pub lower:  String,
-    pub upper:  String,
-    pub work:   String,
+    pub lower: String,
+    pub upper: String,
+    pub work: String,
     pub merged: String,
 }
 
 impl OverlayMount {
     pub fn from_opts(opts: &crate::fs::mount::OverlayOpts) -> Self {
         OverlayMount {
-            lower:  opts.lower.clone(),
-            upper:  opts.upper.clone(),
-            work:   opts.work.clone(),
+            lower: opts.lower.clone(),
+            upper: opts.upper.clone(),
+            work: opts.work.clone(),
             merged: String::new(),
         }
     }
 
-    fn upper_path(&self, rel: &str) -> String { join(&self.upper, rel) }
-    fn lower_path(&self, rel: &str) -> String { join(&self.lower, rel) }
+    fn upper_path(&self, rel: &str) -> String {
+        join(&self.upper, rel)
+    }
+    fn lower_path(&self, rel: &str) -> String {
+        join(&self.lower, rel)
+    }
     fn whiteout_path(&self, rel: &str) -> String {
         let (dir, base) = split_last(rel);
         join(&self.upper, &join(dir, &format!("{}{}", WH_PREFIX, base)))
     }
-    fn work_path(&self, rel: &str) -> String { join(&self.work, rel) }
+    fn work_path(&self, rel: &str) -> String {
+        join(&self.work, rel)
+    }
     fn symlink_sidecar_path(&self, rel: &str) -> String {
         format!("{}{}", self.upper_path(rel), SYMLINK_SUFFIX)
     }
@@ -118,20 +125,26 @@ fn remove_file(path: &str) -> Result<(), isize> {
 }
 
 fn list_dir(path: &str) -> Result<Vec<String>, isize> {
-    crate::fs::vfs_ops::readdir(path)
-        .map(|entries| entries.into_iter().map(|e| e.name).collect())
+    crate::fs::vfs_ops::readdir(path).map(|entries| entries.into_iter().map(|e| e.name).collect())
 }
 
 pub use crate::fs::vfs_ops::KStat;
 
-/// Resolve an overlay-relative path to the concrete layer path used for reading.
+/// Resolve an overlay-relative path to the concrete layer path used for
+/// reading.
 pub fn lookup(om: &OverlayMount, rel: &str) -> Result<String, isize> {
     let wh = om.whiteout_path(rel);
-    if path_exists(&wh) { return Err(ENOENT); }
+    if path_exists(&wh) {
+        return Err(ENOENT);
+    }
     let up = om.upper_path(rel);
-    if path_exists(&up) { return Ok(up); }
+    if path_exists(&up) {
+        return Ok(up);
+    }
     let lo = om.lower_path(rel);
-    if path_exists(&lo) { return Ok(lo); }
+    if path_exists(&lo) {
+        return Ok(lo);
+    }
     Err(ENOENT)
 }
 
@@ -143,7 +156,9 @@ pub fn open_read(om: &OverlayMount, rel: &str) -> Result<String, isize> {
 /// Open for writing: triggers copy-up if the file only exists in lower.
 pub fn open_write(om: &OverlayMount, rel: &str) -> Result<String, isize> {
     let up = om.upper_path(rel);
-    if path_exists(&up) { return Ok(up); }
+    if path_exists(&up) {
+        return Ok(up);
+    }
     let lo = om.lower_path(rel);
     if path_exists(&lo) {
         copy_up(om, rel, &lo.clone(), &up)?;
@@ -156,7 +171,9 @@ pub fn open_write(om: &OverlayMount, rel: &str) -> Result<String, isize> {
 pub fn create(om: &OverlayMount, rel: &str) -> Result<String, isize> {
     let up = om.upper_path(rel);
     let wh = om.whiteout_path(rel);
-    if path_exists(&wh) { let _ = remove_file(&wh); }
+    if path_exists(&wh) {
+        let _ = remove_file(&wh);
+    }
     create_file(&up)?;
     Ok(up)
 }
@@ -172,8 +189,7 @@ pub fn read(om: &OverlayMount, rel: &str, buf: &mut Vec<u8>) -> Result<usize, is
 
 /// Write a file through the overlay (copy-up if needed).
 pub fn write(om: &OverlayMount, rel: &str, data: &[u8]) -> Result<(), isize> {
-    let path = open_write(om, rel)
-        .or_else(|_| create(om, rel))?;
+    let path = open_write(om, rel).or_else(|_| create(om, rel))?;
     write_file(&path, data)
 }
 
@@ -186,7 +202,9 @@ pub fn truncate(om: &OverlayMount, rel: &str, len: u64) -> Result<(), isize> {
 /// stat through the overlay: upper takes priority, then lower.
 pub fn stat(om: &OverlayMount, rel: &str) -> Result<KStat, isize> {
     let wh = om.whiteout_path(rel);
-    if path_exists(&wh) { return Err(ENOENT); }
+    if path_exists(&wh) {
+        return Err(ENOENT);
+    }
     let up = om.upper_path(rel);
     if path_exists(&up) {
         return crate::fs::vfs_ops::stat(&up);
@@ -201,7 +219,9 @@ pub fn stat(om: &OverlayMount, rel: &str) -> Result<KStat, isize> {
 /// Unlink: place a whiteout in the upper layer.
 pub fn unlink(om: &OverlayMount, rel: &str) -> Result<(), isize> {
     let up = om.upper_path(rel);
-    if path_exists(&up) { remove_file(&up)?; }
+    if path_exists(&up) {
+        remove_file(&up)?;
+    }
     let lo = om.lower_path(rel);
     if path_exists(&lo) {
         create_file(&om.whiteout_path(rel))?;
@@ -214,19 +234,26 @@ pub fn unlink(om: &OverlayMount, rel: &str) -> Result<(), isize> {
 /// mkdir in the upper layer.
 pub fn mkdir(om: &OverlayMount, rel: &str) -> Result<(), isize> {
     let up = om.upper_path(rel);
-    if path_exists(&up) { return Err(-17); }
+    if path_exists(&up) {
+        return Err(-17);
+    }
     create_dir(&up)
 }
 
 /// rmdir: whiteout + remove upper if present.
 pub fn rmdir(om: &OverlayMount, rel: &str) -> Result<(), isize> {
     let entries = readdir(om, rel)?;
-    let non_trivial: Vec<_> = entries.iter()
+    let non_trivial: Vec<_> = entries
+        .iter()
         .filter(|e| e.name != "." && e.name != "..")
         .collect();
-    if !non_trivial.is_empty() { return Err(-39); }
+    if !non_trivial.is_empty() {
+        return Err(-39);
+    }
     let up = om.upper_path(rel);
-    if path_is_dir(&up) { remove_file(&up)?; }
+    if path_is_dir(&up) {
+        remove_file(&up)?;
+    }
     let lo = om.lower_path(rel);
     if path_is_dir(&lo) {
         create_file(&om.whiteout_path(rel))?;
@@ -254,8 +281,12 @@ pub fn readdir(om: &OverlayMount, rel: &str) -> Result<Vec<crate::fs::vfs_ops::D
 
     if path_is_dir(&lo_path) {
         for name in list_dir(&lo_path)? {
-            if whiteouts.contains(&name) { continue; }
-            if names.contains(&name) { continue; }
+            if whiteouts.contains(&name) {
+                continue;
+            }
+            if names.contains(&name) {
+                continue;
+            }
             names.push(name);
         }
     }
@@ -267,10 +298,10 @@ pub fn readdir(om: &OverlayMount, rel: &str) -> Result<Vec<crate::fs::vfs_ops::D
         if let Ok(ks) = stat(om, &rel_entry) {
             entries.push(crate::fs::vfs_ops::DirEntry {
                 name,
-                ino:    ks.ino,
+                ino: ks.ino,
                 is_dir: ks.is_dir,
-                mode:   ks.mode,
-                size:   ks.size,
+                mode: ks.mode,
+                size: ks.size,
             });
         }
     }
@@ -301,7 +332,9 @@ pub fn link(om: &OverlayMount, old_rel: &str, new_rel: &str) -> Result<(), isize
 pub fn symlink(om: &OverlayMount, target: &str, link_rel: &str) -> Result<(), isize> {
     // Clear any stale whiteout.
     let wh = om.whiteout_path(link_rel);
-    if path_exists(&wh) { let _ = remove_file(&wh); }
+    if path_exists(&wh) {
+        let _ = remove_file(&wh);
+    }
     // Write the target into the sidecar file.
     let sidecar = om.symlink_sidecar_path(link_rel);
     ensure_upper_dir(om, split_last(link_rel).0)?;
@@ -330,14 +363,18 @@ pub fn readlink(om: &OverlayMount, rel: &str) -> Result<String, isize> {
 /// Update the mode on the upper-layer inode.
 pub fn chmod(om: &OverlayMount, rel: &str, mode: u16) -> Result<(), isize> {
     let up = om.upper_path(rel);
-    if !path_exists(&up) { return Err(ENOENT); }
+    if !path_exists(&up) {
+        return Err(ENOENT);
+    }
     crate::fs::vfs_ops::chmod(&up, mode)
 }
 
 /// Update uid/gid on the upper-layer inode.
 pub fn chown(om: &OverlayMount, rel: &str, uid: u32, gid: u32) -> Result<(), isize> {
     let up = om.upper_path(rel);
-    if !path_exists(&up) { return Err(ENOENT); }
+    if !path_exists(&up) {
+        return Err(ENOENT);
+    }
     crate::fs::vfs_ops::chown(&up, uid, gid)
 }
 
@@ -346,7 +383,9 @@ pub fn chown(om: &OverlayMount, rel: &str, uid: u32, gid: u32) -> Result<(), isi
 
 pub fn copy_up_if_needed(om: &OverlayMount, rel: &str) -> Result<(), isize> {
     let up = om.upper_path(rel);
-    if path_exists(&up) { return Ok(()); }  // already in upper
+    if path_exists(&up) {
+        return Ok(());
+    } // already in upper
     let lo = om.lower_path(rel);
     if path_exists(&lo) {
         return copy_up(om, rel, &lo.clone(), &up);
@@ -366,9 +405,13 @@ fn copy_up(om: &OverlayMount, rel: &str, lower_path: &str, upper_path: &str) -> 
 }
 
 fn ensure_upper_dir(om: &OverlayMount, dir: &str) -> Result<(), isize> {
-    if dir == "/" || dir.is_empty() { return Ok(()); }
+    if dir == "/" || dir.is_empty() {
+        return Ok(());
+    }
     let up_dir = om.upper_path(dir);
-    if path_is_dir(&up_dir) { return Ok(()); }
+    if path_is_dir(&up_dir) {
+        return Ok(());
+    }
     let (parent, _) = split_last(dir);
     ensure_upper_dir(om, parent)?;
     create_dir(&up_dir)
@@ -376,17 +419,20 @@ fn ensure_upper_dir(om: &OverlayMount, dir: &str) -> Result<(), isize> {
 
 fn join(base: &str, rel: &str) -> String {
     let base = base.trim_end_matches('/');
-    let rel  = rel.trim_start_matches('/');
-    if rel.is_empty() { base.to_string() }
-    else { format!("{}/{}", base, rel) }
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}/{}", base, rel)
+    }
 }
 
 fn split_last(path: &str) -> (&str, &str) {
     let p = path.trim_end_matches('/');
     match p.rfind('/') {
         Some(i) if i == 0 => ("/", &p[1..]),
-        Some(i)           => (&p[..i], &p[i+1..]),
-        None              => ("/", p),
+        Some(i) => (&p[..i], &p[i + 1..]),
+        None => ("/", p),
     }
 }
 
@@ -414,12 +460,16 @@ mod tests {
     struct TestOverlay {
         lower: Fs,
         upper: Fs,
-        work:  Fs,
+        work: Fs,
     }
 
     impl TestOverlay {
         fn new() -> Self {
-            TestOverlay { lower: new_fs(), upper: new_fs(), work: new_fs() }
+            TestOverlay {
+                lower: new_fs(),
+                upper: new_fs(),
+                work: new_fs(),
+            }
         }
 
         // Seed a file into the lower layer.
@@ -445,19 +495,26 @@ mod tests {
             self.upper.lock().insert(path.to_string(), orig);
             self.work.lock().remove(path);
             // write new content to upper
-            self.upper.lock().insert(path.to_string(), new_data.to_vec());
+            self.upper
+                .lock()
+                .insert(path.to_string(), new_data.to_vec());
             Ok(())
         }
 
         // Simulate a read: upper wins, then lower.
         fn read(&self, path: &str) -> Result<Vec<u8>, isize> {
-            if let Some(d) = self.upper.lock().get(path).cloned() { return Ok(d); }
-            if let Some(d) = self.lower.lock().get(path).cloned() { return Ok(d); }
+            if let Some(d) = self.upper.lock().get(path).cloned() {
+                return Ok(d);
+            }
+            if let Some(d) = self.lower.lock().get(path).cloned() {
+                return Ok(d);
+            }
             Err(-2)
         }
     }
 
-    /// Mount overlay over tmpfs lower + tmpfs upper, write through it, verify copy-up.
+    /// Mount overlay over tmpfs lower + tmpfs upper, write through it, verify
+    /// copy-up.
     ///
     /// Invariants checked:
     ///   1. Before any write: file is served from lower only.
@@ -522,17 +579,17 @@ mod tests {
     /// Verify path join helper.
     #[test]
     fn test_join() {
-        assert_eq!(join("/upper", "foo.txt"),   "/upper/foo.txt");
+        assert_eq!(join("/upper", "foo.txt"), "/upper/foo.txt");
         assert_eq!(join("/upper/", "/foo.txt"), "/upper/foo.txt");
-        assert_eq!(join("/upper", "/"),         "/upper");
-        assert_eq!(join("/upper", ""),          "/upper");
+        assert_eq!(join("/upper", "/"), "/upper");
+        assert_eq!(join("/upper", ""), "/upper");
     }
 
     /// Verify split_last helper.
     #[test]
     fn test_split_last() {
         assert_eq!(split_last("/a/b/c"), ("/a/b", "c"));
-        assert_eq!(split_last("/foo"),   ("/",    "foo"));
-        assert_eq!(split_last("foo"),    ("/",    "foo"));
+        assert_eq!(split_last("/foo"), ("/", "foo"));
+        assert_eq!(split_last("foo"), ("/", "foo"));
     }
 }

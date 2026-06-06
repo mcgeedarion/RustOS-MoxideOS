@@ -58,29 +58,29 @@
 //!   AP:   gdt::init_ap(cpu_id)  →  idt::load()  →  apic::ap_init_local()
 //! ```
 
+use crate::mm::kstack::alloc_kstack;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::mm::kstack::alloc_kstack;
 
 /// Present | DPL=0 | S=1 | Executable | L=1 (64-bit code).
 const KCODE64: u64 = (1 << 47) | (1 << 44) | (1 << 43) | (1 << 53);
 /// Present | DPL=0 | S=1 | Writable (data).
-const KDATA:   u64 = (1 << 47) | (1 << 44) | (1 << 41);
+const KDATA: u64 = (1 << 47) | (1 << 44) | (1 << 41);
 /// Present | DPL=3 | S=1 | Executable | L=1 (64-bit user code).
 const UCODE64: u64 = (1 << 47) | (3 << 45) | (1 << 44) | (1 << 43) | (1 << 53);
 /// Present | DPL=3 | S=1 | Writable (user data).
-const UDATA:   u64 = (1 << 47) | (3 << 45) | (1 << 44) | (1 << 41);
+const UDATA: u64 = (1 << 47) | (3 << 45) | (1 << 44) | (1 << 41);
 
 /// Kernel code segment selector (RPL=0).
 pub const SELECTOR_KERNEL_CS: u16 = 0x08;
 /// Kernel data segment selector (RPL=0).
 pub const SELECTOR_KERNEL_DS: u16 = 0x10;
 /// User code segment selector (RPL=3) — set on SYSRET.
-pub const SELECTOR_USER_CS:   u16 = 0x1B;
+pub const SELECTOR_USER_CS: u16 = 0x1B;
 /// User data segment selector (RPL=3) — set on SYSRET.
-pub const SELECTOR_USER_DS:   u16 = 0x23;
+pub const SELECTOR_USER_DS: u16 = 0x23;
 /// TSS selector (RPL=0).
-pub const SELECTOR_TSS:       u16 = 0x28;
+pub const SELECTOR_TSS: u16 = 0x28;
 
 // The TSS must be 104 bytes and aligned to at least 4 bytes.
 // `iomap_base` is set to sizeof(Tss) so there is no I/O permission bitmap;
@@ -88,30 +88,40 @@ pub const SELECTOR_TSS:       u16 = 0x28;
 
 #[repr(C, packed)]
 struct Tss {
-    _reserved0:  u32,
-    rsp0:        u64,  // ring-0 stack for IDT transitions from ring 3
-    rsp1:        u64,  // (unused; would be ring-1 stack)
-    rsp2:        u64,  // (unused; would be ring-2 stack)
-    _reserved1:  u64,
-    ist1:        u64,  // IST1 — used by #NMI, #DF, #MC (idt.rs IST=1)
-    ist2:        u64,  // IST2 — reserved for future watchdog use
-    ist3:        u64,
-    ist4:        u64,
-    ist5:        u64,
-    ist6:        u64,
-    ist7:        u64,
-    _reserved2:  u64,
-    _reserved3:  u16,
-    iomap_base:  u16,  // offset to IOPM; = sizeof(Tss) disables IOPM
+    _reserved0: u32,
+    rsp0: u64, // ring-0 stack for IDT transitions from ring 3
+    rsp1: u64, // (unused; would be ring-1 stack)
+    rsp2: u64, // (unused; would be ring-2 stack)
+    _reserved1: u64,
+    ist1: u64, // IST1 — used by #NMI, #DF, #MC (idt.rs IST=1)
+    ist2: u64, // IST2 — reserved for future watchdog use
+    ist3: u64,
+    ist4: u64,
+    ist5: u64,
+    ist6: u64,
+    ist7: u64,
+    _reserved2: u64,
+    _reserved3: u16,
+    iomap_base: u16, // offset to IOPM; = sizeof(Tss) disables IOPM
 }
 
 impl Tss {
     const fn zero() -> Self {
         Self {
-            _reserved0: 0, rsp0: 0, rsp1: 0, rsp2: 0,
-            _reserved1: 0, ist1: 0, ist2: 0, ist3: 0,
-            ist4: 0, ist5: 0, ist6: 0, ist7: 0,
-            _reserved2: 0, _reserved3: 0,
+            _reserved0: 0,
+            rsp0: 0,
+            rsp1: 0,
+            rsp2: 0,
+            _reserved1: 0,
+            ist1: 0,
+            ist2: 0,
+            ist3: 0,
+            ist4: 0,
+            ist5: 0,
+            ist6: 0,
+            ist7: 0,
+            _reserved2: 0,
+            _reserved3: 0,
             iomap_base: core::mem::size_of::<Tss>() as u16,
         }
     }
@@ -123,16 +133,16 @@ impl Tss {
 
 #[repr(C, align(16))]
 struct PerCpuGdt {
-    gdt:  [u64; 7],
-    tss:  Tss,
+    gdt: [u64; 7],
+    tss: Tss,
     used: AtomicBool,
 }
 
 impl PerCpuGdt {
     const fn zero() -> Self {
         Self {
-            gdt:  [0u64; 7],
-            tss:  Tss::zero(),
+            gdt: [0u64; 7],
+            tss: Tss::zero(),
             used: AtomicBool::new(false),
         }
     }
@@ -147,7 +157,7 @@ static mut PER_CPU_GDT: [PerCpuGdt; MAX_CPUS] = [const { PerCpuGdt::zero() }; MA
 #[derive(Copy, Clone)]
 pub struct GdtPointer {
     pub limit: u16,
-    pub base:  u64,
+    pub base: u64,
 }
 
 // Pointed to by IA32_GS_BASE (MSR 0xC000_0101).
@@ -160,22 +170,28 @@ pub struct GdtPointer {
 pub struct PerCpu {
     /// gs:0  — kernel RSP for the running task; read by IDT ring-3 entries
     ///          via the TSS RSP0, and by syscall_asm_entry via GS directly.
-    pub kstack_rsp:    u64,
+    pub kstack_rsp: u64,
     /// gs:8  — user RSP scratch slot; written by `syscall_asm_entry` before
     ///          switching to the kernel stack.
     pub user_rsp_save: u64,
     /// gs:16 — logical CPU id (read-only after percpu_init).
-    pub cpu_id:        u32,
-    pub _pad0:         u32,
+    pub cpu_id: u32,
+    pub _pad0: u32,
     /// gs:24 — pointer to TSS.rsp0; context_switch() writes the new task's
     ///          kernel stack top here for the fast path (avoids a full
     ///          gdt::update_rsp0() call on every switch).
-    pub tss_rsp0_ptr:  u64,
+    pub tss_rsp0_ptr: u64,
 }
 
-static mut PER_CPU_STRUCTS: [PerCpu; MAX_CPUS] = [const { PerCpu {
-    kstack_rsp: 0, user_rsp_save: 0, cpu_id: 0, _pad0: 0, tss_rsp0_ptr: 0,
-}}; MAX_CPUS];
+static mut PER_CPU_STRUCTS: [PerCpu; MAX_CPUS] = [const {
+    PerCpu {
+        kstack_rsp: 0,
+        user_rsp_save: 0,
+        cpu_id: 0,
+        _pad0: 0,
+        tss_rsp0_ptr: 0,
+    }
+}; MAX_CPUS];
 
 static mut BSP_GDT_PTR: GdtPointer = GdtPointer { limit: 0, base: 0 };
 
@@ -193,31 +209,30 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
     //   [51:48] limit[19:16]
     //   [55]    G    = 0      (byte granularity)
     //   [63:56] base[31:24]
-    let lo: u64 =
-          ((limit as u64 & 0x0000_FFFF))
-        | ((base  as u64 & 0x00FF_FFFF) << 16)
-        | ((base  as u64 & 0xFF00_0000) << 32)
+    let lo: u64 = (limit as u64 & 0x0000_FFFF)
+        | ((base as u64 & 0x00FF_FFFF) << 16)
+        | ((base as u64 & 0xFF00_0000) << 32)
         | ((limit as u64 & 0x000F_0000) << 32)
-        | (0x89u64 << 40);   // P=1, DPL=0, Type=0x9 (64-bit avail TSS)
-    // High 64-bit word:
-    //   [31:0] base[63:32]
-    //   [63:32] reserved (must be zero)
+        | (0x89u64 << 40); // P=1, DPL=0, Type=0x9 (64-bit avail TSS)
+                           // High 64-bit word:
+                           //   [31:0] base[63:32]
+                           //   [63:32] reserved (must be zero)
     let hi: u64 = (base >> 32) & 0xFFFF_FFFF;
     (lo, hi)
 }
 
 /// Fill the 7-slot GDT for a CPU whose TSS lives at `tss_ptr`.
 unsafe fn fill_gdt(gdt: &mut [u64; 7], tss_ptr: *const Tss) {
-    gdt[0] = 0;        // null
-    gdt[1] = KCODE64;  // 0x08 kernel CS
-    gdt[2] = KDATA;    // 0x10 kernel DS
-    gdt[3] = UCODE64;  // 0x18 user CS
-    gdt[4] = UDATA;    // 0x20 user DS
-    let tss_base  = tss_ptr as u64;
+    gdt[0] = 0; // null
+    gdt[1] = KCODE64; // 0x08 kernel CS
+    gdt[2] = KDATA; // 0x10 kernel DS
+    gdt[3] = UCODE64; // 0x18 user CS
+    gdt[4] = UDATA; // 0x20 user DS
+    let tss_base = tss_ptr as u64;
     let tss_limit = (core::mem::size_of::<Tss>() - 1) as u32;
     let (lo, hi) = tss_descriptor(tss_base, tss_limit);
-    gdt[5] = lo;       // 0x28 TSS low
-    gdt[6] = hi;       // 0x30 TSS high
+    gdt[5] = lo; // 0x28 TSS low
+    gdt[6] = hi; // 0x30 TSS high
 }
 
 /// Load a GDT pointer + reload all segment registers + load TSS.
@@ -314,7 +329,7 @@ pub fn gdt_init() {
         // Build the pseudo-descriptor.
         let ptr = GdtPointer {
             limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
-            base:  slot.gdt.as_ptr() as u64,
+            base: slot.gdt.as_ptr() as u64,
         };
         BSP_GDT_PTR = ptr;
 
@@ -326,10 +341,10 @@ pub fn gdt_init() {
 
         // Init PerCpu struct.
         let pcpu = &mut PER_CPU_STRUCTS[cpu_id];
-        pcpu.kstack_rsp    = kstack_top as u64;
+        pcpu.kstack_rsp = kstack_top as u64;
         pcpu.user_rsp_save = 0;
-        pcpu.cpu_id        = cpu_id as u32;
-        pcpu.tss_rsp0_ptr  = &slot.tss.rsp0 as *const u64 as u64;
+        pcpu.cpu_id = cpu_id as u32;
+        pcpu.tss_rsp0_ptr = &slot.tss.rsp0 as *const u64 as u64;
 
         // Point GS_BASE at the per-CPU struct.
         set_gsbase(pcpu);
@@ -339,13 +354,18 @@ pub fn gdt_init() {
 /// Initialise a non-BSP (AP) CPU's GDT, TSS, PerCpu struct, and GSBASE.
 ///
 /// Called from `ap_entry(cpu_id)` after the AP has paging enabled.
-/// Unsafe because it writes per-CPU statics and executes privileged instructions.
+/// Unsafe because it writes per-CPU statics and executes privileged
+/// instructions.
 pub unsafe fn init_ap(cpu_id: u32) {
     let idx = cpu_id as usize;
-    assert!(idx < MAX_CPUS, "gdt::init_ap: cpu_id {} exceeds MAX_CPUS", idx);
+    assert!(
+        idx < MAX_CPUS,
+        "gdt::init_ap: cpu_id {} exceeds MAX_CPUS",
+        idx
+    );
 
     let kstack_top = alloc_kstack();
-    let ist1_top   = alloc_kstack();
+    let ist1_top = alloc_kstack();
 
     let slot = &mut PER_CPU_GDT[idx];
     slot.used.store(true, Ordering::Relaxed);
@@ -359,19 +379,24 @@ pub unsafe fn init_ap(cpu_id: u32) {
 
     let ptr = GdtPointer {
         limit: (core::mem::size_of::<[u64; 7]>() - 1) as u16,
-        base:  slot.gdt.as_ptr() as u64,
+        base: slot.gdt.as_ptr() as u64,
     };
     load_gdt(&ptr);
 
     let pcpu = &mut PER_CPU_STRUCTS[idx];
-    pcpu.kstack_rsp    = kstack_top as u64;
+    pcpu.kstack_rsp = kstack_top as u64;
     pcpu.user_rsp_save = 0;
-    pcpu.cpu_id        = cpu_id;
-    pcpu.tss_rsp0_ptr  = &slot.tss.rsp0 as *const u64 as u64;
+    pcpu.cpu_id = cpu_id;
+    pcpu.tss_rsp0_ptr = &slot.tss.rsp0 as *const u64 as u64;
 
     set_gsbase(pcpu);
 
-    log::debug!("gdt: AP {} online kstack={:#x} ist1={:#x}", cpu_id, kstack_top, ist1_top);
+    log::debug!(
+        "gdt: AP {} online kstack={:#x} ist1={:#x}",
+        cpu_id,
+        kstack_top,
+        ist1_top
+    );
 }
 
 /// Write a new AP kernel stack pointer into the trampoline shared-memory slot

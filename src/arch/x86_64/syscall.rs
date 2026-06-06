@@ -27,9 +27,9 @@
 //!   rust_syscall_handler.  The frame also holds the user RSP so that
 //!   signal delivery (push_sigframe_x86) and rt_sigreturn can read/write it.
 
-use core::arch::global_asm;
 use crate::proc::scheduler;
 use crate::uaccess::{copy_to_user, validate_user_ptr};
+use core::arch::global_asm;
 
 /// Register state saved by `syscall_asm_entry` on the kernel stack.
 ///
@@ -52,11 +52,11 @@ pub struct SyscallFrame {
     pub rsi: usize,
     pub rdx: usize,
     pub r10: usize,
-    pub r8:  usize,
-    pub r9:  usize,
-    pub rip:    usize,   // saved from RCX by the SYSCALL instruction
-    pub rflags: usize,   // saved from R11 by the SYSCALL instruction
-    pub rsp:    usize,   // user stack pointer (saved explicitly by stub)
+    pub r8: usize,
+    pub r9: usize,
+    pub rip: usize,    // saved from RCX by the SYSCALL instruction
+    pub rflags: usize, // saved from R11 by the SYSCALL instruction
+    pub rsp: usize,    // user stack pointer (saved explicitly by stub)
 }
 
 // Registered as MSR_LSTAR.  On entry:
@@ -93,15 +93,15 @@ global_asm!(
     //  active for ring-0 SYSCALL in this bare-metal environment because we
     //  don't use the syscall IST/TSS stack pointer.  If/when a proper per-CPU
     //  kernel stack is added, swap RSP from GS here).
-    "push r11",          // push user RFLAGS (r11 after SYSCALL)
-    "push rcx",          // push user RIP    (rcx after SYSCALL)
+    "push r11", // push user RFLAGS (r11 after SYSCALL)
+    "push rcx", // push user RIP    (rcx after SYSCALL)
     "push r9",
     "push r8",
     "push r10",
     "push rdx",
     "push rsi",
     "push rdi",
-    "push rax",          // syscall number
+    "push rax", // syscall number
     "push rbx",
     "push rbp",
     "push r12",
@@ -124,8 +124,8 @@ global_asm!(
     //    user_rsp = current_rsp + 15*8  ... but wait, that's the kernel
     //  stack top.  In a single-stack model RSP on SYSCALL entry IS the user
     //  RSP.  We pushed 15 values, so user_rsp = rsp + 120.
-    "lea rax, [rsp + 120]",  // rax = user RSP
-    "mov [rsp + 120], rax",  // store into SyscallFrame.rsp slot
+    "lea rax, [rsp + 120]", // rax = user RSP
+    "mov [rsp + 120], rax", // store into SyscallFrame.rsp slot
     //  NOTE: rax will be overwritten by rust_syscall_handler's return value;
     //  that's fine — we load rax from frame.rax on exit.
     "sti",
@@ -133,28 +133,30 @@ global_asm!(
     "cli",
     // ── 7. Restore user RFLAGS→r11 and RIP→rcx from the (possibly modified)
     //       frame (signal delivery may have changed rip/rflags/rsp). ───────
-    "mov r11, [rsp + 112]",  // frame.rflags
-    "mov rcx, [rsp + 104]",  // frame.rip
+    "mov r11, [rsp + 112]", // frame.rflags
+    "mov rcx, [rsp + 104]", // frame.rip
     "pop r15",
     "pop r14",
     "pop r13",
     "pop r12",
     "pop rbp",
     "pop rbx",
-    "pop rax",   // return value (set by handler into frame.rax)
+    "pop rax", // return value (set by handler into frame.rax)
     "pop rdi",
     "pop rsi",
     "pop rdx",
     "pop r10",
     "pop r8",
     "pop r9",
-    "add rsp, 16",   // skip rcx/r11 slots (already loaded above)
+    "add rsp, 16", // skip rcx/r11 slots (already loaded above)
     // user RSP was stored at [rsp] now; restore it.
-    "pop rsp",       // CAUTION: this changes rsp to user stack
+    "pop rsp", // CAUTION: this changes rsp to user stack
     "sysretq",
 );
 
-extern "C" { pub fn syscall_asm_entry(); }
+extern "C" {
+    pub fn syscall_asm_entry();
+}
 
 /// Called from `syscall_asm_entry` with a pointer to the SyscallFrame on the
 /// kernel stack.  We handle NR 15 (rt_sigreturn) in-line here because it needs
@@ -180,13 +182,12 @@ pub extern "C" fn rust_syscall_handler(frame: &mut SyscallFrame) {
     }
 
     let ret = crate::syscall::dispatch(
-        nr,
-        frame.rdi, frame.rsi, frame.rdx,
-        frame.r10, frame.r8,  frame.r9,
+        nr, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
     );
     frame.rax = ret as usize;
 
-    // Decrement in_syscall before signal delivery (signal handlers run in user mode).
+    // Decrement in_syscall before signal delivery (signal handlers run in user
+    // mode).
     {
         let cpu = crate::smp::percpu::current_cpu_id() as usize;
         let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu] };
@@ -199,13 +200,14 @@ pub extern "C" fn rust_syscall_handler(frame: &mut SyscallFrame) {
 
 /// syscall_setup: configure SYSCALL/SYSRET MSRs.
 pub fn syscall_setup() {
-    use crate::arch::x86_64::cpu::{wrmsr, rdmsr, MSR_EFER, MSR_STAR, MSR_LSTAR, MSR_FMASK};
+    use crate::arch::x86_64::cpu::{rdmsr, wrmsr, MSR_EFER, MSR_FMASK, MSR_LSTAR, MSR_STAR};
     unsafe {
         let efer = rdmsr(MSR_EFER);
         wrmsr(MSR_EFER, efer | 1);
         wrmsr(MSR_STAR, 0x001B_0008u64 << 32);
         wrmsr(MSR_LSTAR, syscall_asm_entry as u64);
-        // FMASK: clear IF (bit 9), TF (bit 8), DF (bit 10), AC (bit 18), NT (bit 14), IOPL.
+        // FMASK: clear IF (bit 9), TF (bit 8), DF (bit 10), AC (bit 18), NT (bit 14),
+        // IOPL.
         wrmsr(MSR_FMASK, 0x47700);
     }
 }
@@ -245,14 +247,14 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
                 );
             }
             0
-        }
+        },
         ARCH_GET_FS => {
             let base = scheduler::with_proc(pid, |p| p.ctx.fs_base).unwrap_or(0);
             if addr != 0 && validate_user_ptr(addr, 8) {
                 let _ = copy_to_user(addr, &base.to_ne_bytes());
             }
             0
-        }
+        },
         ARCH_SET_GS => {
             unsafe {
                 core::arch::asm!(
@@ -264,7 +266,7 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
                 );
             }
             0
-        }
+        },
         ARCH_GET_GS => {
             let mut gs: u64 = 0;
             unsafe {
@@ -280,7 +282,7 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
                 let _ = copy_to_user(addr, &gs.to_ne_bytes());
             }
             0
-        }
+        },
         _ => -22,
     }
 }
@@ -290,18 +292,19 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
 #[no_mangle]
 pub extern "C" fn child_first_run_hook() {
     let pid = scheduler::current_pid();
-    if pid == 0 { return; }
+    if pid == 0 {
+        return;
+    }
 
-    let (tid_va, tid_val, fs_base) = scheduler::with_procs(|procs| {
-        match procs.iter_mut().find(|p| p.pid == pid) {
+    let (tid_va, tid_val, fs_base) =
+        scheduler::with_procs(|procs| match procs.iter_mut().find(|p| p.pid == pid) {
             Some(p) => {
                 let r = (p.child_tid_va, p.child_tid_val, p.ctx.fs_base);
                 p.child_tid_va = 0;
                 r
-            }
+            },
             None => (0, 0, 0),
-        }
-    });
+        });
 
     if tid_va != 0 {
         let _ = copy_to_user(tid_va, &tid_val.to_ne_bytes());
@@ -321,11 +324,11 @@ pub extern "C" fn child_first_run_hook() {
 }
 
 // ====================================================================
-// Public helpers re-exported for callers under the `crate::arch::x86_64::syscall`
-// path. The actual logic for these helpers historically lived inside
-// `proc::clone` / `proc::fork_syscall` as file-local `fn` items; the
-// versions below are minimal entry points that match the call sites in
-// `proc::exec` (and avoid the cross-module privacy issue).
+// Public helpers re-exported for callers under the
+// `crate::arch::x86_64::syscall` path. The actual logic for these helpers
+// historically lived inside `proc::clone` / `proc::fork_syscall` as file-local
+// `fn` items; the versions below are minimal entry points that match the call
+// sites in `proc::exec` (and avoid the cross-module privacy issue).
 // ====================================================================
 
 // Selector constants must match those used in proc::clone::push_syscall_frame.
@@ -344,19 +347,9 @@ const USER_SS_PUB: usize = 0x1b;
 /// `kstack_top` must point to the top of a 17×u64-or-larger kernel stack
 /// region that the caller currently owns.
 #[cfg(target_arch = "x86_64")]
-pub fn push_syscall_frame(
-    kstack_top: usize,
-    pc:         usize,
-    rflags:     usize,
-    user_sp:    usize,
-) {
+pub fn push_syscall_frame(kstack_top: usize, pc: usize, rflags: usize, user_sp: usize) {
     // SAFETY: requirement is documented on the function.
-    let frame = unsafe {
-        core::slice::from_raw_parts_mut(
-            (kstack_top - 17 * 8) as *mut usize,
-            17,
-        )
-    };
+    let frame = unsafe { core::slice::from_raw_parts_mut((kstack_top - 17 * 8) as *mut usize, 17) };
     frame.iter_mut().for_each(|x| *x = 0);
     frame[0] = USER_SS_PUB;
     frame[1] = if user_sp != 0 { user_sp } else { kstack_top };
@@ -373,18 +366,9 @@ pub fn push_syscall_frame(
 /// `kstack_top` must point to the same stack region used in the
 /// matching [`push_syscall_frame`] call.
 #[cfg(target_arch = "x86_64")]
-pub fn patch_syscall_frame(
-    kstack_top: usize,
-    pc:         usize,
-    user_sp:    usize,
-) {
+pub fn patch_syscall_frame(kstack_top: usize, pc: usize, user_sp: usize) {
     // SAFETY: see [`push_syscall_frame`].
-    let frame = unsafe {
-        core::slice::from_raw_parts_mut(
-            (kstack_top - 17 * 8) as *mut usize,
-            17,
-        )
-    };
+    let frame = unsafe { core::slice::from_raw_parts_mut((kstack_top - 17 * 8) as *mut usize, 17) };
     frame[1] = if user_sp != 0 { user_sp } else { kstack_top };
     frame[4] = pc;
 }

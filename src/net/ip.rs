@@ -10,23 +10,33 @@ pub const IP_HDR_MIN: usize = 20;
 
 // Protocol numbers
 pub const PROTO_ICMP: u8 = 1;
-pub const PROTO_TCP:  u8 = 6;
-pub const PROTO_UDP:  u8 = 17;
+pub const PROTO_TCP: u8 = 6;
+pub const PROTO_UDP: u8 = 17;
 
 /// Our IPv4 address (host u32, network byte order semantics).
-static OUR_IP:      Mutex<u32> = Mutex::new(0x0A00_0202); // 10.0.2.2 (qemu user-mode default)
-static GATEWAY_IP:  Mutex<u32> = Mutex::new(0x0A00_0202);
+static OUR_IP: Mutex<u32> = Mutex::new(0x0A00_0202); // 10.0.2.2 (qemu user-mode default)
+static GATEWAY_IP: Mutex<u32> = Mutex::new(0x0A00_0202);
 static SUBNET_MASK: Mutex<u32> = Mutex::new(0xFFFF_FF00);
 
 static ID_COUNTER: Mutex<u16> = Mutex::new(1);
 
-pub fn our_ip()           -> u32 { *OUR_IP.lock() }
-pub fn set_ip(ip: u32)          { *OUR_IP.lock()      = ip; }
-pub fn set_gw(gw: u32)          { *GATEWAY_IP.lock()  = gw; }
-pub fn set_mask(m: u32)         { *SUBNET_MASK.lock() = m; }
+pub fn our_ip() -> u32 {
+    *OUR_IP.lock()
+}
+pub fn set_ip(ip: u32) {
+    *OUR_IP.lock() = ip;
+}
+pub fn set_gw(gw: u32) {
+    *GATEWAY_IP.lock() = gw;
+}
+pub fn set_mask(m: u32) {
+    *SUBNET_MASK.lock() = m;
+}
 
 /// Alias for `our_ip()` — exposed under the name used by `fs/ioctl/net.rs`.
-pub fn get_ip() -> u32 { our_ip() }
+pub fn get_ip() -> u32 {
+    our_ip()
+}
 
 /// Returns the MAC address of the first initialised NIC, or zeros if none.
 pub fn get_mac() -> [u8; 6] {
@@ -73,29 +83,29 @@ pub fn send(dst_ip: u32, proto: u8, payload: &[u8]) {
     let id = next_id();
 
     let mut hdr = [0u8; IP_HDR_MIN];
-    hdr[0]  = 0x45; // version=4, IHL=5
-    hdr[1]  = 0;    // DSCP/ECN
-    hdr[2]  = (total_len >> 8) as u8;
-    hdr[3]  =  total_len       as u8;
-    hdr[4]  = (id >> 8) as u8;
-    hdr[5]  =  id       as u8;
-    hdr[6]  = 0x40; // DF bit set, no fragmentation
-    hdr[7]  = 0;
-    hdr[8]  = 64;   // TTL
-    hdr[9]  = proto;
+    hdr[0] = 0x45; // version=4, IHL=5
+    hdr[1] = 0; // DSCP/ECN
+    hdr[2] = (total_len >> 8) as u8;
+    hdr[3] = total_len as u8;
+    hdr[4] = (id >> 8) as u8;
+    hdr[5] = id as u8;
+    hdr[6] = 0x40; // DF bit set, no fragmentation
+    hdr[7] = 0;
+    hdr[8] = 64; // TTL
+    hdr[9] = proto;
     hdr[12..16].copy_from_slice(&our_ip().to_be_bytes());
     hdr[16..20].copy_from_slice(&dst_ip.to_be_bytes());
 
     let csum = checksum(&hdr);
     hdr[10] = (csum >> 8) as u8;
-    hdr[11] =  csum       as u8;
+    hdr[11] = csum as u8;
 
     let mut pkt = alloc::vec![0u8; IP_HDR_MIN + payload.len()];
     pkt[..IP_HDR_MIN].copy_from_slice(&hdr);
     pkt[IP_HDR_MIN..].copy_from_slice(payload);
 
     // Route: same subnet → direct; otherwise → gateway.
-    let mask     = *SUBNET_MASK.lock();
+    let mask = *SUBNET_MASK.lock();
     let next_hop = if dst_ip & mask == our_ip() & mask {
         dst_ip
     } else {
@@ -114,17 +124,25 @@ pub fn send(dst_ip: u32, proto: u8, payload: &[u8]) {
 
 /// Receive an IPv4 packet from the Ethernet layer.
 pub fn receive(pkt: &[u8]) {
-    if pkt.len() < IP_HDR_MIN { return; }
-    let ihl   = ((pkt[0] & 0x0F) * 4) as usize;
-    if pkt.len() < ihl { return; }
+    if pkt.len() < IP_HDR_MIN {
+        return;
+    }
+    let ihl = ((pkt[0] & 0x0F) * 4) as usize;
+    if pkt.len() < ihl {
+        return;
+    }
     let total = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
-    if pkt.len() < total { return; }
+    if pkt.len() < total {
+        return;
+    }
 
-    if checksum(&pkt[..ihl]) != 0 { return; }
+    if checksum(&pkt[..ihl]) != 0 {
+        return;
+    }
 
-    let proto   = pkt[9];
-    let src_ip  = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
-    let dst_ip  = u32::from_be_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+    let proto = pkt[9];
+    let src_ip = u32::from_be_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
+    let dst_ip = u32::from_be_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
     let payload = &pkt[ihl..total];
 
     let our = our_ip();
@@ -134,8 +152,8 @@ pub fn receive(pkt: &[u8]) {
 
     match proto {
         PROTO_ICMP => icmp::receive(src_ip, dst_ip, payload),
-        PROTO_TCP  => tcp::receive(src_ip, payload),
-        PROTO_UDP  => udp::receive(src_ip, payload),
-        _          => {}
+        PROTO_TCP => tcp::receive(src_ip, payload),
+        PROTO_UDP => udp::receive(src_ip, payload),
+        _ => {},
     }
 }

@@ -21,7 +21,12 @@ pub struct Plane {
 
 impl Plane {
     pub fn new(id: u32, plane_type: PlaneType, possible_crtcs: u32) -> Self {
-        Self { id, plane_type, possible_crtcs, fb_id: None }
+        Self {
+            id,
+            plane_type,
+            possible_crtcs,
+            fb_id: None,
+        }
     }
 
     pub fn attach_fb(&mut self, fb_id: u32) {

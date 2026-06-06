@@ -9,9 +9,18 @@ pub const SQ_ENTRIES: usize = 256;
 /// Number of CQE slots.  Typically 2× SQ to absorb bursts.
 pub const CQ_ENTRIES: usize = 512;
 
-const _: () = assert!(SQ_ENTRIES.is_power_of_two(), "SQ_ENTRIES must be a power of two");
-const _: () = assert!(CQ_ENTRIES.is_power_of_two(), "CQ_ENTRIES must be a power of two");
-const _: () = assert!(CQ_ENTRIES >= SQ_ENTRIES, "CQ must be at least as large as SQ");
+const _: () = assert!(
+    SQ_ENTRIES.is_power_of_two(),
+    "SQ_ENTRIES must be a power of two"
+);
+const _: () = assert!(
+    CQ_ENTRIES.is_power_of_two(),
+    "CQ_ENTRIES must be a power of two"
+);
+const _: () = assert!(
+    CQ_ENTRIES >= SQ_ENTRIES,
+    "CQ must be at least as large as SQ"
+);
 
 /// Lightweight wrapper that enforces the power-of-two masking contract and
 /// tracks available/used capacity without touching the atomics directly.
@@ -26,7 +35,10 @@ pub struct RingBuffer {
 impl RingBuffer {
     pub const fn new(capacity: usize) -> Self {
         // capacity must be a power of two — enforced by const assertions above.
-        RingBuffer { capacity, mask: capacity - 1 }
+        RingBuffer {
+            capacity,
+            mask: capacity - 1,
+        }
     }
 
     /// Map a raw index to a slot index (wraps around).

@@ -199,7 +199,7 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
     use alloc::sync::Arc;
 
     match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC => {}
+        CLOCK_REALTIME | CLOCK_MONOTONIC => {},
         _ => return -22, // EINVAL
     }
 
@@ -351,7 +351,7 @@ pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
             } else {
                 0
             }
-        }
+        },
     }
 }
 

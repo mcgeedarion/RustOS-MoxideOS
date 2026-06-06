@@ -30,12 +30,12 @@
 //! creates a circular wait.  This matches early-Linux behaviour.
 
 extern crate alloc;
-use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::proc::scheduler::{current_pid, with_proc};
 use crate::proc::rlimit::{RLIMIT_LOCKS, RLIM_INFINITY};
+use crate::proc::scheduler::{current_pid, with_proc};
 
 // flock(2) operations
 pub const LOCK_SH: i32 = 1;
@@ -49,30 +49,30 @@ pub const F_WRLCK: i16 = 1;
 pub const F_UNLCK: i16 = 2;
 
 // fcntl(2) commands (only the lock-related subset)
-pub const F_GETLK:  i32 = 5;
-pub const F_SETLK:  i32 = 6;
+pub const F_GETLK: i32 = 5;
+pub const F_SETLK: i32 = 6;
 pub const F_SETLKW: i32 = 7;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Flock {
-    pub l_type:   i16,
+    pub l_type: i16,
     pub l_whence: i16,
-    pub _pad:     u32,
-    pub l_start:  i64,
-    pub l_len:    i64,
-    pub l_pid:    u32,
+    pub _pad: u32,
+    pub l_start: i64,
+    pub l_len: i64,
+    pub l_pid: u32,
 }
 
 #[derive(Clone, Debug)]
 struct LockEntry {
     /// Owner PID.
-    pid:    usize,
+    pid: usize,
     /// `F_RDLCK` or `F_WRLCK`.
-    ltype:  i16,
+    ltype: i16,
     /// Byte range: [start, end).  For `flock` the range is [0, u64::MAX).
-    start:  u64,
-    end:    u64,
+    start: u64,
+    end: u64,
     /// True if this came from `flock(2)` (whole-file BSD lock).
     is_bsd: bool,
 }
@@ -86,17 +86,26 @@ static LOCK_TABLE: Mutex<BTreeMap<u64, InodeLocks>> = Mutex::new(BTreeMap::new()
 /// Returns the current lock count held by `pid` across all inodes.
 fn count_locks_for(pid: usize) -> usize {
     let tbl = LOCK_TABLE.lock();
-    tbl.values().flat_map(|v| v.iter()).filter(|e| e.pid == pid).count()
+    tbl.values()
+        .flat_map(|v| v.iter())
+        .filter(|e| e.pid == pid)
+        .count()
 }
 
 /// Check whether adding one more lock for `pid` would exceed the soft
 /// `RLIMIT_LOCKS`.  Returns -ENOLCK (-37) if exceeded, 0 otherwise.
 fn check_lock_limit(pid: usize) -> isize {
-    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_LOCKS))
-        .unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
-    if soft == RLIM_INFINITY { return 0; }
+    let (soft, _) =
+        with_proc(pid, |p| p.rlimits.get(RLIMIT_LOCKS)).unwrap_or((RLIM_INFINITY, RLIM_INFINITY));
+    if soft == RLIM_INFINITY {
+        return 0;
+    }
     let current = count_locks_for(pid) as u64;
-    if current >= soft { -37 } else { 0 } // ENOLCK
+    if current >= soft {
+        -37
+    } else {
+        0
+    } // ENOLCK
 }
 
 /// True if `a` and `b` overlap in byte range.
@@ -107,10 +116,16 @@ fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 /// True if `entry` (held by someone else) conflicts with a new lock of `ltype`
 /// on range `[start, end)` by `pid`.
 fn conflicts(entry: &LockEntry, pid: usize, ltype: i16, start: u64, end: u64) -> bool {
-    if entry.pid == pid { return false; } // same owner never conflicts
-    if !ranges_overlap(entry.start, entry.end, start, end) { return false; }
+    if entry.pid == pid {
+        return false;
+    } // same owner never conflicts
+    if !ranges_overlap(entry.start, entry.end, start, end) {
+        return false;
+    }
     // Two shared locks never conflict.
-    if entry.ltype == F_RDLCK && ltype == F_RDLCK { return false; }
+    if entry.ltype == F_RDLCK && ltype == F_RDLCK {
+        return false;
+    }
     true
 }
 
@@ -118,9 +133,9 @@ fn conflicts(entry: &LockEntry, pid: usize, ltype: i16, start: u64, end: u64) ->
 ///
 /// `inode_id` must be resolved by the caller from the fd before calling here.
 pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
-    let pid    = current_pid();
-    let nb     = operation & LOCK_NB != 0;
-    let op     = operation & !LOCK_NB;
+    let pid = current_pid();
+    let nb = operation & LOCK_NB != 0;
+    let op = operation & !LOCK_NB;
 
     if op == LOCK_UN {
         // Release any BSD lock held by this pid on this inode.
@@ -147,14 +162,18 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
             if !had {
                 drop(tbl);
                 let rc = check_lock_limit(pid);
-                if rc < 0 { return rc; }
+                if rc < 0 {
+                    return rc;
+                }
             } else {
                 list.retain(|e| !(e.pid == pid && e.is_bsd));
             }
         } else {
             drop(tbl);
             let rc = check_lock_limit(pid);
-            if rc < 0 { return rc; }
+            if rc < 0 {
+                return rc;
+            }
         }
     }
 
@@ -163,7 +182,13 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
         let list = tbl.entry(inode_id).or_insert_with(Vec::new);
         let blocked = list.iter().any(|e| conflicts(e, pid, ltype, 0, u64::MAX));
         if !blocked {
-            list.push(LockEntry { pid, ltype, start: 0, end: u64::MAX, is_bsd: true });
+            list.push(LockEntry {
+                pid,
+                ltype,
+                start: 0,
+                end: u64::MAX,
+                is_bsd: true,
+            });
             return 0;
         }
         if nb {
@@ -178,11 +203,7 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
 ///
 /// `inode_id` must be resolved by the caller.  `flock_uptr` is a userspace
 /// pointer to `struct flock`.
-pub fn sys_fcntl_lock(
-    inode_id:   u64,
-    cmd:        i32,
-    flock_uptr: usize,
-) -> isize {
+pub fn sys_fcntl_lock(inode_id: u64, cmd: i32, flock_uptr: usize) -> isize {
     use crate::uaccess::{copy_from_user, copy_to_user};
     let pid = current_pid();
 
@@ -200,11 +221,11 @@ pub fn sys_fcntl_lock(
             for e in list.iter() {
                 if conflicts(e, pid, ltype, start, end) {
                     let mut out = fl;
-                    out.l_type   = e.ltype;
+                    out.l_type = e.ltype;
                     out.l_whence = 0; // SEEK_SET
-                    out.l_start  = e.start as i64;
-                    out.l_len    = (e.end - e.start) as i64;
-                    out.l_pid    = e.pid as u32;
+                    out.l_start = e.start as i64;
+                    out.l_len = (e.end - e.start) as i64;
+                    out.l_pid = e.pid as u32;
                     let _ = copy_to_user(flock_uptr as *mut Flock, &out);
                     return 0;
                 }
@@ -219,9 +240,7 @@ pub fn sys_fcntl_lock(
     if ltype == F_UNLCK {
         let mut tbl = LOCK_TABLE.lock();
         if let Some(list) = tbl.get_mut(&inode_id) {
-            list.retain(|e| {
-                !(e.pid == pid && ranges_overlap(e.start, e.end, start, end))
-            });
+            list.retain(|e| !(e.pid == pid && ranges_overlap(e.start, e.end, start, end)));
         }
         return 0;
     }
@@ -232,12 +251,18 @@ pub fn sys_fcntl_lock(
     {
         let has_existing = {
             let tbl = LOCK_TABLE.lock();
-            tbl.get(&inode_id).map(|l| l.iter().any(|e| e.pid == pid
-                && ranges_overlap(e.start, e.end, start, end))).unwrap_or(false)
+            tbl.get(&inode_id)
+                .map(|l| {
+                    l.iter()
+                        .any(|e| e.pid == pid && ranges_overlap(e.start, e.end, start, end))
+                })
+                .unwrap_or(false)
         };
         if !has_existing {
             let rc = check_lock_limit(pid);
-            if rc < 0 { return rc; }
+            if rc < 0 {
+                return rc;
+            }
         }
     }
 
@@ -249,7 +274,13 @@ pub fn sys_fcntl_lock(
         if !blocked {
             // Remove any existing lock from this pid that overlaps, then insert.
             list.retain(|e| !(e.pid == pid && ranges_overlap(e.start, e.end, start, end)));
-            list.push(LockEntry { pid, ltype, start, end, is_bsd: false });
+            list.push(LockEntry {
+                pid,
+                ltype,
+                start,
+                end,
+                is_bsd: false,
+            });
             return 0;
         }
         if nb {

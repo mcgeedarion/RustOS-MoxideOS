@@ -71,7 +71,10 @@ impl Regions {
 
     /// Total amount of usable RAM (in bytes).
     pub fn total_usable(&self) -> u64 {
-        self.iter().filter(|r| r.is_usable()).map(|r| r.length).sum()
+        self.iter()
+            .filter(|r| r.is_usable())
+            .map(|r| r.length)
+            .sum()
     }
 
     /// Convert into the owned Vec.

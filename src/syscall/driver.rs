@@ -18,9 +18,9 @@
 //! via `validate_user_ptr` before any dereference.
 
 use crate::{
-    mm::{PhysAddr, VirtAddr, dma_alloc_coherent},
-    proc::current_process,
     kernel::capabilities::Capability,
+    mm::{dma_alloc_coherent, PhysAddr, VirtAddr},
+    proc::current_process,
 };
 use scheme_api::{DriverHandle, IpcEndpoint};
 
@@ -31,13 +31,13 @@ pub enum DriverSysError {
     /// Caller does not hold `CAP_DRIVER`.
     PermissionDenied = -1,
     /// The requested PCI BDF does not exist or is already owned.
-    NxDevice         = -2,
+    NxDevice = -2,
     /// DMA allocation failed (out of physically contiguous memory).
-    NoMem            = -3,
+    NoMem = -3,
     /// `irq` is out of range or already subscribed by another process.
-    InvalidIrq       = -4,
+    InvalidIrq = -4,
     /// Argument pointer is not a valid userspace address.
-    BadAddress       = -14,
+    BadAddress = -14,
 }
 
 /// Claim ownership of a PCI device identified by its BDF (Bus/Device/Function)
@@ -46,10 +46,10 @@ pub enum DriverSysError {
 /// On success the kernel:
 /// 1. Verifies the calling process holds `CAP_DRIVER`.
 /// 2. Marks the device as owned by this process in the PCI device table.
-/// 3. Maps the device's MMIO BARs read/write into the calling process's
-///    address space.
-/// 4. Returns a `DriverHandle` that authorises subsequent DMA and IRQ
-///    syscalls for this device.
+/// 3. Maps the device's MMIO BARs read/write into the calling process's address
+///    space.
+/// 4. Returns a `DriverHandle` that authorises subsequent DMA and IRQ syscalls
+///    for this device.
 ///
 /// # Arguments
 /// - `bdf`       — PCI Bus/Device/Function (24-bit encoded).
@@ -63,11 +63,11 @@ pub fn sys_driver_bind(bdf: u32, cap_flags: u32) -> Result<DriverHandle, DriverS
     }
 
     // Locate the device in the PCI device tree.
-    let pci_dev = crate::drivers::pcie::find_device_by_bdf(bdf)
-        .ok_or(DriverSysError::NxDevice)?;
+    let pci_dev = crate::drivers::pcie::find_device_by_bdf(bdf).ok_or(DriverSysError::NxDevice)?;
 
     // Atomically claim ownership; fails if another process already owns it.
-    pci_dev.try_claim(proc.pid())
+    pci_dev
+        .try_claim(proc.pid())
         .map_err(|_| DriverSysError::NxDevice)?;
 
     // Map each BAR into the caller's address space.
@@ -80,8 +80,12 @@ pub fn sys_driver_bind(bdf: u32, cap_flags: u32) -> Result<DriverHandle, DriverS
 
     // Mint and return a driver handle bound to (pid, bdf).
     let handle = DriverHandle(((proc.pid() as u64) << 32) | (bdf as u64));
-    log::debug!("[driver] pid {} bound to BDF {:06x} handle={:?}\n",
-                proc.pid(), bdf, handle);
+    log::debug!(
+        "[driver] pid {} bound to BDF {:06x} handle={:?}\n",
+        proc.pid(),
+        bdf,
+        handle
+    );
     Ok(handle)
 }
 
@@ -95,16 +99,16 @@ pub fn sys_driver_bind(bdf: u32, cap_flags: u32) -> Result<DriverHandle, DriverS
 /// # Arguments
 /// - `handle` — `DriverHandle` from a prior `sys_driver_bind` call.
 /// - `size`   — number of bytes to allocate (rounded up to page size).
-/// - `align`  — physical alignment in bytes (must be a power of two,
-///              minimum 4096).
+/// - `align`  — physical alignment in bytes (must be a power of two, minimum
+///   4096).
 ///
 /// # Safety note for callers
 /// The returned physical address aliases the returned virtual mapping.
 /// Do **not** also map it via `mmap`; use only the returned virt pointer.
 pub fn sys_dma_alloc(
     handle: DriverHandle,
-    size:   usize,
-    align:  usize,
+    size: usize,
+    align: usize,
 ) -> Result<(VirtAddr, PhysAddr), DriverSysError> {
     let proc = current_process();
 
@@ -119,11 +123,11 @@ pub fn sys_dma_alloc(
     }
 
     // Allocate physically contiguous pages.
-    let (phys, virt_kernel) = dma_alloc_coherent(size, align)
-        .ok_or(DriverSysError::NoMem)?;
+    let (phys, virt_kernel) = dma_alloc_coherent(size, align).ok_or(DriverSysError::NoMem)?;
 
     // Map the pages into the user process's address space.
-    let virt_user = proc.vm_map_phys(phys, size, /* rw */ true)
+    let virt_user = proc
+        .vm_map_phys(phys, size, /* rw */ true)
         .map_err(|_| DriverSysError::NoMem)?;
 
     // Zero the buffer before handing it to userspace.
@@ -131,8 +135,13 @@ pub fn sys_dma_alloc(
         core::ptr::write_bytes(virt_kernel.as_mut_ptr::<u8>(), 0, size);
     }
 
-    log::debug!("[driver] DMA alloc pid {} size=0x{:x} phys={:?} virt={:?}\n",
-                proc.pid(), size, phys, virt_user);
+    log::debug!(
+        "[driver] DMA alloc pid {} size=0x{:x} phys={:?} virt={:?}\n",
+        proc.pid(),
+        size,
+        phys,
+        virt_user
+    );
     Ok((virt_user, phys))
 }
 
@@ -150,8 +159,8 @@ pub fn sys_dma_alloc(
 /// - `irq`      — IRQ line to subscribe (MSI vector or legacy IRQ number).
 /// - `endpoint` — `IpcEndpoint` that will receive `IrqNotification` messages.
 pub fn sys_irq_subscribe(
-    handle:   DriverHandle,
-    irq:      u32,
+    handle: DriverHandle,
+    irq: u32,
     endpoint: IpcEndpoint,
 ) -> Result<(), DriverSysError> {
     let proc = current_process();
@@ -165,7 +174,11 @@ pub fn sys_irq_subscribe(
     crate::kernel::irq::subscribe_userspace(irq, endpoint)
         .map_err(|_| DriverSysError::InvalidIrq)?;
 
-    log::info!("[driver] pid {} subscribed IRQ {} → endpoint {:?}\n",
-               proc.pid(), irq, endpoint);
+    log::info!(
+        "[driver] pid {} subscribed IRQ {} → endpoint {:?}\n",
+        proc.pid(),
+        irq,
+        endpoint
+    );
     Ok(())
 }

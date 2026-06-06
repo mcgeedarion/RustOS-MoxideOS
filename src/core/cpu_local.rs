@@ -17,11 +17,11 @@
 //!
 //! # Safety contract
 //!
-//! * `CpuLocal::get()` is `unsafe` — the caller must guarantee that
-//!   preemption is disabled (interrupts off or a preemption guard held)
-//!   for the duration of the access, or that `T` is `Sync + Copy`.
-//! * The per-CPU pointer **must** be initialised by SMP code before any
-//!   `get()` call.  Calling `get()` before init is undefined behaviour.
+//! * `CpuLocal::get()` is `unsafe` — the caller must guarantee that preemption
+//!   is disabled (interrupts off or a preemption guard held) for the duration
+//!   of the access, or that `T` is `Sync + Copy`.
+//! * The per-CPU pointer **must** be initialised by SMP code before any `get()`
+//!   call.  Calling `get()` before init is undefined behaviour.
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -36,11 +36,11 @@ pub const MAX_CPU_LOCAL_SLOTS: usize = 64;
 #[repr(C)]
 pub struct PerCpuBlock {
     /// Self-pointer (offset 0) — x86_64 GS-relative `mov rax, gs:[0]` idiom.
-    pub self_ptr:  *mut PerCpuBlock,
+    pub self_ptr: *mut PerCpuBlock,
     /// HART / APIC identifier for this CPU.
-    pub cpu_id:    u32,
+    pub cpu_id: u32,
     /// Is this CPU currently in an interrupt handler?
-    pub in_irq:    u32,
+    pub in_irq: u32,
     /// Opaque data slots for subsystems (keyed by `CpuLocalKey`).
     slots: [UnsafeCell<usize>; MAX_CPU_LOCAL_SLOTS],
 }
@@ -116,7 +116,10 @@ unsafe impl<T: Copy + 'static> Sync for CpuLocal<T> {}
 impl<T: Copy + 'static> CpuLocal<T> {
     /// Create a new accessor for `key`.
     pub const fn new(key: CpuLocalKey) -> Self {
-        Self { key, _marker: PhantomData }
+        Self {
+            key,
+            _marker: PhantomData,
+        }
     }
 
     /// Return the per-CPU value for the **current** CPU.

@@ -9,14 +9,14 @@
 //! ## What we do here
 //!   1. Print a banner via UEFI SimpleTextOutput.
 //!   2. Capture the GOP framebuffer (graceful fallback if not available).
-//!   3. Locate the ACPI 2.0 RSDP from the EFI configuration table.
-//!      On DT-only boards (Raspberry Pi, older SBCs) this will be 0.
-//!   4. Locate the initrd:
-//!        a. EFI_INITRD_MEDIA_GUID LoadFile2 protocol  (systemd-boot / GRUB2)
-//!        b. OVMF/EDK2 vendor config-table fallback    (QEMU -initrd flag)
-//!   5. Obtain the EFI memory map and call ExitBootServices.
-//!      ExitBootServices is retried once on EFI_INVALID_PARAMETER per
-//!      UEFI spec §7.4.6 (required for AMI/Insyde firmware compatibility).
+//!   3. Locate the ACPI 2.0 RSDP from the EFI configuration table. On DT-only
+//!      boards (Raspberry Pi, older SBCs) this will be 0.
+//!   4. Locate the initrd: a. EFI_INITRD_MEDIA_GUID LoadFile2 protocol
+//!      (systemd-boot / GRUB2) b. OVMF/EDK2 vendor config-table fallback (QEMU
+//!      -initrd flag)
+//!   5. Obtain the EFI memory map and call ExitBootServices. ExitBootServices
+//!      is retried once on EFI_INVALID_PARAMETER per UEFI spec §7.4.6 (required
+//!      for AMI/Insyde firmware compatibility).
 //!   6. Switch to the kernel boot stack and tail-call kernel_main().
 //!
 //! ## Memory layout after ExitBootServices
@@ -195,14 +195,20 @@ pub unsafe extern "efiapi" fn efi_main(
     let bs_base = st.boot_services as usize;
 
     // 1. Banner — identifies this as the SECONDARY (aarch64) boot target.
-    efi_print(st.con_out, "RustOS [SECONDARY] aarch64 booting via UEFI...\r\n");
+    efi_print(
+        st.con_out,
+        "RustOS [SECONDARY] aarch64 booting via UEFI...\r\n",
+    );
 
-    // 2. Capture GOP framebuffer — graceful fallback if firmware has no GOP.
-    //    On QEMU virt aarch64 with -device virtio-gpu-pci this will succeed.
+    // 2. Capture GOP framebuffer — graceful fallback if firmware has no GOP. On
+    //    QEMU virt aarch64 with -device virtio-gpu-pci this will succeed.
     let gop_ok =
         crate::drivers::gop::capture_from_boot_services(st.boot_services as *mut core::ffi::c_void);
     if !gop_ok {
-        efi_print(st.con_out, "rustos: GOP not available — serial-only mode\r\n");
+        efi_print(
+            st.con_out,
+            "rustos: GOP not available — serial-only mode\r\n",
+        );
     }
 
     // 3 & 4. Walk EFI configuration table for ACPI RSDP and OVMF initrd.
@@ -252,8 +258,13 @@ pub unsafe extern "efiapi" fn efi_main(
     let mut map_buf: *mut u8 = core::ptr::null_mut();
     let alloc_status = (bs.allocate_pool)(EFI_LOADER_DATA, map_size, &mut map_buf);
     if alloc_status != EFI_SUCCESS || map_buf.is_null() {
-        efi_print(st.con_out, "rustos: FATAL: AllocatePool for memory map failed\r\n");
-        loop { asm!("wfi", options(nostack, nomem)); }
+        efi_print(
+            st.con_out,
+            "rustos: FATAL: AllocatePool for memory map failed\r\n",
+        );
+        loop {
+            asm!("wfi", options(nostack, nomem));
+        }
     }
 
     let status = (bs.get_memory_map)(
@@ -265,10 +276,12 @@ pub unsafe extern "efiapi" fn efi_main(
     );
     if status != EFI_SUCCESS {
         efi_print(st.con_out, "rustos: FATAL: GetMemoryMap failed\r\n");
-        loop { asm!("wfi", options(nostack, nomem)); }
+        loop {
+            asm!("wfi", options(nostack, nomem));
+        }
     }
 
-    EFI_MAP_PTR  = map_buf as usize;
+    EFI_MAP_PTR = map_buf as usize;
     EFI_MAP_SIZE = map_size;
     EFI_DESC_SIZE = desc_size;
     BOOT_INFO = BootInfo {
@@ -296,7 +309,7 @@ pub unsafe extern "efiapi" fn efi_main(
             &mut retry_desc_ver,
         );
         if remap_status == EFI_SUCCESS {
-            EFI_MAP_SIZE  = retry_map_size;
+            EFI_MAP_SIZE = retry_map_size;
             EFI_DESC_SIZE = retry_desc_size;
             BOOT_INFO.efi_memory_map =
                 EfiMemoryMapInfo::new(EFI_MAP_PTR, EFI_MAP_SIZE, EFI_DESC_SIZE);
@@ -305,7 +318,9 @@ pub unsafe extern "efiapi" fn efi_main(
     }
 
     if exit_status != EFI_SUCCESS {
-        loop { asm!("wfi", options(nostack, nomem)); }
+        loop {
+            asm!("wfi", options(nostack, nomem));
+        }
     }
 
     // 6. Switch to kernel boot stack and tail-call kernel_main.

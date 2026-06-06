@@ -14,45 +14,45 @@
 //!   pivot_root(2)      — stub (swaps root and put_old)
 
 extern crate alloc;
-use alloc::{string::String, vec::Vec, sync::Arc};
-use spin::Mutex;
 use crate::security::ns::alloc_ns_id;
+use alloc::{string::String, sync::Arc, vec::Vec};
+use spin::Mutex;
 
 /// A single mount-point record.
 #[derive(Clone, Debug)]
 pub struct MountEntry {
     /// Device string ("devtmpfs", "/dev/sda1", etc.)
-    pub device:    String,
+    pub device: String,
     /// Absolute mountpoint path.
-    pub mountpt:   String,
+    pub mountpt: String,
     /// Filesystem type string.
-    pub fstype:    String,
+    pub fstype: String,
     /// Mount flags (MS_RDONLY etc. matching Linux UAPI).
-    pub flags:     u64,
+    pub flags: u64,
     /// Propagation peer group id (0 = private).
-    pub peer_grp:  u32,
+    pub peer_grp: u32,
 }
 
 /// MS_* mount flag constants (UAPI).
 pub mod ms {
-    pub const RDONLY:     u64 = 1;
-    pub const NOSUID:     u64 = 2;
-    pub const NODEV:      u64 = 4;
-    pub const NOEXEC:     u64 = 8;
-    pub const SYNCHRONOUS:u64 = 16;
-    pub const REMOUNT:    u64 = 32;
-    pub const MANDLOCK:   u64 = 64;
-    pub const NOATIME:    u64 = 1024;
-    pub const BIND:       u64 = 4096;
-    pub const SHARED:     u64 = 1 << 20;
-    pub const PRIVATE:    u64 = 1 << 18;
-    pub const SLAVE:      u64 = 1 << 19;
+    pub const RDONLY: u64 = 1;
+    pub const NOSUID: u64 = 2;
+    pub const NODEV: u64 = 4;
+    pub const NOEXEC: u64 = 8;
+    pub const SYNCHRONOUS: u64 = 16;
+    pub const REMOUNT: u64 = 32;
+    pub const MANDLOCK: u64 = 64;
+    pub const NOATIME: u64 = 1024;
+    pub const BIND: u64 = 4096;
+    pub const SHARED: u64 = 1 << 20;
+    pub const PRIVATE: u64 = 1 << 18;
+    pub const SLAVE: u64 = 1 << 19;
     pub const UNBINDABLE: u64 = 1 << 17;
 }
 
 pub struct MntNs {
-    pub id:     u64,
-    mounts:     Mutex<Vec<MountEntry>>,
+    pub id: u64,
+    mounts: Mutex<Vec<MountEntry>>,
 }
 
 impl MntNs {
@@ -60,26 +60,35 @@ impl MntNs {
     pub fn new_init() -> Self {
         let mut mounts = Vec::new();
         mounts.push(MountEntry {
-            device:   String::from("rootfs"),
-            mountpt:  String::from("/"),
-            fstype:   String::from("rootfs"),
-            flags:    0,
+            device: String::from("rootfs"),
+            mountpt: String::from("/"),
+            fstype: String::from("rootfs"),
+            flags: 0,
             peer_grp: 1,
         });
-        MntNs { id: alloc_ns_id(), mounts: Mutex::new(mounts) }
+        MntNs {
+            id: alloc_ns_id(),
+            mounts: Mutex::new(mounts),
+        }
     }
 
     /// Shallow clone of `parent`'s mount list (CLONE_NEWNS semantics).
     pub fn copy_of(parent: &Arc<MntNs>) -> Self {
         let list = parent.mounts.lock().clone();
-        MntNs { id: alloc_ns_id(), mounts: Mutex::new(list) }
+        MntNs {
+            id: alloc_ns_id(),
+            mounts: Mutex::new(list),
+        }
     }
 
     /// Add a mount entry (mount(2)).
     /// Returns EBUSY if `mountpt` is already occupied and REMOUNT not set.
     pub fn mount(
         &self,
-        device: String, mountpt: String, fstype: String, flags: u64,
+        device: String,
+        mountpt: String,
+        fstype: String,
+        flags: u64,
     ) -> Result<(), isize> {
         let mut list = self.mounts.lock();
         if flags & ms::REMOUNT != 0 {
@@ -89,18 +98,30 @@ impl MntNs {
             }
             return Err(-2); // ENOENT
         }
-        if list.iter().any(|e| e.mountpt == mountpt) { return Err(-16); } // EBUSY
-        list.push(MountEntry { device, mountpt, fstype, flags, peer_grp: 0 });
+        if list.iter().any(|e| e.mountpt == mountpt) {
+            return Err(-16);
+        } // EBUSY
+        list.push(MountEntry {
+            device,
+            mountpt,
+            fstype,
+            flags,
+            peer_grp: 0,
+        });
         Ok(())
     }
 
     /// Remove a mount entry (umount2(2)).
     pub fn umount(&self, mountpt: &str, _flags: u64) -> Result<(), isize> {
         let mut list = self.mounts.lock();
-        let pos = list.iter().position(|e| e.mountpt == mountpt)
+        let pos = list
+            .iter()
+            .position(|e| e.mountpt == mountpt)
             .ok_or(-22isize)?; // EINVAL
-        // Refuse to unmount root.
-        if list[pos].mountpt == "/" { return Err(-16); } // EBUSY
+                               // Refuse to unmount root.
+        if list[pos].mountpt == "/" {
+            return Err(-16);
+        } // EBUSY
         list.remove(pos);
         Ok(())
     }
@@ -113,11 +134,13 @@ impl MntNs {
     /// pivot_root stub: swap root and put_old mountpoints.
     pub fn pivot_root(&self, new_root: &str, put_old: &str) -> Result<(), isize> {
         let mut list = self.mounts.lock();
-        let nr = list.iter_mut().find(|e| e.mountpt == new_root)
+        let nr = list
+            .iter_mut()
+            .find(|e| e.mountpt == new_root)
             .ok_or(-2isize)?;
         let new_device = nr.device.clone();
         let new_fstype = nr.fstype.clone();
-        let new_flags  = nr.flags;
+        let new_flags = nr.flags;
         // Move old root to put_old.
         if let Some(old) = list.iter_mut().find(|e| e.mountpt == "/") {
             old.mountpt = String::from(put_old);

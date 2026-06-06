@@ -10,30 +10,30 @@
 //!   created in ns A cannot be used by a process in ns B.
 //!
 //! ## Integration points
-//! * `net::socket::sys_socket()` should call `current_net_ns()` and store
-//!   the result in the socket object.
+//! * `net::socket::sys_socket()` should call `current_net_ns()` and store the
+//!   result in the socket object.
 //! * Every socket syscall (send/recv/connect/bind/…) should call
-//!   `check_socket_ns(sock.net_ns, current_net_ns())` and return `-EACCES`
-//!   on mismatch.
+//!   `check_socket_ns(sock.net_ns, current_net_ns())` and return `-EACCES` on
+//!   mismatch.
 //! * procfs renders `/proc/net/dev` per net-ns via `list_ifaces(ns)`.
 
 extern crate alloc;
+use crate::proc::namespace::{NsId, INIT_NS};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::proc::namespace::{NsId, INIT_NS};
 
 #[derive(Clone, Debug)]
 pub struct NetIface {
     /// Interface name ("lo", "eth0", "veth0", …)
-    pub name:    String,
+    pub name: String,
     /// IPv4 address in network byte order (0 = none assigned)
-    pub ipv4:    u32,
+    pub ipv4: u32,
     /// IPv4 prefix length (e.g. 8 for 127.0.0.1/8)
     pub prefix4: u8,
     /// Whether the interface is up
-    pub up:      bool,
+    pub up: bool,
     /// Loopback flag
     pub loopback: bool,
 }
@@ -41,10 +41,10 @@ pub struct NetIface {
 impl NetIface {
     fn loopback() -> Self {
         NetIface {
-            name:     "lo".to_string(),
-            ipv4:     0x7f00_0001u32.to_be(), // 127.0.0.1 in network byte order
-            prefix4:  8,
-            up:       true,
+            name: "lo".to_string(),
+            ipv4: 0x7f00_0001u32.to_be(), // 127.0.0.1 in network byte order
+            prefix4: 8,
+            up: true,
             loopback: true,
         }
     }
@@ -56,7 +56,9 @@ struct NetNs {
 
 impl NetNs {
     fn new_with_loopback() -> Self {
-        NetNs { ifaces: alloc::vec![NetIface::loopback()] }
+        NetNs {
+            ifaces: alloc::vec![NetIface::loopback()],
+        }
     }
 
     fn add(&mut self, iface: NetIface) {
@@ -82,14 +84,22 @@ struct NetNsTable {
 }
 
 impl NetNsTable {
-    const fn new() -> Self { NetNsTable { entries: BTreeMap::new() } }
+    const fn new() -> Self {
+        NetNsTable {
+            entries: BTreeMap::new(),
+        }
+    }
 
     fn ensure(&mut self, ns: NsId) {
-        self.entries.entry(ns).or_insert_with(NetNs::new_with_loopback);
+        self.entries
+            .entry(ns)
+            .or_insert_with(NetNs::new_with_loopback);
     }
 
     fn get_mut(&mut self, ns: NsId) -> &mut NetNs {
-        self.entries.entry(ns).or_insert_with(NetNs::new_with_loopback)
+        self.entries
+            .entry(ns)
+            .or_insert_with(NetNs::new_with_loopback)
     }
 
     fn get(&self, ns: NsId) -> Option<&NetNs> {
@@ -119,15 +129,16 @@ pub fn create_net_ns(ns_id: NsId) {
 /// Called from `exit::ns_exit` after confirming no other live process shares
 /// the namespace.
 pub fn destroy_net_ns(ns_id: NsId) {
-    if ns_id == INIT_NS { return; }
+    if ns_id == INIT_NS {
+        return;
+    }
     NET_NS_TABLE.lock().entries.remove(&ns_id);
 }
 
 /// Return the current process's net namespace id.
 pub fn current_net_ns() -> NsId {
     let pid = crate::proc::scheduler::current_pid();
-    crate::proc::scheduler::with_proc(pid, |p| p.ns.net)
-        .unwrap_or(INIT_NS)
+    crate::proc::scheduler::with_proc(pid, |p| p.ns.net).unwrap_or(INIT_NS)
 }
 
 /// Add or replace a network interface in a net-ns.
@@ -145,7 +156,7 @@ pub fn net_ns_list_ifaces(ns: NsId) -> Vec<NetIface> {
     let tbl = NET_NS_TABLE.lock();
     match tbl.get(ns) {
         Some(n) => n.list(),
-        None    => alloc::vec![NetIface::loopback()],
+        None => alloc::vec![NetIface::loopback()],
     }
 }
 
@@ -172,17 +183,26 @@ pub fn move_iface(src_ns: NsId, dst_ns: NsId, name: &str) -> Result<(), isize> {
     let mut tbl = NET_NS_TABLE.lock();
     // find and clone the iface from src
     let iface = {
-        let src = tbl.entries.entry(src_ns).or_insert_with(NetNs::new_with_loopback);
+        let src = tbl
+            .entries
+            .entry(src_ns)
+            .or_insert_with(NetNs::new_with_loopback);
         match src.ifaces.iter().find(|i| i.name == name) {
             Some(i) => i.clone(),
-            None    => return Err(-19), // ENODEV
+            None => return Err(-19), // ENODEV
         }
     };
     // remove from src (loopback is protected)
     if !iface.loopback {
-        tbl.entries.entry(src_ns).or_insert_with(NetNs::new_with_loopback).remove(name);
+        tbl.entries
+            .entry(src_ns)
+            .or_insert_with(NetNs::new_with_loopback)
+            .remove(name);
     }
     // add to dst
-    tbl.entries.entry(dst_ns).or_insert_with(NetNs::new_with_loopback).add(iface);
+    tbl.entries
+        .entry(dst_ns)
+        .or_insert_with(NetNs::new_with_loopback)
+        .add(iface);
     Ok(())
 }

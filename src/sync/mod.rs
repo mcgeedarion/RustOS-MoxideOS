@@ -17,10 +17,10 @@
 
 pub mod futex;
 pub mod mutex;
+pub mod poll_source;
 pub mod spinlock;
 pub mod wait_queue;
-pub mod poll_source;
 
-pub use wait_queue::{WaitQueue, WakeReason, CancellationToken, CancelReason, ReadyMask};
-pub use poll_source::{PollSource, wait_on, wait_any};
 pub use mutex::Mutex;
+pub use poll_source::{wait_any, wait_on, PollSource};
+pub use wait_queue::{CancelReason, CancellationToken, ReadyMask, WaitQueue, WakeReason};

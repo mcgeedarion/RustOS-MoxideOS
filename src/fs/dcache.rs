@@ -10,11 +10,7 @@
 //! 1 024 entries is intentionally conservative for an embedded / test
 //! kernel; raise the constant as workloads grow.
 
-use alloc::{
-    collections::BTreeMap,
-    string::String,
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use spin::Mutex;
 
 const DCACHE_MAX: usize = 1024;
@@ -22,12 +18,12 @@ const DCACHE_MAX: usize = 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct DKey {
     parent: u64,
-    name:   String,
+    name: String,
 }
 
 struct DCache {
     /// The actual mapping.
-    map:   BTreeMap<DKey, u64>,
+    map: BTreeMap<DKey, u64>,
     /// Insertion-order list for O(1)-amortised LRU eviction.
     order: Vec<DKey>,
 }
@@ -35,13 +31,16 @@ struct DCache {
 impl DCache {
     const fn new() -> Self {
         Self {
-            map:   BTreeMap::new(),
+            map: BTreeMap::new(),
             order: Vec::new(),
         }
     }
 
     fn lookup(&self, parent: u64, name: &str) -> Option<u64> {
-        let key = DKey { parent, name: String::from(name) };
+        let key = DKey {
+            parent,
+            name: String::from(name),
+        };
         self.map.get(&key).copied()
     }
 
@@ -65,7 +64,10 @@ impl DCache {
     }
 
     fn invalidate(&mut self, parent: u64, name: &str) {
-        let key = DKey { parent, name: String::from(name) };
+        let key = DKey {
+            parent,
+            name: String::from(name),
+        };
         if self.map.remove(&key).is_some() {
             self.order.retain(|k| k != &key);
         }
@@ -73,7 +75,8 @@ impl DCache {
 
     fn invalidate_inode(&mut self, inode: u64) {
         // Collect all keys that map to this inode.
-        let victims: Vec<DKey> = self.map
+        let victims: Vec<DKey> = self
+            .map
             .iter()
             .filter(|(_, &v)| v == inode)
             .map(|(k, _)| k.clone())

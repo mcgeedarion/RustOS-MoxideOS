@@ -8,8 +8,9 @@
 //!               The hardware driver stubs live in `crate::drivers::drm`
 //!               and `crate::drivers::virtio_gpu`.
 //!
-//!   `wayland` — In-kernel Wayland compositor and server.  [cfg(feature = "wayland")]
-//!               Surfaces are presented to the display via the DRM layer.
+//!   `wayland` — In-kernel Wayland compositor and server.  [cfg(feature =
+//! "wayland")]               Surfaces are presented to the display via the DRM
+//! layer.
 //!
 //!   `font`    — Zero-copy PSF2 bitmap font parser and glyph rasteriser.
 //!               Reads an embedded `*.psf` blob and writes XRGB8888 pixels.
@@ -29,9 +30,9 @@
 //! wayland = ["kernel-drivers/wayland"]
 //! ```
 
+pub mod console;
 pub mod drm;
 pub mod font;
-pub mod console;
 
 #[cfg(feature = "wayland")]
 pub mod wayland;

@@ -6,20 +6,20 @@
 //!
 //! ## Boot sequence
 //!
-//!   0.  hal::init()               — disable IRQs, serial TX available
-//!   1.  cpu::enable_fp_simd()     — CPACR_EL1.FPEN = 0b11
-//!   2.  interrupts::init()        — VBAR_EL1 ← &__exception_vectors
-//!   3.  paging::init()            — MMU on, kernel mapped in TTBR1
-//!   4.  heap_init()               — global allocator
-//!   5.  pmm::init()               — physical memory manager
-//!   6.  time::init()              — generic timer calibration
-//!   7.  gic::init()               — GICv2/v3 enable + IRQ routing
-//!   8.  pci::ecam_init()          — ECAM base from ACPI / DTB
-//!   9.  virtio_blk / block init   — storage backend
-//!  10.  fs::initramfs::mount()    — initrd
-//!  11.  spawn_init()              — PID 1
-//!  12.  smp::bring_up_secondaries()
-//!  13.  idle loop
+//!   0. hal::init()               — disable IRQs, serial TX available
+//!   1. cpu::enable_fp_simd()     — CPACR_EL1.FPEN = 0b11
+//!   2. interrupts::init()        — VBAR_EL1 ← &__exception_vectors
+//!   3. paging::init()            — MMU on, kernel mapped in TTBR1
+//!   4. heap_init()               — global allocator
+//!   5. pmm::init()               — physical memory manager
+//!   6. time::init()              — generic timer calibration
+//!   7. gic::init()               — GICv2/v3 enable + IRQ routing
+//!   8. pci::ecam_init()          — ECAM base from ACPI / DTB
+//!   9. virtio_blk / block init   — storage backend
+//!  10. fs::initramfs::mount()    — initrd
+//!  11. spawn_init()              — PID 1
+//!  12. smp::bring_up_secondaries()
+//!  13. idle loop
 
 use crate::init::boot_info::BootInfo;
 use crate::proc::exec::spawn_user_process;
@@ -30,10 +30,14 @@ pub fn init(boot_info: &'static BootInfo) -> ! {
     super::hal::init();
 
     // 1. FP/SIMD.
-    unsafe { super::cpu::enable_fp_simd(); }
+    unsafe {
+        super::cpu::enable_fp_simd();
+    }
 
     // 2. Exception vectors.
-    unsafe { super::interrupts::init(); }
+    unsafe {
+        super::interrupts::init();
+    }
     crate::serial_println!("aarch64: exception vectors installed");
 
     // 3. MMU / paging.
@@ -47,7 +51,9 @@ pub fn init(boot_info: &'static BootInfo) -> ! {
     // 5. PMM.
     {
         let regions = super::mem_layout::memory_regions(boot_info);
-        unsafe { crate::mm::pmm::init_from_regions(&regions); }
+        unsafe {
+            crate::mm::pmm::init_from_regions(&regions);
+        }
     }
     crate::mm::memmap::memmap_init();
     crate::serial_println!("aarch64: PMM ready");
@@ -57,9 +63,7 @@ pub fn init(boot_info: &'static BootInfo) -> ! {
     crate::serial_println!("time: clocksource={:?}", crate::time::clocksource());
 
     // 7. GIC.
-    crate::irq::aarch64::gic::init(
-        crate::irq::aarch64::gic::GicConfig::qemu_virt_v3()
-    );
+    crate::irq::aarch64::gic::init(crate::irq::aarch64::gic::GicConfig::qemu_virt_v3());
     crate::serial_println!("aarch64: GIC ready");
 
     // 8. PCIe ECAM (base from ACPI MCFG or DTB — 0 if not present).
@@ -105,10 +109,14 @@ pub fn init(boot_info: &'static BootInfo) -> ! {
     super::smp::bring_up_secondaries();
 
     // 13. Enable IRQs and idle.
-    unsafe { super::hal::interrupts_enable(); }
+    unsafe {
+        super::hal::interrupts_enable();
+    }
     crate::serial_println!("aarch64: kernel_main: idle");
     loop {
-        unsafe { asm!("wfi", options(nostack, nomem)); }
+        unsafe {
+            asm!("wfi", options(nostack, nomem));
+        }
         crate::proc::scheduler::schedule();
     }
 }

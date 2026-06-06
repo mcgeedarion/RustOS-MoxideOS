@@ -21,8 +21,8 @@
 //! layer) can later take over by simply replacing or overlaying that
 //! buffer.
 
-use crate::display::font::Psf2Font;
 use crate::display::drm::framebuffer::FramebufferDesc;
+use crate::display::font::Psf2Font;
 
 /// Default foreground: bright white.
 pub const DEFAULT_FG: u32 = 0x00FF_FFFF;
@@ -32,16 +32,21 @@ pub const DEFAULT_BG: u32 = 0x001C_1C1C;
 /// A single text cell.
 #[derive(Clone, Copy)]
 struct Cell {
-    ch:  u8,
-    fg:  u32,
-    bg:  u32,
+    ch: u8,
+    fg: u32,
+    bg: u32,
     /// Whether this cell needs to be repainted on the next flush.
     dirty: bool,
 }
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { ch: b' ', fg: DEFAULT_FG, bg: DEFAULT_BG, dirty: true }
+        Self {
+            ch: b' ',
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+            dirty: true,
+        }
     }
 }
 
@@ -50,20 +55,20 @@ impl Default for Cell {
 /// Generic over the font lifetime so it can hold a `Psf2Font<'static>`
 /// from an embedded font blob without any allocation.
 pub struct Console<'font> {
-    font:    Psf2Font<'font>,
-    fb:      FramebufferDesc,
-    cols:    usize,
-    rows:    usize,
+    font: Psf2Font<'font>,
+    fb: FramebufferDesc,
+    cols: usize,
+    rows: usize,
     /// Column of the text cursor.
     cursor_col: usize,
     /// Row of the text cursor.
     cursor_row: usize,
     /// Flat cell grid, row-major.
-    cells:   alloc::vec::Vec<Cell>,
+    cells: alloc::vec::Vec<Cell>,
     /// Current foreground / background colours (can be changed via escape
     /// sequences or direct API later).
-    fg:      u32,
-    bg:      u32,
+    fg: u32,
+    bg: u32,
 }
 
 impl<'font> Console<'font> {
@@ -72,7 +77,7 @@ impl<'font> Console<'font> {
     /// `font`  — parsed PSF2 font.  
     /// `fb`    — DRM framebuffer descriptor (used for dimensions/pitch).  
     pub fn new(font: Psf2Font<'font>, fb: FramebufferDesc) -> Self {
-        let cols = fb.width  as usize / font.width()  as usize;
+        let cols = fb.width as usize / font.width() as usize;
         let rows = fb.height as usize / font.height() as usize;
         let cells = alloc::vec![Cell::default(); cols * rows];
         Self {
@@ -98,8 +103,8 @@ impl<'font> Console<'font> {
     pub fn feed_char(&mut self, ch: u8) {
         match ch {
             b'\r' | b'\n' => self.newline(),
-            0x08 | 0x7F   => self.backspace(),
-            _              => self.put_char(ch),
+            0x08 | 0x7F => self.backspace(),
+            _ => self.put_char(ch),
         }
     }
 
@@ -116,7 +121,7 @@ impl<'font> Console<'font> {
     /// `pitch`  is the framebuffer stride expressed in **pixels** (i.e.
     ///          `FramebufferDesc::stride() / 4` for 32 bpp).
     pub fn flush(&mut self, pixels: &mut [u32], pitch: usize) {
-        let gw = self.font.width()  as usize;
+        let gw = self.font.width() as usize;
         let gh = self.font.height() as usize;
 
         for row in 0..self.rows {
@@ -177,7 +182,12 @@ impl<'font> Console<'font> {
             self.newline();
         }
         let idx = self.cursor_row * self.cols + self.cursor_col;
-        self.cells[idx] = Cell { ch, fg: self.fg, bg: self.bg, dirty: true };
+        self.cells[idx] = Cell {
+            ch,
+            fg: self.fg,
+            bg: self.bg,
+            dirty: true,
+        };
         self.cursor_col += 1;
     }
 
@@ -198,7 +208,12 @@ impl<'font> Console<'font> {
             self.cursor_col = self.cols - 1;
         }
         let idx = self.cursor_row * self.cols + self.cursor_col;
-        self.cells[idx] = Cell { ch: b' ', fg: self.fg, bg: self.bg, dirty: true };
+        self.cells[idx] = Cell {
+            ch: b' ',
+            fg: self.fg,
+            bg: self.bg,
+            dirty: true,
+        };
     }
 
     /// Shift every row up by one; blank the last row.
@@ -215,7 +230,10 @@ impl<'font> Console<'font> {
         // Blank the last row.
         let last = (self.rows - 1) * self.cols;
         for col in 0..self.cols {
-            self.cells[last + col] = Cell { dirty: true, ..Cell::default() };
+            self.cells[last + col] = Cell {
+                dirty: true,
+                ..Cell::default()
+            };
         }
         self.cursor_row = self.rows - 1;
     }

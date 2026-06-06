@@ -16,27 +16,25 @@
 //!   transaction.rs— CoW write path re-export
 //!   allocator.rs  — bump allocator re-export
 
-pub mod superblock;
-pub mod inode;
-pub mod extent;
-pub mod directory;
-pub mod mount;
-pub mod ops;
-pub mod tree;
+pub mod allocator;
 pub mod api;
 pub mod checksum;
 pub mod compression;
+pub mod directory;
+pub mod extent;
+pub mod inode;
+pub mod mount;
+pub mod ops;
+pub mod superblock;
 pub mod transaction;
-pub mod allocator;
+pub mod tree;
 
-pub use superblock::{
-    BtrfsKey, BtrfsSuperblock, BtrfsChunkItem, BtrfsRootItem,
-    BtrfsHeader, BtrfsItem, BtrfsKeyPtr, BtrfsFs, BtrfsInodeItem,
-    BtrfsFileExtentItem, BtrfsDirItem, BTRFS_MOUNTS,
-};
 pub use api::{
-    mount, btrfs_stat, btrfs_read_all, btrfs_write_all, btrfs_readdir,
-    btrfs_create, btrfs_mkdir, btrfs_unlink, btrfs_rmdir, btrfs_rename,
-    btrfs_link, btrfs_symlink, btrfs_readlink, btrfs_chmod, btrfs_chown,
-    btrfs_set_times, btrfs_truncate, btrfs_statfs, sync_inode,
+    btrfs_chmod, btrfs_chown, btrfs_create, btrfs_link, btrfs_mkdir, btrfs_read_all, btrfs_readdir,
+    btrfs_readlink, btrfs_rename, btrfs_rmdir, btrfs_set_times, btrfs_stat, btrfs_statfs,
+    btrfs_symlink, btrfs_truncate, btrfs_unlink, btrfs_write_all, mount, sync_inode,
+};
+pub use superblock::{
+    BtrfsChunkItem, BtrfsDirItem, BtrfsFileExtentItem, BtrfsFs, BtrfsHeader, BtrfsInodeItem,
+    BtrfsItem, BtrfsKey, BtrfsKeyPtr, BtrfsRootItem, BtrfsSuperblock, BTRFS_MOUNTS,
 };

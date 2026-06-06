@@ -5,34 +5,34 @@
 //! 1. Before entering S3 we save the AP wakeup vector into the FACS
 //!    `FirmwareWakingVector` field so firmware knows where to jump on resume.
 //! 2. The BSP issues the PM1a/PM1b sleep transition.
-//! 3. On resume, real-mode trampoline code (not here) reloads the GDT/IDT
-//!    and jumps to `resume_entry` which restores saved registers and returns.
+//! 3. On resume, real-mode trampoline code (not here) reloads the GDT/IDT and
+//!    jumps to `resume_entry` which restores saved registers and returns.
 //!
 //! This file owns:
 //! - FACS discovery and wakeup-vector installation
 //! - S3 preparation hooks (arch-level save is called out to `crate::arch`)
 //! - A minimal resume stub that re-enables ACPI and signals completion
 
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
-use crate::console::println;
 use super::power::{enter_sleep_state, init as power_init};
+use crate::console::println;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[repr(C, packed)]
 struct Facs {
-    sig:                    [u8; 4],  // "FACS"
-    len:                    u32,
-    hw_sig:                 u32,
-    fw_waking_vector:       u32,      // 32-bit real-mode wakeup address
-    global_lock:            u32,
-    flags:                  u32,
-    x_fw_waking_vector:     u64,      // 64-bit wakeup address (ACPI ≥ 2.0)
-    version:                u8,
-    _rsvd:                  [u8; 3],
-    ospm_flags:             u32,
-    _rsvd2:                 [u8; 24],
+    sig: [u8; 4], // "FACS"
+    len: u32,
+    hw_sig: u32,
+    fw_waking_vector: u32, // 32-bit real-mode wakeup address
+    global_lock: u32,
+    flags: u32,
+    x_fw_waking_vector: u64, // 64-bit wakeup address (ACPI ≥ 2.0)
+    version: u8,
+    _rsvd: [u8; 3],
+    ospm_flags: u32,
+    _rsvd2: [u8; 24],
 }
 
-const FADT_OFF_FIRMWARE_CTRL: usize = 36;   // 32-bit FACS phys address
+const FADT_OFF_FIRMWARE_CTRL: usize = 36; // 32-bit FACS phys address
 const FADT_OFF_X_FIRMWARE_CTRL: usize = 132; // 64-bit FACS phys address (v2)
 
 // Physical address of the FACS, discovered at init time.
@@ -50,7 +50,7 @@ pub unsafe fn init() {
         None => {
             println!("acpi/sleep: FADT not found, S3 unavailable");
             return;
-        }
+        },
     };
 
     let fadt_len = (*(fadt as *const super::SdtHeader)).len as usize;
@@ -81,7 +81,10 @@ pub unsafe fn init() {
     }
 
     FACS_PHYS.store(facs_phys, Ordering::Relaxed);
-    println!("acpi/sleep: FACS @ {:#010x}  hw_sig={:#010x}", facs_phys, facs.hw_sig);
+    println!(
+        "acpi/sleep: FACS @ {:#010x}  hw_sig={:#010x}",
+        facs_phys, facs.hw_sig
+    );
 }
 
 /// Install `wakeup_vector` as the 64-bit wakeup entry point in the FACS.

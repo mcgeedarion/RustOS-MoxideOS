@@ -28,22 +28,22 @@
 
 use spin::Mutex;
 
-const PLIC_PRIORITY_BASE:  usize = 0x0000_0000;
-const PLIC_ENABLE_BASE:    usize = 0x0000_2000;
-const PLIC_ENABLE_STRIDE:  usize = 0x0000_0080; // per context
-const PLIC_CTX_BASE:       usize = 0x0020_0000;
-const PLIC_CTX_STRIDE:     usize = 0x0000_1000; // per context
-const PLIC_CTX_THRESHOLD:  usize = 0x0000;
-const PLIC_CTX_CLAIM:      usize = 0x0004;
+const PLIC_PRIORITY_BASE: usize = 0x0000_0000;
+const PLIC_ENABLE_BASE: usize = 0x0000_2000;
+const PLIC_ENABLE_STRIDE: usize = 0x0000_0080; // per context
+const PLIC_CTX_BASE: usize = 0x0020_0000;
+const PLIC_CTX_STRIDE: usize = 0x0000_1000; // per context
+const PLIC_CTX_THRESHOLD: usize = 0x0000;
+const PLIC_CTX_CLAIM: usize = 0x0004;
 
 const MAX_IRQ: usize = 128;
 
 type IrqHandler = fn();
 
 struct PlicState {
-    base:     usize,
+    base: usize,
     /// S-mode hart 0 context number (BSP). APs use hart*2+1.
-    ctx:      usize,
+    ctx: usize,
     handlers: [Option<IrqHandler>; MAX_IRQ],
 }
 
@@ -51,8 +51,8 @@ unsafe impl Send for PlicState {}
 unsafe impl Sync for PlicState {}
 
 static PLIC: Mutex<PlicState> = Mutex::new(PlicState {
-    base:     0,
-    ctx:      1,
+    base: 0,
+    ctx: 1,
     handlers: [None; MAX_IRQ],
 });
 
@@ -75,8 +75,8 @@ pub fn set_base(base: usize) {
 /// Returns `false` if no PLIC base was found in the FDT.
 pub fn init() -> bool {
     let state = PLIC.lock();
-    let base  = state.base;
-    let ctx   = state.ctx;
+    let base = state.base;
+    let ctx = state.ctx;
     drop(state);
     if base == 0 {
         crate::println!("plic: WARNING: base not set — PLIC not initialised");
@@ -93,10 +93,12 @@ pub fn init() -> bool {
 /// Initialise the PLIC for an AP's S-mode context.
 pub fn init_context(ctx: usize) {
     let state = PLIC.lock();
-    let base  = state.base;
+    let base = state.base;
     let bsp_ctx = state.ctx;
     drop(state);
-    if base == 0 { return; }
+    if base == 0 {
+        return;
+    }
 
     unsafe {
         let thr_addr = base + PLIC_CTX_BASE + ctx * PLIC_CTX_STRIDE + PLIC_CTX_THRESHOLD;
@@ -104,8 +106,8 @@ pub fn init_context(ctx: usize) {
         let words = MAX_IRQ / 32;
         for w in 0..words {
             let bsp_en = base + PLIC_ENABLE_BASE + bsp_ctx * PLIC_ENABLE_STRIDE + w * 4;
-            let ap_en  = base + PLIC_ENABLE_BASE + ctx     * PLIC_ENABLE_STRIDE + w * 4;
-            let bits   = r32(bsp_en);
+            let ap_en = base + PLIC_ENABLE_BASE + ctx * PLIC_ENABLE_STRIDE + w * 4;
+            let bits = r32(bsp_en);
             w32(ap_en, bits);
         }
     }
@@ -113,11 +115,15 @@ pub fn init_context(ctx: usize) {
 }
 
 pub fn enable_irq(irq: u32, handler: IrqHandler) {
-    if irq == 0 || irq as usize >= MAX_IRQ { return; }
+    if irq == 0 || irq as usize >= MAX_IRQ {
+        return;
+    }
     let mut state = PLIC.lock();
     let base = state.base;
-    let ctx  = state.ctx;
-    if base == 0 { return; }
+    let ctx = state.ctx;
+    if base == 0 {
+        return;
+    }
     state.handlers[irq as usize] = Some(handler);
     drop(state);
     unsafe {
@@ -128,13 +134,17 @@ pub fn enable_irq(irq: u32, handler: IrqHandler) {
 }
 
 pub fn disable_irq(irq: u32) {
-    if irq == 0 || irq as usize >= MAX_IRQ { return; }
+    if irq == 0 || irq as usize >= MAX_IRQ {
+        return;
+    }
     let mut state = PLIC.lock();
     let base = state.base;
-    let ctx  = state.ctx;
+    let ctx = state.ctx;
     state.handlers[irq as usize] = None;
     drop(state);
-    if base == 0 { return; }
+    if base == 0 {
+        return;
+    }
     unsafe {
         let en_addr = base + PLIC_ENABLE_BASE + ctx * PLIC_ENABLE_STRIDE + (irq as usize / 32) * 4;
         w32(en_addr, r32(en_addr) & !(1 << (irq % 32)));
@@ -143,30 +153,42 @@ pub fn disable_irq(irq: u32) {
 
 pub fn handle_irq() {
     let base = PLIC.lock().base;
-    if base == 0 { return; }
+    if base == 0 {
+        return;
+    }
     let hart_id: usize;
-    unsafe { core::arch::asm!("mv {}, tp", out(reg) hart_id, options(nostack, nomem)); }
+    unsafe {
+        core::arch::asm!("mv {}, tp", out(reg) hart_id, options(nostack, nomem));
+    }
     let ctx = hart_id * 2 + 1;
     let claim_addr = base + PLIC_CTX_BASE + ctx * PLIC_CTX_STRIDE + PLIC_CTX_CLAIM;
     loop {
         let irq = unsafe { r32(claim_addr) };
-        if irq == 0 { break; }
+        if irq == 0 {
+            break;
+        }
 
         #[cfg(feature = "debug")]
         {
             use crate::debug::trace::{emit, TraceEvent, TraceKind};
             emit(TraceEvent {
-                kind:  TraceKind::IrqDispatch,
-                id:    irq,
-                arg:   hart_id as u64,
+                kind: TraceKind::IrqDispatch,
+                id: irq,
+                arg: hart_id as u64,
                 ticks: crate::time::read_ticks(),
             });
         }
 
         let handler = PLIC.lock().handlers.get(irq as usize).copied().flatten();
-        if let Some(h) = handler { h(); }
-        unsafe { w32(claim_addr, irq); }
+        if let Some(h) = handler {
+            h();
+        }
+        unsafe {
+            w32(claim_addr, irq);
+        }
     }
 }
 
-pub fn base() -> usize { PLIC.lock().base }
+pub fn base() -> usize {
+    PLIC.lock().base
+}

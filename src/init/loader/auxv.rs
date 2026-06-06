@@ -22,28 +22,28 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-const AT_NULL:   u64 =  0;
-const AT_PHDR:   u64 =  3;
-const AT_PHENT:  u64 =  4;
-const AT_PHNUM:  u64 =  5;
-const AT_PAGESZ: u64 =  6;
-const AT_BASE:   u64 =  7;
-const AT_FLAGS:  u64 =  8;
-const AT_ENTRY:  u64 =  9;
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_FLAGS: u64 = 8;
+const AT_ENTRY: u64 = 9;
 const AT_RANDOM: u64 = 25;
 
 const PAGE: usize = 4096;
 
 /// Build the initial stack for a newly exec'd process.
 pub fn build_stack(
-    stack_buf:   &mut [u8],
-    stack_top:   usize,
-    argv:        &[&str],
-    envp:        &[&str],
-    entry:       usize,
-    phdr_va:     usize,
-    phdr_count:  usize,
-    phdr_size:   usize,
+    stack_buf: &mut [u8],
+    stack_top: usize,
+    argv: &[&str],
+    envp: &[&str],
+    entry: usize,
+    phdr_va: usize,
+    phdr_count: usize,
+    phdr_size: usize,
 ) -> Option<usize> {
     let buf_va_base = stack_top - stack_buf.len();
 
@@ -70,32 +70,31 @@ pub fn build_stack(
     let str_total = (string_bytes.len() + 15) & !15;
 
     let string_va_base = stack_top.checked_sub(str_total)?;
-    let random_va      = string_va_base + random_offset;
+    let random_va = string_va_base + random_offset;
 
     let buf_string_off = string_va_base.checked_sub(buf_va_base)?;
     if buf_string_off + string_bytes.len() > stack_buf.len() {
         return None;
     }
-    stack_buf[buf_string_off..buf_string_off + string_bytes.len()]
-        .copy_from_slice(&string_bytes);
+    stack_buf[buf_string_off..buf_string_off + string_bytes.len()].copy_from_slice(&string_bytes);
 
     let auxv: &[(u64, u64)] = &[
-        (AT_PHDR,   phdr_va    as u64),
-        (AT_PHENT,  phdr_size  as u64),
-        (AT_PHNUM,  phdr_count as u64),
-        (AT_PAGESZ, PAGE       as u64),
-        (AT_ENTRY,  entry      as u64),
-        (AT_BASE,   0_u64),
-        (AT_FLAGS,  0_u64),
-        (AT_RANDOM, random_va  as u64),
-        (AT_NULL,   0_u64),
+        (AT_PHDR, phdr_va as u64),
+        (AT_PHENT, phdr_size as u64),
+        (AT_PHNUM, phdr_count as u64),
+        (AT_PAGESZ, PAGE as u64),
+        (AT_ENTRY, entry as u64),
+        (AT_BASE, 0_u64),
+        (AT_FLAGS, 0_u64),
+        (AT_RANDOM, random_va as u64),
+        (AT_NULL, 0_u64),
     ];
 
-    let argc           = argv.len();
+    let argc = argv.len();
     let ptrtable_words = 1 + (argc + 1) + (envp.len() + 1) + auxv.len() * 2;
     let ptrtable_bytes = ptrtable_words * 8;
 
-    let rsp_raw     = string_va_base.checked_sub(ptrtable_bytes)?;
+    let rsp_raw = string_va_base.checked_sub(ptrtable_bytes)?;
     let initial_rsp = rsp_raw & !0xF_usize;
 
     let table_buf_off = initial_rsp.checked_sub(buf_va_base)?;
@@ -108,18 +107,27 @@ pub fn build_stack(
     macro_rules! write64 {
         ($val:expr) => {{
             let end = off + 8;
-            if end > stack_buf.len() { return None; }
+            if end > stack_buf.len() {
+                return None;
+            }
             stack_buf[off..end].copy_from_slice(&($val as u64).to_ne_bytes());
             off = end;
         }};
     }
 
     write64!(argc);
-    for ao in &argv_offsets { write64!(string_va_base + ao); }
+    for ao in &argv_offsets {
+        write64!(string_va_base + ao);
+    }
     write64!(0u64);
-    for eo in &envp_offsets { write64!(string_va_base + eo); }
+    for eo in &envp_offsets {
+        write64!(string_va_base + eo);
+    }
     write64!(0u64);
-    for (atype, aval) in auxv { write64!(atype); write64!(aval); }
+    for (atype, aval) in auxv {
+        write64!(atype);
+        write64!(aval);
+    }
 
     Some(initial_rsp)
 }

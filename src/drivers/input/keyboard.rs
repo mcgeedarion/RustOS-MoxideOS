@@ -15,9 +15,9 @@
 extern crate alloc;
 use crate::drivers::input::evdev;
 
-const PS2_DATA:   u16 = 0x60;
+const PS2_DATA: u16 = 0x60;
 const PS2_STATUS: u16 = 0x64;
-const PS2_CMD:    u16 = 0x64;
+const PS2_CMD: u16 = 0x64;
 
 const STATUS_OBF: u8 = 1 << 0; // output buffer full (data ready to read)
 const STATUS_IBF: u8 = 1 << 1; // input  buffer full (do not write yet)
@@ -84,14 +84,17 @@ static HID_TO_ASCII: [u8; 256] = [
 use spin::Mutex;
 
 struct KbdState {
-    extended:    bool,
-    lshift:      bool,
-    rshift:      bool,
-    capslock:    bool,
+    extended: bool,
+    lshift: bool,
+    rshift: bool,
+    capslock: bool,
 }
 
 static STATE: Mutex<KbdState> = Mutex::new(KbdState {
-    extended: false, lshift: false, rshift: false, capslock: false,
+    extended: false,
+    lshift: false,
+    rshift: false,
+    capslock: false,
 });
 
 /// Process one raw PS/2 scancode byte.
@@ -105,8 +108,8 @@ pub fn handle_scancode(sc: u8) {
     }
 
     let release = sc & 0x80 != 0;
-    let code    = sc & 0x7F;
-    let ext     = st.extended;
+    let code = sc & 0x7F;
+    let ext = st.extended;
     st.extended = false;
 
     let hid: u16 = if ext {
@@ -115,14 +118,24 @@ pub fn handle_scancode(sc: u8) {
         SC1_TO_HID[code as usize]
     };
 
-    if hid == 0 { return; }
+    if hid == 0 {
+        return;
+    }
 
     // Track shift / capslock state.
     match hid {
-        225 => { st.lshift = !release; }
-        229 => { st.rshift = !release; }
-        57  => { if !release { st.capslock = !st.capslock; } }
-        _   => {}
+        225 => {
+            st.lshift = !release;
+        },
+        229 => {
+            st.rshift = !release;
+        },
+        57 => {
+            if !release {
+                st.capslock = !st.capslock;
+            }
+        },
+        _ => {},
     }
 
     let value = if release { 0i32 } else { 1 };
@@ -136,7 +149,9 @@ pub fn handle_scancode(sc: u8) {
 /// Returns 0 for non-printable keys.
 pub fn hid_to_char(hid: u16, shifted: bool) -> u8 {
     let base = HID_TO_ASCII.get(hid as usize).copied().unwrap_or(0);
-    if base == 0 { return 0; }
+    if base == 0 {
+        return 0;
+    }
     if shifted && base.is_ascii_alphabetic() {
         base.to_ascii_uppercase()
     } else if shifted {
@@ -148,10 +163,26 @@ pub fn hid_to_char(hid: u16, shifted: bool) -> u8 {
 
 fn shift_symbol(c: u8) -> u8 {
     match c {
-        b'1' => b'!', b'2' => b'@', b'3' => b'#', b'4' => b'$', b'5' => b'%',
-        b'6' => b'^', b'7' => b'&', b'8' => b'*', b'9' => b'(', b'0' => b')',
-        b'-' => b'_', b'=' => b'+', b'[' => b'{', b']' => b'}', b'\\' => b'|',
-        b';' => b':', b'\'' => b'"', b'`' => b'~', b',' => b'<', b'.' => b'>',
+        b'1' => b'!',
+        b'2' => b'@',
+        b'3' => b'#',
+        b'4' => b'$',
+        b'5' => b'%',
+        b'6' => b'^',
+        b'7' => b'&',
+        b'8' => b'*',
+        b'9' => b'(',
+        b'0' => b')',
+        b'-' => b'_',
+        b'=' => b'+',
+        b'[' => b'{',
+        b']' => b'}',
+        b'\\' => b'|',
+        b';' => b':',
+        b'\'' => b'"',
+        b'`' => b'~',
+        b',' => b'<',
+        b'.' => b'>',
         b'/' => b'?',
         _ => c,
     }
@@ -171,7 +202,9 @@ pub fn read_char() -> u8 {
                 let shifted = st.lshift || st.rshift || st.capslock;
                 drop(st);
                 let c = hid_to_char(ev.code, shifted);
-                if c != 0 { return c; }
+                if c != 0 {
+                    return c;
+                }
             }
         }
         core::hint::spin_loop();

@@ -41,24 +41,19 @@
 //! the ring is empty **and** `writers == 0`.
 
 extern crate alloc;
-use alloc::{
-    collections::BTreeMap,
-    sync::Arc,
-    vec,
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
-use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
-use crate::fs::scheme_table::Scheme;
 use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
+use crate::fs::scheme_table::Scheme;
+use scheme_api::{OpenFlags, SchemeError, SchemeFileId};
 
 struct PipeBuf {
-    ring:    Vec<u8>,
-    head:    usize,
-    tail:    usize,
-    cap:     usize,
+    ring: Vec<u8>,
+    head: usize,
+    tail: usize,
+    cap: usize,
     /// Number of open write-end handles.  Starts at 1.
     /// When it reaches 0 and the ring is empty, read returns EOF.
     writers: usize,
@@ -66,19 +61,31 @@ struct PipeBuf {
 
 impl PipeBuf {
     fn new(cap: usize) -> Self {
-        Self { ring: vec![0u8; cap], head: 0, tail: 0, cap, writers: 1 }
+        Self {
+            ring: vec![0u8; cap],
+            head: 0,
+            tail: 0,
+            cap,
+            writers: 1,
+        }
     }
 
-    fn is_empty(&self) -> bool { self.head == self.tail }
+    fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
 
-    fn is_full(&self) -> bool { (self.tail + 1) % self.cap == self.head }
+    fn is_full(&self) -> bool {
+        (self.tail + 1) % self.cap == self.head
+    }
 
     /// Copy as many bytes from `buf` into the ring as will fit.
     /// Returns the number of bytes actually written.
     fn push(&mut self, buf: &[u8]) -> usize {
         let mut n = 0;
         for &b in buf {
-            if self.is_full() { break; }
+            if self.is_full() {
+                break;
+            }
             self.ring[self.tail] = b;
             self.tail = (self.tail + 1) % self.cap;
             n += 1;
@@ -91,7 +98,9 @@ impl PipeBuf {
     fn pop(&mut self, buf: &mut [u8]) -> usize {
         let mut n = 0;
         for slot in buf.iter_mut() {
-            if self.is_empty() { break; }
+            if self.is_empty() {
+                break;
+            }
             *slot = self.ring[self.head];
             self.head = (self.head + 1) % self.cap;
             n += 1;
@@ -103,8 +112,8 @@ impl PipeBuf {
 // Keyed by the *write-end* fid (always even).  The read-end fid is
 // write_fid + 1 (always odd); both share the same `PipeBuf`.
 
-static PIPES:    Mutex<BTreeMap<u32, PipeBuf>> = Mutex::new(BTreeMap::new());
-static PIPE_CTR: AtomicU32                    = AtomicU32::new(2);
+static PIPES: Mutex<BTreeMap<u32, PipeBuf>> = Mutex::new(BTreeMap::new());
+static PIPE_CTR: AtomicU32 = AtomicU32::new(2);
 
 /// Allocate a new pipe-buffer ID.  IDs are even and start at 2.
 /// The read-end fid is always `id + 1`.
@@ -141,7 +150,7 @@ impl Scheme for PipeScheme {
 
         if pipe.is_empty() {
             if pipe.writers == 0 {
-                return Ok(0);  // EOF
+                return Ok(0); // EOF
             }
             return Err(SchemeError::WouldBlock);
         }
@@ -154,8 +163,7 @@ impl Scheme for PipeScheme {
     /// has already been closed, i.e. the pipe-buffer entry is gone.
     fn write(&self, fid: SchemeFileId, buf: &[u8]) -> Result<usize, SchemeError> {
         let mut pipes = PIPES.lock();
-        let pipe = pipes.get_mut(&(fid.0 as u32))
-            .ok_or(SchemeError::Io)?;  // read end gone → EPIPE
+        let pipe = pipes.get_mut(&(fid.0 as u32)).ok_or(SchemeError::Io)?; // read end gone → EPIPE
         Ok(pipe.push(buf))
     }
 
@@ -207,12 +215,12 @@ pub fn create_pipe() -> Result<(usize, usize), SchemeError> {
     let rfid = SchemeFileId(wfid.0 + 1);
 
     let write_bfd = alloc_scheme_backing_fd();
-    let read_bfd  = alloc_scheme_backing_fd();
+    let read_bfd = alloc_scheme_backing_fd();
 
     // Register both ends so scheme_fd_read / scheme_fd_write / scheme_fd_close
     // can dispatch them without knowing they are pipes.
     scheme_fd_register(write_bfd, Arc::clone(&scheme), wfid);
-    scheme_fd_register(read_bfd,  Arc::clone(&scheme), rfid);
+    scheme_fd_register(read_bfd, Arc::clone(&scheme), rfid);
 
     // (read_bfd, write_bfd) mirrors the POSIX pipe(fds) convention:
     // fds[0] = read end, fds[1] = write end.

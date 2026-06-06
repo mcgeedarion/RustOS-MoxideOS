@@ -6,27 +6,28 @@
 //!   0a. serial::early_init()          — 16550 TX-only, no alloc, no heap
 //!   0b. vga::init()                   — VGA text mode (no-op when GOP active)
 //!   0c. heap_init()                   — global allocator
-//!   1.  gdt_init()                    — GDT + TSS + GSBASE
-//!   2.  idt_init()                    — IDT exception/IRQ vectors
-//!   3.  syscall_setup()               — SYSCALL/SYSRET MSRs
-//!   4.  serial::init()                — full 16550 reinit
-//!   5.  arch::x86_64::memory::discover() → pmm::init_from_regions()
-//!   5b. time::init()                  — TSC/HPET calibration (BEFORE apic_init)
-//!   6.  xsave_init()                  — XSAVE/FXSAVE feature detection
-//!   7.  acpi_init()                   — RSDP → MADT: CPU list, I/O APIC
-//!   8.  pcie_init()                   — PCIe bus enumeration + BAR
+//!   1. gdt_init()                    — GDT + TSS + GSBASE
+//!   2. idt_init()                    — IDT exception/IRQ vectors
+//!   3. syscall_setup()               — SYSCALL/SYSRET MSRs
+//!   4. serial::init()                — full 16550 reinit
+//!   5. arch::x86_64::memory::discover() → pmm::init_from_regions()
+//!   5b. time::init()                  — TSC/HPET calibration (BEFORE
+//! apic_init)
+//!   6. xsave_init()                  — XSAVE/FXSAVE feature detection
+//!   7. acpi_init()                   — RSDP → MADT: CPU list, I/O APIC
+//!   8. pcie_init()                   — PCIe bus enumeration + BAR
 //!   8a. virtio_gpu::init()            — probe virtio-gpu PCI device
 //!   8b. drm::init_heads()             — register GOP + virtio-gpu scanouts
-//!   9.  apic_init()                   — Local APIC enable (timer MASKED)
+//!   9. apic_init()                   — Local APIC enable (timer MASKED)
 //!   9b. calibrate_lapic_timer()       — measure bus clock, arm 1ms periodic
-//!  10.  probe_ahci()                  — AHCI SATA (stub → false on real hw)
+//!  10. probe_ahci()                  — AHCI SATA (stub → false on real hw)
 //!  10b. probe_nvme()                  — NVMe via PCI class 0x01/0x08/0x02
 //!  10c. virtio_blk fallback           — QEMU / no real disk
-//!  11.  mount_initramfs()             — CPIO initrd
-//!  12.  mount_root()                  — ext2 or ramfs
+//!  11. mount_initramfs()             — CPIO initrd
+//!  12. mount_root()                  — ext2 or ramfs
 //!  12b. gdbstub::session::init()      — /dev/gdbstub on COM1 [cfg(gdbstub)]
-//!  13.  spawn_init()                  — PID 1
-//!  14.  idle loop
+//!  13. spawn_init()                  — PID 1
+//!  14. idle loop
 
 use crate::arch::x86_64::{
     apic::{apic_init, calibrate_lapic_timer},
@@ -212,7 +213,7 @@ fn probe_ahci() -> bool {
         None => {
             serial_println!("ahci: no controller on PCI bus");
             return false;
-        }
+        },
     };
     dev.enable();
     let bar5 = match dev.bar_mmio(5) {
@@ -220,7 +221,7 @@ fn probe_ahci() -> bool {
         None => {
             serial_println!("ahci: BAR5 not decoded");
             return false;
-        }
+        },
     };
     serial_println!("ahci: controller at BAR5={:#x}", bar5);
     crate::drivers::block::ahci::ahci_init(bar5);
@@ -239,7 +240,7 @@ fn probe_nvme() -> Option<usize> {
         None => {
             serial_println!("nvme: no controller on PCI bus");
             return None;
-        }
+        },
     };
     dev.enable();
     let bar0_phys = match dev.bar_mmio(0) {
@@ -247,7 +248,7 @@ fn probe_nvme() -> Option<usize> {
         None => {
             serial_println!("nvme: BAR0 not decoded");
             return None;
-        }
+        },
     };
     let bar0_virt = crate::arch::x86_64::mem_layout::higher_half::phys_to_virt(bar0_phys) as u64;
     serial_println!("nvme: controller at BAR0={:#x}", bar0_phys);

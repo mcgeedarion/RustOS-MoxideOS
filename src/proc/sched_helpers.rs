@@ -43,22 +43,70 @@ impl CbsUtilBucket {
     const fn new() -> Self {
         Self {
             cpu: [
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
             ],
         }
     }
@@ -67,10 +115,14 @@ impl CbsUtilBucket {
 static CBS_UTIL: CbsUtilBucket = CbsUtilBucket::new();
 
 fn scaled_util(runtime: u64, period: u64) -> Option<u64> {
-    if period == 0 { return None; }
+    if period == 0 {
+        return None;
+    }
     let wide = (runtime as u128) << 32;
     let result = wide / period as u128;
-    if result > u64::MAX as u128 { return None; }
+    if result > u64::MAX as u128 {
+        return None;
+    }
     Some(result as u64)
 }
 
@@ -104,7 +156,9 @@ pub fn cbs_admit(
     let ncpus = ncpus.min(MAX_CBS_CPUS);
 
     for cpu in 0..ncpus {
-        if cpumask & (1u64 << cpu) == 0 { continue; }
+        if cpumask & (1u64 << cpu) == 0 {
+            continue;
+        }
         let current = CBS_UTIL.cpu[cpu].load(Ordering::Relaxed);
         if current.saturating_add(su) > CBS_SCALE {
             return Err(-16); // EBUSY
@@ -122,12 +176,14 @@ pub fn cbs_admit(
 pub fn cbs_release(runtime: u64, period: u64, cpumask: u64) {
     let su = match scaled_util(runtime, period) {
         Some(v) => v,
-        None    => return,
+        None => return,
     };
     let ncpus = crate::smp::percpu::cpu_count() as usize;
     let ncpus = ncpus.min(MAX_CBS_CPUS);
     for cpu in 0..ncpus {
-        if cpumask & (1u64 << cpu) == 0 { continue; }
+        if cpumask & (1u64 << cpu) == 0 {
+            continue;
+        }
         // Saturating sub: guard against double-release bugs.
         let prev = CBS_UTIL.cpu[cpu].load(Ordering::Relaxed);
         CBS_UTIL.cpu[cpu].fetch_sub(su.min(prev), Ordering::Relaxed);
@@ -137,7 +193,9 @@ pub fn cbs_release(runtime: u64, period: u64, cpumask: u64) {
 /// Query the current utilization (0..=CBS_SCALE) for a CPU.
 /// Returns CBS_SCALE + 1 if `cpu` is out of range.
 pub fn cbs_util_for_cpu(cpu: usize) -> u64 {
-    if cpu >= MAX_CBS_CPUS { return CBS_SCALE + 1; }
+    if cpu >= MAX_CBS_CPUS {
+        return CBS_SCALE + 1;
+    }
     CBS_UTIL.cpu[cpu].load(Ordering::Relaxed)
 }
 
@@ -145,7 +203,9 @@ fn commit(su: u64, cpumask: u64) {
     let ncpus = crate::smp::percpu::cpu_count() as usize;
     let ncpus = ncpus.min(MAX_CBS_CPUS);
     for cpu in 0..ncpus {
-        if cpumask & (1u64 << cpu) == 0 { continue; }
+        if cpumask & (1u64 << cpu) == 0 {
+            continue;
+        }
         CBS_UTIL.cpu[cpu].fetch_add(su, Ordering::Relaxed);
     }
 }

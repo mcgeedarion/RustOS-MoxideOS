@@ -3,7 +3,8 @@
 //! ## Pending-packet queue
 //!
 //! When `resolve(ip)` is called and the MAC is not yet in the cache, it:
-//!   1. Enqueues the fully-built IP packet in `PENDING_PKTS` (keyed by next-hop IP).
+//!   1. Enqueues the fully-built IP packet in `PENDING_PKTS` (keyed by next-hop
+//!      IP).
 //!   2. Sends an ARP request.
 //!   3. Returns `None` so the caller does *not* drop the packet.
 //!
@@ -29,29 +30,36 @@ use spin::Mutex;
 use crate::net::eth;
 
 const ETHERTYPE_ARP: u16 = 0x0806;
-const ETHERTYPE_IP:  u16 = 0x0800;
-const HW_ETHER:      u16 = 0x0001;
-const PROTO_IP:      u16 = 0x0800;
-const OP_REQUEST:    u16 = 0x0001;
-const OP_REPLY:      u16 = 0x0002;
+const ETHERTYPE_IP: u16 = 0x0800;
+const HW_ETHER: u16 = 0x0001;
+const PROTO_IP: u16 = 0x0800;
+const OP_REQUEST: u16 = 0x0001;
+const OP_REPLY: u16 = 0x0002;
 
 #[derive(Clone, Copy, Default)]
 pub struct ArpEntry {
-    pub ip:    u32,
-    pub mac:   [u8; 6],
+    pub ip: u32,
+    pub mac: [u8; 6],
     pub valid: bool,
 }
 
 const CACHE_SIZE: usize = 64;
-static CACHE: Mutex<[ArpEntry; CACHE_SIZE]> =
-    Mutex::new([ArpEntry { ip: 0, mac: [0; 6], valid: false }; CACHE_SIZE]);
+static CACHE: Mutex<[ArpEntry; CACHE_SIZE]> = Mutex::new(
+    [ArpEntry {
+        ip: 0,
+        mac: [0; 6],
+        valid: false,
+    }; CACHE_SIZE],
+);
 
 /// Eviction cursor for the cache (round-robin).
 static CACHE_NEXT: Mutex<usize> = Mutex::new(0);
 
 /// Look up IP → MAC in the ARP cache.
 pub fn lookup(ip: u32) -> Option<[u8; 6]> {
-    CACHE.lock().iter()
+    CACHE
+        .lock()
+        .iter()
         .find(|e| e.valid && e.ip == ip)
         .map(|e| e.mac)
 }
@@ -72,21 +80,25 @@ pub fn insert(ip: u32, mac: [u8; 6]) {
         *next = (i + 1) % CACHE_SIZE;
         i
     };
-    cache[idx] = ArpEntry { ip, mac, valid: true };
+    cache[idx] = ArpEntry {
+        ip,
+        mac,
+        valid: true,
+    };
 }
 
-const PENDING_TOTAL:  usize = 32;
+const PENDING_TOTAL: usize = 32;
 const PENDING_PER_IP: usize = 4;
 
 /// One buffered IP packet waiting for an ARP reply.
 struct PendingPkt {
     dst_ip: u32,
-    pkt:    Vec<u8>,  // fully-built Ethernet payload (IP packet)
+    pkt: Vec<u8>, // fully-built Ethernet payload (IP packet)
 }
 
 struct PendingQueue {
     slots: [Option<PendingPkt>; PENDING_TOTAL],
-    len:   usize,
+    len: usize,
 }
 
 impl PendingQueue {
@@ -99,7 +111,8 @@ impl PendingQueue {
 
     /// Count how many packets are queued for `ip`.
     fn count_for(&self, ip: u32) -> usize {
-        self.slots.iter()
+        self.slots
+            .iter()
             .filter(|s| s.as_ref().map(|p| p.dst_ip == ip).unwrap_or(false))
             .count()
     }
@@ -109,7 +122,9 @@ impl PendingQueue {
     fn enqueue(&mut self, dst_ip: u32, pkt: Vec<u8>) {
         // Evict oldest same-IP if at per-IP limit.
         if self.count_for(dst_ip) >= PENDING_PER_IP {
-            if let Some(slot) = self.slots.iter_mut()
+            if let Some(slot) = self
+                .slots
+                .iter_mut()
                 .find(|s| s.as_ref().map(|p| p.dst_ip == dst_ip).unwrap_or(false))
             {
                 *slot = None;
@@ -156,7 +171,9 @@ static PENDING: Mutex<PendingQueue> = Mutex::new(PendingQueue::new());
 ///   arrives.
 /// * Directed / subnet broadcast always resolves to ff:ff:ff:ff:ff:ff.
 pub fn resolve(ip: u32) -> Option<[u8; 6]> {
-    if ip == 0xFFFF_FFFF { return Some([0xFF; 6]); }
+    if ip == 0xFFFF_FFFF {
+        return Some([0xFF; 6]);
+    }
     lookup(ip)
 }
 
@@ -181,7 +198,7 @@ pub fn resolve_or_queue(ip: u32, pkt: Vec<u8>) -> bool {
 /// Build and send an ARP request for `target_ip`.
 pub fn send_request(target_ip: u32) {
     let our_mac = eth::our_mac();
-    let our_ip  = crate::net::ip::our_ip();
+    let our_ip = crate::net::ip::our_ip();
     let mut pkt = [0u8; 28];
     pkt[0..2].copy_from_slice(&HW_ETHER.to_be_bytes());
     pkt[2..4].copy_from_slice(&PROTO_IP.to_be_bytes());
@@ -201,11 +218,13 @@ pub fn send_request(target_ip: u32) {
 /// directed at us, send a reply.  If this is a reply, also flush any pending
 /// packets queued for the sender's IP.
 pub fn receive(_src_mac: [u8; 6], pkt: &[u8]) {
-    if pkt.len() < 28 { return; }
-    let op         = u16::from_be_bytes([pkt[6],  pkt[7]]);
+    if pkt.len() < 28 {
+        return;
+    }
+    let op = u16::from_be_bytes([pkt[6], pkt[7]]);
     let sender_mac: [u8; 6] = pkt[8..14].try_into().unwrap();
-    let sender_ip  = u32::from_be_bytes([pkt[14], pkt[15], pkt[16], pkt[17]]);
-    let target_ip  = u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]);
+    let sender_ip = u32::from_be_bytes([pkt[14], pkt[15], pkt[16], pkt[17]]);
+    let target_ip = u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]);
 
     // Always learn the sender.
     insert(sender_ip, sender_mac);
@@ -213,7 +232,7 @@ pub fn receive(_src_mac: [u8; 6], pkt: &[u8]) {
     // Reply to requests directed at us.
     if op == OP_REQUEST && target_ip == crate::net::ip::our_ip() {
         let our_mac = eth::our_mac();
-        let our_ip  = crate::net::ip::our_ip();
+        let our_ip = crate::net::ip::our_ip();
         let mut reply = [0u8; 28];
         reply[0..2].copy_from_slice(&HW_ETHER.to_be_bytes());
         reply[2..4].copy_from_slice(&PROTO_IP.to_be_bytes());

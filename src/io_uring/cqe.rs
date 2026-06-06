@@ -28,7 +28,11 @@ impl Cqe {
     /// Return a zero-initialised CQE (const so it can seed static arrays).
     #[inline]
     pub const fn zeroed() -> Self {
-        Cqe { user_data: 0, res: 0, flags: 0 }
+        Cqe {
+            user_data: 0,
+            res: 0,
+            flags: 0,
+        }
     }
 
     /// Returns `Ok(res as usize)` for success, or maps the negated errno to
@@ -66,16 +70,16 @@ impl Cqe {
 // Prefixed `E_` to avoid collision with any future `std::io::ErrorKind` mirror.
 
 pub mod errno {
-    pub const E_AGAIN:       i32 = -11;  // EAGAIN / EWOULDBLOCK
-    pub const E_INTR:        i32 = -4;   // EINTR
-    pub const E_INVAL:       i32 = -22;  // EINVAL
-    pub const E_BADF:        i32 = -9;   // EBADF
-    pub const E_NOBUFS:      i32 = -105; // ENOBUFS
+    pub const E_AGAIN: i32 = -11; // EAGAIN / EWOULDBLOCK
+    pub const E_INTR: i32 = -4; // EINTR
+    pub const E_INVAL: i32 = -22; // EINVAL
+    pub const E_BADF: i32 = -9; // EBADF
+    pub const E_NOBUFS: i32 = -105; // ENOBUFS
     pub const E_CONNREFUSED: i32 = -111; // ECONNREFUSED
-    pub const E_CONNRESET:   i32 = -104; // ECONNRESET
-    pub const E_TIMEDOUT:    i32 = -110; // ETIMEDOUT
-    pub const E_ADDRINUSE:   i32 = -98;  // EADDRINUSE
-    pub const E_PIPE:        i32 = -32;  // EPIPE
-    pub const E_NOMEM:       i32 = -12;  // ENOMEM
-    pub const E_NOSYS:       i32 = -38;  // ENOSYS (opcode not implemented)
+    pub const E_CONNRESET: i32 = -104; // ECONNRESET
+    pub const E_TIMEDOUT: i32 = -110; // ETIMEDOUT
+    pub const E_ADDRINUSE: i32 = -98; // EADDRINUSE
+    pub const E_PIPE: i32 = -32; // EPIPE
+    pub const E_NOMEM: i32 = -12; // ENOMEM
+    pub const E_NOSYS: i32 = -38; // ENOSYS (opcode not implemented)
 }

@@ -65,12 +65,15 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::{Mutex, Once};
 
-use crate::arch::{Arch, api::{Paging, PageFlags}};
+use crate::arch::{
+    api::{PageFlags, Paging},
+    Arch,
+};
 use crate::mm::pmm::{alloc_page, free_page};
 use crate::proc::scheduler;
 
-const PAGE_SIZE:    usize = 4096;
-const PAGE_MASK:    usize = !(PAGE_SIZE - 1);
+const PAGE_SIZE: usize = 4096;
+const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 /// Maximum swap devices supported simultaneously.
 pub const MAX_SWAP_DEVS: usize = 8;
 /// Maximum swap slots per device (~16 GiB per device with 4 KiB pages).
@@ -85,7 +88,7 @@ const SWAP_MAGIC: u64 = 0x5257_4150_4D41_4743; // b"CGATPMAWS" reversed
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SwapSlot {
     /// Device index (0 … MAX_SWAP_DEVS-1).
-    pub dev:  u8,
+    pub dev: u8,
     /// Slot index within the device (1-based; 0 is reserved).
     pub slot: u32,
 }
@@ -103,20 +106,24 @@ impl SwapSlot {
     /// now non-overlapping for the full u32 slot range.
     #[inline]
     pub fn encode_pte(self) -> usize {
-        ((self.slot as usize) << 24)
-            | ((self.dev  as usize) << 16)
-            | 0xAB // swap-type marker; bit 0 (PRESENT/VALID) = 0
+        ((self.slot as usize) << 24) | ((self.dev as usize) << 16) | 0xAB // swap-type marker; bit 0 (PRESENT/VALID) = 0
     }
 
     /// Decode a not-present PTE back to a `SwapSlot`.
     /// Returns `None` if the PTE does not contain a valid swap entry.
     #[inline]
     pub fn decode_pte(pte: usize) -> Option<Self> {
-        if pte & 1 != 0 { return None; }         // present — not a swap PTE
-        if (pte & 0xFF) != 0xAB { return None; } // wrong marker
-        let dev  = ((pte >> 16) & 0xFF) as u8;
+        if pte & 1 != 0 {
+            return None;
+        } // present — not a swap PTE
+        if (pte & 0xFF) != 0xAB {
+            return None;
+        } // wrong marker
+        let dev = ((pte >> 16) & 0xFF) as u8;
         let slot = (pte >> 24) as u32;
-        if dev as usize >= MAX_SWAP_DEVS || slot == 0 { return None; }
+        if dev as usize >= MAX_SWAP_DEVS || slot == 0 {
+            return None;
+        }
         Some(SwapSlot { dev, slot })
     }
 
@@ -138,18 +145,18 @@ pub struct SwapOps {
     /// Write one page from `buf` to `byte_offset` on this device.
     pub write_page: unsafe fn(dev_priv: u64, byte_offset: u64, buf: *const u8) -> isize,
     /// Read  one page into `buf` from `byte_offset` on this device.
-    pub read_page:  unsafe fn(dev_priv: u64, byte_offset: u64, buf: *mut   u8) -> isize,
+    pub read_page: unsafe fn(dev_priv: u64, byte_offset: u64, buf: *mut u8) -> isize,
     /// Private data passed as the first argument to every I/O call.
     /// Typically a BAR base address or device index.
     pub dev_priv: u64,
 }
 
 struct SwapDevice {
-    ops:       SwapOps,
+    ops: SwapOps,
     /// Total number of slots on this device (including slot 0).
     num_slots: u32,
     /// Bitmap: bit N=1 → slot N is free.
-    free_map:  Vec<u64>,
+    free_map: Vec<u64>,
     /// Number of free slots remaining.
     free_count: u32,
     /// Next slot to consider when scanning (clock-hand for allocation).
@@ -161,9 +168,12 @@ impl SwapDevice {
         let words = ((num_slots + 63) / 64) as usize;
         let mut free_map = alloc::vec![u64::MAX; words];
         // Slot 0 is reserved — mark as used.
-        if !free_map.is_empty() { free_map[0] &= !1u64; }
+        if !free_map.is_empty() {
+            free_map[0] &= !1u64;
+        }
         SwapDevice {
-            ops, num_slots,
+            ops,
+            num_slots,
             free_map,
             free_count: num_slots.saturating_sub(1),
             alloc_hand: 1,
@@ -171,15 +181,21 @@ impl SwapDevice {
     }
 
     fn alloc_slot(&mut self) -> Option<u32> {
-        if self.free_count == 0 { return None; }
+        if self.free_count == 0 {
+            return None;
+        }
         let n = self.num_slots as usize;
         let start = self.alloc_hand as usize;
         for delta in 0..n {
-            let idx   = (start + delta) % n;
-            if idx == 0 { continue; } // slot 0 reserved
-            let word  = idx / 64;
-            let bit   = idx % 64;
-            if word >= self.free_map.len() { continue; }
+            let idx = (start + delta) % n;
+            if idx == 0 {
+                continue;
+            } // slot 0 reserved
+            let word = idx / 64;
+            let bit = idx % 64;
+            if word >= self.free_map.len() {
+                continue;
+            }
             if self.free_map[word] & (1u64 << bit) != 0 {
                 self.free_map[word] &= !(1u64 << bit); // mark used
                 self.free_count -= 1;
@@ -192,7 +208,7 @@ impl SwapDevice {
 
     fn free_slot(&mut self, slot: u32) {
         let word = (slot / 64) as usize;
-        let bit  = (slot % 64) as usize;
+        let bit = (slot % 64) as usize;
         if word < self.free_map.len() {
             if self.free_map[word] & (1u64 << bit) == 0 {
                 self.free_map[word] |= 1u64 << bit;
@@ -201,7 +217,9 @@ impl SwapDevice {
         }
     }
 
-    fn free_slots(&self) -> u32 { self.free_count }
+    fn free_slots(&self) -> u32 {
+        self.free_count
+    }
 }
 
 struct DevTable {
@@ -212,10 +230,7 @@ struct DevTable {
 impl DevTable {
     const fn new() -> Self {
         DevTable {
-            devs: [
-                None, None, None, None,
-                None, None, None, None,
-            ],
+            devs: [None, None, None, None, None, None, None, None],
             count: 0,
         }
     }
@@ -226,17 +241,17 @@ static DEV_TABLE: Mutex<DevTable> = Mutex::new(DevTable::new());
 #[derive(Clone, Copy, Default)]
 struct LruEntry {
     /// Physical address of the page frame.
-    pa:  usize,
+    pa: usize,
     /// PID that owns the virtual mapping.
     pid: u32,
     /// Virtual address in that process's address space.
-    va:  usize,
+    va: usize,
 }
 
 struct LruClock {
-    ring:  Vec<LruEntry>,
+    ring: Vec<LruEntry>,
     /// Index of the clock hand.
-    hand:  usize,
+    hand: usize,
     /// Number of valid entries currently in the ring.
     count: usize,
 }
@@ -244,8 +259,8 @@ struct LruClock {
 impl LruClock {
     fn new() -> Self {
         LruClock {
-            ring:  alloc::vec![LruEntry::default(); LRU_CAPACITY],
-            hand:  0,
+            ring: alloc::vec![LruEntry::default(); LRU_CAPACITY],
+            hand: 0,
             count: 0,
         }
     }
@@ -288,10 +303,16 @@ impl LruClock {
     ///
     /// Returns `None` if the ring is empty.
     fn next_candidate(&mut self) -> Option<LruEntry> {
-        if self.count == 0 { return None; }
+        if self.count == 0 {
+            return None;
+        }
         let e = self.ring[self.hand];
         self.hand = (self.hand + 1) % self.count;
-        if e.pa != 0 { Some(e) } else { None }
+        if e.pa != 0 {
+            Some(e)
+        } else {
+            None
+        }
     }
 }
 
@@ -303,25 +324,25 @@ static LRU: Once<Mutex<LruClock>> = Once::new();
 
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 
-static STAT_SWAPOUT:    AtomicU64 = AtomicU64::new(0);
-static STAT_SWAPIN:     AtomicU64 = AtomicU64::new(0);
+static STAT_SWAPOUT: AtomicU64 = AtomicU64::new(0);
+static STAT_SWAPIN: AtomicU64 = AtomicU64::new(0);
 static STAT_EVICT_FAIL: AtomicU64 = AtomicU64::new(0);
 static STAT_FREE_SLOTS: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SwapStats {
-    pub swapout_pages:   u64,
-    pub swapin_pages:    u64,
-    pub evict_failures:  u64,
-    pub free_slots:      u32,
+    pub swapout_pages: u64,
+    pub swapin_pages: u64,
+    pub evict_failures: u64,
+    pub free_slots: u32,
 }
 
 pub fn stats() -> SwapStats {
     SwapStats {
-        swapout_pages:  STAT_SWAPOUT.load(Ordering::Relaxed),
-        swapin_pages:   STAT_SWAPIN.load(Ordering::Relaxed),
+        swapout_pages: STAT_SWAPOUT.load(Ordering::Relaxed),
+        swapin_pages: STAT_SWAPIN.load(Ordering::Relaxed),
         evict_failures: STAT_EVICT_FAIL.load(Ordering::Relaxed),
-        free_slots:     STAT_FREE_SLOTS.load(Ordering::Relaxed),
+        free_slots: STAT_FREE_SLOTS.load(Ordering::Relaxed),
     }
 }
 
@@ -334,9 +355,13 @@ pub fn stats() -> SwapStats {
 /// Returns `Err(-28)` (ENOSPC) if all device slots are full.
 /// Returns `Err(-22)` (EINVAL) if `num_slots < 2`.
 pub fn add_swap_device(ops: SwapOps, num_slots: u32) -> Result<u8, isize> {
-    if num_slots < 2 { return Err(-22); }
+    if num_slots < 2 {
+        return Err(-22);
+    }
     let mut tbl = DEV_TABLE.lock();
-    if tbl.count >= MAX_SWAP_DEVS { return Err(-28); } // ENOSPC
+    if tbl.count >= MAX_SWAP_DEVS {
+        return Err(-28);
+    } // ENOSPC
     let idx = (0..MAX_SWAP_DEVS)
         .find(|&i| tbl.devs[i].is_none())
         .ok_or(-28isize)?;
@@ -360,7 +385,9 @@ pub fn add_swap_device(ops: SwapOps, num_slots: u32) -> Result<u8, isize> {
 pub fn remove_swap_device(dev_idx: u8) -> Result<(), isize> {
     let mut tbl = DEV_TABLE.lock();
     let idx = dev_idx as usize;
-    if idx >= MAX_SWAP_DEVS || tbl.devs[idx].is_none() { return Err(-6); } // ENXIO
+    if idx >= MAX_SWAP_DEVS || tbl.devs[idx].is_none() {
+        return Err(-6);
+    } // ENXIO
     let free = tbl.devs[idx].as_ref().map(|d| d.free_slots()).unwrap_or(0);
     tbl.devs[idx] = None;
     tbl.count -= 1;
@@ -401,7 +428,9 @@ pub fn untrack_page(pa: usize) {
 ///   - from `try_free_page` when `alloc_page()` returns `None`
 ///   - from `kswapd_tick` on a schedule
 pub fn swapout_one() -> bool {
-    if !is_enabled() { return false; }
+    if !is_enabled() {
+        return false;
+    }
     let lru_mutex = match LRU.get() {
         Some(m) => m,
         None => return false,
@@ -417,10 +446,14 @@ pub fn swapout_one() -> bool {
                 None => break,
             };
             // Skip pages belonging to the kernel (pid 0).
-            if e.pid == 0 { continue; }
+            if e.pid == 0 {
+                continue;
+            }
             // Check the accessed bit in the PTE.
             let cr3 = scheduler::with_proc(e.pid, |p| p.user_satp).unwrap_or(0);
-            if cr3 == 0 { continue; }
+            if cr3 == 0 {
+                continue;
+            }
             if <Arch as Paging>::pte_accessed(cr3, e.va) {
                 // Second-chance: clear the bit and skip this time.
                 <Arch as Paging>::clear_accessed(cr3, e.va);
@@ -437,7 +470,7 @@ pub fn swapout_one() -> bool {
         None => {
             STAT_EVICT_FAIL.fetch_add(1, Ordering::Relaxed);
             return false;
-        }
+        },
     };
 
     let slot = {
@@ -446,7 +479,10 @@ pub fn swapout_one() -> bool {
         for i in 0..MAX_SWAP_DEVS {
             if let Some(ref mut dev) = tbl.devs[i] {
                 if let Some(s) = dev.alloc_slot() {
-                    found = Some(SwapSlot { dev: i as u8, slot: s });
+                    found = Some(SwapSlot {
+                        dev: i as u8,
+                        slot: s,
+                    });
                     break;
                 }
             }
@@ -459,7 +495,7 @@ pub fn swapout_one() -> bool {
         None => {
             STAT_EVICT_FAIL.fetch_add(1, Ordering::Relaxed);
             return false;
-        }
+        },
     };
     STAT_FREE_SLOTS.fetch_sub(1, Ordering::Relaxed);
 
@@ -474,7 +510,7 @@ pub fn swapout_one() -> bool {
                 // Device disappeared between slot allocation and write.
                 STAT_EVICT_FAIL.fetch_add(1, Ordering::Relaxed);
                 return false;
-            }
+            },
         }
     }; // DEV_TABLE lock released here — before the I/O call
 
@@ -517,24 +553,24 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
     let page_va = faulting_va & PAGE_MASK;
 
     let cr3 = scheduler::with_proc(pid, |p| p.user_satp).unwrap_or(0);
-    if cr3 == 0 { return false; }
+    if cr3 == 0 {
+        return false;
+    }
 
     let raw_pte = <Arch as Paging>::read_pte(cr3, page_va);
     let slot = match SwapSlot::decode_pte(raw_pte) {
         Some(s) => s,
-        None    => return false, // not a swap PTE after all
+        None => return false, // not a swap PTE after all
     };
 
     // If the PMM is empty, try to free a page via swapout before retrying.
-    let pa_ptr = alloc_page().or_else(|| {
-        if swapout_one() { alloc_page() } else { None }
-    });
+    let pa_ptr = alloc_page().or_else(|| if swapout_one() { alloc_page() } else { None });
     let pa = match pa_ptr {
         Some(p) => p,
         None => {
             crate::proc::signal::send_signal(pid, 9 /* SIGKILL */);
             return false;
-        }
+        },
     };
 
     // Same pattern as swapout_one: extract I/O pointers then drop the lock
@@ -547,7 +583,7 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
                 free_page(pa);
                 crate::proc::signal::send_signal(pid, 7 /* SIGBUS */);
                 return false;
-            }
+            },
         }
     }; // DEV_TABLE lock released here
 
@@ -587,20 +623,23 @@ pub fn swapin(pid: u32, faulting_va: usize) -> bool {
 pub fn try_free_page(retries: usize) -> bool {
     let mut freed = false;
     for _ in 0..retries {
-        if swapout_one() { freed = true; break; }
+        if swapout_one() {
+            freed = true;
+            break;
+        }
     }
     freed
 }
 
 /// Watermarks: kswapd starts reclaiming below `LOW` and stops above `HIGH`.
 /// Units: number of free PMM pages.
-static WATERMARK_LOW:  AtomicU64 = AtomicU64::new(256);  // ~1 MiB
+static WATERMARK_LOW: AtomicU64 = AtomicU64::new(256); // ~1 MiB
 static WATERMARK_HIGH: AtomicU64 = AtomicU64::new(1024); // ~4 MiB
 
 /// Set the low/high watermarks (in pages).  Must satisfy `low < high`.
 pub fn set_watermarks(low: u64, high: u64) {
     if low < high {
-        WATERMARK_LOW.store(low,  Ordering::Relaxed);
+        WATERMARK_LOW.store(low, Ordering::Relaxed);
         WATERMARK_HIGH.store(high, Ordering::Relaxed);
     }
 }
@@ -612,16 +651,24 @@ pub fn set_watermarks(low: u64, high: u64) {
 /// no more pages can be evicted.  Caps a single tick at `max_per_tick`
 /// evictions to bound jitter.
 pub fn kswapd_tick(max_per_tick: usize) {
-    if !is_enabled() { return; }
-    let low  = WATERMARK_LOW.load(Ordering::Relaxed);
+    if !is_enabled() {
+        return;
+    }
+    let low = WATERMARK_LOW.load(Ordering::Relaxed);
     let high = WATERMARK_HIGH.load(Ordering::Relaxed);
     let free = crate::mm::pmm::free_pages() as u64;
-    if free >= low { return; } // above low watermark — nothing to do
+    if free >= low {
+        return;
+    } // above low watermark — nothing to do
     let mut reclaimed = 0;
     while reclaimed < max_per_tick {
         let now = crate::mm::pmm::free_pages() as u64;
-        if now >= high { break; } // reached high watermark
-        if !swapout_one() { break; } // no more candidates
+        if now >= high {
+            break;
+        } // reached high watermark
+        if !swapout_one() {
+            break;
+        } // no more candidates
         reclaimed += 1;
     }
 }
@@ -641,7 +688,7 @@ pub fn sys_swapon(path: *const u8, path_len: usize) -> isize {
     };
     match add_swap_device(ops, num_slots) {
         Ok(idx) => idx as isize,
-        Err(e)  => e,
+        Err(e) => e,
     }
 }
 
@@ -681,7 +728,8 @@ fn drain_swap_device(dev_idx: u8) {
     // Collect (pid, cr3) pairs under a read lock so we don't hold the
     // scheduler lock across the (potentially slow) swapin I/O calls.
     let targets: alloc::vec::Vec<(u32, usize)> = scheduler::with_procs_ro(|procs| {
-        procs.iter()
+        procs
+            .iter()
             .filter(|p| p.user_satp != 0)
             .map(|p| (p.pid as u32, p.user_satp))
             .collect()
@@ -706,8 +754,8 @@ fn drain_swap_device(dev_idx: u8) {
 
 /// One line of `/proc/swaps` output.
 pub struct SwapEntry {
-    pub dev_idx:    usize,
-    pub num_slots:  u32,
+    pub dev_idx: usize,
+    pub num_slots: u32,
     pub free_slots: u32,
 }
 
@@ -718,8 +766,8 @@ pub fn proc_swaps() -> Vec<SwapEntry> {
     for i in 0..MAX_SWAP_DEVS {
         if let Some(ref d) = tbl.devs[i] {
             out.push(SwapEntry {
-                dev_idx:    i,
-                num_slots:  d.num_slots,
+                dev_idx: i,
+                num_slots: d.num_slots,
                 free_slots: d.free_slots(),
             });
         }
@@ -743,7 +791,11 @@ use crate::mm::mmap::PROT_EXEC;
 #[inline]
 fn prot_to_flags(prot: u32) -> PageFlags {
     let mut f = PageFlags::PRESENT | PageFlags::USER;
-    if prot & PROT_WRITE != 0 { f |= PageFlags::WRITE; }
-    if prot & PROT_EXEC  == 0 { f |= PageFlags::NX;    }
+    if prot & PROT_WRITE != 0 {
+        f |= PageFlags::WRITE;
+    }
+    if prot & PROT_EXEC == 0 {
+        f |= PageFlags::NX;
+    }
     f
 }

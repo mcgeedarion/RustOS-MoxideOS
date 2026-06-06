@@ -65,15 +65,15 @@ extern "C" {
 /// correctly (i.e., the linker script includes the `.kmtest_registry` section).
 unsafe fn registry() -> &'static [KmTestEntry] {
     let start = core::ptr::addr_of!(__kmtest_start);
-    let end   = core::ptr::addr_of!(__kmtest_end);
-    let len   = (end as usize - start as usize) / core::mem::size_of::<KmTestEntry>();
+    let end = core::ptr::addr_of!(__kmtest_end);
+    let len = (end as usize - start as usize) / core::mem::size_of::<KmTestEntry>();
     core::slice::from_raw_parts(start, len)
 }
 
 /// Aggregate result returned by `run_all()`.
 #[derive(Copy, Clone)]
 pub struct KmTestSummary {
-    pub total:  usize,
+    pub total: usize,
     pub passed: usize,
     pub failed: usize,
 }
@@ -117,13 +117,17 @@ pub fn run_all(mut report: impl FnMut(&'static str, KmTestResult)) -> KmTestSumm
     // SAFETY: relies on correct linker script placement; see `registry()` docs.
     let tests = unsafe { registry() };
 
-    let mut summary = KmTestSummary { total: tests.len(), passed: 0, failed: 0 };
+    let mut summary = KmTestSummary {
+        total: tests.len(),
+        passed: 0,
+        failed: 0,
+    };
 
     for entry in tests {
         let result = (entry.run)();
         match &result {
-            Ok(())   => summary.passed += 1,
-            Err(_)   => summary.failed += 1,
+            Ok(()) => summary.passed += 1,
+            Err(_) => summary.failed += 1,
         }
         report(entry.name, result);
     }

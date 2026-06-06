@@ -21,8 +21,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::breakpoints::{HwBreakpointTable, SwBreakpointTable, WatchKind, WatchpointTable};
 use super::target::GdbTarget;
-use super::breakpoints::{SwBreakpointTable, HwBreakpointTable, WatchpointTable, WatchKind};
 
 // GDB AArch64 register count: x0-x30, sp, pc, cpsr = 34
 pub const AARCH64_REG_COUNT: usize = 34;
@@ -98,11 +98,17 @@ fn rsp_packet(body: &str) -> String {
 fn read_raw_regs(target: &GdbTarget) -> [u64; AARCH64_FRAME_SIZE] {
     use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_read};
     let bfd = crate::fs::process_fd::proc_fd_backing(
-        crate::proc::scheduler::current_pid(), target.regs_fd);
+        crate::proc::scheduler::current_pid(),
+        target.regs_fd,
+    );
     let mut frame = [0u64; AARCH64_FRAME_SIZE];
-    if bfd < 0 { return frame; }
+    if bfd < 0 {
+        return frame;
+    }
     let bfd = bfd as usize;
-    if !is_proc_debug_fd(bfd) { return frame; }
+    if !is_proc_debug_fd(bfd) {
+        return frame;
+    }
     let mut buf = [0u8; AARCH64_FRAME_SIZE * 8];
     proc_debug_read(bfd, &mut buf, 0);
     for i in 0..AARCH64_FRAME_SIZE {
@@ -114,10 +120,16 @@ fn read_raw_regs(target: &GdbTarget) -> [u64; AARCH64_FRAME_SIZE] {
 fn write_raw_regs(target: &GdbTarget, frame: &[u64; AARCH64_FRAME_SIZE]) {
     use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_write};
     let bfd = crate::fs::process_fd::proc_fd_backing(
-        crate::proc::scheduler::current_pid(), target.regs_fd);
-    if bfd < 0 { return; }
+        crate::proc::scheduler::current_pid(),
+        target.regs_fd,
+    );
+    if bfd < 0 {
+        return;
+    }
     let bfd = bfd as usize;
-    if !is_proc_debug_fd(bfd) { return; }
+    if !is_proc_debug_fd(bfd) {
+        return;
+    }
     let mut buf = [0u8; AARCH64_FRAME_SIZE * 8];
     for i in 0..AARCH64_FRAME_SIZE {
         buf[i * 8..(i + 1) * 8].copy_from_slice(&frame[i].to_le_bytes());
@@ -131,7 +143,7 @@ fn write_raw_regs(target: &GdbTarget, frame: &[u64; AARCH64_FRAME_SIZE]) {
 
 /// State saved when a `BRK #0` is injected for single-step.
 pub struct BrkState {
-    pub addr:     u64,
+    pub addr: u64,
     pub original: [u8; 4],
 }
 
@@ -140,7 +152,9 @@ pub fn step_inject_brk(target: &mut GdbTarget) -> Option<BrkState> {
     let raw = read_raw_regs(target);
     let pc = raw[32]; // frame[32] = pc
     let original_bytes = target.read_mem(pc, 4);
-    if original_bytes.len() < 4 { return None; }
+    if original_bytes.len() < 4 {
+        return None;
+    }
     let original: [u8; 4] = original_bytes[..4].try_into().ok()?;
     // BRK #0 = 0xd4200000 little-endian
     target.write_mem(pc, &[0x00, 0x00, 0x20, 0xd4]);
@@ -157,16 +171,16 @@ pub fn step_restore_brk(target: &mut GdbTarget, state: &BrkState) {
 // ---------------------------------------------------------------------------
 
 pub struct Aarch64Session {
-    pub sw_bps:  SwBreakpointTable,
-    pub hw_bps:  HwBreakpointTable,
+    pub sw_bps: SwBreakpointTable,
+    pub hw_bps: HwBreakpointTable,
     pub watches: WatchpointTable,
 }
 
 impl Aarch64Session {
     pub fn new() -> Self {
         Aarch64Session {
-            sw_bps:  SwBreakpointTable::new(),
-            hw_bps:  HwBreakpointTable::new(),
+            sw_bps: SwBreakpointTable::new(),
+            hw_bps: HwBreakpointTable::new(),
             watches: WatchpointTable::new(),
         }
     }
@@ -185,58 +199,88 @@ impl Aarch64Session {
 
 fn handle_z_packet(body: &str, target: &mut GdbTarget, session: &mut Aarch64Session) -> String {
     let insert = body.as_bytes()[0] == b'Z';
-    let rest   = &body[1..];
+    let rest = &body[1..];
     let mut parts = rest.splitn(3, ',');
-    let kind  = parts.next().unwrap_or("");
-    let addr  = parse_hex_u64(parts.next().unwrap_or(""));
+    let kind = parts.next().unwrap_or("");
+    let addr = parse_hex_u64(parts.next().unwrap_or(""));
     let _size = parse_hex_u64(parts.next().unwrap_or("")) as usize;
 
     match kind {
         "0" => {
             if insert {
-                if session.sw_bps.add(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.sw_bps.add(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             } else {
-                if session.sw_bps.remove(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.sw_bps.remove(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             }
-        }
+        },
         "1" => {
             if insert {
-                if session.hw_bps.add_exec(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.hw_bps.add_exec(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             } else {
-                if session.hw_bps.remove(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.hw_bps.remove(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             }
-        }
+        },
         "2" => {
             if insert {
-                if session.watches.add(target, addr, _size, WatchKind::Write) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.watches.add(target, addr, _size, WatchKind::Write) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             } else {
-                if session.watches.remove(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.watches.remove(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             }
-        }
+        },
         "3" => {
             if insert {
-                if session.watches.add(target, addr, _size, WatchKind::Read) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.watches.add(target, addr, _size, WatchKind::Read) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             } else {
-                if session.watches.remove(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.watches.remove(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             }
-        }
+        },
         "4" => {
             if insert {
-                if session.watches.add(target, addr, _size, WatchKind::Access) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.watches.add(target, addr, _size, WatchKind::Access) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             } else {
-                if session.watches.remove(target, addr) { rsp_packet("OK") }
-                else { rsp_packet("E01") }
+                if session.watches.remove(target, addr) {
+                    rsp_packet("OK")
+                } else {
+                    rsp_packet("E01")
+                }
             }
-        }
+        },
         _ => rsp_packet(""),
     }
 }
@@ -246,89 +290,106 @@ fn handle_z_packet(body: &str, target: &mut GdbTarget, session: &mut Aarch64Sess
 // ---------------------------------------------------------------------------
 
 pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Aarch64Session) -> String {
-    if body.is_empty() { return rsp_packet(""); }
+    if body.is_empty() {
+        return rsp_packet("");
+    }
     match body.as_bytes()[0] {
         b'?' => {
             let status = target.poll_status();
-            if status.starts_with('T') { rsp_packet(&status) }
-            else { rsp_packet("T05") }
-        }
+            if status.starts_with('T') {
+                rsp_packet(&status)
+            } else {
+                rsp_packet("T05")
+            }
+        },
         // Read all registers
         b'g' => {
             let raw = read_raw_regs(target);
             let regs = build_gdb_regs(&raw);
             let mut hex = String::with_capacity(AARCH64_REG_COUNT * 16);
-            for &v in &regs { hex.push_str(&u64_le_hex(v)); }
+            for &v in &regs {
+                hex.push_str(&u64_le_hex(v));
+            }
             rsp_packet(&hex)
-        }
+        },
         // Write all registers
         b'G' => {
             let bytes = decode_hex_bytes(&body[1..]);
             let mut gdb_regs = [0u64; AARCH64_REG_COUNT];
             for i in 0..AARCH64_REG_COUNT {
                 let off = i * 8;
-                if off + 8 > bytes.len() { break; }
+                if off + 8 > bytes.len() {
+                    break;
+                }
                 gdb_regs[i] = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
             }
             let frame = unpack_gdb_regs(&gdb_regs);
             write_raw_regs(target, &frame);
             rsp_packet("OK")
-        }
+        },
         // Read single register  'p<regnum>'
         b'p' => {
             let idx = parse_hex_u64(&body[1..]) as usize;
-            if idx >= AARCH64_REG_COUNT { return rsp_packet("E01"); }
+            if idx >= AARCH64_REG_COUNT {
+                return rsp_packet("E01");
+            }
             let raw = read_raw_regs(target);
             let regs = build_gdb_regs(&raw);
             rsp_packet(&u64_le_hex(regs[idx]))
-        }
+        },
         // Write single register  'P<regnum>=<val>'
         b'P' => {
             let rest = &body[1..];
-            let eq  = rest.find('=').unwrap_or(rest.len());
+            let eq = rest.find('=').unwrap_or(rest.len());
             let idx = parse_hex_u64(&rest[..eq]) as usize;
             let val = parse_hex_u64(&rest[eq + 1..]);
-            if idx >= AARCH64_REG_COUNT { return rsp_packet("E01"); }
+            if idx >= AARCH64_REG_COUNT {
+                return rsp_packet("E01");
+            }
             let mut frame = read_raw_regs(target);
             frame[idx] = val;
             write_raw_regs(target, &frame);
             rsp_packet("OK")
-        }
+        },
         // Read memory  'm<addr>,<len>'
         b'm' => {
             let rest = &body[1..];
             let mut parts = rest.splitn(2, ',');
             let addr = parse_hex_u64(parts.next().unwrap_or(""));
-            let len  = parse_hex_u64(parts.next().unwrap_or("")) as usize;
+            let len = parse_hex_u64(parts.next().unwrap_or("")) as usize;
             let data = target.read_mem(addr, len);
             rsp_packet(&encode_hex_bytes(&data))
-        }
+        },
         // Write memory  'M<addr>,<len>:<hex>'
         b'M' => {
             let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
             let addr = parse_hex_u64(&rest[..rest.find(',').unwrap_or(colon)]);
-            let hex_data = if colon < rest.len() { &rest[colon + 1..] } else { "" };
+            let hex_data = if colon < rest.len() {
+                &rest[colon + 1..]
+            } else {
+                ""
+            };
             target.write_mem(addr, &decode_hex_bytes(hex_data));
             rsp_packet("OK")
-        }
+        },
         // Continue
         b'c' => {
             target.ctl("cont");
             String::new()
-        }
+        },
         // Single-step: inject BRK #0 then continue
         b's' => {
             let _ = step_inject_brk(target);
             target.ctl("cont");
             String::new()
-        }
+        },
         // Breakpoints / watchpoints
         b'Z' | b'z' => handle_z_packet(body, target, session),
         b'k' => {
             crate::proc::signal::send_signal(target.pid, 9);
             rsp_packet("OK")
-        }
+        },
         b'q' => {
             if body.starts_with("qSupported") {
                 rsp_packet("PacketSize=4000;swbreak+;hwbreak+;watchpoint+")
@@ -337,7 +398,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Aarch64Se
             } else {
                 rsp_packet("")
             }
-        }
+        },
         _ => rsp_packet(""),
     }
 }

@@ -65,13 +65,13 @@ fn lsm_check_existing(path: &str, flags: u32) -> Result<(), isize> {
 
 pub fn open_raw(path: &str, flags: u32) -> Result<usize, isize> {
     match lsm_check_existing(path, flags) {
-        Ok(()) => {}
+        Ok(()) => {},
         Err(-2) if flags & O_CREAT != 0 => {
             let ctx = crate::security::lsm::LsmCtx::for_current_task("", 0, 0o666);
             crate::security::lsm::lsm_dispatch(crate::security::lsm::Hook::InodeCreate, &ctx)
                 .map_err(|e| e as isize)?;
             crate::fs::vfs_ops::create(path)?;
-        }
+        },
         Err(e) => return Err(e),
     }
 
@@ -185,7 +185,7 @@ pub fn dup_from_raw(fd: usize, min_fd: usize) -> isize {
         Some(n) => {
             fds.insert(n, raw);
             n as isize
-        }
+        },
         None => -24,
     }
 }
@@ -344,7 +344,7 @@ pub fn flush_fd(fd: usize, include_metadata: bool) -> isize {
             let _ = include_metadata; // reserved for future split accounting
             crate::fs::ext2::sync_inode(&path);
             0
-        }
+        },
         // All other current backends are write-through or read-only.
         // Returning 0 is correct per POSIX ("shall not fail" for sync on
         // write-through systems).

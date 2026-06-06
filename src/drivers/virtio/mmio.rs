@@ -9,36 +9,36 @@ use core::ptr::{read_volatile, write_volatile};
 // ---------------------------------------------------------------------------
 // MMIO register offsets (§4.2.2)
 // ---------------------------------------------------------------------------
-const OFF_MAGIC:            usize = 0x000; // ro: 0x74726976
-const OFF_VERSION:          usize = 0x004; // ro: must be 2
-const OFF_DEVICE_ID:        usize = 0x008;
-const OFF_VENDOR_ID:        usize = 0x00C;
-const OFF_DEVICE_FEATURES:  usize = 0x010;
-const OFF_DEVICE_FEAT_SEL:  usize = 0x014;
-const OFF_DRIVER_FEATURES:  usize = 0x020;
-const OFF_DRIVER_FEAT_SEL:  usize = 0x024;
-const OFF_QUEUE_SEL:        usize = 0x030;
-const OFF_QUEUE_NUM_MAX:    usize = 0x034;
-const OFF_QUEUE_NUM:        usize = 0x038;
-const OFF_QUEUE_READY:      usize = 0x044;
-const OFF_QUEUE_NOTIFY:     usize = 0x050;
+const OFF_MAGIC: usize = 0x000; // ro: 0x74726976
+const OFF_VERSION: usize = 0x004; // ro: must be 2
+const OFF_DEVICE_ID: usize = 0x008;
+const OFF_VENDOR_ID: usize = 0x00C;
+const OFF_DEVICE_FEATURES: usize = 0x010;
+const OFF_DEVICE_FEAT_SEL: usize = 0x014;
+const OFF_DRIVER_FEATURES: usize = 0x020;
+const OFF_DRIVER_FEAT_SEL: usize = 0x024;
+const OFF_QUEUE_SEL: usize = 0x030;
+const OFF_QUEUE_NUM_MAX: usize = 0x034;
+const OFF_QUEUE_NUM: usize = 0x038;
+const OFF_QUEUE_READY: usize = 0x044;
+const OFF_QUEUE_NOTIFY: usize = 0x050;
 const OFF_INTERRUPT_STATUS: usize = 0x060;
-const OFF_INTERRUPT_ACK:    usize = 0x064;
-const OFF_STATUS:           usize = 0x070;
-const OFF_QUEUE_DESC_LOW:   usize = 0x080;
-const OFF_QUEUE_DESC_HIGH:  usize = 0x084;
-const OFF_QUEUE_AVAIL_LOW:  usize = 0x090;
+const OFF_INTERRUPT_ACK: usize = 0x064;
+const OFF_STATUS: usize = 0x070;
+const OFF_QUEUE_DESC_LOW: usize = 0x080;
+const OFF_QUEUE_DESC_HIGH: usize = 0x084;
+const OFF_QUEUE_AVAIL_LOW: usize = 0x090;
 const OFF_QUEUE_AVAIL_HIGH: usize = 0x094;
-const OFF_QUEUE_USED_LOW:   usize = 0x0A0;
-const OFF_QUEUE_USED_HIGH:  usize = 0x0A4;
-const OFF_CONFIG:           usize = 0x100;
+const OFF_QUEUE_USED_LOW: usize = 0x0A0;
+const OFF_QUEUE_USED_HIGH: usize = 0x0A4;
+const OFF_CONFIG: usize = 0x100;
 
 // Device status bits (§2.1)
-const STATUS_ACKNOWLEDGE:   u32 = 1;
-const STATUS_DRIVER:        u32 = 2;
-const STATUS_DRIVER_OK:     u32 = 4;
-const STATUS_FEATURES_OK:   u32 = 8;
-const STATUS_FAILED:        u32 = 128;
+const STATUS_ACKNOWLEDGE: u32 = 1;
+const STATUS_DRIVER: u32 = 2;
+const STATUS_DRIVER_OK: u32 = 4;
+const STATUS_FEATURES_OK: u32 = 8;
+const STATUS_FAILED: u32 = 128;
 
 const VIRTIO_MAGIC: u32 = 0x74726976;
 
@@ -57,8 +57,12 @@ impl VirtioMmio {
     pub fn new(base: usize) -> Option<Self> {
         let dev = Self { base };
 
-        if dev.read(OFF_MAGIC) != VIRTIO_MAGIC { return None; }
-        if dev.read(OFF_VERSION) != 2          { return None; }
+        if dev.read(OFF_MAGIC) != VIRTIO_MAGIC {
+            return None;
+        }
+        if dev.read(OFF_VERSION) != 2 {
+            return None;
+        }
 
         // Reset device, then set ACKNOWLEDGE | DRIVER
         dev.write(OFF_STATUS, 0);
@@ -100,15 +104,18 @@ impl VirtioMmio {
     /// Configure virtqueue `idx` with the given physical addresses.
     pub fn init_queue(&self, idx: u32, num: u32, desc: u64, avail: u64, used: u64) {
         self.write(OFF_QUEUE_SEL, idx);
-        assert!(num <= self.read(OFF_QUEUE_NUM_MAX), "queue size exceeds device max");
+        assert!(
+            num <= self.read(OFF_QUEUE_NUM_MAX),
+            "queue size exceeds device max"
+        );
         self.write(OFF_QUEUE_NUM, num);
 
-        self.write(OFF_QUEUE_DESC_LOW,   (desc  & 0xFFFF_FFFF) as u32);
-        self.write(OFF_QUEUE_DESC_HIGH,  (desc  >> 32) as u32);
-        self.write(OFF_QUEUE_AVAIL_LOW,  (avail & 0xFFFF_FFFF) as u32);
+        self.write(OFF_QUEUE_DESC_LOW, (desc & 0xFFFF_FFFF) as u32);
+        self.write(OFF_QUEUE_DESC_HIGH, (desc >> 32) as u32);
+        self.write(OFF_QUEUE_AVAIL_LOW, (avail & 0xFFFF_FFFF) as u32);
         self.write(OFF_QUEUE_AVAIL_HIGH, (avail >> 32) as u32);
-        self.write(OFF_QUEUE_USED_LOW,   (used  & 0xFFFF_FFFF) as u32);
-        self.write(OFF_QUEUE_USED_HIGH,  (used  >> 32) as u32);
+        self.write(OFF_QUEUE_USED_LOW, (used & 0xFFFF_FFFF) as u32);
+        self.write(OFF_QUEUE_USED_HIGH, (used >> 32) as u32);
 
         self.write(OFF_QUEUE_READY, 1);
     }

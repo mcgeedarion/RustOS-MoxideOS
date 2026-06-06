@@ -16,14 +16,14 @@
 //!   CLINT base:          0x0200_0000
 //!   timebase-frequency:  10_000_000 Hz  (10 MHz)
 
-use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MTIME_OFFSET: usize = 0xBFF8;
 const MTIMECMP_BASE: usize = 0x4000;
 
-static CLINT_BASE:   AtomicU64  = AtomicU64::new(0x0200_0000); // QEMU default
-static TIMEBASE_HZ:  AtomicU64  = AtomicU64::new(10_000_000);  // 10 MHz default
-static CLINT_READY:  AtomicBool = AtomicBool::new(false);
+static CLINT_BASE: AtomicU64 = AtomicU64::new(0x0200_0000); // QEMU default
+static TIMEBASE_HZ: AtomicU64 = AtomicU64::new(10_000_000); // 10 MHz default
+static CLINT_READY: AtomicBool = AtomicBool::new(false);
 
 /// Initialise CLINT clocksource.  `base` and `freq_hz` come from the FDT.
 /// Falls back to QEMU defaults if called with zeros.
@@ -34,8 +34,12 @@ pub fn init() -> bool {
 
 /// Configure with FDT-provided base address and timebase frequency.
 pub fn configure(base: u64, freq_hz: u64) {
-    if base    != 0 { CLINT_BASE.store(base, Ordering::SeqCst); }
-    if freq_hz != 0 { TIMEBASE_HZ.store(freq_hz, Ordering::SeqCst); }
+    if base != 0 {
+        CLINT_BASE.store(base, Ordering::SeqCst);
+    }
+    if freq_hz != 0 {
+        TIMEBASE_HZ.store(freq_hz, Ordering::SeqCst);
+    }
 }
 
 /// Read the `mtime` counter.
@@ -58,16 +62,21 @@ pub fn read_ns() -> u64 {
     ticks_to_ns(read_mtime())
 }
 
-/// Program `mtimecmp` for hart `hartid` to fire an interrupt `ns_from_now` ns later.
+/// Program `mtimecmp` for hart `hartid` to fire an interrupt `ns_from_now` ns
+/// later.
 pub fn set_next_event(hartid: usize, ns_from_now: u64) {
     let base = CLINT_BASE.load(Ordering::Relaxed);
-    let hz   = TIMEBASE_HZ.load(Ordering::Relaxed);
-    let now  = read_mtime();
+    let hz = TIMEBASE_HZ.load(Ordering::Relaxed);
+    let now = read_mtime();
     let delta_ticks = (ns_from_now as u128 * hz as u128 / 1_000_000_000) as u64;
-    let cmp  = now.wrapping_add(delta_ticks);
+    let cmp = now.wrapping_add(delta_ticks);
     let addr = (base as usize + MTIMECMP_BASE + hartid * 8) as *mut u64;
-    unsafe { core::ptr::write_volatile(addr, cmp); }
+    unsafe {
+        core::ptr::write_volatile(addr, cmp);
+    }
 }
 
 /// Return the timebase frequency (from FDT or default).
-pub fn freq_hz() -> u64 { TIMEBASE_HZ.load(Ordering::Relaxed) }
+pub fn freq_hz() -> u64 {
+    TIMEBASE_HZ.load(Ordering::Relaxed)
+}

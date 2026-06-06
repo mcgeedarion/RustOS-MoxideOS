@@ -7,20 +7,14 @@
 //!
 //! New code should import from `crate::device::pci` directly.
 
-use crate::device::pci::{
-    self as pci_bus,
-    ecam,
-};
 pub use crate::device::pci::PciDevice;
+use crate::device::pci::{self as pci_bus, ecam};
 
 // Legacy class-tuple constants + class lookup live in the x86_64 PCI
 // driver. Re-export so callers can use the `drivers::pcie::*` path.
 #[cfg(target_arch = "x86_64")]
 pub use crate::arch::x86_64::pci::{
-    PCI_CLASS_STORAGE_AHCI,
-    PCI_CLASS_STORAGE_NVME,
-    PCI_CLASS_NETWORK_ETH,
-    find_device_by_class,
+    find_device_by_class, PCI_CLASS_NETWORK_ETH, PCI_CLASS_STORAGE_AHCI, PCI_CLASS_STORAGE_NVME,
 };
 use crate::device::pci::msix::msix_configure as _msix_configure;
 
@@ -60,9 +54,10 @@ pub fn cfg_write16(bus: u8, dev: u8, func: u8, off: u16, val: u16) {
     ecam::cfg_write16(bus, dev, func, off, val)
 }
 
-// PciDevice is already brought into scope at the top via `use crate::device::pci::PciDevice;`
-// (it is public by virtue of being defined in a pub module and re-exporting it
-//  here as a second `pub use` would shadow itself; downstream callers can use
+// PciDevice is already brought into scope at the top via `use
+// crate::device::pci::PciDevice;` (it is public by virtue of being defined in a
+// pub module and re-exporting it  here as a second `pub use` would shadow
+// itself; downstream callers can use
 //  either `crate::drivers::platform::pcie::PciDevice` (via the `use` above) or
 //  `crate::device::pci::PciDevice` directly).
 
@@ -82,16 +77,13 @@ pub fn find(vendor: u16, device_id: u16) -> Option<PciDevice> {
 }
 
 /// Configure an MSI-X vector.  Delegates to `device::pci::msix`.
-pub fn msix_configure(
-    d:        &PciDevice,
-    vec_idx:  usize,
-    lapic_id: u32,
-    vector:   u8,
-    data:     u32,
-) {
+pub fn msix_configure(d: &PciDevice, vec_idx: usize, lapic_id: u32, vector: u8, data: u32) {
     _msix_configure(d, vec_idx, lapic_id, vector, data);
 }
 
 // ===== GUESS: alias for kernel_main bring-up =====
 /// GUESS: alias to arch PCI enumeration init.
-#[inline] pub fn pcie_init() { crate::arch::x86_64::pci::init(); }
+#[inline]
+pub fn pcie_init() {
+    crate::arch::x86_64::pci::init();
+}

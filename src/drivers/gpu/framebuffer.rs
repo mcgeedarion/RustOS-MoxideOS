@@ -8,8 +8,8 @@ use crate::drivers::gpu::drm::GemBo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
-    Argb8888,  // 0xAARRGGBB
-    Xrgb8888,  // 0x00RRGGBB
+    Argb8888, // 0xAARRGGBB
+    Xrgb8888, // 0x00RRGGBB
     Rgb565,
     Bgr888,
 }
@@ -18,37 +18,45 @@ impl PixelFormat {
     pub fn bytes_per_pixel(self) -> usize {
         match self {
             PixelFormat::Argb8888 | PixelFormat::Xrgb8888 => 4,
-            PixelFormat::Rgb565   => 2,
-            PixelFormat::Bgr888   => 3,
+            PixelFormat::Rgb565 => 2,
+            PixelFormat::Bgr888 => 3,
         }
     }
 }
 
 impl Default for PixelFormat {
-    fn default() -> Self { PixelFormat::Xrgb8888 }
+    fn default() -> Self {
+        PixelFormat::Xrgb8888
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Framebuffer {
-    pub phys:   u64,
-    pub width:  u32,
+    pub phys: u64,
+    pub width: u32,
     pub height: u32,
-    pub pitch:  u32,  // bytes per row
+    pub pitch: u32, // bytes per row
     pub format: PixelFormat,
 }
 
 impl Framebuffer {
     pub fn new(phys: u64, width: u32, height: u32, format: PixelFormat) -> Self {
         let pitch = width * format.bytes_per_pixel() as u32;
-        Self { phys, width, height, pitch, format }
+        Self {
+            phys,
+            width,
+            height,
+            pitch,
+            format,
+        }
     }
 
     pub fn from_gem(bo: &GemBo) -> Self {
         Self {
-            phys:   bo.phys,
-            width:  bo.width,
+            phys: bo.phys,
+            width: bo.width,
             height: bo.height,
-            pitch:  bo.pitch,
+            pitch: bo.pitch,
             format: bo.format,
         }
     }
@@ -75,17 +83,18 @@ impl Framebuffer {
     pub fn put_pixel(&self, x: u32, y: u32, argb: u32) {
         let off = (y * self.pitch / 4 + x) as usize;
         unsafe {
-            core::ptr::write_volatile(
-                (self.phys as *mut u32).add(off),
-                argb,
-            );
+            core::ptr::write_volatile((self.phys as *mut u32).add(off), argb);
         }
     }
 
     /// Fill the entire framebuffer with `argb`.
     pub fn clear(&self, argb: u32) {
         let px = self.as_u32_slice_mut();
-        for p in px.iter_mut() { unsafe { core::ptr::write_volatile(p, argb); } }
+        for p in px.iter_mut() {
+            unsafe {
+                core::ptr::write_volatile(p, argb);
+            }
+        }
     }
 
     /// Blit a `w*h` ARGB pixel rectangle at `(x, y)`.
@@ -96,7 +105,9 @@ impl Framebuffer {
             let dst = self.as_u32_slice_mut();
             for col in 0..w as usize {
                 if dst_off + col < dst.len() && src_off + col < pixels.len() {
-                    unsafe { core::ptr::write_volatile(&mut dst[dst_off + col], pixels[src_off + col]); }
+                    unsafe {
+                        core::ptr::write_volatile(&mut dst[dst_off + col], pixels[src_off + col]);
+                    }
                 }
             }
         }

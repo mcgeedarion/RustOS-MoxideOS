@@ -13,12 +13,12 @@
 //! PCIe ACPI-mediated hot-plug (GPE + Notify) is in `hotplug`.
 //! NUMA topology (SRAT + SLIT) is in `numa`.
 
-pub mod power;
-pub mod sleep;
-pub mod cpufreq;
 pub mod battery;
+pub mod cpufreq;
 pub mod hotplug;
 pub mod numa;
+pub mod power;
+pub mod sleep;
 
 use core::mem::size_of;
 use core::slice;
@@ -95,7 +95,10 @@ pub unsafe fn init(rsdp_phys: usize) {
         println!("acpi: bad rsdp sig");
         return;
     }
-    if !checksum_ok(slice::from_raw_parts(rsdp_phys as *const u8, size_of::<RsdpV1>())) {
+    if !checksum_ok(slice::from_raw_parts(
+        rsdp_phys as *const u8,
+        size_of::<RsdpV1>(),
+    )) {
         println!("acpi: rsdp v1 checksum failed");
         return;
     }
@@ -132,7 +135,7 @@ pub unsafe fn find_table(sig: &[u8; 4]) -> Option<*const SdtHeader> {
                     return Some(phys as *const SdtHeader);
                 }
             }
-        }
+        },
         AcpiRoot::Xsdt(hdr) => {
             let hdr_ref = &*hdr;
             let total = hdr_ref.len as usize;
@@ -146,7 +149,7 @@ pub unsafe fn find_table(sig: &[u8; 4]) -> Option<*const SdtHeader> {
                     return Some(phys as *const SdtHeader);
                 }
             }
-        }
+        },
     }
     None
 }
@@ -190,7 +193,11 @@ pub fn mcfg_base() -> Option<usize> {
         let mcfg = find_table(b"MCFG")?;
         let body = (mcfg as usize + 44) as *const u64;
         let base = body.read_unaligned();
-        if base == 0 { None } else { Some(base as usize) }
+        if base == 0 {
+            None
+        } else {
+            Some(base as usize)
+        }
     }
 }
 
@@ -205,7 +212,11 @@ pub fn cpu_count() -> usize {
             }
         });
     }
-    if count == 0 { 1 } else { count }
+    if count == 0 {
+        1
+    } else {
+        count
+    }
 }
 
 /// Return the base address of the PCIe ECAM region from MCFG, if present.

@@ -28,21 +28,21 @@ use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 
-const GPIO_INPUT_VAL:  usize = 0x00;
-const GPIO_INPUT_EN:   usize = 0x04;
-const GPIO_OUTPUT_EN:  usize = 0x08;
+const GPIO_INPUT_VAL: usize = 0x00;
+const GPIO_INPUT_EN: usize = 0x04;
+const GPIO_OUTPUT_EN: usize = 0x08;
 const GPIO_OUTPUT_VAL: usize = 0x0C;
-const GPIO_RISE_IE:    usize = 0x10;
-const GPIO_RISE_IP:    usize = 0x14;
-const GPIO_FALL_IE:    usize = 0x18;
-const GPIO_FALL_IP:    usize = 0x1C;
-const GPIO_HIGH_IE:    usize = 0x20;
-const GPIO_HIGH_IP:    usize = 0x24;
-const GPIO_LOW_IE:     usize = 0x28;
-const GPIO_LOW_IP:     usize = 0x2C;
-const GPIO_IOF_EN:     usize = 0x30;
-const GPIO_IOF_SEL:    usize = 0x34;
-const GPIO_OUT_XOR:    usize = 0x38;
+const GPIO_RISE_IE: usize = 0x10;
+const GPIO_RISE_IP: usize = 0x14;
+const GPIO_FALL_IE: usize = 0x18;
+const GPIO_FALL_IP: usize = 0x1C;
+const GPIO_HIGH_IE: usize = 0x20;
+const GPIO_HIGH_IP: usize = 0x24;
+const GPIO_LOW_IE: usize = 0x28;
+const GPIO_LOW_IP: usize = 0x2C;
+const GPIO_IOF_EN: usize = 0x30;
+const GPIO_IOF_SEL: usize = 0x34;
+const GPIO_OUT_XOR: usize = 0x38;
 
 /// Maximum number of GPIO banks the driver manages.
 pub const MAX_BANKS: usize = 4;
@@ -55,9 +55,9 @@ pub struct GpioBank {
     /// Physical (identity-mapped) MMIO base address.
     pub mmio_base: usize,
     /// Human-readable label (e.g. "gpio0").
-    pub label:     &'static str,
+    pub label: &'static str,
     /// PLIC source IDs for this bank's interrupt line (one per bank).
-    pub plic_src:  u32,
+    pub plic_src: u32,
 }
 
 static BANKS: Mutex<Vec<GpioBank>> = Mutex::new(Vec::new());
@@ -88,7 +88,9 @@ unsafe fn gpio_clear_bits(base: usize, off: usize, mask: u32) {
 /// Returns the bank index, or None if `MAX_BANKS` is exceeded.
 pub fn register_bank(bank: GpioBank) -> Option<usize> {
     let mut banks = BANKS.lock();
-    if banks.len() >= MAX_BANKS { return None; }
+    if banks.len() >= MAX_BANKS {
+        return None;
+    }
     let idx = banks.len();
     banks.push(bank);
     Some(idx)
@@ -102,18 +104,18 @@ pub fn banks() -> Vec<GpioBank> {
 /// Configure pin `pin` on `bank` as an output.
 pub fn set_output(bank: usize, pin: u8) {
     with_bank(bank, |base| unsafe {
-        gpio_set_bits(base,   GPIO_OUTPUT_EN,  1 << pin);
-        gpio_clear_bits(base, GPIO_INPUT_EN,   1 << pin);
-        gpio_clear_bits(base, GPIO_IOF_EN,     1 << pin);
+        gpio_set_bits(base, GPIO_OUTPUT_EN, 1 << pin);
+        gpio_clear_bits(base, GPIO_INPUT_EN, 1 << pin);
+        gpio_clear_bits(base, GPIO_IOF_EN, 1 << pin);
     });
 }
 
 /// Configure pin `pin` on `bank` as an input.
 pub fn set_input(bank: usize, pin: u8) {
     with_bank(bank, |base| unsafe {
-        gpio_set_bits(base,   GPIO_INPUT_EN,   1 << pin);
-        gpio_clear_bits(base, GPIO_OUTPUT_EN,  1 << pin);
-        gpio_clear_bits(base, GPIO_IOF_EN,     1 << pin);
+        gpio_set_bits(base, GPIO_INPUT_EN, 1 << pin);
+        gpio_clear_bits(base, GPIO_OUTPUT_EN, 1 << pin);
+        gpio_clear_bits(base, GPIO_IOF_EN, 1 << pin);
     });
 }
 
@@ -122,7 +124,7 @@ pub fn set_input(bank: usize, pin: u8) {
 pub fn set_iof(bank: usize, pin: u8, iof: u8) {
     with_bank(bank, |base| unsafe {
         gpio_clear_bits(base, GPIO_OUTPUT_EN, 1 << pin);
-        gpio_clear_bits(base, GPIO_INPUT_EN,  1 << pin);
+        gpio_clear_bits(base, GPIO_INPUT_EN, 1 << pin);
         if iof == 1 {
             gpio_set_bits(base, GPIO_IOF_SEL, 1 << pin);
         } else {
@@ -165,7 +167,7 @@ pub fn write_all(bank: usize, val: u32) {
 pub fn set_polarity_invert(bank: usize, pin: u8, invert: bool) {
     with_bank(bank, |base| unsafe {
         if invert {
-            gpio_set_bits(base,   GPIO_OUT_XOR, 1 << pin);
+            gpio_set_bits(base, GPIO_OUT_XOR, 1 << pin);
         } else {
             gpio_clear_bits(base, GPIO_OUT_XOR, 1 << pin);
         }
@@ -203,14 +205,22 @@ pub fn irq_enable(bank: usize, pin: u8, trig: IrqTrigger) {
         use IrqTrigger::*;
         let m = 1 << pin;
         match trig {
-            RisingEdge  => { gpio_set_bits(base, GPIO_RISE_IE, m); }
-            FallingEdge => { gpio_set_bits(base, GPIO_FALL_IE, m); }
-            HighLevel   => { gpio_set_bits(base, GPIO_HIGH_IE, m); }
-            LowLevel    => { gpio_set_bits(base, GPIO_LOW_IE,  m); }
-            BothEdges   => {
+            RisingEdge => {
+                gpio_set_bits(base, GPIO_RISE_IE, m);
+            },
+            FallingEdge => {
+                gpio_set_bits(base, GPIO_FALL_IE, m);
+            },
+            HighLevel => {
+                gpio_set_bits(base, GPIO_HIGH_IE, m);
+            },
+            LowLevel => {
+                gpio_set_bits(base, GPIO_LOW_IE, m);
+            },
+            BothEdges => {
                 gpio_set_bits(base, GPIO_RISE_IE, m);
                 gpio_set_bits(base, GPIO_FALL_IE, m);
-            }
+            },
         }
     });
 }
@@ -222,7 +232,7 @@ pub fn irq_disable(bank: usize, pin: u8) {
         gpio_write(base, GPIO_RISE_IE, gpio_read(base, GPIO_RISE_IE) & m);
         gpio_write(base, GPIO_FALL_IE, gpio_read(base, GPIO_FALL_IE) & m);
         gpio_write(base, GPIO_HIGH_IE, gpio_read(base, GPIO_HIGH_IE) & m);
-        gpio_write(base, GPIO_LOW_IE,  gpio_read(base, GPIO_LOW_IE)  & m);
+        gpio_write(base, GPIO_LOW_IE, gpio_read(base, GPIO_LOW_IE) & m);
     });
 }
 
@@ -236,12 +246,12 @@ pub fn irq_pending(bank: usize) -> Option<(u32, u32, u32, u32)> {
         let rise = gpio_read(base, GPIO_RISE_IP);
         let fall = gpio_read(base, GPIO_FALL_IP);
         let high = gpio_read(base, GPIO_HIGH_IP);
-        let low  = gpio_read(base, GPIO_LOW_IP);
+        let low = gpio_read(base, GPIO_LOW_IP);
         // Write 1 to clear pending bits.
         gpio_write(base, GPIO_RISE_IP, rise);
         gpio_write(base, GPIO_FALL_IP, fall);
         gpio_write(base, GPIO_HIGH_IP, high);
-        gpio_write(base, GPIO_LOW_IP,  low);
+        gpio_write(base, GPIO_LOW_IP, low);
         Some((rise, fall, high, low))
     }
 }

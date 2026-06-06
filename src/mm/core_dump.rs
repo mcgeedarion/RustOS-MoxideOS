@@ -22,80 +22,94 @@
 //! so that `gdb` and `lldb` can open the resulting file.
 
 extern crate alloc;
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::proc::rlimit::{RLIMIT_CORE, RLIM_INFINITY};
 use crate::proc::scheduler::{current_pid, with_proc};
 
-const ELFMAG:     [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELFCLASS64:  u8     = 2;
-const ELFDATA2LSB: u8     = 1;
-const ET_CORE:     u16    = 4;
-const PT_LOAD:     u32    = 1;
-const PT_NOTE:     u32    = 4;
-const PF_R:        u32    = 4;
-const PF_W:        u32    = 2;
-const PF_X:        u32    = 1;
+const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1;
+const ET_CORE: u16 = 4;
+const PT_LOAD: u32 = 1;
+const PT_NOTE: u32 = 4;
+const PF_R: u32 = 4;
+const PF_W: u32 = 2;
+const PF_X: u32 = 1;
 
 /// ELF machine type — selected at compile time so the core file is accepted
 /// by gdb/lldb on both x86-64 and RISC-V targets.
 #[cfg(target_arch = "x86_64")]
-const EM_MACHINE: u16 = 62;  // EM_X86_64
+const EM_MACHINE: u16 = 62; // EM_X86_64
 #[cfg(target_arch = "riscv64")]
 const EM_MACHINE: u16 = 243; // EM_RISCV
 #[cfg(target_arch = "aarch64")]
 const EM_MACHINE: u16 = 183; // EM_AARCH64
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
-const EM_MACHINE: u16 = 0;   // EM_NONE — unsupported arch
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+)))]
+const EM_MACHINE: u16 = 0; // EM_NONE — unsupported arch
 
 const NT_PRSTATUS: u32 = 1;
 const NT_PRPSINFO: u32 = 3;
 
-fn push_u16(buf: &mut Vec<u8>, v: u16) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn push_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn push_u64(buf: &mut Vec<u8>, v: u64) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn push_zeros(buf: &mut Vec<u8>, n: usize) { buf.resize(buf.len() + n, 0); }
-fn align4(n: usize) -> usize { (n + 3) & !3 }
+fn push_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn push_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn push_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn push_zeros(buf: &mut Vec<u8>, n: usize) {
+    buf.resize(buf.len() + n, 0);
+}
+fn align4(n: usize) -> usize {
+    (n + 3) & !3
+}
 
 fn write_elf_header(buf: &mut Vec<u8>, phnum: u16) {
     buf.extend_from_slice(&ELFMAG);
-    buf.push(ELFCLASS64);    // EI_CLASS
-    buf.push(ELFDATA2LSB);   // EI_DATA
-    buf.push(1);             // EI_VERSION = EV_CURRENT
-    buf.push(0);             // EI_OSABI = ELFOSABI_NONE
-    push_zeros(buf, 8);      // EI_ABIVERSION + padding
-    push_u16(buf, ET_CORE);  // e_type
+    buf.push(ELFCLASS64); // EI_CLASS
+    buf.push(ELFDATA2LSB); // EI_DATA
+    buf.push(1); // EI_VERSION = EV_CURRENT
+    buf.push(0); // EI_OSABI = ELFOSABI_NONE
+    push_zeros(buf, 8); // EI_ABIVERSION + padding
+    push_u16(buf, ET_CORE); // e_type
     push_u16(buf, EM_MACHINE); // e_machine — arch-selected above
-    push_u32(buf, 1);        // e_version
-    push_u64(buf, 0);        // e_entry
-    push_u64(buf, 64);       // e_phoff — phdrs start right after ehdr
-    push_u64(buf, 0);        // e_shoff
-    push_u32(buf, 0);        // e_flags
-    push_u16(buf, 64);       // e_ehsize
-    push_u16(buf, 56);       // e_phentsize
-    push_u16(buf, phnum);    // e_phnum
-    push_u16(buf, 64);       // e_shentsize
-    push_u16(buf, 0);        // e_shnum
-    push_u16(buf, 0);        // e_shstrndx
-    // total: 64 bytes
+    push_u32(buf, 1); // e_version
+    push_u64(buf, 0); // e_entry
+    push_u64(buf, 64); // e_phoff — phdrs start right after ehdr
+    push_u64(buf, 0); // e_shoff
+    push_u32(buf, 0); // e_flags
+    push_u16(buf, 64); // e_ehsize
+    push_u16(buf, 56); // e_phentsize
+    push_u16(buf, phnum); // e_phnum
+    push_u16(buf, 64); // e_shentsize
+    push_u16(buf, 0); // e_shnum
+    push_u16(buf, 0); // e_shstrndx
+                      // total: 64 bytes
 }
 
 fn write_phdr(
     buf: &mut Vec<u8>,
-    p_type:   u32,
-    p_flags:  u32,
+    p_type: u32,
+    p_flags: u32,
     p_offset: u64,
-    p_vaddr:  u64,
+    p_vaddr: u64,
     p_filesz: u64,
-    p_memsz:  u64,
-    p_align:  u64,
+    p_memsz: u64,
+    p_align: u64,
 ) {
     push_u32(buf, p_type);
     push_u32(buf, p_flags);
     push_u64(buf, p_offset);
     push_u64(buf, p_vaddr);
-    push_u64(buf, 0);        // p_paddr (irrelevant for core)
+    push_u64(buf, 0); // p_paddr (irrelevant for core)
     push_u64(buf, p_filesz);
     push_u64(buf, p_memsz);
     push_u64(buf, p_align);
@@ -125,41 +139,41 @@ fn write_note(buf: &mut Vec<u8>, name: &[u8], typ: u32, desc: &[u8]) {
 
 fn prstatus_note(pid: usize, signo: u32) -> Vec<u8> {
     let mut n = Vec::with_capacity(148);
-    push_u32(&mut n, signo);         // pr_info.si_signo
-    push_u32(&mut n, 0);             // pr_info.si_code
-    push_u32(&mut n, 0);             // pr_info.si_errno
-    push_u16(&mut n, signo as u16);  // pr_cursig
-    push_u16(&mut n, 0);             // pad
-    push_u64(&mut n, 0);             // pr_sigpend
-    push_u64(&mut n, 0);             // pr_sighold
-    push_u32(&mut n, pid as u32);    // pr_pid
-    push_u32(&mut n, 0);             // pr_ppid
-    push_u32(&mut n, 0);             // pr_pgrp
-    push_u32(&mut n, 0);             // pr_sid
-    // pr_utime, pr_stime, pr_cutime, pr_cstime: 4 × 16 bytes (timeval64)
+    push_u32(&mut n, signo); // pr_info.si_signo
+    push_u32(&mut n, 0); // pr_info.si_code
+    push_u32(&mut n, 0); // pr_info.si_errno
+    push_u16(&mut n, signo as u16); // pr_cursig
+    push_u16(&mut n, 0); // pad
+    push_u64(&mut n, 0); // pr_sigpend
+    push_u64(&mut n, 0); // pr_sighold
+    push_u32(&mut n, pid as u32); // pr_pid
+    push_u32(&mut n, 0); // pr_ppid
+    push_u32(&mut n, 0); // pr_pgrp
+    push_u32(&mut n, 0); // pr_sid
+                         // pr_utime, pr_stime, pr_cutime, pr_cstime: 4 × 16 bytes (timeval64)
     push_zeros(&mut n, 4 * 16);
     // pr_reg: 27 × 8 bytes (general-purpose registers, zeroed)
     push_zeros(&mut n, 27 * 8);
-    push_u32(&mut n, 0);             // pr_fpvalid
+    push_u32(&mut n, 0); // pr_fpvalid
     n
 }
 
 fn prpsinfo_note(pid: usize, exe: &str) -> Vec<u8> {
     let mut n = Vec::with_capacity(124);
-    n.push(0u8);   // pr_state
-    n.push(b' ');  // pr_sname
-    n.push(0u8);   // pr_zomb
-    n.push(0u8);   // pr_nice
-    push_u64(&mut n, 0);           // pr_flag
-    push_u32(&mut n, 0);           // pr_uid
-    push_u32(&mut n, 0);           // pr_gid
-    push_u32(&mut n, pid as u32);  // pr_pid
-    push_u32(&mut n, 0);           // pr_ppid
-    push_u32(&mut n, 0);           // pr_pgrp
-    push_u32(&mut n, 0);           // pr_sid
-    // pr_fname: 16 bytes (basename, NUL-padded)
+    n.push(0u8); // pr_state
+    n.push(b' '); // pr_sname
+    n.push(0u8); // pr_zomb
+    n.push(0u8); // pr_nice
+    push_u64(&mut n, 0); // pr_flag
+    push_u32(&mut n, 0); // pr_uid
+    push_u32(&mut n, 0); // pr_gid
+    push_u32(&mut n, pid as u32); // pr_pid
+    push_u32(&mut n, 0); // pr_ppid
+    push_u32(&mut n, 0); // pr_pgrp
+    push_u32(&mut n, 0); // pr_sid
+                         // pr_fname: 16 bytes (basename, NUL-padded)
     let name_bytes = exe.as_bytes();
-    let fname_len  = name_bytes.len().min(15);
+    let fname_len = name_bytes.len().min(15);
     n.extend_from_slice(&name_bytes[..fname_len]);
     push_zeros(&mut n, 16 - fname_len);
     // pr_psargs: 80 bytes (argv string, NUL-padded)
@@ -183,20 +197,15 @@ const PAGE_SIZE: usize = 4096;
 fn copy_user_range(dst: &mut Vec<u8>, src_va: usize, size: usize) {
     let mut offset = 0usize;
     while offset < size {
-        let page_va   = src_va + offset;
+        let page_va = src_va + offset;
         let page_base = page_va & !0xFFF;
-        let page_off  = page_va & 0xFFF;
-        let copy_len  = PAGE_SIZE.min(size - offset).min(PAGE_SIZE - page_off);
+        let page_off = page_va & 0xFFF;
+        let copy_len = PAGE_SIZE.min(size - offset).min(PAGE_SIZE - page_off);
 
         // Try to read one page through the architecture's safe-copy helper.
         // copy_from_user_page returns true on success, false on fault.
         let ok = unsafe {
-            crate::mm::user_copy::copy_from_user_page(
-                page_base,
-                page_off,
-                dst,
-                copy_len,
-            )
+            crate::mm::user_copy::copy_from_user_page(page_base, page_off, dst, copy_len)
         };
         if !ok {
             // Page not readable (swapped, not present, etc.) — emit zeros.
@@ -215,32 +224,58 @@ fn copy_user_range(dst: &mut Vec<u8>, src_va: usize, size: usize) {
 pub fn write_core_dump(signo: u32) -> isize {
     let pid = current_pid();
 
-    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_CORE))
-        .unwrap_or((0, 0));
+    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_CORE)).unwrap_or((0, 0));
     if soft == 0 {
         return 0; // core dumps disabled
     }
-    let max_bytes: u64 = if soft == RLIM_INFINITY { u64::MAX } else { soft };
+    let max_bytes: u64 = if soft == RLIM_INFINITY {
+        u64::MAX
+    } else {
+        soft
+    };
 
-    struct VmaSnap { start: usize, end: usize, flags: u32 }
+    struct VmaSnap {
+        start: usize,
+        end: usize,
+        flags: u32,
+    }
     let (vmas, exe_path): (Vec<VmaSnap>, String) = with_proc(pid, |p| {
-        let snaps = p.vmas.iter().map(|v| VmaSnap {
-            start: v.start,
-            end:   v.end,
-            flags: {
-                let mut f = PF_R;
-                if v.writable   { f |= PF_W; }
-                if v.executable { f |= PF_X; }
-                f
-            },
-        }).collect();
+        let snaps = p
+            .vmas
+            .iter()
+            .map(|v| VmaSnap {
+                start: v.start,
+                end: v.end,
+                flags: {
+                    let mut f = PF_R;
+                    if v.writable {
+                        f |= PF_W;
+                    }
+                    if v.executable {
+                        f |= PF_X;
+                    }
+                    f
+                },
+            })
+            .collect();
         let exe = p.exe_path.clone().unwrap_or_else(|| "unknown".into());
         (snaps, exe)
-    }).unwrap_or_else(|| (Vec::new(), String::from("unknown")));
+    })
+    .unwrap_or_else(|| (Vec::new(), String::from("unknown")));
 
     let mut notes: Vec<u8> = Vec::new();
-    write_note(&mut notes, b"CORE\0", NT_PRSTATUS, &prstatus_note(pid, signo));
-    write_note(&mut notes, b"CORE\0", NT_PRPSINFO, &prpsinfo_note(pid, &exe_path));
+    write_note(
+        &mut notes,
+        b"CORE\0",
+        NT_PRSTATUS,
+        &prstatus_note(pid, signo),
+    );
+    write_note(
+        &mut notes,
+        b"CORE\0",
+        NT_PRPSINFO,
+        &prpsinfo_note(pid, &exe_path),
+    );
 
     // Truncating the raw buffer mid-segment (the old approach) produces a
     // structurally invalid ELF.  Instead we compute the total size up-front
@@ -254,9 +289,9 @@ pub fn write_core_dump(signo: u32) -> isize {
     //   Note data: notes.len() bytes
     //   VMA data:  sum of (vma.end - vma.start) for included VMAs
 
-    let ehdr_size   = 64usize;
-    let phdr_size   = 56usize;
-    let note_size   = notes.len();
+    let ehdr_size = 64usize;
+    let phdr_size = 56usize;
+    let note_size = notes.len();
 
     // Determine how many VMAs we can include within max_bytes.
     let mut included_vmas = 0usize;
@@ -270,16 +305,16 @@ pub fn write_core_dump(signo: u32) -> isize {
                 Some(new) if new <= max_bytes => {
                     running = new;
                     included_vmas += 1;
-                }
+                },
                 _ => break,
             }
         }
     }
     let vmas = &vmas[..included_vmas];
 
-    let phnum    = 1 + vmas.len(); // PT_NOTE + PT_LOAD × N
+    let phnum = 1 + vmas.len(); // PT_NOTE + PT_LOAD × N
     let phdrs_end = ehdr_size + phdr_size * phnum;
-    let note_off  = phdrs_end;
+    let note_off = phdrs_end;
     let mut data_off = note_off + note_size;
 
     let mut buf: Vec<u8> = Vec::new();
@@ -288,15 +323,30 @@ pub fn write_core_dump(signo: u32) -> isize {
     write_elf_header(&mut buf, phnum as u16);
 
     // PT_NOTE phdr
-    write_phdr(&mut buf, PT_NOTE, 0,
-        note_off as u64, 0, note_size as u64, note_size as u64, 4);
+    write_phdr(
+        &mut buf,
+        PT_NOTE,
+        0,
+        note_off as u64,
+        0,
+        note_size as u64,
+        note_size as u64,
+        4,
+    );
 
     // PT_LOAD phdrs
     for vma in vmas {
         let size = vma.end - vma.start;
-        write_phdr(&mut buf, PT_LOAD, vma.flags,
-            data_off as u64, vma.start as u64,
-            size as u64, size as u64, 0x1000);
+        write_phdr(
+            &mut buf,
+            PT_LOAD,
+            vma.flags,
+            data_off as u64,
+            vma.start as u64,
+            size as u64,
+            size as u64,
+            0x1000,
+        );
         data_off += size;
     }
 
@@ -314,10 +364,11 @@ pub fn write_core_dump(signo: u32) -> isize {
     let core_path = with_proc(pid, |p| {
         let cwd = p.cwd().unwrap_or_else(|| "/".into());
         alloc::format!("{}/core", cwd)
-    }).unwrap_or_else(|| "/core".into());
+    })
+    .unwrap_or_else(|| "/core".into());
 
     match crate::fs::vfs_ops::vfs_write_bytes(&core_path, &buf) {
-        Ok(_)  => buf.len() as isize,
+        Ok(_) => buf.len() as isize,
         Err(e) => e,
     }
 }
@@ -329,9 +380,10 @@ pub fn should_dump(signo: u32) -> bool {
     //   SIGQUIT(3), SIGILL(4), SIGTRAP(5), SIGABRT(6), SIGBUS(7),
     //   SIGFPE(8), SIGSEGV(11), SIGSYS(12/31), SIGXCPU(24), SIGXFSZ(25)
     const CORE_SIGS: &[u32] = &[3, 4, 5, 6, 7, 8, 11, 12, 24, 25, 31];
-    if !CORE_SIGS.contains(&signo) { return false; }
+    if !CORE_SIGS.contains(&signo) {
+        return false;
+    }
     let pid = current_pid();
-    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_CORE))
-        .unwrap_or((0, 0));
+    let (soft, _) = with_proc(pid, |p| p.rlimits.get(RLIMIT_CORE)).unwrap_or((0, 0));
     soft != 0
 }

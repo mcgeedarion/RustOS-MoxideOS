@@ -21,9 +21,10 @@ use syn::{parse_macro_input, Ident, ItemFn};
 
 /// Mark a function as a kernel test.
 ///
-/// The annotated function must have the signature `fn() -> kmtest::KmTestResult`.
-/// The macro generates a companion `static` placed in the `.kmtest_registry`
-/// linker section; `kmtest::run_all()` iterates that section at runtime.
+/// The annotated function must have the signature `fn() ->
+/// kmtest::KmTestResult`. The macro generates a companion `static` placed in
+/// the `.kmtest_registry` linker section; `kmtest::run_all()` iterates that
+/// section at runtime.
 #[proc_macro_attribute]
 pub fn kernel_test(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);

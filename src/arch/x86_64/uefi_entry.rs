@@ -9,12 +9,12 @@
 //!   1. Print a banner via UEFI SimpleTextOutput.
 //!   2. Capture the GOP framebuffer (graceful fallback if not available).
 //!   3. Locate the ACPI 2.0 RSDP from the EFI configuration table.
-//!   4. Locate the initrd:
-//!        a. EFI_INITRD_MEDIA_GUID LoadFile2 protocol  (systemd-boot / GRUB2 / real HW)
-//!        b. OVMF vendor config-table fallback          (QEMU -initrd flag)
+//!   4. Locate the initrd: a. EFI_INITRD_MEDIA_GUID LoadFile2 protocol
+//!      (systemd-boot / GRUB2 / real HW) b. OVMF vendor config-table fallback
+//!      (QEMU -initrd flag)
 //!   5. Obtain the EFI memory map dynamically and call ExitBootServices.
-//!      ExitBootServices is retried once on EFI_INVALID_PARAMETER per
-//!      UEFI spec §7.4.6 (required for AMI/Insyde firmware compatibility).
+//!      ExitBootServices is retried once on EFI_INVALID_PARAMETER per UEFI spec
+//!      §7.4.6 (required for AMI/Insyde firmware compatibility).
 //!   6. Switch to the kernel boot stack and tail-call kernel_main().
 //!
 //! ## Memory layout after ExitBootServices
@@ -105,9 +105,11 @@ struct EfiBootServices {
         // 0x048
         buffer: *mut u8,
     ) -> EfiStatus,
-    _ev: [*mut core::ffi::c_void; 5], // 0x050
-                                      // locate_handle_buffer at offset 0x0B0 (resolved via fixed offset below)
-                                      // ExitBootServices at offset 0x190 (resolved via fixed offset below)
+    _ev: [*mut core::ffi::c_void; 5], /* 0x050
+                                       * locate_handle_buffer at offset 0x0B0 (resolved via
+                                       * fixed offset below)
+                                       * ExitBootServices at offset 0x190 (resolved via fixed
+                                       * offset below) */
 }
 
 // EfiMemoryType variants we care about for allocate_pool.
@@ -192,7 +194,10 @@ pub unsafe extern "efiapi" fn uefi_start(
     let bs_base = st.boot_services as usize;
 
     // 1. Banner — identifies this as the PRIMARY (x86_64) boot target.
-    efi_print(st.con_out, "RustOS [PRIMARY] x86_64 booting via UEFI...\r\n");
+    efi_print(
+        st.con_out,
+        "RustOS [PRIMARY] x86_64 booting via UEFI...\r\n",
+    );
 
     // 2. Capture GOP framebuffer — graceful fallback if firmware has no GOP.
     let gop_ok =

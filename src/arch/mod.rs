@@ -17,7 +17,8 @@
 //!   ```
 //!
 //! No code outside `src/arch/` should import from `arch::x86_64` or
-//! `arch::riscv64`, or `arch::aarch64` directly.  Use `arch::Arch` and `arch::api::*`.
+//! `arch::riscv64`, or `arch::aarch64` directly.  Use `arch::Arch` and
+//! `arch::api::*`.
 
 pub mod api;
 
@@ -50,9 +51,15 @@ pub type Arch = ArchImpl;
 /// or final idle loop. This is the only hook called by the common kernel entry.
 pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
     #[cfg(target_arch = "x86_64")]
-    { return x86_64::init(boot_info); }
+    {
+        return x86_64::init(boot_info);
+    }
     #[cfg(target_arch = "riscv64")]
-    { return riscv64::init(boot_info); }
+    {
+        return riscv64::init(boot_info);
+    }
     #[cfg(target_arch = "aarch64")]
-    { return aarch64::init(boot_info); }
+    {
+        return aarch64::init(boot_info);
+    }
 }

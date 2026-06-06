@@ -16,9 +16,9 @@
 //!   bracket wraps the copy loop between `STAC` / `CLAC` to temporarily allow
 //!   supervisor access to user pages.  SMEP prevents execution from user pages
 //!   regardless.
-//! * **RISC-V** — `sstatus.SUM` is cleared during normal kernel execution.
-//!   Each access bracket sets `SUM=1`, performs the copy, then clears it again.
-//!   The `stvec` fault handler translates load/store page-faults into `EFAULT`.
+//! * **RISC-V** — `sstatus.SUM` is cleared during normal kernel execution. Each
+//!   access bracket sets `SUM=1`, performs the copy, then clears it again. The
+//!   `stvec` fault handler translates load/store page-faults into `EFAULT`.
 
 use core::mem;
 use core::ptr;
@@ -37,7 +37,8 @@ const USER_ADDR_MAX: usize = 0x0000_0040_0000_0000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum UaccessError {
-    /// The user pointer was NULL, misaligned, or outside the user address space.
+    /// The user pointer was NULL, misaligned, or outside the user address
+    /// space.
     Fault = 14, // EFAULT
 }
 

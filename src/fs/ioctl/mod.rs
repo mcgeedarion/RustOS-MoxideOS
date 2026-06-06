@@ -7,22 +7,22 @@
 //!   block.rs   — BLK* block device ioctls
 //!   file.rs    — generic fd helpers (FIONREAD, FIONBIO)
 
-pub mod consts;
-pub mod tty;
-pub mod net;
 pub mod block;
+pub mod consts;
 pub mod file;
+pub mod net;
+pub mod tty;
 
-use consts::*;
 use crate::uaccess::{copy_from_user, copy_to_user};
+use consts::*;
 
 pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
     // Pipe / epoll FDs
     if crate::ipc::pipe::is_pipe_fd(fd) {
         match req {
             FIONREAD => return file::pipe_fionread(fd, arg),
-            FIONBIO  => return file::set_nonblock(fd, arg),
-            _        => return -25,
+            FIONBIO => return file::set_nonblock(fd, arg),
+            _ => return -25,
         }
     }
 
@@ -30,9 +30,9 @@ pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
     if crate::net::socket::is_socket_fd(fd) {
         return match req {
             req if req >= SIOCGIFNAME && req <= SIOCETHTOOL => net::sioc_ioctl(req, arg),
-            FIONREAD   => file::vfs_fionread(fd, arg),
-            FIONBIO    => file::set_nonblock(fd, arg),
-            _          => -25,
+            FIONREAD => file::vfs_fionread(fd, arg),
+            FIONBIO => file::set_nonblock(fd, arg),
+            _ => -25,
         };
     }
 
@@ -56,7 +56,7 @@ pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
                     copy_to_user(arg, &vi);
                 }
                 return 0;
-            }
+            },
             // FBIOGET_FSCREENINFO (0x4602)
             0x4602 => {
                 if let Some(info) = crate::drivers::gop::get() {
@@ -68,7 +68,7 @@ pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
                     copy_to_user(arg, &fi);
                 }
                 return 0;
-            }
+            },
             // FBIOPAN_DISPLAY (0x4606) — no-op
             0x4606 => return 0,
             _ => return -25,
@@ -78,26 +78,42 @@ pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
     // Epoll FDs
     if crate::io_uring::epoll::is_epoll_fd(fd) {
         return match req {
-            FIONBIO => { file::set_nonblock(fd, arg); 0 }
-            _       => -25,
+            FIONBIO => {
+                file::set_nonblock(fd, arg);
+                0
+            },
+            _ => -25,
         };
     }
 
     // Default: treat as tty/vfs
     let is_tty = crate::tty::is_tty_fd(fd);
     match req {
-        req if is_tty && (req == TCGETS || req == TCSETS || req == TCSETSW ||
-               req == TCSETSF || req == TIOCGPGRP || req == TIOCSPGRP ||
-               req == TIOCGWINSZ || req == TIOCSWINSZ || req == TIOCGPTPEER ||
-               req == TIOCSPTLCK || req == TIOCGPTN || req == TIOCNOTTY ||
-               req == TIOCSCTTY || req == TIOCEXCL || req == TIOCNXCL ||
-               req == TIOCOUTQ || req == TIOCSTI)
-            => tty::tty_ioctl(fd, req, arg),
+        req if is_tty
+            && (req == TCGETS
+                || req == TCSETS
+                || req == TCSETSW
+                || req == TCSETSF
+                || req == TIOCGPGRP
+                || req == TIOCSPGRP
+                || req == TIOCGWINSZ
+                || req == TIOCSWINSZ
+                || req == TIOCGPTPEER
+                || req == TIOCSPTLCK
+                || req == TIOCGPTN
+                || req == TIOCNOTTY
+                || req == TIOCSCTTY
+                || req == TIOCEXCL
+                || req == TIOCNXCL
+                || req == TIOCOUTQ
+                || req == TIOCSTI) =>
+        {
+            tty::tty_ioctl(fd, req, arg)
+        },
         FIONREAD => file::vfs_fionread(fd, arg),
-        FIONBIO  => file::set_nonblock(fd, arg),
+        FIONBIO => file::set_nonblock(fd, arg),
         FIOCLEX | FIONCLEX | FIOASYNC => 0,
-        _ if req >= SIOCGIFNAME && req <= SIOCETHTOOL
-            => net::sioc_ioctl(req, arg),
-        _   => -25,
+        _ if req >= SIOCGIFNAME && req <= SIOCETHTOOL => net::sioc_ioctl(req, arg),
+        _ => -25,
     }
 }

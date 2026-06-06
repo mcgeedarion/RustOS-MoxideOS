@@ -22,9 +22,9 @@
 //! pidfd (process exit), futex wait-queues.
 
 extern crate alloc;
+use crate::sync::wait_queue::{CancellationToken, ReadyMask, WaitQueue, WakeReason};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::sync::wait_queue::{WaitQueue, ReadyMask, WakeReason, CancellationToken};
 
 pub trait PollSource: Send + Sync {
     /// Return the immediately-ready subset of `interest`. Must not block.
@@ -42,9 +42,9 @@ pub trait PollSource: Send + Sync {
 ///
 /// This is the canonical entry point for all blocking read/write/accept/etc.
 pub fn wait_on(
-    src:      &dyn PollSource,
+    src: &dyn PollSource,
     interest: ReadyMask,
-    cancel:   Option<&CancellationToken>,
+    cancel: Option<&CancellationToken>,
     deadline: Option<u64>,
 ) -> (ReadyMask, WakeReason) {
     loop {
@@ -56,8 +56,8 @@ pub fn wait_on(
         match reason {
             // Re-check poll() — guards against spurious wakeups and the
             // case where two tasks race to consume the same readiness event.
-            WakeReason::Ready     => continue,
-            WakeReason::Timeout   => return (0, WakeReason::Timeout),
+            WakeReason::Ready => continue,
+            WakeReason::Timeout => return (0, WakeReason::Timeout),
             WakeReason::Cancelled => return (0, WakeReason::Cancelled),
         }
     }
@@ -71,8 +71,8 @@ pub fn wait_on(
 /// Each element is `(source, interest_mask)`.
 /// Returns as soon as any source fires, times out, or is cancelled.
 pub fn wait_any(
-    sources:  &[(Arc<dyn PollSource>, ReadyMask)],
-    cancel:   Option<&CancellationToken>,
+    sources: &[(Arc<dyn PollSource>, ReadyMask)],
+    cancel: Option<&CancellationToken>,
     deadline: Option<u64>,
 ) -> WakeReason {
     if sources.is_empty() {
@@ -88,8 +88,8 @@ pub fn wait_any(
         }
     }
 
-    // 2. Build one shared aggregate WaitQueue.
-    //    All source WaitQueues forward their wakeups here.
+    // 2. Build one shared aggregate WaitQueue. All source WaitQueues forward their
+    //    wakeups here.
     let agg = WaitQueue::new();
 
     // 3. Register forwarder on every source's WaitQueue.
@@ -117,16 +117,26 @@ pub struct AlwaysReady {
 }
 
 impl AlwaysReady {
-    pub const fn new() -> Self { Self { wq: WaitQueue::new() } }
+    pub const fn new() -> Self {
+        Self {
+            wq: WaitQueue::new(),
+        }
+    }
 }
 
 impl PollSource for AlwaysReady {
     fn poll(&self, interest: ReadyMask) -> ReadyMask {
         use crate::fs::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
         let mut r = 0;
-        if interest & (POLLIN  | POLLRDNORM) != 0 { r |= POLLIN  | POLLRDNORM; }
-        if interest & (POLLOUT | POLLWRNORM) != 0 { r |= POLLOUT | POLLWRNORM; }
+        if interest & (POLLIN | POLLRDNORM) != 0 {
+            r |= POLLIN | POLLRDNORM;
+        }
+        if interest & (POLLOUT | POLLWRNORM) != 0 {
+            r |= POLLOUT | POLLWRNORM;
+        }
         r
     }
-    fn wait_queue(&self) -> &WaitQueue { &self.wq }
+    fn wait_queue(&self) -> &WaitQueue {
+        &self.wq
+    }
 }

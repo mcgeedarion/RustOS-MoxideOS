@@ -1,7 +1,7 @@
 //! TCP listen/accept path.
-use crate::net::tcp;
-use super::super::types::{SockAddr, SocketState, AF_INET, SOCK_STREAM};
 use super::super::core::SOCKETS;
+use super::super::types::{SockAddr, SocketState, AF_INET, SOCK_STREAM};
+use crate::net::tcp;
 
 pub fn tcp_listen(fd: usize, port: u16) {
     tcp::listen(fd, port);

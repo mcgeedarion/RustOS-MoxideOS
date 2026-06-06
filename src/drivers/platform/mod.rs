@@ -17,5 +17,8 @@ pub mod tty;
 pub mod clint {
     pub use crate::time::clint::*;
     /// GUESS: alias to monotonic ns reader for input drivers.
-    #[inline] pub fn monotonic_ns() -> u64 { crate::time::monotonic_ns() }
+    #[inline]
+    pub fn monotonic_ns() -> u64 {
+        crate::time::monotonic_ns()
+    }
 }

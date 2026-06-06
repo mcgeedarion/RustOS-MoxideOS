@@ -21,9 +21,9 @@
 extern crate alloc;
 use alloc::{
     collections::BTreeMap,
+    format,
     string::{String, ToString},
     vec::Vec,
-    format,
 };
 
 use spin::Mutex;
@@ -35,44 +35,62 @@ pub(crate) enum INodeData {
 }
 
 pub(crate) struct INode {
-    pub ino:   u64,
-    pub mode:  u16,
-    pub uid:   u32,
-    pub gid:   u32,
+    pub ino: u64,
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
     pub nlink: u32,
     pub atime: u64,
     pub mtime: u64,
     pub ctime: u64,
-    pub data:  INodeData,
+    pub data: INodeData,
 }
 
 impl INode {
     pub fn new_file(ino: u64) -> Self {
         INode {
-            ino, mode: 0o100644, uid: 0, gid: 0, nlink: 1,
-            atime: 0, mtime: 0, ctime: 0,
+            ino,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
             data: INodeData::File(Vec::new()),
         }
     }
     pub fn new_dir(ino: u64) -> Self {
         INode {
-            ino, mode: 0o040755, uid: 0, gid: 0, nlink: 2,
-            atime: 0, mtime: 0, ctime: 0,
+            ino,
+            mode: 0o040755,
+            uid: 0,
+            gid: 0,
+            nlink: 2,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
             data: INodeData::Dir(BTreeMap::new()),
         }
     }
     pub fn new_symlink(ino: u64, target: &str) -> Self {
         INode {
-            ino, mode: 0o120777, uid: 0, gid: 0, nlink: 1,
-            atime: 0, mtime: 0, ctime: 0,
+            ino,
+            mode: 0o120777,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime: 0,
+            mtime: 0,
+            ctime: 0,
             data: INodeData::Symlink(target.to_string()),
         }
     }
     pub fn file_size(&self) -> usize {
         match &self.data {
-            INodeData::File(v)    => v.len(),
+            INodeData::File(v) => v.len(),
             INodeData::Symlink(s) => s.len(),
-            INodeData::Dir(_)     => 0,
+            INodeData::Dir(_) => 0,
         }
     }
     pub fn is_dir(&self) -> bool {
@@ -81,11 +99,11 @@ impl INode {
 }
 
 pub struct TmpFsStatfs {
-    pub f_type:    u64,   // always TMPFS_MAGIC
-    pub f_bsize:   u64,
-    pub f_blocks:  u64,
-    pub f_bfree:   u64,
-    pub f_bavail:  u64,
+    pub f_type: u64, // always TMPFS_MAGIC
+    pub f_bsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
     pub f_namelen: u64,
 }
 
@@ -93,18 +111,18 @@ pub struct TmpFsStatfs {
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
 
 pub(crate) struct TmpFs {
-    pub inodes:   BTreeMap<u64, INode>,
-    pub paths:    BTreeMap<String, u64>,
+    pub inodes: BTreeMap<u64, INode>,
+    pub paths: BTreeMap<String, u64>,
     pub next_ino: u64,
-    pub limit:    usize,
-    pub used:     usize,
+    pub limit: usize,
+    pub used: usize,
 }
 
 impl TmpFs {
     fn new(limit: usize) -> Self {
         let mut fs = TmpFs {
-            inodes:   BTreeMap::new(),
-            paths:    BTreeMap::new(),
+            inodes: BTreeMap::new(),
+            paths: BTreeMap::new(),
             next_ino: 2,
             limit,
             used: 0,
@@ -125,13 +143,13 @@ impl TmpFs {
     pub fn statfs(&self) -> TmpFsStatfs {
         let bsize: u64 = 4096;
         let total_blocks = (self.limit as u64).div_ceil(bsize);
-        let used_blocks  = (self.used  as u64).div_ceil(bsize);
+        let used_blocks = (self.used as u64).div_ceil(bsize);
         TmpFsStatfs {
-            f_type:    TMPFS_MAGIC,
-            f_bsize:   bsize,
-            f_blocks:  total_blocks,
-            f_bfree:   total_blocks.saturating_sub(used_blocks),
-            f_bavail:  total_blocks.saturating_sub(used_blocks),
+            f_type: TMPFS_MAGIC,
+            f_bsize: bsize,
+            f_blocks: total_blocks,
+            f_bfree: total_blocks.saturating_sub(used_blocks),
+            f_bavail: total_blocks.saturating_sub(used_blocks),
             f_namelen: 255,
         }
     }
@@ -141,13 +159,14 @@ impl TmpFs {
     /// the mount root is stripped to get the in-fs relative path.
     fn resolve(&self, mount_point: &str, full_path: &str) -> Option<u64> {
         let rel = strip_mount_prefix(mount_point, full_path);
-        self.paths.get(rel).copied()
+        self.paths
+            .get(rel)
+            .copied()
             .or_else(|| self.paths.get(&alloc::format!("{}/", rel)).copied())
     }
 }
 
-pub(crate) static TMPFS_INSTANCES: Mutex<BTreeMap<String, TmpFs>> =
-    Mutex::new(BTreeMap::new());
+pub(crate) static TMPFS_INSTANCES: Mutex<BTreeMap<String, TmpFs>> = Mutex::new(BTreeMap::new());
 
 /// Mount a new tmpfs instance at `mount_point` with the given byte limit.
 /// If a mount already exists at this point it is replaced.
@@ -166,9 +185,15 @@ fn ensure_defaults() {
 }
 
 fn normalise_mp(mp: &str) -> String {
-    if mp.is_empty() { return "/".to_string(); }
+    if mp.is_empty() {
+        return "/".to_string();
+    }
     let s = mp.trim_end_matches('/');
-    if s.is_empty() { "/".to_string() } else { s.to_string() }
+    if s.is_empty() {
+        "/".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// Strip the mount-point prefix from a full path, returning the
@@ -182,28 +207,25 @@ fn strip_mount_prefix<'a>(mount_point: &str, full_path: &'a str) -> &'a str {
         return "/";
     }
     if let Some(rel) = full_path.strip_prefix(mp) {
-        if rel.starts_with('/') { return rel; }
+        if rel.starts_with('/') {
+            return rel;
+        }
     }
     full_path
 }
 
 /// Find the best (longest-prefix) TmpFs mount for a given full path.
 /// Returns (mount_point_key, in-fs_relative_path) or None.
-fn best_mount<'a>(
-    tbl: &'a BTreeMap<String, TmpFs>,
-    full_path: &str,
-) -> Option<(&'a str, String)> {
+fn best_mount<'a>(tbl: &'a BTreeMap<String, TmpFs>, full_path: &str) -> Option<(&'a str, String)> {
     let mut best_len = 0usize;
     let mut best_mp: Option<&str> = None;
     for mp in tbl.keys() {
         let ms = mp.trim_end_matches('/');
-        if (full_path == ms
-            || full_path.starts_with(&alloc::format!("{}/", ms))
-            || ms.is_empty())
+        if (full_path == ms || full_path.starts_with(&alloc::format!("{}/", ms)) || ms.is_empty())
             && ms.len() >= best_len
         {
             best_len = ms.len();
-            best_mp  = Some(mp.as_str());
+            best_mp = Some(mp.as_str());
         }
     }
     let mp = best_mp?;
@@ -215,7 +237,11 @@ fn best_mount<'a>(
 fn parent_path(rel: &str) -> &str {
     let trimmed = rel.trim_end_matches('/');
     if let Some(pos) = trimmed.rfind('/') {
-        if pos == 0 { "/" } else { &trimmed[..pos] }
+        if pos == 0 {
+            "/"
+        } else {
+            &trimmed[..pos]
+        }
     } else {
         "/"
     }
@@ -238,13 +264,17 @@ pub fn tmpfs_create(full_path: &str) -> Result<(), isize> {
     let mp = mp.to_string();
     let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
 
-    if fs.paths.contains_key(&rel) { return Err(-17); }  // EEXIST
+    if fs.paths.contains_key(&rel) {
+        return Err(-17);
+    } // EEXIST
 
     let parent = parent_path(&rel).to_string();
-    let name   = basename(&rel).to_string();
-    if !fs.paths.contains_key(&parent) { return Err(-2); } // ENOENT
+    let name = basename(&rel).to_string();
+    if !fs.paths.contains_key(&parent) {
+        return Err(-2);
+    } // ENOENT
 
-    let ino  = fs.alloc_ino();
+    let ino = fs.alloc_ino();
     let node = INode::new_file(ino);
     fs.inodes.insert(ino, node);
     fs.paths.insert(rel, ino);
@@ -282,9 +312,11 @@ pub fn tmpfs_write_all(full_path: &str, data: &[u8]) -> Result<(), isize> {
     // Create if missing.
     if !fs.paths.contains_key(&rel) {
         let parent = parent_path(&rel).to_string();
-        let name   = basename(&rel).to_string();
-        if !fs.paths.contains_key(&parent) { return Err(-2); }
-        let ino  = fs.alloc_ino();
+        let name = basename(&rel).to_string();
+        if !fs.paths.contains_key(&parent) {
+            return Err(-2);
+        }
+        let ino = fs.alloc_ino();
         let node = INode::new_file(ino);
         fs.inodes.insert(ino, node);
         fs.paths.insert(rel.clone(), ino);
@@ -305,21 +337,24 @@ pub fn tmpfs_write_all(full_path: &str, data: &[u8]) -> Result<(), isize> {
     let new_size = data.len();
     if new_size > old_size {
         let delta = new_size - old_size;
-        if fs.used + delta > fs.limit { return Err(-28); } // ENOSPC
+        if fs.used + delta > fs.limit {
+            return Err(-28);
+        } // ENOSPC
         fs.used += delta;
     } else {
         fs.used = fs.used.saturating_sub(old_size - new_size);
     }
     let node = fs.inodes.get_mut(&ino).ok_or(-2isize)?;
     match &mut node.data {
-        INodeData::File(v) => { *v = data.to_vec(); Ok(()) }
+        INodeData::File(v) => {
+            *v = data.to_vec();
+            Ok(())
+        },
         _ => Err(-22),
     }
 }
 
-pub fn tmpfs_pread(full_path: &str, offset: usize, len: usize)
-    -> Result<Vec<u8>, isize>
-{
+pub fn tmpfs_pread(full_path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     ensure_defaults();
     let tbl = TMPFS_INSTANCES.lock();
     let (mp, rel) = best_mount(&tbl, full_path).ok_or(-2isize)?;
@@ -328,17 +363,17 @@ pub fn tmpfs_pread(full_path: &str, offset: usize, len: usize)
     let node = fs.inodes.get(&ino).ok_or(-2isize)?;
     match &node.data {
         INodeData::File(v) => {
-            if offset >= v.len() { return Ok(Vec::new()); }
+            if offset >= v.len() {
+                return Ok(Vec::new());
+            }
             let end = (offset + len).min(v.len());
             Ok(v[offset..end].to_vec())
-        }
+        },
         _ => Err(-22),
     }
 }
 
-pub fn tmpfs_pwrite(full_path: &str, offset: usize, data: &[u8])
-    -> Result<usize, isize>
-{
+pub fn tmpfs_pwrite(full_path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     ensure_defaults();
     let mut tbl = TMPFS_INSTANCES.lock();
     let (mp, rel) = best_mount(&tbl, full_path).ok_or(-2isize)?;
@@ -353,17 +388,21 @@ pub fn tmpfs_pwrite(full_path: &str, offset: usize, data: &[u8])
     let new_end = offset + data.len();
     if new_end > old_size {
         let delta = new_end - old_size;
-        if fs.used + delta > fs.limit { return Err(-28); }
+        if fs.used + delta > fs.limit {
+            return Err(-28);
+        }
         fs.used += delta;
     }
     let node = fs.inodes.get_mut(&ino).ok_or(-2isize)?;
     match &mut node.data {
         INodeData::File(v) => {
             let end = offset + data.len();
-            if end > v.len() { v.resize(end, 0); }
+            if end > v.len() {
+                v.resize(end, 0);
+            }
             v[offset..end].copy_from_slice(data);
             Ok(data.len())
-        }
+        },
         _ => Err(-22),
     }
 }
@@ -382,14 +421,19 @@ pub fn tmpfs_truncate(full_path: &str, len: usize) -> Result<(), isize> {
     };
     if len > old_size {
         let delta = len - old_size;
-        if fs.used + delta > fs.limit { return Err(-28); }
+        if fs.used + delta > fs.limit {
+            return Err(-28);
+        }
         fs.used += delta;
     } else {
         fs.used = fs.used.saturating_sub(old_size - len);
     }
     let node = fs.inodes.get_mut(&ino).ok_or(-2isize)?;
     match &mut node.data {
-        INodeData::File(v) => { v.resize(len, 0); Ok(()) }
+        INodeData::File(v) => {
+            v.resize(len, 0);
+            Ok(())
+        },
         _ => Err(-22),
     }
 }
@@ -404,17 +448,17 @@ pub fn tmpfs_stat(full_path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
     let size = node.file_size() as u64;
     Ok(crate::fs::vfs_ops::KStat {
         ino,
-        mode:    node.mode,
-        nlink:   node.nlink,
-        uid:     node.uid,
-        gid:     node.gid,
+        mode: node.mode,
+        nlink: node.nlink,
+        uid: node.uid,
+        gid: node.gid,
         size,
-        atime:   node.atime,
-        mtime:   node.mtime,
-        ctime:   node.ctime,
+        atime: node.atime,
+        mtime: node.mtime,
+        ctime: node.ctime,
         blksize: 4096,
-        blocks:  size.div_ceil(512),
-        is_dir:  node.is_dir(),
+        blocks: size.div_ceil(512),
+        is_dir: node.is_dir(),
     })
 }
 
@@ -425,13 +469,17 @@ pub fn tmpfs_mkdir(full_path: &str) -> Result<(), isize> {
     let mp = mp.to_string();
     let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
 
-    if fs.paths.contains_key(&rel) { return Err(-17); }
+    if fs.paths.contains_key(&rel) {
+        return Err(-17);
+    }
 
     let parent = parent_path(&rel).to_string();
-    let name   = basename(&rel).to_string();
-    if !fs.paths.contains_key(&parent) { return Err(-2); }
+    let name = basename(&rel).to_string();
+    if !fs.paths.contains_key(&parent) {
+        return Err(-2);
+    }
 
-    let ino  = fs.alloc_ino();
+    let ino = fs.alloc_ino();
     let node = INode::new_dir(ino);
     fs.inodes.insert(ino, node);
     fs.paths.insert(rel, ino);
@@ -457,11 +505,13 @@ pub fn tmpfs_rmdir(full_path: &str) -> Result<(), isize> {
         INodeData::Dir(entries) => entries.is_empty(),
         _ => return Err(-20), // ENOTDIR
     };
-    if !is_empty { return Err(-39); } // ENOTEMPTY
+    if !is_empty {
+        return Err(-39);
+    } // ENOTEMPTY
 
     // Remove from parent.
-    let parent    = parent_path(&rel).to_string();
-    let name      = basename(&rel).to_string();
+    let parent = parent_path(&rel).to_string();
+    let name = basename(&rel).to_string();
     let parent_ino = fs.paths.get(&parent).copied().unwrap_or(1);
     if let Some(p) = fs.inodes.get_mut(&parent_ino) {
         if let INodeData::Dir(ref mut entries) = p.data {
@@ -482,12 +532,14 @@ pub fn tmpfs_unlink(full_path: &str) -> Result<(), isize> {
 
     let &ino = fs.paths.get(&rel).ok_or(-2isize)?;
     let node = fs.inodes.get(&ino).ok_or(-2isize)?;
-    if node.is_dir() { return Err(-21); } // EISDIR
+    if node.is_dir() {
+        return Err(-21);
+    } // EISDIR
     let freed = node.file_size();
     fs.used = fs.used.saturating_sub(freed);
 
-    let parent    = parent_path(&rel).to_string();
-    let name      = basename(&rel).to_string();
+    let parent = parent_path(&rel).to_string();
+    let name = basename(&rel).to_string();
     let parent_ino = fs.paths.get(&parent).copied().unwrap_or(1);
     if let Some(p) = fs.inodes.get_mut(&parent_ino) {
         if let INodeData::Dir(ref mut entries) = p.data {
@@ -501,7 +553,9 @@ pub fn tmpfs_unlink(full_path: &str) -> Result<(), isize> {
         n.nlink = n.nlink.saturating_sub(1);
         n.nlink
     };
-    if nlink == 0 { fs.inodes.remove(&ino); }
+    if nlink == 0 {
+        fs.inodes.remove(&ino);
+    }
     Ok(())
 }
 
@@ -511,7 +565,9 @@ pub fn tmpfs_rename(old_path: &str, new_path: &str) -> Result<(), isize> {
     // Both paths must be on the same tmpfs instance.
     let (mp_o, rel_o) = best_mount(&tbl, old_path).ok_or(-2isize)?;
     let (mp_n, rel_n) = best_mount(&tbl, new_path).ok_or(-2isize)?;
-    if mp_o != mp_n { return Err(-18); } // EXDEV
+    if mp_o != mp_n {
+        return Err(-18);
+    } // EXDEV
     let mp = mp_o.to_string();
     let rel_o = rel_o.clone();
     let rel_n = rel_n.clone();
@@ -520,11 +576,13 @@ pub fn tmpfs_rename(old_path: &str, new_path: &str) -> Result<(), isize> {
     let &ino = fs.paths.get(&rel_o).ok_or(-2isize)?;
 
     // Remove old directory entry.
-    let old_parent    = parent_path(&rel_o).to_string();
-    let old_name      = basename(&rel_o).to_string();
+    let old_parent = parent_path(&rel_o).to_string();
+    let old_name = basename(&rel_o).to_string();
     let old_parent_ino = fs.paths.get(&old_parent).copied().unwrap_or(1);
     if let Some(p) = fs.inodes.get_mut(&old_parent_ino) {
-        if let INodeData::Dir(ref mut entries) = p.data { entries.remove(&old_name); }
+        if let INodeData::Dir(ref mut entries) = p.data {
+            entries.remove(&old_name);
+        }
     }
     fs.paths.remove(&rel_o);
 
@@ -535,11 +593,13 @@ pub fn tmpfs_rename(old_path: &str, new_path: &str) -> Result<(), isize> {
     }
 
     // Insert new directory entry.
-    let new_parent    = parent_path(&rel_n).to_string();
-    let new_name      = basename(&rel_n).to_string();
+    let new_parent = parent_path(&rel_n).to_string();
+    let new_name = basename(&rel_n).to_string();
     let new_parent_ino = fs.paths.get(&new_parent).copied().unwrap_or(1);
     if let Some(p) = fs.inodes.get_mut(&new_parent_ino) {
-        if let INodeData::Dir(ref mut entries) = p.data { entries.insert(new_name, ino); }
+        if let INodeData::Dir(ref mut entries) = p.data {
+            entries.insert(new_name, ino);
+        }
     }
     fs.paths.insert(rel_n, ino);
     Ok(())
@@ -550,24 +610,34 @@ pub fn tmpfs_link(existing: &str, new_path: &str) -> Result<(), isize> {
     let mut tbl = TMPFS_INSTANCES.lock();
     let (mp_e, rel_e) = best_mount(&tbl, existing).ok_or(-2isize)?;
     let (mp_n, rel_n) = best_mount(&tbl, new_path).ok_or(-2isize)?;
-    if mp_e != mp_n { return Err(-18); }
-    let mp    = mp_e.to_string();
+    if mp_e != mp_n {
+        return Err(-18);
+    }
+    let mp = mp_e.to_string();
     let rel_e = rel_e.clone();
     let rel_n = rel_n.clone();
     let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
 
     let &ino = fs.paths.get(&rel_e).ok_or(-2isize)?;
-    if fs.paths.contains_key(&rel_n) { return Err(-17); }
-    if fs.inodes.get(&ino).map(|n| n.is_dir()).unwrap_or(false) { return Err(-1); }
+    if fs.paths.contains_key(&rel_n) {
+        return Err(-17);
+    }
+    if fs.inodes.get(&ino).map(|n| n.is_dir()).unwrap_or(false) {
+        return Err(-1);
+    }
 
-    let parent    = parent_path(&rel_n).to_string();
-    let name      = basename(&rel_n).to_string();
+    let parent = parent_path(&rel_n).to_string();
+    let name = basename(&rel_n).to_string();
     let parent_ino = fs.paths.get(&parent).copied().ok_or(-2isize)?;
     if let Some(p) = fs.inodes.get_mut(&parent_ino) {
-        if let INodeData::Dir(ref mut entries) = p.data { entries.insert(name, ino); }
+        if let INodeData::Dir(ref mut entries) = p.data {
+            entries.insert(name, ino);
+        }
     }
     fs.paths.insert(rel_n, ino);
-    if let Some(node) = fs.inodes.get_mut(&ino) { node.nlink += 1; }
+    if let Some(node) = fs.inodes.get_mut(&ino) {
+        node.nlink += 1;
+    }
     Ok(())
 }
 
@@ -578,19 +648,25 @@ pub fn tmpfs_symlink(target: &str, link_path: &str) -> Result<(), isize> {
     let mp = mp.to_string();
     let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
 
-    if fs.paths.contains_key(&rel) { return Err(-17); }
+    if fs.paths.contains_key(&rel) {
+        return Err(-17);
+    }
     let parent = parent_path(&rel).to_string();
-    let name   = basename(&rel).to_string();
-    if !fs.paths.contains_key(&parent) { return Err(-2); }
+    let name = basename(&rel).to_string();
+    if !fs.paths.contains_key(&parent) {
+        return Err(-2);
+    }
 
-    let ino  = fs.alloc_ino();
+    let ino = fs.alloc_ino();
     let node = INode::new_symlink(ino, target);
     fs.inodes.insert(ino, node);
     fs.paths.insert(rel, ino);
 
     let parent_ino = *fs.paths.get(&parent).unwrap();
     if let Some(p) = fs.inodes.get_mut(&parent_ino) {
-        if let INodeData::Dir(ref mut entries) = p.data { entries.insert(name, ino); }
+        if let INodeData::Dir(ref mut entries) = p.data {
+            entries.insert(name, ino);
+        }
     }
     Ok(())
 }
@@ -608,9 +684,7 @@ pub fn tmpfs_readlink(full_path: &str) -> Result<String, isize> {
     }
 }
 
-pub fn tmpfs_readdir(full_path: &str)
-    -> Result<Vec<crate::fs::vfs_ops::DirEntry>, isize>
-{
+pub fn tmpfs_readdir(full_path: &str) -> Result<Vec<crate::fs::vfs_ops::DirEntry>, isize> {
     ensure_defaults();
     let tbl = TMPFS_INSTANCES.lock();
     let (mp, rel) = best_mount(&tbl, full_path).ok_or(-2isize)?;
@@ -624,16 +698,16 @@ pub fn tmpfs_readdir(full_path: &str)
                 if let Some(child) = fs.inodes.get(&child_ino) {
                     let size = child.file_size() as u64;
                     out.push(crate::fs::vfs_ops::DirEntry {
-                        name:   name.clone(),
-                        ino:    child_ino,
+                        name: name.clone(),
+                        ino: child_ino,
                         is_dir: child.is_dir(),
-                        mode:   child.mode,
+                        mode: child.mode,
                         size,
                     });
                 }
             }
             Ok(out)
-        }
+        },
         _ => Err(-20), // ENOTDIR
     }
 }
@@ -659,8 +733,12 @@ pub fn tmpfs_chown(full_path: &str, uid: u32, gid: u32) -> Result<(), isize> {
     let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
     let &ino = fs.paths.get(&rel).ok_or(-2isize)?;
     let node = fs.inodes.get_mut(&ino).ok_or(-2isize)?;
-    if uid != u32::MAX { node.uid = uid; }
-    if gid != u32::MAX { node.gid = gid; }
+    if uid != u32::MAX {
+        node.uid = uid;
+    }
+    if gid != u32::MAX {
+        node.gid = gid;
+    }
     Ok(())
 }
 
@@ -674,23 +752,21 @@ pub fn tmpfs_statfs_for(full_path: &str) -> crate::fs::vfs_ops::KStatfs {
     let mut best_mp: Option<&str> = None;
     for mp in tbl.keys() {
         let ms = mp.trim_end_matches('/');
-        if (full_path == ms
-            || full_path.starts_with(&alloc::format!("{}/", ms))
-            || ms.is_empty())
+        if (full_path == ms || full_path.starts_with(&alloc::format!("{}/", ms)) || ms.is_empty())
             && ms.len() >= best_len
         {
             best_len = ms.len();
-            best_mp  = Some(mp.as_str());
+            best_mp = Some(mp.as_str());
         }
     }
     if let Some(mp) = best_mp {
         let sf = tbl.get(mp).unwrap().statfs();
         return crate::fs::vfs_ops::KStatfs {
-            f_type:    sf.f_type,
-            f_bsize:   sf.f_bsize,
-            f_blocks:  sf.f_blocks,
-            f_bfree:   sf.f_bfree,
-            f_bavail:  sf.f_bavail,
+            f_type: sf.f_type,
+            f_bsize: sf.f_bsize,
+            f_blocks: sf.f_blocks,
+            f_bfree: sf.f_bfree,
+            f_bavail: sf.f_bavail,
             f_namelen: sf.f_namelen,
         };
     }
@@ -711,29 +787,28 @@ pub fn is_anon_path(path: &str) -> bool {
 
 /// Parse "<mountroot>/@anon:<ino>" into (mountroot, ino).
 fn parse_anon_path(full_path: &str) -> Option<(&str, u64)> {
-    let at      = full_path.rfind(ANON_PREFIX)?;
+    let at = full_path.rfind(ANON_PREFIX)?;
     let ino_str = &full_path[at + ANON_PREFIX.len()..];
     let ino: u64 = ino_str.parse().ok()?;
     Some((&full_path[..at], ino))
 }
 
-fn anon_fs_mut<'a>(
-    tbl: &'a mut BTreeMap<String, TmpFs>,
-    mp_prefix: &str,
-) -> Option<&'a mut TmpFs> {
+fn anon_fs_mut<'a>(tbl: &'a mut BTreeMap<String, TmpFs>, mp_prefix: &str) -> Option<&'a mut TmpFs> {
     let key = mp_prefix.trim_end_matches('/').to_string();
-    if tbl.contains_key(&key)              { return tbl.get_mut(&key); }
+    if tbl.contains_key(&key) {
+        return tbl.get_mut(&key);
+    }
     let key2 = alloc::format!("{}/", key);
-    if tbl.contains_key(&key2)             { return tbl.get_mut(&key2); }
+    if tbl.contains_key(&key2) {
+        return tbl.get_mut(&key2);
+    }
     None
 }
 
-fn anon_fs_ref<'a>(
-    tbl: &'a BTreeMap<String, TmpFs>,
-    mp_prefix: &str,
-) -> Option<&'a TmpFs> {
+fn anon_fs_ref<'a>(tbl: &'a BTreeMap<String, TmpFs>, mp_prefix: &str) -> Option<&'a TmpFs> {
     let key = mp_prefix.trim_end_matches('/').to_string();
-    tbl.get(&key).or_else(|| tbl.get(&alloc::format!("{}/", key)))
+    tbl.get(&key)
+        .or_else(|| tbl.get(&alloc::format!("{}/", key)))
 }
 
 /// Create an anonymous (unlinked) file inside the tmpfs that owns `dir_path`.
@@ -745,67 +820,71 @@ pub fn tmpfs_create_anon(dir_path: &str) -> Result<String, isize> {
     let mut best_mp: Option<String> = None;
     for mp in tbl.keys() {
         let ms = mp.trim_end_matches('/');
-        if (dir_path == ms
-            || dir_path.starts_with(&alloc::format!("{}/", ms))
-            || ms.is_empty())
+        if (dir_path == ms || dir_path.starts_with(&alloc::format!("{}/", ms)) || ms.is_empty())
             && ms.len() >= best_len
         {
             best_len = ms.len();
-            best_mp  = Some(mp.clone());
+            best_mp = Some(mp.clone());
         }
     }
     let mp = best_mp.ok_or(-2isize)?;
     let fs = tbl.get_mut(&mp).ok_or(-2isize)?;
-    let ino  = fs.alloc_ino();
+    let ino = fs.alloc_ino();
     let node = INode::new_file(ino);
     fs.inodes.insert(ino, node);
     let mountroot = mp.trim_end_matches('/');
-    Ok(alloc::format!("{}{}{}",  mountroot, ANON_PREFIX, ino))
+    Ok(alloc::format!("{}{}{}", mountroot, ANON_PREFIX, ino))
 }
 
 /// pread on an anonymous inode.
-pub fn tmpfs_anon_pread(full_path: &str, offset: usize, len: usize)
-    -> Result<Vec<u8>, isize>
-{
+pub fn tmpfs_anon_pread(full_path: &str, offset: usize, len: usize) -> Result<Vec<u8>, isize> {
     ensure_defaults();
     let (mp_prefix, ino) = parse_anon_path(full_path).ok_or(-9isize)?;
     let mut tbl = TMPFS_INSTANCES.lock();
-    let fs   = anon_fs_mut(&mut tbl, mp_prefix).ok_or(-9isize)?;
+    let fs = anon_fs_mut(&mut tbl, mp_prefix).ok_or(-9isize)?;
     let node = fs.inodes.get(&ino).ok_or(-9isize)?;
     match &node.data {
         INodeData::File(v) => {
-            if offset >= v.len() { return Ok(Vec::new()); }
+            if offset >= v.len() {
+                return Ok(Vec::new());
+            }
             let end = (offset + len).min(v.len());
             Ok(v[offset..end].to_vec())
-        }
+        },
         _ => Err(-22),
     }
 }
 
 /// pwrite on an anonymous inode.
-pub fn tmpfs_anon_pwrite(full_path: &str, offset: usize, data: &[u8])
-    -> Result<usize, isize>
-{
+pub fn tmpfs_anon_pwrite(full_path: &str, offset: usize, data: &[u8]) -> Result<usize, isize> {
     ensure_defaults();
     let (mp_prefix, ino) = parse_anon_path(full_path).ok_or(-9isize)?;
     let mut tbl = TMPFS_INSTANCES.lock();
-    let fs   = anon_fs_mut(&mut tbl, mp_prefix).ok_or(-9isize)?;
+    let fs = anon_fs_mut(&mut tbl, mp_prefix).ok_or(-9isize)?;
     let node = fs.inodes.get(&ino).ok_or(-9isize)?;
-    let old_size = if let INodeData::File(v) = &node.data { v.len() } else { return Err(-22); };
-    let new_end  = offset + data.len();
+    let old_size = if let INodeData::File(v) = &node.data {
+        v.len()
+    } else {
+        return Err(-22);
+    };
+    let new_end = offset + data.len();
     if new_end > old_size {
         let delta = new_end - old_size;
-        if fs.used + delta > fs.limit { return Err(-28); }
+        if fs.used + delta > fs.limit {
+            return Err(-28);
+        }
         fs.used += delta;
     }
     let node = fs.inodes.get_mut(&ino).ok_or(-9isize)?;
     match &mut node.data {
         INodeData::File(v) => {
             let end = offset + data.len();
-            if end > v.len() { v.resize(end, 0); }
+            if end > v.len() {
+                v.resize(end, 0);
+            }
             v[offset..end].copy_from_slice(data);
             Ok(data.len())
-        }
+        },
         _ => Err(-22),
     }
 }
@@ -815,19 +894,28 @@ pub fn tmpfs_anon_truncate(full_path: &str, len: usize) -> Result<(), isize> {
     ensure_defaults();
     let (mp_prefix, ino) = parse_anon_path(full_path).ok_or(-9isize)?;
     let mut tbl = TMPFS_INSTANCES.lock();
-    let fs   = anon_fs_mut(&mut tbl, mp_prefix).ok_or(-9isize)?;
+    let fs = anon_fs_mut(&mut tbl, mp_prefix).ok_or(-9isize)?;
     let node = fs.inodes.get(&ino).ok_or(-9isize)?;
-    let old_size = if let INodeData::File(v) = &node.data { v.len() } else { return Err(-22); };
+    let old_size = if let INodeData::File(v) = &node.data {
+        v.len()
+    } else {
+        return Err(-22);
+    };
     if len > old_size {
         let delta = len - old_size;
-        if fs.used + delta > fs.limit { return Err(-28); }
+        if fs.used + delta > fs.limit {
+            return Err(-28);
+        }
         fs.used += delta;
     } else {
         fs.used = fs.used.saturating_sub(old_size - len);
     }
     let node = fs.inodes.get_mut(&ino).ok_or(-9isize)?;
     match &mut node.data {
-        INodeData::File(v) => { v.resize(len, 0); Ok(()) }
+        INodeData::File(v) => {
+            v.resize(len, 0);
+            Ok(())
+        },
         _ => Err(-22),
     }
 }
@@ -836,22 +924,22 @@ pub fn tmpfs_anon_truncate(full_path: &str, len: usize) -> Result<(), isize> {
 pub fn tmpfs_anon_stat(full_path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
     ensure_defaults();
     let (mp_prefix, ino) = parse_anon_path(full_path).ok_or(-9isize)?;
-    let tbl  = TMPFS_INSTANCES.lock();
-    let fs   = anon_fs_ref(&tbl, mp_prefix).ok_or(-9isize)?;
+    let tbl = TMPFS_INSTANCES.lock();
+    let fs = anon_fs_ref(&tbl, mp_prefix).ok_or(-9isize)?;
     let node = fs.inodes.get(&ino).ok_or(-9isize)?;
     let size = node.file_size() as u64;
     Ok(crate::fs::vfs_ops::KStat {
         ino,
-        mode:    node.mode,
-        nlink:   1,
-        uid:     node.uid,
-        gid:     node.gid,
+        mode: node.mode,
+        nlink: 1,
+        uid: node.uid,
+        gid: node.gid,
         size,
-        atime:   node.atime,
-        mtime:   node.mtime,
-        ctime:   node.ctime,
+        atime: node.atime,
+        mtime: node.mtime,
+        ctime: node.ctime,
         blksize: 4096,
-        blocks:  size.div_ceil(512),
-        is_dir:  false,
+        blocks: size.div_ceil(512),
+        is_dir: false,
     })
 }

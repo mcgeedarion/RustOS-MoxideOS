@@ -13,17 +13,21 @@ pub fn next_ephemeral() -> u16 {
 pub fn read_sockaddr_in(va: usize) -> Option<(u16, u32)> {
     let mut buf = [0u8; 8];
     copy_from_user(va, &mut buf);
-    if u16::from_be_bytes([buf[0], buf[1]]) != 2 { return None; }
+    if u16::from_be_bytes([buf[0], buf[1]]) != 2 {
+        return None;
+    }
     let port = u16::from_be_bytes([buf[2], buf[3]]);
-    let ip   = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let ip = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     Some((port, ip))
 }
 
 pub fn read_sockaddr_in6(va: usize) -> Option<(u16, ipv6::Addr6, u32, u32)> {
     let mut buf = [0u8; 28];
     copy_from_user(va, &mut buf);
-    if u16::from_be_bytes([buf[0], buf[1]]) != 10 { return None; }
-    let port     = u16::from_be_bytes([buf[2], buf[3]]);
+    if u16::from_be_bytes([buf[0], buf[1]]) != 10 {
+        return None;
+    }
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
     let flowinfo = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let mut addr = [0u8; 16];
     addr.copy_from_slice(&buf[8..24]);
@@ -32,7 +36,9 @@ pub fn read_sockaddr_in6(va: usize) -> Option<(u16, ipv6::Addr6, u32, u32)> {
 }
 
 pub fn write_sockaddr_in(va: usize, ip: u32, port: u16) {
-    if va == 0 { return; }
+    if va == 0 {
+        return;
+    }
     let mut buf = [0u8; 16];
     buf[0..2].copy_from_slice(&2u16.to_be_bytes());
     buf[2..4].copy_from_slice(&port.to_be_bytes());
@@ -41,7 +47,9 @@ pub fn write_sockaddr_in(va: usize, ip: u32, port: u16) {
 }
 
 pub fn write_sockaddr_in6(va: usize, ip: &ipv6::Addr6, port: u16, flowinfo: u32, scope_id: u32) {
-    if va == 0 { return; }
+    if va == 0 {
+        return;
+    }
     let mut buf = [0u8; 28];
     buf[0..2].copy_from_slice(&10u16.to_be_bytes());
     buf[2..4].copy_from_slice(&port.to_be_bytes());

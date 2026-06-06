@@ -15,8 +15,8 @@
 //!   /proc/cpuinfo           → per-CPU info (one block per logical CPU)
 //!   /proc/perf_core_count   → count of online Performance-class cores
 //!   /proc/slabinfo          → slab allocator cache statistics
-//!   /proc/schemes           → one registered scheme name per line (Redox-style)
-//!   /proc/sys/fs/binfmt_misc/*  → delegated to procfs_binfmt
+//!   /proc/schemes           → one registered scheme name per line
+//! (Redox-style)   /proc/sys/fs/binfmt_misc/*  → delegated to procfs_binfmt
 //!
 //! ## Debug fds  (/proc/<pid>/mem|regs|ctl)
 //!   Delegated to proc_debug.rs — see that file for details.
@@ -37,8 +37,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use spin::Mutex;
 use alloc::collections::BTreeMap;
+use spin::Mutex;
 
 /// The 7 canonical namespace names in /proc/<pid>/ns/.
 pub const NS_NAMES: &[&str] = &["mnt", "pid", "net", "uts", "ipc", "user", "time"];
@@ -51,7 +51,7 @@ pub fn is_procfs_fd(fdno: usize) -> bool {
 #[derive(Clone)]
 struct ProcFd {
     content: Vec<u8>,
-    offset:  usize,
+    offset: usize,
     /// When `Some`, writes to this fd are forwarded to procfs_binfmt.
     write_path: Option<alloc::string::String>,
 }
@@ -63,7 +63,7 @@ pub fn procfs_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
     let guard = PROCFS_FDS.lock();
     let pfd = match guard.get(&fdno) {
         Some(p) => p,
-        None    => return -9,
+        None => return -9,
     };
     let start = offset.min(pfd.content.len());
     let avail = &pfd.content[start..];
@@ -83,7 +83,7 @@ pub fn procfs_write(fdno: usize, data: &[u8]) -> isize {
     };
     match write_path {
         Some(ref path) => match crate::fs::procfs_binfmt::write(path, data) {
-            Ok(n)  => n as isize,
+            Ok(n) => n as isize,
             Err(e) => e,
         },
         None => -9, // EBADF — fd exists but is read-only
@@ -120,7 +120,9 @@ pub fn procfs_ns_stat(path: &str) -> Option<(u64, u32)> {
     if name.is_empty() {
         return Some((tpid as u64 * 1000 + 7, 0o040555));
     }
-    if !NS_NAMES.contains(&name) { return None; }
+    if !NS_NAMES.contains(&name) {
+        return None;
+    }
     let ns_id = crate::proc::namespace::ns_id_of(tpid, name)?;
     Some((ns_id, 0o120444))
 }
@@ -149,8 +151,8 @@ pub fn procfs_readlink(path: &str, buf: &mut [u8]) -> isize {
     }
 
     if let Some((epid, "")) = strip_pid_prefix(p, "/exe") {
-        let exe = crate::proc::scheduler::exe_path_of(epid)
-            .unwrap_or_else(|| String::from("/init"));
+        let exe =
+            crate::proc::scheduler::exe_path_of(epid).unwrap_or_else(|| String::from("/init"));
         return copy_link(exe.as_bytes(), buf);
     }
 
@@ -179,7 +181,7 @@ fn gen_cpuinfo() -> Vec<u8> {
         if let Some(info) = crate::smp::cpu_info(i) {
             let core_type = match info.core_type {
                 crate::smp::CoreType::Performance => "performance",
-                crate::smp::CoreType::Efficiency  => "efficiency",
+                crate::smp::CoreType::Efficiency => "efficiency",
             };
             out.push_str(&format!(
                 "processor\t: {}\nhw_id\t\t: {}\nnode\t\t: {}\ncore_type\t: {}\nonline\t\t: {}\n\n",
@@ -188,7 +190,9 @@ fn gen_cpuinfo() -> Vec<u8> {
         }
     }
     if out.is_empty() {
-        out.push_str("processor\t: 0\nmodel name\t: rustos virtual CPU\ncore_type\t: performance\n");
+        out.push_str(
+            "processor\t: 0\nmodel name\t: rustos virtual CPU\ncore_type\t: performance\n",
+        );
     }
     out.into_bytes()
 }
@@ -198,8 +202,7 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     // Must be checked before the generic /proc/<pid>/... matchers because
     // the path starts with "/proc/sys" which has no pid component.
     if crate::fs::procfs_binfmt::owns_path(path) {
-        return crate::fs::procfs_binfmt::read(path)
-            .map(|s| s.into_bytes());
+        return crate::fs::procfs_binfmt::read(path).map(|s| s.into_bytes());
     }
 
     let pid = crate::proc::scheduler::current_pid();
@@ -208,7 +211,10 @@ fn generate(path: &str) -> Option<Vec<u8>> {
 
     if let Some((_tpid, "")) = strip_pid_prefix(p, "/ns") {
         let mut out = String::new();
-        for name in NS_NAMES { out.push_str(name); out.push('\n'); }
+        for name in NS_NAMES {
+            out.push_str(name);
+            out.push('\n');
+        }
         return Some(out.into_bytes());
     }
 
@@ -243,18 +249,21 @@ fn generate(path: &str) -> Option<Vec<u8>> {
     }
     if p == "/proc/meminfo" {
         let total = crate::mm::pmm::total_pages() as u64 * 4;
-        let free  = crate::mm::pmm::free_pages()  as u64 * 4;
-        let slab  = crate::mm::slab::slab_stats();
+        let free = crate::mm::pmm::free_pages() as u64 * 4;
+        let slab = crate::mm::slab::slab_stats();
         let slab_kb = (slab.total_slabs * 4) as u64;
-        return Some(format!(
-            "MemTotal:      {:8} kB\n\
+        return Some(
+            format!(
+                "MemTotal:      {:8} kB\n\
              MemFree:       {:8} kB\n\
              MemAvailable:  {:8} kB\n\
              Slab:          {:8} kB\n\
              SReclaimable:  {:8} kB\n\
              SUnreclaim:    {:8} kB\n",
-            total, free, free, slab_kb, slab_kb, 0u64,
-        ).into_bytes());
+                total, free, free, slab_kb, slab_kb, 0u64,
+            )
+            .into_bytes(),
+        );
     }
     if p == "/proc/cpuinfo" {
         return Some(gen_cpuinfo());
@@ -264,8 +273,7 @@ fn generate(path: &str) -> Option<Vec<u8>> {
         return Some(format!("{count}\n").into_bytes());
     }
     if p == "/proc/self/cmdline" || p.ends_with("/cmdline") {
-        let exe = crate::proc::scheduler::exe_path_of(pid)
-            .unwrap_or_else(|| String::from("/init"));
+        let exe = crate::proc::scheduler::exe_path_of(pid).unwrap_or_else(|| String::from("/init"));
         let mut v = exe.into_bytes();
         v.push(0);
         return Some(v);
@@ -312,21 +320,28 @@ fn gen_slabinfo() -> String {
          # name                  <active_objs> <num_objs> <objsize> \
 <objperslab> <pagesperslab> \
 : tunables <limit> <batchcount> <sharedfactor> \
-: slabdata <active_slabs> <num_slabs> <sharedavail>\n"
+: slabdata <active_slabs> <num_slabs> <sharedavail>\n",
     );
     for cs in &stats.per_cache {
-        if cs.obj_size == 0 { continue; }
-        let hdr_raw      = 40usize;
-        let hdr_off      = (hdr_raw + cs.obj_size - 1) & !(cs.obj_size - 1);
+        if cs.obj_size == 0 {
+            continue;
+        }
+        let hdr_raw = 40usize;
+        let hdr_off = (hdr_raw + cs.obj_size - 1) & !(cs.obj_size - 1);
         let obj_per_slab = (4096 - hdr_off) / cs.obj_size;
-        let total_objs   = cs.total_slabs * obj_per_slab;
+        let total_objs = cs.total_slabs * obj_per_slab;
         let active_slabs = cs.partial_slabs + cs.full_slabs;
         out.push_str(&format!(
             "{:<22} {:6} {:6} {:6} {:6} {:6} : tunables      0      0      0 \
 : slabdata {:6} {:6}      0\n",
             format!("kmalloc-{}", cs.obj_size),
-            cs.active_objs, total_objs, cs.obj_size, obj_per_slab, 1,
-            active_slabs, cs.total_slabs,
+            cs.active_objs,
+            total_objs,
+            cs.obj_size,
+            obj_per_slab,
+            1,
+            active_slabs,
+            cs.total_slabs,
         ));
     }
     out
@@ -335,55 +350,66 @@ fn gen_slabinfo() -> String {
 const RLIM_INFINITY: u64 = u64::MAX;
 
 fn fmt_limit(v: u64) -> alloc::string::String {
-    if v == RLIM_INFINITY { alloc::string::String::from("unlimited") }
-    else { format!("{}", v) }
+    if v == RLIM_INFINITY {
+        alloc::string::String::from("unlimited")
+    } else {
+        format!("{}", v)
+    }
 }
 
 fn gen_limits(pid: usize) -> String {
     use crate::proc::rlimit::*;
     let get = |res: usize| -> (u64, u64) { crate::proc::rlimit::getrlimit_for(pid, res) };
-    let header = format!("{:<26}{:<21}{:<21}{}\n", "Limit", "Soft Limit", "Hard Limit", "Units");
+    let header = format!(
+        "{:<26}{:<21}{:<21}{}\n",
+        "Limit", "Soft Limit", "Hard Limit", "Units"
+    );
     let rows: &[(&str, usize, &str)] = &[
-        ("Max cpu time",          RLIMIT_CPU,       "seconds"),
-        ("Max file size",         RLIMIT_FSIZE,     "bytes"),
-        ("Max data size",         RLIMIT_DATA,      "bytes"),
-        ("Max stack size",        RLIMIT_STACK,     "bytes"),
-        ("Max core file size",    RLIMIT_CORE,      "bytes"),
-        ("Max resident set",      RLIMIT_RSS,       "bytes"),
-        ("Max processes",         RLIMIT_NPROC,     "processes"),
-        ("Max open files",        RLIMIT_NOFILE,    "files"),
-        ("Max locked memory",     RLIMIT_MEMLOCK,   "bytes"),
-        ("Max address space",     RLIMIT_AS,        "bytes"),
-        ("Max file locks",        RLIMIT_LOCKS,     "locks"),
-        ("Max pending signals",   RLIMIT_SIGPENDING,"signals"),
-        ("Max msgqueue size",     RLIMIT_MSGQUEUE,  "bytes"),
-        ("Max nice priority",     RLIMIT_NICE,      ""),
-        ("Max realtime priority", RLIMIT_RTPRIO,    ""),
-        ("Max realtime timeout",  RLIMIT_RTTIME,    "us"),
+        ("Max cpu time", RLIMIT_CPU, "seconds"),
+        ("Max file size", RLIMIT_FSIZE, "bytes"),
+        ("Max data size", RLIMIT_DATA, "bytes"),
+        ("Max stack size", RLIMIT_STACK, "bytes"),
+        ("Max core file size", RLIMIT_CORE, "bytes"),
+        ("Max resident set", RLIMIT_RSS, "bytes"),
+        ("Max processes", RLIMIT_NPROC, "processes"),
+        ("Max open files", RLIMIT_NOFILE, "files"),
+        ("Max locked memory", RLIMIT_MEMLOCK, "bytes"),
+        ("Max address space", RLIMIT_AS, "bytes"),
+        ("Max file locks", RLIMIT_LOCKS, "locks"),
+        ("Max pending signals", RLIMIT_SIGPENDING, "signals"),
+        ("Max msgqueue size", RLIMIT_MSGQUEUE, "bytes"),
+        ("Max nice priority", RLIMIT_NICE, ""),
+        ("Max realtime priority", RLIMIT_RTPRIO, ""),
+        ("Max realtime timeout", RLIMIT_RTTIME, "us"),
     ];
     let mut out = header;
     for &(name, res, units) in rows {
         let (soft, hard) = get(res);
-        out.push_str(&format!("{:<26}{:<21}{:<21}{}\n", name, fmt_limit(soft), fmt_limit(hard), units));
+        out.push_str(&format!(
+            "{:<26}{:<21}{:<21}{}\n",
+            name,
+            fmt_limit(soft),
+            fmt_limit(hard),
+            units
+        ));
     }
     out
 }
 
 fn gen_status(pid: usize) -> String {
-    use crate::proc::scheduler::with_proc;
     use crate::proc::process::State;
-    let (state_ch, ppid, vsize_kb, comm, rt_cpu_time_us) =
-        with_proc(pid, |p| {
-            let ch = match p.state {
-                State::Running | State::Ready => 'R',
-                State::Blocked               => 'S',
-                State::Zombie                => 'Z',
-            };
-            let vsize: u64 = p.vmas.iter().map(|v| (v.end - v.start) as u64).sum();
-            let comm = exe_basename(&p.exe_path);
-            (ch, p.ppid, vsize / 1024, comm, p.rt_cpu_time_us)
-        })
-        .unwrap_or_else(|| ('R', 1, 0, String::from("rustos"), 0));
+    use crate::proc::scheduler::with_proc;
+    let (state_ch, ppid, vsize_kb, comm, rt_cpu_time_us) = with_proc(pid, |p| {
+        let ch = match p.state {
+            State::Running | State::Ready => 'R',
+            State::Blocked => 'S',
+            State::Zombie => 'Z',
+        };
+        let vsize: u64 = p.vmas.iter().map(|v| (v.end - v.start) as u64).sum();
+        let comm = exe_basename(&p.exe_path);
+        (ch, p.ppid, vsize / 1024, comm, p.rt_cpu_time_us)
+    })
+    .unwrap_or_else(|| ('R', 1, 0, String::from("rustos"), 0));
     format!(
         "Name:\t{}\nState:\t{} \nPid:\t{}\nPPid:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nRtCpuTime:\t{} us\n",
         comm, state_ch, pid, ppid, vsize_kb, vsize_kb, rt_cpu_time_us
@@ -393,47 +419,88 @@ fn gen_status(pid: usize) -> String {
 const USER_HZ: u64 = 100;
 
 fn gen_stat(pid: usize) -> String {
-    use crate::proc::scheduler::with_proc;
     use crate::proc::process::State;
-    use crate::proc::rlimit::RLIMIT_RSS;
     use crate::proc::rlimit::getrlimit_for;
+    use crate::proc::rlimit::RLIMIT_RSS;
+    use crate::proc::scheduler::with_proc;
 
     let snap = with_proc(pid, |p| {
         let state_ch = match p.state {
             State::Running | State::Ready => 'R',
-            State::Blocked               => 'S',
-            State::Zombie                => 'Z',
+            State::Blocked => 'S',
+            State::Zombie => 'Z',
         };
         let comm = exe_basename(&p.exe_path);
-        let comm = if comm.len() > 15 { comm[..15].to_string() } else { comm };
+        let comm = if comm.len() > 15 {
+            comm[..15].to_string()
+        } else {
+            comm
+        };
         let utime = p.cpu_time_ns * USER_HZ / 1_000_000_000;
         let priority: i64 = {
             use crate::proc::scheduler::SchedPolicy;
             match p.sched.policy {
-                SchedPolicy::Fifo | SchedPolicy::Rr =>
-                    (99i64).saturating_sub(p.sched.rt_priority as i64),
+                SchedPolicy::Fifo | SchedPolicy::Rr => {
+                    (99i64).saturating_sub(p.sched.rt_priority as i64)
+                },
                 _ => -((p.sched.nice as i64) + 2),
             }
         };
         let vsize: u64 = p.vmas.iter().map(|v| (v.end - v.start) as u64).sum();
-        let rss: u64   = vsize / 4096;
+        let rss: u64 = vsize / 4096;
         let start_code: u64 = p.vmas.first().map(|v| v.start as u64).unwrap_or(0);
-        let end_code:   u64 = p.vmas.last().map(|v| v.end   as u64).unwrap_or(0);
-        (state_ch, comm, p.ppid, utime, priority, p.sched.nice as i64,
-         vsize, rss, start_code, end_code, p.pc as u64,
-         p.exit_signal as i64, p.sched.last_cpu as u64,
-         p.sched.rt_priority as u64, p.sched.policy as u32,
-         p.brk_base as u64, p.brk as u64, p.exit_code as i64,
-         p.rt_cpu_time_us)
+        let end_code: u64 = p.vmas.last().map(|v| v.end as u64).unwrap_or(0);
+        (
+            state_ch,
+            comm,
+            p.ppid,
+            utime,
+            priority,
+            p.sched.nice as i64,
+            vsize,
+            rss,
+            start_code,
+            end_code,
+            p.pc as u64,
+            p.exit_signal as i64,
+            p.sched.last_cpu as u64,
+            p.sched.rt_priority as u64,
+            p.sched.policy as u32,
+            p.brk_base as u64,
+            p.brk as u64,
+            p.exit_code as i64,
+            p.rt_cpu_time_us,
+        )
     });
-    let (state_ch, comm, ppid, utime, priority, nice, vsize, rss,
-         start_code, end_code, kstkeip, exit_signal, processor,
-         rt_priority, policy, start_data, end_data, exit_code,
-         rt_cpu_time_us) = match snap {
+    let (
+        state_ch,
+        comm,
+        ppid,
+        utime,
+        priority,
+        nice,
+        vsize,
+        rss,
+        start_code,
+        end_code,
+        kstkeip,
+        exit_signal,
+        processor,
+        rt_priority,
+        policy,
+        start_data,
+        end_data,
+        exit_code,
+        rt_cpu_time_us,
+    ) = match snap {
         Some(s) => s,
-        None    => return format!(
-            "{} (?) Z 1 {} {} 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 \
-             0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", pid, pid, pid),
+        None => {
+            return format!(
+                "{} (?) Z 1 {} {} 0 -1 0 0 0 0 0 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 \
+             0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                pid, pid, pid
+            )
+        },
     };
     let (rsslim, _) = getrlimit_for(pid, RLIMIT_RSS);
     format!(
@@ -442,19 +509,35 @@ fn gen_stat(pid: usize) -> String {
          {vsize} {rss} {rsslim} {start_code} {end_code} 0 0 {kstkeip} 0 0 0 0 0 \
          {exit_signal} {processor} {rt_priority} {policy} {rt_cpu_time_us} 0 0 \
          {start_data} {end_data} {start_data} 0 0 0 0 {exit_code}\n",
-        pid=pid, comm=comm, state=state_ch, ppid=ppid, pgrp=pid, session=pid,
-        utime=utime, priority=priority, nice=nice,
-        vsize=vsize, rss=rss, rsslim=rsslim,
-        start_code=start_code, end_code=end_code, kstkeip=kstkeip,
-        exit_signal=exit_signal, processor=processor,
-        rt_priority=rt_priority, policy=policy,
-        rt_cpu_time_us=rt_cpu_time_us,
-        start_data=start_data, end_data=end_data, exit_code=exit_code,
+        pid = pid,
+        comm = comm,
+        state = state_ch,
+        ppid = ppid,
+        pgrp = pid,
+        session = pid,
+        utime = utime,
+        priority = priority,
+        nice = nice,
+        vsize = vsize,
+        rss = rss,
+        rsslim = rsslim,
+        start_code = start_code,
+        end_code = end_code,
+        kstkeip = kstkeip,
+        exit_signal = exit_signal,
+        processor = processor,
+        rt_priority = rt_priority,
+        policy = policy,
+        rt_cpu_time_us = rt_cpu_time_us,
+        start_data = start_data,
+        end_data = end_data,
+        exit_code = exit_code,
     )
 }
 
 fn exe_basename(exe_path: &Option<String>) -> String {
-    exe_path.as_deref()
+    exe_path
+        .as_deref()
         .and_then(|p| p.rsplit('/').next())
         .map(|s| s.to_string())
         .unwrap_or_else(|| String::from("rustos"))
@@ -462,16 +545,16 @@ fn exe_basename(exe_path: &Option<String>) -> String {
 
 fn gen_maps(pid: usize) -> String {
     let mut out = String::new();
-    let vmas = crate::proc::scheduler::with_proc(pid, |p| p.vmas.clone())
-        .unwrap_or_default();
+    let vmas = crate::proc::scheduler::with_proc(pid, |p| p.vmas.clone()).unwrap_or_default();
     for vma in &vmas {
         let r = if vma.prot & 1 != 0 { 'r' } else { '-' };
         let w = if vma.prot & 2 != 0 { 'w' } else { '-' };
         let x = if vma.prot & 4 != 0 { 'x' } else { '-' };
         let label = match &vma.kind {
-            crate::mm::mmap::VmaKind::FileBacked(fd, _) =>
-                crate::fs::vfs::fd_to_path(*fd).unwrap_or_default(),
-            crate::mm::mmap::VmaKind::Heap  => String::from("[heap]"),
+            crate::mm::mmap::VmaKind::FileBacked(fd, _) => {
+                crate::fs::vfs::fd_to_path(*fd).unwrap_or_default()
+            },
+            crate::mm::mmap::VmaKind::Heap => String::from("[heap]"),
             crate::mm::mmap::VmaKind::Stack => String::from("[stack]"),
             _ => String::new(),
         };
@@ -512,7 +595,14 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
             .unwrap_or_default();
         let write_path = Some(alloc::string::String::from(path));
         let fdno = next_procfs_fd();
-        PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0, write_path });
+        PROCFS_FDS.lock().insert(
+            fdno,
+            ProcFd {
+                content,
+                offset: 0,
+                write_path,
+            },
+        );
         return fdno as isize;
     }
 
@@ -522,15 +612,19 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
         let name = rest.trim_end_matches('/');
         if NS_NAMES.contains(&name) {
             let ns_fd = crate::proc::namespace::ns_fd_open(tpid, name);
-            if ns_fd < 0 { return ns_fd; }
+            if ns_fd < 0 {
+                return ns_fd;
+            }
             if let Some(ns_id) = crate::proc::namespace::ns_id_of(tpid, name) {
-                let content = crate::proc::namespace::ns_symlink(name, ns_id)
-                    .into_bytes();
-                PROCFS_FDS.lock().insert(ns_fd as usize, ProcFd {
-                    content,
-                    offset: 0,
-                    write_path: None,
-                });
+                let content = crate::proc::namespace::ns_symlink(name, ns_id).into_bytes();
+                PROCFS_FDS.lock().insert(
+                    ns_fd as usize,
+                    ProcFd {
+                        content,
+                        offset: 0,
+                        write_path: None,
+                    },
+                );
             }
             return ns_fd;
         }
@@ -539,9 +633,16 @@ pub fn procfs_open(path: &str, _flags: u32) -> isize {
     match generate(path) {
         Some(content) => {
             let fdno = next_procfs_fd();
-            PROCFS_FDS.lock().insert(fdno, ProcFd { content, offset: 0, write_path: None });
+            PROCFS_FDS.lock().insert(
+                fdno,
+                ProcFd {
+                    content,
+                    offset: 0,
+                    write_path: None,
+                },
+            );
             fdno as isize
-        }
+        },
         None => -2,
     }
 }
@@ -554,11 +655,15 @@ fn is_debug_path(path: &str) -> bool {
         if let Some(after) = path.strip_prefix("/proc/") {
             if let Some(slash) = after.find('/') {
                 let maybe_pid = &after[..slash];
-                let leaf = &after[slash+1..];
+                let leaf = &after[slash + 1..];
                 maybe_pid.bytes().all(|b| b.is_ascii_digit())
                     && matches!(leaf, "mem" | "regs" | "ctl")
-            } else { false }
-        } else { false }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
     };
     p
 }
@@ -566,7 +671,9 @@ fn is_debug_path(path: &str) -> bool {
 fn next_procfs_fd() -> usize {
     let guard = PROCFS_FDS.lock();
     for candidate in 256..512 {
-        if !guard.contains_key(&candidate) { return candidate; }
+        if !guard.contains_key(&candidate) {
+            return candidate;
+        }
     }
     256
 }

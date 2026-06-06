@@ -21,9 +21,8 @@ pub fn set_base(base: u64) {
 #[inline]
 fn addr(bus: u8, dev: u8, func: u8, off: u16) -> usize {
     let base = *ECAM_BASE.lock() as usize;
-    base
-        | ((bus  as usize) << 20)
-        | ((dev  as usize) << 15)
+    base | ((bus as usize) << 20)
+        | ((dev as usize) << 15)
         | ((func as usize) << 12)
         | (off as usize)
 }

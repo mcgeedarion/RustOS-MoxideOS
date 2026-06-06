@@ -3,26 +3,28 @@
 // VirtIO Block Device Driver (MMIO, VirtIO 1.x spec)
 // Supports: read, write, flush via virtqueue descriptor chains
 
-use core::sync::atomic::{fence, Ordering};
-use crate::drivers::virtio::{VirtioMmio, Virtqueue, VirtqDesc, VIRTQ_DESC_F_WRITE, VIRTQ_DESC_F_NEXT};
+use crate::drivers::virtio::{
+    VirtioMmio, VirtqDesc, Virtqueue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+};
 use crate::mm::phys::{phys_to_virt, virt_to_phys};
 use crate::sync::Mutex;
+use core::sync::atomic::{fence, Ordering};
 
 // ---------------------------------------------------------------------------
 // VirtIO-blk device feature bits
 // ---------------------------------------------------------------------------
-const VIRTIO_BLK_F_RO:         u32 = 1 << 5;
-const VIRTIO_BLK_F_BLK_SIZE:   u32 = 1 << 6;
-const VIRTIO_BLK_F_FLUSH:      u32 = 1 << 9;
+const VIRTIO_BLK_F_RO: u32 = 1 << 5;
+const VIRTIO_BLK_F_BLK_SIZE: u32 = 1 << 6;
+const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
 
 // Request type codes
-const VIRTIO_BLK_T_IN:    u32 = 0; // read
-const VIRTIO_BLK_T_OUT:   u32 = 1; // write
+const VIRTIO_BLK_T_IN: u32 = 0; // read
+const VIRTIO_BLK_T_OUT: u32 = 1; // write
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
 
 // Status byte written back by device
-const VIRTIO_BLK_S_OK:     u8 = 0;
-const VIRTIO_BLK_S_IOERR:  u8 = 1;
+const VIRTIO_BLK_S_OK: u8 = 0;
+const VIRTIO_BLK_S_IOERR: u8 = 1;
 const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 pub const SECTOR_SIZE: usize = 512;
@@ -45,15 +47,19 @@ struct VirtioBlkReqHeader {
 #[repr(C, align(512))]
 struct VirtioBlkReq {
     header: VirtioBlkReqHeader,
-    data:   [u8; SECTOR_SIZE],
+    data: [u8; SECTOR_SIZE],
     status: u8,
 }
 
 impl VirtioBlkReq {
     const fn new() -> Self {
         Self {
-            header: VirtioBlkReqHeader { req_type: 0, _reserved: 0, sector: 0 },
-            data:   [0u8; SECTOR_SIZE],
+            header: VirtioBlkReqHeader {
+                req_type: 0,
+                _reserved: 0,
+                sector: 0,
+            },
+            data: [0u8; SECTOR_SIZE],
             status: 0xFF, // sentinel: not-yet-written
         }
     }
@@ -63,9 +69,9 @@ impl VirtioBlkReq {
 // Driver state
 // ---------------------------------------------------------------------------
 pub struct VirtioBlk {
-    mmio:      VirtioMmio,
-    vq:        Virtqueue<QUEUE_SIZE>,
-    capacity:  u64, // in 512-byte sectors
+    mmio: VirtioMmio,
+    vq: Virtqueue<QUEUE_SIZE>,
+    capacity: u64, // in 512-byte sectors
     read_only: bool,
 }
 
@@ -87,16 +93,28 @@ impl VirtioBlk {
 
         // Accept flush and block-size hints; note read-only flag
         let read_only = dev_features & VIRTIO_BLK_F_RO != 0;
-        if dev_features & VIRTIO_BLK_F_FLUSH    != 0 { drv_features |= VIRTIO_BLK_F_FLUSH; }
-        if dev_features & VIRTIO_BLK_F_BLK_SIZE != 0 { drv_features |= VIRTIO_BLK_F_BLK_SIZE; }
-        if read_only { drv_features |= VIRTIO_BLK_F_RO; }
+        if dev_features & VIRTIO_BLK_F_FLUSH != 0 {
+            drv_features |= VIRTIO_BLK_F_FLUSH;
+        }
+        if dev_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
+            drv_features |= VIRTIO_BLK_F_BLK_SIZE;
+        }
+        if read_only {
+            drv_features |= VIRTIO_BLK_F_RO;
+        }
 
         mmio.write_driver_features(0, drv_features);
         mmio.set_features_ok()?; // returns None if device rejects features
 
         // --- set up the single virtqueue (queue 0) ---
         let vq = Virtqueue::new();
-        mmio.init_queue(0, QUEUE_SIZE as u32, vq.desc_phys(), vq.avail_phys(), vq.used_phys());
+        mmio.init_queue(
+            0,
+            QUEUE_SIZE as u32,
+            vq.desc_phys(),
+            vq.avail_phys(),
+            vq.used_phys(),
+        );
 
         mmio.set_driver_ok();
 
@@ -105,11 +123,20 @@ impl VirtioBlk {
         let cap_hi = mmio.read_config32(4) as u64;
         let capacity = (cap_hi << 32) | cap_lo;
 
-        Some(Self { mmio, vq, capacity, read_only })
+        Some(Self {
+            mmio,
+            vq,
+            capacity,
+            read_only,
+        })
     }
 
-    pub fn capacity_sectors(&self) -> u64 { self.capacity }
-    pub fn read_only(&self) -> bool       { self.read_only }
+    pub fn capacity_sectors(&self) -> u64 {
+        self.capacity
+    }
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
 
     // -----------------------------------------------------------------------
     // Public I/O interface
@@ -119,7 +146,7 @@ impl VirtioBlk {
     pub fn read_sector(&mut self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), BlkError> {
         let mut req = VirtioBlkReq::new();
         req.header.req_type = VIRTIO_BLK_T_IN;
-        req.header.sector   = lba;
+        req.header.sector = lba;
 
         self.submit_and_wait(&mut req, false)?;
         buf.copy_from_slice(&req.data);
@@ -128,10 +155,12 @@ impl VirtioBlk {
 
     /// Write one 512-byte sector at `lba` from `buf`.
     pub fn write_sector(&mut self, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), BlkError> {
-        if self.read_only { return Err(BlkError::ReadOnly); }
+        if self.read_only {
+            return Err(BlkError::ReadOnly);
+        }
         let mut req = VirtioBlkReq::new();
         req.header.req_type = VIRTIO_BLK_T_OUT;
-        req.header.sector   = lba;
+        req.header.sector = lba;
         req.data.copy_from_slice(buf);
 
         self.submit_and_wait(&mut req, true)
@@ -148,7 +177,8 @@ impl VirtioBlk {
     // Internal: build descriptor chain, notify device, poll used ring
     // -----------------------------------------------------------------------
 
-    /// Builds a 3-descriptor chain for one block request and polls for completion.
+    /// Builds a 3-descriptor chain for one block request and polls for
+    /// completion.
     ///
     /// Chain layout (required by spec):
     ///   [0] header  — device-readable
@@ -159,30 +189,29 @@ impl VirtioBlk {
 
         // Descriptor 0: request header
         let d0 = VirtqDesc {
-            addr:  req_phys as u64,
-            len:   core::mem::size_of::<VirtioBlkReqHeader>() as u32,
+            addr: req_phys as u64,
+            len: core::mem::size_of::<VirtioBlkReqHeader>() as u32,
             flags: VIRTQ_DESC_F_NEXT,
-            next:  1,
+            next: 1,
         };
 
         // Descriptor 1: data buffer
         let data_phys = req_phys + core::mem::offset_of!(VirtioBlkReq, data);
-        let data_flags = VIRTQ_DESC_F_NEXT
-            | if !is_write { VIRTQ_DESC_F_WRITE } else { 0 };
+        let data_flags = VIRTQ_DESC_F_NEXT | if !is_write { VIRTQ_DESC_F_WRITE } else { 0 };
         let d1 = VirtqDesc {
-            addr:  data_phys as u64,
-            len:   SECTOR_SIZE as u32,
+            addr: data_phys as u64,
+            len: SECTOR_SIZE as u32,
             flags: data_flags,
-            next:  2,
+            next: 2,
         };
 
         // Descriptor 2: status byte (always device-writable)
         let status_phys = req_phys + core::mem::offset_of!(VirtioBlkReq, status);
         let d2 = VirtqDesc {
-            addr:  status_phys as u64,
-            len:   1,
+            addr: status_phys as u64,
+            len: 1,
             flags: VIRTQ_DESC_F_WRITE,
-            next:  0,
+            next: 0,
         };
 
         // Place chain in virtqueue and kick device
@@ -198,10 +227,10 @@ impl VirtioBlk {
         fence(Ordering::Acquire);
 
         match req.status {
-            VIRTIO_BLK_S_OK     => Ok(()),
-            VIRTIO_BLK_S_IOERR  => Err(BlkError::IoError),
+            VIRTIO_BLK_S_OK => Ok(()),
+            VIRTIO_BLK_S_IOERR => Err(BlkError::IoError),
             VIRTIO_BLK_S_UNSUPP => Err(BlkError::Unsupported),
-            _                   => Err(BlkError::IoError),
+            _ => Err(BlkError::IoError),
         }
     }
 }

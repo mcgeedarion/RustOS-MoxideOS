@@ -7,45 +7,56 @@
 //!   basic io_uring: IORING_OP_NOP completes without error
 //!   SysV msgqueue: msgsnd / msgrcv round-trip
 
-use kmtest::{register, KmTestResult};
 use crate::fs::{
+    io_syscalls::{sys_close, sys_read, sys_write},
     pipe::{sys_pipe, sys_pipe2},
-    io_syscalls::{sys_read, sys_write, sys_close},
 };
-use crate::net::socket::{sys_socket, sys_socketpair, sys_send, sys_recv};
-use crate::io_uring::syscall::{
-    sys_io_uring_setup, sys_io_uring_enter, sys_io_uring_register,
-};
-use crate::ipc::msg::{msgget, msgsnd, msgrcv};
+use crate::io_uring::syscall::{sys_io_uring_enter, sys_io_uring_register, sys_io_uring_setup};
+use crate::ipc::msg::{msgget, msgrcv, msgsnd};
+use crate::net::socket::{sys_recv, sys_send, sys_socket, sys_socketpair};
+use kmtest::{register, KmTestResult};
 
-const AF_UNIX:      i32 = 1;
-const SOCK_STREAM:  i32 = 1;
-const IPC_PRIVATE:  i32 = 0;
-const IPC_CREAT:    i32 = 0o1000;
+const AF_UNIX: i32 = 1;
+const SOCK_STREAM: i32 = 1;
+const IPC_PRIVATE: i32 = 0;
+const IPC_CREAT: i32 = 0o1000;
 
 /// pipe(2): write to write-end, read from read-end, data matches.
 fn ipc_pipe_roundtrip() -> KmTestResult {
     let mut fds = [0usize; 2];
     let r = sys_pipe(fds.as_mut_ptr() as usize);
-    if r != 0 { return Err("pipe() failed"); }
+    if r != 0 {
+        return Err("pipe() failed");
+    }
     let (rfd, wfd) = (fds[0], fds[1]);
 
     let data = b"pipe_test";
     let n = sys_write(wfd, data.as_ptr() as usize, data.len());
-    if n != data.len() as isize { sys_close(rfd); sys_close(wfd); return Err("pipe write failed"); }
+    if n != data.len() as isize {
+        sys_close(rfd);
+        sys_close(wfd);
+        return Err("pipe write failed");
+    }
 
     let mut buf = [0u8; 32];
     let m = sys_read(rfd, buf.as_mut_ptr() as usize, buf.len());
-    sys_close(rfd); sys_close(wfd);
-    if m != data.len() as isize { return Err("pipe read returned wrong count"); }
-    if &buf[..data.len()] != data { return Err("pipe data mismatch"); }
+    sys_close(rfd);
+    sys_close(wfd);
+    if m != data.len() as isize {
+        return Err("pipe read returned wrong count");
+    }
+    if &buf[..data.len()] != data {
+        return Err("pipe data mismatch");
+    }
     Ok(())
 }
 
 /// Multiple writes; total read count equals total write count.
 fn ipc_pipe_multi_write() -> KmTestResult {
     let mut fds = [0usize; 2];
-    if sys_pipe(fds.as_mut_ptr() as usize) != 0 { return Err("pipe() failed"); }
+    if sys_pipe(fds.as_mut_ptr() as usize) != 0 {
+        return Err("pipe() failed");
+    }
     let (rfd, wfd) = (fds[0], fds[1]);
 
     let total = 64usize;
@@ -55,7 +66,8 @@ fn ipc_pipe_multi_write() -> KmTestResult {
     }
     let mut buf = [0u8; 128];
     let n = sys_read(rfd, buf.as_mut_ptr() as usize, buf.len());
-    sys_close(rfd); sys_close(wfd);
+    sys_close(rfd);
+    sys_close(wfd);
     if n != total as isize {
         return Err("multi-write pipe: total read count mismatch");
     }
@@ -66,20 +78,28 @@ fn ipc_pipe_multi_write() -> KmTestResult {
 fn ipc_socketpair_echo() -> KmTestResult {
     let mut sv = [0usize; 2];
     let r = sys_socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as usize);
-    if r != 0 { return Err("socketpair() failed"); }
+    if r != 0 {
+        return Err("socketpair() failed");
+    }
     let (s0, s1) = (sv[0], sv[1]);
 
     let msg = b"echo_test";
     let sent = sys_send(s0, msg.as_ptr() as usize, msg.len(), 0);
     if sent != msg.len() as isize {
-        sys_close(s0); sys_close(s1);
+        sys_close(s0);
+        sys_close(s1);
         return Err("socketpair send failed");
     }
     let mut buf = [0u8; 32];
     let rcvd = sys_recv(s1, buf.as_mut_ptr() as usize, buf.len(), 0);
-    sys_close(s0); sys_close(s1);
-    if rcvd != msg.len() as isize { return Err("socketpair recv wrong count"); }
-    if &buf[..msg.len()] != msg { return Err("socketpair data mismatch"); }
+    sys_close(s0);
+    sys_close(s1);
+    if rcvd != msg.len() as isize {
+        return Err("socketpair recv wrong count");
+    }
+    if &buf[..msg.len()] != msg {
+        return Err("socketpair data mismatch");
+    }
     Ok(())
 }
 
@@ -110,23 +130,27 @@ fn ipc_sysv_msg_roundtrip() -> KmTestResult {
     let payload = b"msg_payload".to_vec();
     let mtype: i64 = 7;
     match msgsnd(qid, mtype, payload.clone(), 0) {
-        Ok(()) => {}
+        Ok(()) => {},
         Err(_) => return Err("msgsnd failed"),
     }
     match msgrcv(qid, payload.len(), mtype, 0) {
         Ok((rcv_type, rcv_data)) => {
-            if rcv_type != mtype { return Err("msgrcv mtype mismatch"); }
-            if rcv_data != payload { return Err("msgrcv payload mismatch"); }
-        }
+            if rcv_type != mtype {
+                return Err("msgrcv mtype mismatch");
+            }
+            if rcv_data != payload {
+                return Err("msgrcv payload mismatch");
+            }
+        },
         Err(_) => return Err("msgrcv failed"),
     }
     Ok(())
 }
 
 pub fn register() {
-    register!("ipc_pipe_roundtrip",      ipc_pipe_roundtrip);
-    register!("ipc_pipe_multi_write",    ipc_pipe_multi_write);
-    register!("ipc_socketpair_echo",     ipc_socketpair_echo);
-    register!("ipc_io_uring_nop",        ipc_io_uring_nop);
-    register!("ipc_sysv_msg_roundtrip",  ipc_sysv_msg_roundtrip);
+    register!("ipc_pipe_roundtrip", ipc_pipe_roundtrip);
+    register!("ipc_pipe_multi_write", ipc_pipe_multi_write);
+    register!("ipc_socketpair_echo", ipc_socketpair_echo);
+    register!("ipc_io_uring_nop", ipc_io_uring_nop);
+    register!("ipc_sysv_msg_roundtrip", ipc_sysv_msg_roundtrip);
 }

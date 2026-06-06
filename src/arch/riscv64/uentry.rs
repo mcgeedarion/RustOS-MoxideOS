@@ -7,15 +7,15 @@
 //!   1. Allocate and map the per-process trapframe page + trampoline page.
 //!   2. Prime the trapframe's save area with kernel bootstrap values.
 //!   3. Set `stvec = uservec` (trampoline entry), `sscratch = TRAPFRAME_VADDR`.
-//!   4. Load sepc / sstatus and jump to `userret` in the trampoline.
-//!      `userret` switches `satp`, restores GPRs, and executes `sret`.
+//!   4. Load sepc / sstatus and jump to `userret` in the trampoline. `userret`
+//!      switches `satp`, restores GPRs, and executes `sret`.
 
-use crate::mm::pmm;
-use crate::arch::riscv64::paging::{self, PTE_R, PTE_W, PTE_U};
+use crate::arch::riscv64::mem_layout::{page, satp as SATP_MODE, sv39 as SV};
+use crate::arch::riscv64::paging::{self, PTE_R, PTE_U, PTE_W};
 use crate::arch::riscv64::trampoline::{
-    TRAPFRAME_VADDR, fill_save_area, map_trampoline_for_process,
+    fill_save_area, map_trampoline_for_process, TRAPFRAME_VADDR,
 };
-use crate::arch::riscv64::mem_layout::{page, sv39 as SV, satp as SATP_MODE};
+use crate::mm::pmm;
 use crate::smp::percpu;
 
 const USER_STACK_PAGES: usize = 4;
@@ -25,13 +25,15 @@ const USER_STACK_PAGES: usize = 4;
 /// user virtual address of the stack top.
 pub fn alloc_user_stack(root_ppn: usize) -> Option<usize> {
     const USER_STACK_TOP: usize = 0x0000_003F_FFFF_F000;
-    let size            = USER_STACK_PAGES * page::SIZE;
+    let size = USER_STACK_PAGES * page::SIZE;
     let stack_virt_base = USER_STACK_TOP - size;
-    let root_pa         = root_ppn << page::SHIFT;
+    let root_pa = root_ppn << page::SHIFT;
 
     for i in 0..USER_STACK_PAGES {
         let pa = pmm::alloc_page()?;
-        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, page::SIZE); }
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, page::SIZE);
+        }
         let va = stack_virt_base + i * page::SIZE;
         paging::map_page_into(root_pa, va, pa, PTE_R | PTE_W | PTE_U);
     }
@@ -46,16 +48,11 @@ pub fn alloc_user_stack(root_ppn: usize) -> Option<usize> {
 /// `root_ppn` — physical page number of the Sv39 root page table.
 /// `kstack_top` — top of this process's kernel stack (for `uservec` bootstrap).
 #[inline(never)]
-pub unsafe fn jump_to_user(
-    entry:      usize,
-    user_sp:    usize,
-    root_ppn:   usize,
-    kstack_top: usize,
-) -> ! {
+pub unsafe fn jump_to_user(entry: usize, user_sp: usize, root_ppn: usize, kstack_top: usize) -> ! {
     use core::arch::asm;
 
-    let user_satp   = SATP_MODE::MODE_SV39 | (root_ppn & SV::SATP_PPN_MASK);
-    let root_pa     = root_ppn << page::SHIFT;
+    let user_satp = SATP_MODE::MODE_SV39 | (root_ppn & SV::SATP_PPN_MASK);
+    let root_pa = root_ppn << page::SHIFT;
     let kernel_satp = {
         use crate::arch::riscv64::csr::get_satp;
         get_satp()
@@ -63,7 +60,7 @@ pub unsafe fn jump_to_user(
     let hartid = percpu::current_cpu_id();
 
     // Map trampoline + trapframe pages into the user page table.
-    let tf_pa  = map_trampoline_for_process(root_pa);
+    let tf_pa = map_trampoline_for_process(root_pa);
     // Kernel VA of the trapframe page (identity-mapped in the kernel PT).
     let tf_kva = tf_pa; // kernel uses identity map over physical RAM
 
@@ -90,14 +87,16 @@ pub unsafe fn jump_to_user(
         fn userret();
     }
     let tramp_start_kva = unsafe { &_trampoline_start as *const u8 as usize };
-    let userret_kva     = userret as usize;
+    let userret_kva = userret as usize;
     // offset of userret within the trampoline section
-    let userret_off     = userret_kva - tramp_start_kva;
-    let tramp_pa        = crate::arch::riscv64::trampoline::trampoline_pa();
+    let userret_off = userret_kva - tramp_start_kva;
+    let tramp_pa = crate::arch::riscv64::trampoline::trampoline_pa();
     let userret_exec_va = tramp_pa + userret_off; // kernel identity-mapped VA
 
     // Point stvec at uservec (trampoline entry) so future U-mode traps land there.
-    extern "C" { fn uservec(); }
+    extern "C" {
+        fn uservec();
+    }
     use crate::arch::riscv64::csr::set_stvec;
     set_stvec(uservec as usize);
 

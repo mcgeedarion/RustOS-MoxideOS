@@ -3,7 +3,13 @@ use std::process::Command;
 
 // Improvement #2, #8: Magic strings extracted as constants
 const CRT_DIR: &str = "src/init/crt";
-const CRT_SOURCES: &[&str] = &["compiler_rt.c", "crt0.c", "memcpy.c", "memmove.c", "memset.c"];
+const CRT_SOURCES: &[&str] = &[
+    "compiler_rt.c",
+    "crt0.c",
+    "memcpy.c",
+    "memmove.c",
+    "memset.c",
+];
 
 const RISCV_ASM_SRC: &str = "src/arch/riscv64/uentry.S";
 const RISCV_OBJ_NAME: &str = "uentry_riscv64.o";
@@ -58,7 +64,8 @@ fn main() {
 ///   -ffreestanding   — no host libc assumptions
 ///   -nostdlib        — do not link the standard library
 ///   -O2              — light optimisation (safe for freestanding)
-///   -fno-stack-protector — the stubs *define* __stack_chk_fail; avoid recursion
+///   -fno-stack-protector — the stubs *define* __stack_chk_fail; avoid
+/// recursion
 ///
 /// # Panics
 /// Panics if the C compiler fails to compile the sources.
@@ -87,7 +94,8 @@ fn compile_crt() {
 /// Assemble the RISC-V uentry trampoline and archive it as a static library.
 ///
 /// Produces `libuentry_riscv64.a` for RISC-V 64 targets.
-/// Uses the RISC-V toolchain binaries: `riscv64-unknown-elf-as` and `riscv64-unknown-elf-ar`.
+/// Uses the RISC-V toolchain binaries: `riscv64-unknown-elf-as` and
+/// `riscv64-unknown-elf-ar`.
 ///
 /// # Panics
 /// Panics if the archival step fails after successful assembly.
@@ -102,7 +110,10 @@ fn assemble_riscv_uentry(out: &PathBuf) {
     if !run_command(
         {
             let mut cmd = Command::new(&as_bin);
-            cmd.args(RISCV_FLAGS).args(["-o"]).arg(&obj).arg(RISCV_ASM_SRC);
+            cmd.args(RISCV_FLAGS)
+                .args(["-o"])
+                .arg(&obj)
+                .arg(RISCV_ASM_SRC);
             cmd
         },
         &format!("{as_bin} assembly"),
@@ -135,7 +146,8 @@ fn assemble_riscv_uentry(out: &PathBuf) {
 ///
 /// Requires: `rustup component add llvm-tools-preview`
 /// Falls back to system `llvm-objcopy` if rustup version unavailable.
-/// On first build, the ELF may not exist yet; re-run `cargo build` to produce the .efi file.
+/// On first build, the ELF may not exist yet; re-run `cargo build` to produce
+/// the .efi file.
 fn produce_uefi_image(out: &PathBuf) {
     // Improvement #5: Use PROFILE env var instead of fragile path inspection
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
@@ -186,7 +198,8 @@ fn produce_uefi_image(out: &PathBuf) {
 /// host triple. If not found, falls back to searching PATH.
 ///
 /// # Returns
-/// Path to `llvm-objcopy` binary (either absolute from rustup or relative for PATH search).
+/// Path to `llvm-objcopy` binary (either absolute from rustup or relative for
+/// PATH search).
 fn locate_llvm_objcopy() -> String {
     let sysroot = String::from_utf8_lossy(
         &Command::new("rustc")
@@ -234,16 +247,14 @@ fn locate_llvm_objcopy() -> String {
 /// `true` if the command succeeded, `false` otherwise.
 fn run_command(mut cmd: Command, context: &str) -> bool {
     match cmd.status() {
-        Ok(status) if status.success() => {
-            true
-        }
+        Ok(status) if status.success() => true,
         Ok(status) => {
             println!("cargo:warning={context} failed with status {status}");
             false
-        }
+        },
         Err(e) => {
             println!("cargo:warning={context} failed: {e}");
             false
-        }
+        },
     }
 }

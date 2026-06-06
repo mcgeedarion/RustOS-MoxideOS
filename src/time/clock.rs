@@ -16,53 +16,52 @@
 //! | CLOCK_BOOTTIME_ALARM     | 9  | BOOTTIME + wake-from-suspend |
 //! | CLOCK_TAI                | 11 | REALTIME + TAI leap offset |
 
-use crate::time::{Timespec, NSEC_PER_SEC,
-                  read_monotonic_ns, read_boottime_ns,
-                  realtime_offset_ns, tai_offset_s, MONO_NS};
+use crate::time::{
+    read_boottime_ns, read_monotonic_ns, realtime_offset_ns, tai_offset_s, Timespec, MONO_NS,
+    NSEC_PER_SEC,
+};
 use core::sync::atomic::Ordering;
 
-pub const CLOCK_REALTIME:           i32 = 0;
-pub const CLOCK_MONOTONIC:          i32 = 1;
+pub const CLOCK_REALTIME: i32 = 0;
+pub const CLOCK_MONOTONIC: i32 = 1;
 pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
-pub const CLOCK_THREAD_CPUTIME_ID:  i32 = 3;
-pub const CLOCK_MONOTONIC_RAW:      i32 = 4;
-pub const CLOCK_REALTIME_COARSE:    i32 = 5;
-pub const CLOCK_MONOTONIC_COARSE:   i32 = 6;
-pub const CLOCK_BOOTTIME:           i32 = 7;
-pub const CLOCK_REALTIME_ALARM:     i32 = 8;
-pub const CLOCK_BOOTTIME_ALARM:     i32 = 9;
-pub const CLOCK_TAI:                i32 = 11;
+pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+pub const CLOCK_MONOTONIC_RAW: i32 = 4;
+pub const CLOCK_REALTIME_COARSE: i32 = 5;
+pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
+pub const CLOCK_BOOTTIME: i32 = 7;
+pub const CLOCK_REALTIME_ALARM: i32 = 8;
+pub const CLOCK_BOOTTIME_ALARM: i32 = 9;
+pub const CLOCK_TAI: i32 = 11;
 
 /// Kernel implementation of `clock_gettime(2)`.
 /// `clk_id` is the POSIX clock ID; returns `Timespec` or EINVAL.
 pub fn clock_gettime(clk_id: i32) -> Result<Timespec, isize> {
     match clk_id {
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => {
-            Ok(Timespec::from_ns(read_monotonic_ns()))
-        }
-        CLOCK_MONOTONIC_COARSE => {
-            Ok(Timespec::from_ns(MONO_NS.load(Ordering::Relaxed)))
-        }
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW => Ok(Timespec::from_ns(read_monotonic_ns())),
+        CLOCK_MONOTONIC_COARSE => Ok(Timespec::from_ns(MONO_NS.load(Ordering::Relaxed))),
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => {
             let mono_ns = read_monotonic_ns() as i64;
-            let offset  = realtime_offset_ns();
+            let offset = realtime_offset_ns();
             let real_ns = mono_ns.saturating_add(offset);
-            if real_ns < 0 { return Ok(Timespec::ZERO); }
+            if real_ns < 0 {
+                return Ok(Timespec::ZERO);
+            }
             Ok(Timespec::from_ns(real_ns as u64))
-        }
-        CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
-            Ok(Timespec::from_ns(read_boottime_ns()))
-        }
+        },
+        CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => Ok(Timespec::from_ns(read_boottime_ns())),
         CLOCK_TAI => {
             let mono_ns = read_monotonic_ns() as i64;
-            let offset  = realtime_offset_ns();
+            let offset = realtime_offset_ns();
             let tai_off = tai_offset_s() * NSEC_PER_SEC as i64;
             let ns = mono_ns.saturating_add(offset).saturating_add(tai_off);
-            if ns < 0 { return Ok(Timespec::ZERO); }
+            if ns < 0 {
+                return Ok(Timespec::ZERO);
+            }
             Ok(Timespec::from_ns(ns as u64))
-        }
+        },
         CLOCK_PROCESS_CPUTIME_ID => Ok(get_process_cputime()),
-        CLOCK_THREAD_CPUTIME_ID  => Ok(get_thread_cputime()),
+        CLOCK_THREAD_CPUTIME_ID => Ok(get_thread_cputime()),
         _ => Err(-22), // EINVAL
     }
 }
@@ -77,7 +76,9 @@ pub fn clock_gettime(clk_id: i32) -> Result<Timespec, isize> {
 /// (The previous code returned -1 for the non-settable arm, which is not
 /// a valid errno and confused callers.)
 pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
-    if !ts.is_valid() { return Err(-22); }
+    if !ts.is_valid() {
+        return Err(-22);
+    }
     match clk_id {
         CLOCK_REALTIME => {
             let mono_ns = read_monotonic_ns() as i64;
@@ -85,7 +86,7 @@ pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
             let offset = new_real_ns - mono_ns;
             crate::time::set_realtime_offset_ns(offset);
             Ok(())
-        }
+        },
         CLOCK_TAI => {
             let real_ns = {
                 let mono = read_monotonic_ns() as i64;
@@ -95,7 +96,7 @@ pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
             let tai_off_ns = tai_ns - real_ns;
             crate::time::set_tai_offset_s(tai_off_ns / NSEC_PER_SEC as i64);
             Ok(())
-        }
+        },
         // CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_BOOTTIME,
         // CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, etc.
         // are not settable.  POSIX says EINVAL for an unsupported clock.
@@ -107,15 +108,22 @@ pub fn clock_settime(clk_id: i32, ts: Timespec) -> Result<(), isize> {
 /// TSC/CLINT clocks have 1 ns resolution; tick-based have HZ resolution.
 pub fn clock_getres(clk_id: i32) -> Result<Timespec, isize> {
     match clk_id {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW
-        | CLOCK_BOOTTIME | CLOCK_TAI
-        | CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM
-        | CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            Ok(Timespec { tv_sec: 0, tv_nsec: 1 })
-        }
-        CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => {
-            Ok(Timespec { tv_sec: 0, tv_nsec: 1_000_000 })
-        }
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_BOOTTIME
+        | CLOCK_TAI
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_BOOTTIME_ALARM
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID => Ok(Timespec {
+            tv_sec: 0,
+            tv_nsec: 1,
+        }),
+        CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => Ok(Timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        }),
         _ => Err(-22),
     }
 }
@@ -127,8 +135,7 @@ pub fn clock_getres(clk_id: i32) -> Result<Timespec, isize> {
 /// matching the tick period.
 fn get_process_cputime() -> Timespec {
     let pid = crate::proc::scheduler::current_pid();
-    let ns = crate::proc::scheduler::with_proc(pid as usize, |p| p.cpu_time_ns)
-        .unwrap_or(0);
+    let ns = crate::proc::scheduler::with_proc(pid as usize, |p| p.cpu_time_ns).unwrap_or(0);
     Timespec::from_ns(ns)
 }
 
@@ -158,5 +165,7 @@ pub fn gettimeofday() -> Timeval {
 
 /// `time(2)` — returns seconds since the Unix epoch.
 pub fn time_secs() -> i64 {
-    clock_gettime(CLOCK_REALTIME).map(|ts| ts.tv_sec).unwrap_or(0)
+    clock_gettime(CLOCK_REALTIME)
+        .map(|ts| ts.tv_sec)
+        .unwrap_or(0)
 }

@@ -3,8 +3,8 @@
 // Parses an ELF image, validates it, maps PT_LOAD segments into the
 // virtual address space, and returns the entry-point address.
 // Assumes:
-//   - The binary blob is already in kernel memory (e.g. loaded from
-//     a ramdisk or passed by the bootloader).
+//   - The binary blob is already in kernel memory (e.g. loaded from a ramdisk
+//     or passed by the bootloader).
 //   - `memory::vmm::map_page` handles page-table insertion.
 //   - `memory::pmm::alloc_frame` returns a free 4 KiB physical frame.
 //   - The kernel runs in the higher half; user segments go below
@@ -23,52 +23,52 @@ extern crate alloc;
 // use crate::memory::vmm::{map_page, PageFlags};
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-const ELFCLASS64: u8      = 2;
-const ELFDATA2LSB: u8     = 1;   // little-endian
-const ET_EXEC: u16        = 2;   // static executable
-const ET_DYN:  u16        = 3;   // position-independent / shared object
-const EM_X86_64: u16      = 62;
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1; // little-endian
+const ET_EXEC: u16 = 2; // static executable
+const ET_DYN: u16 = 3; // position-independent / shared object
+const EM_X86_64: u16 = 62;
 
-const PT_LOAD:    u32 = 1;
+const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
-const PT_INTERP:  u32 = 3;
+const PT_INTERP: u32 = 3;
 
-const PF_X: u32 = 0x1;   // execute
-const PF_W: u32 = 0x2;   // write
-const PF_R: u32 = 0x4;   // read
+const PF_X: u32 = 0x1; // execute
+const PF_W: u32 = 0x2; // write
+const PF_R: u32 = 0x4; // read
 
 const PAGE_SIZE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct Elf64Header {
-    pub e_ident:     [u8; 16],
-    pub e_type:      u16,
-    pub e_machine:   u16,
-    pub e_version:   u32,
-    pub e_entry:     u64,   // virtual entry point
-    pub e_phoff:     u64,   // offset to program header table
-    pub e_shoff:     u64,   // offset to section header table
-    pub e_flags:     u32,
-    pub e_ehsize:    u16,
+    pub e_ident: [u8; 16],
+    pub e_type: u16,
+    pub e_machine: u16,
+    pub e_version: u32,
+    pub e_entry: u64, // virtual entry point
+    pub e_phoff: u64, // offset to program header table
+    pub e_shoff: u64, // offset to section header table
+    pub e_flags: u32,
+    pub e_ehsize: u16,
     pub e_phentsize: u16,
-    pub e_phnum:     u16,
+    pub e_phnum: u16,
     pub e_shentsize: u16,
-    pub e_shnum:     u16,
-    pub e_shstrndx:  u16,
+    pub e_shnum: u16,
+    pub e_shstrndx: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
 pub struct Elf64Phdr {
-    pub p_type:   u32,
-    pub p_flags:  u32,
-    pub p_offset: u64,   // offset in file
-    pub p_vaddr:  u64,   // virtual address in memory
-    pub p_paddr:  u64,   // physical address (usually ignored)
-    pub p_filesz: u64,   // bytes in file image
-    pub p_memsz:  u64,   // bytes in memory image (>= p_filesz)
-    pub p_align:  u64,   // alignment (power of 2)
+    pub p_type: u32,
+    pub p_flags: u32,
+    pub p_offset: u64, // offset in file
+    pub p_vaddr: u64,  // virtual address in memory
+    pub p_paddr: u64,  // physical address (usually ignored)
+    pub p_filesz: u64, // bytes in file image
+    pub p_memsz: u64,  // bytes in memory image (>= p_filesz)
+    pub p_align: u64,  // alignment (power of 2)
 }
 
 #[derive(Debug)]
@@ -81,7 +81,7 @@ pub enum ElfError {
     WrongArch,
     InvalidPhdrTable,
     SegmentOutOfBounds,
-    HasInterpreter,        // dynamic linker required – not yet supported
+    HasInterpreter, // dynamic linker required – not yet supported
     AllocFailed,
     UnalignedSegment,
 }
@@ -112,7 +112,7 @@ pub unsafe fn load_elf(data: &[u8]) -> Result<u64, ElfError> {
 
     // Map every PT_LOAD segment.
     for phdr in phdrs {
-        let p_type = { phdr.p_type };   // copy out of packed field
+        let p_type = { phdr.p_type }; // copy out of packed field
         if p_type == PT_LOAD {
             map_load_segment(data, phdr)?;
         }
@@ -127,9 +127,7 @@ fn parse_header(data: &[u8]) -> Result<Elf64Header, ElfError> {
     }
     // SAFETY: we just checked length; Elf64Header is repr(C,packed) with
     // no invalid bit-patterns.
-    let hdr = unsafe {
-        (data.as_ptr() as *const Elf64Header).read_unaligned()
-    };
+    let hdr = unsafe { (data.as_ptr() as *const Elf64Header).read_unaligned() };
     Ok(hdr)
 }
 
@@ -143,7 +141,7 @@ fn validate_header(hdr: &Elf64Header) -> Result<(), ElfError> {
     if hdr.e_ident[5] != ELFDATA2LSB {
         return Err(ElfError::NotLittleEndian);
     }
-    let e_type    = { hdr.e_type };
+    let e_type = { hdr.e_type };
     let e_machine = { hdr.e_machine };
     if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::UnsupportedType);
@@ -158,15 +156,19 @@ fn program_headers<'a>(
     data: &'a [u8],
     hdr: &Elf64Header,
 ) -> Result<impl Iterator<Item = &'a Elf64Phdr>, ElfError> {
-    let phoff   = { hdr.e_phoff }    as usize;
-    let phnum   = { hdr.e_phnum }    as usize;
-    let phentsz = { hdr.e_phentsize} as usize;
+    let phoff = { hdr.e_phoff } as usize;
+    let phnum = { hdr.e_phnum } as usize;
+    let phentsz = { hdr.e_phentsize } as usize;
 
     if phentsz < mem::size_of::<Elf64Phdr>() {
         return Err(ElfError::InvalidPhdrTable);
     }
     let end = phoff
-        .checked_add(phnum.checked_mul(phentsz).ok_or(ElfError::InvalidPhdrTable)?)
+        .checked_add(
+            phnum
+                .checked_mul(phentsz)
+                .ok_or(ElfError::InvalidPhdrTable)?,
+        )
         .ok_or(ElfError::InvalidPhdrTable)?;
     if end > data.len() {
         return Err(ElfError::InvalidPhdrTable);
@@ -175,16 +177,16 @@ fn program_headers<'a>(
     let slice = &data[phoff..end];
     let iter = (0..phnum).map(move |i| {
         // SAFETY: bounds verified above; Elf64Phdr is repr(C,packed).
-        unsafe {
-            &*(slice[i * phentsz..].as_ptr() as *const Elf64Phdr)
-        }
+        unsafe { &*(slice[i * phentsz..].as_ptr() as *const Elf64Phdr) }
     });
     Ok(iter)
 }
 
 fn has_interpreter(data: &[u8], hdr: &Elf64Header) -> bool {
     // If program_headers fails we conservatively return false.
-    let Ok(phdrs) = program_headers(data, hdr) else { return false; };
+    let Ok(phdrs) = program_headers(data, hdr) else {
+        return false;
+    };
     phdrs.any(|ph| { ph.p_type } == PT_INTERP)
 }
 
@@ -198,12 +200,12 @@ fn has_interpreter(data: &[u8], hdr: &Elf64Header) -> bool {
 #[cfg(any())]
 unsafe fn map_load_segment(data: &[u8], phdr: &Elf64Phdr) -> Result<(), ElfError> {
     // Read packed fields into locals to avoid UB references to unaligned fields.
-    let vaddr   = { phdr.p_vaddr  };
-    let offset  = { phdr.p_offset } as usize;
-    let filesz  = { phdr.p_filesz } as usize;
-    let memsz   = { phdr.p_memsz  } as usize;
-    let flags   = { phdr.p_flags  };
-    let align   = { phdr.p_align  };
+    let vaddr = { phdr.p_vaddr };
+    let offset = { phdr.p_offset } as usize;
+    let filesz = { phdr.p_filesz } as usize;
+    let memsz = { phdr.p_memsz } as usize;
+    let flags = { phdr.p_flags };
+    let align = { phdr.p_align };
 
     if memsz == 0 {
         return Ok(());
@@ -215,19 +217,25 @@ unsafe fn map_load_segment(data: &[u8], phdr: &Elf64Phdr) -> Result<(), ElfError
     }
 
     // Validate file slice.
-    let file_end = offset.checked_add(filesz).ok_or(ElfError::SegmentOutOfBounds)?;
+    let file_end = offset
+        .checked_add(filesz)
+        .ok_or(ElfError::SegmentOutOfBounds)?;
     if file_end > data.len() {
         return Err(ElfError::SegmentOutOfBounds);
     }
 
     // Build VMM flags.
     let mut page_flags = PageFlags::USER | PageFlags::PRESENT;
-    if flags & PF_W != 0 { page_flags |= PageFlags::WRITABLE; }
-    if flags & PF_X == 0 { page_flags |= PageFlags::NO_EXECUTE; }
+    if flags & PF_W != 0 {
+        page_flags |= PageFlags::WRITABLE;
+    }
+    if flags & PF_X == 0 {
+        page_flags |= PageFlags::NO_EXECUTE;
+    }
 
     // Page-align the virtual range.
     let vstart = align_down(vaddr, PAGE_SIZE);
-    let vend   = align_up(vaddr + memsz as u64, PAGE_SIZE);
+    let vend = align_up(vaddr + memsz as u64, PAGE_SIZE);
 
     let mut page_vaddr = vstart;
     while page_vaddr < vend {
@@ -239,14 +247,7 @@ unsafe fn map_load_segment(data: &[u8], phdr: &Elf64Phdr) -> Result<(), ElfError
         core::ptr::write_bytes(frame_virt as *mut u8, 0, PAGE_SIZE as usize);
 
         // Copy the portion of the file image that falls inside this page.
-        copy_file_bytes_into_frame(
-            data,
-            offset,
-            filesz,
-            vaddr,
-            page_vaddr,
-            frame_virt,
-        );
+        copy_file_bytes_into_frame(data, offset, filesz, vaddr, page_vaddr, frame_virt);
 
         // Insert the mapping.
         map_page(page_vaddr, frame_phys, page_flags);
@@ -264,23 +265,23 @@ unsafe fn map_load_segment(data: &[u8], phdr: &Elf64Phdr) -> Result<(), ElfError
 /// `seg_offset` – byte offset in `data` where the segment's file image starts
 /// `seg_filesz` – number of bytes present in the file (rest is BSS)
 unsafe fn copy_file_bytes_into_frame(
-    data:        &[u8],
-    seg_offset:  usize,
-    seg_filesz:  usize,
-    seg_vaddr:   u64,
-    page_vaddr:  u64,
-    frame_virt:  u64,
+    data: &[u8],
+    seg_offset: usize,
+    seg_filesz: usize,
+    seg_vaddr: u64,
+    page_vaddr: u64,
+    frame_virt: u64,
 ) {
     // Virtual range covered by this page.
     let page_end = page_vaddr + PAGE_SIZE;
 
     // Virtual range of the file-backed part of the segment.
     let file_vstart = seg_vaddr;
-    let file_vend   = seg_vaddr + seg_filesz as u64;
+    let file_vend = seg_vaddr + seg_filesz as u64;
 
     // Intersection.
     let copy_vstart = file_vstart.max(page_vaddr);
-    let copy_vend   = file_vend.min(page_end);
+    let copy_vend = file_vend.min(page_end);
 
     if copy_vstart >= copy_vend {
         return; // nothing to copy for this page (all BSS or gap)
@@ -293,8 +294,8 @@ unsafe fn copy_file_bytes_into_frame(
     // Offset within the 4 KiB frame.
     let frame_byte_start = (copy_vstart - page_vaddr) as usize;
 
-    let src  = data[file_byte_start..file_byte_start + copy_len].as_ptr();
-    let dst  = (frame_virt + frame_byte_start as u64) as *mut u8;
+    let src = data[file_byte_start..file_byte_start + copy_len].as_ptr();
+    let dst = (frame_virt + frame_byte_start as u64) as *mut u8;
 
     core::ptr::copy_nonoverlapping(src, dst, copy_len);
 }
@@ -362,38 +363,56 @@ pub fn parse_elf_header(data: &[u8]) -> Result<Elf64Hdr, ParseError> {
         return Err(ParseError::OutOfBounds);
     }
     // SAFETY: bounds checked above; Elf64Header is repr(C, packed).
-    let hdr: Elf64Header = unsafe {
-        (data.as_ptr() as *const Elf64Header).read_unaligned()
-    };
-    if hdr.e_ident[0..4] != ELF_MAGIC { return Err(ParseError::BadMagic); }
-    if hdr.e_ident[4]    != ELFCLASS64 { return Err(ParseError::NotElf64); }
-    if hdr.e_ident[5]    != ELFDATA2LSB { return Err(ParseError::BadEndian); }
+    let hdr: Elf64Header = unsafe { (data.as_ptr() as *const Elf64Header).read_unaligned() };
+    if hdr.e_ident[0..4] != ELF_MAGIC {
+        return Err(ParseError::BadMagic);
+    }
+    if hdr.e_ident[4] != ELFCLASS64 {
+        return Err(ParseError::NotElf64);
+    }
+    if hdr.e_ident[5] != ELFDATA2LSB {
+        return Err(ParseError::BadEndian);
+    }
     // GUESS: e_type and e_machine validation kept lenient — callers
     // (fs::elf::read_phdrs) just want a sane header back, not enforcement.
-    let _et      = { let v = hdr.e_type;    v }; // unaligned read pattern
-    let _em      = { let v = hdr.e_machine; v };
+    let _et = {
+        let v = hdr.e_type;
+        v
+    }; // unaligned read pattern
+    let _em = {
+        let v = hdr.e_machine;
+        v
+    };
     Ok(hdr)
 }
 
 /// Parse the program-header table for `hdr` out of `data`.
 /// Returns `None` if the file is truncated or `e_phentsize` is wrong.
-pub fn parse_phdrs_with_hdr(
-    data: &[u8],
-    hdr:  &Elf64Hdr,
-) -> Option<alloc::vec::Vec<Elf64Phdr>> {
-    let phoff     = { let v = hdr.e_phoff;     v } as usize;
-    let phnum     = { let v = hdr.e_phnum;     v } as usize;
-    let phentsize = { let v = hdr.e_phentsize; v } as usize;
-    if phentsize < mem::size_of::<Elf64Phdr>() { return None; }
+pub fn parse_phdrs_with_hdr(data: &[u8], hdr: &Elf64Hdr) -> Option<alloc::vec::Vec<Elf64Phdr>> {
+    let phoff = {
+        let v = hdr.e_phoff;
+        v
+    } as usize;
+    let phnum = {
+        let v = hdr.e_phnum;
+        v
+    } as usize;
+    let phentsize = {
+        let v = hdr.e_phentsize;
+        v
+    } as usize;
+    if phentsize < mem::size_of::<Elf64Phdr>() {
+        return None;
+    }
     let total = phoff.checked_add(phentsize.checked_mul(phnum)?)?;
-    if total > data.len() { return None; }
+    if total > data.len() {
+        return None;
+    }
     let mut out = alloc::vec::Vec::with_capacity(phnum);
     for i in 0..phnum {
         let off = phoff + i * phentsize;
         // SAFETY: bounds checked just above.
-        let p: Elf64Phdr = unsafe {
-            (data.as_ptr().add(off) as *const Elf64Phdr).read_unaligned()
-        };
+        let p: Elf64Phdr = unsafe { (data.as_ptr().add(off) as *const Elf64Phdr).read_unaligned() };
         out.push(p);
     }
     Some(out)
@@ -414,27 +433,47 @@ pub fn parse_phdrs_with_hdr(
 /// is migrated to the arch::api Paging trait this argument becomes
 /// load-bearing.
 pub fn load_elf_into(
-    _cr3:  usize,
-    data:  &[u8],
-    hdr:   &Elf64Hdr,
+    _cr3: usize,
+    data: &[u8],
+    hdr: &Elf64Hdr,
     phdrs: &[Elf64Phdr],
 ) -> Result<u64, ParseError> {
     // GUESS: existing load_segments is the canonical mapping logic.
     // Re-validating here is cheap and keeps this function honest.
-    if data.len() < mem::size_of::<Elf64Header>() { return Err(ParseError::OutOfBounds); }
+    if data.len() < mem::size_of::<Elf64Header>() {
+        return Err(ParseError::OutOfBounds);
+    }
     // Walk PT_LOAD segments and confirm offsets are in range; defer
     // actual page-table installation to load_segments via load_elf.
     for p in phdrs {
-        let p_type   = { let v = p.p_type;   v };
-        let p_offset = { let v = p.p_offset; v } as usize;
-        let p_filesz = { let v = p.p_filesz; v } as usize;
-        if p_type != PT_LOAD { continue; }
-        if p_offset.checked_add(p_filesz).map(|x| x > data.len()).unwrap_or(true) {
+        let p_type = {
+            let v = p.p_type;
+            v
+        };
+        let p_offset = {
+            let v = p.p_offset;
+            v
+        } as usize;
+        let p_filesz = {
+            let v = p.p_filesz;
+            v
+        } as usize;
+        if p_type != PT_LOAD {
+            continue;
+        }
+        if p_offset
+            .checked_add(p_filesz)
+            .map(|x| x > data.len())
+            .unwrap_or(true)
+        {
             return Err(ParseError::OutOfBounds);
         }
     }
     // Entry-point from the header.
-    let entry = { let v = hdr.e_entry; v };
+    let entry = {
+        let v = hdr.e_entry;
+        v
+    };
     Ok(entry)
 }
 
@@ -444,12 +483,25 @@ pub fn load_elf_into(
 pub fn end_of_bss(phdrs: &[Elf64Phdr], bias: u64) -> usize {
     let mut hi: u64 = 0;
     for p in phdrs {
-        let p_type  = { let v = p.p_type;  v };
-        let p_vaddr = { let v = p.p_vaddr; v };
-        let p_memsz = { let v = p.p_memsz; v };
-        if p_type != PT_LOAD { continue; }
+        let p_type = {
+            let v = p.p_type;
+            v
+        };
+        let p_vaddr = {
+            let v = p.p_vaddr;
+            v
+        };
+        let p_memsz = {
+            let v = p.p_memsz;
+            v
+        };
+        if p_type != PT_LOAD {
+            continue;
+        }
         let end = p_vaddr.wrapping_add(p_memsz).wrapping_add(bias);
-        if end > hi { hi = end; }
+        if end > hi {
+            hi = end;
+        }
     }
     hi as usize
 }

@@ -20,10 +20,10 @@
 //!  304  hartid        — hart ID restored into tp by uservec
 //! ```
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::arch::riscv64::mem_layout::page;
 use crate::arch::riscv64::paging::{map_page_into, PTE_R, PTE_W, PTE_X};
 use crate::mm::pmm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// VA of the shared trampoline code page in every address space.
 pub const TRAMPOLINE_VADDR: usize = 0xFFFF_FFFF_FFFF_F000;
@@ -33,7 +33,7 @@ pub const TRAPFRAME_VADDR: usize = TRAMPOLINE_VADDR - page::SIZE;
 
 extern "C" {
     static _trampoline_start: u8;
-    static _trampoline_end:   u8;
+    static _trampoline_end: u8;
 }
 
 /// Physical address of the single shared trampoline code page.
@@ -43,7 +43,7 @@ static TRAMPOLINE_PA: AtomicUsize = AtomicUsize::new(0);
 /// physical page and maps it RX into the kernel page table.
 pub fn trampoline_init() {
     let src = unsafe { &_trampoline_start as *const u8 as usize };
-    let end = unsafe { &_trampoline_end   as *const u8 as usize };
+    let end = unsafe { &_trampoline_end as *const u8 as usize };
     let len = end - src;
     assert!(len <= page::SIZE, "trampoline code exceeds one page");
 
@@ -60,7 +60,8 @@ pub fn trampoline_init() {
     map_page_into(kroot, TRAMPOLINE_VADDR, pa, PTE_R | PTE_X);
 }
 
-/// Physical address of the trampoline code page (valid after `trampoline_init`).
+/// Physical address of the trampoline code page (valid after
+/// `trampoline_init`).
 #[inline]
 pub fn trampoline_pa() -> usize {
     TRAMPOLINE_PA.load(Ordering::Acquire)
@@ -73,11 +74,18 @@ pub fn trampoline_pa() -> usize {
 /// kernel VA via `phys_to_virt`.
 pub fn map_trampoline_for_process(user_root_pa: usize) -> usize {
     // Shared trampoline code — RX, no PTE_U (supervisor only).
-    map_page_into(user_root_pa, TRAMPOLINE_VADDR, trampoline_pa(), PTE_R | PTE_X);
+    map_page_into(
+        user_root_pa,
+        TRAMPOLINE_VADDR,
+        trampoline_pa(),
+        PTE_R | PTE_X,
+    );
 
     // Per-process trapframe — RW, no PTE_U (supervisor only).
     let tf_pa = pmm::alloc_page().expect("map_trampoline_for_process: OOM");
-    unsafe { core::ptr::write_bytes(tf_pa as *mut u8, 0, page::SIZE); }
+    unsafe {
+        core::ptr::write_bytes(tf_pa as *mut u8, 0, page::SIZE);
+    }
     map_page_into(user_root_pa, TRAPFRAME_VADDR, tf_pa, PTE_R | PTE_W);
 
     tf_pa
@@ -88,11 +96,11 @@ pub const SAVE_AREA_OFF: usize = 272; // = 34 * 8  (after 34-slot TrapFrame)
 
 pub mod save {
     use super::SAVE_AREA_OFF;
-    pub const KERNEL_SATP: usize = SAVE_AREA_OFF;       // slot 34
-    pub const KERNEL_SP:   usize = SAVE_AREA_OFF + 8;   // slot 35
-    pub const KERNEL_TRAP: usize = SAVE_AREA_OFF + 16;  // slot 36
-    pub const USER_SATP:   usize = SAVE_AREA_OFF + 24;  // slot 37
-    pub const HARTID:      usize = SAVE_AREA_OFF + 32;  // slot 38
+    pub const KERNEL_SATP: usize = SAVE_AREA_OFF; // slot 34
+    pub const KERNEL_SP: usize = SAVE_AREA_OFF + 8; // slot 35
+    pub const KERNEL_TRAP: usize = SAVE_AREA_OFF + 16; // slot 36
+    pub const USER_SATP: usize = SAVE_AREA_OFF + 24; // slot 37
+    pub const HARTID: usize = SAVE_AREA_OFF + 32; // slot 38
 }
 
 /// Write kernel bootstrap values into the per-process save area so that
@@ -103,18 +111,18 @@ pub mod save {
 /// # Safety
 /// `tf_kva` must be the kernel virtual address of the process's trapframe page.
 pub unsafe fn fill_save_area(
-    tf_kva:      usize,
+    tf_kva: usize,
     kernel_satp: usize,
-    kernel_sp:   usize,
-    user_satp:   usize,
-    hartid:      usize,
+    kernel_sp: usize,
+    user_satp: usize,
+    hartid: usize,
 ) {
     use crate::arch::riscv64::trap::riscv_trap_entry;
     w(tf_kva + save::KERNEL_SATP, kernel_satp);
-    w(tf_kva + save::KERNEL_SP,   kernel_sp);
+    w(tf_kva + save::KERNEL_SP, kernel_sp);
     w(tf_kva + save::KERNEL_TRAP, riscv_trap_entry as usize);
-    w(tf_kva + save::USER_SATP,   user_satp);
-    w(tf_kva + save::HARTID,      hartid);
+    w(tf_kva + save::USER_SATP, user_satp);
+    w(tf_kva + save::HARTID, hartid);
 }
 
 #[inline]

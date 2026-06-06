@@ -10,7 +10,8 @@
 //! ## PSCI interface
 //!
 //! We use the SMCCC / HVC conduit already wrapped by
-//! `crate::firmware::psci`.  The function ID for CPU_ON (64-bit) is 0xC400_0003.
+//! `crate::firmware::psci`.  The function ID for CPU_ON (64-bit) is
+//! 0xC400_0003.
 
 #![allow(dead_code)]
 
@@ -27,7 +28,9 @@ pub fn bring_up_secondaries() {
         return;
     }
 
-    extern "C" { fn secondary_entry(); }
+    extern "C" {
+        fn secondary_entry();
+    }
 
     for mpidr in secondaries {
         let stack_top = match crate::mm::pmm::alloc_pages(4) {
@@ -35,20 +38,18 @@ pub fn bring_up_secondaries() {
             None => {
                 crate::serial_println!("smp: out of memory for secondary stack mpidr={:#x}", mpidr);
                 continue;
-            }
+            },
         };
 
         SECONDARY_STACK_TOP.store(stack_top as u64, Ordering::Release);
 
         unsafe {
-            if let Err(e) = crate::firmware::psci::cpu_on(
-                mpidr,
-                secondary_entry as usize as u64,
-                0,
-            ) {
+            if let Err(e) = crate::firmware::psci::cpu_on(mpidr, secondary_entry as usize as u64, 0)
+            {
                 crate::serial_println!(
                     "smp: psci cpu_on failed for mpidr={:#x} err={:?}",
-                    mpidr, e
+                    mpidr,
+                    e
                 );
             }
         }

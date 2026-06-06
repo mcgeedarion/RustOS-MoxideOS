@@ -38,20 +38,20 @@ use crate::io_uring::ops;
 use crate::io_uring::ring::{self, IoUringParams};
 use crate::mm::mmap;
 use crate::proc::scheduler;
-use crate::sync::wait_queue::{WakeReason, CancellationToken};
+use crate::sync::wait_queue::{CancellationToken, WakeReason};
 use crate::uaccess::{copy_from_user, copy_to_user};
 use alloc::sync::Arc;
 
-const IORING_REGISTER_BUFFERS:           u32 = 0;
-const IORING_UNREGISTER_BUFFERS:         u32 = 1;
-const IORING_REGISTER_FILES:             u32 = 2;
-const IORING_UNREGISTER_FILES:           u32 = 3;
-const IORING_REGISTER_EVENTFD:           u32 = 4;
-const IORING_UNREGISTER_EVENTFD:         u32 = 5;
-const IORING_REGISTER_FILES_UPDATE:      u32 = 6;
-const IORING_REGISTER_IOWQ_AFF:          u32 = 7;
-const IORING_UNREGISTER_IOWQ_AFF:        u32 = 8;
-const IORING_REGISTER_IOWQ_MAX_WORKERS:  u32 = 9;
+const IORING_REGISTER_BUFFERS: u32 = 0;
+const IORING_UNREGISTER_BUFFERS: u32 = 1;
+const IORING_REGISTER_FILES: u32 = 2;
+const IORING_UNREGISTER_FILES: u32 = 3;
+const IORING_REGISTER_EVENTFD: u32 = 4;
+const IORING_UNREGISTER_EVENTFD: u32 = 5;
+const IORING_REGISTER_FILES_UPDATE: u32 = 6;
+const IORING_REGISTER_IOWQ_AFF: u32 = 7;
+const IORING_UNREGISTER_IOWQ_AFF: u32 = 8;
+const IORING_REGISTER_IOWQ_MAX_WORKERS: u32 = 9;
 
 #[inline]
 fn current_cancel() -> Option<Arc<CancellationToken>> {
@@ -61,8 +61,12 @@ fn current_cancel() -> Option<Arc<CancellationToken>> {
 
 /// `io_uring_setup(entries, params_va)` → fd
 pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
-    if entries == 0 || entries > ring::MAX_ENTRIES { return -22; }
-    if params_va == 0 { return -14; }
+    if entries == 0 || entries > ring::MAX_ENTRIES {
+        return -22;
+    }
+    if params_va == 0 {
+        return -14;
+    }
 
     let mut params = IoUringParams::default();
     if copy_from_user(params_va, unsafe {
@@ -70,12 +74,16 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
             &mut params as *mut _ as *mut u8,
             core::mem::size_of::<IoUringParams>(),
         )
-    }).is_err() { return -14; }
+    })
+    .is_err()
+    {
+        return -14;
+    }
 
     let pid = scheduler::current_pid() as u32;
 
     let ring_idx = match ring::alloc_ring(pid, entries) {
-        Ok(i)  => i,
+        Ok(i) => i,
         Err(e) => return e,
     };
 
@@ -84,19 +92,23 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
         None => {
             ring::free_ring(ring_idx);
             return -24;
-        }
+        },
     };
 
-    ring::with_ring_mut(ring_idx, |r| { r.fd = fd; });
+    ring::with_ring_mut(ring_idx, |r| {
+        r.fd = fd;
+    });
 
     let (sq_pa, cq_pa) = ring::with_ring(ring_idx, |r| (r.sq_pa, r.cq_pa)).unwrap();
     let page_size = 4096usize;
 
     let sq_va = mmap::sys_mmap(
-        0, page_size,
+        0,
+        page_size,
         mmap::PROT_READ | mmap::PROT_WRITE,
         mmap::MAP_SHARED | mmap::MAP_ANONYMOUS,
-        usize::MAX, sq_pa,
+        usize::MAX,
+        sq_pa,
     );
     if sq_va < 0 {
         ring::free_ring(ring_idx);
@@ -105,10 +117,12 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
     }
 
     let cq_va = mmap::sys_mmap(
-        0, page_size,
+        0,
+        page_size,
         mmap::PROT_READ | mmap::PROT_WRITE,
         mmap::MAP_SHARED | mmap::MAP_ANONYMOUS,
-        usize::MAX, cq_pa,
+        usize::MAX,
+        cq_pa,
     );
     if cq_va < 0 {
         ring::free_ring(ring_idx);
@@ -132,25 +146,29 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
     fd as isize
 }
 
-/// `io_uring_enter(fd, to_submit, min_complete, flags, sig_va, sig_sz)` → submitted
+/// `io_uring_enter(fd, to_submit, min_complete, flags, sig_va, sig_sz)` →
+/// submitted
 ///
 /// Phase 1: drain and execute SQEs.
 /// Phase 2 (GETEVENTS): sleep on `cq_wq` until `min_complete` CQEs are ready.
-///   - Wakes on each `post_cqe()` call; re-checks count; sleeps again if needed.
+///   - Wakes on each `post_cqe()` call; re-checks count; sleeps again if
+///     needed.
 ///   - Returns `-EINTR` (-4) if a signal cancels the wait.
 pub fn sys_io_uring_enter(
-    fd:           usize,
-    to_submit:    u32,
+    fd: usize,
+    to_submit: u32,
     min_complete: u32,
-    flags:        u32,
-    _sig_va:      usize,
-    _sig_sz:      usize,
+    flags: u32,
+    _sig_va: usize,
+    _sig_sz: usize,
 ) -> isize {
     let pid = scheduler::current_pid() as u32;
-    let Some(ring_idx) = ring::ring_idx_for_fd(pid, fd) else { return -9; };
+    let Some(ring_idx) = ring::ring_idx_for_fd(pid, fd) else {
+        return -9;
+    };
 
-    let sqes          = ring::with_ring(ring_idx, |r| r.drain_sq()).unwrap_or_default();
-    let submit_count  = (to_submit as usize).min(sqes.len());
+    let sqes = ring::with_ring(ring_idx, |r| r.drain_sq()).unwrap_or_default();
+    let submit_count = (to_submit as usize).min(sqes.len());
     let mut submitted = 0u32;
 
     for sqe in sqes.iter().take(submit_count) {
@@ -165,7 +183,7 @@ pub fn sys_io_uring_enter(
         // the RING_TABLE lock while sleeping.
         let cq_wq = match ring::cq_wq_for(ring_idx) {
             Some(wq) => wq,
-            None     => return -9,
+            None => return -9,
         };
         let cancel = current_cancel();
         let cancel_ref = cancel.as_deref();
@@ -173,16 +191,17 @@ pub fn sys_io_uring_enter(
         let deadline_ns = crate::time::monotonic_ns() + 5_000_000_000;
 
         loop {
-            let available = ring::with_ring(ring_idx, |r| r.cq_available())
-                .unwrap_or(0);
-            if available >= min_complete { break; }
+            let available = ring::with_ring(ring_idx, |r| r.cq_available()).unwrap_or(0);
+            if available >= min_complete {
+                break;
+            }
 
             // Sleep until a CQE is posted, deadline fires, or signal arrives.
-            let reason = cq_wq.wait(0x0001 /*CQ_READY*/, cancel_ref, Some(deadline_ns));
+            let reason = cq_wq.wait(0x0001 /* CQ_READY */, cancel_ref, Some(deadline_ns));
             match reason {
                 WakeReason::Cancelled => return -4, // EINTR
-                WakeReason::Timeout   => break,     // deadline — return what we have
-                WakeReason::Ready(_)  => {}          // re-check count
+                WakeReason::Timeout => break,       // deadline — return what we have
+                WakeReason::Ready(_) => {},         // re-check count
             }
         }
     }
@@ -191,71 +210,93 @@ pub fn sys_io_uring_enter(
 }
 
 /// `io_uring_register(fd, opcode, arg_va, nr_args)` → 0 or -errno
-pub fn sys_io_uring_register(
-    fd:      usize,
-    opcode:  u32,
-    arg_va:  usize,
-    nr_args: u32,
-) -> isize {
+pub fn sys_io_uring_register(fd: usize, opcode: u32, arg_va: usize, nr_args: u32) -> isize {
     let pid = scheduler::current_pid() as u32;
-    let Some(ring_idx) = ring::ring_idx_for_fd(pid, fd) else { return -9; };
+    let Some(ring_idx) = ring::ring_idx_for_fd(pid, fd) else {
+        return -9;
+    };
     let nr = nr_args as usize;
 
     match opcode {
         IORING_REGISTER_BUFFERS => {
-            if arg_va == 0 || nr == 0 { return -22; }
-            let iovec_size  = 2 * core::mem::size_of::<usize>();
-            let mut buf     = alloc::vec![0u8; nr * iovec_size];
-            if copy_from_user(&mut buf, arg_va).is_err() { return -14; }
+            if arg_va == 0 || nr == 0 {
+                return -22;
+            }
+            let iovec_size = 2 * core::mem::size_of::<usize>();
+            let mut buf = alloc::vec![0u8; nr * iovec_size];
+            if copy_from_user(&mut buf, arg_va).is_err() {
+                return -14;
+            }
             ring::with_ring_mut(ring_idx, |r| {
                 r.reg_bufs.clear();
                 for i in 0..nr {
-                    let off  = i * iovec_size;
-                    let base = usize::from_ne_bytes(buf[off..off+8].try_into().unwrap_or([0;8]));
-                    let len  = usize::from_ne_bytes(buf[off+8..off+16].try_into().unwrap_or([0;8]));
+                    let off = i * iovec_size;
+                    let base = usize::from_ne_bytes(buf[off..off + 8].try_into().unwrap_or([0; 8]));
+                    let len =
+                        usize::from_ne_bytes(buf[off + 8..off + 16].try_into().unwrap_or([0; 8]));
                     r.reg_bufs.push((base, len));
                 }
                 0isize
-            }).unwrap_or(-9)
-        }
+            })
+            .unwrap_or(-9)
+        },
 
-        IORING_UNREGISTER_BUFFERS => {
-            ring::with_ring_mut(ring_idx, |r| { r.reg_bufs.clear(); 0isize }).unwrap_or(-9)
-        }
+        IORING_UNREGISTER_BUFFERS => ring::with_ring_mut(ring_idx, |r| {
+            r.reg_bufs.clear();
+            0isize
+        })
+        .unwrap_or(-9),
 
         IORING_REGISTER_FILES => {
-            if arg_va == 0 || nr == 0 { return -22; }
+            if arg_va == 0 || nr == 0 {
+                return -22;
+            }
             let mut fds = alloc::vec![0i32; nr];
-            let bytes = unsafe {
-                core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, nr * 4)
-            };
-            if copy_from_user(bytes, arg_va).is_err() { return -14; }
-            ring::with_ring_mut(ring_idx, |r| { r.reg_fds = fds.clone(); 0isize }).unwrap_or(-9)
-        }
+            let bytes =
+                unsafe { core::slice::from_raw_parts_mut(fds.as_mut_ptr() as *mut u8, nr * 4) };
+            if copy_from_user(bytes, arg_va).is_err() {
+                return -14;
+            }
+            ring::with_ring_mut(ring_idx, |r| {
+                r.reg_fds = fds.clone();
+                0isize
+            })
+            .unwrap_or(-9)
+        },
 
-        IORING_UNREGISTER_FILES => {
-            ring::with_ring_mut(ring_idx, |r| { r.reg_fds.clear(); 0isize }).unwrap_or(-9)
-        }
+        IORING_UNREGISTER_FILES => ring::with_ring_mut(ring_idx, |r| {
+            r.reg_fds.clear();
+            0isize
+        })
+        .unwrap_or(-9),
 
         IORING_REGISTER_EVENTFD => {
-            if arg_va == 0 { return -22; }
+            if arg_va == 0 {
+                return -22;
+            }
             let mut efd_bytes = [0u8; 4];
-            if copy_from_user(&mut efd_bytes, arg_va).is_err() { return -14; }
+            if copy_from_user(&mut efd_bytes, arg_va).is_err() {
+                return -14;
+            }
             let _efd = i32::from_ne_bytes(efd_bytes);
             0
-        }
+        },
 
         IORING_UNREGISTER_EVENTFD => 0,
 
         IORING_REGISTER_FILES_UPDATE => {
-            if arg_va == 0 || nr == 0 { return -22; }
+            if arg_va == 0 || nr == 0 {
+                return -22;
+            }
             let mut raw = alloc::vec![0u8; 8 + nr * 4];
-            if copy_from_user(&mut raw, arg_va).is_err() { return -14; }
-            let offset = u32::from_ne_bytes(raw[0..4].try_into().unwrap_or([0;4])) as usize;
+            if copy_from_user(&mut raw, arg_va).is_err() {
+                return -14;
+            }
+            let offset = u32::from_ne_bytes(raw[0..4].try_into().unwrap_or([0; 4])) as usize;
             ring::with_ring_mut(ring_idx, |r| {
                 for i in 0..nr {
                     let new_fd = i32::from_ne_bytes(
-                        raw[8 + i*4 .. 8 + i*4 + 4].try_into().unwrap_or([0;4])
+                        raw[8 + i * 4..8 + i * 4 + 4].try_into().unwrap_or([0; 4]),
                     );
                     let slot = offset + i;
                     if slot < r.reg_fds.len() {
@@ -266,10 +307,12 @@ pub fn sys_io_uring_register(
                     }
                 }
                 nr as isize
-            }).unwrap_or(-9)
-        }
+            })
+            .unwrap_or(-9)
+        },
 
-        IORING_REGISTER_IOWQ_AFF | IORING_UNREGISTER_IOWQ_AFF
+        IORING_REGISTER_IOWQ_AFF
+        | IORING_UNREGISTER_IOWQ_AFF
         | IORING_REGISTER_IOWQ_MAX_WORKERS => 0,
 
         _ => -22,

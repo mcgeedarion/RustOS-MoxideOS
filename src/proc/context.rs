@@ -63,22 +63,32 @@
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
 pub struct Context {
-    pub r15:     usize,  // 0x00
-    pub r14:     usize,  // 0x08
-    pub r13:     usize,  // 0x10
-    pub r12:     usize,  // 0x18
-    pub rbp:     usize,  // 0x20
-    pub rbx:     usize,  // 0x28
-    pub rsp:     usize,  // 0x30
-    pub rip:     usize,  // 0x38
+    pub r15: usize, // 0x00
+    pub r14: usize, // 0x08
+    pub r13: usize, // 0x10
+    pub r12: usize, // 0x18
+    pub rbp: usize, // 0x20
+    pub rbx: usize, // 0x28
+    pub rsp: usize, // 0x30
+    pub rip: usize, // 0x38
     /// TLS base stored in IA32_FS_BASE MSR (0xC000_0100).
-    pub fs_base: usize,  // 0x40
+    pub fs_base: usize, // 0x40
 }
 
 #[cfg(target_arch = "x86_64")]
 impl Context {
     pub const fn zero() -> Self {
-        Self { r15:0, r14:0, r13:0, r12:0, rbp:0, rbx:0, rsp:0, rip:0, fs_base:0 }
+        Self {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            rsp: 0,
+            rip: 0,
+            fs_base: 0,
+        }
     }
 }
 
@@ -86,27 +96,41 @@ impl Context {
 #[derive(Default, Clone, Copy)]
 #[repr(C)]
 pub struct Context {
-    pub ra:  usize,  // 0x00  — resume address after switch
-    pub sp:  usize,  // 0x08  — kernel stack pointer
-    pub s0:  usize,  // 0x10  — fp / callee-saved
-    pub s1:  usize,  // 0x18
-    pub s2:  usize,  // 0x20
-    pub s3:  usize,  // 0x28
-    pub s4:  usize,  // 0x30
-    pub s5:  usize,  // 0x38
-    pub s6:  usize,  // 0x40
-    pub s7:  usize,  // 0x48
-    pub s8:  usize,  // 0x50
-    pub s9:  usize,  // 0x58
-    pub s10: usize,  // 0x60
-    pub s11: usize,  // 0x68
+    pub ra: usize,  // 0x00  — resume address after switch
+    pub sp: usize,  // 0x08  — kernel stack pointer
+    pub s0: usize,  // 0x10  — fp / callee-saved
+    pub s1: usize,  // 0x18
+    pub s2: usize,  // 0x20
+    pub s3: usize,  // 0x28
+    pub s4: usize,  // 0x30
+    pub s5: usize,  // 0x38
+    pub s6: usize,  // 0x40
+    pub s7: usize,  // 0x48
+    pub s8: usize,  // 0x50
+    pub s9: usize,  // 0x58
+    pub s10: usize, // 0x60
+    pub s11: usize, // 0x68
 }
 
 #[cfg(target_arch = "riscv64")]
 impl Context {
     pub const fn zero() -> Self {
-        Self { ra:0, sp:0, s0:0, s1:0, s2:0, s3:0,
-               s4:0, s5:0, s6:0, s7:0, s8:0, s9:0, s10:0, s11:0 }
+        Self {
+            ra: 0,
+            sp: 0,
+            s0: 0,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            s5: 0,
+            s6: 0,
+            s7: 0,
+            s8: 0,
+            s9: 0,
+            s10: 0,
+            s11: 0,
+        }
     }
 }
 
@@ -266,15 +290,15 @@ pub unsafe fn switch(
 /// dummy `Context` on the stack.  Instead it branches directly into the
 /// arch first-time-entry path:
 ///
-/// - **x86_64**: loads `Pcb::ctx` which was set up by `clone` to point
-///   `rsp` at the syscall frame and `rip` at `sysret_trampoline`.  We call
-///   `switch_to` with a dummy that is stack-allocated but whose save half
-///   is intentionally discarded (the scheduler never uses the `prev` of a
-///   `Cold → Live` transition again).
+/// - **x86_64**: loads `Pcb::ctx` which was set up by `clone` to point `rsp` at
+///   the syscall frame and `rip` at `sysret_trampoline`.  We call `switch_to`
+///   with a dummy that is stack-allocated but whose save half is intentionally
+///   discarded (the scheduler never uses the `prev` of a `Cold → Live`
+///   transition again).
 ///
-/// - **RISC-V**: loads `Pcb::ctx.{ra=task_entry_trampoline, sp=kstack-tf}`
-///   via `switch_riscv` with a dummy old-context, then `ret` in the naked
-///   stub jumps to `task_entry_trampoline` → `trap_return` → `sret`.
+/// - **RISC-V**: loads `Pcb::ctx.{ra=task_entry_trampoline, sp=kstack-tf}` via
+///   `switch_riscv` with a dummy old-context, then `ret` in the naked stub
+///   jumps to `task_entry_trampoline` → `trap_return` → `sret`.
 ///
 /// # Safety
 /// Task pointer must be valid.  Interrupts must be disabled.
@@ -289,7 +313,7 @@ pub unsafe fn restore(task: *mut crate::proc::task_types::Task) {
     // restore() on a Live task is now a bug caught at the call site
     // (schedule() matches on run_state), not silently mishandled here.
     let mut dummy = Context::zero();
-    let next_ctx  = task_ctx_ptr(task) as *const Context;
+    let next_ctx = task_ctx_ptr(task) as *const Context;
     #[cfg(target_arch = "x86_64")]
     switch_to(&mut dummy as *mut Context, next_ctx);
     #[cfg(target_arch = "riscv64")]

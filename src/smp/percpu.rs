@@ -7,8 +7,8 @@
 //!
 //! RISC-V: The `tp` (thread pointer) register holds the pointer to the block.
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Size of the interrupt stack allocated per CPU (16 KiB).
 pub const IST_SIZE: usize = 16 * 1024;
@@ -75,8 +75,7 @@ impl PercpuBlock {
 
 /// Static storage for up to MAX_CPUS per-CPU blocks.
 pub static mut PERCPU_BLOCKS: [PercpuBlock; crate::smp::MAX_CPUS] = {
-    let mut arr: [PercpuBlock; crate::smp::MAX_CPUS] =
-        unsafe { core::mem::zeroed() };
+    let mut arr: [PercpuBlock; crate::smp::MAX_CPUS] = unsafe { core::mem::zeroed() };
     arr
 };
 
@@ -102,12 +101,12 @@ pub unsafe fn init(cpu_id: u32) {
         blk.node = info.node;
     }
     blk.intr_disable_depth = 0;
-    blk.intr_was_enabled   = false;
-    blk.current_task       = core::ptr::null_mut();
-    blk.current_pid        = 0;
-    blk.ctx_switches       = 0;
-    blk.ipi_pending        = AtomicU32::new(0);
-    blk.runqueue           = crate::proc::scheduler::RunQueue::new();
+    blk.intr_was_enabled = false;
+    blk.current_task = core::ptr::null_mut();
+    blk.current_pid = 0;
+    blk.ctx_switches = 0;
+    blk.ipi_pending = AtomicU32::new(0);
+    blk.runqueue = crate::proc::scheduler::RunQueue::new();
 
     CPU_COUNT.fetch_max(cpu_id + 1, Ordering::Release);
 
@@ -198,7 +197,9 @@ pub fn push_off() -> bool {
         was_on = (sstatus & 2) != 0;
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
-    { was_on = false; }
+    {
+        was_on = false;
+    }
     if blk.intr_disable_depth == 0 {
         blk.intr_was_enabled = was_on;
     }
@@ -215,8 +216,12 @@ pub fn pop_off() {
     blk.intr_disable_depth -= 1;
     if blk.intr_disable_depth == 0 && blk.intr_was_enabled {
         #[cfg(target_arch = "x86_64")]
-        unsafe { core::arch::asm!("sti", options(nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("sti", options(nostack, preserves_flags));
+        }
         #[cfg(target_arch = "riscv64")]
-        unsafe { core::arch::asm!("csrsi sstatus, 2", options(nostack)); }
+        unsafe {
+            core::arch::asm!("csrsi sstatus, 2", options(nostack));
+        }
     }
 }

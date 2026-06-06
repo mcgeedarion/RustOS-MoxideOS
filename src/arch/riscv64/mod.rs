@@ -7,8 +7,8 @@ pub mod memory;
 pub mod paging;
 pub mod smp;
 pub mod syscall;
-pub mod trap;
 pub mod trampoline;
+pub mod trap;
 pub mod uefi_entry;
 pub mod uentry;
 
@@ -19,11 +19,15 @@ pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
     let fdt_ptr = boot_info.fdt.start;
     trap::trap_init();
     if fdt_ptr != 0 {
-        unsafe { fdt::fdt_phase1(fdt_ptr); }
+        unsafe {
+            fdt::fdt_phase1(fdt_ptr);
+        }
     }
 
     let regions = crate::arch::riscv64::memory::discover(fdt_ptr);
-    unsafe { crate::mm::pmm::init_from_regions(&regions); }
+    unsafe {
+        crate::mm::pmm::init_from_regions(&regions);
+    }
 
     plic::init();
     crate::heap::init();
@@ -38,7 +42,9 @@ pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
     crate::display::wayland::init();
 
     if fdt_ptr != 0 {
-        unsafe { fdt::fdt_phase2(fdt_ptr); }
+        unsafe {
+            fdt::fdt_phase2(fdt_ptr);
+        }
     }
     crate::block::virtio_blk::init();
 

@@ -2,9 +2,9 @@
 //!
 //! When the `trace` Cargo feature is active, rustc is instructed (in
 //! `build.rs`) to pass `-Z instrument-functions` to every compilation unit.
-//! LLVM then inserts calls to `__cyg_profile_func_enter` / `__cyg_profile_func_exit`
-//! at every function prologue and epilogue — the same ABI used by GCC's
-//! `-finstrument-functions`.
+//! LLVM then inserts calls to `__cyg_profile_func_enter` /
+//! `__cyg_profile_func_exit` at every function prologue and epilogue — the same
+//! ABI used by GCC's `-finstrument-functions`.
 //!
 //! # Recursion guard
 //!
@@ -22,50 +22,52 @@
 
 #[cfg(all(feature = "debug", feature = "trace"))]
 pub mod inner {
-    use core::sync::atomic::{AtomicBool, Ordering};
     use super::super::trace::{emit, TraceEvent, TraceKind};
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     /// Per-CPU recursion guard. We use a single global bool here; replace with
     /// a per-hart/per-core array once SMP hart-ID helpers are available.
     static IN_HOOK: AtomicBool = AtomicBool::new(false);
 
-    /// Called by LLVM at every function entry when `-Z instrument-functions` is active.
+    /// Called by LLVM at every function entry when `-Z instrument-functions` is
+    /// active.
     ///
     /// # Safety
     /// Raw function pointers; must not unwind; must not allocate.
     #[no_mangle]
     #[inline(never)]
-    pub unsafe extern "C" fn __cyg_profile_func_enter(
-        func:      *const (),
-        _callsite: *const (),
-    ) {
+    pub unsafe extern "C" fn __cyg_profile_func_enter(func: *const (), _callsite: *const ()) {
         // Guard against recursion.
-        if IN_HOOK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if IN_HOOK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
         emit(TraceEvent {
-            kind:  TraceKind::FuncEnter,
-            id:    0,
-            arg:   func as u64,
+            kind: TraceKind::FuncEnter,
+            id: 0,
+            arg: func as u64,
             ticks: crate::arch::time::read_ticks(),
         });
         IN_HOOK.store(false, Ordering::Release);
     }
 
-    /// Called by LLVM at every function exit when `-Z instrument-functions` is active.
+    /// Called by LLVM at every function exit when `-Z instrument-functions` is
+    /// active.
     #[no_mangle]
     #[inline(never)]
-    pub unsafe extern "C" fn __cyg_profile_func_exit(
-        func:      *const (),
-        _callsite: *const (),
-    ) {
-        if IN_HOOK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+    pub unsafe extern "C" fn __cyg_profile_func_exit(func: *const (), _callsite: *const ()) {
+        if IN_HOOK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
         emit(TraceEvent {
-            kind:  TraceKind::FuncExit,
-            id:    0,
-            arg:   func as u64,
+            kind: TraceKind::FuncExit,
+            id: 0,
+            arg: func as u64,
             ticks: crate::arch::time::read_ticks(),
         });
         IN_HOOK.store(false, Ordering::Release);

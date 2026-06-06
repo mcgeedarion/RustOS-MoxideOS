@@ -19,4 +19,4 @@ pub mod error;
 pub mod fast_hash;
 pub mod panic;
 
-pub use error::{KernelError, KResult};
+pub use error::{KResult, KernelError};

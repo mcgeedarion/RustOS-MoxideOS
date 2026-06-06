@@ -25,19 +25,24 @@
 //! | 0x390  | Timer Current Count       |
 //! | 0x3E0  | Timer Divide Config       |
 
+use crate::arch::x86_64::mem_layout::{apic as ml, higher_half, trampoline as tram};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::arch::x86_64::mem_layout::{apic as ml, trampoline as tram, higher_half};
 
-static X2APIC_MODE: AtomicBool  = AtomicBool::new(false);
-static LAPIC_PHYS:  AtomicU64   = AtomicU64::new(ml::LAPIC_PHYS_DEFAULT);
+static X2APIC_MODE: AtomicBool = AtomicBool::new(false);
+static LAPIC_PHYS: AtomicU64 = AtomicU64::new(ml::LAPIC_PHYS_DEFAULT);
 
 /// Calibrated APIC timer ticks per millisecond (set by calibrate_lapic_timer).
 static APIC_TICKS_PER_MS: AtomicU64 = AtomicU64::new(0);
 
-#[inline] fn x2apic() -> bool { X2APIC_MODE.load(Ordering::Relaxed) }
+#[inline]
+fn x2apic() -> bool {
+    X2APIC_MODE.load(Ordering::Relaxed)
+}
 
 /// Override the LAPIC physical base (called from ACPI MADT parser).
-pub fn set_lapic_base(phys: u64) { LAPIC_PHYS.store(phys, Ordering::Relaxed); }
+pub fn set_lapic_base(phys: u64) {
+    LAPIC_PHYS.store(phys, Ordering::Relaxed);
+}
 
 #[inline]
 fn lapic_virt() -> usize {
@@ -153,10 +158,12 @@ unsafe fn local_apic_setup() {
         lapic_write(off, ml::LVT_MASKED);
     }
     // Spurious Vector Register: software-enable LAPIC + spurious vector.
-    lapic_write(ml::REG_SPURIOUS,
-        ml::SPURIOUS_ENABLE | ml::SPURIOUS_VECTOR as u32);
+    lapic_write(
+        ml::REG_SPURIOUS,
+        ml::SPURIOUS_ENABLE | ml::SPURIOUS_VECTOR as u32,
+    );
     // Timer: divide-by-16, MASKED until calibrate_lapic_timer() runs.
-    lapic_write(ml::REG_TIMER_DCR, 0x3);  // divide by 16
+    lapic_write(ml::REG_TIMER_DCR, 0x3); // divide by 16
     lapic_write(ml::REG_TIMER_LVT, ml::LVT_MASKED);
     lapic_write(ml::REG_TIMER_ICR, 0);
 }
@@ -169,8 +176,11 @@ pub fn apic_init() {
         local_apic_setup();
     }
     register_ipi_handlers();
-    log::info!("apic: BSP id={:#x} mode={}",
-        lapic_id(), if x2apic() { "x2APIC" } else { "xAPIC" });
+    log::info!(
+        "apic: BSP id={:#x} mode={}",
+        lapic_id(),
+        if x2apic() { "x2APIC" } else { "xAPIC" }
+    );
 }
 
 /// Per-AP initialisation.  Called from `ap_entry()` after GDT+IDT are live.
@@ -197,9 +207,14 @@ pub unsafe fn ap_init_local() {
 pub fn calibrate_lapic_timer() {
     let ticks_per_ms = unsafe { measure_apic_ticks_per_ms() };
     APIC_TICKS_PER_MS.store(ticks_per_ms, Ordering::SeqCst);
-    unsafe { arm_periodic_1ms(ticks_per_ms); }
-    log::info!("apic: timer calibrated — {} ticks/ms (ICR={})",
-        ticks_per_ms, ticks_per_ms);
+    unsafe {
+        arm_periodic_1ms(ticks_per_ms);
+    }
+    log::info!(
+        "apic: timer calibrated — {} ticks/ms (ICR={})",
+        ticks_per_ms,
+        ticks_per_ms
+    );
 }
 
 /// Measure how many APIC bus ticks elapse in 10 ms, return ticks/ms.
@@ -208,7 +223,7 @@ unsafe fn measure_apic_ticks_per_ms() -> u64 {
     const WINDOW_MS: u64 = 10;
 
     // Set APIC timer to count-down from max with divider, no interrupt.
-    lapic_write(ml::REG_TIMER_DCR, 0x3);         // divide by 16
+    lapic_write(ml::REG_TIMER_DCR, 0x3); // divide by 16
     lapic_write(ml::REG_TIMER_LVT, ml::LVT_MASKED);
     lapic_write(ml::REG_TIMER_ICR, 0xFFFF_FFFF);
 
@@ -264,11 +279,11 @@ unsafe fn measure_with_best_reference(window_ms: u64) -> u64 {
 unsafe fn pit_wait_ms(ms: u64) {
     const PIT_HZ: u64 = 1_193_182;
     // Max PIT one-shot count = 65535 ≈ 54.9 ms.  Split into 10 ms chunks.
-    const CHUNK_MS:    u64 = 10;
+    const CHUNK_MS: u64 = 10;
     const CHUNK_COUNT: u16 = 11932; // PIT counts for ~10 ms
 
     let full_chunks = ms / CHUNK_MS;
-    let remainder   = ms % CHUNK_MS;
+    let remainder = ms % CHUNK_MS;
 
     for _ in 0..full_chunks {
         pit_oneshot(CHUNK_COUNT);
@@ -283,8 +298,8 @@ unsafe fn pit_wait_ms(ms: u64) {
 unsafe fn pit_oneshot(count: u16) {
     // Disable gate, configure channel 2 mode 0.
     let mut v: u8 = inb(0x61) & 0xFE; // gate off
-    outb(0x61, v & 0xFD);             // speaker off
-    outb(0x43, 0xB0);                 // channel 2, mode 0, binary
+    outb(0x61, v & 0xFD); // speaker off
+    outb(0x43, 0xB0); // channel 2, mode 0, binary
     outb(0x42, (count & 0xFF) as u8);
     outb(0x42, (count >> 8) as u8);
     // Start count: set gate bit.
@@ -305,15 +320,19 @@ unsafe fn arm_periodic_1ms(ticks_per_ms: u64) {
     lapic_write(ml::REG_TIMER_DCR, 0x3); // divide by 16
     lapic_write(ml::REG_TIMER_ICR, icr);
     // Enable periodic mode (bit 17) + vector, unmask.
-    lapic_write(ml::REG_TIMER_LVT,
-        (1 << 17) | crate::smp::ipi::APIC_TIMER_VECTOR as u32);
+    lapic_write(
+        ml::REG_TIMER_LVT,
+        (1 << 17) | crate::smp::ipi::APIC_TIMER_VECTOR as u32,
+    );
 }
 
 /// Signal end-of-interrupt to the LAPIC.  Must be called before returning
 /// from any LAPIC-sourced interrupt handler (timer, IPI, etc.).
 #[inline]
 pub fn send_eoi() {
-    unsafe { lapic_write(ml::REG_EOI, 0); }
+    unsafe {
+        lapic_write(ml::REG_EOI, 0);
+    }
 }
 
 /// Return the calling CPU's APIC ID.
@@ -321,7 +340,7 @@ pub fn send_eoi() {
 pub fn lapic_id() -> u32 {
     unsafe {
         if x2apic() {
-            lapic_read(ml::REG_ID)      // x2APIC: full 32-bit APIC ID
+            lapic_read(ml::REG_ID) // x2APIC: full 32-bit APIC ID
         } else {
             lapic_read(ml::REG_ID) >> 24 // xAPIC: ID in bits [31:24]
         }
@@ -335,9 +354,7 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
         icr_wait_idle();
         icr_write(
             apic_id,
-            ml::ICR_DELIVERY_FIXED
-                | ml::ICR_LEVEL_ASSERT
-                | vector as u32,
+            ml::ICR_DELIVERY_FIXED | ml::ICR_LEVEL_ASSERT | vector as u32,
         );
         icr_wait_idle();
     }
@@ -345,7 +362,7 @@ pub fn send_ipi(apic_id: u32, vector: u8) {
 
 extern "C" {
     static ap_trampoline_start: u8;
-    static ap_trampoline_end:   u8;
+    static ap_trampoline_end: u8;
 }
 
 /// Copy the trampoline into the low page, fill BSP-supplied slots, then
@@ -360,27 +377,26 @@ pub fn start_all_aps() {
     let tram_base = ml::TRAMPOLINE_PHYS;
 
     unsafe {
-        let src  = &ap_trampoline_start as *const u8;
-        let end  = &ap_trampoline_end   as *const u8;
-        let len  = end as usize - src as usize;
-        let dst  = higher_half::phys_to_virt(tram_base) as *mut u8;
+        let src = &ap_trampoline_start as *const u8;
+        let end = &ap_trampoline_end as *const u8;
+        let len = end as usize - src as usize;
+        let dst = higher_half::phys_to_virt(tram_base) as *mut u8;
         core::ptr::copy_nonoverlapping(src, dst, len);
     }
 
     unsafe {
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
-        let slot = higher_half::phys_to_virt(tram_base + tram::GDT_PTR_OFFSET as u64 - 0x20)
-                   as *mut u64;  // PML4 slot = TRAMPOLINE_PHYS + 0xFF0
-        let pml4_slot = higher_half::phys_to_virt(
-            tram_base + tram::PML4_OFFSET as u64) as *mut u64;
+        let slot =
+            higher_half::phys_to_virt(tram_base + tram::GDT_PTR_OFFSET as u64 - 0x20) as *mut u64; // PML4 slot = TRAMPOLINE_PHYS + 0xFF0
+        let pml4_slot = higher_half::phys_to_virt(tram_base + tram::PML4_OFFSET as u64) as *mut u64;
         let _ = slot;
         core::ptr::write_volatile(pml4_slot, cr3 & !0xFFFu64);
     }
 
     unsafe {
-        let gdt_slot = higher_half::phys_to_virt(
-            tram_base + tram::GDT_PTR_OFFSET as u64) as *mut u8;
+        let gdt_slot =
+            higher_half::phys_to_virt(tram_base + tram::GDT_PTR_OFFSET as u64) as *mut u8;
         core::arch::asm!("sgdt [{p}]", p = in(reg) gdt_slot, options(nostack));
     }
 
@@ -395,7 +411,7 @@ pub fn start_all_aps() {
         ;
         icr_wait_idle();
     }
-    busy_wait_us(10_000);  // 10 ms — now calibrated
+    busy_wait_us(10_000); // 10 ms — now calibrated
 
     unsafe {
         icr_wait_idle();
@@ -419,10 +435,10 @@ pub fn start_all_aps() {
         let stack_top = allocate_ap_stack(cpu_id);
 
         unsafe {
-            let stack_slot = higher_half::phys_to_virt(
-                tram_base + tram::KSTACK_OFFSET as u64) as *mut u64;
-            let cpuid_slot = higher_half::phys_to_virt(
-                tram_base + tram::CPU_ID_OFFSET as u64) as *mut u32;
+            let stack_slot =
+                higher_half::phys_to_virt(tram_base + tram::KSTACK_OFFSET as u64) as *mut u64;
+            let cpuid_slot =
+                higher_half::phys_to_virt(tram_base + tram::CPU_ID_OFFSET as u64) as *mut u32;
             core::ptr::write_volatile(stack_slot, stack_top);
             core::ptr::write_volatile(cpuid_slot, cpu_id);
         }
@@ -433,7 +449,7 @@ pub fn start_all_aps() {
         unsafe {
             send_sipi(info.hw_id, tram_page);
             busy_wait_us(200);
-            send_sipi(info.hw_id, tram_page);  // second SIPI per MP spec §B.4
+            send_sipi(info.hw_id, tram_page); // second SIPI per MP spec §B.4
             busy_wait_us(200);
         }
 
@@ -453,9 +469,9 @@ unsafe fn send_sipi(apic_id: u32, page: u8) {
 /// Allocate `AP_STACK_PAGES` physically contiguous pages and return the
 /// virtual address of the top (stacks grow downward).
 fn allocate_ap_stack(_cpu_id: u32) -> u64 {
-    const AP_STACK_PAGES: usize = 16;  // 64 KiB
-    let phys = crate::mm::pmm::alloc_pages(AP_STACK_PAGES)
-        .expect("apic: AP stack allocation failed");
+    const AP_STACK_PAGES: usize = 16; // 64 KiB
+    let phys =
+        crate::mm::pmm::alloc_pages(AP_STACK_PAGES).expect("apic: AP stack allocation failed");
     let virt = higher_half::phys_to_virt(phys as u64);
     (virt + AP_STACK_PAGES * 0x1000) as u64
 }
@@ -481,7 +497,7 @@ fn register_ipi_handlers() {
     });
     idt::register_irq(ipi::IPI_PANIC_HALT, |_f| {
         ipi::dispatch(crate::smp::percpu::current_cpu_id());
-        send_eoi();  // unreachable if PanicHalt fires, kept for correctness
+        send_eoi(); // unreachable if PanicHalt fires, kept for correctness
     });
 }
 
@@ -502,13 +518,16 @@ pub fn busy_wait_us(us: u64) {
     } else {
         // PIT path: no TSC yet — use PIT channel 2 (safe at any point).
         let ms = (us + 999) / 1000; // round up to ms
-        unsafe { pit_wait_ms(ms.max(1)); }
+        unsafe {
+            pit_wait_ms(ms.max(1));
+        }
     }
 }
 
 #[inline]
 fn rdtsc() -> u64 {
-    let lo: u32; let hi: u32;
+    let lo: u32;
+    let hi: u32;
     unsafe {
         core::arch::asm!("rdtsc",
             out("eax") lo, out("edx") hi,

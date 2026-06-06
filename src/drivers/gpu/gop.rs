@@ -18,7 +18,7 @@ use crate::drivers::gpu::framebuffer::{Framebuffer, PixelFormat};
 use crate::drivers::gpu::gpu::DisplayInfo;
 
 struct GopState {
-    fb:     Framebuffer,
+    fb: Framebuffer,
     format: GopPixelFormat,
 }
 
@@ -34,23 +34,28 @@ static GOP: Mutex<Option<GopState>> = Mutex::new(None);
 /// Initialise from values supplied by the bootloader.
 pub fn init(fb_base: u64, width: u32, height: u32, pitch_bytes: u32) {
     let fb = Framebuffer {
-        phys:   fb_base,
+        phys: fb_base,
         width,
         height,
-        pitch:  pitch_bytes,
+        pitch: pitch_bytes,
         format: PixelFormat::Xrgb8888,
     };
-    *GOP.lock() = Some(GopState { fb, format: GopPixelFormat::BgrX });
+    *GOP.lock() = Some(GopState {
+        fb,
+        format: GopPixelFormat::BgrX,
+    });
 }
 
-pub fn is_initialised() -> bool { GOP.lock().is_some() }
+pub fn is_initialised() -> bool {
+    GOP.lock().is_some()
+}
 
 pub fn display_info() -> Option<DisplayInfo> {
     GOP.lock().as_ref().map(|g| DisplayInfo {
-        width:  g.fb.width,
+        width: g.fb.width,
         height: g.fb.height,
-        pitch:  g.fb.pitch,
-        bpp:    32,
+        pitch: g.fb.pitch,
+        bpp: 32,
     })
 }
 
@@ -80,8 +85,8 @@ fn argb_to_gopfmt(argb: u32, fmt: GopPixelFormat) -> u32 {
     // Input: 0xAARRGGBB
     let a = (argb >> 24) & 0xFF;
     let r = (argb >> 16) & 0xFF;
-    let g = (argb >>  8) & 0xFF;
-    let b =  argb        & 0xFF;
+    let g = (argb >> 8) & 0xFF;
+    let b = argb & 0xFF;
     match fmt {
         GopPixelFormat::RgbX => (r << 24) | (g << 16) | (b << 8) | a,
         GopPixelFormat::BgrX => (b << 24) | (g << 16) | (r << 8) | a,

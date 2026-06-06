@@ -32,7 +32,9 @@ pub unsafe fn enable_fp_simd() {
 #[inline]
 pub fn read_ttbr0() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {v}, ttbr0_el1", v = out(reg) v, options(nostack, nomem)); }
+    unsafe {
+        asm!("mrs {v}, ttbr0_el1", v = out(reg) v, options(nostack, nomem));
+    }
     v
 }
 
@@ -51,7 +53,9 @@ pub unsafe fn write_ttbr0(val: u64) {
 #[inline]
 pub fn read_ttbr1() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {v}, ttbr1_el1", v = out(reg) v, options(nostack, nomem)); }
+    unsafe {
+        asm!("mrs {v}, ttbr1_el1", v = out(reg) v, options(nostack, nomem));
+    }
     v
 }
 
@@ -70,7 +74,9 @@ pub unsafe fn write_ttbr1(val: u64) {
 #[inline]
 pub fn counter_freq() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {v}, cntfrq_el0", v = out(reg) v, options(nostack, nomem)); }
+    unsafe {
+        asm!("mrs {v}, cntfrq_el0", v = out(reg) v, options(nostack, nomem));
+    }
     v
 }
 
@@ -78,7 +84,9 @@ pub fn counter_freq() -> u64 {
 #[inline]
 pub fn read_virtual_count() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {v}, cntvct_el0", v = out(reg) v, options(nostack, nomem)); }
+    unsafe {
+        asm!("mrs {v}, cntvct_el0", v = out(reg) v, options(nostack, nomem));
+    }
     v
 }
 
@@ -86,6 +94,8 @@ pub fn read_virtual_count() -> u64 {
 #[inline]
 pub fn current_el() -> u64 {
     let v: u64;
-    unsafe { asm!("mrs {v}, CurrentEL", v = out(reg) v, options(nostack, nomem)); }
+    unsafe {
+        asm!("mrs {v}, CurrentEL", v = out(reg) v, options(nostack, nomem));
+    }
     (v >> 2) & 0b11
 }

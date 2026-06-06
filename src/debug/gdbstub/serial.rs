@@ -13,18 +13,18 @@ use x86_64::instructions::port::Port;
 
 const COM1_BASE: u16 = 0x3F8;
 
-const REG_DATA:    u16 = COM1_BASE;       // RBR (r) / THR (w)
-const REG_IER:     u16 = COM1_BASE + 1;   // Interrupt Enable
-const REG_FCR:     u16 = COM1_BASE + 2;   // FIFO Control (write)
-const REG_LCR:     u16 = COM1_BASE + 3;   // Line Control
-const REG_MCR:     u16 = COM1_BASE + 4;   // Modem Control
-const REG_LSR:     u16 = COM1_BASE + 5;   // Line Status
-const REG_DLL:     u16 = COM1_BASE;       // Divisor Latch Low  (DLAB=1)
-const REG_DLH:     u16 = COM1_BASE + 1;   // Divisor Latch High (DLAB=1)
+const REG_DATA: u16 = COM1_BASE; // RBR (r) / THR (w)
+const REG_IER: u16 = COM1_BASE + 1; // Interrupt Enable
+const REG_FCR: u16 = COM1_BASE + 2; // FIFO Control (write)
+const REG_LCR: u16 = COM1_BASE + 3; // Line Control
+const REG_MCR: u16 = COM1_BASE + 4; // Modem Control
+const REG_LSR: u16 = COM1_BASE + 5; // Line Status
+const REG_DLL: u16 = COM1_BASE; // Divisor Latch Low  (DLAB=1)
+const REG_DLH: u16 = COM1_BASE + 1; // Divisor Latch High (DLAB=1)
 
 // LSR bit flags
-const LSR_DATA_READY:  u8 = 1 << 0;  // Received byte waiting in RBR
-const LSR_THRE:        u8 = 1 << 5;  // Transmitter Holding Register Empty
+const LSR_DATA_READY: u8 = 1 << 0; // Received byte waiting in RBR
+const LSR_THRE: u8 = 1 << 5; // Transmitter Holding Register Empty
 
 // Baud divisor for 115200 baud (base clock = 1.8432 MHz)
 const BAUD_115200: u16 = 1;
@@ -35,11 +35,11 @@ const BAUD_115200: u16 = 1;
 /// use goes through the [`Connection`] impl.
 pub struct SerialPort {
     data: Port<u8>,
-    ier:  Port<u8>,
-    fcr:  Port<u8>,
-    lcr:  Port<u8>,
-    mcr:  Port<u8>,
-    lsr:  Port<u8>,
+    ier: Port<u8>,
+    fcr: Port<u8>,
+    lcr: Port<u8>,
+    mcr: Port<u8>,
+    lsr: Port<u8>,
 }
 
 impl SerialPort {
@@ -50,11 +50,11 @@ impl SerialPort {
     pub const unsafe fn new() -> Self {
         Self {
             data: Port::new(REG_DATA),
-            ier:  Port::new(REG_IER),
-            fcr:  Port::new(REG_FCR),
-            lcr:  Port::new(REG_LCR),
-            mcr:  Port::new(REG_MCR),
-            lsr:  Port::new(REG_LSR),
+            ier: Port::new(REG_IER),
+            fcr: Port::new(REG_FCR),
+            lcr: Port::new(REG_LCR),
+            mcr: Port::new(REG_MCR),
+            lsr: Port::new(REG_LSR),
         }
     }
 
@@ -73,7 +73,7 @@ impl SerialPort {
         let mut dll: Port<u8> = Port::new(REG_DLL);
         let mut dlh: Port<u8> = Port::new(REG_DLH);
         dll.write((BAUD_115200 & 0xFF) as u8);
-        dlh.write((BAUD_115200 >> 8)   as u8);
+        dlh.write((BAUD_115200 >> 8) as u8);
 
         // 8 data bits, no parity, 1 stop bit (clear DLAB)
         self.lcr.write(0x03);

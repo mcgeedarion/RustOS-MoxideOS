@@ -39,7 +39,7 @@ pub const FLAG_OPEN_BINARY: u8 = 1 << 0;
 /// `C` — use interpreter credentials (setuid/setgid from interpreter inode).
 pub const FLAG_CREDENTIALS: u8 = 1 << 1;
 /// `F` — "fix binary": entry survives `mount --bind` remounts.
-pub const FLAG_FIX_BINARY:  u8 = 1 << 2;
+pub const FLAG_FIX_BINARY: u8 = 1 << 2;
 
 // ── Entry type ──────────────────────────────────────────────────────────────
 
@@ -48,8 +48,8 @@ pub enum MatchType {
     /// Match by magic bytes at a fixed file offset.
     Magic {
         offset: usize,
-        magic:  Vec<u8>,
-        mask:   Vec<u8>, // same length as magic; all-0xFF ⇒ exact match
+        magic: Vec<u8>,
+        mask: Vec<u8>, // same length as magic; all-0xFF ⇒ exact match
     },
     /// Match by filename extension (e.g. ".jar").
     Extension(String),
@@ -58,14 +58,15 @@ pub enum MatchType {
 #[derive(Clone, Debug)]
 pub struct BinfmtEntry {
     /// Human-readable name shown under `/proc/sys/fs/binfmt_misc/<name>`.
-    pub name:        String,
-    pub match_type:  MatchType,
-    /// Absolute path to the user-space interpreter (e.g. `/usr/bin/qemu-x86_64`).
+    pub name: String,
+    pub match_type: MatchType,
+    /// Absolute path to the user-space interpreter (e.g.
+    /// `/usr/bin/qemu-x86_64`).
     pub interpreter: String,
-    pub flags:       u8,
+    pub flags: u8,
     /// Whether this entry is active.  Toggled by writing `0`/`1` to the
     /// per-entry proc file.
-    pub enabled:     bool,
+    pub enabled: bool,
 }
 
 // ── Table ──────────────────────────────────────────────────────────────────
@@ -76,7 +77,9 @@ pub struct BinfmtTable {
 
 impl BinfmtTable {
     const fn new() -> Self {
-        BinfmtTable { entries: Vec::new() }
+        BinfmtTable {
+            entries: Vec::new(),
+        }
     }
 
     /// Add a new entry.  Duplicate names overwrite the existing entry so that
@@ -113,14 +116,20 @@ impl BinfmtTable {
     /// the file should be handled natively.
     pub fn probe<'a>(&'a self, file_header: &[u8]) -> Option<&'a BinfmtEntry> {
         for entry in &self.entries {
-            if !entry.enabled { continue; }
+            if !entry.enabled {
+                continue;
+            }
             let matched = match &entry.match_type {
-                MatchType::Magic { offset, magic, mask } => {
-                    probe_magic(file_header, *offset, magic, mask)
-                }
+                MatchType::Magic {
+                    offset,
+                    magic,
+                    mask,
+                } => probe_magic(file_header, *offset, magic, mask),
                 MatchType::Extension(_) => false, // probed at path level, not here
             };
-            if matched { return Some(entry); }
+            if matched {
+                return Some(entry);
+            }
         }
         None
     }
@@ -133,11 +142,15 @@ impl BinfmtTable {
 
 fn probe_magic(header: &[u8], offset: usize, magic: &[u8], mask: &[u8]) -> bool {
     let end = offset.saturating_add(magic.len());
-    if end > header.len() { return false; }
+    if end > header.len() {
+        return false;
+    }
     let window = &header[offset..end];
     for i in 0..magic.len() {
         let m = if i < mask.len() { mask[i] } else { 0xFF };
-        if window[i] & m != magic[i] & m { return false; }
+        if window[i] & m != magic[i] & m {
+            return false;
+        }
     }
     true
 }
@@ -150,7 +163,8 @@ static BINFMT_TABLE: Mutex<BinfmtTable> = Mutex::new(BinfmtTable::new());
 /// Returns `Some((interpreter_path, flags))` when a matching entry is found.
 pub fn probe_header(file_header: &[u8]) -> Option<(String, u8)> {
     let tbl = BINFMT_TABLE.lock();
-    tbl.probe(file_header).map(|e| (e.interpreter.clone(), e.flags))
+    tbl.probe(file_header)
+        .map(|e| (e.interpreter.clone(), e.flags))
 }
 
 /// Register a new entry from a parsed description string.
@@ -184,52 +198,66 @@ pub fn list() -> Vec<BinfmtEntry> {
 
 pub fn parse_register_string(s: &str) -> Result<BinfmtEntry, &'static str> {
     let s = s.trim();
-    if s.is_empty() { return Err("empty"); }
+    if s.is_empty() {
+        return Err("empty");
+    }
     // The first character is the chosen delimiter.
     let delim = s.chars().next().unwrap();
     let parts: Vec<&str> = s[delim.len_utf8()..].split(delim).collect();
     // Expected 7 fields after the leading delimiter:
     //  name | type | offset | magic | mask | interpreter | flags
-    if parts.len() < 7 { return Err("too few fields"); }
-    let name        = parts[0];
-    let kind        = parts[1];
-    let offset_str  = parts[2];
-    let magic_str   = parts[3];
-    let mask_str    = parts[4];
+    if parts.len() < 7 {
+        return Err("too few fields");
+    }
+    let name = parts[0];
+    let kind = parts[1];
+    let offset_str = parts[2];
+    let magic_str = parts[3];
+    let mask_str = parts[4];
     let interpreter = parts[5];
-    let flags_str   = parts[6];
+    let flags_str = parts[6];
 
-    if name.is_empty()        { return Err("empty name"); }
-    if interpreter.is_empty() { return Err("empty interpreter"); }
+    if name.is_empty() {
+        return Err("empty name");
+    }
+    if interpreter.is_empty() {
+        return Err("empty interpreter");
+    }
 
     let flags = parse_flags(flags_str);
 
     let match_type = match kind {
         "M" | "m" => {
             let offset = offset_str.parse::<usize>().unwrap_or(0);
-            let magic  = decode_hex(magic_str).ok_or("bad magic hex")?;
-            let mask   = if mask_str.is_empty() {
+            let magic = decode_hex(magic_str).ok_or("bad magic hex")?;
+            let mask = if mask_str.is_empty() {
                 alloc::vec![0xFF; magic.len()]
             } else {
                 let m = decode_hex(mask_str).ok_or("bad mask hex")?;
-                if m.len() != magic.len() { return Err("mask/magic length mismatch"); }
+                if m.len() != magic.len() {
+                    return Err("mask/magic length mismatch");
+                }
                 m
             };
-            MatchType::Magic { offset, magic, mask }
-        }
+            MatchType::Magic {
+                offset,
+                magic,
+                mask,
+            }
+        },
         "E" | "e" => {
             // magic_str is the extension, offset/mask are ignored.
             MatchType::Extension(magic_str.to_string())
-        }
+        },
         _ => return Err("unknown type; expected M or E"),
     };
 
     Ok(BinfmtEntry {
-        name:        name.to_string(),
+        name: name.to_string(),
         match_type,
         interpreter: interpreter.to_string(),
         flags,
-        enabled:     true,
+        enabled: true,
     })
 }
 
@@ -240,14 +268,16 @@ fn parse_flags(s: &str) -> u8 {
             'O' | 'o' => f |= FLAG_OPEN_BINARY,
             'C' | 'c' => f |= FLAG_CREDENTIALS,
             'F' | 'f' => f |= FLAG_FIX_BINARY,
-            _ => {}
+            _ => {},
         }
     }
     f
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
+    if s.len() % 2 != 0 {
+        return None;
+    }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
     let mut i = 0;

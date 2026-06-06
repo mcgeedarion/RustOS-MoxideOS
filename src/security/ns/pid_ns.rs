@@ -12,39 +12,39 @@
 //!   /proc/sys/kernel/pid_max — capped at PID_MAX per namespace
 
 extern crate alloc;
-use alloc::collections::BTreeMap;
-use spin::Mutex;
-use core::sync::atomic::{AtomicU32, Ordering};
 use crate::security::ns::alloc_ns_id;
+use alloc::collections::BTreeMap;
+use core::sync::atomic::{AtomicU32, Ordering};
+use spin::Mutex;
 
 pub const PID_MAX: u32 = 4_194_304; // 2^22, Linux default
 
 /// A single PID namespace.
 pub struct PidNs {
-    pub id:    u64,
+    pub id: u64,
     /// The level in the hierarchy (init ns = 0).
     pub level: u32,
-    next_pid:  AtomicU32,
+    next_pid: AtomicU32,
     /// Map of ns-local PID → kernel task-id for /proc enumeration.
-    pid_map:   Mutex<BTreeMap<u32, u64>>,
+    pid_map: Mutex<BTreeMap<u32, u64>>,
 }
 
 impl PidNs {
     pub fn new_init() -> Self {
         PidNs {
-            id:      alloc_ns_id(),
-            level:   0,
+            id: alloc_ns_id(),
+            level: 0,
             next_pid: AtomicU32::new(1),
-            pid_map:  Mutex::new(BTreeMap::new()),
+            pid_map: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn new_child() -> Self {
         PidNs {
-            id:       alloc_ns_id(),
-            level:    0, // caller can increment
+            id: alloc_ns_id(),
+            level: 0, // caller can increment
             next_pid: AtomicU32::new(1),
-            pid_map:  Mutex::new(BTreeMap::new()),
+            pid_map: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -54,7 +54,9 @@ impl PidNs {
         // Simple linear scan — good enough for a research kernel.
         loop {
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
-            if pid >= PID_MAX { return Err("pid namespace exhausted"); }
+            if pid >= PID_MAX {
+                return Err("pid namespace exhausted");
+            }
             let mut map = self.pid_map.lock();
             if !map.contains_key(&pid) {
                 map.insert(pid, task_id);
@@ -79,5 +81,7 @@ impl PidNs {
     }
 
     /// True if no tasks are registered (namespace can be reaped).
-    pub fn is_empty(&self) -> bool { self.pid_map.lock().is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.pid_map.lock().is_empty()
+    }
 }

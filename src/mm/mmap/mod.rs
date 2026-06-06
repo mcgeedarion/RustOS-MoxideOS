@@ -12,10 +12,13 @@
 //!   syscalls.rs   — sys_munmap, sys_brk, set_brk_base
 
 extern crate alloc;
+use crate::arch::{
+    api::{PageFlags, Paging},
+    Arch,
+};
+use crate::proc::scheduler;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::arch::{Arch, api::{PageFlags, Paging}};
-use crate::proc::scheduler;
 
 #[derive(Clone, Debug)]
 pub enum VmaKind {
@@ -30,46 +33,54 @@ pub enum VmaKind {
 
 #[derive(Clone, Debug)]
 pub struct Vma {
-    pub start:       usize,
-    pub end:         usize,
-    pub prot:        u32,
-    pub flags:       u32,
-    pub kind:        VmaKind,
+    pub start: usize,
+    pub end: usize,
+    pub prot: u32,
+    pub flags: u32,
+    pub kind: VmaKind,
     pub file_offset: u64,
-    pub locked:      bool,
+    pub locked: bool,
 }
 
 impl Vma {
-    pub fn is_heap(&self)  -> bool { matches!(self.kind, VmaKind::Heap) }
-    pub fn is_stack(&self) -> bool { matches!(self.kind, VmaKind::Stack) }
-    pub fn contains(&self, addr: usize) -> bool { self.start <= addr && addr < self.end }
+    pub fn is_heap(&self) -> bool {
+        matches!(self.kind, VmaKind::Heap)
+    }
+    pub fn is_stack(&self) -> bool {
+        matches!(self.kind, VmaKind::Stack)
+    }
+    pub fn contains(&self, addr: usize) -> bool {
+        self.start <= addr && addr < self.end
+    }
 }
 
-pub const PROT_READ:  u32 = 1;
+pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
-pub const PROT_EXEC:  u32 = 4;
+pub const PROT_EXEC: u32 = 4;
 
-pub const MAP_SHARED:  u32 = 0x01;
+pub const MAP_SHARED: u32 = 0x01;
 pub const MAP_PRIVATE: u32 = 0x02;
-pub const MAP_FIXED:   u32 = 0x10;
-pub const MAP_ANON:    u32 = 0x20;
+pub const MAP_FIXED: u32 = 0x10;
+pub const MAP_ANON: u32 = 0x20;
 /// Stack segment grows downward.
-pub const MAP_GROWSDOWN:   u32 = 0x0100;
-pub const PAGE:            usize = 4096;
+pub const MAP_GROWSDOWN: u32 = 0x0100;
+pub const PAGE: usize = 4096;
 
-pub mod mm_lock;
-pub mod vma;
-pub mod mapping;
-pub mod fault;
-pub mod protection;
 pub mod anonymous;
+pub mod fault;
+pub mod mapping;
+pub mod mm_lock;
+pub mod protection;
 pub mod syscalls;
+pub mod vma;
 
-pub use mm_lock::{with_mm_write, check_rlimit_as};
-pub use vma::{insert_vma, remove_vma, find_vma, clone_vmas, clear_vmas_internal,
-              with_vmas, vma_total_kb, heap_kb, stack_kb, current_brk, page_align_up};
-pub use mapping::sys_mmap;
 pub use anonymous::{alloc_user_stack, clear_vmas_pub};
 pub use fault::free_address_space;
+pub use mapping::sys_mmap;
+pub use mm_lock::{check_rlimit_as, with_mm_write};
 pub use protection::sys_mprotect;
-pub use syscalls::{sys_munmap, sys_brk, set_brk_base, set_brk_base_compute};
+pub use syscalls::{set_brk_base, set_brk_base_compute, sys_brk, sys_munmap};
+pub use vma::{
+    clear_vmas_internal, clone_vmas, current_brk, find_vma, heap_kb, insert_vma, page_align_up,
+    remove_vma, stack_kb, vma_total_kb, with_vmas,
+};

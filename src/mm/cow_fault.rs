@@ -81,11 +81,11 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
 ///
 ///   1. map_page()      — replace the PTE in this process's page tables
 ///   2. flush_va()      — invalidate local TLB entry
-///   3. tlb_shootdown() — send TLB-shootdown IPIs to all other CPUs and
-///                        WAIT for their acknowledgment (blocking)
+///   3. tlb_shootdown() — send TLB-shootdown IPIs to all other CPUs and WAIT
+///      for their acknowledgment (blocking)
 ///   4. put_page()      — decrement the refcount; buddy_free_page is called
-///                        only when the count reaches zero, which is safe
-///                        when multiple fork children share the same frame.
+///      only when the count reaches zero, which is safe when multiple fork
+///      children share the same frame.
 ///
 /// Skipping step 3 on a multi-processor system would allow another CPU
 /// that held this process's address space loaded to dereference the freed

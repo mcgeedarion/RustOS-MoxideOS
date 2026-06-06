@@ -6,7 +6,8 @@
 
 use core::ops::Range;
 
-/// Human-readable architecture name (`"aarch64"`, `"riscv64"`, `"x86_64"`, ...).
+/// Human-readable architecture name (`"aarch64"`, `"riscv64"`, `"x86_64"`,
+/// ...).
 pub fn name() -> &'static str {
     #[cfg(target_arch = "aarch64")]
     {
@@ -29,8 +30,9 @@ pub const fn page_size() -> usize {
 
 /// Returns the canonical kernel virtual address range.
 ///
-/// On ARM64 and RV64 we identity-map a large chunk early, then move to the higher-half
-/// if desired later.  On x86_64 this typically points at the higher-half.
+/// On ARM64 and RV64 we identity-map a large chunk early, then move to the
+/// higher-half if desired later.  On x86_64 this typically points at the
+/// higher-half.
 pub fn kernel_va_range() -> Range<usize> {
     crate::arch::hal::kernel_va_range()
 }
@@ -126,16 +128,21 @@ pub fn interrupts_enabled() -> bool {
 pub struct TrapFrame {
     /// Return value register (rax on x86_64, a0 on riscv64).
     /// hal.rs reads `f.regs[0]` for the syscall return value.
-    pub regs:    [u64; 16],
-    pub pc:      u64,
+    pub regs: [u64; 16],
+    pub pc: u64,
     pub user_sp: u64,
-    pub flags:   u64,
+    pub flags: u64,
 }
 
 impl TrapFrame {
     #[inline]
     pub const fn zeroed() -> Self {
-        Self { regs: [0; 16], pc: 0, user_sp: 0, flags: 0 }
+        Self {
+            regs: [0; 16],
+            pc: 0,
+            user_sp: 0,
+            flags: 0,
+        }
     }
 }
 
@@ -143,33 +150,55 @@ impl TrapFrame {
 /// Bit assignments are arbitrary at this layer; per-arch impls map them
 /// to native PTE bits (see `x86_64/hal.rs::Paging::map_page`).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PageFlags { bits: u32 }
+pub struct PageFlags {
+    bits: u32,
+}
 
 impl PageFlags {
     pub const PRESENT: Self = Self { bits: 1 << 0 };
-    pub const WRITE:   Self = Self { bits: 1 << 1 };
-    pub const USER:    Self = Self { bits: 1 << 2 };
-    pub const NX:      Self = Self { bits: 1 << 3 };
-    pub const COW:     Self = Self { bits: 1 << 4 };
-    pub const GLOBAL:  Self = Self { bits: 1 << 5 };
+    pub const WRITE: Self = Self { bits: 1 << 1 };
+    pub const USER: Self = Self { bits: 1 << 2 };
+    pub const NX: Self = Self { bits: 1 << 3 };
+    pub const COW: Self = Self { bits: 1 << 4 };
+    pub const GLOBAL: Self = Self { bits: 1 << 5 };
 
-    #[inline] pub const fn empty() -> Self { Self { bits: 0 } }
-    #[inline] pub const fn bits(self) -> u32 { self.bits }
-    #[inline] pub const fn contains(self, other: Self) -> bool {
+    #[inline]
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.bits
+    }
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
         (self.bits & other.bits) == other.bits
     }
 }
 
 impl core::ops::BitOr for PageFlags {
     type Output = Self;
-    #[inline] fn bitor(self, rhs: Self) -> Self { Self { bits: self.bits | rhs.bits } }
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            bits: self.bits | rhs.bits,
+        }
+    }
 }
 impl core::ops::BitAnd for PageFlags {
     type Output = Self;
-    #[inline] fn bitand(self, rhs: Self) -> Self { Self { bits: self.bits & rhs.bits } }
+    #[inline]
+    fn bitand(self, rhs: Self) -> Self {
+        Self {
+            bits: self.bits & rhs.bits,
+        }
+    }
 }
 impl core::ops::BitOrAssign for PageFlags {
-    #[inline] fn bitor_assign(&mut self, rhs: Self) { self.bits |= rhs.bits; }
+    #[inline]
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.bits |= rhs.bits;
+    }
 }
 
 /// Per-arch initialisation steps. Called once during boot.
@@ -231,8 +260,8 @@ pub trait ContextSwitch {
     /// `next_cr3` is live.
     unsafe fn switch_to(
         current_frame: *mut TrapFrame,
-        next_frame:    *const TrapFrame,
-        next_cr3:      usize,
+        next_frame: *const TrapFrame,
+        next_cr3: usize,
     );
 
     /// Build an initial user-mode trap frame for a freshly exec'd process.
@@ -274,5 +303,3 @@ pub trait FpState {
     unsafe fn fp_restore(src: *const u8);
     fn fp_area_size() -> usize;
 }
-
-

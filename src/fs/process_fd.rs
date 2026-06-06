@@ -379,7 +379,7 @@ pub fn proc_fd_close(pid: usize, fd: usize) -> isize {
             }
             crate::fs::fcntl::close_fd_meta(e.backing_fd);
             0
-        }
+        },
     }
 }
 

@@ -29,12 +29,12 @@
 //! concrete `NsId` via `nsfd_to_ns_id`.
 
 extern crate alloc;
+use crate::uaccess::{copy_from_user, copy_to_user};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::uaccess::{copy_from_user, copy_to_user};
 
 /// Opaque namespace identifier (equivalent to Linux nsfs inode number).
 pub type NsId = u64;
@@ -55,11 +55,11 @@ pub fn alloc_ns_id() -> NsId {
 /// The full set of namespace references carried by a process.
 #[derive(Clone, Copy, Debug)]
 pub struct NsSet {
-    pub mnt:  NsId,
-    pub uts:  NsId,
-    pub ipc:  NsId,
-    pub net:  NsId,
-    pub pid:  NsId,
+    pub mnt: NsId,
+    pub uts: NsId,
+    pub ipc: NsId,
+    pub net: NsId,
+    pub pid: NsId,
     pub user: NsId,
     pub time: NsId,
     pub cgroup: NsId,
@@ -68,18 +68,24 @@ pub struct NsSet {
 impl NsSet {
     pub const fn init() -> Self {
         NsSet {
-            mnt: INIT_NS, uts: INIT_NS, ipc: INIT_NS, net: INIT_NS,
-            pid: INIT_NS, user: INIT_NS, time: INIT_NS, cgroup: INIT_NS,
+            mnt: INIT_NS,
+            uts: INIT_NS,
+            ipc: INIT_NS,
+            net: INIT_NS,
+            pid: INIT_NS,
+            user: INIT_NS,
+            time: INIT_NS,
+            cgroup: INIT_NS,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct MountEntry {
-    pub source:  String,
-    pub target:  String,
-    pub fstype:  String,
-    pub flags:   u64,
+    pub source: String,
+    pub target: String,
+    pub fstype: String,
+    pub flags: u64,
     pub options: String,
 }
 
@@ -92,23 +98,30 @@ static MOUNT_NS_TABLE: Mutex<MountNsTable> = Mutex::new(MountNsTable {
 });
 
 pub fn init_mount_ns() {
-    MOUNT_NS_TABLE.lock().entries
+    MOUNT_NS_TABLE
+        .lock()
+        .entries
         .entry(INIT_NS)
         .or_insert_with(Vec::new);
 }
 
 /// List all mount entries for process `pid`'s mount namespace.
 pub fn list_mounts(pid: usize) -> Vec<MountEntry> {
-    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt)
-        .unwrap_or(INIT_NS);
-    MOUNT_NS_TABLE.lock().entries.get(&ns).cloned().unwrap_or_default()
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt).unwrap_or(INIT_NS);
+    MOUNT_NS_TABLE
+        .lock()
+        .entries
+        .get(&ns)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Add a mount entry to process `pid`'s mount namespace.
 pub fn add_mount(pid: usize, entry: MountEntry) {
-    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt)
-        .unwrap_or(INIT_NS);
-    MOUNT_NS_TABLE.lock().entries
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt).unwrap_or(INIT_NS);
+    MOUNT_NS_TABLE
+        .lock()
+        .entries
         .entry(ns)
         .or_insert_with(Vec::new)
         .push(entry);
@@ -116,8 +129,7 @@ pub fn add_mount(pid: usize, entry: MountEntry) {
 
 /// Remove a mount entry by target path from process `pid`'s mount namespace.
 pub fn remove_mount(pid: usize, target: &str) {
-    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt)
-        .unwrap_or(INIT_NS);
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt).unwrap_or(INIT_NS);
     if let Some(v) = MOUNT_NS_TABLE.lock().entries.get_mut(&ns) {
         v.retain(|e| e.target != target);
     }
@@ -125,22 +137,27 @@ pub fn remove_mount(pid: usize, target: &str) {
 
 /// Destroy a private mount namespace.  No-op for INIT_NS.
 pub fn drop_mount_ns(ns: NsId) {
-    if ns == INIT_NS { return; }
+    if ns == INIT_NS {
+        return;
+    }
     MOUNT_NS_TABLE.lock().entries.remove(&ns);
 }
 
-static UTS_NS_TABLE:    Mutex<BTreeMap<NsId, String>> = Mutex::new(BTreeMap::new());
+static UTS_NS_TABLE: Mutex<BTreeMap<NsId, String>> = Mutex::new(BTreeMap::new());
 static UTS_DOMAIN_TABLE: Mutex<BTreeMap<NsId, String>> = Mutex::new(BTreeMap::new());
 
 /// Initialise INIT_NS hostname.  Called once from kernel init.
 pub fn init_uts_ns() {
-    UTS_NS_TABLE.lock().entry(INIT_NS)
+    UTS_NS_TABLE
+        .lock()
+        .entry(INIT_NS)
         .or_insert_with(|| String::from("rustos"));
 }
 
 /// Get the hostname for a UTS namespace.
 pub fn uts_hostname(ns: NsId) -> String {
-    UTS_NS_TABLE.lock()
+    UTS_NS_TABLE
+        .lock()
         .get(&ns)
         .cloned()
         .unwrap_or_else(|| String::from("rustos"))
@@ -153,14 +170,17 @@ pub fn uts_set_hostname(ns: NsId, name: String) {
 
 /// Destroy a private UTS namespace.  No-op for INIT_NS.
 pub fn drop_uts_ns(ns: NsId) {
-    if ns == INIT_NS { return; }
+    if ns == INIT_NS {
+        return;
+    }
     UTS_NS_TABLE.lock().remove(&ns);
     UTS_DOMAIN_TABLE.lock().remove(&ns);
 }
 
 /// Get the domainname for a UTS namespace.
 pub fn uts_domainname(ns: NsId) -> String {
-    UTS_DOMAIN_TABLE.lock()
+    UTS_DOMAIN_TABLE
+        .lock()
         .get(&ns)
         .cloned()
         .unwrap_or_default()
@@ -175,17 +195,22 @@ pub fn uts_set_domainname(ns: NsId, name: String) {
 ///
 /// Returns -EPERM (-1) if uid != 0, -EINVAL if len > 64 or contains NUL.
 pub fn sys_sethostname(name_va: usize, len: usize) -> isize {
-    if len > 64 { return -22; } // EINVAL
+    if len > 64 {
+        return -22;
+    } // EINVAL
     let mut buf = alloc::vec![0u8; len];
-    if copy_from_user(name_va, &mut buf).is_err() { return -14; } // EFAULT
-    if buf.contains(&0) { return -22; } // EINVAL — no embedded NUL
+    if copy_from_user(name_va, &mut buf).is_err() {
+        return -14;
+    } // EFAULT
+    if buf.contains(&0) {
+        return -22;
+    } // EINVAL — no embedded NUL
     let name = match alloc::string::String::from_utf8(buf) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return -22,
     };
     let pid = crate::proc::scheduler::current_pid();
-    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
-        .unwrap_or(INIT_NS);
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts).unwrap_or(INIT_NS);
     uts_set_hostname(ns, name);
     0
 }
@@ -195,24 +220,28 @@ pub fn sys_sethostname(name_va: usize, len: usize) -> isize {
 /// Previously a silent no-op.  Now stores the name in the per-UTS-namespace
 /// domain table so `uname(2)` can return it in the domainname field.
 pub fn sys_setdomainname(name_va: usize, len: usize) -> isize {
-    if len > 64 { return -22; }
+    if len > 64 {
+        return -22;
+    }
     if len == 0 {
         let pid = crate::proc::scheduler::current_pid();
-        let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
-            .unwrap_or(INIT_NS);
+        let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts).unwrap_or(INIT_NS);
         uts_set_domainname(ns, String::new());
         return 0;
     }
     let mut buf = alloc::vec![0u8; len];
-    if copy_from_user(name_va, &mut buf).is_err() { return -14; }
-    if buf.contains(&0) { return -22; }
+    if copy_from_user(name_va, &mut buf).is_err() {
+        return -14;
+    }
+    if buf.contains(&0) {
+        return -22;
+    }
     let name = match alloc::string::String::from_utf8(buf) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(_) => return -22,
     };
     let pid = crate::proc::scheduler::current_pid();
-    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
-        .unwrap_or(INIT_NS);
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts).unwrap_or(INIT_NS);
     uts_set_domainname(ns, name);
     0
 }
@@ -220,17 +249,20 @@ pub fn sys_setdomainname(name_va: usize, len: usize) -> isize {
 /// gethostname helper used by sys_uname and direct gethostname(2) calls.
 /// Copies at most `len` bytes (including a NUL terminator) to `buf_va`.
 pub fn sys_gethostname(buf_va: usize, len: usize) -> isize {
-    if buf_va == 0 || len == 0 { return -22; }
+    if buf_va == 0 || len == 0 {
+        return -22;
+    }
     let pid = crate::proc::scheduler::current_pid();
-    let ns  = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
-        .unwrap_or(INIT_NS);
+    let ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts).unwrap_or(INIT_NS);
     let name = uts_hostname(ns);
     let bytes = name.as_bytes();
     let copy_len = bytes.len().min(len - 1);
     let mut out = alloc::vec![0u8; len];
     out[..copy_len].copy_from_slice(&bytes[..copy_len]);
     // out[copy_len] = 0 (NUL terminator) — already zeroed by vec initialisation.
-    if copy_to_user(buf_va, &out).is_err() { return -14; }
+    if copy_to_user(buf_va, &out).is_err() {
+        return -14;
+    }
     0
 }
 
@@ -239,18 +271,19 @@ pub fn sys_gethostname(buf_va: usize, len: usize) -> isize {
 pub fn ns_id_of(pid: usize, name: &str) -> Option<NsId> {
     crate::proc::scheduler::with_proc(pid, |p| {
         let id = match name {
-            "mnt"    => p.ns.mnt,
-            "uts"    => p.ns.uts,
-            "ipc"    => p.ns.ipc,
-            "net"    => p.ns.net,
-            "pid"    => p.ns.pid,
-            "user"   => p.ns.user,
-            "time"   => p.ns.time,
+            "mnt" => p.ns.mnt,
+            "uts" => p.ns.uts,
+            "ipc" => p.ns.ipc,
+            "net" => p.ns.net,
+            "pid" => p.ns.pid,
+            "user" => p.ns.user,
+            "time" => p.ns.time,
             "cgroup" => p.ns.cgroup,
-            _        => return None,
+            _ => return None,
         };
         Some(id)
-    }).flatten()
+    })
+    .flatten()
 }
 
 /// Format the /proc/<pid>/ns/<name> target string (e.g. "uts:[4026531838]").
@@ -286,25 +319,26 @@ pub fn nsfd_to_ns_id(fd: usize) -> Option<(String, NsId)> {
 pub fn setns_apply(pid: usize, name: &str, ns_id: NsId) -> isize {
     crate::proc::scheduler::with_proc_mut(pid, |p| {
         match name {
-            "mnt"    => p.ns.mnt    = ns_id,
-            "uts"    => p.ns.uts    = ns_id,
-            "ipc"    => p.ns.ipc    = ns_id,
-            "net"    => p.ns.net    = ns_id,
-            "pid"    => p.ns.pid    = ns_id,
-            "user"   => p.ns.user   = ns_id,
-            "time"   => p.ns.time   = ns_id,
+            "mnt" => p.ns.mnt = ns_id,
+            "uts" => p.ns.uts = ns_id,
+            "ipc" => p.ns.ipc = ns_id,
+            "net" => p.ns.net = ns_id,
+            "pid" => p.ns.pid = ns_id,
+            "user" => p.ns.user = ns_id,
+            "time" => p.ns.time = ns_id,
             "cgroup" => p.ns.cgroup = ns_id,
-            _        => return -22,
+            _ => return -22,
         }
         0
-    }).unwrap_or(-3)
+    })
+    .unwrap_or(-3)
 }
 
 /// NR 308  setns(fd, nstype)
 pub fn sys_setns(fd: usize, _nstype: i32) -> isize {
     let (name, ns_id) = match nsfd_to_ns_id(fd) {
         Some(pair) => pair,
-        None       => return -9,
+        None => return -9,
     };
     let pid = crate::proc::scheduler::current_pid();
     setns_apply(pid, &name, ns_id)
@@ -315,56 +349,95 @@ pub fn sys_setns(fd: usize, _nstype: i32) -> isize {
 /// Called by `sys_unshare` for each flag bit it processes.
 /// For mount namespaces, COW-copies the current mount table.
 /// For net namespaces, seeds a new loopback-only interface table.
-/// For UTS namespaces, copies the parent hostname and domainname into the new ns.
+/// For UTS namespaces, copies the parent hostname and domainname into the new
+/// ns.
 pub fn unshare_ns(pid: usize, name: &str) -> isize {
     let new_id = alloc_ns_id();
     match name {
         "mnt" => {
-            let parent_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt)
-                .unwrap_or(INIT_NS);
+            let parent_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.mnt).unwrap_or(INIT_NS);
             let mounts: Vec<MountEntry> = {
                 let tbl = MOUNT_NS_TABLE.lock();
                 tbl.entries.get(&parent_ns).cloned().unwrap_or_default()
             };
             MOUNT_NS_TABLE.lock().entries.insert(new_id, mounts);
-        }
+        },
         "net" => {
             crate::proc::net_ns::create_net_ns(new_id);
-        }
+        },
         "uts" => {
             // Clone parent's hostname and domainname into the new UTS ns.
-            let parent_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts)
-                .unwrap_or(INIT_NS);
-            let hostname   = uts_hostname(parent_ns);
+            let parent_ns = crate::proc::scheduler::with_proc(pid, |p| p.ns.uts).unwrap_or(INIT_NS);
+            let hostname = uts_hostname(parent_ns);
             let domainname = uts_domainname(parent_ns);
             UTS_NS_TABLE.lock().insert(new_id, hostname);
             UTS_DOMAIN_TABLE.lock().insert(new_id, domainname);
-        }
+        },
         // IPC, user, pid, time: no extra global state needed yet.
-        _ => {}
+        _ => {},
     }
     setns_apply(pid, name, new_id)
 }
 
-const CLONE_NEWNS:   usize = 0x0002_0000; // mount
-const CLONE_NEWUTS:  usize = 0x0400_0000; // UTS
-const CLONE_NEWIPC:  usize = 0x0800_0000; // IPC
+const CLONE_NEWNS: usize = 0x0002_0000; // mount
+const CLONE_NEWUTS: usize = 0x0400_0000; // UTS
+const CLONE_NEWIPC: usize = 0x0800_0000; // IPC
 const CLONE_NEWUSER: usize = 0x1000_0000; // user
-const CLONE_NEWPID:  usize = 0x2000_0000; // PID
-const CLONE_NEWNET:  usize = 0x4000_0000; // network
+const CLONE_NEWPID: usize = 0x2000_0000; // PID
+const CLONE_NEWNET: usize = 0x4000_0000; // network
 const CLONE_NEWTIME: usize = 0x0000_0080; // time
 const CLONE_NEWCGROUP: usize = 0x0200_0000; // cgroup
 
 /// NR 272  unshare(flags)
 pub fn sys_unshare(flags: usize) -> isize {
     let pid = crate::proc::scheduler::current_pid();
-    if flags & CLONE_NEWNS   != 0 { let r = unshare_ns(pid, "mnt");    if r < 0 { return r; } }
-    if flags & CLONE_NEWUTS  != 0 { let r = unshare_ns(pid, "uts");    if r < 0 { return r; } }
-    if flags & CLONE_NEWIPC  != 0 { let r = unshare_ns(pid, "ipc");    if r < 0 { return r; } }
-    if flags & CLONE_NEWNET  != 0 { let r = unshare_ns(pid, "net");    if r < 0 { return r; } }
-    if flags & CLONE_NEWPID  != 0 { let r = unshare_ns(pid, "pid");    if r < 0 { return r; } }
-    if flags & CLONE_NEWUSER != 0 { let r = unshare_ns(pid, "user");   if r < 0 { return r; } }
-    if flags & CLONE_NEWTIME != 0 { let r = unshare_ns(pid, "time");   if r < 0 { return r; } }
-    if flags & CLONE_NEWCGROUP != 0 { let r = unshare_ns(pid, "cgroup"); if r < 0 { return r; } }
+    if flags & CLONE_NEWNS != 0 {
+        let r = unshare_ns(pid, "mnt");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWUTS != 0 {
+        let r = unshare_ns(pid, "uts");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWIPC != 0 {
+        let r = unshare_ns(pid, "ipc");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWNET != 0 {
+        let r = unshare_ns(pid, "net");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWPID != 0 {
+        let r = unshare_ns(pid, "pid");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWUSER != 0 {
+        let r = unshare_ns(pid, "user");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWTIME != 0 {
+        let r = unshare_ns(pid, "time");
+        if r < 0 {
+            return r;
+        }
+    }
+    if flags & CLONE_NEWCGROUP != 0 {
+        let r = unshare_ns(pid, "cgroup");
+        if r < 0 {
+            return r;
+        }
+    }
     0
 }

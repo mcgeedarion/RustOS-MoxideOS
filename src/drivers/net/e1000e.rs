@@ -24,98 +24,98 @@ use spin::Mutex;
 use crate::drivers::net::nic::{MacAddr, NicStats};
 
 pub const VENDOR_INTEL: u16 = 0x8086;
-pub const DEV_82574L:   u16 = 0x10D3;
-pub const DEV_82574L2:  u16 = 0x10F6;
-pub const DEV_82583V:   u16 = 0x150C;
+pub const DEV_82574L: u16 = 0x10D3;
+pub const DEV_82574L2: u16 = 0x10F6;
+pub const DEV_82583V: u16 = 0x150C;
 
-const CTRL:      usize = 0x0000;
-const STATUS:    usize = 0x0008;
-const EERD:      usize = 0x0014;
-const CTRL_EXT:  usize = 0x0018;
-const IMS:       usize = 0x00D0;
-const IMC:       usize = 0x00D8;
-const RCTL:      usize = 0x0100;
-const TCTL:      usize = 0x0400;
-const TIPG:      usize = 0x0410;
+const CTRL: usize = 0x0000;
+const STATUS: usize = 0x0008;
+const EERD: usize = 0x0014;
+const CTRL_EXT: usize = 0x0018;
+const IMS: usize = 0x00D0;
+const IMC: usize = 0x00D8;
+const RCTL: usize = 0x0100;
+const TCTL: usize = 0x0400;
+const TIPG: usize = 0x0410;
 
-const RDBAL:     usize = 0x2800;
-const RDBAH:     usize = 0x2804;
-const RDLEN:     usize = 0x2808;
-const RDH:       usize = 0x2810;
-const RDT:       usize = 0x2818;
+const RDBAL: usize = 0x2800;
+const RDBAH: usize = 0x2804;
+const RDLEN: usize = 0x2808;
+const RDH: usize = 0x2810;
+const RDT: usize = 0x2818;
 
-const TDBAL:     usize = 0x3800;
-const TDBAH:     usize = 0x3804;
-const TDLEN:     usize = 0x3808;
-const TDH:       usize = 0x3810;
-const TDT:       usize = 0x3818;
+const TDBAL: usize = 0x3800;
+const TDBAH: usize = 0x3804;
+const TDLEN: usize = 0x3808;
+const TDH: usize = 0x3810;
+const TDT: usize = 0x3818;
 
-const RAL0:      usize = 0x5400;
-const RAH0:      usize = 0x5404;
+const RAL0: usize = 0x5400;
+const RAH0: usize = 0x5404;
 
-const ICR:       usize = 0x00C0;
+const ICR: usize = 0x00C0;
 
 // CTRL bits
-const CTRL_RST:  u32 = 1 << 26;
-const CTRL_SLU:  u32 = 1 << 6;
+const CTRL_RST: u32 = 1 << 26;
+const CTRL_SLU: u32 = 1 << 6;
 const CTRL_ASDE: u32 = 1 << 5;
 
 // RCTL bits
-const RCTL_EN:       u32 = 1 << 1;
-const RCTL_BAM:      u32 = 1 << 15;
-const RCTL_SECRC:    u32 = 1 << 26;
-const RCTL_SZ_2048:  u32 = 0 << 16;
+const RCTL_EN: u32 = 1 << 1;
+const RCTL_BAM: u32 = 1 << 15;
+const RCTL_SECRC: u32 = 1 << 26;
+const RCTL_SZ_2048: u32 = 0 << 16;
 
 // TCTL bits
-const TCTL_EN:       u32 = 1 << 1;
-const TCTL_PSP:      u32 = 1 << 3;
+const TCTL_EN: u32 = 1 << 1;
+const TCTL_PSP: u32 = 1 << 3;
 const TCTL_CT_SHIFT: u32 = 4;
-const TCTL_COLD_SHIFT:u32 = 12;
+const TCTL_COLD_SHIFT: u32 = 12;
 
 // RX/TX ring sizes
 const RX_DESC_COUNT: usize = 256;
 const TX_DESC_COUNT: usize = 256;
-const RX_BUF_SIZE:   usize = 2048;
+const RX_BUF_SIZE: usize = 2048;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 struct RxDesc {
-    addr:   u64,
-    len:    u16,
-    csum:   u16,
+    addr: u64,
+    len: u16,
+    csum: u16,
     status: u8,
     errors: u8,
-    special:u16,
+    special: u16,
 }
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 struct TxDesc {
-    addr:   u64,
-    len:    u16,
-    cso:    u8,
-    cmd:    u8,
+    addr: u64,
+    len: u16,
+    cso: u8,
+    cmd: u8,
     status: u8,
-    css:    u8,
-    special:u16,
+    css: u8,
+    special: u16,
 }
 
 const RXD_STAT_DD: u8 = 1 << 0;
 const TXD_CMD_EOP: u8 = 1 << 0;
-const TXD_CMD_IFCS:u8 = 1 << 1;
-const TXD_CMD_RS:  u8 = 1 << 3;
+const TXD_CMD_IFCS: u8 = 1 << 1;
+const TXD_CMD_RS: u8 = 1 << 3;
 const TXD_STAT_DD: u8 = 1 << 0;
 
 struct E1000e {
-    mmio:        usize,
-    rx_descs:    *mut RxDesc,
-    tx_descs:    *mut TxDesc,
-    rx_bufs:     Vec<u64>,
-    tx_bufs:     Vec<u64>,
-    rx_tail:     usize,
-    tx_tail:     usize,
-    mac:         MacAddr,
-    stats:       NicStats,
+    mmio: usize,
+    rx_descs: *mut RxDesc,
+    tx_descs: *mut TxDesc,
+    rx_bufs: Vec<u64>,
+    tx_bufs: Vec<u64>,
+    rx_tail: usize,
+    tx_tail: usize,
+    mac: MacAddr,
+    stats: NicStats,
 }
 
 unsafe impl Send for E1000e {}
@@ -124,7 +124,9 @@ unsafe impl Sync for E1000e {}
 static NIC: Mutex<Option<E1000e>> = Mutex::new(None);
 
 pub fn init(mmio_base: u64) {
-    unsafe { _init(mmio_base as usize); }
+    unsafe {
+        _init(mmio_base as usize);
+    }
 }
 
 pub fn is_initialised() -> bool {
@@ -150,7 +152,9 @@ pub fn recv(out: &mut [u8]) -> Option<usize> {
 unsafe fn _init(mmio: usize) {
     // Global reset.
     write32(mmio, CTRL, read32(mmio, CTRL) | CTRL_RST);
-    for _ in 0..1_000_000 { core::hint::spin_loop(); }
+    for _ in 0..1_000_000 {
+        core::hint::spin_loop();
+    }
 
     // Disable interrupts for polling mode.
     write32(mmio, IMC, 0xFFFF_FFFF);
@@ -163,7 +167,10 @@ unsafe fn _init(mmio: usize) {
     for i in 0..RX_DESC_COUNT {
         let buf = alloc_dma(RX_BUF_SIZE, 2048).unwrap();
         rx_bufs.push(buf);
-        (*rx_descs.add(i)) = RxDesc { addr: buf, ..Default::default() };
+        (*rx_descs.add(i)) = RxDesc {
+            addr: buf,
+            ..Default::default()
+        };
     }
 
     // Allocate TX ring + buffers.
@@ -173,20 +180,31 @@ unsafe fn _init(mmio: usize) {
     for i in 0..TX_DESC_COUNT {
         let buf = alloc_dma(2048, 2048).unwrap();
         tx_bufs.push(buf);
-        (*tx_descs.add(i)) = TxDesc { status: TXD_STAT_DD, ..Default::default() };
+        (*tx_descs.add(i)) = TxDesc {
+            status: TXD_STAT_DD,
+            ..Default::default()
+        };
     }
 
     // Program RX ring.
     write32(mmio, RDBAL, rx_descs_phys as u32);
     write32(mmio, RDBAH, (rx_descs_phys >> 32) as u32);
-    write32(mmio, RDLEN, (RX_DESC_COUNT * core::mem::size_of::<RxDesc>()) as u32);
+    write32(
+        mmio,
+        RDLEN,
+        (RX_DESC_COUNT * core::mem::size_of::<RxDesc>()) as u32,
+    );
     write32(mmio, RDH, 0);
     write32(mmio, RDT, (RX_DESC_COUNT - 1) as u32);
 
     // Program TX ring.
     write32(mmio, TDBAL, tx_descs_phys as u32);
     write32(mmio, TDBAH, (tx_descs_phys >> 32) as u32);
-    write32(mmio, TDLEN, (TX_DESC_COUNT * core::mem::size_of::<TxDesc>()) as u32);
+    write32(
+        mmio,
+        TDLEN,
+        (TX_DESC_COUNT * core::mem::size_of::<TxDesc>()) as u32,
+    );
     write32(mmio, TDH, 0);
     write32(mmio, TDT, 0);
 
@@ -218,17 +236,23 @@ unsafe fn _init(mmio: usize) {
 unsafe fn _send(frame: &[u8]) -> Result<(), &'static str> {
     let mut nic_g = NIC.lock();
     let nic = nic_g.as_mut().ok_or("e1000e not initialised")?;
-    if frame.len() > 2048 { return Err("frame too large"); }
+    if frame.len() > 2048 {
+        return Err("frame too large");
+    }
 
     let idx = nic.tx_tail;
     let desc = &mut *nic.tx_descs.add(idx);
 
     // Wait until NIC owns no longer.
     for _ in 0..5_000_000 {
-        if desc.status & TXD_STAT_DD != 0 { break; }
+        if desc.status & TXD_STAT_DD != 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
-    if desc.status & TXD_STAT_DD == 0 { return Err("tx timeout"); }
+    if desc.status & TXD_STAT_DD == 0 {
+        return Err("tx timeout");
+    }
 
     core::ptr::copy_nonoverlapping(frame.as_ptr(), nic.tx_bufs[idx] as *mut u8, frame.len());
     *desc = TxDesc {
@@ -296,6 +320,8 @@ unsafe fn write32(base: usize, off: usize, val: u32) {
 fn alloc_dma(size: usize, align: usize) -> Option<u64> {
     let pages = (size + 0xFFF) / 0x1000;
     let phys = crate::mm::pmm::alloc_pages_aligned(pages, align)?.as_ptr() as u64;
-    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, pages * 0x1000); }
+    unsafe {
+        core::ptr::write_bytes(phys as *mut u8, 0, pages * 0x1000);
+    }
     Some(phys)
 }

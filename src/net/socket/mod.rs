@@ -7,14 +7,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-pub mod types;
 pub mod address;
 pub mod buffer;
 pub mod core;
-pub mod traits;
 pub mod poll;
 pub mod syscalls;
 pub mod tcp;
+pub mod traits;
+pub mod types;
 pub mod udp;
 pub mod unix;
 
@@ -23,16 +23,19 @@ pub mod unix;
 /// through `udp::`.
 pub use udp::demux_udp;
 
-pub use types::{Socket, SockAddr, SocketState, AF_INET, AF_INET6, AF_UNIX,
-                SOCK_STREAM, SOCK_DGRAM, SOCK_RAW,
-                SOL_SOCKET, SO_REUSEADDR, SO_KEEPALIVE, SO_ERROR,
-                IPPROTO_TCP, IPPROTO_UDP, MSG_PEEK, MSG_DONTWAIT,
-                SHUT_RD, SHUT_WR, SHUT_RDWR, MAX_SOCKETS};
+pub use types::{
+    SockAddr, Socket, SocketState, AF_INET, AF_INET6, AF_UNIX, IPPROTO_TCP, IPPROTO_UDP,
+    MAX_SOCKETS, MSG_DONTWAIT, MSG_PEEK, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW,
+    SOCK_STREAM, SOL_SOCKET, SO_ERROR, SO_KEEPALIVE, SO_REUSEADDR,
+};
 
-pub use core::{sys_socket, sys_bind, sys_listen, sys_accept, sys_connect,
-               sys_getsockname, sys_getpeername, alloc_slot, SOCKETS};
-pub use traits::{sys_setsockopt, sys_getsockopt, sys_shutdown};
-pub use poll::{socket_poll, socket_read, socket_write, is_socket_fd};
-pub use syscalls::{sys_sendmsg, sys_recvmsg, sys_socketpair, socket_close};
-pub use address::{read_sockaddr_in, read_sockaddr_in6,
-                  write_sockaddr_in, write_sockaddr_in6, next_ephemeral};
+pub use address::{
+    next_ephemeral, read_sockaddr_in, read_sockaddr_in6, write_sockaddr_in, write_sockaddr_in6,
+};
+pub use core::{
+    alloc_slot, sys_accept, sys_bind, sys_connect, sys_getpeername, sys_getsockname, sys_listen,
+    sys_socket, SOCKETS,
+};
+pub use poll::{is_socket_fd, socket_poll, socket_read, socket_write};
+pub use syscalls::{socket_close, sys_recvmsg, sys_sendmsg, sys_socketpair};
+pub use traits::{sys_getsockopt, sys_setsockopt, sys_shutdown};

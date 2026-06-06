@@ -1,7 +1,7 @@
-use alloc::vec::Vec;
-use crate::proc::scheduler;
-use super::{Vma, VmaKind, PAGE};
 use super::mm_lock::with_mm_write;
+use super::{Vma, VmaKind, PAGE};
+use crate::proc::scheduler;
+use alloc::vec::Vec;
 
 pub fn insert_vma(pid: usize, vma: Vma) {
     with_mm_write(pid, |p| {
@@ -19,8 +19,12 @@ pub fn remove_vma(pid: usize, addr: usize, len: usize) {
 
 pub fn find_vma(pid: usize, addr: usize) -> Option<Vma> {
     scheduler::with_proc(pid, |p| {
-        p.vmas.iter().find(|v| v.start <= addr && v.end > addr).cloned()
-    }).flatten()
+        p.vmas
+            .iter()
+            .find(|v| v.start <= addr && v.end > addr)
+            .cloned()
+    })
+    .flatten()
 }
 
 pub fn clone_vmas(src_pid: usize, dst_pid: usize) {
@@ -34,42 +38,53 @@ pub fn clear_vmas_internal(pid: usize) {
 
 pub fn with_vmas<F: FnMut(&Vma)>(pid: u32, mut f: F) {
     scheduler::with_proc(pid as usize, |p| {
-        for v in &p.vmas { f(v); }
+        for v in &p.vmas {
+            f(v);
+        }
     });
 }
 
 pub fn vma_total_kb(pid: u32) -> usize {
     scheduler::with_proc(pid as usize, |p| {
         p.vmas.iter().map(|v| (v.end - v.start) / 1024).sum()
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
 pub fn heap_kb(pid: u32) -> usize {
     scheduler::with_proc(pid as usize, |p| {
-        p.vmas.iter()
+        p.vmas
+            .iter()
             .filter(|v| matches!(v.kind, VmaKind::Heap))
             .map(|v| (v.end - v.start) / 1024)
             .sum()
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
 pub fn stack_kb(pid: u32) -> usize {
     scheduler::with_proc(pid as usize, |p| {
-        p.vmas.iter()
+        p.vmas
+            .iter()
             .filter(|v| matches!(v.kind, VmaKind::Stack))
             .map(|v| (v.end - v.start) / 1024)
             .sum()
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
 pub fn current_brk(pid: u32) -> usize {
     scheduler::with_proc(pid as usize, |p| {
-        p.vmas.iter()
+        p.vmas
+            .iter()
             .filter(|v| matches!(v.kind, VmaKind::Heap))
             .map(|v| v.end)
             .max()
             .unwrap_or(0)
-    }).unwrap_or(0)
+    })
+    .unwrap_or(0)
 }
 
-pub fn page_align_up(n: usize) -> usize { (n + PAGE - 1) & !(PAGE - 1) }
+pub fn page_align_up(n: usize) -> usize {
+    (n + PAGE - 1) & !(PAGE - 1)
+}

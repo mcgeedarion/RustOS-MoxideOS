@@ -2,51 +2,59 @@
 
 use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
-use crate::console::println;
 use super::SdtHeader;
+use crate::console::println;
 
 const PM1_STS_PWRBTN: u16 = 1 << 8;
 const PM1_STS_SLPBTN: u16 = 1 << 9;
-const PM1_STS_RTC:    u16 = 1 << 10;
-const PM1_STS_WAK:    u16 = 1 << 15;
+const PM1_STS_RTC: u16 = 1 << 10;
+const PM1_STS_WAK: u16 = 1 << 15;
 
 const PM1_EN_PWRBTN: u16 = 1 << 8;
 const PM1_EN_SLPBTN: u16 = 1 << 9;
-const PM1_EN_RTC:    u16 = 1 << 10;
-const PM1_EN_WAK:    u16 = 1 << 15;
+const PM1_EN_RTC: u16 = 1 << 10;
+const PM1_EN_WAK: u16 = 1 << 15;
 
-const PM1_CNT_SCI_EN:        u16 = 1 << 0;
-const PM1_CNT_SLP_EN:        u16 = 1 << 13;
+const PM1_CNT_SCI_EN: u16 = 1 << 0;
+const PM1_CNT_SLP_EN: u16 = 1 << 13;
 const PM1_CNT_SLP_TYP_SHIFT: u16 = 10;
 
-const FADT_OFF_DSDT:         usize = 40;
-const FADT_OFF_SCI_INT:      usize = 46;
-const FADT_OFF_SMI_CMD:      usize = 48;
-const FADT_OFF_ACPI_ENABLE:  usize = 52;
+const FADT_OFF_DSDT: usize = 40;
+const FADT_OFF_SCI_INT: usize = 46;
+const FADT_OFF_SMI_CMD: usize = 48;
+const FADT_OFF_ACPI_ENABLE: usize = 52;
 const FADT_OFF_PM1A_EVT_BLK: usize = 56;
 const FADT_OFF_PM1B_EVT_BLK: usize = 60;
 const FADT_OFF_PM1A_CNT_BLK: usize = 64;
 const FADT_OFF_PM1B_CNT_BLK: usize = 68;
-const FADT_OFF_PM1_EVT_LEN:  usize = 88;
+const FADT_OFF_PM1_EVT_LEN: usize = 88;
 
 // Cached ports
 static PM1A_STS: AtomicU16 = AtomicU16::new(0);
-static PM1A_EN:  AtomicU16 = AtomicU16::new(0);
+static PM1A_EN: AtomicU16 = AtomicU16::new(0);
 static PM1A_CNT: AtomicU16 = AtomicU16::new(0);
 static PM1B_STS: AtomicU16 = AtomicU16::new(0);
-static PM1B_EN:  AtomicU16 = AtomicU16::new(0);
+static PM1B_EN: AtomicU16 = AtomicU16::new(0);
 static PM1B_CNT: AtomicU16 = AtomicU16::new(0);
 static SCI_VECTOR: AtomicU8 = AtomicU8::new(0);
 
 // SLP_TYP values indexed by S-state number.
 // Fallback S5 = 5 for common QEMU/Bochs setups; parse_dsdt() can override.
 static SLP_TYP_A: [AtomicU8; 6] = [
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(5),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(5),
 ];
 static SLP_TYP_B: [AtomicU8; 6] = [
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(5),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(5),
 ];
 
 #[inline(always)]
@@ -137,10 +145,7 @@ unsafe fn scan_s5(aml: &[u8]) {
     while i + 10 < aml.len() {
         if aml[i..i + 4] == name {
             let op = aml[i + 4];
-            if (op == 0x12 || op == 0x10)
-                && aml[i + 7] == 0x0A
-                && aml[i + 9] == 0x0A
-            {
+            if (op == 0x12 || op == 0x10) && aml[i + 7] == 0x0A && aml[i + 9] == 0x0A {
                 SLP_TYP_A[5].store(aml[i + 8], Ordering::Relaxed);
                 SLP_TYP_B[5].store(aml[i + 10], Ordering::Relaxed);
                 break;
@@ -213,7 +218,9 @@ fn handle_power_button() {
 
 fn handle_sleep_button() {
     println!("acpi/power: sleep button");
-    unsafe { enter_sleep_state(3); }
+    unsafe {
+        enter_sleep_state(3);
+    }
 }
 
 fn handle_wake() {
@@ -285,7 +292,9 @@ pub fn shutdown() {
         outw(0x4004, 0x3400);
     }
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
     }
 }
 
@@ -303,7 +312,9 @@ pub fn reboot() {
     }
 
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack));
+        }
     }
 }
 

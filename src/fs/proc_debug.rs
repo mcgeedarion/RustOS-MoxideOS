@@ -73,7 +73,7 @@ fn fd_kind_for_current(fdno: usize) -> Result<ProcDebugKind, isize> {
     let target = match fd.kind {
         ProcDebugKind::Mem { pid } | ProcDebugKind::Regs { pid } | ProcDebugKind::Ctl { pid } => {
             pid
-        }
+        },
     };
     let caller = scheduler::current_pid();
     // Revalidate on every operation so stale fds cannot outlive credential,
@@ -155,7 +155,7 @@ fn read_mem(pid: usize, buf: &mut [u8], vaddr: usize) -> isize {
         match <Arch as Paging>::virt_to_phys(cr3, va) {
             Some(pa) => {
                 *chunk = unsafe { *(pa as *const u8) };
-            }
+            },
             None => break,
         }
         written += 1;
@@ -200,7 +200,7 @@ fn read_ctl(pid: usize, buf: &mut [u8]) -> isize {
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             return n as isize;
-        }
+        },
         PtraceState::Tracee { .. } => b"running",
         PtraceState::None => b"none",
     };
@@ -298,7 +298,7 @@ fn write_ctl(pid: usize, data: &[u8]) -> isize {
             }
             send_signal(pid, 19); // SIGSTOP
             data.len() as isize
-        }
+        },
         "cont" => {
             let caller = scheduler::current_pid();
             scheduler::with_proc_mut(pid, |p, _| {
@@ -317,7 +317,7 @@ fn write_ctl(pid: usize, data: &[u8]) -> isize {
             });
             scheduler::wake_pid(pid);
             data.len() as isize
-        }
+        },
         "step" => {
             let caller = scheduler::current_pid();
             scheduler::with_proc_mut(pid, |p, _| {
@@ -346,7 +346,7 @@ fn write_ctl(pid: usize, data: &[u8]) -> isize {
             });
             scheduler::wake_pid(pid);
             data.len() as isize
-        }
+        },
         _ => -22, // EINVAL
     }
 }

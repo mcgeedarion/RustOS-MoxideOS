@@ -1,14 +1,15 @@
-use alloc::vec::Vec;
-use crate::arch::{Arch, api::Paging};
-use crate::proc::scheduler;
-use super::{Vma, VmaKind, PAGE};
 use super::mm_lock::with_mm_write;
+use super::{Vma, VmaKind, PAGE};
+use crate::arch::{api::Paging, Arch};
+use crate::proc::scheduler;
+use alloc::vec::Vec;
 
 pub fn free_address_space(pid: usize, user_cr3: usize) {
-    if user_cr3 == 0 { return; }
+    if user_cr3 == 0 {
+        return;
+    }
 
-    let vmas: Vec<Vma> = scheduler::with_proc(pid, |p| p.vmas.clone())
-        .unwrap_or_default();
+    let vmas: Vec<Vma> = scheduler::with_proc(pid, |p| p.vmas.clone()).unwrap_or_default();
 
     for vma in &vmas {
         let is_phys = matches!(vma.kind, VmaKind::PhysMap(_));

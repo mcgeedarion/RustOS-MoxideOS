@@ -1,4 +1,5 @@
-//! `scheme-api` — types shared between the kernel and userspace driver processes.
+//! `scheme-api` — types shared between the kernel and userspace driver
+//! processes.
 //!
 //! This crate is `no_std` by default so it can be linked into the kernel.
 //! Enable the `std` feature for userspace consumers and host-side tests.

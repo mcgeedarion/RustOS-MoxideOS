@@ -1,4 +1,5 @@
-//! Software breakpoints, hardware execution breakpoints, and memory watchpoints.
+//! Software breakpoints, hardware execution breakpoints, and memory
+//! watchpoints.
 //!
 //! # x86-64
 //! Software breakpoints patch `0xCC` (INT3) into the target and restore the
@@ -33,7 +34,7 @@ use super::target::GdbTarget;
 // The kernel exposes these at byte offset 0 in the debug pseudo-fd.
 const DR0_OFFSET: usize = 0;
 const DR7_OFFSET: usize = 5 * 8; // dr0..dr5 (dr4/dr5 alias dr6/dr7, skip), real offset
-// We use a flat layout: dr0=0, dr1=1, dr2=2, dr3=3, dr6=4, dr7=5  (indices × 8)
+                                 // We use a flat layout: dr0=0, dr1=1, dr2=2, dr3=3, dr6=4, dr7=5  (indices × 8)
 const DR_IDX_DR7: usize = 5;
 
 // DR7 per-slot bit positions: slot 0..3
@@ -49,9 +50,9 @@ const fn dr7_len_bits(len: usize) -> u64 {
     }
 }
 
-const DR7_RW_EXEC:  u64 = 0b00;
+const DR7_RW_EXEC: u64 = 0b00;
 const DR7_RW_WRITE: u64 = 0b01;
-const DR7_RW_RW:    u64 = 0b11;
+const DR7_RW_RW: u64 = 0b11;
 
 /// Read the 6-register debug register block [dr0,dr1,dr2,dr3,dr6,dr7] from
 /// the target's /proc/<pid>/debug fd.
@@ -64,7 +65,9 @@ fn read_debug_regs(target: &GdbTarget) -> [u64; 6] {
     // Kernel convention: reads at offset 0xFFFF_0000 return the DR block.
     const DR_VIRT_OFFSET: usize = 0xFFFF_0000;
     let bfd = crate::fs::process_fd::proc_fd_backing(
-        crate::proc::scheduler::current_pid(), target.mem_fd);
+        crate::proc::scheduler::current_pid(),
+        target.mem_fd,
+    );
     let mut buf = [0u8; 6 * 8];
     if bfd >= 0 {
         let bfd = bfd as usize;
@@ -74,7 +77,7 @@ fn read_debug_regs(target: &GdbTarget) -> [u64; 6] {
     }
     let mut out = [0u64; 6];
     for i in 0..6 {
-        out[i] = u64::from_le_bytes(buf[i*8..(i+1)*8].try_into().unwrap());
+        out[i] = u64::from_le_bytes(buf[i * 8..(i + 1) * 8].try_into().unwrap());
     }
     out
 }
@@ -83,19 +86,25 @@ fn write_debug_regs(target: &GdbTarget, dr: &[u64; 6]) {
     use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_write};
     const DR_VIRT_OFFSET: usize = 0xFFFF_0000;
     let bfd = crate::fs::process_fd::proc_fd_backing(
-        crate::proc::scheduler::current_pid(), target.mem_fd);
-    if bfd < 0 { return; }
+        crate::proc::scheduler::current_pid(),
+        target.mem_fd,
+    );
+    if bfd < 0 {
+        return;
+    }
     let bfd = bfd as usize;
-    if !is_proc_debug_fd(bfd) { return; }
+    if !is_proc_debug_fd(bfd) {
+        return;
+    }
     let mut buf = [0u8; 6 * 8];
     for i in 0..6 {
-        buf[i*8..(i+1)*8].copy_from_slice(&dr[i].to_le_bytes());
+        buf[i * 8..(i + 1) * 8].copy_from_slice(&dr[i].to_le_bytes());
     }
     proc_debug_write(bfd, &buf, DR_VIRT_OFFSET);
 }
 
 struct SwBreakpoint {
-    addr:     u64,
+    addr: u64,
     original: u8,
 }
 
@@ -104,17 +113,28 @@ pub struct SwBreakpointTable {
 }
 
 impl SwBreakpointTable {
-    pub fn new() -> Self { SwBreakpointTable { bps: Vec::new() } }
+    pub fn new() -> Self {
+        SwBreakpointTable { bps: Vec::new() }
+    }
 
     /// Patch `0xCC` (INT3) at `addr`, saving the original byte.
     /// Returns `false` if already set or memory write fails.
     pub fn add(&mut self, target: &mut GdbTarget, addr: u64) -> bool {
-        if self.bps.iter().any(|b| b.addr == addr) { return false; }
+        if self.bps.iter().any(|b| b.addr == addr) {
+            return false;
+        }
         let orig = target.read_mem(addr, 1);
-        if orig.is_empty() { return false; }
+        if orig.is_empty() {
+            return false;
+        }
         let written = target.write_mem(addr, &[0xCC]);
-        if written == 0 { return false; }
-        self.bps.push(SwBreakpoint { addr, original: orig[0] });
+        if written == 0 {
+            return false;
+        }
+        self.bps.push(SwBreakpoint {
+            addr,
+            original: orig[0],
+        });
         true
     }
 
@@ -134,7 +154,9 @@ impl SwBreakpointTable {
     pub fn remove_all(&mut self, target: &mut GdbTarget) {
         // iterate indices in reverse so swap_remove doesn't skip any
         let addrs: Vec<u64> = self.bps.iter().map(|b| b.addr).collect();
-        for addr in addrs { self.remove(target, addr); }
+        for addr in addrs {
+            self.remove(target, addr);
+        }
     }
 }
 
@@ -148,19 +170,28 @@ pub struct HwBreakpointTable {
 }
 
 impl HwBreakpointTable {
-    pub fn new() -> Self { HwBreakpointTable { bps: Vec::new() } }
+    pub fn new() -> Self {
+        HwBreakpointTable { bps: Vec::new() }
+    }
 
     fn free_slot(&self) -> Option<usize> {
         for s in 0..4 {
-            if !self.bps.iter().any(|b| b.slot == s) { return Some(s); }
+            if !self.bps.iter().any(|b| b.slot == s) {
+                return Some(s);
+            }
         }
         None
     }
 
     /// Install an execution breakpoint at `addr` using a free DR slot.
     pub fn add_exec(&mut self, target: &mut GdbTarget, addr: u64) -> bool {
-        if self.bps.iter().any(|b| b.addr == addr) { return false; }
-        let slot = match self.free_slot() { Some(s) => s, None => return false };
+        if self.bps.iter().any(|b| b.addr == addr) {
+            return false;
+        }
+        let slot = match self.free_slot() {
+            Some(s) => s,
+            None => return false,
+        };
         let mut dr = read_debug_regs(target);
         // Set DRn address
         dr[slot] = addr;
@@ -197,15 +228,17 @@ impl HwBreakpointTable {
 
     pub fn remove_all(&mut self, target: &mut GdbTarget) {
         let addrs: Vec<u64> = self.bps.iter().map(|b| b.addr).collect();
-        for addr in addrs { self.remove(target, addr); }
+        for addr in addrs {
+            self.remove(target, addr);
+        }
     }
 }
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum WatchKind {
-    Write,   // Z2 — DR7 R/W = 01
-    Read,    // Z3 — x86 does not support read-only; treat as access
-    Access,  // Z4 — DR7 R/W = 11
+    Write,  // Z2 — DR7 R/W = 01
+    Read,   // Z3 — x86 does not support read-only; treat as access
+    Access, // Z4 — DR7 R/W = 11
 }
 
 struct Watchpoint {
@@ -218,30 +251,30 @@ pub struct WatchpointTable {
 }
 
 impl WatchpointTable {
-    pub fn new() -> Self { WatchpointTable { wps: Vec::new() } }
+    pub fn new() -> Self {
+        WatchpointTable { wps: Vec::new() }
+    }
 
     fn free_slot(&self, hw_bps: &HwBreakpointTable) -> Option<usize> {
         // Watchpoints share DR0–DR3 with HW execution BPs
         for s in 0..4 {
             let used_by_bp = hw_bps.bps.iter().any(|b| b.slot == s);
             let used_by_wp = self.wps.iter().any(|w| w.slot == s);
-            if !used_by_bp && !used_by_wp { return Some(s); }
+            if !used_by_bp && !used_by_wp {
+                return Some(s);
+            }
         }
         None
     }
 
     /// Install a watchpoint.  `len` should be 1, 2, 4, or 8.
-    pub fn add(
-        &mut self,
-        target: &mut GdbTarget,
-        addr: u64,
-        len: usize,
-        kind: WatchKind,
-    ) -> bool {
+    pub fn add(&mut self, target: &mut GdbTarget, addr: u64, len: usize, kind: WatchKind) -> bool {
         // We don't have the hw_bps borrow here; call the combined version from
         // the session level.  For standalone use, provide a dummy HwBreakpointTable.
         // In practice the session owns both tables.
-        if self.wps.iter().any(|w| w.addr == addr) { return false; }
+        if self.wps.iter().any(|w| w.addr == addr) {
+            return false;
+        }
         // Find a free slot not used by this watchpoint table itself
         let slot = {
             let mut found = None;
@@ -251,11 +284,14 @@ impl WatchpointTable {
                     break;
                 }
             }
-            match found { Some(s) => s, None => return false }
+            match found {
+                Some(s) => s,
+                None => return false,
+            }
         };
         let rw_bits: u64 = match kind {
-            WatchKind::Write  => DR7_RW_WRITE,
-            WatchKind::Read   => DR7_RW_RW, // x86 has no read-only, use R/W
+            WatchKind::Write => DR7_RW_WRITE,
+            WatchKind::Read => DR7_RW_RW, // x86 has no read-only, use R/W
             WatchKind::Access => DR7_RW_RW,
         };
         let len_bits = dr7_len_bits(len);
@@ -290,7 +326,9 @@ impl WatchpointTable {
 
     pub fn remove_all(&mut self, target: &mut GdbTarget) {
         let addrs: Vec<u64> = self.wps.iter().map(|w| w.addr).collect();
-        for addr in addrs { self.remove(target, addr); }
+        for addr in addrs {
+            self.remove(target, addr);
+        }
     }
 }
 
@@ -308,14 +346,16 @@ impl WatchpointTable {
 const RISCV_TRIG_VIRT_OFFSET: usize = 0xFFFF_1000;
 const TDATA1_TYPE2: u64 = 2u64 << 60;
 const TDATA1_M_MODE: u64 = 1 << 6;
-const TDATA1_EXEC:  u64 = 1 << 2;
+const TDATA1_EXEC: u64 = 1 << 2;
 const TDATA1_STORE: u64 = 1 << 1;
-const TDATA1_LOAD:  u64 = 1 << 0;
+const TDATA1_LOAD: u64 = 1 << 0;
 
 fn read_riscv_triggers(target: &GdbTarget) -> [[u64; 2]; 4] {
     use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_read};
     let bfd = crate::fs::process_fd::proc_fd_backing(
-        crate::proc::scheduler::current_pid(), target.mem_fd);
+        crate::proc::scheduler::current_pid(),
+        target.mem_fd,
+    );
     let mut buf = [0u8; 4 * 2 * 8];
     if bfd >= 0 {
         let bfd = bfd as usize;
@@ -327,7 +367,7 @@ fn read_riscv_triggers(target: &GdbTarget) -> [[u64; 2]; 4] {
     for s in 0..4 {
         for w in 0..2 {
             let off = (s * 2 + w) * 8;
-            out[s][w] = u64::from_le_bytes(buf[off..off+8].try_into().unwrap());
+            out[s][w] = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         }
     }
     out
@@ -336,15 +376,21 @@ fn read_riscv_triggers(target: &GdbTarget) -> [[u64; 2]; 4] {
 fn write_riscv_triggers(target: &GdbTarget, trig: &[[u64; 2]; 4]) {
     use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_write};
     let bfd = crate::fs::process_fd::proc_fd_backing(
-        crate::proc::scheduler::current_pid(), target.mem_fd);
-    if bfd < 0 { return; }
+        crate::proc::scheduler::current_pid(),
+        target.mem_fd,
+    );
+    if bfd < 0 {
+        return;
+    }
     let bfd = bfd as usize;
-    if !is_proc_debug_fd(bfd) { return; }
+    if !is_proc_debug_fd(bfd) {
+        return;
+    }
     let mut buf = [0u8; 4 * 2 * 8];
     for s in 0..4 {
         for w in 0..2 {
             let off = (s * 2 + w) * 8;
-            buf[off..off+8].copy_from_slice(&trig[s][w].to_le_bytes());
+            buf[off..off + 8].copy_from_slice(&trig[s][w].to_le_bytes());
         }
     }
     proc_debug_write(bfd, &buf, RISCV_TRIG_VIRT_OFFSET);
@@ -358,7 +404,10 @@ pub fn riscv_add_trigger(
 ) -> bool {
     let mut trig = read_riscv_triggers(target);
     let slot = (0..4).find(|&s| trig[s][0] == 0);
-    let slot = match slot { Some(s) => s, None => return false };
+    let slot = match slot {
+        Some(s) => s,
+        None => return false,
+    };
     trig[slot][0] = TDATA1_TYPE2 | TDATA1_M_MODE | kind_bits;
     trig[slot][1] = addr;
     write_riscv_triggers(target, &trig);
@@ -379,5 +428,5 @@ pub fn riscv_remove_trigger(target: &GdbTarget, addr: u64) -> bool {
 }
 
 pub use TDATA1_EXEC as RISCV_TRIG_EXEC;
+pub use TDATA1_LOAD as RISCV_TRIG_LOAD;
 pub use TDATA1_STORE as RISCV_TRIG_STORE;
-pub use TDATA1_LOAD  as RISCV_TRIG_LOAD;

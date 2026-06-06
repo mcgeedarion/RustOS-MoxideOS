@@ -23,9 +23,9 @@
 extern crate alloc;
 use alloc::vec::Vec;
 
-use super::{PciDevice, devices, find};
 use super::ecam::set_base;
 use super::enumerate::scan_all;
+use super::{devices, find, PciDevice};
 
 /// Zero-sized token representing the PCI bus manager.
 ///

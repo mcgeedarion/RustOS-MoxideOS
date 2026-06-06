@@ -12,8 +12,8 @@ pub struct MacAddr(pub [u8; 6]);
 pub struct NicStats {
     pub rx_packets: u64,
     pub tx_packets: u64,
-    pub rx_bytes:   u64,
-    pub tx_bytes:   u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 /// Returns true if any supported NIC driver is initialised.

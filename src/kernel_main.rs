@@ -1,9 +1,10 @@
 //! Architecture-independent kernel entry-point dispatcher.
 //!
-//! Every boot path builds a [`BootInfo`] and enters this single exported symbol.
-//! Boot priority (x86_64 = PRIMARY, aarch64 = SECONDARY, riscv64 = TERTIARY)
-//! is logged here before handing off to the arch-specific initialisation layer,
-//! so every boot log is self-documenting regardless of which image ran.
+//! Every boot path builds a [`BootInfo`] and enters this single exported
+//! symbol. Boot priority (x86_64 = PRIMARY, aarch64 = SECONDARY, riscv64 =
+//! TERTIARY) is logged here before handing off to the arch-specific
+//! initialisation layer, so every boot log is self-documenting regardless of
+//! which image ran.
 
 use crate::init::boot_info::BootInfo;
 

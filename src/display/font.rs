@@ -18,14 +18,14 @@ pub const PSF2_MAGIC: u32 = 0x864A_B572;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Psf2Header {
-    pub magic:        u32,
-    pub version:      u32,
-    pub header_size:  u32,  // bytes before glyph data
-    pub flags:        u32,  // bit 0: has unicode table
-    pub glyph_count:  u32,
+    pub magic: u32,
+    pub version: u32,
+    pub header_size: u32, // bytes before glyph data
+    pub flags: u32,       // bit 0: has unicode table
+    pub glyph_count: u32,
     pub bytes_per_glyph: u32,
-    pub height:       u32,  // pixels per glyph
-    pub width:        u32,  // pixels per glyph
+    pub height: u32, // pixels per glyph
+    pub width: u32,  // pixels per glyph
 }
 
 /// A validated, zero-copy view into a PSF2 font blob.
@@ -52,9 +52,8 @@ impl<'a> Psf2Font<'a> {
         }
 
         // SAFETY: we just verified `data` is long enough for the header.
-        let hdr: Psf2Header = unsafe {
-            core::ptr::read_unaligned(data.as_ptr() as *const Psf2Header)
-        };
+        let hdr: Psf2Header =
+            unsafe { core::ptr::read_unaligned(data.as_ptr() as *const Psf2Header) };
 
         if hdr.magic != PSF2_MAGIC {
             return Err(Psf2Error::BadMagic);
@@ -76,16 +75,23 @@ impl<'a> Psf2Font<'a> {
             return Err(Psf2Error::TooShort);
         }
 
-        Ok(Self { header: hdr, glyphs: &data[glyph_start..glyph_end] })
+        Ok(Self {
+            header: hdr,
+            glyphs: &data[glyph_start..glyph_end],
+        })
     }
 
     /// Width of a single glyph in pixels.
     #[inline]
-    pub fn width(&self) -> u32 { self.header.width }
+    pub fn width(&self) -> u32 {
+        self.header.width
+    }
 
     /// Height of a single glyph in pixels.
     #[inline]
-    pub fn height(&self) -> u32 { self.header.height }
+    pub fn height(&self) -> u32 {
+        self.header.height
+    }
 
     /// Bytes per glyph row (rounded up to the nearest whole byte).
     #[inline]
@@ -99,8 +105,8 @@ impl<'a> Psf2Font<'a> {
         if index >= self.header.glyph_count {
             return None;
         }
-        let bpg  = self.header.bytes_per_glyph as usize;
-        let off  = index as usize * bpg;
+        let bpg = self.header.bytes_per_glyph as usize;
+        let off = index as usize * bpg;
         Some(&self.glyphs[off..off + bpg])
     }
 
@@ -108,11 +114,11 @@ impl<'a> Psf2Font<'a> {
     /// `(dst_x, dst_y)` into a 32-bpp `XRGB8888` pixel buffer.
     ///
     /// * `pixels`  — mutable slice of `u32` covering the full framebuffer.
-    /// * `pitch`   — number of `u32` elements per horizontal scan line
-    ///               (i.e. `fb_width` or `fb_pitch / 4`).
+    /// * `pitch`   — number of `u32` elements per horizontal scan line (i.e.
+    ///   `fb_width` or `fb_pitch / 4`).
     /// * `fg`      — foreground colour as `0x00RRGGBB`.
-    /// * `bg`      — background colour; pass `None` to skip background
-    ///               pixels (transparent blending).
+    /// * `bg`      — background colour; pass `None` to skip background pixels
+    ///   (transparent blending).
     pub fn draw_glyph(
         &self,
         ch: u8,
@@ -124,15 +130,19 @@ impl<'a> Psf2Font<'a> {
         bg: Option<u32>,
     ) {
         // Clamp to the font's glyph table; unmapped bytes use glyph 0.
-        let index = if (ch as u32) < self.header.glyph_count { ch as u32 } else { 0 };
+        let index = if (ch as u32) < self.header.glyph_count {
+            ch as u32
+        } else {
+            0
+        };
         let bitmap = match self.glyph_bitmap(index) {
             Some(b) => b,
-            None    => return,
+            None => return,
         };
 
         let bpr = self.bytes_per_row() as usize;
-        let h   = self.header.height as usize;
-        let w   = self.header.width  as usize;
+        let h = self.header.height as usize;
+        let w = self.header.width as usize;
 
         for row in 0..h {
             let row_bytes = &bitmap[row * bpr..(row + 1) * bpr];
@@ -140,7 +150,7 @@ impl<'a> Psf2Font<'a> {
 
             for col in 0..w {
                 let byte_idx = col / 8;
-                let bit_idx  = 7 - (col % 8);  // MSB-first
+                let bit_idx = 7 - (col % 8); // MSB-first
                 let set = (row_bytes[byte_idx] >> bit_idx) & 1 != 0;
 
                 let pixel_off = base + col;

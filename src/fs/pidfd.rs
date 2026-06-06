@@ -171,7 +171,7 @@ pub fn sys_pidfd_open(pid: usize, flags: u32) -> isize {
         pid_caller,
         scheme_bfd,
         None,
-        nonblock_fl | 1, /* FD_CLOEXEC */
+        nonblock_fl | 1, // FD_CLOEXEC
         None,
     );
     user_fd as isize
@@ -212,7 +212,7 @@ pub fn sys_pidfd_send_signal(scheme_bfd: usize, sig: u32, _info_va: usize, flags
             crate::proc::scheduler::procs_unlock();
             crate::proc::wait::notify_exit(pid);
             0
-        }
+        },
         SIGSTOP => {
             let procs = crate::proc::scheduler::procs_lock();
             if let Some(p) = procs.iter_mut().find(|p| p.pid == pid) {
@@ -220,15 +220,15 @@ pub fn sys_pidfd_send_signal(scheme_bfd: usize, sig: u32, _info_va: usize, flags
             }
             crate::proc::scheduler::procs_unlock();
             0
-        }
+        },
         SIGCONT => {
             crate::proc::scheduler::wake_pid(pid);
             0
-        }
+        },
         _ => {
             PENDING_SIGNAL.lock().insert(pid, sig);
             0
-        }
+        },
     }
 }
 

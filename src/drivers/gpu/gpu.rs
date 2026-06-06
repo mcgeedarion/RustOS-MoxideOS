@@ -11,8 +11,8 @@
 //!
 //! ## Usage
 //!   ```
-//!   gpu::init_virtio(mmio_base);   // or gpu::init_vga() / gpu::init_gop(&info)
-//!   gpu::clear(0x00_00_00_FF);     // ARGB black
+//!   gpu::init_virtio(mmio_base);   // or gpu::init_vga() /
+//! gpu::init_gop(&info)   gpu::clear(0x00_00_00_FF);     // ARGB black
 //!   gpu::blit(x, y, w, h, pixels);
 //!   gpu::flush();
 //!   ```
@@ -23,10 +23,10 @@ use spin::Mutex;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DisplayInfo {
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
-    pub pitch:  u32,   // bytes per row
-    pub bpp:    u8,    // bits per pixel
+    pub pitch: u32, // bytes per row
+    pub bpp: u8,    // bits per pixel
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,10 +67,10 @@ pub fn is_initialised() -> bool {
 pub fn display_info() -> Option<DisplayInfo> {
     match *BACKEND.lock() {
         Backend::VirtioGpu => crate::drivers::gpu::virtio_gpu::display_info(),
-        Backend::AmdGpu    => crate::drivers::gpu::amdgpu_gem::display_info(),
-        Backend::Vga       => crate::drivers::gpu::vga::display_info(),
-        Backend::Gop       => crate::drivers::gpu::gop::display_info(),
-        Backend::None      => None,
+        Backend::AmdGpu => crate::drivers::gpu::amdgpu_gem::display_info(),
+        Backend::Vga => crate::drivers::gpu::vga::display_info(),
+        Backend::Gop => crate::drivers::gpu::gop::display_info(),
+        Backend::None => None,
     }
 }
 
@@ -78,9 +78,9 @@ pub fn display_info() -> Option<DisplayInfo> {
 pub fn clear(argb: u32) {
     match *BACKEND.lock() {
         Backend::VirtioGpu => crate::drivers::gpu::virtio_gpu::clear(argb),
-        Backend::Vga       => crate::drivers::gpu::vga::clear(argb),
-        Backend::Gop       => crate::drivers::gpu::gop::clear(argb),
-        _                  => {}
+        Backend::Vga => crate::drivers::gpu::vga::clear(argb),
+        Backend::Gop => crate::drivers::gpu::gop::clear(argb),
+        _ => {},
     }
 }
 
@@ -88,9 +88,9 @@ pub fn clear(argb: u32) {
 pub fn blit(x: u32, y: u32, width: u32, height: u32, pixels: &[u32]) {
     match *BACKEND.lock() {
         Backend::VirtioGpu => crate::drivers::gpu::virtio_gpu::blit(x, y, width, height, pixels),
-        Backend::Vga       => crate::drivers::gpu::vga::blit(x, y, width, height, pixels),
-        Backend::Gop       => crate::drivers::gpu::gop::blit(x, y, width, height, pixels),
-        _                  => {}
+        Backend::Vga => crate::drivers::gpu::vga::blit(x, y, width, height, pixels),
+        Backend::Gop => crate::drivers::gpu::gop::blit(x, y, width, height, pixels),
+        _ => {},
     }
 }
 
@@ -98,12 +98,13 @@ pub fn blit(x: u32, y: u32, width: u32, height: u32, pixels: &[u32]) {
 pub fn flush() {
     match *BACKEND.lock() {
         Backend::VirtioGpu => crate::drivers::gpu::virtio_gpu::flush(),
-        Backend::Gop       => { /* GOP writes directly to linear FB */ }
-        _                  => {}
+        Backend::Gop => { /* GOP writes directly to linear FB */ },
+        _ => {},
     }
 }
 
-/// Draw an ASCII character at pixel position `(x, y)` using an 8×16 bitmap font.
+/// Draw an ASCII character at pixel position `(x, y)` using an 8×16 bitmap
+/// font.
 pub fn draw_char(x: u32, y: u32, c: u8, fg: u32, bg: u32) {
     let glyph = font_glyph(c);
     let mut px = [bg; 8 * 16];

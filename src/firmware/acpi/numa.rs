@@ -2,11 +2,10 @@
 //!
 //! ## Tables used
 //!
-//! - **SRAT** (System Resource Affinity Table, ACPI 6.5 §5.2.16)
-//!   Maps CPUs (LAPIC / x2APIC) and memory ranges to proximity domains
-//!   (NUMA nodes).
-//! - **SLIT** (System Locality Information Table, ACPI 6.5 §5.2.17)
-//!   Provides a symmetric distance matrix between all NUMA nodes.
+//! - **SRAT** (System Resource Affinity Table, ACPI 6.5 §5.2.16) Maps CPUs
+//!   (LAPIC / x2APIC) and memory ranges to proximity domains (NUMA nodes).
+//! - **SLIT** (System Locality Information Table, ACPI 6.5 §5.2.17) Provides a
+//!   symmetric distance matrix between all NUMA nodes.
 //!
 //! ## Topology model
 //!
@@ -15,21 +14,21 @@
 //!   ranges and a bitmask of LAPIC IDs.
 //! - A flat distance matrix indexed `[from][to]` where 10 = local access.
 
-use crate::console::println;
 use super::SdtHeader;
+use crate::console::println;
 
-pub const MAX_NODES:        usize = 8;
-const MAX_MEM_RANGES:       usize = 16;
-const SRAT_DISTANCE_LOCAL:  u8    = 10;
+pub const MAX_NODES: usize = 8;
+const MAX_MEM_RANGES: usize = 16;
+const SRAT_DISTANCE_LOCAL: u8 = 10;
 
-const SRAT_TYPE_LAPIC:      u8 = 0;
-const SRAT_TYPE_MEM:        u8 = 1;
-const SRAT_TYPE_X2APIC:     u8 = 2;
+const SRAT_TYPE_LAPIC: u8 = 0;
+const SRAT_TYPE_MEM: u8 = 1;
+const SRAT_TYPE_X2APIC: u8 = 2;
 
 #[derive(Copy, Clone, Default, Debug)]
 pub struct MemRange {
     pub base: u64,
-    pub len:  u64,
+    pub len: u64,
     /// Hot-pluggable memory range (SRAT flag bit 1).
     pub hotpluggable: bool,
     /// Non-volatile / persistent memory (SRAT flag bit 2).
@@ -39,24 +38,28 @@ pub struct MemRange {
 #[derive(Copy, Clone, Debug)]
 pub struct NumaNode {
     /// Proximity domain identifier.
-    pub domain:        u32,
-    pub mem_ranges:    [MemRange; MAX_MEM_RANGES],
+    pub domain: u32,
+    pub mem_ranges: [MemRange; MAX_MEM_RANGES],
     pub mem_range_cnt: usize,
     /// Bitmask of LAPIC IDs assigned to this node (up to 64 CPUs per node).
-    pub lapic_mask:    u64,
+    pub lapic_mask: u64,
     /// Set to true if at least one enabled LAPIC or memory range was found.
-    pub present:       bool,
+    pub present: bool,
 }
 
 impl NumaNode {
     const fn empty() -> Self {
         Self {
-            domain:        0,
-            mem_ranges:    [MemRange { base: 0, len: 0, hotpluggable: false, persistent: false };
-                            MAX_MEM_RANGES],
+            domain: 0,
+            mem_ranges: [MemRange {
+                base: 0,
+                len: 0,
+                hotpluggable: false,
+                persistent: false,
+            }; MAX_MEM_RANGES],
             mem_range_cnt: 0,
-            lapic_mask:    0,
-            present:       false,
+            lapic_mask: 0,
+            present: false,
         }
     }
 }
@@ -90,48 +93,48 @@ unsafe fn node_for_domain(domain: u32) -> Option<&'static mut NumaNode> {
     }
     let idx = NODE_COUNT;
     NODE_COUNT += 1;
-    NODES[idx].domain  = domain;
+    NODES[idx].domain = domain;
     NODES[idx].present = true;
     Some(&mut NODES[idx])
 }
 
 #[repr(C, packed)]
 struct SratLapic {
-    kind:      u8,
-    len:       u8,
-    prox_lo:   u8,   // bits [7:0] of proximity domain
-    lapic_id:  u8,
-    flags:     u32,
+    kind: u8,
+    len: u8,
+    prox_lo: u8, // bits [7:0] of proximity domain
+    lapic_id: u8,
+    flags: u32,
     sapic_eid: u8,
-    prox_hi:   [u8; 3], // bits [31:8] of proximity domain
-    _clk:      u32,
+    prox_hi: [u8; 3], // bits [31:8] of proximity domain
+    _clk: u32,
 }
 
 #[repr(C, packed)]
 struct SratMem {
-    kind:      u8,
-    len:       u8,
-    prox_dom:  u32,
-    _rsvd:     u16,
-    base_lo:   u32,
-    base_hi:   u32,
-    len_lo:    u32,
-    len_hi:    u32,
-    _rsvd2:    u32,
-    flags:     u32,
-    _rsvd3:    u64,
+    kind: u8,
+    len: u8,
+    prox_dom: u32,
+    _rsvd: u16,
+    base_lo: u32,
+    base_hi: u32,
+    len_lo: u32,
+    len_hi: u32,
+    _rsvd2: u32,
+    flags: u32,
+    _rsvd3: u64,
 }
 
 #[repr(C, packed)]
 struct SratX2Apic {
-    kind:      u8,
-    len:       u8,
-    _rsvd:     u16,
-    prox_dom:  u32,
+    kind: u8,
+    len: u8,
+    _rsvd: u16,
+    prox_dom: u32,
     x2apic_id: u32,
-    flags:     u32,
-    _clk:      u32,
-    _rsvd2:    u32,
+    flags: u32,
+    _clk: u32,
+    _rsvd2: u32,
 }
 
 pub unsafe fn parse_srat() {
@@ -144,7 +147,7 @@ pub unsafe fn parse_srat() {
             NODES[0].domain = 0;
             NODES[0].present = true;
             return;
-        }
+        },
     };
 
     let total = (*hdr).len as usize;
@@ -155,76 +158,107 @@ pub unsafe fn parse_srat() {
         return;
     }
 
-    let base  = hdr as usize;
-    let end   = base + total;
+    let base = hdr as usize;
+    let end = base + total;
     let mut p = base + body_off;
 
     while p + 2 <= end {
         let kind = *(p as *const u8);
-        let len  = *((p + 1) as *const u8) as usize;
-        if len < 2 || p + len > end { break; }
+        let len = *((p + 1) as *const u8) as usize;
+        if len < 2 || p + len > end {
+            break;
+        }
 
         match kind {
             SRAT_TYPE_LAPIC => {
-                if len < core::mem::size_of::<SratLapic>() { p += len; continue; }
+                if len < core::mem::size_of::<SratLapic>() {
+                    p += len;
+                    continue;
+                }
                 let e = &*(p as *const SratLapic);
                 let flags = e.flags;
-                if flags & 1 == 0 { p += len; continue; } // not enabled
+                if flags & 1 == 0 {
+                    p += len;
+                    continue;
+                } // not enabled
                 let domain = e.prox_lo as u32
                     | ((e.prox_hi[0] as u32) << 8)
                     | ((e.prox_hi[1] as u32) << 16)
                     | ((e.prox_hi[2] as u32) << 24);
                 let lid = e.lapic_id;
                 if let Some(node) = node_for_domain(domain) {
-                    if lid < 64 { node.lapic_mask |= 1u64 << lid; }
+                    if lid < 64 {
+                        node.lapic_mask |= 1u64 << lid;
+                    }
                 }
-            }
+            },
             SRAT_TYPE_MEM => {
-                if len < core::mem::size_of::<SratMem>() { p += len; continue; }
+                if len < core::mem::size_of::<SratMem>() {
+                    p += len;
+                    continue;
+                }
                 let e = &*(p as *const SratMem);
-                if e.flags & 1 == 0 { p += len; continue; } // not enabled
-                let domain   = e.prox_dom;
-                let base_pa  = (e.base_hi as u64) << 32 | e.base_lo as u64;
-                let range_len = (e.len_hi  as u64) << 32 | e.len_lo  as u64;
-                let hotplug  = e.flags & (1 << 1) != 0;
-                let persist  = e.flags & (1 << 2) != 0;
+                if e.flags & 1 == 0 {
+                    p += len;
+                    continue;
+                } // not enabled
+                let domain = e.prox_dom;
+                let base_pa = (e.base_hi as u64) << 32 | e.base_lo as u64;
+                let range_len = (e.len_hi as u64) << 32 | e.len_lo as u64;
+                let hotplug = e.flags & (1 << 1) != 0;
+                let persist = e.flags & (1 << 2) != 0;
                 if let Some(node) = node_for_domain(domain) {
                     let idx = node.mem_range_cnt;
                     if idx < MAX_MEM_RANGES {
                         node.mem_ranges[idx] = MemRange {
                             base: base_pa,
-                            len:  range_len,
+                            len: range_len,
                             hotpluggable: hotplug,
-                            persistent:   persist,
+                            persistent: persist,
                         };
                         node.mem_range_cnt += 1;
                     }
                 }
-            }
+            },
             SRAT_TYPE_X2APIC => {
-                if len < core::mem::size_of::<SratX2Apic>() { p += len; continue; }
-                let e = &*(p as *const SratX2Apic);
-                if e.flags & 1 == 0 { p += len; continue; }
-                let domain = e.prox_dom;
-                let xid    = e.x2apic_id;
-                if let Some(node) = node_for_domain(domain) {
-                    if xid < 64 { node.lapic_mask |= 1u64 << xid; }
+                if len < core::mem::size_of::<SratX2Apic>() {
+                    p += len;
+                    continue;
                 }
-            }
-            _ => {}
+                let e = &*(p as *const SratX2Apic);
+                if e.flags & 1 == 0 {
+                    p += len;
+                    continue;
+                }
+                let domain = e.prox_dom;
+                let xid = e.x2apic_id;
+                if let Some(node) = node_for_domain(domain) {
+                    if xid < 64 {
+                        node.lapic_mask |= 1u64 << xid;
+                    }
+                }
+            },
+            _ => {},
         }
         p += len;
     }
 
-    println!("acpi/numa: {} NUMA node(s) discovered from SRAT", NODE_COUNT);
+    println!(
+        "acpi/numa: {} NUMA node(s) discovered from SRAT",
+        NODE_COUNT
+    );
     for i in 0..NODE_COUNT {
         let n = &NODES[i];
-        println!("  Node {}  lapic_mask={:#018x}  {} mem range(s)",
-            n.domain, n.lapic_mask, n.mem_range_cnt);
+        println!(
+            "  Node {}  lapic_mask={:#018x}  {} mem range(s)",
+            n.domain, n.lapic_mask, n.mem_range_cnt
+        );
         for r in 0..n.mem_range_cnt {
             let mr = &n.mem_ranges[r];
-            println!("    [{:#018x} + {:#010x})  hp={}  persist={}",
-                mr.base, mr.len, mr.hotpluggable, mr.persistent);
+            println!(
+                "    [{:#018x} + {:#010x})  hp={}  persist={}",
+                mr.base, mr.len, mr.hotpluggable, mr.persistent
+            );
         }
     }
 }
@@ -235,13 +269,15 @@ pub unsafe fn parse_slit() {
         None => {
             println!("acpi/numa: no SLIT, using default distances");
             return;
-        }
+        },
     };
 
     let total = (*hdr).len as usize;
     // SLIT header = SdtHeader (36) + 8 (locality_count: u64) = 44 bytes.
     let body_off = core::mem::size_of::<SdtHeader>();
-    if total < body_off + 8 { return; }
+    if total < body_off + 8 {
+        return;
+    }
 
     let count_ptr = (hdr as usize + body_off) as *const u64;
     let locality_count = count_ptr.read_unaligned() as usize;
@@ -250,7 +286,10 @@ pub unsafe fn parse_slit() {
     let expected = locality_count * locality_count;
 
     if matrix_bytes < expected {
-        println!("acpi/numa: SLIT matrix too small ({} < {})", matrix_bytes, expected);
+        println!(
+            "acpi/numa: SLIT matrix too small ({} < {})",
+            matrix_bytes, expected
+        );
         return;
     }
 
@@ -316,7 +355,9 @@ pub fn node_for_phys(pa: u64) -> Option<usize> {
 
 /// Return the NUMA node that owns the given LAPIC ID, if known.
 pub fn node_for_lapic(lapic_id: u8) -> Option<usize> {
-    if lapic_id >= 64 { return None; }
+    if lapic_id >= 64 {
+        return None;
+    }
     let mask = 1u64 << lapic_id;
     let nodes = unsafe { &NODES[..NODE_COUNT] };
     for (idx, node) in nodes.iter().enumerate() {

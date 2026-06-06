@@ -28,5 +28,6 @@ pub fn read_sectors_vec(lba: u64, count: u32) -> alloc::vec::Vec<u8> {
 /// GUESS: presence probe. We don't track init state across the static
 /// driver — return true to allow FS init to attempt I/O and fail gracefully.
 #[inline]
-pub fn is_present() -> bool { true }
-
+pub fn is_present() -> bool {
+    true
+}
