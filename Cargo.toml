@@ -27,6 +27,11 @@ kmtest = { path = "crates/kmtest", optional = true }
 # x86_64 = "0.15"
 # uart_16550 = "0.3"
 
+[build-dependencies]
+# Used by build.rs::compile_crt() to build the freestanding C runtime stubs
+# (src/init/crt/*.c) into librustos_crt.a and link it into the kernel.
+cc = "1"
+
 [features]
 default = []
 

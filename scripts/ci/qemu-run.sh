@@ -158,13 +158,12 @@ cd "$ROOT_DIR"
 # Resolve cargo target and ELF path.
 case "$ARCH" in
   x86_64)
-    if [[ "$BOOT" == "multiboot" ]]; then
-      CARGO_TARGET="x86_64-unknown-none"
-      CARGO_EXTRA_FLAGS=(--no-default-features --features multiboot2_boot,sysv_ipc,namespaces)
-    else
-      CARGO_TARGET="x86_64-unknown-none"
-      CARGO_EXTRA_FLAGS=()
-    fi
+    # Both UEFI and multiboot paths compile from the same x86_64-unknown-none
+    # target with the default feature set; entry points (uefi_entry.rs vs
+    # multiboot2_entry.rs) are unconditionally compiled in src/main.rs and
+    # selected by the firmware/loader, not by Cargo features.
+    CARGO_TARGET="x86_64-unknown-none"
+    CARGO_EXTRA_FLAGS=()
     KERNEL_ELF="target/${CARGO_TARGET}/${PROFILE}/rustos"
     QEMU_BIN="qemu-system-x86_64"
     ;;
