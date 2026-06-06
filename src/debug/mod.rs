@@ -29,7 +29,11 @@
 #[cfg(feature = "debug")]
 mod debug_impl {
     // GDB Remote Serial Protocol stub.
+    // `#[path]` is needed because this module is declared inside an inline
+    // `mod debug_impl { }` block; without it Cargo would look for the file at
+    // `src/debug/debug_impl/gdbstub.rs` instead of the actual location.
     #[cfg(feature = "gdbstub")]
+    #[path = "gdbstub/mod.rs"]
     pub mod gdbstub;
     #[cfg(feature = "gdbstub")]
     pub use gdbstub as _gdbstub_reexport;
