@@ -653,7 +653,7 @@ static EXCEPTION_NAMES: &[&str] = &[
     "MF",  "AC",  "MC",  "XM",  "VE",  "CP",
 ];
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn exc_noerr_asm<const N: u64>() {
     core::arch::asm!(
         "push 0",
@@ -669,7 +669,7 @@ unsafe extern "C" fn exc_noerr_asm<const N: u64>() {
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn exc_err_asm<const N: u64>() {
     core::arch::asm!(
         push_all!(),
@@ -687,7 +687,7 @@ unsafe extern "C" fn exc_err_asm<const N: u64>() {
 /// Per-vector IRQ stub.  Encodes the vector number N as an immediate into
 /// `rsi` so `generic_irq_dispatch` always receives the correct vector.
 /// This replaces the old single `generic_irq_asm_stub` that passed rsi=0.
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn generic_irq_asm<const N: u64>() {
     core::arch::asm!(
         "push 0",
@@ -703,7 +703,7 @@ unsafe extern "C" fn generic_irq_asm<const N: u64>() {
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn db_asm() {
     core::arch::asm!(
         "push 0",
@@ -717,7 +717,7 @@ unsafe extern "C" fn db_asm() {
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn nmi_asm() {
     core::arch::asm!(
         "push 0",
@@ -731,7 +731,7 @@ unsafe extern "C" fn nmi_asm() {
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn bp_asm() {
     core::arch::asm!(
         "push 0",
@@ -745,7 +745,7 @@ unsafe extern "C" fn bp_asm() {
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn page_fault_asm() {
     core::arch::asm!(
         push_all!(),
@@ -759,7 +759,7 @@ unsafe extern "C" fn page_fault_asm() {
     );
 }
 
-#[naked]
+#[unsafe(naked)]
 unsafe extern "C" fn timer_irq_asm() {
     core::arch::asm!(
         "push 0",

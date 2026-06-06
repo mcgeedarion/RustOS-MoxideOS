@@ -7,6 +7,7 @@
 //! - Syscall-facing modules (`*_syscalls`, `ioctl`, `poll`, etc.) must preserve VFS locking/order constraints.
 
 pub mod binfmt_misc;
+pub mod path;
 pub mod btrfs;
 pub mod cdfs;
 pub mod cgroupfs;

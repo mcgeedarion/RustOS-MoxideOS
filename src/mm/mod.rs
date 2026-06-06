@@ -29,6 +29,7 @@ pub mod heap;
 pub mod kasan;
 pub mod kstack;
 pub mod memmap;
+pub mod boot_memory;
 pub mod mlock;
 pub mod mmap;
 pub mod page_fault;

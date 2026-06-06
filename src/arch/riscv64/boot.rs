@@ -67,7 +67,7 @@ pub static BOOT_STACK_TOP: [u8; 0] = [];
 /// Naked SBI entry stub.  Entered with MMU off, interrupts off.
 /// Saves a0/a1, sets sp = BOOT_STACK_TOP, then calls the common kernel_main.
 #[no_mangle]
-#[naked]
+#[unsafe(naked)]
 #[link_section = ".text.boot"]
 pub unsafe extern "C" fn _start() -> ! {
     asm!(

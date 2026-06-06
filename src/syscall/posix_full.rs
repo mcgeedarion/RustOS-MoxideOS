@@ -1,8 +1,8 @@
-//! POSIX-full syscall implementations — syscalls with real logic that are
-//! not large enough to warrant their own module.
+// POSIX-full syscall implementations — syscalls with real logic that are
+// not large enough to warrant their own module. (Included by src/syscall/mod.rs.)
 
-extern crate alloc;
-use alloc::string::String;
+// extern crate alloc; -- provided by parent (src/syscall/mod.rs via include!)
+// use alloc::string::String; -- provided by parent
 
 /// NR 97  getrlimit(resource, rlim_va)
 /// NR 162 getrlimit64 alias — same layout on x86-64.

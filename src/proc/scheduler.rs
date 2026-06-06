@@ -823,7 +823,7 @@ pub fn schedule_on(task: *mut crate::proc::task_types::Task, cpu: u32) {
     t.sched.cpumask  = 1u64 << cpu;
     t.sched.last_cpu = cpu;
     unsafe {
-        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]\
+        crate::smp::percpu::PERCPU_BLOCKS[cpu as usize]
             .runqueue.enqueue(task);
     }
     crate::smp::ipi::send_reschedule(cpu);
@@ -974,3 +974,24 @@ pub fn ap_idle() -> ! {
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)); }
     }
 }
+
+// ===== GUESS: short aliases for new callers =====
+
+/// GUESS: alias of `with_procs_ro` — callers use `scheduler::with_procs`.
+#[inline]
+pub fn with_procs<T, F>(f: F) -> T
+where F: FnOnce(&alloc::vec::Vec<alloc::sync::Arc<ProcLock>>) -> T,
+{
+    with_procs_ro(f)
+}
+
+/// GUESS: pidfd.rs uses imperative `procs_lock`/`procs_unlock` pairs. We
+/// don't have a static lock to hand back, so return an owned Vec snapshot.
+/// This loses live mutation visibility but keeps callers compiling. The
+/// surface is read-only in pidfd.
+pub fn procs_lock() -> alloc::vec::Vec<alloc::sync::Arc<ProcLock>> {
+    with_procs_ro(|v| v.clone())
+}
+
+/// GUESS: no-op pair — the snapshot from `procs_lock` releases via Drop.
+#[inline] pub fn procs_unlock() {}

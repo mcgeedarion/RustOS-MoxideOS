@@ -12,8 +12,7 @@
 // is wrong — callers rely on lchown succeeding to set metadata.  Return
 // EPERM (-1) to match sys_chown behaviour: ownership changes are not
 // persisted but the caller learns they failed rather than silently no-op.
-#[allow(dead_code)]
-fn sys_lchown_impl(_path: usize, _uid: u32, _gid: u32) -> isize { -1 }
+// sys_lchown_impl moved to stubs.rs (more complete impl).
 
 // These share the same "not enforced" rationale as getpriority/setpriority.
 // They are wired in mod.rs implicitly through the _   => -38 fallback,

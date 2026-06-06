@@ -64,7 +64,7 @@ pub fn send_ipi(target_hw_id: usize) {
 
 extern "C" { fn ap_entry(cpu_id: u32) -> !; }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn ap_entry_riscv() -> ! {
     core::arch::asm!(

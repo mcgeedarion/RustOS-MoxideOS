@@ -40,7 +40,7 @@
 //!   All reads are synthesised on-the-fly; there is no backing storage.
 
 extern crate alloc;
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use spin::Mutex;
 
 pub const SYSFS_FD_BASE: usize = 0x7000_0000;

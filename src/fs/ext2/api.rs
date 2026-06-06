@@ -170,3 +170,7 @@ pub fn create_file(path: &str, mode: u16) -> Result<(), i32> {
         .unwrap_or(Err(-2))
         .map_err(|e| e as i32)
 }
+// ===== GUESS: short alias =====
+/// GUESS: alias of `sys_stat` for callers using `ext2::stat`.
+#[inline]
+pub fn stat(path: &str) -> Result<Ext2Stat, i32> { sys_stat(path) }

@@ -141,3 +141,10 @@ static FONT8X16: [[u8; 16]; 128] = {
     // Full font data would be ~2 KB; abbreviated here.
     f
 };
+
+// ===== GUESS: set_scanout — DRM scanout binding =====
+/// GUESS: bind framebuffer as the active scanout. Without a real KMS/DRM
+/// implementation we just publish dimensions via init_gop.
+pub fn set_scanout(fb: &crate::display::drm::framebuffer::Framebuffer) {
+    init_gop(fb.paddr, fb.width, fb.height, fb.pitch);
+}

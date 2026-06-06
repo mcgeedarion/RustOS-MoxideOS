@@ -35,3 +35,20 @@ macro_rules! kprintln {
     ($fmt:expr) => ($crate::kprint!(concat!($fmt, "\n")));
     ($fmt:expr, $($arg:tt)*) => ($crate::kprint!(concat!($fmt, "\n"), $($arg)*));
 }
+
+/// Serial println — alias for [`kprintln`]; kept for call sites that
+/// historically targeted the serial backend directly. Output still goes
+/// through the console::print_fmt path, which routes to the per-arch
+/// serial backend.
+#[macro_export]
+macro_rules! serial_println {
+    () => ($crate::kprint!("\n"));
+    ($fmt:expr) => ($crate::kprint!(concat!($fmt, "\n")));
+    ($fmt:expr, $($arg:tt)*) => ($crate::kprint!(concat!($fmt, "\n"), $($arg)*));
+}
+
+/// Serial print — alias for [`kprint`].
+#[macro_export]
+macro_rules! serial_print {
+    ($($arg:tt)*) => ($crate::kprint!($($arg)*));
+}

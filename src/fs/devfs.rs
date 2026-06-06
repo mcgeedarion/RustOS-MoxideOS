@@ -125,3 +125,24 @@ pub fn init() {
     // also open the device by fd number via WAYLAND_INPUT_FD.
     crate::fs::vfs::ensure_dir("/dev/input");
 }
+
+// ===== GUESS: fd -> device FileOps lookup =====
+/// GUESS: map a kernel fd to a devfs-backed FileOps handle. Without a
+/// dedicated fd table for devfs we look up via the global process file table.
+/// Returns None when the fd is not a devfs entry.
+pub fn get_dev_fd(_fd: i32) -> Option<alloc::sync::Arc<dyn FileOps + Send + Sync>> {
+    // GUESS: we don't currently store a per-fd kind tag distinguishing
+    // devfs entries from regular file entries. Treat all fds as
+    // non-devfs to preserve existing branch behaviour in callers.
+    None
+}
+
+// ===== GUESS: stat alias for devfs entries =====
+/// GUESS: devfs nodes have no concrete stat backing. Return a synthetic
+/// character-device stat so callers can branch on file-type. Returns
+/// Err(-2) (ENOENT) when path is not a devfs entry.
+pub fn stat(_path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
+    // GUESS: cannot resolve without a devfs path map. Surface ENOENT
+    // so VFS dispatchers fall through to the next FS.
+    Err(-2)
+}

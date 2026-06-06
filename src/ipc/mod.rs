@@ -25,6 +25,33 @@ pub mod pipe_scheme;
 pub mod sem;
 pub mod shm;
 
+// ====================================================================
+// Userspace driver IPC entry points.
+//
+// `fs::ipc_proxy_scheme` proxies VFS calls to a userspace driver over an
+// `IpcEndpoint` (defined in the `scheme_api` crate). The send/recv path
+// is not yet implemented; the stubs below keep the build green and
+// surface a clear runtime error (`Err(())`) so callers fall back to
+// `SchemeError::Unreachable`.
+// ====================================================================
+
+use alloc::vec::Vec;
+
+/// Send `_bytes` to the userspace driver associated with `_endpoint`.
+/// Returns `Err(())` until the real IPC fast-path lands.
+pub fn endpoint_send(_endpoint: scheme_api::IpcEndpoint, _bytes: &[u8]) -> Result<(), ()> {
+    // GUESS: real impl will marshal into a per-endpoint shared ring;
+    // for now refuse so the proxy scheme returns Unreachable.
+    Err(())
+}
+
+/// Block until the userspace driver associated with `_endpoint` posts a
+/// reply. Returns `Err(())` until the real IPC fast-path lands.
+pub fn endpoint_recv(_endpoint: scheme_api::IpcEndpoint) -> Result<Vec<u8>, ()> {
+    // GUESS: see endpoint_send.
+    Err(())
+}
+
 /// `struct ipc_perm` — matches Linux x86_64 UAPI layout.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]

@@ -201,3 +201,7 @@ fn update_cursor(col: usize, row: usize) {
 unsafe fn outb(port: u16, val: u8) {
     core::arch::asm!("out dx, al", in("dx") port, in("al") val);
 }
+
+// ===== GUESS: char-level printer for tty fast paths =====
+/// GUESS: prints a single char via `putchar`.
+#[inline] pub fn print_char(c: char) { putchar(c as u8); }

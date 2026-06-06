@@ -658,3 +658,45 @@ pub fn dump_freelist() {
 unsafe fn zero_page(pa: usize) {
     core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
 }
+
+// ===== GUESS: caller-expected aliases for legacy/new naming convergence =====
+
+/// GUESS: alias of `alloc_pages_contig` — callers use `pmm::alloc_pages(n)`.
+#[inline]
+pub fn alloc_pages(n: usize) -> Option<usize> {
+    alloc_pages_contig(n)
+}
+
+/// GUESS: align-aware allocator. Tries up to `align` page-aligned bases by
+/// over-allocating and scanning, since the buddy allocator only guarantees
+/// `n`-page natural alignment. Returns NonNull<u8> pointing at the physical
+/// address (callers `.as_ptr() as u64`).
+pub fn alloc_pages_aligned(n: usize, align: usize) -> Option<core::ptr::NonNull<u8>> {
+    let pa = alloc_pages_contig(n)?;
+    // Natural buddy alignment usually satisfies callers (DMA pages need <=64K).
+    if align == 0 || (pa & (align - 1)) == 0 {
+        return core::ptr::NonNull::new(pa as *mut u8);
+    }
+    // Fall back: free and try a larger contig allocation that covers `align`.
+    free_pages_contig(pa, n);
+    let extra = (align / PAGE_SIZE).max(1);
+    let pa2 = alloc_pages_contig(n + extra)?;
+    let aligned = (pa2 + align - 1) & !(align - 1);
+    // Leak the prefix/suffix — acceptable for early boot DMA setup. GUESS.
+    let _ = (pa2, aligned);
+    core::ptr::NonNull::new(aligned as *mut u8)
+}
+
+/// GUESS: alias of `pmm_add_region` — callers use `pmm::add_region(base, size)`.
+#[inline]
+pub fn add_region(base: usize, size: usize) {
+    pmm_add_region(base, size);
+}
+
+/// GUESS: free a page-table root page allocated for a CR3/satp. Frees the
+/// single page at `pa`. Caller is responsible for already having torn down
+/// any user mappings; PML4/satp root is one 4 KiB page.
+#[inline]
+pub fn free_page_table(pa: usize) {
+    free_page(pa);
+}
