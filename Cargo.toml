@@ -22,6 +22,16 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 kmtest = { path = "crates/kmtest", optional = true }
 
+# Synchronisation primitives. `crate::sync::mutex` re-exports `spin::Mutex`,
+# and many subsystems use `spin::Mutex` / `spin::Once` directly.
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock", "once", "lazy"] }
+
+# cfg_if! macro used by various arch-gated modules.
+cfg-if = "1"
+
+# log crate used by drivers/firmware/networking code paths.
+log = { version = "0.4", default-features = false }
+
 # Add your kernel dependencies here
 # Examples:
 # x86_64 = "0.15"
@@ -33,7 +43,15 @@ kmtest = { path = "crates/kmtest", optional = true }
 cc = "1"
 
 [features]
-default = []
+# GUESS: callers reference crate::input and crate::debug unconditionally,
+# so the gating features must be on by default for a normal build.
+default = ["input_events", "gdbstub"]
+
+# Evdev / virtio-input subsystem.
+input_events = []
+
+# GDB Remote Serial Protocol stub.
+gdbstub = []
 
 # Build as a UEFI loader/application.
 uefi_boot = []

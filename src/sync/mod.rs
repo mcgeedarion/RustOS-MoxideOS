@@ -23,3 +23,4 @@ pub mod poll_source;
 
 pub use wait_queue::{WaitQueue, WakeReason, CancellationToken, CancelReason, ReadyMask};
 pub use poll_source::{PollSource, wait_on, wait_any};
+pub use mutex::Mutex;

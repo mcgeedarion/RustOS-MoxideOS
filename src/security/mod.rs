@@ -16,6 +16,8 @@
 pub mod aslr;
 pub mod canary;
 pub mod capset;
+// GUESS: callers use crate::security::CapSet; canonical is capset::CapSet.
+pub use capset::CapSet;
 pub mod dac;
 pub mod lsm;
 pub mod pti;

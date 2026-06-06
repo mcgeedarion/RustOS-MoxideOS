@@ -60,6 +60,47 @@ pub fn user_ptr_ok<T>(addr: usize) -> bool {
     user_access_ok(addr, mem::size_of::<T>())
 }
 
+/// Public alias for the per-arch user/kernel split. Exclusive upper bound
+/// of the user virtual address space.
+pub const USER_SPACE_END: usize = USER_ADDR_MAX;
+
+/// Public wrapper around [`user_access_ok`] used by syscall glue that
+/// wants a single `validate_user_ptr(addr, len) -> bool` predicate.
+#[inline]
+pub fn validate_user_ptr(addr: usize, len: usize) -> bool {
+    addr != 0 && user_access_ok(addr, len)
+}
+
+/// Thin wrapper around [`copy_to_user`] that returns the number of bytes
+/// copied (success = `len`, failure = `0`). Matches the contract used by
+/// `crate::mm::UserBuffer::write_bytes`.
+///
+/// # Safety
+/// `src` must point to `len` bytes of readable kernel memory; `dst` must
+/// reference a validated user-space range of at least `len` bytes.
+#[inline]
+pub unsafe fn copy_to_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    match copy_to_user(dst as usize, src, len) {
+        Ok(()) => len,
+        Err(_) => 0,
+    }
+}
+
+/// Thin wrapper around [`copy_from_user`] that returns the number of
+/// bytes copied (success = `len`, failure = `0`). Matches the contract
+/// used by `crate::mm::UserBuffer::read_bytes`.
+///
+/// # Safety
+/// `dst` must point to `len` bytes of writable kernel memory; `src` must
+/// reference a validated user-space range of at least `len` bytes.
+#[inline]
+pub unsafe fn copy_from_user_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    match copy_from_user(dst, src as usize, len) {
+        Ok(()) => len,
+        Err(_) => 0,
+    }
+}
+
 /// Executes `f` inside an architecture-specific "user access window".
 ///
 /// On x86_64 this is a `STAC … CLAC` bracket (enables supervisor access to

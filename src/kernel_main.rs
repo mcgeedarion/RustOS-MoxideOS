@@ -21,19 +21,5 @@ pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> ! {
     crate::arch::init(boot_info)
 }
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    crate::serial_println!("KERNEL PANIC: {}", info);
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("hlt", options(nostack, nomem));
-        }
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("wfi", options(nostack, nomem));
-        }
-        #[cfg(target_arch = "aarch64")]
-        crate::arch::aarch64::hal::wait_for_interrupt();
-    }
-}
+// GUESS: removed duplicate #[panic_handler] - the canonical one lives in
+// src/kernel/panic.rs (richer: halts other CPUs, prints banner, drains trace).

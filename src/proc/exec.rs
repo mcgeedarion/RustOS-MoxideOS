@@ -666,4 +666,7 @@ fn copy_strvec_from_user(vec_va: usize) -> Vec<String> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn alloc_map_stack(cr3: usize, stack_top
+fn alloc_map_stack(_cr3: usize, _stack_top: usize) -> usize {
+    // GUESS: temporary stub so the parser reaches EOF; real body written in a later commit.
+    unimplemented!("alloc_map_stack pending design - see sweep step 5")
+}
