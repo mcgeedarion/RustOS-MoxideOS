@@ -25,6 +25,16 @@ pub fn set_ip(ip: u32)          { *OUR_IP.lock()      = ip; }
 pub fn set_gw(gw: u32)          { *GATEWAY_IP.lock()  = gw; }
 pub fn set_mask(m: u32)         { *SUBNET_MASK.lock() = m; }
 
+/// Alias for `our_ip()` — exposed under the name used by `fs/ioctl/net.rs`.
+pub fn get_ip() -> u32 { our_ip() }
+
+/// Returns the MAC address of the first initialised NIC, or zeros if none.
+pub fn get_mac() -> [u8; 6] {
+    crate::drivers::net::nic::mac()
+        .map(|m| m.0)
+        .unwrap_or([0; 6])
+}
+
 fn next_id() -> u16 {
     let mut c = ID_COUNTER.lock();
     let id = *c;
