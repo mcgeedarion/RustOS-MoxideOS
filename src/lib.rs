@@ -71,6 +71,14 @@ pub mod firmware;
 pub mod fs;
 pub mod init;
 pub use init::initramfs;
+
+// GUESS: re-exports for callers that reference these at the crate root.
+// Targets exist under their canonical homes; restoring the short paths is
+// cheaper than rewriting every call site.
+pub use exec::elf;
+pub use kernel::rand;
+pub use kernel::uaccess;
+pub use mm::allocator;
 pub mod io_uring;
 pub mod ipc;
 pub mod irq;

@@ -16,5 +16,7 @@ pub mod gpu;
 pub mod input;
 pub mod net;
 pub mod platform;
+// GUESS: callers use crate::drivers::pcie; canonical home is platform::pcie.
+pub use platform::pcie;
 pub mod virtio;
 pub mod virtio_blk;
