@@ -1,6 +1,10 @@
-pub mod ap_boot;
+// NOTE: ap_boot.s and boot.s are bare assembly fragments (GAS / NASM
+// syntax). They are not Rust modules and are not assembled by build.rs
+// today; `_start` is provided in Rust by multiboot2_entry.rs via
+// #[naked] + global_asm!. The .s files are retained as reference /
+// future-replacement material; wire them through build.rs (or move
+// their bodies into global_asm! blocks) when SMP/multiboot lands.
 pub mod apic;
-pub mod boot;
 pub mod cpu;
 pub mod gdt;
 pub mod hal;

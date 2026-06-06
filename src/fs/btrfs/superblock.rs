@@ -407,7 +407,7 @@ impl BtrfsSuperblock {
     }
 }
 
-struct BtrfsHeader {
+pub struct BtrfsHeader {
     csum:       [u8; 32],
     fsid:       [u8; 16],
     bytenr:     u64,
@@ -443,7 +443,7 @@ const BTRFS_HEADER_SIZE: usize = 101;
 const BTRFS_ITEM_SIZE:   usize = 25;
 const BTRFS_KEY_PTR_SIZE:usize = 33;
 
-struct BtrfsItem {
+pub struct BtrfsItem {
     key:    BtrfsKey,
     offset: u32,
     size:   u32,
@@ -459,7 +459,7 @@ impl BtrfsItem {
     }
 }
 
-struct BtrfsKeyPtr {
+pub struct BtrfsKeyPtr {
     key:        BtrfsKey,
     block_ptr:  u64,
     generation: u64,

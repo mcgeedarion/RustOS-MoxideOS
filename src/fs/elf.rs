@@ -23,7 +23,7 @@ use crate::fs::vfs;
 
 /// Return `true` if the first 4 bytes of `data` are the ELF magic bytes.
 #[inline]
-pub fn is_elf( &[u8]) -> bool {
+pub fn is_elf(data: &[u8]) -> bool {
     data.len() >= 4
         && data[EI_MAG0] == 0x7f
         && data[EI_MAG1] == b'E'
@@ -71,7 +71,7 @@ pub struct ElfNote {
 }
 
 /// Parse ELF note entries from a raw PT_NOTE segment byte slice.
-pub fn parse_notes( &[u8]) -> Vec<ElfNote> {
+pub fn parse_notes(data: &[u8]) -> Vec<ElfNote> {
     let mut notes = Vec::new();
     let mut pos = 0usize;
 

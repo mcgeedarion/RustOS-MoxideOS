@@ -92,7 +92,7 @@ pub unsafe fn do_panic(ctx: &PanicContext<'_>) -> ! {
 /// kernel_panic!("unexpected trap", &trap_frame_bytes);
 /// ```
 #[macro_export]
-macros! kernel_panic {
+macro_rules! kernel_panic {
     ($msg:expr) => {{
         unsafe {
             $crate::core::panic::do_panic(&$crate::core::panic::PanicContext {
