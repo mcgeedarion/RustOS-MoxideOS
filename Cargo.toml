@@ -22,6 +22,16 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 kmtest = { path = "crates/kmtest", optional = true }
 
+# Synchronisation primitives. `crate::sync::mutex` re-exports `spin::Mutex`,
+# and many subsystems use `spin::Mutex` / `spin::Once` directly.
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock", "once", "lazy"] }
+
+# cfg_if! macro used by various arch-gated modules.
+cfg-if = "1"
+
+# log crate used by drivers/firmware/networking code paths.
+log = { version = "0.4", default-features = false }
+
 # Add your kernel dependencies here
 # Examples:
 # x86_64 = "0.15"

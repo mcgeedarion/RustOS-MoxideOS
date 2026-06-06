@@ -26,4 +26,5 @@ pub mod namespace;
 pub mod ptrace;
 pub mod ipc;
 pub mod cgroup;
-pub mod seccomp_filter;
+// GUESS: file missing, no callers anywhere in tree, declaration orphaned.
+// pub mod seccomp_filter;
