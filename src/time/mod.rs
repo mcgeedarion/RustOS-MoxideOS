@@ -196,3 +196,15 @@ pub fn init() {
     timer::init();
     timerfd::init();
 }
+
+// ===== GUESS: short aliases for new callers =====
+
+/// GUESS: alias of `read_monotonic_ns`.
+#[inline] pub fn monotonic_ns() -> u64 { read_monotonic_ns() }
+
+/// GUESS: ns -> ms conversion of monotonic clock.
+#[inline] pub fn monotonic_ms() -> u64 { read_monotonic_ns() / 1_000_000 }
+
+/// GUESS: ns -> us "ticks" (microseconds) — best fit for callers that count
+/// "ticks" without a specific frequency contract.
+#[inline] pub fn monotonic_ticks() -> u64 { read_monotonic_ns() / 1_000 }

@@ -53,3 +53,25 @@ pub fn write_byte(b: u8) {
 pub fn write_str(s: &str) {
     for b in s.bytes() { write_byte(b); }
 }
+
+// ===== GUESS: alias surface for new callers =====
+
+/// GUESS: alias of `write_byte` for callers using `serial::putc`.
+#[inline] pub fn putc(b: u8) { write_byte(b); }
+
+/// GUESS: 16550 RX read. Polls LSR bit 0 (DR). Returns None when empty.
+pub fn getc() -> Option<u8> {
+    use x86_64::instructions::port::Port;
+    const COM1: u16 = 0x3F8;
+    unsafe {
+        let lsr: u8 = Port::<u8>::new(COM1 + 5).read();
+        if lsr & 1 == 0 { return None; }
+        Some(Port::<u8>::new(COM1).read())
+    }
+}
+
+/// GUESS: alias of `init` — early COM1 setup before heap.
+#[inline] pub fn early_init() { init(); }
+
+/// GUESS: byte-wise polled write of a string for early/panic paths.
+pub fn serial_print(s: &str) { write_str(s); }
