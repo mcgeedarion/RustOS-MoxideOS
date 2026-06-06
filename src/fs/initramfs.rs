@@ -41,9 +41,9 @@ pub fn mount_initramfs() {
         let path: String = if entry.name.starts_with('/') {
             entry.name.into()
         } else if let Some(rest) = entry.name.strip_prefix("./") {
-            alloc::format!"/{rest}")
+            alloc::format!("/{rest}")
         } else {
-            alloc::format!"/{}", entry.name)
+            alloc::format!("/{}", entry.name)
         };
 
         // S_IFMT mask (Linux inode mode field upper 4 bits):

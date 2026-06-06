@@ -1,0 +1,19 @@
+# Cargo build output
+/target/
+
+# Cargo.lock is committed for binaries / kernels by convention.
+# Leave it tracked once it's committed; don't add it here.
+
+# rustup-pinned local overrides
+/rust-toolchain
+
+# QEMU / EDK2 transient artifacts created by scripts/ci/qemu-run.sh
+/edk2-aarch64-vars.fd
+/edk2-riscv-vars.fd
+
+# UEFI ESP staging directory created by build.rs::produce_uefi_image
+/esp/
+
+# Editor / OS clutter
+*.swp
+.DS_Store

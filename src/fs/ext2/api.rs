@@ -2,7 +2,8 @@
 //! Source lines 1035–end of the original ext2.rs monolith.
 extern crate alloc;
 use alloc::{vec::Vec, string::String};
-use super::structs::{Ext2Stat, Ext2DirEntry, Ext2Statfs, Ext2Fs, Superblock, BgDesc, FS};
+use super::superblock::{Ext2Stat, Ext2Statfs, Ext2Fs, Superblock, BgDesc, FS};
+use super::inode::Ext2DirEntry;
 
 pub fn mount() -> bool {
     // Read superblock from sector 2 (offset 1024 bytes)
