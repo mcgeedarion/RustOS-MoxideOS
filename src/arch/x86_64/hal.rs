@@ -263,3 +263,118 @@ impl FpState for ArchImpl {
     unsafe fn fp_restore(src: *const u8) { xsave::xrstor_from(src); }
     fn fp_area_size() -> usize { xsave::xsave_area_size() }
 }
+
+// ====================================================================
+// HAL free functions (consumed by `crate::arch::api::*` wrappers).
+//
+// These are the surface that `arch::api::name`, `arch::api::cpu_relax`,
+// `arch::api::tlb_flush_all`, etc. forward to. Keeping them as plain
+// free fns rather than trait methods preserves the existing
+// `crate::arch::hal::<fn>` import path used by `arch::api`.
+// ====================================================================
+
+use core::ops::Range;
+
+/// Canonical kernel virtual address range on x86_64 (higher half).
+#[inline]
+pub fn kernel_va_range() -> Range<usize> {
+    0xFFFF_8000_0000_0000usize..0xFFFF_FFFF_FFFF_FFFFusize
+}
+
+/// `true` if `addr` is in the canonical user-space half of the AS.
+#[inline]
+pub fn is_user_addr(addr: usize) -> bool {
+    addr < 0x0000_8000_0000_0000
+}
+
+/// `true` if `addr` is canonical (top 16 bits are sign-extension of bit 47).
+#[inline]
+pub fn is_valid_addr(addr: usize) -> bool {
+    let hi = addr >> 47;
+    hi == 0 || hi == 0x1_FFFF
+}
+
+/// Flush the entire local TLB by writing CR3.
+#[inline]
+pub unsafe fn tlb_flush_all() {
+    let cr3: u64;
+    core::arch::asm!("mov {0}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+    core::arch::asm!("mov cr3, {0}", in(reg) cr3, options(nostack, preserves_flags));
+}
+
+/// Invalidate a single page TLB entry.
+#[inline]
+pub unsafe fn tlb_flush_page(va: usize) {
+    core::arch::asm!("invlpg [{0}]", in(reg) va, options(nostack, preserves_flags));
+}
+
+/// SMT-friendly pause hint.
+#[inline]
+pub fn cpu_relax() {
+    unsafe { core::arch::asm!("pause", options(nostack, nomem, preserves_flags)) }
+}
+
+/// Halt until the next interrupt is delivered.
+#[inline]
+pub fn wait_for_interrupt() {
+    unsafe { core::arch::asm!("hlt", options(nostack, nomem, preserves_flags)) }
+}
+
+/// Read the TSC.
+#[inline]
+pub fn time_now_cycles() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, nomem, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Emit `int3` for the debugger.
+#[inline]
+pub fn debug_break() {
+    unsafe { core::arch::asm!("int3", options(nostack, nomem, preserves_flags)) }
+}
+
+/// Local APIC ID via CPUID.1.EBX[31:24]. Falls back to 0 if CPUID is
+/// unavailable (which never happens on real x86_64 hardware but keeps
+/// this safe in odd test environments).
+#[inline]
+pub fn cpu_id() -> usize {
+    let ebx: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx:e}, ebx",
+            "pop rbx",
+            inout("eax") 1u32 => _,
+            ebx = out(reg) ebx,
+            out("ecx") _,
+            out("edx") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    ((ebx >> 24) & 0xff) as usize
+}
+
+/// Enable interrupts on the local CPU (`STI`).
+#[inline]
+pub unsafe fn interrupts_enable() {
+    core::arch::asm!("sti", options(nostack, nomem));
+}
+
+/// Disable interrupts on the local CPU (`CLI`).
+#[inline]
+pub unsafe fn interrupts_disable() {
+    core::arch::asm!("cli", options(nostack, nomem));
+}
+
+/// Returns `true` if the IF flag in RFLAGS is set.
+#[inline]
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {0}", out(reg) flags, options(nomem, preserves_flags)); }
+    (flags & (1 << 9)) != 0
+}

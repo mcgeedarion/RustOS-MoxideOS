@@ -78,6 +78,7 @@ dependencies = [
  "cfg-if",
  "kmtest",
  "log",
+ "scheme-api",
  "spin",
 ]
 
