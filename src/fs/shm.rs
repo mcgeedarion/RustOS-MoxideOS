@@ -33,9 +33,6 @@ const O_TRUNC: u32 = 0o1000;
 const O_CLOEXEC: u32 = 0o2000000;
 
 /// Normalise a POSIX shm name into an absolute /dev/shm path.
-///
-/// POSIX requires the name to start with '/'.  We strip any extra leading
-/// slashes and prepend "/dev/shm".
 fn shm_path(name: &str) -> Option<String> {
     let name = name.trim_start_matches('/');
     if name.is_empty() {
@@ -49,11 +46,6 @@ fn shm_path(name: &str) -> Option<String> {
 }
 
 /// Open (or create) a POSIX shared memory object.
-///
-/// Equivalent to `open("/dev/shm/<name>", oflag, mode)` with some
-/// extra POSIX checks (name must be a single component, etc.).
-///
-/// Returns a non-negative FD on success, or a negative errno on failure.
 pub fn shm_open(name: &str, oflag: u32, _mode: u32) -> isize {
     // Ensure the /dev/shm tmpfs instance is ready.
     crate::fs::ramfs::tmpfs_mount("/dev/shm", 64 * 1024 * 1024);
@@ -96,9 +88,6 @@ pub fn shm_open(name: &str, oflag: u32, _mode: u32) -> isize {
 }
 
 /// Remove a POSIX shared memory object.
-///
-/// The backing file is deleted from /dev/shm; any still-open FDs retain
-/// access until they are closed (nlink-based deferred free in ramfs).
 pub fn shm_unlink(name: &str) -> isize {
     let path = match shm_path(name) {
         Some(p) => p,
@@ -112,10 +101,6 @@ pub fn shm_unlink(name: &str) -> isize {
 
 // ── Syscall-layer wrappers (for direct invocation by statically linked
 // binaries)
-
-/// sys_shm_open(name_va, oflag, mode)  — called when a binary invokes the
-/// open(2) path with a /dev/shm/ prefix (musl does this); kept here for
-/// completeness and for any ABI path that jumps directly.
 pub fn sys_shm_open(name_va: usize, oflag: u32, mode: u32) -> isize {
     let name = match read_cstr_safe(name_va) {
         Some(s) => s,
