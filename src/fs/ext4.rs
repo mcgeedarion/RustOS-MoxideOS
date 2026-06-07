@@ -144,7 +144,6 @@ struct BgDesc32 {
 }
 
 /// 64-byte (ext4 64BIT) block group descriptor.
-/// The hi-word fields are at offsets 32..64.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct BgDesc64 {
@@ -168,7 +167,6 @@ struct BgDesc64 {
 }
 
 /// Ext4 inode (256 bytes minimum on disk; may be larger for extra fields).
-/// We only read the first 160 bytes which contain everything we need.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Inode {
@@ -211,7 +209,6 @@ struct Inode {
 }
 
 /// Ext4 extent tree header (at the start of the inode.block[] area or
-/// at the start of an interior / leaf block).
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ExtentHeader {
@@ -223,7 +220,6 @@ struct ExtentHeader {
 }
 
 /// An index node entry — points to a child block containing more
-/// ExtentHeader + entries.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct ExtentIdx {
@@ -234,7 +230,6 @@ struct ExtentIdx {
 }
 
 /// A leaf node entry — a contiguous run of `len` logical blocks
-/// starting at `block`, stored physically at `start_hi:start_lo`.
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct Extent {
@@ -307,9 +302,6 @@ struct Ext4Fs {
 static FS: Mutex<Option<Ext4Fs>> = Mutex::new(None);
 
 /// Mount an ext4 filesystem from the virtio-blk device.
-///
-/// Returns `true` on success, `false` if the device is absent, the
-/// superblock magic is wrong, or any INCOMPAT feature is unsupported.
 pub fn mount() -> bool {
     if !crate::drivers::virtio_blk::is_present() {
         return false;
@@ -435,8 +427,6 @@ impl Ext4Fs {
 
     fn bgd_offset(&self, g: usize) -> usize {
         // BGD table starts immediately after the superblock block.
-        // For block_size == 1024, superblock is in block 1 → BGD in block 2.
-        // For block_size >= 2048, superblock is in block 0 → BGD in block 1.
         let bgd_block: usize = if self.block_size == 1024 { 2 } else { 1 };
         bgd_block * self.block_size + g * self.bgd_size
     }
@@ -509,7 +499,6 @@ impl Ext4Fs {
         }
     }
 
-    // Returns all physical (blkno, len) pairs in logical order.
     // Panic-safe: bounds-checked at every level.
 
     fn extents_collect(&self, data: &[u8], depth: u16, out: &mut Vec<(u64, u16)>) {
@@ -684,12 +673,7 @@ impl Ext4Fs {
         out
     }
 
-    // Works for both linear directories and htree (dir_index) directories.
-    // HTree leaf blocks contain exactly the same DirEntry2 records as linear
-    // directories, so scanning every data block linearly is always correct
-    // (the internal htree index blocks have rec_len spanning the whole block
-    // and inode==0, so they are skipped safely).
-
+    // Works for both linear directories and htree (dir_index) directories
     fn scan_dir_blocks<F>(&self, ino: &Inode, mut f: F)
     where
         F: FnMut(&[u8]) -> bool,
@@ -812,7 +796,6 @@ impl Ext4Fs {
             return Some(2);
         }
         // Track the current directory path so relative symlinks can be resolved
-        // against the correct parent directory.
         let mut cur_dir = String::from("/");
         for component in path.split('/') {
             if component.is_empty() || component == "." {
@@ -845,13 +828,7 @@ impl Ext4Fs {
                     self.lookup_path_depth(&abs, depth + 1)?
                 };
                 ino = resolved;
-                // Update cur_dir: the resolved inode may be a dir; recompute
-                // by re-walking to keep cur_dir in sync for further components.
-                // Simplest correct approach: set cur_dir to the abs target path
-                // (strip trailing filename if target ends in a non-dir component
-                // — but we can't know that cheaply; leave cur_dir as-is and let
-                // future ".." lookups use the inode's own ".." entry which is
-                // always correct regardless of cur_dir).
+                
                 cur_dir = if target_str.starts_with('/') {
                     String::from(target_str)
                 } else {
@@ -1045,8 +1022,6 @@ pub fn sys_statfs(path: &str) -> Result<Ext4Statfs, i32> {
 }
 
 /// Mutable access to the mounted ext4 FS for use by kernel subsystems
-/// that need to call into the driver under a single lock acquire.
-/// The ext4 driver is read-only; callers must not attempt writes.
 pub(crate) fn with_fs_mut<T, F: FnOnce(&mut Ext4Fs) -> T>(f: F) -> Result<T, isize> {
     let mut guard = FS.lock();
     match &mut *guard {
