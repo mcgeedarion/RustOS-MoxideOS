@@ -17,6 +17,7 @@ pub mod multiboot2;
 pub mod multiboot2_entry;
 pub mod paging;
 pub mod pci;
+pub mod power;
 pub mod serial;
 pub mod syscall;
 pub mod uefi_entry;

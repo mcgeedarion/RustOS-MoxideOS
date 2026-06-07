@@ -13,15 +13,28 @@ use crate::syscall::signal_nr::{SIGKILL, SIGSTOP};
 pub(super) const AT_FDCWD_STUBS: i32 = -100;
 
 pub(super) fn resolve_at_path_for_stubs(dirfd: i32, path_va: usize) -> Result<String, isize> {
-    crate::fs::at_path::resolve_at(dirfd, path_va)
+    let path = crate::proc::exec::read_cstr_safe(path_va).ok_or_else(efault)?;
+    if dirfd == AT_FDCWD_STUBS || path.starts_with('/') {
+        Ok(resolve_path(&path))
+    } else {
+        let dir_path =
+            crate::fs::process_fd::proc_fd_path(scheduler::current_pid() as usize, dirfd as usize)
+                .ok_or_else(ebadf)?;
+        let joined = if dir_path.ends_with('/') {
+            alloc::format!("{}{}", dir_path, path)
+        } else {
+            alloc::format!("{}/{}", dir_path, path)
+        };
+        Ok(resolve_path(&joined))
+    }
 }
 
 // copy helpers used by ptrace
 fn copy_to_user(dst_va: usize, src: &[u8]) -> Result<(), ()> {
-    crate::mm::uaccess::copy_to_user(dst_va, src)
+    crate::uaccess::copy_to_user(dst_va, src.as_ptr(), src.len()).map_err(|_| ())
 }
 fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
-    crate::mm::uaccess::copy_from_user(dst, src_va)
+    crate::uaccess::copy_from_user(dst.as_mut_ptr(), src_va, dst.len()).map_err(|_| ())
 }
 
 /// NR 79  getcwd(buf_va, size)
@@ -166,9 +179,9 @@ pub(super) fn sys_unlink_impl(path_va: usize) -> isize {
 }
 
 pub(super) fn sys_symlinkat_impl(target_va: usize, new_dirfd: i32, linkpath_va: usize) -> isize {
-    let target = match crate::mm::uaccess::read_user_str(target_va, 4096) {
-        Ok(s) => s,
-        Err(_) => return efault(),
+    let target = match crate::proc::exec::read_cstr_safe(target_va) {
+        Some(s) => s,
+        None => return efault(),
     };
     let link = match resolve_at_path_for_stubs(new_dirfd, linkpath_va) {
         Ok(p) => p,
@@ -425,7 +438,7 @@ fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> 
 /// Read `N` u64 register values from userspace at `va`.
 #[inline]
 fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isize> {
-    let mut bytes = [0u8; N * 8];
+    let mut bytes = alloc::vec![0u8; N * 8];
     if copy_from_user(&mut bytes, va).is_err() {
         return Err(efault());
     }
@@ -440,7 +453,7 @@ fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isi
 /// Write `N` u64 register values to userspace at `va`.
 #[inline]
 fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Result<(), isize> {
-    let mut bytes = [0u8; N * 8];
+    let mut bytes = alloc::vec![0u8; N * 8];
     for (i, &reg) in regs.iter().enumerate() {
         let off = i * 8;
         bytes[off..off + 8].copy_from_slice(&reg.to_le_bytes());
