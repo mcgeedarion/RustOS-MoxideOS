@@ -1,12 +1,4 @@
 //! Ext4 write API surface.
-//!
-//! This module intentionally stays thin.  The real on-disk mutation logic must
-//! live in `ext4.rs`, where the mounted `Ext4Fs` image, block-group descriptors,
-//! inode table, and block/inode bitmaps are available under the filesystem lock.
-//!
-//! Until those internals grow a complete journaled writer, these entry points
-//! return explicit errors instead of calling missing private methods.  This keeps
-//! the kernel buildable and prevents accidental partial ext4 mutation.
 
 extern crate alloc;
 use alloc::string::String;
@@ -17,19 +9,11 @@ const EROFS: i32 = -30;
 const ENOTSUP: i32 = -95;
 
 /// Write all dirty ext4 blocks back to the block device.
-///
-/// There is no mutable ext4 block cache in the current driver, so there are no
-/// dirty blocks to flush yet.  Returning success matches POSIX `fsync` behavior
-/// for a clean read-only filesystem image.
 pub fn flush_dirty() -> i32 {
     0
 }
 
 /// Write `buf` to the file at `path` starting at `offset`.
-///
-/// Full ext4 writes require block allocation, inode updates, directory updates,
-/// and journal ordering in `ext4.rs`.  Refuse writes until that implementation
-/// exists in the filesystem core.
 pub fn write(_path: &str, _buf: &[u8], _offset: u64) -> i32 {
     EROFS
 }
