@@ -1,9 +1,5 @@
 //! VFS kernel-internal helpers.
 //!
-//! The full per-fd dispatch layer lives in the individual fs modules
-//! (ext2, devfs, pipe, etc.) and is wired through the fd table in fcntl.rs.
-//! This file exposes thin wrappers that kernel subsystems use to read/write
-//! files without going through syscall user-space copy paths.
 
 extern crate alloc;
 use crate::core::fast_hash::KernelFastMap;
@@ -42,7 +38,6 @@ pub struct VfsStat {
 }
 
 /// Fast map is safe here: keys are bounded kernel-assigned raw fd numbers and
-/// iteration order is never exposed as an ABI.
 static RAW_FDS: Mutex<KernelFastMap<usize, RawFd>> = Mutex::new(KernelFastMap::new());
 
 fn alloc_raw_fd() -> Option<usize> {
