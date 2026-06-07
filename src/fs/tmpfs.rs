@@ -694,3 +694,27 @@ pub fn tmpfs_statfs(path: &str) -> Result<KStatfs, isize> {
         f_namelen: 255,
     })
 }
+
+/// Placeholder scheme adapter used to keep boot-time scheme registration wired
+/// while the concrete `TmpFs` URL dispatch is implemented.
+pub struct TmpFs;
+
+impl TmpFs {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for TmpFs {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

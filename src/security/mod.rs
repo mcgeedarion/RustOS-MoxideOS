@@ -18,6 +18,14 @@ pub mod canary;
 pub mod capset;
 // GUESS: callers use crate::security::CapSet; canonical is capset::CapSet.
 pub use capset::{cap, CapSet};
+
+/// Compatibility constants for call sites that use named capability fields.
+pub struct Cap;
+
+impl Cap {
+    pub const IpcLock: u8 = cap::IPC_LOCK;
+    pub const SysNice: u8 = cap::SYS_NICE;
+}
 pub mod dac;
 pub mod lsm;
 pub mod ns;

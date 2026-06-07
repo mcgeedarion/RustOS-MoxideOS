@@ -695,3 +695,27 @@ fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)>
     let tail = rest.strip_prefix(suffix)?;
     Some((pid, tail))
 }
+
+/// Placeholder scheme adapter used to keep boot-time scheme registration wired
+/// while the concrete `ProcFs` URL dispatch is implemented.
+pub struct ProcFs;
+
+impl ProcFs {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for ProcFs {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

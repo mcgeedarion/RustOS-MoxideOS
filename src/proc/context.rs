@@ -141,7 +141,7 @@ impl Context {
 ///
 /// # Safety
 /// Both pointers must be valid, non-null, 8-byte-aligned `Context`s.
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn switch_to(old: *mut Context, new: *const Context) {
     core::arch::asm!(
         "mov [rdi + 0x00], r15",
@@ -191,7 +191,7 @@ pub unsafe extern "C" fn switch_to(old: *mut Context, new: *const Context) {
 /// # Safety
 /// Both pointers must be valid, non-null, 8-byte-aligned `Context`s.
 /// Must be called with supervisor interrupts disabled (sstatus.SIE = 0).
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn switch_riscv(old: *mut Context, new: *const Context) {
     core::arch::asm!(
         // Save old context
@@ -245,7 +245,7 @@ pub unsafe extern "C" fn switch_riscv(old: *mut Context, new: *const Context) {
 /// The layout matches `riscv_trap_entry`'s save sequence so that
 /// `trap_return` can be reused directly.
 #[cfg(target_arch = "riscv64")]
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn task_entry_trampoline() {
     core::arch::asm!(
         // sp already points at the TrapFrame; call the arch return path.

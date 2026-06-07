@@ -20,6 +20,28 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+#[inline]
+unsafe fn outl(port: u16, val: u32) {
+    core::arch::asm!(
+        "outl %eax, %dx",
+        in("dx") port,
+        in("eax") val,
+        options(att_syntax, nostack, preserves_flags)
+    );
+}
+
+#[inline]
+unsafe fn inl(port: u16) -> u32 {
+    let val: u32;
+    core::arch::asm!(
+        "inl %dx, %eax",
+        in("dx") port,
+        out("eax") val,
+        options(att_syntax, nostack, preserves_flags)
+    );
+    val
+}
+
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 
@@ -44,8 +66,8 @@ fn config_addr(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
 
 pub fn config_read_u32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     unsafe {
-        x86::io::outl(CONFIG_ADDRESS, config_addr(bus, dev, func, offset));
-        x86::io::inl(CONFIG_DATA)
+        outl(CONFIG_ADDRESS, config_addr(bus, dev, func, offset));
+        inl(CONFIG_DATA)
     }
 }
 
@@ -61,8 +83,8 @@ pub fn config_read_u8(bus: u8, dev: u8, func: u8, offset: u8) -> u8 {
 
 pub fn config_write_u32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
     unsafe {
-        x86::io::outl(CONFIG_ADDRESS, config_addr(bus, dev, func, offset));
-        x86::io::outl(CONFIG_DATA, val);
+        outl(CONFIG_ADDRESS, config_addr(bus, dev, func, offset));
+        outl(CONFIG_DATA, val);
     }
 }
 

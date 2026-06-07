@@ -26,7 +26,7 @@ pub static mut MBI_PTR: usize = 0;
 /// establishing a stack, then set up RSP and forward them to
 /// `multiboot2_start`.
 #[no_mangle]
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::asm!(
         // Save Multiboot2 arguments before RSP is valid.

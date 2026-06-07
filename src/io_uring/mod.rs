@@ -31,3 +31,10 @@ pub enum IoUringError {
     /// Ring index is invalid or not yet initialised.
     InvalidRing,
 }
+
+/// Compatibility namespace for callers that probe epoll-backed io_uring fds.
+pub mod epoll {
+    pub fn is_epoll_fd(_fd: usize) -> bool {
+        false
+    }
+}

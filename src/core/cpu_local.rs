@@ -32,7 +32,6 @@ pub const MAX_CPU_LOCAL_SLOTS: usize = 64;
 /// The block of per-CPU data stored at the address held in `tp`/`%gs`.
 #[repr(C)]
 pub struct PerCpuBlock {
-
     pub self_ptr: *mut PerCpuBlock,
     pub cpu_id: u32,
     pub in_irq: u32,
@@ -44,7 +43,6 @@ pub struct PerCpuBlock {
 unsafe impl Sync for PerCpuBlock {}
 
 impl PerCpuBlock {
-    
     #[inline]
     pub unsafe fn read_slot(&self, index: usize) -> usize {
         debug_assert!(index < MAX_CPU_LOCAL_SLOTS);
@@ -137,7 +135,7 @@ pub unsafe fn current_cpu_block() -> *mut PerCpuBlock {
             core::arch::asm!(
                 "mv {ptr}, tp",
                 ptr = out(reg) ptr,
-                options(nostack, readonly, nomem)
+                options(nostack, nomem)
             );
         }
         ptr

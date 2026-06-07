@@ -1,5 +1,4 @@
 /// build.rs
-
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -37,7 +36,7 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
-    compile_crt();
+    compile_crt(&target_arch);
 
     if target_arch == "riscv64" {
         assemble_riscv_uentry(&out);
@@ -54,24 +53,55 @@ fn main() {
 }
 
 /// Compile C runtime stubs into a static archive `librustos_crt.a`.
-fn compile_crt() {
+fn compile_crt(target_arch: &str) {
     for src in CRT_SOURCES {
         println!("cargo:rerun-if-changed={CRT_DIR}/{src}");
     }
 
     let mut build = cc::Build::new();
+    configure_crt_compiler(&mut build, target_arch);
 
     for flag in CRT_COMPILE_FLAGS {
         build.flag(flag);
     }
-
-    build.static_flag(true);
 
     for src in CRT_SOURCES {
         build.file(format!("{CRT_DIR}/{src}"));
     }
 
     build.compile("rustos_crt");
+}
+
+/// Select a usable C compiler for freestanding CRT objects when cross-building.
+///
+/// `cc` will honor explicit `CC_<target>`, `TARGET_CC`, and `CC` environment
+/// variables before this helper runs. When none are present for non-host kernel
+/// targets, prefer Clang with an explicit target triple so host `cc` is not
+/// invoked with incompatible `-march`/`-mabi` flags.
+fn configure_crt_compiler(build: &mut cc::Build, target_arch: &str) {
+    if std::env::var_os("CC").is_some() || std::env::var_os("TARGET_CC").is_some() {
+        return;
+    }
+
+    match target_arch {
+        "riscv64" if command_exists("clang") => {
+            build.compiler("clang");
+            build.flag("--target=riscv64-unknown-elf");
+        },
+        "aarch64" if command_exists("clang") => {
+            build.compiler("clang");
+            build.flag("--target=aarch64-none-elf");
+        },
+        _ => {},
+    }
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Assemble the RISC-V uentry trampoline and archive it as a static library.
@@ -114,7 +144,7 @@ fn assemble_riscv_uentry(out: &PathBuf) {
 }
 
 /// Convert the ELF kernel to a PE32+ UEFI application (BOOTX64.EFI).
-fn produce_uefi_image(out: &PathBuf) {
+fn produce_uefi_image(_out: &PathBuf) {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let elf_path = PathBuf::from(format!("target/x86_64-unknown-none/{profile}/rustos"));
 

@@ -12,7 +12,9 @@
 
 pub mod acpi;
 pub mod dt;
+#[cfg(target_arch = "aarch64")]
 pub mod psci;
+#[cfg(target_arch = "aarch64")]
 pub mod topology;
 
 // Re-export so existing `crate::acpi` and `crate::dt` paths still compile.

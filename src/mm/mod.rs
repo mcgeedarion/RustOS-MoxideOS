@@ -137,3 +137,51 @@ impl UserBuffer {
         Ok(())
     }
 }
+
+/// Minimal memfd compatibility hooks used by fcntl while full memfd support is
+/// not wired into the VFS.
+pub mod memfd {
+    pub fn is_memfd(_fd: usize) -> bool {
+        false
+    }
+
+    pub fn sys_memfd_add_seals(_fd: usize, _seals: u32) -> isize {
+        -38
+    }
+
+    pub fn sys_memfd_get_seals(_fd: usize) -> isize {
+        -38
+    }
+}
+
+/// Transitional VM mapping helpers for SysV shared memory.
+pub mod vmm {
+    pub fn map_range(
+        _hint: usize,
+        _size: usize,
+        _prot: u32,
+        _frames: &[usize],
+    ) -> Result<usize, isize> {
+        Err(-38)
+    }
+
+    pub fn unmap_range(_addr: usize) -> Result<(), isize> {
+        Err(-38)
+    }
+}
+
+/// Compatibility user-copy facade for core-dump code.
+pub mod user_copy {
+    pub fn copy_from_user_page(
+        _page_base: usize,
+        _page_off: usize,
+        dst: &mut [u8],
+        copy_len: usize,
+    ) -> Result<(), isize> {
+        let n = core::cmp::min(copy_len, dst.len());
+        for b in &mut dst[..n] {
+            *b = 0;
+        }
+        Ok(())
+    }
+}

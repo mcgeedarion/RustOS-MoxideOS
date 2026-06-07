@@ -133,3 +133,26 @@ pub fn keyboard_tick() {
         }
     }
 }
+
+/// Placeholder TTY scheme adapter for scheme-table registration.
+pub struct TtyScheme;
+
+impl TtyScheme {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for TtyScheme {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}
