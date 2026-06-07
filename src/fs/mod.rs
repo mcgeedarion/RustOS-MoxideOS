@@ -51,6 +51,7 @@ pub mod ramfs;
 pub mod scheme_fd; // new: scheme backing-fd store + dispatch helpers
 pub mod scheme_table;
 pub mod shm;
+pub mod signalfd;
 pub mod splice;
 pub mod stat_syscalls;
 pub mod sysfs;
