@@ -1,12 +1,4 @@
 //! Kernel-wide error type.
-//!
-//! [`KernelError`] is the single error enum that all kernel subsystems
-//! should return.  Using one type avoids the "error tower" problem where
-//! every layer defines its own error and callers must `.map_err` at every
-//! boundary.
-//!
-//! The variants are coarse-grained on purpose: fine-grained context lives
-//! in the call-site log or in the debug payload carried by some variants.
 
 use core::fmt;
 
@@ -16,39 +8,28 @@ use core::fmt;
 pub enum KernelError {
     /// Physical or virtual memory exhausted.
     OutOfMemory,
-    /// Address is not aligned to the required boundary.
     BadAlignment,
-    /// Address or range falls outside a valid region.
     BadAddress,
-    /// Integer or pointer arithmetic would overflow.
     Overflow,
 
     /// Caller supplied an invalid argument.
     InvalidArgument,
-    /// Operation is not permitted for the calling context.
     PermissionDenied,
-    /// The requested resource does not exist.
     NotFound,
-    /// The resource already exists.
     AlreadyExists,
 
     /// An underlying hardware or firmware operation failed.
     IoError,
-    /// A device is not ready or not present.
     DeviceNotReady,
-    /// A timeout elapsed before the operation completed.
     Timeout,
 
     /// A lock or resource is currently held by another owner.
     WouldBlock,
-    /// A deadlock was detected or is imminent.
     Deadlock,
 
     /// The subsystem or object has not been initialised yet.
     NotInitialised,
-    /// An operation was attempted in an invalid state.
     InvalidState,
-    /// Internal kernel invariant violated (should trigger a panic in debug).
     InternalError,
 
     /// Wrap a raw POSIX errno for syscall return paths.
