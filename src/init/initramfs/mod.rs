@@ -80,9 +80,9 @@ pub fn load() -> InitramfsHandle<'static> {
     let len = INITRAMFS_LEN.load(Ordering::Relaxed);
 
     if pa == 0 || len == 0 {
-        crate::println!("initramfs: FATAL: initramfs physical address not set.");
-        crate::println!("initramfs: Pass -initrd <file> to QEMU and ensure");
-        crate::println!("initramfs: the boot stub calls set_initramfs_range().");
+        crate::kprintln!("initramfs: FATAL: initramfs physical address not set.");
+        crate::kprintln!("initramfs: Pass -initrd <file> to QEMU and ensure");
+        crate::kprintln!("initramfs: the boot stub calls set_initramfs_range().");
         loop {
             #[cfg(target_arch = "riscv64")]
             unsafe {
@@ -101,12 +101,12 @@ pub fn load() -> InitramfsHandle<'static> {
     let cpio: &'static [u8] = unsafe { core::slice::from_raw_parts(pa as *const u8, len) };
 
     if cpio.len() < HEADER_LEN || &cpio[..6] != NEWC_MAGIC {
-        crate::println!(
+        crate::kprintln!(
             "initramfs: WARN: cpio magic not found at {:#x} (len={})",
             pa,
             len
         );
-        crate::println!(
+        crate::kprintln!(
             "initramfs: the archive may be compressed — pass an uncompressed cpio to QEMU."
         );
     }

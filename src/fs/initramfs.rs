@@ -100,7 +100,7 @@ pub fn mount_initramfs() {
     }
 
     MOUNTED.store(true, Ordering::Release);
-    crate::println!(
+    crate::kprintln!(
         "initramfs: mounted {} entries into VFS",
         count_entries(&handle)
     );

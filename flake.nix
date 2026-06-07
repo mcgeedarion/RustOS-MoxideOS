@@ -26,7 +26,7 @@
         # Centralized version and toolchain date
         # -----------------------------------------------------------------------
         version = "0.2.0";
-        nightlyDate = "2025-05-15";
+        nightlyDate = "2026-06-07";
 
         rustToolchain = pkgs.rust-bin.nightly.${nightlyDate}.default.override {
           extensions = [

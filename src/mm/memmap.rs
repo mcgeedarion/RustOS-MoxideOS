@@ -80,7 +80,7 @@ fn phys_to_virt(pa: u64) -> usize {
 // compatibility layer if needed by existing callers.
 
 pub fn memmap_init() {
-    crate::log::kprintln!(
+    crate::kprintln!(
         "pmm: {} MiB total, {} MiB free",
         crate::mm::pmm::total_pages() * 4 / 1024,
         crate::mm::pmm::free_pages() * 4 / 1024,

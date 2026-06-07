@@ -150,7 +150,7 @@ pub fn tmpfs_mount(mount_point: &str, size_limit: usize) {
     let mut map = MOUNTS.lock();
     map.entry(mount_point.to_string())
         .or_insert_with(|| TmpfsMount::new(size_limit));
-    crate::arch::x86_64::serial::serial_println!(
+    crate::serial_println!(
         "tmpfs: mounted {} (limit={} bytes)",
         mount_point,
         if size_limit == 0 {

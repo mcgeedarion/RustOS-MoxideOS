@@ -20,17 +20,17 @@ fn halt_loop() -> ! {
 fn panic(info: &core::panic::PanicInfo) -> ! {
     Arch::disable();
     crate::smp::ipi::halt_all_except_self();
-    Arch::serial_write(b"\r\n\r\n*** KERNEL PANIC ***\r\n");
+    serial_write(b"\r\n\r\n*** KERNEL PANIC ***\r\n");
     if let Some(loc) = info.location() {
-        Arch::serial_write(b"Location: ");
-        Arch::serial_write(loc.file().as_bytes());
-        Arch::serial_write(b":");
+        serial_write(b"Location: ");
+        serial_write(loc.file().as_bytes());
+        serial_write(b":");
         serial_u64(loc.line() as u64);
-        Arch::serial_write(b"\r\n");
+        serial_write(b"\r\n");
     }
-    Arch::serial_write(b"Message:  ");
+    serial_write(b"Message:  ");
     let _ = write!(ArchSerialWriter, "{}", info.message());
-    Arch::serial_write(b"\r\n");
+    serial_write(b"\r\n");
     halt_loop()
 }
 
@@ -38,20 +38,26 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 #[cold]
 fn alloc_error(layout: core::alloc::Layout) -> ! {
     Arch::disable();
-    Arch::serial_write(b"\r\n*** OOM: alloc_error ***\r\n");
-    Arch::serial_write(b"Requested size:  ");
+    serial_write(b"\r\n*** OOM: alloc_error ***\r\n");
+    serial_write(b"Requested size:  ");
     serial_u64(layout.size() as u64);
-    Arch::serial_write(b"\r\nRequested align: ");
+    serial_write(b"\r\nRequested align: ");
     serial_u64(layout.align() as u64);
-    Arch::serial_write(b"\r\n");
+    serial_write(b"\r\n");
     halt_loop()
 }
 
 struct ArchSerialWriter;
 impl Write for ArchSerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        Arch::serial_write(s.as_bytes());
+        serial_write(s.as_bytes());
         Ok(())
+    }
+}
+
+fn serial_write(bytes: &[u8]) {
+    for &b in bytes {
+        Arch::serial_putc(b);
     }
 }
 
@@ -67,5 +73,5 @@ fn serial_u64(mut n: u64) {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
     }
-    Arch::serial_write(&buf[i..]);
+    serial_write(&buf[i..]);
 }

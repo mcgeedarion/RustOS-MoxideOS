@@ -113,7 +113,7 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
         return;
     }
 
-    crate::println!("mb2: MBI at {:#x}, {} bytes", mbi_ptr, total_size);
+    crate::kprintln!("mb2: MBI at {:#x}, {} bytes", mbi_ptr, total_size);
 
     let mut off: usize = 8; // skip fixed header (total_size + reserved)
     let base = mbi_ptr;
@@ -141,7 +141,7 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
                     // We accept any module (take the first one as the initrd).
                     let len = mod_end.saturating_sub(mod_start);
                     if mod_start != 0 && len > 0 {
-                        crate::println!(
+                        crate::kprintln!(
                             "mb2: module tag: initrd at {:#x}..{:#x} ({} bytes)",
                             mod_start,
                             mod_end,
@@ -175,7 +175,7 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
                                 // The PMM's add_region() is responsible for
                                 // filtering pages that are already in use.
                                 crate::mm::pmm::add_region(base_addr, length);
-                                crate::println!(
+                                crate::kprintln!(
                                     "mb2: usable RAM {:#x}..{:#x} ({} MiB)",
                                     base_addr,
                                     base_addr + length,

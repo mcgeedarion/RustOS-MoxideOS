@@ -89,17 +89,17 @@ fn run_range(tests: &[kmtest::KmTestEntry], start: usize, end: usize) -> isize {
         total += 1;
         match result {
             Ok(()) => {
-                serial_println!("KMTEST  PASS  {}", entry.name);
+                crate::serial_println!("KMTEST  PASS  {}", entry.name);
             },
             Err(msg) => {
-                serial_println!("KMTEST  FAIL  {} \u{2014} {}", entry.name, msg);
+                crate::serial_println!("KMTEST  FAIL  {} \u{2014} {}", entry.name, msg);
                 failures += 1;
             },
         }
     }
 
     let passed = total - failures;
-    serial_println!("KMTEST  DONE  {}/{} passed", passed, total);
+    crate::serial_println!("KMTEST  DONE  {}/{} passed", passed, total);
 
     failures as isize
 }
