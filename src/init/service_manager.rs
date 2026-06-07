@@ -1,10 +1,4 @@
 //! Minimal userspace service supervisor for the hybrid service plane.
-//!
-//! The kernel keeps only lifecycle metadata here.  PID 1 or the initramfs
-//! loader still decides which binaries belong in userspace; this module records
-//! those launches, associates capabilities, and marks restartable services as
-//! pending when they exit so init can relaunch them without rebooting the
-//! kernel.
 
 extern crate alloc;
 
