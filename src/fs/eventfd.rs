@@ -127,6 +127,15 @@ pub fn eventfd_close(fd: usize) {
     EVENTFDS.lock().remove(&fd);
 }
 
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_efd(fd: usize) {
+    eventfd_close(fd);
+}
+
+/// Duplicate hook for process-local fd aliases. Eventfd state is shared by the
+/// backing fd.
+pub fn efd_dup(_fd: usize) {}
+
 /// Poll readiness bitmask: bit 0 = POLLIN, bit 2 = POLLOUT.
 pub fn eventfd_poll(fd: usize) -> u32 {
     let map = EVENTFDS.lock();

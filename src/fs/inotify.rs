@@ -281,6 +281,19 @@ pub fn inotify_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_inotify(fdno: usize) {
+    if crate::fs::scheme_fd::is_scheme_fd(fdno) {
+        crate::fs::scheme_fd::scheme_fd_close(fdno);
+    } else {
+        inotify_close(fdno);
+    }
+}
+
+/// Duplicate hook for process-local fd aliases. Inotify state is shared by the
+/// backing fd.
+pub fn inotify_dup(_fdno: usize) {}
+
 pub fn is_inotify_fd(fdno: usize) -> bool {
     fdno >= INOTIFY_FD_BASE && TABLE.lock().contains_key(&fdno)
 }

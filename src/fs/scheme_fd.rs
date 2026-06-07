@@ -83,6 +83,12 @@ pub fn is_scheme_fd(backing_fd: usize) -> bool {
     SCHEME_FD_STORE.contains(backing_fd)
 }
 
+/// Clone the registered scheme/fid pair for compatibility callers that need
+/// to translate a synthetic backing fd back to a scheme-local file id.
+pub fn scheme_fd_get_fid(backing_fd: usize) -> Option<(Arc<dyn Scheme>, SchemeFileId)> {
+    SCHEME_FD_STORE.get(backing_fd)
+}
+
 /// Read up to `buf.len()` bytes from the scheme fd.
 pub fn scheme_fd_read(backing_fd: usize, buf: &mut [u8]) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {

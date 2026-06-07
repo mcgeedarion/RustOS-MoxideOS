@@ -23,7 +23,7 @@ pub mod sleep;
 use core::mem::size_of;
 use core::slice;
 
-use crate::console::println;
+use crate::println;
 
 #[repr(C, packed)]
 pub struct RsdpV1 {

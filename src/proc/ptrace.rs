@@ -180,11 +180,11 @@ pub fn apply_user_regs_pub(kstack_top: usize, regs: &[u64; UREG_COUNT]) {
 /// this thin wrapper is kept here so signal.rs / proc_debug.rs can call it
 /// without depending on the syscall crate directly.
 pub fn sys_ptrace(req: i32, pid: i32, addr: usize, data: usize) -> isize {
-    crate::syscall::stubs::sys_ptrace_impl(req, pid, addr, data)
+    crate::syscall::sys_ptrace_impl(req, pid, addr, data)
 }
 
 pub fn ptrace_syscall_stop() {
-    let pid = scheduler::current_pid();
+    let pid = scheduler::current_pid() as usize;
     let (tracer, options) = match scheduler::with_proc(pid, |p| p.ptrace_state) {
         Some(PtraceState::Tracee {
             tracer,

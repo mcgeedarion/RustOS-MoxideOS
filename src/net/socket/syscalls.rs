@@ -82,6 +82,15 @@ fn alloc_socket_pair_slot(conn: UnixConn) -> isize {
     -24
 }
 
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_socket(fd: usize) {
+    socket_close(fd);
+}
+
+/// Duplicate hook for process-local fd aliases. Socket state is shared by the
+/// backing fd.
+pub fn socket_dup(_fd: usize) {}
+
 pub fn socket_close(fd: usize) {
     let mut sockets = SOCKETS.lock();
     if let Some(Some(sock)) = sockets.get_mut(fd) {

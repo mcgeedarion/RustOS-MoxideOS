@@ -6,6 +6,16 @@ use core::arch::asm;
 
 use super::mem_layout::{mair, page, pte, tcr};
 
+pub const PTE_VALID: usize = pte::VALID;
+pub const PTE_TABLE: usize = pte::TABLE;
+pub const PTE_USER: usize = pte::AP_RW_EL0;
+pub const PTE_USER_RO: usize = pte::AP_RO_EL0;
+pub const PTE_AF: usize = pte::AF;
+pub const PTE_SH_INNER: usize = pte::SH_INNER;
+pub const PTE_NORMAL: usize = pte::ATTR_NORMAL;
+pub const PTE_UXN: usize = pte::UXN;
+pub const PTE_PXN: usize = pte::PXN;
+
 static mut KERNEL_TTBR1: usize = 0;
 
 #[inline]
@@ -44,6 +54,11 @@ pub unsafe fn init_mmu(root_pa: usize) {
         out("x9") _,
         options(nostack),
     );
+}
+
+/// Map a single 4 KiB page into the supplied AArch64 translation table root.
+pub unsafe fn map_page(root_pa: usize, va: usize, pa: usize, flags: usize) {
+    map_page_into(root_pa, va, pa, flags);
 }
 
 pub fn map_page_into(root_pa: usize, va: usize, pa: usize, flags: usize) {

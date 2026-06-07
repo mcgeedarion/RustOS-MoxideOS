@@ -22,7 +22,7 @@
 //! Because we don't have a full AML interpreter we model the GPE handler as a
 //! simple callback that calls out to `crate::drivers::pcie::rescan()`.
 
-use crate::console::println;
+use crate::println;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const FADT_OFF_GPE0_BLK: usize = 80;

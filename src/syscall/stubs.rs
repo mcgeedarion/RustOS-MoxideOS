@@ -452,7 +452,7 @@ fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Resul
 }
 
 /// NR 101  ptrace(request, pid, addr, data)
-pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
+pub(crate) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
     use crate::mm::pmm::PAGE_SIZE;
     use crate::proc::ptrace::{
         apply_user_regs_pub, build_user_regs_pub, PtraceState, FRAME_SZ, PTRACE_ATTACH,

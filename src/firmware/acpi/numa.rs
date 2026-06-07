@@ -15,7 +15,7 @@
 //! - A flat distance matrix indexed `[from][to]` where 10 = local access.
 
 use super::SdtHeader;
-use crate::console::println;
+use crate::println;
 
 pub const MAX_NODES: usize = 8;
 const MAX_MEM_RANGES: usize = 16;
