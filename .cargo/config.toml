@@ -1,5 +1,5 @@
 [alias]
-extask = "run --manifest-path xtask/Cargo.toml --"
+xtask = "run --target x86_64-unknown-linux-gnu -p xtask --"
 
 # Default target is overridden per-invocation by xtask via --target.
 # This fallback keeps `cargo build` (without xtask) pointing at the
@@ -7,7 +7,3 @@ extask = "run --manifest-path xtask/Cargo.toml --"
 # host triple.  Change to whichever arch you're actively working on.
 [build]
 target = "targets/riscv64-uefi-loader.json"
-
-[unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]

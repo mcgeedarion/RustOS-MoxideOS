@@ -52,8 +52,8 @@ pub fn init() {
         let e1000e_ids = [DEV_E1000E_82574L, DEV_E1000E_82574L2, DEV_E1000E_82583V];
         for &dev_id in &e1000e_ids {
             if let Some(dev) = pci::find(VENDOR_INTEL, dev_id) {
-                let bar0 = dev.bar[0];
-                let bar1 = dev.bar[1];
+                let bar0 = dev.bars[0];
+                let bar1 = dev.bars[1];
                 // BAR0 low bits: bit0=0 (MMIO), bits[2:1]=10 (64-bit)
                 let mmio_base: u64 = ((bar1 as u64) << 32) | ((bar0 as u64) & !0xF);
                 crate::serial_println!(
@@ -75,7 +75,7 @@ pub fn init() {
         let vnet_ids = [DEV_VIRTIO_NET_LEG, DEV_VIRTIO_NET_T];
         for &dev_id in &vnet_ids {
             if let Some(dev) = pci::find(VENDOR_VIRTIO, dev_id) {
-                let iobase: u16 = (dev.bar[0] & !0x3) as u16;
+                let iobase: u16 = (dev.bars[0] & !0x3) as u16;
                 crate::serial_println!(
                     "[nic] virtio-net {:04x}:{:04x} at {:02x}:{:02x}.{} iobase={:#x}",
                     VENDOR_VIRTIO,

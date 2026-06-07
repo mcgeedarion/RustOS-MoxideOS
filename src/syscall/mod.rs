@@ -67,8 +67,8 @@ include!("stubs.rs");
 include!("posix_full.rs");
 
 // Re-export helpers needed by posix_full.rs
-pub(crate) use self::sys_pwrite64_impl;
-pub(crate) use self::sys_readv_impl;
+pub(crate) use crate::fs::io_syscalls::sys_pwrite64 as sys_pwrite64_impl;
+pub(crate) use crate::fs::io_syscalls::sys_readv as sys_readv_impl;
 
 /// Resolve a dirfd + path_va pair the same way stubs.rs does.
 pub(crate) fn stubs_at_path(dirfd: i32, path_va: usize) -> Option<String> {

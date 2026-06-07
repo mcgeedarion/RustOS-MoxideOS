@@ -68,14 +68,12 @@ pub fn putc(b: u8) {
 
 /// GUESS: 16550 RX read. Polls LSR bit 0 (DR). Returns None when empty.
 pub fn getc() -> Option<u8> {
-    use x86_64::instructions::port::Port;
-    const COM1: u16 = 0x3F8;
     unsafe {
-        let lsr: u8 = Port::<u8>::new(COM1 + 5).read();
+        let lsr = inb(S::COM1_BASE + S::OFF_LSR);
         if lsr & 1 == 0 {
             return None;
         }
-        Some(Port::<u8>::new(COM1).read())
+        Some(inb(S::COM1_BASE))
     }
 }
 

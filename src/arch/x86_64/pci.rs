@@ -321,7 +321,7 @@ pub fn init() {
                 });
                 count += 1;
 
-                crate::println!(
+                crate::kprintln!(
                     "pci: {:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}/{:02x}/{:02x} irq {} msix_cap={:#x}",
                     bus, dev, func, vendor, device_id, class, subclass, prog_if, irq_line, msix_cap
                 );
@@ -339,5 +339,5 @@ pub fn init() {
         }
     }
 
-    crate::println!("pci: enumerated {} function(s)", count);
+    crate::kprintln!("pci: enumerated {} function(s)", count);
 }

@@ -24,7 +24,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use super::ecam::set_base;
-use super::enumerate::scan_all;
 use super::{devices, find, PciDevice};
 
 /// Zero-sized token representing the PCI bus manager.
@@ -43,7 +42,8 @@ impl PciBus {
     /// address space.
     pub unsafe fn init(ecam_base: u64) {
         set_base(ecam_base);
-        scan_all();
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::pci::init();
     }
 
     /// Return a snapshot of all discovered PCI devices.
@@ -75,6 +75,7 @@ impl PciBus {
 
     /// Re-run bus enumeration (e.g., after a hot-plug event).
     pub fn rescan() {
-        scan_all();
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::pci::init();
     }
 }

@@ -26,7 +26,7 @@
 # Current blockers: naked_functions (tracked above), abi_x86_interrupt
 
 [toolchain]
-channel = "nightly-2025-05-15"
+channel = "nightly-2026-06-07"
 profile = "minimal"
 components = [
   "rust-src",            # required by -Z build-std

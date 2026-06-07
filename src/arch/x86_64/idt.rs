@@ -521,7 +521,7 @@ pub extern "C" fn generic_irq_dispatch(frame: &mut InterruptFrame, vector: u64) 
     if let Some(h) = handler {
         h(frame);
     } else {
-        crate::console::println!("[IDT] spurious IRQ vector={:#x} — no handler registered", v);
+        crate::kprintln!("[IDT] spurious IRQ vector={:#x} — no handler registered", v);
         crate::arch::x86_64::apic::send_eoi();
     }
 }
@@ -532,7 +532,7 @@ pub extern "C" fn generic_exception_handler(frame: &mut InterruptFrame, vector: 
         .get(vector as usize)
         .copied()
         .unwrap_or("UNKNOWN");
-    crate::console::println!(
+    crate::kprintln!(
         "[EXCEPTION] #{} (vec={:#x}) err={:#x} rip={:#x} rsp={:#x} rflags={:#x}",
         mnemonic,
         vector,
@@ -556,7 +556,7 @@ pub extern "C" fn generic_exception_handler(frame: &mut InterruptFrame, vector: 
 
 #[no_mangle]
 pub extern "C" fn nmi_handler(frame: &mut InterruptFrame) {
-    crate::console::println!("[NMI] rip={:#x} rsp={:#x}", frame.rip, frame.rsp);
+    crate::kprintln!("[NMI] rip={:#x} rsp={:#x}", frame.rip, frame.rsp);
     // TODO: inspect NMI source (ECC, watchdog, IOCK#).
 }
 
@@ -635,7 +635,7 @@ pub extern "C" fn page_fault_handler(frame: &mut InterruptFrame, faulting_va: u6
     }
 
     let pid = crate::proc::scheduler::current_pid();
-    crate::console::println!(
+    crate::kprintln!(
         "[#PF] pid={} va={:#x} err={:#x} present={} user={} rip={:#x}",
         pid,
         va,
@@ -656,35 +656,35 @@ pub extern "C" fn page_fault_handler(frame: &mut InterruptFrame, faulting_va: u6
 }
 
 fn dump_registers(f: &InterruptFrame) {
-    crate::console::println!(
+    crate::kprintln!(
         "  rax={:#018x} rbx={:#018x} rcx={:#018x} rdx={:#018x}",
         f.rax,
         f.rbx,
         f.rcx,
         f.rdx
     );
-    crate::console::println!(
+    crate::kprintln!(
         "  rsi={:#018x} rdi={:#018x} rbp={:#018x} rsp={:#018x}",
         f.rsi,
         f.rdi,
         f.rbp,
         f.rsp
     );
-    crate::console::println!(
+    crate::kprintln!(
         "  r8 ={:#018x} r9 ={:#018x} r10={:#018x} r11={:#018x}",
         f.r8,
         f.r9,
         f.r10,
         f.r11
     );
-    crate::console::println!(
+    crate::kprintln!(
         "  r12={:#018x} r13={:#018x} r14={:#018x} r15={:#018x}",
         f.r12,
         f.r13,
         f.r14,
         f.r15
     );
-    crate::console::println!("  rip={:#018x} rflags={:#018x}", f.rip, f.rflags);
+    crate::kprintln!("  rip={:#018x} rflags={:#018x}", f.rip, f.rflags);
 }
 
 static EXCEPTION_NAMES: &[&str] = &[

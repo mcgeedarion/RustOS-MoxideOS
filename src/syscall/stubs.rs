@@ -8,10 +8,10 @@ use crate::fs::path::resolve_path;
 use crate::proc::scheduler;
 
 // Named errno helpers — all sourced from the shared errno module.
-use super::errno::{ebadf, efault, einval, enosys, enotsup, erange, esrch};
+use crate::syscall::errno::{ebadf, enotsup, erange, esrch};
 
 // Named signal numbers.
-use super::signal_nr::{SIGKILL, SIGSTOP};
+use crate::syscall::signal_nr::{SIGKILL, SIGSTOP};
 
 pub(super) const AT_FDCWD_STUBS: i32 = -100;
 
@@ -427,7 +427,7 @@ fn ptrace_resolve_remote_pa(pid: i32, addr: usize) -> Result<usize, isize> {
 /// `Err(EPERM)`  if the caller attempts to trace itself.
 #[inline]
 fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> {
-    use super::errno::eperm;
+    use crate::syscall::errno::eperm;
     if target_pid as usize == caller {
         return Err(eperm());
     }

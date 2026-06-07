@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "xtask",
     "crates/scheme-api",
     "crates/kmtest",
     "crates/kmtest-macros",

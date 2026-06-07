@@ -77,8 +77,8 @@ pub fn find(vendor: u16, device_id: u16) -> Option<PciDevice> {
 }
 
 /// Configure an MSI-X vector.  Delegates to `device::pci::msix`.
-pub fn msix_configure(d: &PciDevice, vec_idx: usize, lapic_id: u32, vector: u8, data: u32) {
-    _msix_configure(d, vec_idx, lapic_id, vector, data);
+pub fn msix_configure(d: &PciDevice, vec_idx: usize, lapic_id: u32, vector: u8) {
+    _msix_configure(d, vec_idx, lapic_id, vector);
 }
 
 // ===== GUESS: alias for kernel_main bring-up =====

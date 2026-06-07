@@ -307,9 +307,9 @@ pub unsafe fn parse_slit() {
 }
 
 fn print_distance_row(node: usize, row: &[u8]) {
-    crate::console::print!("  node {} distances: ", node);
+    crate::kprint!("  node {} distances: ", node);
     for d in row {
-        crate::console::print!("{:3} ", d);
+        crate::kprint!("{:3} ", d);
     }
     println!();
 }

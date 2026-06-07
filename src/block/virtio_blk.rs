@@ -96,6 +96,7 @@ struct VirtqUsed {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct BlkReqHeader {
     type_: u32,
     _reserved: u32,

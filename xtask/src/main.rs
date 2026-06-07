@@ -205,7 +205,7 @@ fn target_json(root: &Path, arch: Arch, boot: Boot) -> PathBuf {
         (Arch::AArch64, Boot::Sbi) => "aarch64-kernel.json",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader.json",
         (Arch::RiscV64, Boot::Sbi) => "riscv64-kernel.json",
-        (Arch::X86_64, Boot::Uefi) => "x86_64-uefi-loader.json",
+        (Arch::X86_64, Boot::Uefi) => "x86_64-kernel.json",
         (Arch::X86_64, Boot::Sbi) => "x86_64-kernel.json",
     };
     root.join("targets").join(name)
@@ -217,7 +217,7 @@ fn target_dir_name(arch: Arch, boot: Boot) -> &'static str {
         (Arch::AArch64, Boot::Sbi) => "aarch64-kernel",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
         (Arch::RiscV64, Boot::Sbi) => "riscv64gc-unknown-none-elf",
-        (Arch::X86_64, Boot::Uefi) => "x86_64-uefi-loader",
+        (Arch::X86_64, Boot::Uefi) => "x86_64-kernel",
         (Arch::X86_64, Boot::Sbi) => "x86_64-kernel",
     }
 }
@@ -226,7 +226,7 @@ fn efi_boot_filename(arch: Arch) -> &'static str {
     match arch {
         Arch::AArch64 => "BOOTAA64.EFI",
         Arch::RiscV64 => "BOOTRISCV64.EFI",
-        Arch::X86_64 => "BOOTx64.EFI",
+        Arch::X86_64 => "BOOTX64.EFI",
     }
 }
 
@@ -274,7 +274,7 @@ fn cargo() -> Command {
     Command::new(cargo)
 }
 
-fn run(mut cmd: Command) -> Result<()> {
+fn run(cmd: &mut Command) -> Result<()> {
     log(format!("running: {:?}", cmd));
     let status = cmd.status().context("failed to spawn command")?;
     if !status.success() {
@@ -283,7 +283,7 @@ fn run(mut cmd: Command) -> Result<()> {
     Ok(())
 }
 
-fn run_optional(mut cmd: Command) -> bool {
+fn run_optional(cmd: &mut Command) -> bool {
     log(format!("running (optional): {:?}", cmd));
     match cmd.status() {
         Ok(s) if s.success() => true,
@@ -592,35 +592,52 @@ fn build_with_target_json(root: &Path, opts: &BuildOpts) -> Result<()> {
             "build-std=core,alloc,compiler_builtins",
             "-Z",
             "build-std-features=compiler-builtins-mem",
+            "-Z",
+            "json-target-spec",
         ]);
 
     if let Some(ref feats) = opts.features {
         cmd.arg("--features").arg(feats);
-    } else {
-        cmd.arg("--no-default-features");
+    } else if opts.arch == Arch::X86_64 && opts.boot == Boot::Uefi {
+        cmd.arg("--features").arg("uefi_boot");
     }
 
     if !opts.debug {
         cmd.arg("--release");
     }
-    run(cmd)?;
+    run(&mut cmd)?;
 
     if opts.boot == Boot::Uefi {
         let bin_name = efi_boot_filename(opts.arch);
         let src_efi = binary_path(root, opts.arch, opts.boot, profile, "rustos.efi");
         let src_elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
-        let src = if src_efi.exists() { src_efi } else { src_elf };
-
-        if !src.exists() {
-            bail!("EFI binary not found under target/{target_dir}/{profile}/");
-        }
-
         let esp = esp_boot_dir(root);
         fs::create_dir_all(&esp).context("create esp dir")?;
         let dest = esp.join(bin_name);
-        fs::copy(&src, &dest).context("copy EFI binary")?;
-        log(format!("Built:     {}", src.display()));
-        log(format!("Installed: {}", dest.display()));
+
+        if opts.arch == Arch::X86_64 {
+            if !src_elf.exists() {
+                bail!("kernel ELF not found under target/{target_dir}/{profile}/");
+            }
+            let objcopy = require_tool(
+                &["llvm-objcopy", "rust-objcopy", "objcopy"],
+                "apt install llvm binutils",
+            );
+            run(Command::new(&objcopy)
+                .args(["--target=efi-app-x86_64", "--subsystem=10"])
+                .arg(&src_elf)
+                .arg(&dest))?;
+            log(format!("Built ELF: {}", src_elf.display()));
+            log(format!("Installed EFI: {}", dest.display()));
+        } else {
+            let src = if src_efi.exists() { src_efi } else { src_elf };
+            if !src.exists() {
+                bail!("EFI binary not found under target/{target_dir}/{profile}/");
+            }
+            fs::copy(&src, &dest).context("copy EFI binary")?;
+            log(format!("Built:     {}", src.display()));
+            log(format!("Installed: {}", dest.display()));
+        }
     } else {
         let elf = binary_path(root, opts.arch, opts.boot, profile, "rustos");
         log(format!("Built: {}", elf.display()));

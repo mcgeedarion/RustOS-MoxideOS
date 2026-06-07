@@ -158,13 +158,12 @@ cd "$ROOT_DIR"
 # Resolve cargo target and ELF path.
 case "$ARCH" in
   x86_64)
-    # Both UEFI and multiboot paths compile from the same x86_64-unknown-none
-    # target with the default feature set; entry points (uefi_entry.rs vs
-    # multiboot2_entry.rs) are unconditionally compiled in src/main.rs and
-    # selected by the firmware/loader, not by Cargo features.
-    CARGO_TARGET="x86_64-unknown-none"
+    # Keep the smoke path focused on the single supported bring-up target:
+    # x86_64 UEFI.  Build a normal ELF first, then deterministically convert it
+    # into target/esp/EFI/BOOT/BOOTX64.EFI after cargo succeeds.
+    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"
     CARGO_EXTRA_FLAGS=()
-    KERNEL_ELF="target/${CARGO_TARGET}/${PROFILE}/rustos"
+    KERNEL_ELF="target/x86_64-kernel/${PROFILE}/rustos"
     QEMU_BIN="qemu-system-x86_64"
     ;;
   aarch64)
@@ -191,11 +190,18 @@ CARGO_BUILD_FLAGS=(
   "${CARGO_EXTRA_FLAGS[@]}"
   -Z build-std=core,alloc,compiler_builtins
   -Z build-std-features=compiler-builtins-mem
+  -Z json-target-spec
 )
 [[ "$RELEASE_MODE" -eq 1 ]] && CARGO_BUILD_FLAGS+=(--release)
-[[ "$TEST_MODE"    -eq 1 ]] && CARGO_BUILD_FLAGS+=(--features kmtest)
+if [[ "$TEST_MODE" -eq 1 ]]; then
+  CARGO_BUILD_FLAGS+=(--features kmtest)
+elif [[ "$ARCH" == "x86_64" && "$BOOT" == "uefi" ]]; then
+  CARGO_BUILD_FLAGS+=(--features uefi_boot)
+fi
 
-echo "[*] Building rustos (${ARCH}, ${BOOT}, ${PROFILE}${TEST_MODE:+, kmtest})..."
+BUILD_LABEL="${ARCH}, ${BOOT}, ${PROFILE}"
+[[ "$TEST_MODE" -eq 1 ]] && BUILD_LABEL+=", kmtest"
+echo "[*] Building rustos (${BUILD_LABEL})..."
 cargo build "${CARGO_BUILD_FLAGS[@]}"
 
 if [[ ! -f "$KERNEL_ELF" ]]; then
@@ -203,6 +209,27 @@ if [[ ! -f "$KERNEL_ELF" ]]; then
   exit 1
 fi
 echo "[*] Kernel: $(file "${KERNEL_ELF}")"
+
+if [[ "$ARCH" == "x86_64" && "$BOOT" == "uefi" ]]; then
+  ESP_BOOT_DIR="${ROOT_DIR}/target/esp/EFI/BOOT"
+  EFI_IMAGE="${ESP_BOOT_DIR}/BOOTX64.EFI"
+  OBJCOPY_BIN="${OBJCOPY:-}"
+  if [[ -z "$OBJCOPY_BIN" ]]; then
+    if command -v llvm-objcopy >/dev/null 2>&1; then
+      OBJCOPY_BIN="llvm-objcopy"
+    elif command -v rust-objcopy >/dev/null 2>&1; then
+      OBJCOPY_BIN="rust-objcopy"
+    elif command -v objcopy >/dev/null 2>&1; then
+      OBJCOPY_BIN="objcopy"
+    else
+      echo "[!] llvm-objcopy, rust-objcopy, or objcopy is required for x86_64 UEFI" >&2
+      exit 1
+    fi
+  fi
+  mkdir -p "$ESP_BOOT_DIR"
+  "$OBJCOPY_BIN" --target=efi-app-x86_64 --subsystem=10 "$KERNEL_ELF" "$EFI_IMAGE"
+  echo "[*] UEFI image: $(file "${EFI_IMAGE}")"
+fi
 
 # Build the userspace kmtest runner when in --test mode.
 if [[ "$TEST_MODE" -eq 1 ]]; then
