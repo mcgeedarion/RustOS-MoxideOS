@@ -48,7 +48,6 @@ impl PerCpuBlock {
     #[inline]
     pub unsafe fn read_slot(&self, index: usize) -> usize {
         debug_assert!(index < MAX_CPU_LOCAL_SLOTS);
-        // SAFETY: caller guarantees preemption is disabled.
         unsafe { *self.slots[index].get() }
     }
 
@@ -56,7 +55,6 @@ impl PerCpuBlock {
     #[inline]
     pub unsafe fn write_slot(&self, index: usize, value: usize) {
         debug_assert!(index < MAX_CPU_LOCAL_SLOTS);
-        // SAFETY: caller guarantees exclusive access.
         unsafe { *self.slots[index].get() = value };
     }
 }
@@ -68,7 +66,6 @@ pub struct CpuLocalKey {
 }
 
 impl CpuLocalKey {
-    /// Construct from a static slot index.  Only call from `cpu_local_key!`.
     #[doc(hidden)]
     pub const fn new(index: usize) -> Self {
         Self { index }
@@ -93,7 +90,6 @@ pub struct CpuLocal<T: Copy + 'static> {
 unsafe impl<T: Copy + 'static> Sync for CpuLocal<T> {}
 
 impl<T: Copy + 'static> CpuLocal<T> {
-    /// Create a new accessor for `key`.
     pub const fn new(key: CpuLocalKey) -> Self {
         Self {
             key,
@@ -106,7 +102,6 @@ impl<T: Copy + 'static> CpuLocal<T> {
     pub unsafe fn get(&self) -> T {
         let block = unsafe { current_cpu_block() };
         let raw = unsafe { (*block).read_slot(self.key.index) };
-        // SAFETY: caller guarantees T was stored as a usize-compatible repr.
         unsafe { core::mem::transmute_copy(&raw) }
     }
 
@@ -125,7 +120,6 @@ pub unsafe fn current_cpu_block() -> *mut PerCpuBlock {
     #[cfg(target_arch = "x86_64")]
     {
         let ptr: *mut PerCpuBlock;
-        // Read self-pointer from GS base offset 0.
         unsafe {
             core::arch::asm!(
                 "mov {ptr}, gs:[0]",
@@ -139,7 +133,6 @@ pub unsafe fn current_cpu_block() -> *mut PerCpuBlock {
     #[cfg(target_arch = "riscv64")]
     {
         let ptr: *mut PerCpuBlock;
-        // `tp` holds the PerCpuBlock pointer on riscv64.
         unsafe {
             core::arch::asm!(
                 "mv {ptr}, tp",
