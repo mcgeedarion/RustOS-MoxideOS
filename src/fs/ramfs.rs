@@ -944,8 +944,17 @@ pub fn tmpfs_anon_stat(full_path: &str) -> Result<crate::fs::vfs_ops::KStat, isi
     })
 }
 
-/// Placeholder scheme adapter used to keep boot-time scheme registration wired
-/// while the concrete `RamFs` URL dispatch is implemented.
+struct RamSchemeFd {
+    path: String,
+    offset: usize,
+    readable: bool,
+    writable: bool,
+}
+
+static RAM_SCHEME_FDS: Mutex<BTreeMap<u64, RamSchemeFd>> = Mutex::new(BTreeMap::new());
+static RAM_SCHEME_NEXT_FID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Scheme adapter for `ram:<path>` URLs.
 pub struct RamFs;
 
 impl RamFs {
@@ -954,16 +963,157 @@ impl RamFs {
     }
 }
 
+fn ram_scheme_path(path: &str) -> String {
+    if path.is_empty() {
+        String::from("/")
+    } else if path.starts_with('/') {
+        String::from(path)
+    } else {
+        format!("/{}", path)
+    }
+}
+
+fn ram_scheme_error(errno: isize) -> scheme_api::SchemeError {
+    match errno {
+        -2 => scheme_api::SchemeError::NotFound,
+        -13 => scheme_api::SchemeError::PermissionDenied,
+        -22 => scheme_api::SchemeError::InvalidArg,
+        -11 => scheme_api::SchemeError::WouldBlock,
+        _ => scheme_api::SchemeError::Io,
+    }
+}
+
+fn ram_scheme_access(flags: scheme_api::OpenFlags) -> (bool, bool) {
+    let write = flags.intersects(
+        scheme_api::OpenFlags::WRITE
+            | scheme_api::OpenFlags::CREATE
+            | scheme_api::OpenFlags::TRUNCATE
+            | scheme_api::OpenFlags::APPEND,
+    );
+    let read = flags.contains(scheme_api::OpenFlags::READ) || !write;
+    (read, write)
+}
+
 impl crate::fs::scheme_table::Scheme for RamFs {
     fn open(
         &self,
-        _path: &str,
-        _flags: scheme_api::OpenFlags,
+        path: &str,
+        flags: scheme_api::OpenFlags,
     ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
-        Err(scheme_api::SchemeError::NoSuchScheme)
+        let full_path = ram_scheme_path(path);
+        let (readable, writable) = ram_scheme_access(flags);
+
+        match tmpfs_stat(&full_path) {
+            Ok(st) => {
+                if st.is_dir && !flags.contains(scheme_api::OpenFlags::DIRECTORY) {
+                    return Err(scheme_api::SchemeError::InvalidArg);
+                }
+            },
+            Err(-2) if flags.contains(scheme_api::OpenFlags::CREATE) => {
+                tmpfs_create(&full_path).map_err(ram_scheme_error)?;
+            },
+            Err(e) => return Err(ram_scheme_error(e)),
+        }
+
+        if flags.contains(scheme_api::OpenFlags::TRUNCATE) {
+            tmpfs_truncate(&full_path, 0).map_err(ram_scheme_error)?;
+        }
+
+        let offset = if flags.contains(scheme_api::OpenFlags::APPEND) {
+            tmpfs_stat(&full_path)
+                .map(|st| st.size as usize)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let fid = RAM_SCHEME_NEXT_FID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        RAM_SCHEME_FDS.lock().insert(
+            fid,
+            RamSchemeFd {
+                path: full_path,
+                offset,
+                readable,
+                writable,
+            },
+        );
+        Ok(scheme_api::SchemeFileId(fid))
     }
 
-    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+    fn read(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        buf: &mut [u8],
+    ) -> Result<usize, scheme_api::SchemeError> {
+        let (path, offset, readable) = {
+            let fds = RAM_SCHEME_FDS.lock();
+            let fd = fds.get(&fid.0).ok_or(scheme_api::SchemeError::NotFound)?;
+            (fd.path.clone(), fd.offset, fd.readable)
+        };
+        if !readable {
+            return Err(scheme_api::SchemeError::PermissionDenied);
+        }
+        let data = tmpfs_pread(&path, offset, buf.len()).map_err(ram_scheme_error)?;
+        let n = data.len();
+        buf[..n].copy_from_slice(&data);
+        if n > 0 {
+            if let Some(fd) = RAM_SCHEME_FDS.lock().get_mut(&fid.0) {
+                fd.offset = fd.offset.saturating_add(n);
+            }
+        }
+        Ok(n)
+    }
+
+    fn write(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        buf: &[u8],
+    ) -> Result<usize, scheme_api::SchemeError> {
+        let (path, offset, writable) = {
+            let fds = RAM_SCHEME_FDS.lock();
+            let fd = fds.get(&fid.0).ok_or(scheme_api::SchemeError::NotFound)?;
+            (fd.path.clone(), fd.offset, fd.writable)
+        };
+        if !writable {
+            return Err(scheme_api::SchemeError::PermissionDenied);
+        }
+        let n = tmpfs_pwrite(&path, offset, buf).map_err(ram_scheme_error)?;
+        if n > 0 {
+            if let Some(fd) = RAM_SCHEME_FDS.lock().get_mut(&fid.0) {
+                fd.offset = fd.offset.saturating_add(n);
+            }
+        }
+        Ok(n)
+    }
+
+    fn seek(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        offset: i64,
+        whence: u8,
+    ) -> Result<u64, scheme_api::SchemeError> {
+        let mut fds = RAM_SCHEME_FDS.lock();
+        let fd = fds
+            .get_mut(&fid.0)
+            .ok_or(scheme_api::SchemeError::NotFound)?;
+        let size = tmpfs_stat(&fd.path).map_err(ram_scheme_error)?.size as i64;
+        let base = match whence {
+            0 => 0,
+            1 => fd.offset as i64,
+            2 => size,
+            _ => return Err(scheme_api::SchemeError::InvalidArg),
+        };
+        let next = base
+            .checked_add(offset)
+            .ok_or(scheme_api::SchemeError::InvalidArg)?;
+        if next < 0 {
+            return Err(scheme_api::SchemeError::InvalidArg);
+        }
+        fd.offset = next as usize;
+        Ok(fd.offset as u64)
+    }
+
+    fn close(&self, fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        RAM_SCHEME_FDS.lock().remove(&fid.0);
         Ok(())
     }
 }

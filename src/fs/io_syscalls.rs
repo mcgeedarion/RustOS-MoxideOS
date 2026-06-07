@@ -156,6 +156,8 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
         n = crate::fs::pipe::pipe_read(bfd, &mut kbuf);
     } else if crate::net::socket::is_socket_fd(bfd) {
         n = crate::net::socket::socket_read(bfd, &mut kbuf);
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        n = crate::fs::scheme_fd::scheme_fd_read(bfd, &mut kbuf);
     } else {
         n = vfs::read(bfd, &mut kbuf);
     }
@@ -205,6 +207,9 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::net::socket::is_socket_fd(bfd) {
         return crate::net::socket::socket_write(bfd, &kbuf);
+    }
+    if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        return crate::fs::scheme_fd::scheme_fd_write(bfd, &kbuf);
     }
 
     // Regular VFS file: enforce O_APPEND and RLIMIT_FSIZE.
@@ -342,7 +347,15 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
         n => n as usize,
     };
     let mut kbuf = alloc::vec![0u8; count];
-    let n = vfs::pread(bfd, kbuf.as_mut_ptr(), count, offset);
+    let n = if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        let seek = crate::fs::scheme_fd::scheme_fd_seek(bfd, offset, 0);
+        if seek < 0 {
+            return seek;
+        }
+        crate::fs::scheme_fd::scheme_fd_read(bfd, &mut kbuf)
+    } else {
+        vfs::pread(bfd, kbuf.as_mut_ptr(), count, offset)
+    };
     if n <= 0 {
         return n;
     }
@@ -379,6 +392,14 @@ pub fn sys_pwrite64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isiz
             crate::proc::signal::send_signal(pid, SIGXFSZ);
             return EFBIG;
         }
+    }
+
+    if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        let seek = crate::fs::scheme_fd::scheme_fd_seek(bfd, offset, 0);
+        if seek < 0 {
+            return seek;
+        }
+        return crate::fs::scheme_fd::scheme_fd_write(bfd, &kbuf);
     }
 
     vfs::pwrite(bfd, kbuf.as_ptr(), count, offset)
@@ -527,6 +548,8 @@ fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
         n = crate::fs::pipe::pipe_read(bfd, &mut kbuf);
     } else if crate::net::socket::is_socket_fd(bfd) {
         n = crate::net::socket::socket_read(bfd, &mut kbuf);
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        n = crate::fs::scheme_fd::scheme_fd_read(bfd, &mut kbuf);
     } else {
         n = vfs::read(bfd, &mut kbuf);
     }
@@ -564,6 +587,9 @@ fn write_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::net::socket::is_socket_fd(bfd) {
         return crate::net::socket::socket_write(bfd, &kbuf);
+    }
+    if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        return crate::fs::scheme_fd::scheme_fd_write(bfd, &kbuf);
     }
     vfs::write(bfd, &kbuf)
 }
