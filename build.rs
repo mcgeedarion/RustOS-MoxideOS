@@ -1,7 +1,8 @@
+/// build.rs
+
 use std::path::PathBuf;
 use std::process::Command;
 
-// Improvement #2, #8: Magic strings extracted as constants
 const CRT_DIR: &str = "src/init/crt";
 const CRT_SOURCES: &[&str] = &[
     "compiler_rt.c",
@@ -36,7 +37,6 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
-    // Always compile the freestanding C runtime stubs.
     compile_crt();
 
     if target_arch == "riscv64" {
@@ -47,10 +47,6 @@ fn main() {
         produce_uefi_image(&out);
     }
 
-    // When `--features trace` is active, inject LLVM -Z instrument-functions
-    // so that every Rust function gets __cyg_profile_func_enter/exit calls.
-    // This is a nightly-only rustc flag; it is intentionally gated behind the
-    // `trace` feature so release builds and CI without nightly are unaffected.
     if std::env::var("CARGO_FEATURE_TRACE").is_ok() {
         println!("cargo:rustc-flags=-Z instrument-functions");
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TRACE");
@@ -58,17 +54,6 @@ fn main() {
 }
 
 /// Compile C runtime stubs into a static archive `librustos_crt.a`.
-///
-/// Produces a freestanding C library without host libc dependencies.
-/// Flags:
-///   -ffreestanding   — no host libc assumptions
-///   -nostdlib        — do not link the standard library
-///   -O2              — light optimisation (safe for freestanding)
-///   -fno-stack-protector — the stubs *define* __stack_chk_fail; avoid
-/// recursion
-///
-/// # Panics
-/// Panics if the C compiler fails to compile the sources.
 fn compile_crt() {
     for src in CRT_SOURCES {
         println!("cargo:rerun-if-changed={CRT_DIR}/{src}");
@@ -76,7 +61,6 @@ fn compile_crt() {
 
     let mut build = cc::Build::new();
 
-    // Improvement #2: Use constants for flags
     for flag in CRT_COMPILE_FLAGS {
         build.flag(flag);
     }
@@ -87,25 +71,15 @@ fn compile_crt() {
         build.file(format!("{CRT_DIR}/{src}"));
     }
 
-    // Improvement #1: Explicit error handling
     build.compile("rustos_crt");
 }
 
 /// Assemble the RISC-V uentry trampoline and archive it as a static library.
-///
-/// Produces `libuentry_riscv64.a` for RISC-V 64 targets.
-/// Uses the RISC-V toolchain binaries: `riscv64-unknown-elf-as` and
-/// `riscv64-unknown-elf-ar`.
-///
-/// # Panics
-/// Panics if the archival step fails after successful assembly.
 fn assemble_riscv_uentry(out: &PathBuf) {
     println!("cargo:rerun-if-changed={RISCV_ASM_SRC}");
 
     let obj = out.join(RISCV_OBJ_NAME);
     let lib = out.join(RISCV_LIB_NAME);
-
-    // Improvement #4: Reusable command building logic
     let as_bin = format!("{RISCV_TRIPLE}-as");
     if !run_command(
         {
@@ -140,18 +114,8 @@ fn assemble_riscv_uentry(out: &PathBuf) {
 }
 
 /// Convert the ELF kernel to a PE32+ UEFI application (BOOTX64.EFI).
-///
-/// Produces a valid UEFI application at `target/esp/EFI/BOOT/BOOTX64.EFI`,
-/// which can boot on OVMF or real hardware.
-///
-/// Requires: `rustup component add llvm-tools-preview`
-/// Falls back to system `llvm-objcopy` if rustup version unavailable.
-/// On first build, the ELF may not exist yet; re-run `cargo build` to produce
-/// the .efi file.
 fn produce_uefi_image(out: &PathBuf) {
-    // Improvement #5: Use PROFILE env var instead of fragile path inspection
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    // Improvement #7: Use PathBuf throughout to avoid redundant parsing
     let elf_path = PathBuf::from(format!("target/x86_64-unknown-none/{profile}/rustos"));
 
     println!("cargo:rerun-if-changed={}", elf_path.display());
@@ -161,14 +125,12 @@ fn produce_uefi_image(out: &PathBuf) {
         return;
     }
 
-    // Improvement #7: Use PathBuf consistently
     let esp_dir = PathBuf::from(UEFI_OUTPUT_DIR);
     let _ = std::fs::create_dir_all(&esp_dir);
     let efi_path = esp_dir.join(UEFI_OUTPUT_FILE);
 
     let objcopy_bin = locate_llvm_objcopy();
 
-    // Improvement #4: Reusable command building logic
     if !run_command(
         {
             let mut cmd = Command::new(&objcopy_bin);
@@ -193,13 +155,6 @@ fn produce_uefi_image(out: &PathBuf) {
 }
 
 /// Locate llvm-objcopy from the active rustup toolchain, falling back to PATH.
-///
-/// First attempts to find `llvm-objcopy` in the rustup sysroot for the active
-/// host triple. If not found, falls back to searching PATH.
-///
-/// # Returns
-/// Path to `llvm-objcopy` binary (either absolute from rustup or relative for
-/// PATH search).
 fn locate_llvm_objcopy() -> String {
     let sysroot = String::from_utf8_lossy(
         &Command::new("rustc")
@@ -234,17 +189,6 @@ fn locate_llvm_objcopy() -> String {
         .unwrap_or_else(|| "llvm-objcopy".to_string())
 }
 
-/// Improvement #4: Helper function to run commands with unified error handling.
-///
-/// Executes a command and returns success/failure status.
-/// Prints cargo warnings for diagnostics.
-///
-/// # Arguments
-/// * `cmd` - The Command to execute
-/// * `context` - Description of what the command does (for warning messages)
-///
-/// # Returns
-/// `true` if the command succeeded, `false` otherwise.
 fn run_command(mut cmd: Command, context: &str) -> bool {
     match cmd.status() {
         Ok(status) if status.success() => true,
