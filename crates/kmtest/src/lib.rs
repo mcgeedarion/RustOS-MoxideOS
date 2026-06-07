@@ -7,8 +7,8 @@
 //! use kmtest_macros::kernel_test;
 //!
 //! #[kernel_test]
-//! fn test_basic_arithmetic() -> KmTestResult {
-//!     km_assert_eq!(2 + 2, 4);
+//! fn kernel_pid_namespace_has_init() -> KmTestResult {
+//!     km_assert!(crate::proc::pid_ns::is_init_process(1));
 //!     Ok(())
 //! }
 //! ```
