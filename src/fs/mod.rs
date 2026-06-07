@@ -58,5 +58,8 @@ pub mod sysfs;
 pub mod timerfd;
 pub mod tmpfs;
 pub mod vfs;
-pub mod vfs_ops;
-pub mod vfs_uring;
+
+// Compatibility aliases while call sites migrate to `crate::fs::vfs::ops`
+// and `crate::fs::vfs::uring`.
+pub use vfs::ops as vfs_ops;
+pub use vfs::uring as vfs_uring;
