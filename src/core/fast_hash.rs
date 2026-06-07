@@ -1,10 +1,4 @@
 //! Fast, non-cryptographic hash tables for trusted kernel-internal keys.
-//!
-//! [`KernelFastMap`] is intentionally small and dependency-free so it can be
-//! used in `no_std` kernel code and initialized in statics. It uses an FxHash
-//! style hasher and separate-chaining buckets. Use it only for bounded,
-//! kernel-generated keys where collision resistance, authentication, and stable
-//! iteration order are not security or ABI requirements.
 
 extern crate alloc;
 
@@ -17,11 +11,6 @@ const FX_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const FX_MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
 
 /// Fast FxHash-style hasher for trusted kernel bookkeeping keys.
-///
-/// This is not cryptographic and is not collision-DoS resistant. Do not use it
-/// for attacker-controlled strings, paths, protocol fields, authorization
-/// state, ASLR, canaries, checksums, or any persistent/wire-format integrity
-/// value.
 #[derive(Clone)]
 pub struct KernelFastHasher {
     hash: u64,
@@ -93,10 +82,6 @@ fn make_hash<K: Hash + ?Sized>(key: &K) -> u64 {
 }
 
 /// Dependency-free hash map for trusted, bounded kernel-internal keys.
-///
-/// The map deliberately exposes only the operations currently needed by the
-/// kernel's fast-path registries. Expand this type instead of open-coding new
-/// fast hash tables so audits can find all non-cryptographic hashing uses.
 pub struct KernelFastMap<K, V> {
     buckets: Vec<Vec<(u64, K, V)>>,
     len: usize,
@@ -109,8 +94,6 @@ impl<K, V> Default for KernelFastMap<K, V> {
 }
 
 impl<K, V> KernelFastMap<K, V> {
-    /// Create an empty map. Allocation is deferred until the first insert so
-    /// this can be used in static initializers.
     pub const fn new() -> Self {
         Self {
             buckets: Vec::new(),
