@@ -1,8 +1,5 @@
 // Syscall stubs — thin wrappers and minor implementations that do not
-// warrant their own module. (Included by src/syscall/mod.rs.)
-
-// extern crate alloc; -- provided by parent (src/syscall/mod.rs via include!)
-// use alloc::string::String; -- provided by parent
+// warrant their own module.
 
 use crate::fs::path::resolve_path;
 use crate::proc::scheduler;
@@ -105,14 +102,6 @@ pub(super) fn sys_mkdirat_impl(dirfd: i32, path_va: usize, mode: u32) -> isize {
 }
 
 /// NR 259  mknodat(dirfd, path_va, mode, dev)
-///
-/// Supported node types:
-///   S_IFIFO  (0o010000) — create a named pipe via the VFS pipe layer.
-///   S_IFSOCK (0o014000) — create a UNIX-domain socket node (AF_UNIX bind
-/// path).   S_IFCHR / S_IFBLK   — pass through to vfs_ops::mknod; returns EPERM
-/// if                          the driver table has no entry for (major,
-/// minor).   S_IFREG  with dev=0 — semantically equivalent to creat(2).
-///   S_IFDIR  and other  — EINVAL per POSIX.
 pub(super) fn sys_mknodat_impl(dirfd: i32, path_va: usize, mode: u32, dev: u64) -> isize {
     const S_IFMT: u32 = 0o170000;
     const S_IFREG: u32 = 0o100000;
@@ -405,8 +394,7 @@ fn ptrace_validate_ureg_slot(addr: usize, user_regs_bytes: usize) -> Result<usiz
 }
 
 /// Resolve the page-table physical address for `addr` in the target process's
-/// address space.  Returns `Err(ESRCH)` if the process is not found,
-/// `Err(EFAULT)` if the virtual address is not mapped.
+/// address space.
 #[inline]
 fn ptrace_resolve_remote_pa(pid: i32, addr: usize) -> Result<usize, isize> {
     use crate::arch::api::Paging;
@@ -422,9 +410,6 @@ fn ptrace_resolve_remote_pa(pid: i32, addr: usize) -> Result<usize, isize> {
 }
 
 /// Check that the caller is permitted to trace `target_pid`.
-/// Currently enforces: process must exist; the caller may not trace itself.
-/// Returns `Err(ESRCH)` if the target does not exist,
-/// `Err(EPERM)`  if the caller attempts to trace itself.
 #[inline]
 fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> {
     use crate::syscall::errno::eperm;
@@ -438,8 +423,6 @@ fn ptrace_check_permission(caller: usize, target_pid: i32) -> Result<(), isize> 
 }
 
 /// Read `N` u64 register values from userspace at `va`.
-/// Uses little-endian byte order to match the debugger-facing ptrace ABI
-/// (consistent with PEEKUSER, PEEKTEXT, and GETEVENTMSG which all emit LE).
 #[inline]
 fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isize> {
     let mut bytes = [0u8; N * 8];
@@ -455,7 +438,6 @@ fn ptrace_copy_regs_from_user<const N: usize>(va: usize) -> Result<[u64; N], isi
 }
 
 /// Write `N` u64 register values to userspace at `va`.
-/// Uses little-endian byte order to match the debugger-facing ptrace ABI.
 #[inline]
 fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Result<(), isize> {
     let mut bytes = [0u8; N * 8];
