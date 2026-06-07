@@ -164,14 +164,9 @@ impl PipeInner {
     }
 }
 
-// WaitQueues live OUTSIDE the data mutex so they can be woken without
-// holding the lock (avoids priority inversion and lock ordering issues).
-
 struct PipeState {
     inner: Mutex<PipeInner>,
-    /// Woken when data is written (POLLIN) or write-end closes (POLLHUP).
     read_wq: WaitQueue,
-    /// Woken when data is read (POLLOUT) or read-end closes (POLLERR).
     write_wq: WaitQueue,
 }
 
@@ -191,8 +186,6 @@ struct PipeTable {
 
 impl PipeTable {
     const fn new() -> Self {
-        // Fast map is safe here: keys are kernel-assigned pipe backing fd
-        // numbers and pipe lookup order is never user-visible.
         PipeTable {
             map: KernelFastMap::new(),
         }
@@ -301,8 +294,6 @@ impl PollSource for PipeWriteSource {
     }
 }
 
-/// Returns the correct PollSource end based on bfd parity.
-/// Called by poll::fd_poll_source() (upcoming poll.rs migration).
 pub fn pipe_poll_source(bfd: usize) -> Option<Arc<dyn PollSource>> {
     let state = PIPE_TABLE.lock().get(bfd)?;
     if bfd & 1 == 0 {
@@ -329,9 +320,6 @@ pub fn pipe_dup(bfd: usize) {
 }
 
 /// Read up to `buf.len()` bytes from the read end of a pipe.
-///
-/// Blocking behaviour: parks on `read_wq` via `WaitQueue::wait()` — no
-/// spin loop.  Returns -EINTR if a signal cancels the wait.
 pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
     if buf.is_empty() {
         return 0;
@@ -381,9 +369,6 @@ pub fn pipe_read(bfd: usize, buf: &mut [u8]) -> isize {
 }
 
 /// Write `buf` to the write end of a pipe.
-///
-/// Blocking behaviour: parks on `write_wq` via `WaitQueue::wait()` — no
-/// spin loop.  Returns -EINTR if a signal cancels the wait.
 pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
     if buf.is_empty() {
         return 0;
@@ -474,10 +459,6 @@ pub fn pipe_write(bfd: usize, buf: &[u8]) -> isize {
 }
 
 /// Called by `PipeScheme::close` when a pipe-end fd closes.
-///
-/// Decrements the appropriate refcount.  When the last writer closes,
-/// wakes read waiters with POLLHUP.  When the last reader closes, wakes
-/// write waiters with POLLERR so they observe EPIPE on next iteration.
 pub fn sys_close_pipe(bfd: usize) {
     let state = match PIPE_TABLE.lock().get(bfd) {
         Some(s) => s,
