@@ -1,19 +1,5 @@
 //! IPC-proxy scheme — forwards `Scheme` trait calls to a userspace
 //! driver process over an `IpcEndpoint`.
-//!
-//! When a userspace driver calls `sys_scheme_register("blk", endpoint)`,
-//! the kernel wraps that endpoint in an `IpcProxyScheme` and inserts it
-//! into `SCHEME_TABLE`.  From that point on, every `open/read/write/close`
-//! on a `blk:` URL is serialised into a `SchemeRequest`, sent to the
-//! driver process via its IPC endpoint, and the kernel thread blocks until
-//! `SchemeResponse` arrives.
-//!
-//! # Thread-safety
-//!
-//! `IpcProxyScheme` is `Send + Sync`.  Each method grabs a per-scheme
-//! mutex to serialise concurrent kernel threads calling into the same
-//! driver.  A future optimisation is to assign per-call "cookie" IDs and
-//! allow pipelined in-flight requests.
 
 use alloc::{boxed::Box, vec::Vec};
 use spin::Mutex;
@@ -29,12 +15,8 @@ use super::scheme_table::Scheme;
 /// A `Scheme` implementation that transparently proxies every call to a
 /// registered userspace driver process.
 pub struct IpcProxyScheme {
-    /// Name kept for logging.
     name: alloc::string::String,
-    /// The driver's IPC endpoint.
     endpoint: IpcEndpoint,
-    /// Serialises concurrent callers so that request/response pairs
-    /// are never interleaved.
     lock: Mutex<()>,
 }
 
@@ -136,11 +118,7 @@ impl Scheme for IpcProxyScheme {
     }
 }
 
-// We use a simple tag-prefixed binary format rather than pulling in serde
-// inside the kernel.  Each message starts with a 1-byte discriminant
-// followed by field data.  This is intentionally minimal — swap in a
-// proper codec (e.g. postcard) once a userspace allocator is available.
-
+///
 const TAG_OPEN: u8 = 1;
 const TAG_READ: u8 = 2;
 const TAG_WRITE: u8 = 3;
