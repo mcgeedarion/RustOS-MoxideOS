@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <errno.h>
 
 /* ── wl_display (object id = 1, always) ──────────────────────────────────── */
 #define WL_DISPLAY_ID                   1u
@@ -228,15 +229,31 @@ static inline int32_t wl_read_i32(const uint8_t *buf, size_t off) {
  *   [4..5]  uint16  opcode
  *   [6..7]  uint16  total message size (header + payload)
  */
+static inline int wl_write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
 static inline void wl_send(int fd, uint32_t obj, uint16_t opcode,
                             const void *payload, uint16_t plen) {
     uint8_t  buf[4096];
     uint16_t total = (uint16_t)(8u + plen);
+    if (total > sizeof(buf)) return;
     memcpy(buf,     &obj,    4);
     memcpy(buf + 4, &opcode, 2);
     memcpy(buf + 6, &total,  2);
     if (plen && payload) memcpy(buf + 8, payload, plen);
-    write(fd, buf, total);
+    (void)wl_write_all(fd, buf, total);
 }
 
 /*
@@ -271,7 +288,7 @@ static inline void wl_send_with_fd(int sock, uint32_t obj, uint16_t opcode,
     cm->cmsg_type  = SCM_RIGHTS;
     cm->cmsg_len   = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cm), &send_fd, sizeof(int));
-    sendmsg(sock, &mh, 0);
+    while (sendmsg(sock, &mh, MSG_NOSIGNAL) < 0 && errno == EINTR) { }
 }
 
 /* wl_encode_str — encode a Wayland wire string into *out; returns bytes written */
