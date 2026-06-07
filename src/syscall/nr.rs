@@ -122,3 +122,15 @@ pub const STRICT_ALLOWLIST: &[usize] = &[
 //                  kernel serial console and returns the failure count.
 pub const SYS_KMTEST_LIST: usize = 0x8000_0000;
 pub const SYS_KMTEST_RUN: usize = 0x8000_0001;
+
+// RustOS hybrid-kernel private syscall range.  These are intentionally outside
+// Linux's assigned x86_64 range and below the kmtest sentinel range.
+pub const SYS_DRIVER_BIND: usize = 0x7000_0000;
+pub const SYS_DMA_ALLOC: usize = 0x7000_0001;
+pub const SYS_IRQ_SUBSCRIBE: usize = 0x7000_0002;
+pub const SYS_SCHEME_REGISTER: usize = 0x7000_0003;
+pub const SYS_SCHEME_UNREGISTER: usize = 0x7000_0004;
+pub const SYS_IPC_ENDPOINT_CREATE: usize = 0x7000_0005;
+pub const SYS_IPC_RECV: usize = 0x7000_0006;
+pub const SYS_IPC_SEND: usize = 0x7000_0007;
+pub const SYS_IRQ_ACK: usize = 0x7000_0008;

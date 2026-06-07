@@ -48,9 +48,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod dispatcher_context;
+pub mod driver;
 pub mod errno;
 pub mod nr;
 pub mod routers;
+pub mod scheme;
 pub mod signal_nr;
 
 #[cfg(feature = "kmtest")]
@@ -380,6 +382,8 @@ pub fn dispatch_with_rip(
     } else if let Some(r) = routers::dispatch_ipc(&ctx) {
         ret = r;
     } else if let Some(r) = routers::dispatch_time(&ctx) {
+        ret = r;
+    } else if let Some(r) = routers::dispatch_hybrid_services(&ctx) {
         ret = r;
     } else if let Some(r) = routers::dispatch_kmtest(&ctx) {
         ret = r;

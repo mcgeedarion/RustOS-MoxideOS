@@ -1,118 +1,145 @@
-//! Scheme registration syscall — allows a userspace driver process to
-//! publish itself as the handler for a named scheme prefix.
-//!
-//! # Syscall number (provisional)
-//!
-//! | Number | Name                  |
-//! |--------|-----------------------|
-//! | 403    | `sys_scheme_register` |
-//! | 404    | `sys_scheme_unregister` |
-//!
-//! # Flow
-//!
-//! 1. Driver starts, initialises hardware via its `DriverHandle`.
-//! 2. Driver creates an IPC endpoint: `ep = sys_ipc_endpoint_create()`.
-//! 3. Driver calls `sys_scheme_register("blk", ep)`.
-//! 4. Kernel wraps `ep` in an `IpcProxyScheme` and inserts it into
-//!    `SCHEME_TABLE` under the key `"blk"`.
-//! 5. Any process that calls `open("blk:vda", ...)` now routes through the
-//!    driver transparently.
-//! 6. When the driver exits (or calls `sys_scheme_unregister`), the kernel
-//!    removes the entry; subsequent opens return `ENOENT`.
+//! Scheme registration syscalls for userspace service servers.
 
-use alloc::sync::Arc;
+extern crate alloc;
 
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use scheme_api::IpcEndpoint;
+use spin::Mutex;
 
 use crate::{
     fs::{ipc_proxy_scheme::IpcProxyScheme, scheme_table::SCHEME_TABLE},
-    kernel::capabilities::Capability,
-    proc::current_process,
+    security::{cap, CapSet},
 };
 
-/// Error codes for scheme syscalls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
 pub enum SchemeSysError {
-    /// Caller does not hold `CAP_DRIVER` (required to register a scheme).
     PermissionDenied = -1,
-    /// `name` contains illegal characters or is empty.
     InvalidName = -2,
-    /// A scheme with this name is already registered by a different process.
     AlreadyExists = -3,
-    /// No scheme with this name is registered by the calling process.
     NotFound = -4,
+    BadAddress = -14,
 }
 
-/// Register `endpoint` as the handler for scheme `name`.
-///
-/// After this returns, any `open("<name>:...", ...)` call anywhere in the
-/// system is forwarded to the calling driver process via `endpoint`.
-///
-/// Only one process may own a given scheme name at a time.  Attempting to
-/// register a name already owned by a *different* process returns
-/// `AlreadyExists`; a process may re-register the same name to replace
-/// its endpoint (e.g. after a restart).
-///
-/// # Arguments
-/// - `name`     — scheme prefix, e.g. `"blk"` or `"net"`.  ASCII alphanumeric +
-///   `_` + `-` only; must not contain `':'`.
-/// - `endpoint` — IPC endpoint that will receive `SchemeRequest` messages.
-pub fn sys_scheme_register(name: &str, endpoint: IpcEndpoint) -> Result<(), SchemeSysError> {
-    let proc = current_process();
+impl SchemeSysError {
+    #[inline]
+    fn as_isize(self) -> isize {
+        self as i64 as isize
+    }
+}
 
-    // Only privileged (driver) processes may publish schemes.
-    if !proc.capabilities().has(Capability::Driver) {
+#[derive(Clone, Debug)]
+struct SchemeOwner {
+    pid: usize,
+    endpoint: IpcEndpoint,
+}
+
+static SCHEME_OWNERS: Mutex<BTreeMap<String, SchemeOwner>> = Mutex::new(BTreeMap::new());
+
+#[inline]
+fn current_pid() -> usize {
+    crate::proc::scheduler::current_pid() as usize
+}
+
+fn current_caps() -> CapSet {
+    crate::proc::scheduler::with_proc(current_pid(), |p| p.caps).unwrap_or_else(CapSet::empty)
+}
+
+fn has_driver_capability() -> bool {
+    let caps = current_caps();
+    caps.has(cap::DRIVER) || caps.has(cap::SYS_ADMIN)
+}
+
+fn valid_scheme_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(':')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+pub fn sys_scheme_register(name: &str, endpoint: IpcEndpoint) -> Result<(), SchemeSysError> {
+    if !has_driver_capability() {
+        return Err(SchemeSysError::PermissionDenied);
+    }
+    if !valid_scheme_name(name) {
+        return Err(SchemeSysError::InvalidName);
+    }
+    if !crate::ipc::endpoint_owned_by_current(endpoint) {
         return Err(SchemeSysError::PermissionDenied);
     }
 
-    // Validate the name.
-    if name.is_empty()
-        || name.contains(':')
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    let pid = current_pid();
     {
-        return Err(SchemeSysError::InvalidName);
+        let mut owners = SCHEME_OWNERS.lock();
+        if let Some(owner) = owners.get(name) {
+            if owner.pid != pid {
+                return Err(SchemeSysError::AlreadyExists);
+            }
+        }
+        owners.insert(String::from(name), SchemeOwner { pid, endpoint });
     }
 
-    // Build the proxy and register it.
-    let proxy = Arc::new(IpcProxyScheme::new(name, endpoint));
-    SCHEME_TABLE.register(name, proxy);
-
-    // Record the association in the process descriptor so the kernel can
-    // auto-unregister the scheme when the process exits.
-    proc.register_owned_scheme(alloc::string::String::from(name));
-
-    log::info!(
-        "[scheme] process {} registered scheme \"{}\"\n",
-        proc.pid(),
-        name
+    SCHEME_TABLE.register(
+        name,
+        Arc::new(IpcProxyScheme::with_endpoint(name, endpoint)),
     );
     Ok(())
 }
 
-/// Remove a scheme previously registered by the calling process.
-///
-/// After this returns, `open("<name>:...")` will return `ENOENT` until
-/// another process registers the same name.
-///
-/// The kernel also calls this automatically from the process exit path.
 pub fn sys_scheme_unregister(name: &str) -> Result<(), SchemeSysError> {
-    let proc = current_process();
-
-    // Verify the calling process actually owns this scheme.
-    if !proc.owns_scheme(name) {
-        return Err(SchemeSysError::NotFound);
+    let pid = current_pid();
+    let mut owners = SCHEME_OWNERS.lock();
+    match owners.get(name) {
+        Some(owner) if owner.pid == pid => {},
+        _ => return Err(SchemeSysError::NotFound),
     }
-
+    owners.remove(name);
     SCHEME_TABLE.unregister(name);
-    proc.unregister_owned_scheme(name);
-
-    log::info!(
-        "[scheme] process {} unregistered scheme \"{}\"\n",
-        proc.pid(),
-        name
-    );
     Ok(())
+}
+
+pub fn cleanup_pid(pid: usize) {
+    let names: Vec<String> = SCHEME_OWNERS
+        .lock()
+        .iter()
+        .filter_map(|(name, owner)| (owner.pid == pid).then(|| name.clone()))
+        .collect();
+
+    for name in names {
+        SCHEME_OWNERS.lock().remove(&name);
+        SCHEME_TABLE.unregister(&name);
+    }
+}
+
+fn copy_scheme_name(name_ptr: usize, name_len: usize) -> Result<String, SchemeSysError> {
+    if name_len == 0 || name_len > 64 || !crate::uaccess::validate_user_ptr(name_ptr, name_len) {
+        return Err(SchemeSysError::BadAddress);
+    }
+    let mut bytes = alloc::vec![0u8; name_len];
+    crate::uaccess::copy_from_user(bytes.as_mut_ptr(), name_ptr, name_len)
+        .map_err(|_| SchemeSysError::BadAddress)?;
+    core::str::from_utf8(&bytes)
+        .map(String::from)
+        .map_err(|_| SchemeSysError::InvalidName)
+}
+
+pub fn dispatch_scheme_register(name_ptr: usize, name_len: usize, endpoint: u64) -> isize {
+    let name = match copy_scheme_name(name_ptr, name_len) {
+        Ok(name) => name,
+        Err(e) => return e.as_isize(),
+    };
+    sys_scheme_register(&name, IpcEndpoint(endpoint))
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.as_isize())
+}
+
+pub fn dispatch_scheme_unregister(name_ptr: usize, name_len: usize) -> isize {
+    let name = match copy_scheme_name(name_ptr, name_len) {
+        Ok(name) => name,
+        Err(e) => return e.as_isize(),
+    };
+    sys_scheme_unregister(&name)
+        .map(|_| 0)
+        .unwrap_or_else(|e| e.as_isize())
 }

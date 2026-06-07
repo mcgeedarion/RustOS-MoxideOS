@@ -87,3 +87,30 @@ New subsystems should follow these rules:
 Together these pieces ensure RustOS is not purely monolithic: the privileged core
 remains compact and fast, while drivers and resource servers can be moved across
 the kernel/userspace boundary without changing the application-facing file API.
+
+---
+
+## Implementation Status
+
+The hybrid service plane now has concrete kernel plumbing for the pieces above:
+
+- RustOS-private syscall numbers route driver binding, DMA allocation, IRQ
+  subscription/ack, IPC endpoint operations, and scheme registration through the
+  syscall routers.
+- `sys_driver_bind` records per-process PCI leases, maps non-zero BARs into the
+  caller, and returns typed `DriverHandle` values that must match the owning PID
+  for later DMA and IRQ calls.
+- `sys_dma_alloc` allocates bounded, page-mapped DMA buffers, zeroes them before
+  userspace visibility, and returns both user VA and physical address.
+- IPC endpoints maintain separate kernel-to-server and server-to-kernel queues so
+  VFS `IpcProxyScheme` calls and IRQ notifications share one service endpoint
+  without confusing requests with replies.
+- Scheme registration validates names, requires driver authority, verifies
+  endpoint ownership, rejects cross-process takeovers, and unregisters schemes
+  automatically during process exit.
+- The init service manager records already-selected userspace services, applies
+  service capability sets, and marks restartable services pending when their
+  process exits.
+
+This intentionally does not move additional drivers across the boundary; driver
+placement remains a policy decision made by the existing userspace layout.

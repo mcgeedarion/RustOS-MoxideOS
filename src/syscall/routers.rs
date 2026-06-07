@@ -452,6 +452,34 @@ pub fn dispatch_time(ctx: &SyscallContext) -> Option<isize> {
     }
 }
 
+/// RustOS-private hybrid-kernel service-plane syscalls.
+pub fn dispatch_hybrid_services(ctx: &SyscallContext) -> Option<isize> {
+    let (a, b, c, _d, _e, _f) = (ctx.a0(), ctx.a1(), ctx.a2(), ctx.a3(), ctx.a4(), ctx.a5());
+    match ctx.nr {
+        SYS_DRIVER_BIND => Some(crate::syscall::driver::dispatch_driver_bind(
+            a as u32, b as u32,
+        )),
+        SYS_DMA_ALLOC => Some(crate::syscall::driver::dispatch_dma_alloc(
+            a as u64,
+            b,
+            c,
+            ctx.a3(),
+        )),
+        SYS_IRQ_SUBSCRIBE => Some(crate::syscall::driver::dispatch_irq_subscribe(
+            a as u64, b as u32, c as u64,
+        )),
+        SYS_IRQ_ACK => Some(crate::syscall::driver::dispatch_irq_ack(a as u64, b as u32)),
+        SYS_SCHEME_REGISTER => Some(crate::syscall::scheme::dispatch_scheme_register(
+            a, b, c as u64,
+        )),
+        SYS_SCHEME_UNREGISTER => Some(crate::syscall::scheme::dispatch_scheme_unregister(a, b)),
+        SYS_IPC_ENDPOINT_CREATE => Some(crate::ipc::sys_ipc_endpoint_create()),
+        SYS_IPC_RECV => Some(crate::ipc::sys_ipc_recv(a as u64, b, c)),
+        SYS_IPC_SEND => Some(crate::ipc::sys_ipc_send(a as u64, b, c)),
+        _ => None,
+    }
+}
+
 // Only active when the kernel is compiled with --features kmtest.
 // Uses a private NR range (0x8000_0000+) that can never collide with Linux.
 #[cfg(feature = "kmtest")]

@@ -59,6 +59,12 @@ pub mod cap {
     pub const PERFMON: u8 = 38;
     pub const BPF: u8 = 39;
     pub const CHECKPOINT_RESTORE: u8 = 40;
+
+    /// RustOS-private capability used to authorize userspace driver/service
+    /// processes at the hybrid-kernel boundary.  It aliases Linux
+    /// `CAP_SYS_RAWIO`, which is the closest portable authority for MMIO, DMA,
+    /// and IRQ-facing operations.
+    pub const DRIVER: u8 = SYS_RAWIO;
 }
 
 impl CapSet {
@@ -79,6 +85,11 @@ impl CapSet {
             effective: 0,
             inheritable: 0,
         }
+    }
+
+    /// Compatibility alias for callers that historically used `full()`.
+    pub const fn full() -> Self {
+        Self::all()
     }
 
     /// Check whether `cap` is in the effective set.

@@ -108,6 +108,11 @@ impl SchemeTable {
         self.inner.write().remove(name);
     }
 
+    /// Compatibility alias used by syscall/service cleanup paths.
+    pub fn unregister(&self, name: &str) {
+        self.deregister(name);
+    }
+
     /// Return all registered scheme names in sorted (BTree) order.
     ///
     /// This is the backing API for `/proc/schemes`.  The read lock is held
@@ -163,6 +168,20 @@ impl SchemeTable {
         let fid = handler.open(path, flags)?;
         Ok((handler, fid))
     }
+
+    /// Alias for callers that treat schemes as an open backend.
+    pub fn open(
+        &self,
+        url: &str,
+        flags: OpenFlags,
+    ) -> Result<(Arc<dyn Scheme>, SchemeFileId), SchemeError> {
+        self.open_url(url, flags)
+    }
+}
+
+/// Return true when `path` is a syntactically valid scheme URL.
+pub fn is_scheme_url(path: &str) -> bool {
+    scheme_api::parse_scheme_url(path).is_some()
 }
 
 /// Kernel-wide scheme registry.  Initialised at boot time.

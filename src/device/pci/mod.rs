@@ -62,6 +62,28 @@ pub fn devices() -> Vec<PciDevice> {
     DEVICES.lock().clone()
 }
 
+/// Encode a PCI bus/device/function tuple as the userspace-driver BDF token.
+#[inline]
+pub const fn encode_bdf(bus: u8, dev: u8, func: u8) -> u32 {
+    ((bus as u32) << 16) | ((dev as u32) << 8) | func as u32
+}
+
+/// Decode the userspace-driver BDF token into `(bus, device, function)`.
+#[inline]
+pub const fn decode_bdf(bdf: u32) -> (u8, u8, u8) {
+    ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8)
+}
+
+/// Find a device by encoded bus/device/function.
+pub fn find_by_bdf(bdf: u32) -> Option<PciDevice> {
+    let (bus, dev, func) = decode_bdf(bdf);
+    DEVICES
+        .lock()
+        .iter()
+        .find(|d| d.bus == bus && d.dev == dev && d.func == func)
+        .cloned()
+}
+
 /// Find the first device matching `(vendor, device_id)`.
 pub fn find(vendor: u16, device_id: u16) -> Option<PciDevice> {
     DEVICES
