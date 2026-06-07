@@ -33,6 +33,7 @@ pub mod inotify;
 pub mod io_syscalls;
 pub mod ioctl;
 pub mod ipc_proxy_scheme;
+pub mod jbd2;
 pub mod mount;
 pub mod nfs;
 pub mod ntfs;
