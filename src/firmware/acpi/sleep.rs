@@ -81,9 +81,10 @@ pub unsafe fn init() {
     }
 
     FACS_PHYS.store(facs_phys, Ordering::Relaxed);
+    let hw_sig = core::ptr::addr_of!(facs.hw_sig).read_unaligned();
     println!(
         "acpi/sleep: FACS @ {:#010x}  hw_sig={:#010x}",
-        facs_phys, facs.hw_sig
+        facs_phys, hw_sig
     );
 }
 
@@ -100,10 +101,10 @@ pub unsafe fn set_wakeup_vector(wakeup_vector: u64) {
     let facs = &mut *(phys as usize as *mut Facs);
     if facs.version >= 1 {
         // ACPI 2.0+: use the 64-bit field so we can wake into long mode.
-        core::ptr::write_volatile(&mut facs.x_fw_waking_vector, wakeup_vector);
-        core::ptr::write_volatile(&mut facs.fw_waking_vector, 0u32);
+        core::ptr::addr_of_mut!(facs.x_fw_waking_vector).write_unaligned(wakeup_vector);
+        core::ptr::addr_of_mut!(facs.fw_waking_vector).write_unaligned(0u32);
     } else {
-        core::ptr::write_volatile(&mut facs.fw_waking_vector, wakeup_vector as u32);
+        core::ptr::addr_of_mut!(facs.fw_waking_vector).write_unaligned(wakeup_vector as u32);
     }
     // Memory barrier so the write is visible to firmware.
     core::sync::atomic::fence(Ordering::SeqCst);

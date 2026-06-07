@@ -34,7 +34,7 @@ fn strip_proc_pid(path: &str) -> Option<(usize, &str)> {
     Some((pid, &rest[slash..]))
 }
 
-fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
+fn gather_entries(_fdno: usize, path: &str) -> Vec<Dent> {
     let mut out = Vec::new();
 
     // Synthesise 7 symlink dirents for `ls /proc/self/ns/`.

@@ -105,17 +105,19 @@ pub unsafe fn init(rsdp_phys: usize) {
 
     if v1.rev >= 2 {
         let v2 = &*(rsdp_phys as *const RsdpV2);
-        let len = v2.len as usize;
-        if checksum_ok(slice::from_raw_parts(rsdp_phys as *const u8, len)) && v2.xsdt_phys != 0 {
-            ACPI_ROOT = Some(AcpiRoot::Xsdt(v2.xsdt_phys as usize as *const SdtHeader));
-            println!("acpi: xsdt @ {:#x}", v2.xsdt_phys);
+        let len = core::ptr::addr_of!(v2.len).read_unaligned() as usize;
+        let xsdt_phys = core::ptr::addr_of!(v2.xsdt_phys).read_unaligned();
+        if checksum_ok(slice::from_raw_parts(rsdp_phys as *const u8, len)) && xsdt_phys != 0 {
+            ACPI_ROOT = Some(AcpiRoot::Xsdt(xsdt_phys as usize as *const SdtHeader));
+            println!("acpi: xsdt @ {:#x}", xsdt_phys);
             return;
         }
     }
 
-    if v1.rsdt_phys != 0 {
-        ACPI_ROOT = Some(AcpiRoot::Rsdt(v1.rsdt_phys as usize as *const SdtHeader));
-        println!("acpi: rsdt @ {:#x}", v1.rsdt_phys);
+    let rsdt_phys = core::ptr::addr_of!(v1.rsdt_phys).read_unaligned();
+    if rsdt_phys != 0 {
+        ACPI_ROOT = Some(AcpiRoot::Rsdt(rsdt_phys as usize as *const SdtHeader));
+        println!("acpi: rsdt @ {:#x}", rsdt_phys);
     }
 }
 
