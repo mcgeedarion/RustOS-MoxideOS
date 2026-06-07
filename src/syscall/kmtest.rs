@@ -22,18 +22,8 @@
 use crate::syscall::errno::{efault, einval};
 
 /// Handler for `SYS_KMTEST_LIST`.
-///
-/// If `buf_ptr == 0` the call returns the test count without writing anything.
-/// Otherwise it writes NUL-terminated name strings back-to-back into the
-/// user buffer (up to `buf_len` bytes) and returns the number of names written.
-///
-/// # Safety
-/// `buf_ptr` must be a valid userspace pointer when non-zero.
 pub fn sys_kmtest_list(buf_ptr: usize, buf_len: usize) -> isize {
-    // SAFETY: linker symbols were validated at harness init; see
-    // kmtest::registry().
     let tests = unsafe { kmtest::registry_slice() };
-
     if buf_ptr == 0 {
         return tests.len() as isize;
     }
@@ -60,14 +50,8 @@ pub fn sys_kmtest_list(buf_ptr: usize, buf_len: usize) -> isize {
 }
 
 /// Handler for `SYS_KMTEST_RUN`.
-///
-/// `index == usize::MAX` means run all tests.
-/// Otherwise runs the single test at `index`.
-/// Results are streamed to serial; returns 0 on pass, 1 on fail.
 pub fn sys_kmtest_run(index: usize) -> isize {
-    // SAFETY: same as above.
     let tests = unsafe { kmtest::registry_slice() };
-
     if index == usize::MAX {
         run_range(tests, 0, tests.len())
     } else {
