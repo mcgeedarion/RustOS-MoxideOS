@@ -5,21 +5,21 @@
 //! the descriptor namespace consistent until full signalfd read semantics are
 //! wired into the syscall dispatcher.
 
-use crate::core::fast_hash::KernelFastSet;
+use crate::core::fast_hash::KernelFastMap;
 use spin::Mutex;
 
-/// Fast set is safe here: keys are kernel-assigned fd numbers and iteration
+/// Fast map is safe here: keys are kernel-assigned fd numbers and iteration
 /// order is never exposed as an ABI.
-static SIGNALFDS: Mutex<KernelFastSet<usize>> = Mutex::new(KernelFastSet::new());
+static SIGNALFDS: Mutex<KernelFastMap<usize, ()>> = Mutex::new(KernelFastMap::new());
 
 /// Register an already-allocated backing fd as a signalfd.
 pub fn signalfd_register(fd: usize) {
-    SIGNALFDS.lock().insert(fd);
+    SIGNALFDS.lock().insert(fd, ());
 }
 
 /// Returns true when `fd` is a registered signalfd backing fd.
 pub fn is_signalfd(fd: usize) -> bool {
-    SIGNALFDS.lock().contains(&fd)
+    SIGNALFDS.lock().contains_key(&fd)
 }
 
 /// Close and unregister a signalfd backing fd.
