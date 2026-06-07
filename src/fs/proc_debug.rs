@@ -1,15 +1,4 @@
 //! Kernel-internal backing store for /proc/<pid>/mem, /proc/<pid>/regs,
-//! and /proc/<pid>/ctl — the three fds that let the GDB stub inspect and
-//! control a stopped process without going through ptrace(2).
-//!
-//! ## fd numbering
-//! Synthetic fds are allocated from the range 512..768 so they don't collide
-//! with the existing procfs range (256..512) or vfs fds.
-//!
-//! ## Security
-//! Every open checks `may_debug(opener_pid, target_pid)` which mirrors the
-//! ptrace permission check: caller must be a direct parent or hold
-//! CAP_SYS_PTRACE.
 
 extern crate alloc;
 use crate::core::fast_hash::KernelFastMap;
@@ -37,7 +26,6 @@ struct DebugFd {
 }
 
 /// Fast map is safe here: keys are bounded synthetic debug fd numbers assigned
-/// by the kernel; ptrace permission checks remain separate from hashing.
 static PROC_DEBUG_FDS: Mutex<KernelFastMap<usize, DebugFd>> = Mutex::new(KernelFastMap::new());
 
 pub fn is_proc_debug_fd(fdno: usize) -> bool {
@@ -76,9 +64,6 @@ fn fd_kind_for_current(fdno: usize) -> Result<ProcDebugKind, isize> {
         },
     };
     let caller = scheduler::current_pid();
-    // Revalidate on every operation so stale fds cannot outlive credential,
-    // parentage, or namespace transitions.  Also pin use to the opener to avoid
-    // a leaked synthetic backing fd becoming a confused-deputy capability.
     if caller != fd.opener || !may_debug(caller, target) {
         return Err(-1);
     }
@@ -98,10 +83,7 @@ fn may_mutate_debuggee(caller: usize, target: usize) -> bool {
         .unwrap_or(false)
 }
 
-/// Called from `procfs_open` for paths it recognises as debug paths.
-/// Returns a new synthetic fd ≥ PROC_DEBUG_FD_BASE, or a negative errno.
 pub fn proc_debug_open(opener: usize, path: &str) -> isize {
-    // path must be /proc/<pid>/mem | /proc/<pid>/regs | /proc/<pid>/ctl
     let (pid, kind_str) = match parse_debug_path(path) {
         Some(x) => x,
         None => return -2, // ENOENT
@@ -127,8 +109,6 @@ pub fn proc_debug_close(fdno: usize) {
     PROC_DEBUG_FDS.lock().remove(&fdno);
 }
 
-/// pread64-style: `offset` is the virtual address for Mem fds;
-/// ignored (treated as 0) for Regs and Ctl fds.
 pub fn proc_debug_read(fdno: usize, buf: &mut [u8], offset: usize) -> isize {
     let kind = match fd_kind_for_current(fdno) {
         Ok(k) => k,
@@ -209,7 +189,6 @@ fn read_ctl(pid: usize, buf: &mut [u8]) -> isize {
     n as isize
 }
 
-/// pwrite64-style: `offset` is the target virtual address for Mem fds.
 pub fn proc_debug_write(fdno: usize, data: &[u8], offset: usize) -> isize {
     let kind = match fd_kind_for_current(fdno) {
         Ok(k) => k,
@@ -280,9 +259,7 @@ fn write_regs(pid: usize, data: &[u8]) -> isize {
     }
 }
 
-// RFLAGS trap flag (bit 8)
 const RFLAGS_TF: usize = 1 << 8;
-// kstack frame slot index for RFLAGS (same layout as ptrace.rs F_R11)
 const FRAME_SZ: usize = 17 * 8;
 const F_R11: usize = 14; // RFLAGS lives in saved R11 slot on SYSRET path
 
