@@ -254,6 +254,28 @@ pub fn proc_fd_free(pid: usize) {
     }
 }
 
+fn posix_to_scheme_open_flags(flags: u32) -> scheme_api::OpenFlags {
+    let mut out = scheme_api::OpenFlags::empty();
+    match flags & 3 {
+        0 => out |= scheme_api::OpenFlags::READ,
+        1 => out |= scheme_api::OpenFlags::WRITE,
+        _ => out |= scheme_api::OpenFlags::READ | scheme_api::OpenFlags::WRITE,
+    }
+    if flags & O_CREAT != 0 {
+        out |= scheme_api::OpenFlags::CREATE;
+    }
+    if flags & O_TRUNC != 0 {
+        out |= scheme_api::OpenFlags::TRUNCATE;
+    }
+    if flags & O_APPEND != 0 {
+        out |= scheme_api::OpenFlags::APPEND;
+    }
+    if flags & O_NONBLOCK != 0 {
+        out |= scheme_api::OpenFlags::NON_BLOCK;
+    }
+    out
+}
+
 pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     {
         let lock = PROC_FD_TABLES.lock();
@@ -266,8 +288,7 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
 
     let (bfd, stored_path): (isize, Option<String>) =
         if crate::fs::scheme_table::is_scheme_url(path) {
-            use scheme_api::OpenFlags;
-            let open_flags = OpenFlags::from_bits_truncate(flags);
+            let open_flags = posix_to_scheme_open_flags(flags);
             match crate::fs::scheme_table::SCHEME_TABLE.open(path, open_flags) {
                 Ok((scheme, fid)) => {
                     let bfd = crate::fs::scheme_fd::alloc_scheme_backing_fd();

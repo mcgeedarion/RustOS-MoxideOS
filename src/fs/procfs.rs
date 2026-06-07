@@ -696,8 +696,16 @@ fn strip_pid_prefix<'a>(path: &'a str, suffix: &str) -> Option<(usize, &'a str)>
     Some((pid, tail))
 }
 
-/// Placeholder scheme adapter used to keep boot-time scheme registration wired
-/// while the concrete `ProcFs` URL dispatch is implemented.
+struct ProcSchemeFd {
+    fdno: usize,
+    offset: usize,
+    writable: bool,
+}
+
+static PROC_SCHEME_FDS: Mutex<BTreeMap<u64, ProcSchemeFd>> = Mutex::new(BTreeMap::new());
+static PROC_SCHEME_NEXT_FID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Scheme adapter for `proc:<path>` URLs.
 pub struct ProcFs;
 
 impl ProcFs {
@@ -706,16 +714,143 @@ impl ProcFs {
     }
 }
 
+fn proc_scheme_path(path: &str) -> String {
+    let p = path.trim_start_matches('/');
+    if p.is_empty() {
+        String::from("/proc")
+    } else if p == "proc" || p.starts_with("proc/") {
+        format!("/{}", p)
+    } else {
+        format!("/proc/{}", p)
+    }
+}
+
+fn proc_scheme_error(errno: isize) -> scheme_api::SchemeError {
+    match errno {
+        -2 => scheme_api::SchemeError::NotFound,
+        -13 => scheme_api::SchemeError::PermissionDenied,
+        -22 => scheme_api::SchemeError::InvalidArg,
+        -11 => scheme_api::SchemeError::WouldBlock,
+        _ => scheme_api::SchemeError::Io,
+    }
+}
+
 impl crate::fs::scheme_table::Scheme for ProcFs {
     fn open(
         &self,
-        _path: &str,
-        _flags: scheme_api::OpenFlags,
+        path: &str,
+        flags: scheme_api::OpenFlags,
     ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
-        Err(scheme_api::SchemeError::NoSuchScheme)
+        if flags.intersects(scheme_api::OpenFlags::CREATE | scheme_api::OpenFlags::TRUNCATE) {
+            return Err(scheme_api::SchemeError::PermissionDenied);
+        }
+        let writable = flags.contains(scheme_api::OpenFlags::WRITE)
+            || flags.contains(scheme_api::OpenFlags::APPEND);
+        let fdno = procfs_open(&proc_scheme_path(path), flags.bits());
+        if fdno < 0 {
+            return Err(proc_scheme_error(fdno));
+        }
+        let fid = PROC_SCHEME_NEXT_FID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        PROC_SCHEME_FDS.lock().insert(
+            fid,
+            ProcSchemeFd {
+                fdno: fdno as usize,
+                offset: 0,
+                writable,
+            },
+        );
+        Ok(scheme_api::SchemeFileId(fid))
     }
 
-    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+    fn read(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        buf: &mut [u8],
+    ) -> Result<usize, scheme_api::SchemeError> {
+        let (fdno, offset) = {
+            let fds = PROC_SCHEME_FDS.lock();
+            let fd = fds.get(&fid.0).ok_or(scheme_api::SchemeError::NotFound)?;
+            (fd.fdno, fd.offset)
+        };
+        let n = if crate::fs::proc_debug::is_proc_debug_fd(fdno) {
+            crate::fs::proc_debug::proc_debug_read(fdno, buf, offset)
+        } else {
+            procfs_read(fdno, buf, offset)
+        };
+        if n < 0 {
+            return Err(proc_scheme_error(n));
+        }
+        if n > 0 {
+            if let Some(fd) = PROC_SCHEME_FDS.lock().get_mut(&fid.0) {
+                fd.offset = fd.offset.saturating_add(n as usize);
+            }
+        }
+        Ok(n as usize)
+    }
+
+    fn write(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        buf: &[u8],
+    ) -> Result<usize, scheme_api::SchemeError> {
+        let (fdno, offset, writable) = {
+            let fds = PROC_SCHEME_FDS.lock();
+            let fd = fds.get(&fid.0).ok_or(scheme_api::SchemeError::NotFound)?;
+            (fd.fdno, fd.offset, fd.writable)
+        };
+        if !writable {
+            return Err(scheme_api::SchemeError::PermissionDenied);
+        }
+        let n = if crate::fs::proc_debug::is_proc_debug_fd(fdno) {
+            crate::fs::proc_debug::proc_debug_write(fdno, buf, offset)
+        } else {
+            procfs_write(fdno, buf)
+        };
+        if n < 0 {
+            return Err(proc_scheme_error(n));
+        }
+        if n > 0 {
+            if let Some(fd) = PROC_SCHEME_FDS.lock().get_mut(&fid.0) {
+                fd.offset = fd.offset.saturating_add(n as usize);
+            }
+        }
+        Ok(n as usize)
+    }
+
+    fn seek(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        offset: i64,
+        whence: u8,
+    ) -> Result<u64, scheme_api::SchemeError> {
+        let mut fds = PROC_SCHEME_FDS.lock();
+        let fd = fds
+            .get_mut(&fid.0)
+            .ok_or(scheme_api::SchemeError::NotFound)?;
+        let base = match whence {
+            0 => 0,
+            1 => fd.offset as i64,
+            2 => return Err(scheme_api::SchemeError::InvalidArg),
+            _ => return Err(scheme_api::SchemeError::InvalidArg),
+        };
+        let next = base
+            .checked_add(offset)
+            .ok_or(scheme_api::SchemeError::InvalidArg)?;
+        if next < 0 {
+            return Err(scheme_api::SchemeError::InvalidArg);
+        }
+        fd.offset = next as usize;
+        Ok(fd.offset as u64)
+    }
+
+    fn close(&self, fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        if let Some(fd) = PROC_SCHEME_FDS.lock().remove(&fid.0) {
+            if crate::fs::proc_debug::is_proc_debug_fd(fd.fdno) {
+                crate::fs::proc_debug::proc_debug_close(fd.fdno);
+            } else {
+                procfs_close(fd.fdno);
+            }
+        }
         Ok(())
     }
 }

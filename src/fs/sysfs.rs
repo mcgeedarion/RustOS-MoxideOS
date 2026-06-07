@@ -371,8 +371,16 @@ fn cpu_count() -> usize {
     }
 }
 
-/// Placeholder scheme adapter used to keep boot-time scheme registration wired
-/// while the concrete `SysFs` URL dispatch is implemented.
+struct SysSchemeFd {
+    fdno: usize,
+    offset: usize,
+}
+
+static SYS_SCHEME_FDS: Mutex<alloc::collections::BTreeMap<u64, SysSchemeFd>> =
+    Mutex::new(alloc::collections::BTreeMap::new());
+static SYS_SCHEME_NEXT_FID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+/// Scheme adapter for `sys:<path>` URLs.
 pub struct SysFs;
 
 impl SysFs {
@@ -381,16 +389,108 @@ impl SysFs {
     }
 }
 
+fn sys_scheme_path(path: &str) -> String {
+    let p = path.trim_start_matches('/');
+    if p.is_empty() {
+        String::from("/sys")
+    } else if p == "sys" || p.starts_with("sys/") {
+        alloc::format!("/{}", p)
+    } else {
+        alloc::format!("/sys/{}", p)
+    }
+}
+
+fn sys_scheme_error(errno: isize) -> scheme_api::SchemeError {
+    match errno {
+        -2 => scheme_api::SchemeError::NotFound,
+        -13 => scheme_api::SchemeError::PermissionDenied,
+        -22 => scheme_api::SchemeError::InvalidArg,
+        -11 => scheme_api::SchemeError::WouldBlock,
+        _ => scheme_api::SchemeError::Io,
+    }
+}
+
 impl crate::fs::scheme_table::Scheme for SysFs {
     fn open(
         &self,
-        _path: &str,
-        _flags: scheme_api::OpenFlags,
+        path: &str,
+        flags: scheme_api::OpenFlags,
     ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
-        Err(scheme_api::SchemeError::NoSuchScheme)
+        if flags.intersects(
+            scheme_api::OpenFlags::WRITE
+                | scheme_api::OpenFlags::CREATE
+                | scheme_api::OpenFlags::TRUNCATE
+                | scheme_api::OpenFlags::APPEND,
+        ) {
+            return Err(scheme_api::SchemeError::PermissionDenied);
+        }
+        let fdno = sysfs_open(&sys_scheme_path(path), flags.bits());
+        if fdno < 0 {
+            return Err(sys_scheme_error(fdno));
+        }
+        let fid = SYS_SCHEME_NEXT_FID.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        SYS_SCHEME_FDS.lock().insert(
+            fid,
+            SysSchemeFd {
+                fdno: fdno as usize,
+                offset: 0,
+            },
+        );
+        Ok(scheme_api::SchemeFileId(fid))
     }
 
-    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+    fn read(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        buf: &mut [u8],
+    ) -> Result<usize, scheme_api::SchemeError> {
+        let (fdno, offset) = {
+            let fds = SYS_SCHEME_FDS.lock();
+            let fd = fds.get(&fid.0).ok_or(scheme_api::SchemeError::NotFound)?;
+            (fd.fdno, fd.offset)
+        };
+        let n = sysfs_read(fdno, buf, offset);
+        if n < 0 {
+            return Err(sys_scheme_error(n));
+        }
+        if n > 0 {
+            if let Some(fd) = SYS_SCHEME_FDS.lock().get_mut(&fid.0) {
+                fd.offset = fd.offset.saturating_add(n as usize);
+            }
+        }
+        Ok(n as usize)
+    }
+
+    fn seek(
+        &self,
+        fid: scheme_api::SchemeFileId,
+        offset: i64,
+        whence: u8,
+    ) -> Result<u64, scheme_api::SchemeError> {
+        let mut fds = SYS_SCHEME_FDS.lock();
+        let fd = fds
+            .get_mut(&fid.0)
+            .ok_or(scheme_api::SchemeError::NotFound)?;
+        let base = match whence {
+            0 => 0,
+            1 => fd.offset as i64,
+            2 => return Err(scheme_api::SchemeError::InvalidArg),
+            _ => return Err(scheme_api::SchemeError::InvalidArg),
+        };
+        let next = base
+            .checked_add(offset)
+            .ok_or(scheme_api::SchemeError::InvalidArg)?;
+        if next < 0 {
+            return Err(scheme_api::SchemeError::InvalidArg);
+        }
+        fd.offset = next as usize;
+        Ok(fd.offset as u64)
+    }
+
+    fn close(&self, fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        if let Some(fd) = SYS_SCHEME_FDS.lock().remove(&fid.0) {
+            sysfs_close(fd.fdno);
+        }
         Ok(())
     }
 }
