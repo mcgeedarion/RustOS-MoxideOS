@@ -53,12 +53,12 @@ use crate::fs::process_fd::{
 };
 use crate::fs::vfs;
 use crate::proc::exec::read_cstr_safe;
-use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value, validate_user_ptr};
 use alloc::vec::Vec;
 
 #[inline(always)]
 fn cpid() -> usize {
-    crate::proc::scheduler::current_pid()
+    crate::proc::scheduler::current_pid_usize()
 }
 
 use spin::Mutex;
@@ -144,6 +144,8 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     } else if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
         // cgroupfs maintains its own offset internally.
         n = crate::fs::cgroupfs::cgroupfs_read(bfd, &mut kbuf);
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        n = crate::fs::scheme_fd::scheme_fd_read(bfd, &mut kbuf);
     } else if crate::fs::inotify::is_inotify_fd(bfd) {
         n = crate::fs::inotify::inotify_read(bfd, &mut kbuf);
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
@@ -163,7 +165,7 @@ pub fn sys_read(fd: usize, buf_va: usize, count: usize) -> isize {
     if n <= 0 {
         return n;
     }
-    if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() {
+    if crate::uaccess::copy_to_user_value(buf_va, &kbuf[..n as usize]).is_err() {
         return -14;
     }
     n
@@ -196,6 +198,9 @@ pub fn sys_write(fd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
         return crate::fs::cgroupfs::cgroupfs_write(bfd, &kbuf);
+    }
+    if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        return crate::fs::scheme_fd::scheme_fd_write(bfd, &kbuf);
     }
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return crate::fs::fanotify::fanotify_write(bfd, &kbuf);
@@ -291,6 +296,24 @@ pub fn sys_dup(fd: usize) -> isize {
     let new_bfd = if crate::fs::pipe::is_pipe(bfd) {
         crate::fs::pipe::pipe_dup(bfd);
         bfd
+    } else if crate::net::socket::is_socket_fd(bfd) {
+        crate::net::socket::socket_dup(bfd);
+        bfd
+    } else if crate::fs::eventfd::is_eventfd(bfd) {
+        crate::fs::eventfd::efd_dup(bfd);
+        bfd
+    } else if crate::fs::timerfd::is_timerfd(bfd) {
+        crate::fs::timerfd::tfd_dup(bfd);
+        bfd
+    } else if crate::fs::inotify::is_inotify_fd(bfd) {
+        crate::fs::inotify::inotify_dup(bfd);
+        bfd
+    } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
+        crate::fs::fanotify::fanotify_dup(bfd);
+        bfd
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        crate::fs::scheme_fd::scheme_fd_dup(bfd);
+        bfd
     } else {
         let r = crate::fs::vfs::dup_from(bfd, bfd);
         if r >= 0 {
@@ -346,7 +369,7 @@ pub fn sys_pread64(fd: usize, buf_va: usize, count: usize, offset: i64) -> isize
     if n <= 0 {
         return n;
     }
-    if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() {
+    if crate::uaccess::copy_to_user_value(buf_va, &kbuf[..n as usize]).is_err() {
         return -14;
     }
     n
@@ -515,6 +538,8 @@ fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
         }
     } else if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
         n = crate::fs::cgroupfs::cgroupfs_read(bfd, &mut kbuf);
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        n = crate::fs::scheme_fd::scheme_fd_read(bfd, &mut kbuf);
     } else if crate::fs::inotify::is_inotify_fd(bfd) {
         n = crate::fs::inotify::inotify_read(bfd, &mut kbuf);
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
@@ -533,7 +558,7 @@ fn read_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     if n <= 0 {
         return n;
     }
-    if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() {
+    if crate::uaccess::copy_to_user_value(buf_va, &kbuf[..n as usize]).is_err() {
         return -14;
     }
     n
@@ -555,6 +580,9 @@ fn write_bfd(bfd: usize, buf_va: usize, count: usize) -> isize {
     }
     if crate::fs::cgroupfs::is_cgroupfs_fd(bfd) {
         return crate::fs::cgroupfs::cgroupfs_write(bfd, &kbuf);
+    }
+    if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        return crate::fs::scheme_fd::scheme_fd_write(bfd, &kbuf);
     }
     if crate::fs::fanotify::is_fanotify_fd(bfd) {
         return crate::fs::fanotify::fanotify_write(bfd, &kbuf);

@@ -40,7 +40,7 @@
 extern crate alloc;
 use crate::proc::{scheduler, thread};
 use crate::sync::wait_queue::{CancellationToken, ReadyMask, WaitQueue, WakeReason};
-use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value, validate_user_ptr};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -399,7 +399,7 @@ pub fn futex_lock_pi(addr: usize) -> isize {
             let word2 = u32::from_ne_bytes(wb2);
             if (word2 & FUTEX_TID_MASK) == 0 {
                 let new_word = tid as u32;
-                if !copy_to_user(addr, &new_word.to_ne_bytes()) {
+                if crate::uaccess::copy_to_user_value(addr, &new_word.to_ne_bytes()).is_err() {
                     return -14;
                 }
                 chain.remove(&key);
@@ -427,7 +427,7 @@ pub fn futex_lock_pi(addr: usize) -> isize {
             } // owner released, retry
 
             let flagged = word3 | FUTEX_WAITERS;
-            if !copy_to_user(addr, &flagged.to_ne_bytes()) {
+            if crate::uaccess::copy_to_user_value(addr, &flagged.to_ne_bytes()).is_err() {
                 return -14;
             }
 
@@ -500,7 +500,7 @@ pub fn futex_trylock_pi(addr: usize) -> isize {
     if (word & FUTEX_TID_MASK) != 0 {
         return -11;
     } // EAGAIN
-    if !copy_to_user(addr, &(tid as u32).to_ne_bytes()) {
+    if crate::uaccess::copy_to_user_value(addr, &(tid as u32).to_ne_bytes()).is_err() {
         return -14;
     }
     chain.remove(&key);
@@ -526,14 +526,14 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
         let mut chain = PI_CHAIN.lock();
         match chain.get_mut(&key) {
             None => {
-                if !copy_to_user(addr, &0u32.to_ne_bytes()) {
+                if crate::uaccess::copy_to_user_value(addr, &0u32.to_ne_bytes()).is_err() {
                     return -14;
                 }
                 successor = None;
             },
             Some(rec) => {
                 if rec.waiters.is_empty() {
-                    if !copy_to_user(addr, &0u32.to_ne_bytes()) {
+                    if crate::uaccess::copy_to_user_value(addr, &0u32.to_ne_bytes()).is_err() {
                         return -14;
                     }
                     chain.remove(&key);
@@ -543,7 +543,7 @@ pub fn futex_unlock_pi(addr: usize) -> isize {
                     let still_contested = !rec.waiters.is_empty();
                     let new_word = (next_pid as u32 & FUTEX_TID_MASK)
                         | if still_contested { FUTEX_WAITERS } else { 0 };
-                    if !copy_to_user(addr, &new_word.to_ne_bytes()) {
+                    if crate::uaccess::copy_to_user_value(addr, &new_word.to_ne_bytes()).is_err() {
                         return -14;
                     }
                     rec.owner_pid = next_pid;
@@ -680,7 +680,7 @@ fn wake_robust_futex(entry_va: usize, futex_offset: isize, tid: usize) {
     }
 
     let had_waiters = word & FUTEX_WAITERS != 0;
-    let _ = copy_to_user(futex_va, &FUTEX_OWNER_DIED.to_ne_bytes());
+    let _ = crate::uaccess::copy_to_user_value(futex_va, &FUTEX_OWNER_DIED.to_ne_bytes());
 
     if had_waiters {
         let tgid = thread::tgid_of(tid);
@@ -831,10 +831,10 @@ pub fn sys_get_robust_list(tid: usize, headp: usize, lenp: usize) -> isize {
             Some(x) => x,
             None => return -3,
         };
-    if !copy_to_user(headp, &head.to_ne_bytes()) {
+    if crate::uaccess::copy_to_user_value(headp, &head.to_ne_bytes()).is_err() {
         return -14;
     }
-    if !copy_to_user(lenp, &len.to_ne_bytes()) {
+    if crate::uaccess::copy_to_user_value(lenp, &len.to_ne_bytes()).is_err() {
         return -14;
     }
     0

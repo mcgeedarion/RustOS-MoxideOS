@@ -8,7 +8,7 @@
 //!   Fixed to `if !copy_to_user(...)`.
 
 use crate::proc::scheduler;
-use crate::uaccess::copy_to_user;
+use crate::uaccess::{copy_to_user, copy_to_user_value};
 
 pub fn register_thread(pid: usize, tgid: usize) {
     scheduler::with_proc_mut(pid, |p| p.tgid = tgid);
@@ -75,7 +75,7 @@ pub fn sys_set_tid_address(tidptr: usize) -> isize {
 
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
-    use crate::uaccess::copy_to_user;
+    use crate::uaccess::{copy_to_user, copy_to_user_value};
     const ARCH_SET_GS: usize = 0x1001;
     const ARCH_SET_FS: usize = 0x1002;
     const ARCH_GET_FS: usize = 0x1003;
@@ -104,7 +104,7 @@ pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
         ARCH_GET_FS => {
             let base = scheduler::with_proc(pid, |p| p.tls_base).unwrap_or(0);
             // FIX: copy_to_user returns bool, not Result. Was .is_err().
-            if !copy_to_user(addr, &base.to_ne_bytes()) {
+            if crate::uaccess::copy_to_user_value(addr, &base.to_ne_bytes()).is_err() {
                 return -14;
             }
             0
@@ -114,7 +114,7 @@ pub fn sys_arch_prctl(code: usize, addr: usize) -> isize {
         },
         ARCH_GET_GS => {
             // FIX: same bool vs Result mismatch.
-            if !copy_to_user(addr, &0usize.to_ne_bytes()) {
+            if crate::uaccess::copy_to_user_value(addr, &0usize.to_ne_bytes()).is_err() {
                 return -14;
             }
             0

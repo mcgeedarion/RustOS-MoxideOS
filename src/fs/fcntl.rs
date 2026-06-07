@@ -2,7 +2,7 @@
 
 extern crate alloc;
 use crate::fs::vfs;
-use crate::uaccess::{copy_to_user, validate_user_ptr};
+use crate::uaccess::{copy_to_user, copy_to_user_value, validate_user_ptr};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -61,7 +61,7 @@ fn count_open_fds() -> usize {
 }
 
 fn check_nofile_limit() -> isize {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     let would_exceed =
         crate::proc::scheduler::with_proc(pid, |p| p.rlimits.exceeds_nofile(count_open_fds()))
             .unwrap_or(false);
@@ -169,6 +169,10 @@ pub fn close_fd_no_meta(fd: usize) {
         crate::net::socket::sys_close_socket(fd);
         return;
     }
+    if crate::fs::scheme_fd::is_scheme_fd(fd) {
+        crate::fs::scheme_fd::scheme_fd_close(fd);
+        return;
+    }
     vfs::close(fd);
 }
 
@@ -240,7 +244,7 @@ pub fn dup_from_raw(fd: usize, min_fd: usize) -> isize {
 }
 
 fn current_proc_entry(fd: usize) -> Result<crate::fs::process_fd::FdEntry, isize> {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     crate::fs::process_fd::proc_fd_get(pid, fd).ok_or(-9)
 }
 
@@ -263,11 +267,13 @@ fn duplicate_backing_fd(bfd: usize) -> Result<usize, isize> {
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
         crate::fs::fanotify::fanotify_dup(bfd);
         Ok(bfd)
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        crate::fs::scheme_fd::scheme_fd_dup(bfd);
+        Ok(bfd)
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some()
         || crate::fs::procfs::is_procfs_fd(bfd)
         || crate::fs::sysfs::is_sysfs_fd(bfd)
         || crate::fs::cgroupfs::is_cgroupfs_fd(bfd)
-        || crate::fs::scheme_fd::is_scheme_fd(bfd)
     {
         Ok(bfd)
     } else {
@@ -281,7 +287,7 @@ fn duplicate_backing_fd(bfd: usize) -> Result<usize, isize> {
 }
 
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     let entry = match current_proc_entry(fd) {
         Ok(e) => e,
         Err(e) => return e,
@@ -362,7 +368,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             let mut buf = [0u8; 32];
             let lock_ty = FD_LOCKS.lock().get(&bfd).copied().unwrap_or(F_UNLCK);
             buf[0..2].copy_from_slice(&lock_ty.to_le_bytes());
-            if !copy_to_user(arg, &buf) {
+            if crate::uaccess::copy_to_user_value(arg, &buf).is_err() {
                 return -14;
             }
             0
@@ -422,7 +428,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
 }
 
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
-    crate::fs::process_fd::proc_fd_dup2(crate::proc::scheduler::current_pid(), oldfd, newfd)
+    crate::fs::process_fd::proc_fd_dup2(crate::proc::scheduler::current_pid_usize(), oldfd, newfd)
 }
 
 pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
@@ -431,7 +437,11 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     }
     let r = sys_dup2(oldfd, newfd);
     if r >= 0 && flags & O_CLOEXEC != 0 {
-        crate::fs::process_fd::proc_fd_set_cloexec(crate::proc::scheduler::current_pid(), newfd, true);
+        crate::fs::process_fd::proc_fd_set_cloexec(
+            crate::proc::scheduler::current_pid_usize(),
+            newfd,
+            true,
+        );
     }
     r
 }

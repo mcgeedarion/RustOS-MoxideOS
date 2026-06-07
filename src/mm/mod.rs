@@ -39,6 +39,11 @@ pub mod rss;
 pub mod slab;
 pub mod swap;
 
+/// Compatibility re-export for older callers that used `crate::mm::uaccess`.
+pub mod uaccess {
+    pub use crate::uaccess::*;
+}
+
 /// Initialise memory subsystems that require explicit boot-time setup.
 ///
 /// Call order (enforced by kernel_main):
@@ -111,8 +116,8 @@ impl UserBuffer {
         }
         let dst = unsafe { self.base.add(self.cur) };
         // GUESS: copy_to_user signature taken from the call site in
-        // src/fs/ioctl/net.rs (`copy_to_user(arg, &ifr)`). Definition is
-        // written in kernel/uaccess.rs in this same patch.
+        // src/fs/ioctl/net.rs (`crate::uaccess::copy_to_user_value(arg, &ifr)`).
+        // Definition is written in kernel/uaccess.rs in this same patch.
         let n = unsafe { crate::kernel::uaccess::copy_to_user_raw(dst, src.as_ptr(), src.len()) };
         if n != src.len() {
             return Err(-14);

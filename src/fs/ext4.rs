@@ -15,8 +15,8 @@
 //! Any INCOMPAT bit **not** in the above set causes mount() to return false.
 //!
 //! RO_COMPAT flags are all accepted (checksums not verified). Filesystems that
-//! require journal recovery or encryption are rejected rather than exposing stale
-//! metadata or unreadable encrypted data.
+//! require journal recovery or encryption are rejected rather than exposing
+//! stale metadata or unreadable encrypted data.
 //!
 //! # Architecture
 //!

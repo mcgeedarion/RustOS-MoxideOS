@@ -13,7 +13,7 @@ pub mod file;
 pub mod net;
 pub mod tty;
 
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use consts::*;
 
 pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
@@ -53,7 +53,7 @@ pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
                     vi[8..12].copy_from_slice(&(info.horizontal_resolution as u32).to_ne_bytes());
                     vi[12..16].copy_from_slice(&(info.vertical_resolution as u32).to_ne_bytes());
                     vi[24..28].copy_from_slice(&32u32.to_ne_bytes()); // bits_per_pixel
-                    copy_to_user(arg, &vi);
+                    crate::uaccess::copy_to_user_value(arg, &vi);
                 }
                 return 0;
             },
@@ -65,7 +65,7 @@ pub fn sys_ioctl(fd: usize, req: usize, arg: usize) -> isize {
                     fi[16..24].copy_from_slice(&fb_phys.to_ne_bytes());
                     let line_len: u32 = info.pixels_per_scan_line * 4;
                     fi[48..52].copy_from_slice(&line_len.to_ne_bytes());
-                    copy_to_user(arg, &fi);
+                    crate::uaccess::copy_to_user_value(arg, &fi);
                 }
                 return 0;
             },

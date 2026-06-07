@@ -119,7 +119,7 @@ static PROC_FD_TABLES: Mutex<KernelFastMap<usize, ProcFdTable>> = Mutex::new(Ker
 
 #[inline]
 fn current_pid() -> usize {
-    crate::proc::scheduler::current_pid()
+    crate::proc::scheduler::current_pid_usize()
 }
 
 fn check_nofile(pid: usize, table: &ProcFdTable) -> bool {
@@ -145,6 +145,9 @@ fn dup_backing(bfd: usize) -> usize {
         bfd
     } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
         crate::fs::fanotify::fanotify_dup(bfd);
+        bfd
+    } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
+        crate::fs::scheme_fd::scheme_fd_dup(bfd);
         bfd
     } else if crate::fs::devfs::get_dev_fd(bfd).is_some() {
         bfd
@@ -265,37 +268,29 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     }
 
     let (bfd, stored_path): (isize, Option<String>) =
-        
         if crate::fs::scheme_table::is_scheme_url(path) {
             use scheme_api::OpenFlags;
             let open_flags = OpenFlags::from_bits_truncate(flags);
             match crate::fs::scheme_table::SCHEME_TABLE.open(path, open_flags) {
                 Ok((scheme, fid)) => {
                     let bfd = crate::fs::scheme_fd::alloc_scheme_backing_fd();
-                    crate::fs::scheme_fd::scheme_fd_register(
-                        bfd,
-                        scheme,
-                        fid,
-                    );
-                    
-                    crate::fs::vfs::fd_set_debug_name(
-                        bfd,
-                        alloc::string::String::from(path),
-                    );
+                    crate::fs::scheme_fd::scheme_fd_register(bfd, scheme, fid);
+
+                    crate::fs::vfs::fd_set_debug_name(bfd, alloc::string::String::from(path));
                     (bfd as isize, Some(alloc::string::String::from(path)))
-                }
+                },
                 Err(e) => {
                     use scheme_api::SchemeError;
                     let errno = match e {
-                        SchemeError::NoSuchScheme     => -2,  // ENOENT
-                        SchemeError::NotFound         => -2,
+                        SchemeError::NoSuchScheme => -2, // ENOENT
+                        SchemeError::NotFound => -2,
                         SchemeError::PermissionDenied => -13, // EACCES
-                        SchemeError::InvalidArg       => -22, // EINVAL
-                        SchemeError::WouldBlock        => -11, // EAGAIN
-                        _                             => -5,  // EIO
+                        SchemeError::InvalidArg => -22,       // EINVAL
+                        SchemeError::WouldBlock => -11,       // EAGAIN
+                        _ => -5,                              // EIO
                     };
                     (errno, None)
-                }
+                },
             }
         } else if let Some(fd) = crate::fs::devfs::try_open(path, flags) {
             (fd as isize, None)
@@ -324,7 +319,7 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
                     } else {
                         (e, None)
                     }
-                }
+                },
             }
         };
 

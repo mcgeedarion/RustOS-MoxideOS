@@ -13,7 +13,7 @@
 //!   9  CLOCK_BOOTTIME_ALARM     – alias for MONOTONIC
 
 extern crate alloc;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 
 // Nanosecond special values from <time.h>.
 const UTIME_NOW: i64 = 0x3fff_ffff;
@@ -41,7 +41,7 @@ fn write_timespec(va: usize, sec: i64, nsec: i64) -> isize {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&sec.to_le_bytes());
     buf[8..16].copy_from_slice(&nsec.to_le_bytes());
-    if copy_to_user(va, &buf).is_err() {
+    if crate::uaccess::copy_to_user_value(va, &buf).is_err() {
         -14
     } else {
         0

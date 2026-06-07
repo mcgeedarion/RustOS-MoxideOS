@@ -28,7 +28,7 @@
 //! once cpu_time_ns tracking is wired into the scheduler tick.
 
 extern crate alloc;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::collections::BTreeMap;
 use spin::Mutex as SpinMutex;
 
@@ -84,7 +84,7 @@ fn write_itimerval(va: usize, interval_ns: u64, remaining_ns: u64) -> isize {
     };
     write_timeval(&mut buf, 0, interval_ns);
     write_timeval(&mut buf, 16, remaining_ns);
-    if copy_to_user(va, &buf).is_err() {
+    if crate::uaccess::copy_to_user_value(va, &buf).is_err() {
         -14
     } else {
         0

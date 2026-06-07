@@ -31,7 +31,7 @@ use crate::proc::futex::{futex_wake_addr, robust_list_on_exit};
 use crate::proc::process::State;
 use crate::proc::wait::encode_exit;
 use crate::proc::{scheduler, thread, wait};
-use crate::uaccess::copy_to_user;
+use crate::uaccess::{copy_to_user, copy_to_user_value};
 
 fn clear_child_tid(pid: usize) {
     let va = scheduler::with_proc_mut(pid, |p, pl| {
@@ -44,7 +44,7 @@ fn clear_child_tid(pid: usize) {
     if va == 0 {
         return;
     }
-    let _ = copy_to_user(va, &0u32.to_ne_bytes());
+    let _ = crate::uaccess::copy_to_user_value(va, &0u32.to_ne_bytes());
     futex_wake_addr(va, 1);
 }
 

@@ -21,7 +21,7 @@
 //! set-uid/set-gid bits (not yet implemented; treated as 0/root).
 
 extern crate alloc;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::vec::Vec;
 
 #[inline]
@@ -151,13 +151,13 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> isize {
 pub fn sys_getresuid(ruid_va: usize, euid_va: usize, suid_va: usize) -> isize {
     let (r, e, s) = crate::proc::scheduler::with_proc(current_pid(), |p| (p.uid, p.euid, p.suid))
         .unwrap_or((0, 0, 0));
-    if copy_to_user(ruid_va, &r.to_le_bytes()).is_err() {
+    if crate::uaccess::copy_to_user_value(ruid_va, &r.to_le_bytes()).is_err() {
         return -14;
     }
-    if copy_to_user(euid_va, &e.to_le_bytes()).is_err() {
+    if crate::uaccess::copy_to_user_value(euid_va, &e.to_le_bytes()).is_err() {
         return -14;
     }
-    if copy_to_user(suid_va, &s.to_le_bytes()).is_err() {
+    if crate::uaccess::copy_to_user_value(suid_va, &s.to_le_bytes()).is_err() {
         return -14;
     }
     0
@@ -166,13 +166,13 @@ pub fn sys_getresuid(ruid_va: usize, euid_va: usize, suid_va: usize) -> isize {
 pub fn sys_getresgid(rgid_va: usize, egid_va: usize, sgid_va: usize) -> isize {
     let (r, e, s) = crate::proc::scheduler::with_proc(current_pid(), |p| (p.gid, p.egid, p.sgid))
         .unwrap_or((0, 0, 0));
-    if copy_to_user(rgid_va, &r.to_le_bytes()).is_err() {
+    if crate::uaccess::copy_to_user_value(rgid_va, &r.to_le_bytes()).is_err() {
         return -14;
     }
-    if copy_to_user(egid_va, &e.to_le_bytes()).is_err() {
+    if crate::uaccess::copy_to_user_value(egid_va, &e.to_le_bytes()).is_err() {
         return -14;
     }
-    if copy_to_user(sgid_va, &s.to_le_bytes()).is_err() {
+    if crate::uaccess::copy_to_user_value(sgid_va, &s.to_le_bytes()).is_err() {
         return -14;
     }
     0
@@ -230,7 +230,7 @@ pub fn sys_getgroups(size: i32, list_va: usize) -> isize {
     } // EINVAL
 
     for (i, &gid) in groups.iter().enumerate() {
-        if copy_to_user(list_va + i * 4, &gid.to_le_bytes()).is_err() {
+        if crate::uaccess::copy_to_user_value(list_va + i * 4, &gid.to_le_bytes()).is_err() {
             return -14;
         }
     }

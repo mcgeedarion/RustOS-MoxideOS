@@ -970,7 +970,7 @@ pub struct MmReadGuard {
 unsafe impl Send for MmReadGuard {}
 
 pub fn with_current_mm_read() -> MmReadGuard {
-    let pid = current_pid() as usize;
+    let pid = current_pid_usize();
     let arc = proc_table::with_proc(pid, |pcb| alloc::sync::Arc::clone(&pcb.mm_lock))
         .expect("with_current_mm_read: no current process");
     let guard = unsafe {
@@ -1009,6 +1009,11 @@ pub fn current_pid() -> u32 {
         return CURRENT_PID.load(core::sync::atomic::Ordering::Relaxed);
     }
     unsafe { (*task).pid }
+}
+
+#[inline]
+pub fn current_pid_usize() -> usize {
+    current_pid() as usize
 }
 
 #[inline]
@@ -1068,7 +1073,7 @@ pub fn has_current_user_proc() -> bool {
     unsafe { (*task).pid > 0 }
 }
 pub fn current_ppid() -> u32 {
-    let pid = current_pid() as usize;
+    let pid = current_pid_usize();
     proc_table::with_proc(pid, |p| p.ppid as u32).unwrap_or(0)
 }
 pub fn ap_idle() -> ! {

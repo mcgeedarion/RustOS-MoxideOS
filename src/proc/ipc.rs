@@ -26,7 +26,7 @@
 
 extern crate alloc;
 use crate::proc::namespace::{alloc_ns_id, NsId, INIT_NS};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -176,10 +176,10 @@ pub fn sys_msgrcv(msqid: i32, msgp_va: usize, msgsz: usize, msgtyp: i64, _msgflg
             let msg = q.msgs.remove(i).unwrap();
             let copy_len = msg.data.len().min(msgsz);
             q.bytes = q.bytes.saturating_sub(msg.data.len());
-            if copy_to_user(msgp_va, &msg.mtype.to_le_bytes()).is_err() {
+            if crate::uaccess::copy_to_user_value(msgp_va, &msg.mtype.to_le_bytes()).is_err() {
                 return -14;
             }
-            if copy_len > 0 && copy_to_user(msgp_va + 8, &msg.data[..copy_len]).is_err() {
+            if copy_len > 0 && crate::uaccess::copy_to_user_value(msgp_va + 8, &msg.data[..copy_len]).is_err() {
                 return -14;
             }
             copy_len as isize
@@ -338,7 +338,7 @@ pub fn sys_semctl(semid: i32, semnum: i32, cmd: i32, arg: usize) -> isize {
             };
             for (i, &v) in set.vals.iter().enumerate() {
                 let bytes = (v as i16).to_le_bytes();
-                if copy_to_user(arg + i * 2, &bytes).is_err() {
+                if crate::uaccess::copy_to_user_value(arg + i * 2, &bytes).is_err() {
                     return -14;
                 }
             }
@@ -600,11 +600,11 @@ pub fn sys_mq_receive(mqdes: i32, buf_va: usize, msg_len: usize, prio_va: usize)
     } // EAGAIN
     let msg = mq.msgs.remove(0);
     let copy_len = msg.data.len().min(msg_len);
-    if copy_to_user(buf_va, &msg.data[..copy_len]).is_err() {
+    if crate::uaccess::copy_to_user_value(buf_va, &msg.data[..copy_len]).is_err() {
         return -14;
     }
     if prio_va != 0 {
-        if copy_to_user(prio_va, &msg.priority.to_le_bytes()).is_err() {
+        if crate::uaccess::copy_to_user_value(prio_va, &msg.priority.to_le_bytes()).is_err() {
             return -14;
         }
     }

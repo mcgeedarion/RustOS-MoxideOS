@@ -551,7 +551,7 @@ pub fn sys_pipe(pipefd_va: usize) -> isize {
 pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     use crate::fs::process_fd::proc_fd_install;
     use crate::fs::scheme_fd::{alloc_scheme_backing_fd, scheme_fd_register};
-    use crate::uaccess::{copy_to_user, validate_user_ptr};
+    use crate::uaccess::{copy_to_user, copy_to_user_value, validate_user_ptr};
 
     const O_CLOEXEC: u32 = 0o2000000;
     const O_NONBLOCK: u32 = 0o4000;
@@ -611,7 +611,7 @@ pub fn sys_pipe2(pipefd_va: usize, flags: u32) -> isize {
     // 7. Copy [read_fd, write_fd] to userspace.
     let pair: [i32; 2] = [read_fd as i32, write_fd as i32];
     let bytes: [u8; 8] = unsafe { core::mem::transmute(pair) };
-    if copy_to_user(pipefd_va, &bytes).is_err() {
+    if crate::uaccess::copy_to_user_value(pipefd_va, &bytes).is_err() {
         crate::fs::process_fd::proc_fd_close(pid, read_fd);
         crate::fs::process_fd::proc_fd_close(pid, write_fd);
         return EFAULT;

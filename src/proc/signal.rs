@@ -337,12 +337,14 @@ fn push_sigframe_x86(
         si_addr: info.addr as u64,
         sig_mask: sigmask_for(scheduler::current_pid()),
     };
-    if !copy_to_user(user_rsp, unsafe {
+    if crate::uaccess::copy_to_user_value(user_rsp, unsafe {
         core::slice::from_raw_parts(
             &sf as *const _ as *const u8,
             core::mem::size_of::<SigFrameX86>(),
         )
-    }) {
+    })
+    .is_err()
+    {
         return false;
     }
     frame.rsp = user_rsp;
@@ -383,12 +385,14 @@ fn push_sigframe_aarch64(
         restorer: sa.restorer as u64,
     };
 
-    if !copy_to_user(sp, unsafe {
+    if crate::uaccess::copy_to_user_value(sp, unsafe {
         core::slice::from_raw_parts(
             &sf as *const _ as *const u8,
             core::mem::size_of::<SigFrameAarch64>(),
         )
-    }) {
+    })
+    .is_err()
+    {
         return false;
     }
 

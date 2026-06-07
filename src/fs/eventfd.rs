@@ -38,6 +38,7 @@ struct EventFd {
     counter: u64,
     semaphore: bool,
     nonblock: bool,
+    refs: usize,
 }
 
 /// Fast map is safe here: keys are kernel-assigned fd numbers and eventfd
@@ -52,6 +53,7 @@ pub fn eventfd_register(fd: usize, initval: u64, flags: u32) {
             counter: initval,
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: flags & EFD_NONBLOCK != 0,
+            refs: 1,
         },
     );
 }
@@ -124,7 +126,27 @@ pub fn is_eventfd(fd: usize) -> bool {
 
 /// Remove state when the fd is closed.
 pub fn eventfd_close(fd: usize) {
-    EVENTFDS.lock().remove(&fd);
+    let mut map = EVENTFDS.lock();
+    if let Some(entry) = map.get_mut(&fd) {
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            return;
+        }
+    }
+    map.remove(&fd);
+}
+
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_efd(fd: usize) {
+    eventfd_close(fd);
+}
+
+/// Duplicate hook for process-local fd aliases. Eventfd state is shared by the
+/// backing fd.
+pub fn efd_dup(fd: usize) {
+    if let Some(entry) = EVENTFDS.lock().get_mut(&fd) {
+        entry.refs = entry.refs.saturating_add(1);
+    }
 }
 
 /// Poll readiness bitmask: bit 0 = POLLIN, bit 2 = POLLOUT.

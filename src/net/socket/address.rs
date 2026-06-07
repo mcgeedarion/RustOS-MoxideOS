@@ -1,5 +1,5 @@
 use crate::net::ipv6;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 
 pub static EPHEMERAL: spin::Mutex<u16> = spin::Mutex::new(49152);
 
@@ -43,7 +43,7 @@ pub fn write_sockaddr_in(va: usize, ip: u32, port: u16) {
     buf[0..2].copy_from_slice(&2u16.to_be_bytes());
     buf[2..4].copy_from_slice(&port.to_be_bytes());
     buf[4..8].copy_from_slice(&ip.to_be_bytes());
-    copy_to_user(va, &buf);
+    crate::uaccess::copy_to_user_value(va, &buf);
 }
 
 pub fn write_sockaddr_in6(va: usize, ip: &ipv6::Addr6, port: u16, flowinfo: u32, scope_id: u32) {
@@ -56,5 +56,5 @@ pub fn write_sockaddr_in6(va: usize, ip: &ipv6::Addr6, port: u16, flowinfo: u32,
     buf[4..8].copy_from_slice(&flowinfo.to_be_bytes());
     buf[8..24].copy_from_slice(ip);
     buf[24..28].copy_from_slice(&scope_id.to_be_bytes());
-    copy_to_user(va, &buf);
+    crate::uaccess::copy_to_user_value(va, &buf);
 }

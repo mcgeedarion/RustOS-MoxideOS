@@ -29,7 +29,7 @@
 //! concrete `NsId` via `nsfd_to_ns_id`.
 
 extern crate alloc;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -260,7 +260,7 @@ pub fn sys_gethostname(buf_va: usize, len: usize) -> isize {
     let mut out = alloc::vec![0u8; len];
     out[..copy_len].copy_from_slice(&bytes[..copy_len]);
     // out[copy_len] = 0 (NUL terminator) — already zeroed by vec initialisation.
-    if copy_to_user(buf_va, &out).is_err() {
+    if crate::uaccess::copy_to_user_value(buf_va, &out).is_err() {
         return -14;
     }
     0

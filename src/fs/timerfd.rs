@@ -43,7 +43,7 @@
 
 extern crate alloc;
 use crate::core::fast_hash::KernelFastMap;
-use crate::uaccess::{copy_from_user, copy_to_user, validate_user_ptr};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value, validate_user_ptr};
 use spin::Mutex;
 
 use crate::fs::scheme_table::Scheme;
@@ -70,6 +70,7 @@ pub struct TimerFdEntry {
     pub spec: ItimerspecNs,
     pub expirations: u64,
     pub nonblocking: bool,
+    pub refs: usize,
 }
 
 /// Fast map is safe here: keys are monotonic kernel-assigned timerfd table
@@ -167,7 +168,7 @@ fn write_itimerspec(va: usize, interval_ns: u64, remaining_ns: u64) {
     buf[8..16].copy_from_slice(&insec.to_le_bytes());
     buf[16..24].copy_from_slice(&rsec.to_le_bytes());
     buf[24..32].copy_from_slice(&rnsec.to_le_bytes());
-    let _ = copy_to_user(va, &buf);
+    let _ = crate::uaccess::copy_to_user_value(va, &buf);
 }
 
 fn tick(entry: &mut TimerFdEntry) {
@@ -212,6 +213,7 @@ pub fn sys_timerfd_create(clockid: u32, flags: u32) -> isize {
             spec: ItimerspecNs::default(),
             expirations: 0,
             nonblocking: flags & TFD_NONBLOCK != 0,
+            refs: 1,
         },
     );
 
@@ -356,5 +358,29 @@ pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
 }
 
 pub fn timerfd_close(fdno: usize) {
-    TABLE.lock().remove(&fdno);
+    let mut table = TABLE.lock();
+    if let Some(entry) = table.get_mut(&fdno) {
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            return;
+        }
+    }
+    table.remove(&fdno);
+}
+
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_tfd(fdno: usize) {
+    if crate::fs::scheme_fd::is_scheme_fd(fdno) {
+        crate::fs::scheme_fd::scheme_fd_close(fdno);
+    } else {
+        timerfd_close(fdno);
+    }
+}
+
+/// Duplicate hook for process-local fd aliases. Timerfd state is shared by the
+/// backing fd.
+pub fn tfd_dup(fdno: usize) {
+    if let Some(entry) = TABLE.lock().get_mut(&fdno) {
+        entry.refs = entry.refs.saturating_add(1);
+    }
 }

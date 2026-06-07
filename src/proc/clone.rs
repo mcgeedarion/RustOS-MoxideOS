@@ -233,17 +233,17 @@ pub fn sys_clone3(args_va: usize, args_size: usize) -> isize {
     };
 
     if flags & CLONE_PARENT_SETTID != 0 {
-        let _ = copy_to_user(ca.parent_tid as usize, &(child_pid as u32).to_ne_bytes());
+        let _ = crate::uaccess::copy_to_user_value(ca.parent_tid as usize, &(child_pid as u32).to_ne_bytes());
     }
     if flags & CLONE_PIDFD != 0 {
         let fd = crate::fs::pidfd::alloc(child_pid);
-        let _ = copy_to_user(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
+        let _ = crate::uaccess::copy_to_user_value(ca.pidfd as usize, &(fd as i32).to_ne_bytes());
     }
 
     let child_tid_va = if flags & CLONE_CHILD_SETTID != 0 {
         let va = ca.child_tid as usize;
         if va != 0 && va < USER_SPACE_END {
-            let _ = copy_to_user(va, &(child_pid as u32).to_ne_bytes());
+            let _ = crate::uaccess::copy_to_user_value(va, &(child_pid as u32).to_ne_bytes());
         }
         va
     } else {

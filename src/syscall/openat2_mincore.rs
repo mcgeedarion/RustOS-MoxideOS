@@ -65,7 +65,7 @@ fn sys_mincore(addr: usize, length: usize, vec_va: usize) -> isize {
         } else {
             0u8
         };
-        if crate::uaccess::copy_to_user(vec_va + i, &[present]).is_err() {
+        if crate::uaccess::copy_to_user_value(vec_va + i, &[present]).is_err() {
             return -14;
         }
     }

@@ -12,7 +12,7 @@ fn sys_sched_getscheduler_impl(_pid: usize) -> isize {
 fn sys_sched_getparam_impl(pid: usize, param_va: usize) -> isize {
     // struct sched_param { int sched_priority; }  — 4 bytes on x86-64
     if param_va != 0 {
-        let _ = crate::uaccess::copy_to_user(param_va, &0i32.to_le_bytes());
+        let _ = crate::uaccess::copy_to_user_value(param_va, &0i32.to_le_bytes());
     }
     0
 }

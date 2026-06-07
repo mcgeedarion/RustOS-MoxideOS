@@ -3,7 +3,7 @@ use super::address::{next_ephemeral, read_sockaddr_in, write_sockaddr_in};
 use super::core::SOCKETS;
 use super::types::{SockAddr, SocketState, AF_INET, SOCK_DGRAM};
 use crate::net::{dhcp, dns, ip, udp};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -99,13 +99,13 @@ pub fn sys_recvfrom(
     let n = data.len().min(len);
     let mut out = alloc::vec![0u8; n];
     out.copy_from_slice(&data[..n]);
-    copy_to_user(buf_va, &out);
+    crate::uaccess::copy_to_user_value(buf_va, &out);
     if src_addr_va != 0 {
         write_sockaddr_in(src_addr_va, src_ip, src_port);
     }
     if src_len_va != 0 {
         let sz: u32 = 16;
-        copy_to_user(src_len_va, &sz.to_ne_bytes());
+        crate::uaccess::copy_to_user_value(src_len_va, &sz.to_ne_bytes());
     }
     n as isize
 }

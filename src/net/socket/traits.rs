@@ -4,7 +4,7 @@ use super::types::{
     SO_REUSEADDR,
 };
 use crate::net::tcp;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 
 pub fn sys_setsockopt(
     fd: usize,
@@ -85,9 +85,9 @@ pub fn sys_getsockopt(
         _ => {},
     }
     drop(sockets);
-    copy_to_user(optval_va, &out.to_ne_bytes());
+    crate::uaccess::copy_to_user_value(optval_va, &out.to_ne_bytes());
     let len: u32 = 4;
-    copy_to_user(optlen_va, &len.to_ne_bytes());
+    crate::uaccess::copy_to_user_value(optlen_va, &len.to_ne_bytes());
     0
 }
 

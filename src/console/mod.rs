@@ -52,3 +52,11 @@ macro_rules! serial_println {
 macro_rules! serial_print {
     ($($arg:tt)*) => ($crate::kprint!($($arg)*));
 }
+
+/// Compatibility println macro for older call sites that predate `kprintln!`.
+#[macro_export]
+macro_rules! println {
+    () => ($crate::kprintln!());
+    ($fmt:expr) => ($crate::kprintln!($fmt));
+    ($fmt:expr, $($arg:tt)*) => ($crate::kprintln!($fmt, $($arg)*));
+}

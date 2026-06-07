@@ -303,6 +303,15 @@ pub fn copy_from_user(dst: *mut u8, src: usize, len: usize) -> UaccessResult {
 /// * `dst` is NULL.
 /// * `[dst, dst + len)` extends outside user virtual address space.
 /// * A hardware page fault occurs (e.g. unmapped or read-only page).
+/// Copies the raw bytes of an in-kernel value or slice to a user-space address.
+///
+/// Compatibility helper for call sites that already hold a Rust reference; it
+/// funnels through [`copy_to_user`] so address validation and fault handling
+/// stay centralized.
+pub fn copy_to_user_value<T: ?Sized>(dst: usize, src: &T) -> UaccessResult {
+    copy_to_user(dst, src as *const T as *const u8, mem::size_of_val(src))
+}
+
 pub fn copy_to_user(dst: usize, src: *const u8, len: usize) -> UaccessResult {
     if len == 0 {
         return Ok(());

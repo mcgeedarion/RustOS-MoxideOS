@@ -77,6 +77,7 @@ struct InotifyInstance {
     queue: Vec<QueuedEvent>,
     watches: Vec<Watch>,
     next_wd: i32,
+    refs: usize,
 }
 
 static TABLE: Mutex<BTreeMap<usize, InotifyInstance>> = Mutex::new(BTreeMap::new());
@@ -142,6 +143,7 @@ pub fn sys_inotify_init1(flags: u32) -> isize {
             queue: Vec::new(),
             watches: Vec::new(),
             next_wd: 1,
+            refs: 1,
         },
     );
 
@@ -278,7 +280,31 @@ pub fn inotify_read(fdno: usize, buf: &mut [u8]) -> isize {
 }
 
 pub fn inotify_close(fdno: usize) {
-    TABLE.lock().remove(&fdno);
+    let mut table = TABLE.lock();
+    if let Some(entry) = table.get_mut(&fdno) {
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            return;
+        }
+    }
+    table.remove(&fdno);
+}
+
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_inotify(fdno: usize) {
+    if crate::fs::scheme_fd::is_scheme_fd(fdno) {
+        crate::fs::scheme_fd::scheme_fd_close(fdno);
+    } else {
+        inotify_close(fdno);
+    }
+}
+
+/// Duplicate hook for process-local fd aliases. Inotify state is shared by the
+/// backing fd.
+pub fn inotify_dup(fdno: usize) {
+    if let Some(entry) = TABLE.lock().get_mut(&fdno) {
+        entry.refs = entry.refs.saturating_add(1);
+    }
 }
 
 pub fn is_inotify_fd(fdno: usize) -> bool {

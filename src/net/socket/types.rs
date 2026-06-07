@@ -74,4 +74,5 @@ pub struct Socket {
     /// For AF_UNIX listening sockets
     pub unix_listener: Option<Arc<Mutex<UnixListener>>>,
     pub so_error: i32,
+    pub refs: usize,
 }

@@ -163,7 +163,7 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
 
 /// Handle `fcntl(fd, F_GETLK / F_SETLK / F_SETLKW, flock_ptr)`.
 pub fn sys_fcntl_lock(inode_id: u64, cmd: i32, flock_uptr: usize) -> isize {
-    use crate::uaccess::{copy_from_user, copy_to_user};
+    use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
     let pid = current_pid();
 
     let mut fl = Flock::default();
@@ -185,14 +185,14 @@ pub fn sys_fcntl_lock(inode_id: u64, cmd: i32, flock_uptr: usize) -> isize {
                     out.l_start = e.start as i64;
                     out.l_len = (e.end - e.start) as i64;
                     out.l_pid = e.pid as u32;
-                    let _ = copy_to_user(flock_uptr as *mut Flock, &out);
+                    let _ = crate::uaccess::copy_to_user_value(flock_uptr, &out);
                     return 0;
                 }
             }
         }
         // No conflicting lock.
         fl.l_type = F_UNLCK;
-        let _ = copy_to_user(flock_uptr as *mut Flock, &fl);
+        let _ = crate::uaccess::copy_to_user_value(flock_uptr, &fl);
         return 0;
     }
 

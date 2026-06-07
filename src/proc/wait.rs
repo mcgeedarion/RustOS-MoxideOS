@@ -19,7 +19,7 @@
 
 use crate::proc::process::State;
 use crate::proc::scheduler;
-use crate::uaccess::copy_to_user;
+use crate::uaccess::{copy_to_user, copy_to_user_value};
 
 #[inline]
 pub fn encode_exit(code: i32) -> i32 {
@@ -60,7 +60,7 @@ fn write_rusage(va: usize, utime_ns: u64, stime_ns: u64) {
     let sus = (stime_ns % 1_000_000_000) / 1_000;
     buf[16..24].copy_from_slice(&ss.to_ne_bytes());
     buf[24..32].copy_from_slice(&sus.to_ne_bytes());
-    let _ = copy_to_user(va, &buf);
+    let _ = crate::uaccess::copy_to_user_value(va, &buf);
 }
 
 pub fn notify_exit(exited_pid: usize) {
@@ -272,7 +272,7 @@ fn sys_wait4_impl(pid: isize, wstatus_va: usize, options: u32, rusage_va: usize)
                 }
 
                 if wstatus_va != 0 {
-                    let _ = copy_to_user(wstatus_va, &wstatus.to_ne_bytes());
+                    let _ = crate::uaccess::copy_to_user_value(wstatus_va, &wstatus.to_ne_bytes());
                 }
                 write_rusage(rusage_va, utime_ns, stime_ns);
                 return child_pid as isize;

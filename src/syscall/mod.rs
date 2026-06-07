@@ -117,17 +117,17 @@ pub(crate) fn sys_epoll_create1(flags: u32) -> isize {
 // Deduplicated into a single helper; both NRs route here.
 #[inline]
 pub(crate) fn copy_gid_to_user(a: usize, b: usize, c: usize) -> isize {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     let gid = crate::proc::scheduler::with_proc(pid, |p| p.cred.gid).unwrap_or(0);
     let bytes = gid.to_le_bytes();
     if a != 0 {
-        let _ = crate::uaccess::copy_to_user(a, &bytes);
+        let _ = crate::uaccess::copy_to_user_value(a, &bytes);
     }
     if b != 0 {
-        let _ = crate::uaccess::copy_to_user(b, &bytes);
+        let _ = crate::uaccess::copy_to_user_value(b, &bytes);
     }
     if c != 0 {
-        let _ = crate::uaccess::copy_to_user(c, &bytes);
+        let _ = crate::uaccess::copy_to_user_value(c, &bytes);
     }
     0
 }
@@ -135,17 +135,17 @@ pub(crate) fn copy_gid_to_user(a: usize, b: usize, c: usize) -> isize {
 // Mirrors copy_gid_to_user; extracted from the inline arm in dispatch_process.
 #[inline]
 pub(crate) fn copy_uid_to_user(a: usize, b: usize, c: usize) -> isize {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     let uid = crate::proc::scheduler::with_proc(pid, |p| p.uid).unwrap_or(0);
     let bytes = uid.to_le_bytes();
     if a != 0 {
-        let _ = crate::uaccess::copy_to_user(a, &bytes);
+        let _ = crate::uaccess::copy_to_user_value(a, &bytes);
     }
     if b != 0 {
-        let _ = crate::uaccess::copy_to_user(b, &bytes);
+        let _ = crate::uaccess::copy_to_user_value(b, &bytes);
     }
     if c != 0 {
-        let _ = crate::uaccess::copy_to_user(c, &bytes);
+        let _ = crate::uaccess::copy_to_user_value(c, &bytes);
     }
     0
 }
@@ -169,7 +169,7 @@ fn copy_msgbuf_to_user(msgp_va: usize, mtype: i64, data: &[u8]) -> bool {
     let mut buf = alloc::vec![0u8; 8 + data.len()];
     buf[0..8].copy_from_slice(&mtype.to_ne_bytes());
     buf[8..].copy_from_slice(data);
-    crate::uaccess::copy_to_user(msgp_va, &buf).is_ok()
+    crate::uaccess::copy_to_user_value(msgp_va, &buf).is_ok()
 }
 
 fn copy_sembuf_from_user(sops_va: usize, nsops: usize) -> Option<Vec<sem::Sembuf>> {
@@ -307,7 +307,7 @@ fn copy_mq_attr_to_user(va: usize, attr: &mq::MqAttr) -> bool {
     buf[8..16].copy_from_slice(&attr.mq_maxmsg.to_ne_bytes());
     buf[16..24].copy_from_slice(&attr.mq_msgsize.to_ne_bytes());
     buf[24..32].copy_from_slice(&attr.mq_curmsgs.to_ne_bytes());
-    crate::uaccess::copy_to_user(va, &buf).is_ok()
+    crate::uaccess::copy_to_user_value(va, &buf).is_ok()
 }
 
 pub fn dispatch(nr: usize, a: usize, b: usize, c: usize, d: usize, e: usize, f: usize) -> isize {
@@ -356,7 +356,7 @@ pub fn dispatch_with_rip(
             }
         },
         crate::security::seccomp::SeccompVerdict::Trap => {
-            let pid = crate::proc::scheduler::current_pid();
+            let pid = crate::proc::scheduler::current_pid_usize();
             crate::proc::signal::send_signal(pid, SIGSYS);
             if !is_exit {
                 return -1;
@@ -427,7 +427,7 @@ pub(crate) fn shmctl_dispatch(shmid: i32, cmd: i32, buf_va: usize) -> isize {
         match shm::shmctl(shmid, cmd) {
             Ok(ds) => {
                 if buf_va != 0 {
-                    let _ = crate::uaccess::copy_to_user(buf_va, &serialize_shmid_ds(&ds));
+                    let _ = crate::uaccess::copy_to_user_value(buf_va, &serialize_shmid_ds(&ds));
                 }
                 0
             },
@@ -503,7 +503,7 @@ pub(crate) fn msgctl_dispatch(msqid: i32, cmd: i32, buf_va: usize) -> isize {
         match msg::msgctl(msqid, cmd) {
             Ok(ds) => {
                 if buf_va != 0 {
-                    let _ = crate::uaccess::copy_to_user(buf_va, &serialize_msqid_ds(&ds));
+                    let _ = crate::uaccess::copy_to_user_value(buf_va, &serialize_msqid_ds(&ds));
                 }
                 0
             },
@@ -561,11 +561,11 @@ pub(crate) fn mq_timedreceive_dispatch(
 ) -> isize {
     match mq::mq_receive(mqd, buflen) {
         Ok((data, prio)) => {
-            if crate::uaccess::copy_to_user(buf_va, &data).is_err() {
+            if crate::uaccess::copy_to_user_value(buf_va, &data).is_err() {
                 return efault();
             }
             if prio_va != 0 {
-                let _ = crate::uaccess::copy_to_user(prio_va, &prio.to_ne_bytes());
+                let _ = crate::uaccess::copy_to_user_value(prio_va, &prio.to_ne_bytes());
             }
             data.len() as isize
         },

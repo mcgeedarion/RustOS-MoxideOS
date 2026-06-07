@@ -145,7 +145,7 @@ impl RlimitSet {
 
 pub fn getrlimit_for(pid: usize, resource: usize) -> (u64, u64) {
     if pid == 0 {
-        let me = crate::proc::scheduler::current_pid();
+        let me = crate::proc::scheduler::current_pid_usize();
         crate::proc::scheduler::with_proc(me, |p| p.rlimits.get(resource))
             .unwrap_or((RLIM_INFINITY, RLIM_INFINITY))
     } else {
@@ -156,10 +156,10 @@ pub fn getrlimit_for(pid: usize, resource: usize) -> (u64, u64) {
 
 pub fn setrlimit_for(pid: usize, resource: usize, soft: u64, hard: u64) -> isize {
     let target = if pid == 0 {
-        crate::proc::scheduler::current_pid()
+        crate::proc::scheduler::current_pid_usize()
     } else {
         pid
     };
-    crate::proc::scheduler::with_proc_mut(target, |p| p.rlimits.set(resource, soft, hard))
+    crate::proc::scheduler::with_proc_mut(target, |p, _pl| p.rlimits.set(resource, soft, hard))
         .unwrap_or(-3)
 }

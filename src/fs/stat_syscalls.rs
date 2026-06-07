@@ -168,7 +168,7 @@ pub fn sys_fstat(fd: usize, stat_va: usize) -> isize {
         let buf = unsafe {
             core::slice::from_raw_parts(&s as *const _ as *const u8, core::mem::size_of::<Stat>())
         };
-        if copy_to_user(stat_va, buf).is_err() {
+        if crate::uaccess::copy_to_user_value(stat_va, buf).is_err() {
             -14
         } else {
             0
@@ -307,7 +307,7 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
         let buf = unsafe {
             core::slice::from_raw_parts(&s as *const _ as *const u8, core::mem::size_of::<Stat>())
         };
-        if copy_to_user(stat_va, buf).is_err() {
+        if crate::uaccess::copy_to_user_value(stat_va, buf).is_err() {
             return -14;
         }
         return 0;
@@ -319,7 +319,7 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
         let buf = unsafe {
             core::slice::from_raw_parts(&s as *const _ as *const u8, core::mem::size_of::<Stat>())
         };
-        if copy_to_user(stat_va, buf).is_err() {
+        if crate::uaccess::copy_to_user_value(stat_va, buf).is_err() {
             return -14;
         }
         return 0;
@@ -351,7 +351,7 @@ fn fill_stat(path: &str, stat_va: usize, lstat: bool) -> isize {
                     core::mem::size_of::<Stat>(),
                 )
             };
-            if copy_to_user(stat_va, buf).is_err() {
+            if crate::uaccess::copy_to_user_value(stat_va, buf).is_err() {
                 return -14;
             }
             0
@@ -417,7 +417,7 @@ pub fn sys_getcwd(buf_va: usize, size: usize) -> isize {
     } // ERANGE
     let mut kbuf = alloc::vec![0u8; needed];
     kbuf[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    if copy_to_user(buf_va, &kbuf).is_err() {
+    if crate::uaccess::copy_to_user_value(buf_va, &kbuf).is_err() {
         return -14;
     }
     buf_va as isize
@@ -536,7 +536,7 @@ pub fn sys_readlink(path_va: usize, buf_va: usize, bufsz: usize) -> isize {
         if n < 0 {
             return n;
         }
-        if copy_to_user(buf_va, &kbuf[..n as usize]).is_err() {
+        if crate::uaccess::copy_to_user_value(buf_va, &kbuf[..n as usize]).is_err() {
             return -14;
         }
         return n;
@@ -545,7 +545,7 @@ pub fn sys_readlink(path_va: usize, buf_va: usize, bufsz: usize) -> isize {
     match vfs::readlink(&path) {
         Some(target) => {
             let n = target.len().min(bufsz);
-            if copy_to_user(buf_va, target[..n].as_bytes()).is_err() {
+            if crate::uaccess::copy_to_user_value(buf_va, target[..n].as_bytes()).is_err() {
                 return -14;
             }
             n as isize

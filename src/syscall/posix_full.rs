@@ -28,7 +28,7 @@ pub(super) fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&cur.to_le_bytes());
     buf[8..16].copy_from_slice(&max.to_le_bytes());
-    if crate::mm::uaccess::copy_to_user(rlim_va, &buf).is_err() {
+    if crate::mm::uaccess::copy_to_user_value(rlim_va, &buf).is_err() {
         return -14;
     }
     0
@@ -51,7 +51,7 @@ pub(super) fn sys_prlimit64_impl(_pid: u32, resource: u32, _new_va: usize, old_v
 /// NR 98  getrusage(who, usage_va) — return zeroed struct rusage.
 pub(super) fn sys_getrusage_impl(_who: i32, usage_va: usize) -> isize {
     let buf = [0u8; 144];
-    if crate::mm::uaccess::copy_to_user(usage_va, &buf).is_err() {
+    if crate::mm::uaccess::copy_to_user_value(usage_va, &buf).is_err() {
         return -14;
     }
     0
@@ -68,7 +68,7 @@ pub(super) fn sys_sysinfo_impl(info_va: usize) -> isize {
     buf[48..56].copy_from_slice(&total_mem.to_le_bytes()); // totalram
     buf[56..64].copy_from_slice(&free_mem.to_le_bytes()); // freeram
     buf[104..108].copy_from_slice(&(4096u32).to_le_bytes()); // mem_unit
-    if crate::mm::uaccess::copy_to_user(info_va, &buf).is_err() {
+    if crate::mm::uaccess::copy_to_user_value(info_va, &buf).is_err() {
         return -14;
     }
     0
@@ -78,7 +78,7 @@ pub(super) fn sys_sysinfo_impl(info_va: usize) -> isize {
 pub(super) fn sys_times_impl(tbuf_va: usize) -> isize {
     if tbuf_va != 0 {
         let buf = [0u8; 32]; // struct tms: 4 × clock_t (8 bytes each)
-        if crate::mm::uaccess::copy_to_user(tbuf_va, &buf).is_err() {
+        if crate::mm::uaccess::copy_to_user_value(tbuf_va, &buf).is_err() {
             return -14;
         }
     }
@@ -105,7 +105,7 @@ pub(super) fn sys_uname_impl(uname_va: usize) -> isize {
     for (i, field) in buf.iter().enumerate() {
         flat[i * 65..(i + 1) * 65].copy_from_slice(field);
     }
-    if crate::mm::uaccess::copy_to_user(uname_va, &flat).is_err() {
+    if crate::mm::uaccess::copy_to_user_value(uname_va, &flat).is_err() {
         return -14;
     }
     0
@@ -142,7 +142,7 @@ pub(super) fn sys_prctl_impl(op: i32, a2: usize, _a3: usize, _a4: usize, _a5: us
             let n = b.len().min(15);
             let mut buf = [0u8; 16];
             buf[..n].copy_from_slice(&b[..n]);
-            if crate::mm::uaccess::copy_to_user(a2, &buf).is_err() {
+            if crate::mm::uaccess::copy_to_user_value(a2, &buf).is_err() {
                 return -14;
             }
             0
@@ -178,7 +178,7 @@ pub(super) fn sys_arch_prctl_impl(code: i32, addr: usize) -> isize {
         },
         ARCH_GET_FS => {
             let base = crate::proc::scheduler::with_proc(pid, |p| p.fs_base).unwrap_or(0);
-            if crate::mm::uaccess::copy_to_user(addr, &base.to_le_bytes()).is_err() {
+            if crate::mm::uaccess::copy_to_user_value(addr, &base.to_le_bytes()).is_err() {
                 return -14;
             }
             0
@@ -190,7 +190,7 @@ pub(super) fn sys_arch_prctl_impl(code: i32, addr: usize) -> isize {
         },
         ARCH_GET_GS => {
             let base = crate::proc::scheduler::with_proc(pid, |p| p.gs_base).unwrap_or(0);
-            if crate::mm::uaccess::copy_to_user(addr, &base.to_le_bytes()).is_err() {
+            if crate::mm::uaccess::copy_to_user_value(addr, &base.to_le_bytes()).is_err() {
                 return -14;
             }
             0
@@ -302,7 +302,7 @@ pub(super) fn sys_capget_impl(hdr_va: usize, data_va: usize) -> isize {
     // struct __user_cap_data_struct: two u32 effective/permitted/inheritable pairs.
     if data_va != 0 {
         let full = [0xFFu8; 24]; // all caps set in effective + permitted
-        let _ = crate::mm::uaccess::copy_to_user(data_va, &full);
+        let _ = crate::mm::uaccess::copy_to_user_value(data_va, &full);
     }
     0
 }

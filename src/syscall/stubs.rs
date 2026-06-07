@@ -17,8 +17,8 @@ pub(super) fn resolve_at_path_for_stubs(dirfd: i32, path_va: usize) -> Result<St
 }
 
 // copy helpers used by ptrace
-fn copy_to_user(dst_va: usize, src: &[u8]) -> Result<(), ()> {
-    crate::mm::uaccess::copy_to_user(dst_va, src)
+fn copy_to_user_value<T: ?Sized>(dst_va: usize, src: &T) -> Result<(), ()> {
+    crate::mm::uaccess::copy_to_user_value(dst_va, src).map_err(|_| ())
 }
 fn copy_from_user(dst: &mut [u8], src_va: usize) -> Result<(), ()> {
     crate::mm::uaccess::copy_from_user(dst, src_va)
@@ -35,10 +35,10 @@ pub(super) fn sys_getcwd_impl(buf_va: usize, size: usize) -> isize {
     if bytes.len() + 1 > size {
         return erange();
     }
-    if copy_to_user(buf_va, bytes).is_err() {
+    if copy_to_user_value(buf_va, bytes).is_err() {
         return efault();
     }
-    if copy_to_user(buf_va + bytes.len(), &[0u8]).is_err() {
+    if copy_to_user_value(buf_va + bytes.len(), &[0u8]).is_err() {
         return efault();
     }
     buf_va as isize
@@ -197,7 +197,7 @@ pub(super) fn sys_readlinkat_impl(
     };
     let bytes = target.as_bytes();
     let n = bytes.len().min(bufsz);
-    if copy_to_user(buf_va, &bytes[..n]).is_err() {
+    if copy_to_user_value(buf_va, &bytes[..n]).is_err() {
         return efault();
     }
     n as isize
@@ -445,14 +445,14 @@ fn ptrace_copy_regs_to_user<const N: usize>(va: usize, regs: &[u64; N]) -> Resul
         let off = i * 8;
         bytes[off..off + 8].copy_from_slice(&reg.to_le_bytes());
     }
-    if copy_to_user(va, &bytes).is_err() {
+    if copy_to_user_value(va, &bytes).is_err() {
         return Err(efault());
     }
     Ok(())
 }
 
 /// NR 101  ptrace(request, pid, addr, data)
-pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
+pub(crate) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) -> isize {
     use crate::mm::pmm::PAGE_SIZE;
     use crate::proc::ptrace::{
         apply_user_regs_pub, build_user_regs_pub, PtraceState, FRAME_SZ, PTRACE_ATTACH,
@@ -591,7 +591,7 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             };
             let word: usize = unsafe { core::ptr::read(phys as *const usize) };
             if data != 0 {
-                if copy_to_user(data, &word.to_le_bytes()).is_err() {
+                if copy_to_user_value(data, &word.to_le_bytes()).is_err() {
                     return efault();
                 }
             }
@@ -629,7 +629,7 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
             })
             .unwrap_or(0);
             if data != 0 {
-                if copy_to_user(data, &val.to_le_bytes()).is_err() {
+                if copy_to_user_value(data, &val.to_le_bytes()).is_err() {
                     return efault();
                 }
             }
@@ -698,7 +698,7 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
         PTRACE_GETEVENTMSG => {
             let msg = crate::proc::scheduler::with_proc(pid as usize, |p| p.ptrace_event_msg)
                 .unwrap_or(0);
-            if copy_to_user(data, &msg.to_le_bytes()).is_err() {
+            if copy_to_user_value(data, &msg.to_le_bytes()).is_err() {
                 return efault();
             }
             0
@@ -706,7 +706,7 @@ pub(super) fn sys_ptrace_impl(request: i32, pid: i32, addr: usize, data: usize) 
 
         PTRACE_GETSIGINFO => {
             let si = crate::proc::signal::get_pending_siginfo(pid as usize);
-            if copy_to_user(data, &si).is_err() {
+            if copy_to_user_value(data, &si).is_err() {
                 return efault();
             }
             0

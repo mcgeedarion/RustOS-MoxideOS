@@ -1,6 +1,6 @@
 //! TTY / termios ioctl handlers.
 use super::consts::*;
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 
 pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
     match req {
@@ -18,13 +18,13 @@ pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
             t[12..16].copy_from_slice(&0x8A3Bu32.to_ne_bytes());
             // c_cc[VMIN]=1, c_cc[VTIME]=0 at offsets 22, 23 within c_cc array (base 17)
             t[22] = 1;
-            copy_to_user(arg, &t);
+            crate::uaccess::copy_to_user_value(arg, &t);
             0
         },
         TCSETS | TCSETSW | TCSETSF => 0,
         TIOCGPGRP => {
             let pgid: u32 = crate::proc::scheduler::current_pid() as u32;
-            copy_to_user(arg, &pgid.to_ne_bytes());
+            crate::uaccess::copy_to_user_value(arg, &pgid.to_ne_bytes());
             0
         },
         TIOCSPGRP => 0,
@@ -37,14 +37,14 @@ pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
                 0u16.to_ne_bytes(),
             ]
             .concat();
-            copy_to_user(arg, &ws);
+            crate::uaccess::copy_to_user_value(arg, &ws);
             0
         },
         TIOCSWINSZ => 0,
         TIOCGPTPEER => -1,
         TIOCSPTLCK => 0,
         TIOCGPTN => {
-            copy_to_user(arg, &0u32.to_ne_bytes());
+            crate::uaccess::copy_to_user_value(arg, &0u32.to_ne_bytes());
             0
         },
         TIOCNOTTY => 0,
@@ -52,7 +52,7 @@ pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
         TIOCEXCL => 0,
         TIOCNXCL => 0,
         TIOCOUTQ => {
-            copy_to_user(arg, &0u32.to_ne_bytes());
+            crate::uaccess::copy_to_user_value(arg, &0u32.to_ne_bytes());
             0
         },
         TIOCSTI => 0,
@@ -67,6 +67,6 @@ pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
 
 fn vfs_fionread(fd: usize, arg: usize) -> isize {
     let n: u32 = crate::fs::vfs::vfs_fionread(fd).unwrap_or(0) as u32;
-    copy_to_user(arg, &n.to_ne_bytes());
+    crate::uaccess::copy_to_user_value(arg, &n.to_ne_bytes());
     0
 }

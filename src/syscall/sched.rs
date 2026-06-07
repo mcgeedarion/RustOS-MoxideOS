@@ -49,7 +49,7 @@ use super::errno::{eacces, ebusy, efault, einval, enosys, esrch};
 use crate::proc::rlimit::{RLIMIT_NICE, RLIMIT_RTPRIO, RLIM_INFINITY};
 use crate::proc::sched_helpers::{cbs_admit, cbs_release};
 use crate::proc::scheduler::{SchedEntity, SchedPolicy, CPUMASK_ALL};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 
 // Recognised values for the `which` argument of setpriority / getpriority.
 const PRIO_PROCESS: i32 = 0;
@@ -105,7 +105,7 @@ fn write_sched_param(uptr: usize, param: &SchedParam) -> Result<(), isize> {
     if uptr == 0 {
         return Err(efault());
     }
-    copy_to_user(uptr, &param.sched_priority.to_ne_bytes()).map_err(|_| efault())
+    crate::uaccess::copy_to_user_value(uptr, &param.sched_priority.to_ne_bytes()).map_err(|_| efault())
 }
 
 /// Read a `SchedAttr` from user space using the fixed 48-byte wire layout.
@@ -141,7 +141,7 @@ fn write_sched_attr(uptr: usize, attr: &SchedAttr) -> Result<(), isize> {
     buf[24..32].copy_from_slice(&attr.sched_runtime.to_ne_bytes());
     buf[32..40].copy_from_slice(&attr.sched_deadline.to_ne_bytes());
     buf[40..48].copy_from_slice(&attr.sched_period.to_ne_bytes());
-    copy_to_user(uptr, &buf).map_err(|_| efault())
+    crate::uaccess::copy_to_user_value(uptr, &buf).map_err(|_| efault())
 }
 
 fn nice_floor(pid: usize) -> i8 {
@@ -465,14 +465,14 @@ pub fn sys_sched_getaffinity(pid: usize, cpusetsize: usize, mask_uptr: usize) ->
         crate::proc::scheduler::with_proc(pid, |pcb| pcb.sched.cpumask).unwrap_or(CPUMASK_ALL);
     let bytes_to_write = cpusetsize.min(8);
     let raw = mask.to_le_bytes();
-    if copy_to_user(mask_uptr, &raw[..bytes_to_write]).is_err() {
+    if crate::uaccess::copy_to_user_value(mask_uptr, &raw[..bytes_to_write]).is_err() {
         return efault();
     }
     // Zero-pad any bytes beyond what our 64-bit mask covers.
     let zero = [0u8; 8];
     let rem = cpusetsize.saturating_sub(bytes_to_write);
     if rem > 0 {
-        if copy_to_user(mask_uptr + bytes_to_write, &zero[..rem.min(8)]).is_err() {
+        if crate::uaccess::copy_to_user_value(mask_uptr + bytes_to_write, &zero[..rem.min(8)]).is_err() {
             return efault();
         }
     }

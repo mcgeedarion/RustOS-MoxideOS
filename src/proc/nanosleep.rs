@@ -46,7 +46,7 @@ use crate::proc::scheduler;
 use crate::sync::wait_queue::{WaitQueue, WakeReason};
 use crate::time::clock::{self, CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID};
 use crate::time::{read_monotonic_ns, Timespec};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::sync::Arc;
 
 extern crate alloc;
@@ -84,7 +84,7 @@ pub fn sys_nanosleep(req_va: usize, rem_va: usize) -> isize {
         return -4;
     }
     if rem_va != 0 {
-        let _ = copy_to_user(rem_va, &[0u8; 16]);
+        let _ = crate::uaccess::copy_to_user_value(rem_va, &[0u8; 16]);
     }
     ret
 }
@@ -133,7 +133,7 @@ pub fn sys_clock_nanosleep(clockid: u32, flags: i32, req_va: usize, rem_va: usiz
             return -4;
         }
         if rem_va != 0 {
-            let _ = copy_to_user(rem_va, &[0u8; 16]);
+            let _ = crate::uaccess::copy_to_user_value(rem_va, &[0u8; 16]);
         }
         ret
     }
@@ -157,7 +157,7 @@ pub fn sys_clock_gettime(clockid: u32, timespec_va: usize) -> isize {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&ts.tv_sec.to_le_bytes());
     buf[8..16].copy_from_slice(&(ts.tv_nsec as i64).to_le_bytes());
-    if !copy_to_user(timespec_va, &buf) {
+    if crate::uaccess::copy_to_user_value(timespec_va, &buf).is_err() {
         return -14;
     }
     0
@@ -175,7 +175,7 @@ pub fn sys_clock_getres(clockid: u32, timespec_va: usize) -> isize {
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(&res.tv_sec.to_le_bytes());
     buf[8..16].copy_from_slice(&(res.tv_nsec as i64).to_le_bytes());
-    if !copy_to_user(timespec_va, &buf) {
+    if crate::uaccess::copy_to_user_value(timespec_va, &buf).is_err() {
         return -14;
     }
     0
@@ -235,5 +235,5 @@ fn write_remaining(rem_va: usize, deadline_ns: u64) {
     let mut rbuf = [0u8; 16];
     rbuf[0..8].copy_from_slice(&(rem / 1_000_000_000).to_le_bytes());
     rbuf[8..16].copy_from_slice(&(rem % 1_000_000_000).to_le_bytes());
-    let _ = copy_to_user(rem_va, &rbuf);
+    let _ = crate::uaccess::copy_to_user_value(rem_va, &rbuf);
 }

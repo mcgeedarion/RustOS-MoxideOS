@@ -3,7 +3,7 @@ use super::address::{read_sockaddr_in, write_sockaddr_in};
 use super::buffer::UnixConn;
 use super::core::SOCKETS;
 use super::types::{SocketState, AF_UNIX, MSG_DONTWAIT, SOCK_STREAM};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::vec::Vec;
 
 pub fn sys_sendmsg(fd: usize, msg_va: usize, _flags: u32) -> isize {
@@ -45,7 +45,7 @@ pub fn sys_recvmsg(fd: usize, msg_va: usize, flags: u32) -> isize {
         if r < 0 {
             return if total > 0 { total } else { r };
         }
-        copy_to_user(base, &buf[..r as usize]);
+        crate::uaccess::copy_to_user_value(base, &buf[..r as usize]);
         total += r;
     }
     total
@@ -61,7 +61,7 @@ pub fn sys_socketpair(domain: u16, kind: u16, _proto: u32, sv_va: usize) -> isiz
         return -24;
     }
     let pair = [(fa as usize) as u32, (fb as usize) as u32];
-    copy_to_user(sv_va, unsafe {
+    crate::uaccess::copy_to_user_value(sv_va, unsafe {
         core::slice::from_raw_parts(pair.as_ptr() as *const u8, 8)
     });
     0
@@ -82,9 +82,27 @@ fn alloc_socket_pair_slot(conn: UnixConn) -> isize {
     -24
 }
 
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_socket(fd: usize) {
+    socket_close(fd);
+}
+
+/// Duplicate hook for process-local fd aliases. Socket state is shared by the
+/// backing fd.
+pub fn socket_dup(fd: usize) {
+    let mut sockets = SOCKETS.lock();
+    if let Some(Some(sock)) = sockets.get_mut(fd) {
+        sock.refs = sock.refs.saturating_add(1);
+    }
+}
+
 pub fn socket_close(fd: usize) {
     let mut sockets = SOCKETS.lock();
     if let Some(Some(sock)) = sockets.get_mut(fd) {
+        if sock.refs > 1 {
+            sock.refs -= 1;
+            return;
+        }
         if let Some(conn) = sock.unix_conn.take() {
             conn.close_tx();
         }

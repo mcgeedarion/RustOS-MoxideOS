@@ -456,7 +456,7 @@ fn warn_if_no_arch_check(insns: &[SockFilter]) {
 /// that gate on the call site address evaluate the real address.
 /// Returns Allow, or a denial verdict that dispatch must honour.
 pub fn seccomp_check(nr: usize, args: &[usize; 6], saved_rip: u64) -> SeccompVerdict {
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     if pid == 0 {
         return SeccompVerdict::Allow;
     }
@@ -571,7 +571,7 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
     //     that stacking works, but it cannot remove existing filters.
     //   - If the process has no filter yet, it must hold CAP_SYS_ADMIN or have
     //     called prctl(PR_SET_NO_NEW_PRIVS, 1) (nnp flag on Pcb).
-    let pid = crate::proc::scheduler::current_pid();
+    let pid = crate::proc::scheduler::current_pid_usize();
     if pid == 0 {
         return -(EPERM as isize);
     } // kernel threads

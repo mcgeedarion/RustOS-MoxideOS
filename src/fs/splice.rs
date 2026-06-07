@@ -99,7 +99,7 @@ fn read_loff(va: usize) -> Option<i64> {
 
 fn write_loff(va: usize, val: i64) {
     if va != 0 {
-        let _ = crate::uaccess::copy_to_user(va, &val.to_ne_bytes());
+        let _ = crate::uaccess::copy_to_user_value(va, &val.to_ne_bytes());
     }
 }
 

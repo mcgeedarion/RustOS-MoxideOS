@@ -29,6 +29,7 @@ pub fn free_scheme_backing_fd(fd: usize) {
 struct SchemeFdEntry {
     scheme: Arc<dyn Scheme>,
     fid: SchemeFileId,
+    refs: usize,
 }
 
 struct SchemeFdStore {
@@ -45,9 +46,14 @@ impl SchemeFdStore {
     }
 
     fn insert(&self, backing_fd: usize, scheme: Arc<dyn Scheme>, fid: SchemeFileId) {
-        self.map
-            .lock()
-            .insert(backing_fd, SchemeFdEntry { scheme, fid });
+        self.map.lock().insert(
+            backing_fd,
+            SchemeFdEntry {
+                scheme,
+                fid,
+                refs: 1,
+            },
+        );
     }
 
     /// Clone the (scheme, fid) pair for `backing_fd`, if present.
@@ -58,11 +64,24 @@ impl SchemeFdStore {
             .map(|e| (Arc::clone(&e.scheme), e.fid))
     }
 
-    fn remove(&self, backing_fd: usize) -> Option<(Arc<dyn Scheme>, SchemeFileId)> {
-        self.map
-            .lock()
-            .remove(&backing_fd)
-            .map(|e| (e.scheme, e.fid))
+    fn dup(&self, backing_fd: usize) -> bool {
+        let mut guard = self.map.lock();
+        if let Some(entry) = guard.get_mut(&backing_fd) {
+            entry.refs = entry.refs.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn close_ref(&self, backing_fd: usize) -> Option<(Arc<dyn Scheme>, SchemeFileId)> {
+        let mut guard = self.map.lock();
+        let entry = guard.get_mut(&backing_fd)?;
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            return None;
+        }
+        guard.remove(&backing_fd).map(|e| (e.scheme, e.fid))
     }
 
     /// Returns true iff `backing_fd` is a scheme fd.
@@ -81,6 +100,17 @@ pub fn scheme_fd_register(backing_fd: usize, scheme: Arc<dyn Scheme>, fid: Schem
 /// Returns `true` if `backing_fd` belongs to a scheme.
 pub fn is_scheme_fd(backing_fd: usize) -> bool {
     SCHEME_FD_STORE.contains(backing_fd)
+}
+
+/// Clone the registered scheme/fid pair for compatibility callers that need
+/// to translate a synthetic backing fd back to a scheme-local file id.
+pub fn scheme_fd_get_fid(backing_fd: usize) -> Option<(Arc<dyn Scheme>, SchemeFileId)> {
+    SCHEME_FD_STORE.get(backing_fd)
+}
+
+/// Increment the reference count for a duplicated process-local fd.
+pub fn scheme_fd_dup(backing_fd: usize) -> bool {
+    SCHEME_FD_STORE.dup(backing_fd)
 }
 
 /// Read up to `buf.len()` bytes from the scheme fd.
@@ -133,7 +163,7 @@ pub fn scheme_fd_ioctl(backing_fd: usize, cmd: u64, arg: usize) -> isize {
 
 /// Close a scheme fd — forwards to the scheme handler, removes the entry
 pub fn scheme_fd_close(backing_fd: usize) {
-    if let Some((scheme, fid)) = SCHEME_FD_STORE.remove(backing_fd) {
+    if let Some((scheme, fid)) = SCHEME_FD_STORE.close_ref(backing_fd) {
         // Best-effort: log but do not panic if the driver is already gone.
         if let Err(e) = scheme.close(fid) {
             log::warn!("[scheme] close({:#x}) error: {:?}\n", backing_fd, e);

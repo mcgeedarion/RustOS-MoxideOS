@@ -104,6 +104,7 @@ struct FanotifyInstance {
     nonblock: bool,
     queue: Vec<QueuedEvent>,
     marks: Vec<Mark>,
+    refs: usize,
 }
 
 const MAX_QUEUE: usize = 16384;
@@ -181,6 +182,7 @@ pub fn sys_fanotify_init(flags: u32, _event_f_flags: u32) -> isize {
             nonblock,
             queue: Vec::new(),
             marks: Vec::new(),
+            refs: 1,
         },
     );
 
@@ -331,7 +333,31 @@ pub fn fanotify_write(fdno: usize, buf: &[u8]) -> isize {
 }
 
 pub fn fanotify_close(fdno: usize) {
-    TABLE.lock().remove(&fdno);
+    let mut table = TABLE.lock();
+    if let Some(entry) = table.get_mut(&fdno) {
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            return;
+        }
+    }
+    table.remove(&fdno);
+}
+
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_fanotify(fdno: usize) {
+    if crate::fs::scheme_fd::is_scheme_fd(fdno) {
+        crate::fs::scheme_fd::scheme_fd_close(fdno);
+    } else {
+        fanotify_close(fdno);
+    }
+}
+
+/// Duplicate hook for process-local fd aliases. Fanotify state is shared by the
+/// backing fd.
+pub fn fanotify_dup(fdno: usize) {
+    if let Some(entry) = TABLE.lock().get_mut(&fdno) {
+        entry.refs = entry.refs.saturating_add(1);
+    }
 }
 
 pub fn is_fanotify_fd(fdno: usize) -> bool {

@@ -280,11 +280,11 @@ pub fn dispatch_process(ctx: &SyscallContext) -> Option<isize> {
         SYS_SET_ROBUST_LIST => Some(crate::proc::futex::sys_set_robust_list(a, b)),
         SYS_GET_ROBUST_LIST => Some(crate::proc::futex::sys_get_robust_list(a, b, c)),
         SYS_GETUID | SYS_GETEUID => {
-            let pid = crate::proc::scheduler::current_pid();
+            let pid = crate::proc::scheduler::current_pid_usize();
             Some(crate::proc::scheduler::with_proc(pid, |p| p.uid).unwrap_or(0) as isize)
         },
         SYS_GETGID | SYS_GETEGID => {
-            let pid = crate::proc::scheduler::current_pid();
+            let pid = crate::proc::scheduler::current_pid_usize();
             Some(crate::proc::scheduler::with_proc(pid, |p| p.cred.gid).unwrap_or(0) as isize)
         },
         SYS_SETUID | SYS_SETGID | SYS_SETRESGID => Some(0),

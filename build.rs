@@ -1,5 +1,4 @@
 /// build.rs
-
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -37,7 +36,7 @@ fn main() {
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
 
-    compile_crt();
+    compile_crt(&target_arch);
 
     if target_arch == "riscv64" {
         assemble_riscv_uentry(&out);
@@ -54,12 +53,29 @@ fn main() {
 }
 
 /// Compile C runtime stubs into a static archive `librustos_crt.a`.
-fn compile_crt() {
+fn compile_crt(target_arch: &str) {
     for src in CRT_SOURCES {
         println!("cargo:rerun-if-changed={CRT_DIR}/{src}");
     }
 
     let mut build = cc::Build::new();
+
+    if target_arch == "riscv64"
+        && std::env::var("CC").is_err()
+        && std::env::var("TARGET_CC").is_err()
+    {
+        if command_exists(&format!("{RISCV_TRIPLE}-gcc")) {
+            build.compiler(format!("{RISCV_TRIPLE}-gcc"));
+        } else if command_exists("clang") {
+            build.compiler("clang");
+            build.flag("--target=riscv64-unknown-elf");
+            build.flag("-march=rv64gc");
+            build.flag("-mabi=lp64d");
+        } else {
+            println!("cargo:warning=RISC-V CRT skipped; set CC_riscv64_uefi_loader or install clang/{RISCV_TRIPLE}-gcc");
+            return;
+        }
+    }
 
     for flag in CRT_COMPILE_FLAGS {
         build.flag(flag);
@@ -187,6 +203,16 @@ fn locate_llvm_objcopy() -> String {
         .exists()
         .then(|| candidate.to_string_lossy().into_owned())
         .unwrap_or_else(|| "llvm-objcopy".to_string())
+}
+
+fn command_exists(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn run_command(mut cmd: Command, context: &str) -> bool {

@@ -25,7 +25,7 @@ use crate::arch::{
     api::{PageFlags, Paging},
     Arch,
 };
-use crate::uaccess::copy_to_user;
+use crate::uaccess::{copy_to_user, copy_to_user_value};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -149,7 +149,7 @@ pub fn build_auxv(stack_top: usize, info: &DynExecInfo, random_bytes: [u8; 16]) 
     }
     kbuf[auxv_sz..auxv_sz + 16].copy_from_slice(&random_bytes);
 
-    if copy_to_user(sp, &kbuf).is_err() {
+    if crate::uaccess::copy_to_user_value(sp, &kbuf).is_err() {
         return 0;
     }
     sp

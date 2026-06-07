@@ -3,7 +3,7 @@
 use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
 use super::SdtHeader;
-use crate::console::println;
+use crate::println;
 
 const PM1_STS_PWRBTN: u16 = 1 << 8;
 const PM1_STS_SLPBTN: u16 = 1 << 9;

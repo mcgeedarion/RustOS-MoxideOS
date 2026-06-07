@@ -28,7 +28,7 @@
 //!   signal delivery (push_sigframe_x86) and rt_sigreturn can read/write it.
 
 use crate::proc::scheduler;
-use crate::uaccess::{copy_to_user, validate_user_ptr};
+use crate::uaccess::{copy_to_user, copy_to_user_value, validate_user_ptr};
 use core::arch::global_asm;
 
 /// Register state saved by `syscall_asm_entry` on the kernel stack.
@@ -251,7 +251,7 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
         ARCH_GET_FS => {
             let base = scheduler::with_proc(pid, |p| p.ctx.fs_base).unwrap_or(0);
             if addr != 0 && validate_user_ptr(addr, 8) {
-                let _ = copy_to_user(addr, &base.to_ne_bytes());
+                let _ = crate::uaccess::copy_to_user_value(addr, &base.to_ne_bytes());
             }
             0
         },
@@ -279,7 +279,7 @@ pub fn sys_arch_prctl(code: i32, addr: usize) -> isize {
                 );
             }
             if addr != 0 && validate_user_ptr(addr, 8) {
-                let _ = copy_to_user(addr, &gs.to_ne_bytes());
+                let _ = crate::uaccess::copy_to_user_value(addr, &gs.to_ne_bytes());
             }
             0
         },
@@ -307,7 +307,7 @@ pub extern "C" fn child_first_run_hook() {
         });
 
     if tid_va != 0 {
-        let _ = copy_to_user(tid_va, &tid_val.to_ne_bytes());
+        let _ = crate::uaccess::copy_to_user_value(tid_va, &tid_val.to_ne_bytes());
     }
 
     if fs_base != 0 {

@@ -39,7 +39,7 @@ use crate::io_uring::ring::{self, IoUringParams};
 use crate::mm::mmap;
 use crate::proc::scheduler;
 use crate::sync::wait_queue::{CancellationToken, WakeReason};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::sync::Arc;
 
 const IORING_REGISTER_BUFFERS: u32 = 0;
@@ -137,7 +137,7 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
             core::mem::size_of::<IoUringParams>(),
         )
     };
-    if !copy_to_user(params_va, params_bytes) {
+    if crate::uaccess::copy_to_user_value(params_va, params_bytes).is_err() {
         ring::free_ring(ring_idx);
         crate::fs::vfs::close_fd(fd);
         return -14;

@@ -6,7 +6,7 @@ use super::buffer::{UnixConn, UnixListener};
 use super::types::*;
 use super::unix::stream::{unix_accept, unix_bind, unix_connect, unix_listen};
 use crate::net::{ip, tcp};
-use crate::uaccess::{copy_from_user, copy_to_user};
+use crate::uaccess::{copy_from_user, copy_to_user, copy_to_user_value};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -32,6 +32,7 @@ pub fn new_socket(domain: u16, kind: u16, protocol: u32) -> Socket {
         unix_conn: None,
         unix_listener: None,
         so_error: 0,
+        refs: 1,
     }
 }
 
@@ -146,7 +147,7 @@ pub fn sys_accept(fd: usize, addr_va: usize, addrlen_va: usize) -> isize {
     }
     if addrlen_va != 0 {
         let sz: u32 = 16;
-        copy_to_user(addrlen_va, &sz.to_ne_bytes());
+        crate::uaccess::copy_to_user_value(addrlen_va, &sz.to_ne_bytes());
     }
     let mut sockets = SOCKETS.lock();
     for (i, slot) in sockets.iter_mut().enumerate() {
@@ -211,7 +212,7 @@ pub fn sys_getsockname(fd: usize, addr_va: usize, addrlen_va: usize) -> isize {
             write_sockaddr_in(addr_va, *ip, *port);
             if addrlen_va != 0 {
                 let sz: u32 = 16;
-                copy_to_user(addrlen_va, &sz.to_ne_bytes());
+                crate::uaccess::copy_to_user_value(addrlen_va, &sz.to_ne_bytes());
             }
         },
         Some(SockAddr::V6 {
@@ -224,7 +225,7 @@ pub fn sys_getsockname(fd: usize, addr_va: usize, addrlen_va: usize) -> isize {
             write_sockaddr_in6(addr_va, ip, *port, *flowinfo, *scope_id);
             if addrlen_va != 0 {
                 let sz: u32 = 28;
-                copy_to_user(addrlen_va, &sz.to_ne_bytes());
+                crate::uaccess::copy_to_user_value(addrlen_va, &sz.to_ne_bytes());
             }
         },
         _ => {},
@@ -243,7 +244,7 @@ pub fn sys_getpeername(fd: usize, addr_va: usize, addrlen_va: usize) -> isize {
             write_sockaddr_in(addr_va, *ip, *port);
             if addrlen_va != 0 {
                 let sz: u32 = 16;
-                copy_to_user(addrlen_va, &sz.to_ne_bytes());
+                crate::uaccess::copy_to_user_value(addrlen_va, &sz.to_ne_bytes());
             }
         },
         Some(SockAddr::V6 {
@@ -256,7 +257,7 @@ pub fn sys_getpeername(fd: usize, addr_va: usize, addrlen_va: usize) -> isize {
             write_sockaddr_in6(addr_va, ip, *port, *flowinfo, *scope_id);
             if addrlen_va != 0 {
                 let sz: u32 = 28;
-                copy_to_user(addrlen_va, &sz.to_ne_bytes());
+                crate::uaccess::copy_to_user_value(addrlen_va, &sz.to_ne_bytes());
             }
         },
         _ => {},
