@@ -85,10 +85,6 @@ fn user_fd_to_bfd(user_fd: usize) -> Option<usize> {
     }
 }
 
-// stdin is backed by the serial TTY ring; reads from the actual tty WaitQueue
-// will be wired in once the PTY subsystem owns stdin.  For now poll() checks
-// the ring synchronously and the WaitQueue is a never-slept-on sentinel.
-
 struct StdinSource {
     wq: WaitQueue,
 }
@@ -118,10 +114,6 @@ impl PollSource for StdinSource {
 }
 
 /// Return an `Arc<dyn PollSource>` for any user-visible fd.
-///
-/// This is the canonical dispatch function replacing the old if/else chain
-/// in `fd_ready()`.  Returns `None` only if the fd does not exist at all
-/// (POLLNVAL territory).
 pub fn fd_poll_source(fdno: usize) -> Option<Arc<dyn PollSource>> {
     // fd 0 — stdin
     if fdno == 0 {
