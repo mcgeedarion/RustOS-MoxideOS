@@ -30,18 +30,12 @@ use core::marker::PhantomData;
 pub const MAX_CPU_LOCAL_SLOTS: usize = 64;
 
 /// The block of per-CPU data stored at the address held in `tp`/`%gs`.
-///
-/// Populated by `src/smp/percpu.rs` during AP bringup.  The layout must
-/// be kept in sync with any hand-written assembly that reads fixed offsets.
 #[repr(C)]
 pub struct PerCpuBlock {
-    /// Self-pointer (offset 0) — x86_64 GS-relative `mov rax, gs:[0]` idiom.
+
     pub self_ptr: *mut PerCpuBlock,
-    /// HART / APIC identifier for this CPU.
     pub cpu_id: u32,
-    /// Is this CPU currently in an interrupt handler?
     pub in_irq: u32,
-    /// Opaque data slots for subsystems (keyed by `CpuLocalKey`).
     slots: [UnsafeCell<usize>; MAX_CPU_LOCAL_SLOTS],
 }
 
@@ -50,11 +44,7 @@ pub struct PerCpuBlock {
 unsafe impl Sync for PerCpuBlock {}
 
 impl PerCpuBlock {
-    /// Read slot `index` as a `usize`.
-    ///
-    /// # Safety
-    /// `index` must be < `MAX_CPU_LOCAL_SLOTS` and the value must have been
-    /// written by the same slot's owner before this call.
+    
     #[inline]
     pub unsafe fn read_slot(&self, index: usize) -> usize {
         debug_assert!(index < MAX_CPU_LOCAL_SLOTS);
@@ -63,9 +53,6 @@ impl PerCpuBlock {
     }
 
     /// Write `value` into slot `index`.
-    ///
-    /// # Safety
-    /// Same constraints as [`read_slot`].
     #[inline]
     pub unsafe fn write_slot(&self, index: usize, value: usize) {
         debug_assert!(index < MAX_CPU_LOCAL_SLOTS);
@@ -75,8 +62,6 @@ impl PerCpuBlock {
 }
 
 /// A compile-time-assigned index into the per-CPU slot array.
-///
-/// Create one with the `cpu_local_key!` macro.
 #[derive(Clone, Copy)]
 pub struct CpuLocalKey {
     index: usize,
@@ -91,10 +76,6 @@ impl CpuLocalKey {
 }
 
 /// Declare a per-CPU variable slot.
-///
-/// ```ignore
-/// static SCHED_KEY: CpuLocalKey = cpu_local_key!(7);
-/// ```
 #[macro_export]
 macro_rules! cpu_local_key {
     ($idx:expr) => {
@@ -103,8 +84,6 @@ macro_rules! cpu_local_key {
 }
 
 /// Zero-sized handle to a per-CPU value of type `T` stored in a slot.
-///
-/// `T` must fit in a `usize` (pointer-sized or smaller).
 pub struct CpuLocal<T: Copy + 'static> {
     key: CpuLocalKey,
     _marker: PhantomData<T>,
@@ -123,11 +102,6 @@ impl<T: Copy + 'static> CpuLocal<T> {
     }
 
     /// Return the per-CPU value for the **current** CPU.
-    ///
-    /// # Safety
-    /// * Preemption / interrupts must be disabled for the duration of the
-    ///   access.
-    /// * Per-CPU memory must have been initialised by SMP bringup.
     #[inline]
     pub unsafe fn get(&self) -> T {
         let block = unsafe { current_cpu_block() };
@@ -137,9 +111,6 @@ impl<T: Copy + 'static> CpuLocal<T> {
     }
 
     /// Store `value` into the per-CPU slot for the **current** CPU.
-    ///
-    /// # Safety
-    /// Same constraints as [`get`].
     #[inline]
     pub unsafe fn set(&self, value: T) {
         let block = unsafe { current_cpu_block() };
@@ -149,9 +120,6 @@ impl<T: Copy + 'static> CpuLocal<T> {
 }
 
 /// Retrieve the `PerCpuBlock` pointer for the executing CPU.
-///
-/// # Safety
-/// Must be called only after per-CPU memory has been initialised.
 #[inline]
 pub unsafe fn current_cpu_block() -> *mut PerCpuBlock {
     #[cfg(target_arch = "x86_64")]
