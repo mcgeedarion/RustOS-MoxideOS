@@ -1,13 +1,4 @@
 //! Filesystem subsystem.
-//!
-//! Invariants:
-//! - `vfs` owns path resolution and file descriptor operation dispatch.
-//! - `dcache` entries are advisory caches and must never be treated as
-//!   authority over on-disk state.
-//! - Mount and scheme routing decisions are mediated via `mount`,
-//!   `scheme_table`, and `scheme_fd`.
-//! - Syscall-facing modules (`*_syscalls`, `ioctl`, `poll`, etc.) must preserve
-//!   VFS locking/order constraints.
 
 pub mod binfmt_misc;
 pub mod btrfs;
