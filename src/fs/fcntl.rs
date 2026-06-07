@@ -1,35 +1,4 @@
 //! fcntl — file descriptor control operations.
-//!
-//! ## Commands implemented
-//!   F_DUPFD   (0)  — duplicate fd, using lowest fd >= arg
-//!   F_DUPFD_CLOEXEC (1030) — same + set FD_CLOEXEC
-//!   F_GETFD   (1)  — get fd flags (FD_CLOEXEC)
-//!   F_SETFD   (2)  — set fd flags (FD_CLOEXEC) — synced to ProcFdTable
-//!   F_GETFL   (3)  — get file status flags
-//! (O_RDONLY/O_WRONLY/O_RDWR/O_NONBLOCK)   F_SETFL   (4)  — set file status
-//! flags — synced to ProcFdTable   F_GETLK   (5)  — get lock (stub: always
-//! "unlocked")   F_SETLK   (6)  — set lock (stub: always succeeds)
-//!   F_SETLKW  (7)  — set lock, wait (stub)
-//!   F_SETOWN  (8)  — set process receiving SIGIO/SIGURG (stored, not acted
-//! upon)   F_GETOWN  (9)  — get owner
-//!   F_SETSIG  (10) — real-time signal to use instead of SIGIO
-//!   F_ADD_SEALS (1033) / F_GET_SEALS (1034) — memfd sealing
-//!
-//! ## FD_CLOEXEC
-//!   When set, the fd is closed across execve().  All fds created with
-//!   O_CLOEXEC / SFD_CLOEXEC / EFD_CLOEXEC / TFD_CLOEXEC already have
-//!   the flag set at creation.  fcntl(F_SETFD, FD_CLOEXEC) lets callers
-//!   set it retroactively.
-//!
-//! ## RLIMIT_NOFILE enforcement
-//!   fd_open checks the current process soft NOFILE limit before allocating
-//!   a new fd.  F_DUPFD also checks the limit because dup produces a new fd.
-//!
-//! ## Dual-store synchronisation
-//!   `FD_META` tracks backing-fd metadata used by kernel subsystems.
-//!   `ProcFdTable` (process_fd.rs) tracks per-process-local fd metadata
-//!   visible to syscalls like sys_write (O_APPEND) and sys_close_on_exec.
-//!   F_SETFL and F_SETFD must update BOTH stores so they remain consistent.
 
 extern crate alloc;
 use crate::fs::vfs;
@@ -70,7 +39,9 @@ pub const SEEK_SET: i32 = 0;
 pub const SEEK_CUR: i32 = 1;
 pub const SEEK_END: i32 = 2;
 
-const F_UNLCK: u16 = 2;
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
 
 #[derive(Clone, Default)]
 struct FdMeta {
@@ -213,11 +184,13 @@ pub fn fd_open(path: &str, flags: i32) -> Result<usize, isize> {
     }
 
     let fd = vfs::open_raw(path, flags as u32)?;
-
-    FD_META.lock().entry(fd).or_default();
+    FD_META.lock().entry(fd).or_default().fl_flags = flags;
 
     if flags & O_CLOEXEC != 0 {
         FD_META.lock().entry(fd).or_default().cloexec = true;
+    }
+    if flags & O_NONBLOCK != 0 {
+        FD_META.lock().entry(fd).or_default().nonblock = true;
     }
 
     Ok(fd)
@@ -266,8 +239,55 @@ pub fn dup_from_raw(fd: usize, min_fd: usize) -> isize {
     vfs::dup_from_raw(fd, min_fd)
 }
 
+fn current_proc_entry(fd: usize) -> Result<crate::fs::process_fd::FdEntry, isize> {
+    let pid = crate::proc::scheduler::current_pid();
+    crate::fs::process_fd::proc_fd_get(pid, fd).ok_or(-9)
+}
+
+fn duplicate_backing_fd(bfd: usize) -> Result<usize, isize> {
+    if crate::fs::pipe::is_pipe(bfd) {
+        crate::fs::pipe::pipe_dup(bfd);
+        Ok(bfd)
+    } else if crate::net::socket::is_socket_fd(bfd) {
+        crate::net::socket::socket_dup(bfd);
+        Ok(bfd)
+    } else if crate::fs::eventfd::is_eventfd(bfd) {
+        crate::fs::eventfd::efd_dup(bfd);
+        Ok(bfd)
+    } else if crate::fs::timerfd::is_timerfd(bfd) {
+        crate::fs::timerfd::tfd_dup(bfd);
+        Ok(bfd)
+    } else if crate::fs::inotify::is_inotify_fd(bfd) {
+        crate::fs::inotify::inotify_dup(bfd);
+        Ok(bfd)
+    } else if crate::fs::fanotify::is_fanotify_fd(bfd) {
+        crate::fs::fanotify::fanotify_dup(bfd);
+        Ok(bfd)
+    } else if crate::fs::devfs::get_dev_fd(bfd).is_some()
+        || crate::fs::procfs::is_procfs_fd(bfd)
+        || crate::fs::sysfs::is_sysfs_fd(bfd)
+        || crate::fs::cgroupfs::is_cgroupfs_fd(bfd)
+        || crate::fs::scheme_fd::is_scheme_fd(bfd)
+    {
+        Ok(bfd)
+    } else {
+        let r = vfs::dup_from(bfd, bfd);
+        if r < 0 {
+            Err(r)
+        } else {
+            Ok(r as usize)
+        }
+    }
+}
+
 pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
     let pid = crate::proc::scheduler::current_pid();
+    let entry = match current_proc_entry(fd) {
+        Ok(e) => e,
+        Err(e) => return e,
+    };
+    let bfd = entry.backing_fd;
+
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let limit_check = check_nofile_limit();
@@ -275,15 +295,44 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
                 return limit_check;
             }
 
-            let new_fd = vfs::dup_from(fd, arg) as usize;
-            FD_META.lock().entry(new_fd).or_default();
+            let new_fd = {
+                let mut candidate = arg;
+                loop {
+                    if crate::fs::process_fd::proc_fd_get(pid, candidate).is_none() {
+                        break candidate;
+                    }
+                    candidate = candidate.saturating_add(1);
+                    if candidate == usize::MAX {
+                        return -24;
+                    }
+                }
+            };
+
+            let new_bfd = match duplicate_backing_fd(bfd) {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let flags = if cmd == F_DUPFD_CLOEXEC {
+                (entry.fl_flags as u32) | O_CLOEXEC as u32
+            } else {
+                entry.fl_flags as u32
+            };
+            let installed = crate::fs::process_fd::proc_fd_install(
+                pid,
+                new_bfd,
+                entry.path.clone(),
+                flags,
+                Some(new_fd),
+            );
+            FD_META.lock().entry(new_bfd).or_default().fl_flags = entry.fl_flags;
             if cmd == F_DUPFD_CLOEXEC {
-                set_cloexec(new_fd, true);
+                crate::fs::process_fd::proc_fd_set_cloexec(pid, installed, true);
+                set_cloexec(new_bfd, true);
             }
-            new_fd as isize
+            installed as isize
         },
         F_GETFD => {
-            if is_cloexec(fd) {
+            if entry.cloexec {
                 FD_CLOEXEC as isize
             } else {
                 0
@@ -291,24 +340,15 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
         },
         F_SETFD => {
             let cloexec = arg & FD_CLOEXEC as usize != 0;
-            // Update FD_META (legacy backing-fd metadata).
-            set_cloexec(fd, cloexec);
-            // Update ProcFdTable (per-process-local fd metadata).
-            // `fd` here is the *user-visible* fd number == the process-local fd
-            // because fcntl is always called with the user fd.
+            set_cloexec(bfd, cloexec);
             crate::fs::process_fd::proc_fd_set_cloexec(pid, fd, cloexec);
             0
         },
-        F_GETFL => get_fl(fd) as isize,
+        F_GETFL => entry.fl_flags as isize,
         F_SETFL => {
             let flags = arg as i32;
-            // Update FD_META.
-            set_fl(fd, flags);
-            if flags & O_NONBLOCK != 0 {
-                set_nonblock(fd, true);
-            }
-            // Update ProcFdTable so proc_fd_getfl (used by sys_write O_APPEND
-            // and other flag-aware paths) sees the new flags immediately.
+            set_fl(bfd, flags);
+            set_nonblock(bfd, flags & O_NONBLOCK != 0);
             crate::fs::process_fd::proc_fd_setfl(pid, fd, flags);
             0
         },
@@ -320,7 +360,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
                 return -14;
             }
             let mut buf = [0u8; 32];
-            let lock_ty = FD_LOCKS.lock().get(&fd).copied().unwrap_or(F_UNLCK);
+            let lock_ty = FD_LOCKS.lock().get(&bfd).copied().unwrap_or(F_UNLCK);
             buf[0..2].copy_from_slice(&lock_ty.to_le_bytes());
             if !copy_to_user(arg, &buf) {
                 return -14;
@@ -339,28 +379,28 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
             let mut locks = FD_LOCKS.lock();
             match req {
                 F_UNLCK => {
-                    locks.remove(&fd);
+                    locks.remove(&bfd);
                     0
                 },
                 F_RDLCK | F_WRLCK => {
-                    if let Some(curr) = locks.get(&fd).copied() {
+                    if let Some(curr) = locks.get(&bfd).copied() {
                         if curr != req {
                             return -11; // EAGAIN
                         }
                     }
-                    locks.insert(fd, req);
+                    locks.insert(bfd, req);
                     0
                 },
                 _ => -22,
             }
         },
         F_SETOWN => {
-            FD_META.lock().entry(fd).or_default().owner_pid = arg as i32;
+            FD_META.lock().entry(bfd).or_default().owner_pid = arg as i32;
             0
         },
         F_GETOWN => FD_META
             .lock()
-            .get(&fd)
+            .get(&bfd)
             .map(|m| m.owner_pid as isize)
             .unwrap_or(0),
         F_ADD_SEALS => {
@@ -382,24 +422,7 @@ pub fn sys_fcntl(fd: usize, cmd: i32, arg: usize) -> isize {
 }
 
 pub fn sys_dup2(oldfd: usize, newfd: usize) -> isize {
-    if oldfd == newfd {
-        return oldfd as isize;
-    }
-    let newfd_open = FD_META.lock().contains_key(&newfd);
-    if !newfd_open {
-        let limit_check = check_nofile_limit();
-        if limit_check < 0 {
-            return limit_check;
-        }
-    }
-    sys_close_fd(newfd);
-    let r = vfs::dup_as(oldfd, newfd);
-    if r >= 0 {
-        FD_META.lock().entry(newfd).or_default();
-        let cloexec = is_cloexec(oldfd);
-        set_cloexec(newfd, cloexec);
-    }
-    r
+    crate::fs::process_fd::proc_fd_dup2(crate::proc::scheduler::current_pid(), oldfd, newfd)
 }
 
 pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
@@ -408,7 +431,7 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     }
     let r = sys_dup2(oldfd, newfd);
     if r >= 0 && flags & O_CLOEXEC != 0 {
-        set_cloexec(newfd, true);
+        crate::fs::process_fd::proc_fd_set_cloexec(crate::proc::scheduler::current_pid(), newfd, true);
     }
     r
 }
