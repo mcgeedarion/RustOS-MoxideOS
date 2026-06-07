@@ -2,214 +2,336 @@
 
 ## Overview
 
-RustOS boots as a **UEFI application** on x86_64 and now has an ARM64 UEFI bring-up target.  The build system produces
-a PE32+ binary (`BOOTX64.EFI`) that UEFI firmware loads directly — no
-bootloader (GRUB, syslinux) is required.  This is the same mechanism used by
-Windows, modern Linux distributions with systemd-boot, and most embedded
-UEFI OSes.
+RustOS uses a thin boot layer and a shared kernel entry.  Each supported boot
+path constructs `init::boot_info::BootInfo`, jumps to the exported
+`kernel_main(&BootInfo)` symbol, and then lets `arch::init()` dispatch into the
+active architecture implementation.
 
-A legacy multiboot2 path (for GRUB2 or QEMU `-kernel`) is available behind
-`--features multiboot2_boot` but is not the primary target.
+The current tree supports:
 
----
+- `x86_64` UEFI images and a direct-kernel / Multiboot2-style QEMU path.
+- `riscv64` UEFI images and an SBI/OpenSBI + FDT path.
+- `aarch64` UEFI images and a bare-metal kernel target for board loaders.
 
-## Build
-
-### x86_64
-
-```bash
-# Requires:
-#   rustup component add llvm-tools-preview
-#   rustup target add x86_64-unknown-none
-
-# Debug build (default = UEFI)
-cargo build --target x86_64-unknown-none \
-  -Z build-std=core,alloc,compiler_builtins \
-  -Z build-std-features=compiler-builtins-mem
-
-# Release build
-cargo build --release --target x86_64-unknown-none \
-  -Z build-std=core,alloc,compiler_builtins \
-  -Z build-std-features=compiler-builtins-mem
-```
-
-
-
-### ARM64 / AArch64
-
-The ARM64 target intentionally follows the same baseline hardware requirements
-as the ReactOS ARM64 bring-up: a UEFI-compatible system, an Armv8-A (or newer)
-processor, and either a GICv2 or GICv3 interrupt controller.
-
-```bash
-cargo build --target targets/aarch64-uefi-loader.json \
-  -Z build-std=core,alloc,compiler_builtins \
-  -Z build-std-features=compiler-builtins-mem
-```
-
-The default removable-media UEFI path for ARM64 firmware is
-`EFI/BOOT/BOOTAA64.EFI`; copy the linked image there when constructing an ESP.
-
-`build.rs` invokes `llvm-objcopy --target=efi-app-x86_64` to convert the ELF
-kernel into a PE32+ UEFI application.  The output is placed at:
-
-```
-target/
-  esp/
-    EFI/
-      BOOT/
-        BOOTX64.EFI    ← UEFI application image
-```
-
-`target/esp/` is the root of a valid EFI System Partition (ESP) directory
-tree.  UEFI firmware will find `EFI/BOOT/BOOTX64.EFI` as the removable-media
-default boot entry.
+The preferred user-facing build entry point is `cargo xtask`; the preferred QEMU
+entry point is `scripts/ci/qemu-run.sh`.
 
 ---
 
-## QEMU (OVMF)
+## Requirements
 
-```bash
-# Default — UEFI via OVMF:
-./run_qemu_x86_64.sh
+- Rust nightly pinned by `rust-toolchain.toml`.
+- `rust-src` and `llvm-tools-preview` for custom targets and image conversion.
+- QEMU for the architecture being run.
+- UEFI firmware images for UEFI QEMU modes:
+  - OVMF for `x86_64`.
+  - EDK2/QEMU EFI for `aarch64` and `riscv64`.
+- Optional image tools: `mtools` (`mformat`, `mmd`, `mcopy`) for `cargo xtask
+  image`.
+- Optional initramfs/userland tools: `cpio` and architecture-appropriate musl
+  cross compilers.
+- Optional reproducible environment: `nix develop`.
 
-# With a virtio-blk disk image:
-./run_qemu_x86_64.sh disk.img
+---
 
-# With GDB stub:
-./run_qemu_x86_64.sh --gdb
+## Preferred build commands
 
-# Release build:
-./run_qemu_x86_64.sh --release
+`cargo xtask build` defaults to an x86_64 UEFI release build and installs the
+removable-media EFI binary under `esp/EFI/BOOT/`.
 
-# Legacy multiboot2 (no OVMF needed):
-./run_qemu_x86_64.sh --multiboot
+```sh
+# Default: x86_64 UEFI release build.
+cargo xtask build
 
-# Headless smoke test: wait up to 20 seconds for the early UART marker.
-./run_qemu_x86_64.sh --smoke --timeout 20
+# x86_64 UEFI image installed as esp/EFI/BOOT/BOOTX64.EFI.
+cargo xtask build --arch x86_64 --boot uefi
 
-# Userspace smoke test: require PID 1 to print its pass marker.
-./run_qemu_x86_64.sh --smoke --smoke-marker '[init] TEST PASS: userspace_init' --timeout 30
+# x86_64 direct-kernel target; also emits kernel.bin for low-level loaders.
+cargo xtask build --arch x86_64 --boot sbi
+
+# RISC-V UEFI loader target.
+cargo xtask build --arch riscv64 --boot uefi
+
+# RISC-V SBI/OpenSBI kernel path.
+cargo xtask build --arch riscv64 --boot sbi
+
+# AArch64 UEFI loader target.
+cargo xtask build --arch aarch64 --boot uefi
+
+# AArch64 bare-metal ELF target for board loaders.
+cargo xtask build --arch aarch64 --boot sbi
 ```
 
-`run_qemu_x86_64.sh --smoke` disables networking and graphics, captures serial output,
-and exits successfully only when the configured marker appears.  See
-`docs/status.md` for the current vertical-slice checklist.
+Debug builds use `--debug`; optional feature bundles can be supplied with
+`--features`.
 
-`run_qemu_x86_64.sh` searches for OVMF in the following paths:
+```sh
+cargo xtask build --arch x86_64 --boot uefi --debug
+cargo xtask build --arch x86_64 --boot uefi --features debug,kmtest
+```
 
-| Path | Distribution |
+---
+
+## Initramfs and disk images
+
+Build an initramfs for a target architecture:
+
+```sh
+cargo xtask mkinitramfs --arch x86_64
+cargo xtask mkinitramfs --arch riscv64
+cargo xtask mkinitramfs --arch aarch64
+```
+
+Build a FAT EFI disk image with the architecture-appropriate removable-media
+filename:
+
+```sh
+cargo xtask image --arch x86_64 --boot uefi --initrd
+cargo xtask image --arch riscv64 --boot uefi
+cargo xtask image --arch aarch64 --boot uefi
+```
+
+Image names produced by `xtask`:
+
+| Architecture | EFI removable filename | Disk image name |
+|---|---|---|
+| `x86_64` | `BOOTX64.EFI` | `boot.img` |
+| `riscv64` | `BOOTRISCV64.EFI` | `boot-riscv64.img` |
+| `aarch64` | `BOOTAA64.EFI` | `boot-aarch64.img` |
+
+The `esp/EFI/BOOT/` directory is the staging root for EFI binaries.  The QEMU
+launcher uses `target/esp/` for x86_64 UEFI and `esp/` for the non-x86 UEFI
+virt-machine flows; `cargo xtask image` packages the staged EFI binary into a
+standalone FAT image.
+
+---
+
+## Direct Cargo builds
+
+`xtask` wraps these Cargo concepts, but direct builds are still useful when
+iterating on custom targets:
+
+```sh
+cargo build --target targets/x86_64-kernel.json \
+  -Z build-std=core,alloc,compiler_builtins \
+  -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
+
+cargo build --target targets/riscv64-kernel.json \
+  -Z build-std=core,alloc,compiler_builtins \
+  -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
+
+cargo build --target targets/aarch64-kernel.json \
+  -Z build-std=core,alloc,compiler_builtins \
+  -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec
+```
+
+For x86_64 UEFI, the ELF is converted to a PE/COFF EFI application with
+`llvm-objcopy`, `rust-objcopy`, or `objcopy` using the `efi-app-x86_64` target
+and subsystem 10.
+
+---
+
+## Unified QEMU launcher
+
+Set `ARCH` and run the unified script:
+
+```sh
+ARCH=x86_64  ./scripts/ci/qemu-run.sh
+ARCH=riscv64 ./scripts/ci/qemu-run.sh
+ARCH=aarch64 ./scripts/ci/qemu-run.sh
+```
+
+Common options:
+
+| Option | Description |
 |---|---|
-| `/usr/share/ovmf/OVMF.fd` | Debian / Ubuntu (`apt install ovmf`) |
-| `/usr/share/edk2/ovmf/OVMF.fd` | Arch Linux (`pacman -S edk2-ovmf`) |
-| `/usr/share/qemu/OVMF.fd` | Fedora / openSUSE |
-| `/opt/homebrew/share/qemu/edk2-x86_64-code.fd` | macOS Homebrew |
+| `--boot uefi|multiboot|sbi` | Boot mode. Valid modes depend on `ARCH`. |
+| `--release` | Build and run a release kernel. |
+| `--gdb` | Halt at entry and expose QEMU GDB server on `:1234`. |
+| `--gpu` | Add virtio-gpu and SDL display on x86_64. |
+| `--no-net` | Disable virtio networking. |
+| `--smoke` | Headless smoke run; wait for the configured serial marker. |
+| `--test` | Build kmtest/userspace runner, boot with `init=/bin/kmtest`, and parse results. |
+| `--timeout N` | Override smoke/test timeout. |
+| `--smoke-marker TEXT` | Override the marker required by smoke mode. |
 
-The ESP is mounted via QEMU's `fat:rw:` vvfat pseudo-driver — no loop device
-or mkdosfs is needed.
+Valid QEMU boot modes:
+
+| Architecture | Valid QEMU modes | Default |
+|---|---|---|
+| `x86_64` | `uefi`, `multiboot` | `uefi` |
+| `riscv64` | `uefi`, `sbi` | `uefi` |
+| `aarch64` | `uefi` | `uefi` |
+
+Examples:
+
+```sh
+# x86_64 UEFI through OVMF.
+ARCH=x86_64 ./scripts/ci/qemu-run.sh
+
+# x86_64 direct-kernel / Multiboot2-style path.
+ARCH=x86_64 ./scripts/ci/qemu-run.sh --boot multiboot
+
+# RISC-V SBI/OpenSBI path.
+ARCH=riscv64 ./scripts/ci/qemu-run.sh --boot sbi
+
+# Release build with no virtio-net device.
+ARCH=aarch64 ./scripts/ci/qemu-run.sh --release --no-net
+
+# Smoke test with a custom marker and timeout.
+ARCH=x86_64 ./scripts/ci/qemu-run.sh --smoke --smoke-marker 'TEST PASS: uart_smoke' --timeout 30
+
+# kmtest mode.
+ARCH=x86_64 ./scripts/ci/qemu-run.sh --test --timeout 60
+```
 
 ---
 
-## Real Hardware (bare-metal)
+## QEMU firmware search paths
 
-### ARM64 baseline
+### x86_64 OVMF
 
-ARM64 support requires all of the following before RustOS will treat a board as
-a supported target:
+The QEMU launcher checks:
 
-- UEFI firmware (`efi_main` entry, no non-UEFI ARM64 boot path yet).
-- Armv8-A or newer AArch64 processor.
-- GICv2 or GICv3 interrupt controller, discovered from firmware tables or
-  supplied by the platform fallback during early bring-up.
+| Path | Notes |
+|---|---|
+| `/usr/share/OVMF/OVMF_CODE.fd` plus `/usr/share/OVMF/OVMF_VARS.fd` | Ubuntu/Debian split OVMF layout. |
+| `/usr/share/ovmf/OVMF.fd` | Common single-file OVMF layout. |
+| `/usr/share/edk2/ovmf/OVMF.fd` | Arch-style EDK2 OVMF layout. |
+| `/usr/share/qemu/OVMF.fd` | Fedora/openSUSE-style location. |
+| `/opt/homebrew/share/qemu/edk2-x86_64-code.fd` | macOS Homebrew QEMU location. |
+| `/usr/share/edk2-ovmf/x64/OVMF.fd` | Additional distro location. |
 
+### AArch64 EDK2
 
+The launcher checks:
 
-### 1. Prepare a USB drive
+| Path |
+|---|
+| `/usr/share/qemu-efi-aarch64/QEMU_EFI.fd` |
+| `/usr/share/edk2/aarch64/QEMU_EFI.fd` |
+| `/usr/share/qemu/edk2-aarch64-code.fd` |
+| `/opt/homebrew/share/qemu/edk2-aarch64-code.fd` |
+| `/usr/local/share/qemu/edk2-aarch64-code.fd` |
 
-```bash
-# Replace /dev/sdX with your USB device — DESTRUCTIVE.
+If a writable VARS file is not discovered, the script creates
+`edk2-aarch64-vars.fd` in the repository root.
+
+### RISC-V EDK2
+
+The launcher checks:
+
+| Path |
+|---|
+| `/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd` |
+| `/usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd` |
+| `/usr/share/qemu/edk2-riscv-code.fd` |
+| `/opt/homebrew/share/qemu/edk2-riscv-code.fd` |
+| `/usr/local/share/qemu/edk2-riscv-code.fd` |
+
+If a writable VARS file is not discovered, the script creates
+`edk2-riscv-vars.fd` in the repository root.
+
+---
+
+## Real hardware / removable media
+
+For UEFI hardware, build or stage the appropriate EFI binary and copy it to the
+removable-media path for the target architecture:
+
+| Architecture | Removable-media path |
+|---|---|
+| `x86_64` | `EFI/BOOT/BOOTX64.EFI` |
+| `riscv64` | `EFI/BOOT/BOOTRISCV64.EFI` |
+| `aarch64` | `EFI/BOOT/BOOTAA64.EFI` |
+
+Prepare a USB drive:
+
+```sh
+# Replace /dev/sdX with your USB device — destructive.
 sudo parted /dev/sdX mklabel gpt
 sudo parted /dev/sdX mkpart ESP fat32 1MiB 100%
 sudo parted /dev/sdX set 1 esp on
 sudo mkfs.fat -F32 /dev/sdX1
 ```
 
-### 2. Copy the ESP
+Copy the staged ESP contents:
 
-```bash
+```sh
 sudo mount /dev/sdX1 /mnt
-sudo cp -r target/esp/EFI /mnt/
+sudo mkdir -p /mnt/EFI/BOOT
+sudo cp -r esp/EFI /mnt/
 sudo umount /mnt
 ```
 
-### 3. Boot
-
-1. Insert the USB drive.
-2. Enter UEFI firmware setup (F2 / Delete / F12 at POST).
-3. Select **RustOS** (or `UEFI: <USB drive>`) from the boot menu.
-4. Serial output is on COM1 (115200 8N1).  Connect a USB–serial adapter to
-   the motherboard COM header to see kernel log output.
-
-### Supported firmware
-
-`uefi_entry.rs` includes explicit compatibility handling for:
-
-- **AMI BIOS** (ASUS, Gigabyte, MSI) — ExitBootServices retry on
-  `EFI_INVALID_PARAMETER` per UEFI spec §7.4.6.
-- **Insyde H2O** (Lenovo, HP, Dell laptops) — same retry path.
-- **Standard UEFI 2.x** — single-call fast path.
+If you used `cargo xtask image`, you can instead write the generated image to a
+device with `dd`; verify the target device carefully before doing so.
 
 ---
 
-## Memory Layout (after ExitBootServices)
+## BootInfo memory contract
 
-| Region | Description |
+After firmware handoff, `BootInfo` describes the immutable boot-time facts used
+by the common kernel:
+
+| Field | Meaning |
 |---|---|
-| `0x0000 – 0x00FF` | BIOS data area (untouched) |
-| `0x1000 – 0x9FFF` | AP trampoline (SMP) |
-| `0x400000+` | Kernel image (`.text`, `.rodata`, `.data`, `.bss`) |
-| EFI pool alloc | EFI memory map (pointer in `EFI_MAP_PTR`) |
-| GOP base | Framebuffer physical address (`drivers::gop::GOP_INFO`) |
-| Above kernel | PMM-managed free RAM |
+| `rsdp_phys` | Physical RSDP address when provided by UEFI/ACPI firmware. |
+| `efi_memory_map` | EFI memory-map pointer, byte size, and descriptor size. |
+| `framebuffer` | Optional GOP/framebuffer metadata. |
+| `initramfs` | Optional initramfs physical range. |
+| `cmdline` | Optional command-line physical range. |
+| `fdt` | Optional flattened device tree physical range. |
+| `boot_hart_id` | Boot hart ID for RISC-V/SBI-style entry paths. |
 
-All physical RAM is identity-mapped by the UEFI page tables at
-`ExitBootServices` time.  The kernel's static PMM pool is immediately usable;
-`memmap_init()` promotes the EFI memory map into the full PMM on boot.
+The common kernel entry logs `BootInfo::priority()` before architecture-specific
+initialization so boot logs identify `PRIMARY` x86_64, `SECONDARY` AArch64, or
+`TERTIARY` RISC-V early in the serial output.
 
 ---
 
-## Feature Flags
+## Cargo features
+
+The root crate declares these feature flags:
 
 | Feature | Description |
 |---|---|
-| `uefi_boot` (default) | UEFI bare-metal boot via `uefi_start()` |
-| `multiboot2_boot` | Legacy GRUB2/QEMU `-kernel` boot |
-| `gdbstub` | GDB RSP stub on COM1 (x86_64) or SBI console (RISC-V) |
-| `cgroups` | cgroups v2 hierarchy + cgroupfs VFS |
-| `sysv_ipc` | System V IPC + POSIX message queues |
-| `namespaces` | Linux-compatible namespace isolation |
+| `input_events` | Evdev / virtio-input subsystem; enabled by default. |
+| `gdbstub` | GDB Remote Serial Protocol stub; enabled by default. |
+| `uefi_boot` | Build as a UEFI loader/application where applicable. |
+| `debug` | Convenience bundle for `debug_stub` and `trace`. |
+| `debug_stub` | GDB RSP stub only. |
+| `trace` | Ring-buffer trace support flushed on panic. |
+| `kmtest` | In-kernel test harness registration and dependency. |
 
-To build with multiboot2 instead of UEFI:
+Example feature-specific build:
 
-```bash
-cargo build --target x86_64-unknown-none \
+```sh
+cargo build --target targets/x86_64-kernel.json \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem \
-  --no-default-features \
-  --features multiboot2_boot,sysv_ipc,namespaces
+  -Z json-target-spec \
+  --no-default-features --features kmtest
 ```
 
 ---
 
-## GDB Debugging on Real Hardware
+## GDB debugging
 
-1. Build with `--features gdbstub`.
-2. Connect a USB–serial adapter to COM1 (9600–115200 baud, 8N1).
-3. On the host:
-   ```
-   gdb
-   (gdb) target remote /dev/ttyUSB0
-   (gdb) symbol-file target/x86_64-unknown-none/debug/rustos
-   ```
-4. The kernel will halt at `gdbstub::breakpoint()` calls or hardware
-   exceptions and wait for GDB commands.
+QEMU debugging is the easiest supported path:
+
+```sh
+ARCH=x86_64 ./scripts/ci/qemu-run.sh --gdb
+ARCH=riscv64 ./scripts/ci/qemu-run.sh --boot sbi --gdb
+ARCH=aarch64 ./scripts/ci/qemu-run.sh --gdb
+```
+
+The launcher prints the matching `gdb` or `gdb-multiarch` command with the
+symbol file and `target remote :1234` line for the selected architecture.
+
+For real hardware, build with `gdbstub`/`debug_stub` as appropriate, connect the
+serial adapter used by the target platform, and load the matching kernel symbols
+from the target profile directory.

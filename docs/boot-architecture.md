@@ -2,241 +2,197 @@
 
 ## Philosophy
 
-RustOS shall support both UEFI and bare-metal boot paths, but UEFI shall be considered
-the primary and long-term supported boot mechanism.
+RustOS supports multiple firmware and direct-kernel boot paths, but all of them
+must converge into one small handoff contract and one common kernel entry point.
+Boot code should discover platform facts, build `init::boot_info::BootInfo`, and
+then jump to `kernel_main(&BootInfo)`.
 
-The bare-metal path exists to support:
-
-- Development and debugging
-- Specialized hardware platforms
-- Firmware-independent testing
-- Embedded and research environments
-
-The operating system shall maintain a single kernel initialization path regardless of
-how the system boots.
+UEFI is the primary long-term firmware path for removable-media and QEMU image
+flows.  Direct-kernel paths remain useful for firmware-independent testing,
+OpenSBI/FDT development, board bring-up, and low-level debugging.
 
 ---
 
-## Architectural Principle
+## Architectural principle
 
-Boot methods are responsible only for platform bring-up and transferring control to
-the kernel. All operating system initialization must occur through a shared kernel
-initialization sequence.
+Boot methods are responsible only for platform bring-up and transferring control
+to the kernel.  All operating-system initialization must occur through the shared
+kernel path.
 
-```
-UEFI Entry
+```text
+UEFI entry
     \
      \
-      --> Common Kernel Init --> Scheduler --> Drivers --> Userspace
+      -> BootInfo -> kernel_main() -> arch::init() -> shared subsystems
      /
     /
-Bare Metal Entry
+SBI / FDT / direct-kernel entry
 ```
 
-Boot-specific code should be minimized and isolated.
+Boot-specific code must be minimized and isolated.  It should not duplicate the
+scheduler, VFS, memory manager, security setup, userspace launch, or driver
+policy.
 
 ---
 
-## Supported Architectures
+## Supported architecture boot paths
 
-### x86_64
-
-| Priority   | Boot Method              |
-|------------|--------------------------|
-| Primary    | UEFI                     |
-| Secondary  | Bare-metal bootloader    |
-
-### ARM64 (AArch64)
-
-| Priority   | Boot Method              |
-|------------|--------------------------|
-| Primary    | UEFI                     |
-| Secondary  | Direct firmware/board entry |
-
-### RISC-V
-
-| Priority   | Boot Method              |
-|------------|--------------------------|
-| Primary    | UEFI where available; SBI-compliant firmware |
-| Secondary  | Bare-metal board entry   |
+| Architecture | UEFI path | Direct / firmware-specific path | Default helper behavior |
+|---|---|---|---|
+| `x86_64` | `src/arch/x86_64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTX64.EFI` | Direct-kernel / Multiboot2-style path through x86_64 kernel target | `cargo xtask build` defaults to `x86_64` + `uefi`; QEMU accepts `--boot uefi` or `--boot multiboot`. |
+| `riscv64` | `src/arch/riscv64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTRISCV64.EFI` | SBI/OpenSBI + FDT path through the RISC-V kernel target | QEMU accepts `--boot uefi` or `--boot sbi`. |
+| `aarch64` | `src/arch/aarch64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTAA64.EFI` | Bare-metal kernel target for board loaders/U-Boot-style flows | QEMU launcher currently supports `--boot uefi`; `xtask` can also build the bare-metal kernel target. |
 
 ---
 
-## Boot Layer Responsibilities
+## Boot layer responsibilities
 
-### UEFI Entry
+### UEFI entries
 
-**Responsible for:**
+UEFI entry code is responsible for:
 
-- Obtain memory map
-- Initialize framebuffer/GOP
-- Load kernel image
-- Collect boot information
-- `ExitBootServices()`
-- Transfer control to kernel
+- Capturing firmware tables such as the RSDP where available.
+- Capturing UEFI memory-map metadata before `ExitBootServices()`.
+- Discovering a GOP framebuffer when firmware provides one.
+- Passing optional command line, initramfs, and FDT ranges when available.
+- Switching to an architecture-appropriate boot stack when required.
+- Calling `ExitBootServices()` and then jumping to `kernel_main`.
 
-**Must NOT:**
+UEFI entry code must not:
 
-- Initialize schedulers
-- Start drivers
-- Create processes
-- Perform platform-independent kernel work
+- Start the scheduler.
+- Mount filesystems.
+- Launch userspace.
+- Run platform-independent driver policy.
+- Duplicate common kernel initialization.
 
-### Bare-Metal Entry
+### Direct-kernel / SBI / board entries
 
-**Responsible for:**
+Direct entry code is responsible for:
 
-- Establish stack
-- Configure minimum CPU state
-- Discover memory
-- Initialize serial console
-- Build boot information structure
-- Transfer control to kernel
+- Establishing the minimum CPU state and stack required by the architecture.
+- Discovering or receiving memory/FDT information from firmware.
+- Initializing enough serial output for early diagnostics.
+- Filling `BootInfo` fields that are meaningful for that platform.
+- Jumping to `kernel_main`.
 
-**Must NOT:**
-
-- Duplicate kernel initialization
-- Perform driver initialization
-- Start scheduler
+Direct entry code must not duplicate common subsystem initialization.
 
 ---
 
-## Unified Boot Information Structure
+## Unified boot information structure
 
-All boot methods must produce the same structure:
+The canonical handoff ABI is `BootInfo` in `src/init/boot_info.rs`:
 
 ```rust
+#[repr(C)]
 pub struct BootInfo {
-    pub memory_map: MemoryMap,
-    pub framebuffer: Option<Framebuffer>,
-    pub command_line: Option<String>,
-    pub architecture: Architecture,
-    pub boot_method: BootMethod,
+    pub rsdp_phys: u64,
+    pub efi_memory_map: EfiMemoryMapInfo,
+    pub framebuffer: FramebufferInfo,
+    pub initramfs: BootRange,
+    pub cmdline: BootRange,
+    pub fdt: BootRange,
+    pub boot_hart_id: usize,
 }
 ```
 
-This structure is the contract between the boot layer and the kernel. The kernel must
-not care whether the system was started by UEFI or a bare-metal loader.
+Supporting structures:
+
+- `BootRange { start, len }` describes physical ranges for blobs such as an
+  initramfs, command line, or FDT.
+- `EfiMemoryMapInfo { ptr, size, desc_size }` preserves the EFI memory map after
+  `ExitBootServices()`.
+- `FramebufferInfo` describes an optional firmware framebuffer.
+- `BootInfo::priority()` labels the active architecture in the boot banner:
+  `PRIMARY` for x86_64, `SECONDARY` for AArch64, and `TERTIARY` for RISC-V.
+
+The kernel must not care whether these facts came from OVMF, EDK2, OpenSBI,
+U-Boot, or a direct test harness.
 
 ---
 
-## Common Kernel Initialization
+## Common kernel entry
 
 Every boot path must enter:
 
 ```rust
-kernel_main(boot_info: &'static BootInfo)
+#[no_mangle]
+pub extern "C" fn kernel_main(boot_info: &'static BootInfo) -> !
 ```
 
-Kernel initialization sequence:
+The common entry performs the architecture-independent dispatch contract:
 
-```
-kernel_main()
-    ↓
-cpu_init()
-    ↓
-memory_manager_init()
-    ↓
-interrupts_init()
-    ↓
-timer_init()
-    ↓
-scheduler_init()
-    ↓
-driver_manager_init()
-    ↓
-userspace_init()
+```text
+kernel_main(&BootInfo)
+    -> print boot-priority banner
+    -> log the hybrid-kernel architecture contract
+    -> arch::init(&BootInfo)
+    -> architecture-specific early init
+    -> shared subsystem initialization
+    -> initramfs / schemes / shell / userspace or idle loop
 ```
 
-No architecture should bypass this sequence.
+`src/arch/mod.rs` owns the compile-time architecture selection and exposes
+`crate::arch::Arch` as the HAL alias for common code.
 
 ---
 
-## Architecture Separation
+## Architecture separation
 
-Architecture-specific code must remain confined to:
+Architecture-specific code must remain under:
 
+```text
+src/arch/
+├── x86_64/
+├── aarch64/
+└── riscv64/
 ```
-kernel/
-├── arch/
-│   ├── x86_64/
-│   ├── aarch64/
-│   └── riscv64/
-```
 
-Architecture-specific responsibilities:
+Architecture-specific responsibilities include:
 
-- Context switching
-- Interrupt handling
-- MMU / page tables
-- CPU feature detection
-- Timer implementation
-- Low-level synchronization
+- CPU feature setup and context switching.
+- Interrupt/trap/syscall entry.
+- MMU and page-table operations.
+- Boot stacks, early serial, and low-level assembly.
+- Architecture timer and SMP hooks.
 
-Everything else should be architecture-independent.
+Common code should use `crate::arch::Arch` and types/traits from
+`crate::arch::api` instead of importing `arch::x86_64`, `arch::riscv64`, or
+`arch::aarch64` directly.
 
 ---
 
-## Driver Initialization
+## Driver and userspace initialization
 
-Drivers must never depend on the boot method.
+Drivers must not depend on the boot method.  A driver can depend on hardware
+facts exposed by the device, bus, firmware table, or kernel abstractions, but it
+should not branch on “booted via UEFI” versus “booted via SBI”.
 
 ```rust
-// Bad
+// Avoid boot-policy checks inside drivers.
 if booted_via_uefi {
     init_nvme();
 }
 
-// Good
+// Prefer a device/bus-driven initialization path.
 driver_manager.initialize();
 ```
 
-Drivers should operate solely on kernel-provided abstractions.
+Likewise, userspace launch policy belongs in the common init/service path, not in
+UEFI or board entry code.
 
 ---
 
-## Long-Term Maintenance Rule
+## Long-term maintenance rule
 
 When adding a new subsystem:
 
-1. Implement it once.
-2. Place it in the common kernel.
-3. Do not duplicate functionality for UEFI and bare-metal paths.
+1. Implement it once in the common kernel when possible.
+2. Keep only unavoidable CPU/firmware setup in the architecture entry.
+3. Extend `BootInfo` only when all boot paths can tolerate the new field.
+4. Update `docs/booting.md` and `docs/arch_capability_matrix.md` if a build,
+   image, firmware, or validation flow changes.
 
-If code must exist in both paths, it likely belongs in the common kernel instead.
-
----
-
-## Future Expansion
-
-The architecture must accommodate future boot methods without changes to the shared
-kernel:
-
-| Boot Method      | Converges into  |
-|------------------|-----------------|
-| UEFI             | `kernel_main()` |
-| BIOS             | `kernel_main()` |
-| Coreboot         | `kernel_main()` |
-| SBI              | `kernel_main()` |
-| Custom Loader    | `kernel_main()` |
-| Hypervisor Loader| `kernel_main()` |
-
-No new boot method may require changes to the scheduler, drivers, memory management,
-or userspace initialization.
-
----
-
-## Project Policy
-
-1. UEFI is the primary supported boot path.
-2. Bare-metal support is retained as a minimal secondary path.
-3. All boot methods must converge into a single kernel initialization sequence.
-4. Kernel subsystems must remain boot-method agnostic.
-5. Architecture-specific code must be isolated from platform-independent code.
-6. No subsystem may require separate UEFI and bare-metal implementations unless
-   technically unavoidable.
-7. Long-term development effort should focus on improving the shared kernel rather
-   than expanding boot-specific logic.
-
-This approach scales across x86_64, ARM64, and RISC-V while avoiding the maintenance
-burden of two separate OS initialization paths.
+If code must exist in both UEFI and direct paths, it probably belongs in the
+common kernel or in an architecture HAL abstraction.
