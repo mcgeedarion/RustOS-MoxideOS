@@ -1,14 +1,4 @@
 // src/io_uring/ops/accept.rs
-// IORING_OP_ACCEPT handler.
-// Accepts an incoming connection on the listening socket `sqe.fd`.
-// Field mapping:
-//   sqe.fd       → listening socket fd
-//   sqe.addr     → *mut sockaddr_storage (filled by the network stack)
-//   sqe.addr3    → *mut socklen_t        (updated with actual addr length)
-//   sqe.op_flags → accept4() flags (e.g. SOCK_NONBLOCK | SOCK_CLOEXEC)
-// CQE result:
-//   res >= 0 → new connected socket fd
-//   res <  0 → negated errno (E_AGAIN if no connection pending)
 
 use crate::io_uring::{cqe::errno, sqe::Sqe};
 
@@ -52,17 +42,6 @@ use core::{
 };
 
 /// Async wrapper around IORING_OP_ACCEPT.
-///
-/// Suspends the calling task until an incoming connection is available.
-/// Wakeup is driven by `IoUringRing::post_cqe` → `cq_wq.wake(POLLIN)`;
-/// callers should `cq_wq_for(ring_idx).unwrap().wait(...)` to block.
-///
-/// # Example
-/// ```rust,no_run
-/// let mut peer_addr = SockaddrStorage::zeroed();
-/// let mut addrlen: u32 = core::mem::size_of::<SockaddrStorage>() as u32;
-/// let client_fd = IoAccept::new(ring_idx, listen_fd, addr_va, addrlen_va, 0, token).await?;
-/// ```
 pub struct IoAccept {
     ring_idx: usize,
     fd: i32,
@@ -75,11 +54,6 @@ pub struct IoAccept {
 
 impl IoAccept {
     /// Create a new accept future.
-    ///
-    /// `ring_idx` identifies the per-process io_uring instance (index into
-    /// the global ring table).  `addr_va` and `addrlen_va` are raw virtual
-    /// addresses that must remain valid and pinned for the lifetime of this
-    /// future.
     pub fn new(
         ring_idx: usize,
         fd: i32,
