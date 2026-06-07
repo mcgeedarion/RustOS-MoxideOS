@@ -2,27 +2,7 @@
 //! too specific to belong in the main vfs.rs but are needed by multiple
 //! syscall implementations.
 //!
-//! # set_times
-//!
-//! Updates atime and/or mtime on a named file.  The VFS itself stores two
-//! u64 nanosecond timestamps per inode; here we look the inode up by path
-//! and write the requested fields.
-//!
-//! # sync_all / fsync_fd / fdatasync_fd
-//!
-//! Flush all dirty VFS page-cache buffers to the backing block device.
-//! Our VFS uses a simple write-through model on most paths, so `sync_all`
-//! just iterates the open-file table and calls `flush` on each entry that
-//! has a dirty bit set.
-//!
-//! # flock
-//!
-//! Advisory POSIX/BSD flock(2) implementation.  Stores lock state per
-//! (inode_id, fd) pair in a global table.  Locking is cooperative; the
-//! kernel does not prevent un-locked writes.
-//!
-//! # posix_fadvise
-//!
+
 //! Accepted and ignored (no readahead / eviction policy yet).
 
 extern crate alloc;
@@ -43,13 +23,11 @@ pub fn set_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) {
 }
 
 /// Flush every dirty buffer in the VFS page cache to persistent storage.
-/// Called by `sync(2)` and `syncfs(2)`.
 pub fn sync_all() {
     crate::fs::vfs::flush_all_dirty();
 }
 
 /// Flush the file backing `fd` to storage (fsync semantics: metadata + data).
-/// Returns 0 on success or a negative errno on failure.
 pub fn fsync_fd(fd: usize) -> isize {
     crate::fs::vfs::flush_fd(fd, true /* include_metadata */)
 }
@@ -82,8 +60,6 @@ static FLOCK_TABLE: SpinMutex<BTreeMap<u64 /* inode_id */, AdvisoryLock>> =
     SpinMutex::new(BTreeMap::new());
 
 /// Implements `flock(fd, operation)`.
-/// Returns 0 on success, -EWOULDBLOCK (-11) if LOCK_NB is set and the lock
-/// cannot be acquired, or -EINVAL (-22) for unknown operations.
 pub fn sys_flock(fd: usize, operation: i32) -> isize {
     const LOCK_SH: i32 = 1;
     const LOCK_EX: i32 = 2;
@@ -196,8 +172,6 @@ pub fn flock_release_fd(fd: usize) {
 }
 
 /// NR 221  posix_fadvise(fd, offset, len, advice)
-/// Accepted and ignored; we have no readahead or eviction policy yet.
-/// Returns 0 (success) for all valid advice values.
 pub fn sys_posix_fadvise(_fd: usize, _offset: i64, _len: i64, advice: i32) -> isize {
     const POSIX_FADV_NORMAL: i32 = 0;
     const POSIX_FADV_SEQUENTIAL: i32 = 2;
