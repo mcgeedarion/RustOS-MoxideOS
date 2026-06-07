@@ -1,17 +1,4 @@
 //! NTFS read-only filesystem driver.
-//!
-//! Supports:
-//!   - Boot sector / BPB parsing
-//!   - MFT (Master File Table) record loading
-//!   - $FILE_NAME and $DATA attribute parsing (resident data only)
-//!   - Directory index ($INDEX_ROOT) traversal for path resolution
-//!
-//! Write support is intentionally omitted — NTFS write is complex and
-//! risky; read-only is enough for Windows disk interoperability.
-//!
-//! Non-resident $DATA attributes (files > ~700 bytes) use a data-run
-//! list to locate clusters; this driver decodes those runs to support
-//! large files.
 
 extern crate alloc;
 use alloc::{
