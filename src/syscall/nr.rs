@@ -1,12 +1,4 @@
 //! Linux x86-64 syscall number constants.
-//!
-//! These are the canonical NR_* names used throughout the syscall
-//! dispatcher, seccomp filters, and any other code that references
-//! syscall numbers by value.  Using named constants prevents magic-
-//! number bugs and makes grepping for a specific syscall trivial.
-//!
-//! Naming convention: `SYS_<UPPERCASE_SYSCALL_NAME>`.
-//! All values are `usize` to match the `nr` argument in dispatch.
 
 pub const SYS_READ: usize = 0;
 pub const SYS_WRITE: usize = 1;
@@ -113,18 +105,12 @@ pub const STRICT_ALLOWLIST: &[usize] = &[
     SYS_EXIT_GROUP,
 ];
 
-// These numbers are in the 0x8000_0000+ range, well above any current or
-// planned Linux NR, so they can never collide.  They are compiled out in
-// release builds (only present when feature = "kmtest").
-// SYS_KMTEST_LIST: returns the count of registered tests; optionally fills
-//                  a user-supplied buffer with NUL-terminated name strings.
 // SYS_KMTEST_RUN:  runs one test by index; streams pass/fail lines to the
 //                  kernel serial console and returns the failure count.
 pub const SYS_KMTEST_LIST: usize = 0x8000_0000;
 pub const SYS_KMTEST_RUN: usize = 0x8000_0001;
 
-// RustOS hybrid-kernel private syscall range.  These are intentionally outside
-// Linux's assigned x86_64 range and below the kmtest sentinel range.
+// RustOS hybrid-kernel private syscall range.
 pub const SYS_DRIVER_BIND: usize = 0x7000_0000;
 pub const SYS_DMA_ALLOC: usize = 0x7000_0001;
 pub const SYS_IRQ_SUBSCRIBE: usize = 0x7000_0002;
