@@ -1,17 +1,4 @@
 //! VFS bridge: mount the CPIO initramfs into the ramfs tree.
-//!
-//! Call `mount_initramfs()` once, after `heap::init()` and before the first
-//! `open(2)` or `execve` that needs to reach a file inside the initramfs.
-//! The function is idempotent — a second call is a no-op.
-//!
-//! The function walks the CPIO archive (via `initramfs::load()`) and for
-//! each entry:
-//!   * directory  → `vfs::mkdir(path)`
-//!   * regular file → `vfs::create_file(path, data)`
-//!   * symlink    → `vfs::symlink(target, path)` (if the VFS supports it)
-//!
-//! The CPIO "TRAILER!!!" entry signals end-of-archive and terminates the
-//! walk.  Paths starting with "." are normalised to absolute paths.
 
 extern crate alloc;
 use alloc::string::String;
@@ -24,8 +11,6 @@ use crate::initramfs;
 static MOUNTED: AtomicBool = AtomicBool::new(false);
 
 /// Walk the CPIO initramfs and create corresponding VFS entries.
-///
-/// Idempotent: returns immediately if already mounted.
 pub fn mount_initramfs() {
     if MOUNTED.load(Ordering::Acquire) {
         return;
@@ -52,14 +37,6 @@ pub fn mount_initramfs() {
             alloc::format!("/{}", entry.name)
         };
 
-        // S_IFMT mask (Linux inode mode field upper 4 bits):
-        //   0o140000 = socket   (skip)
-        //   0o120000 = symlink
-        //   0o100000 = regular file
-        //   0o060000 = block device (skip)
-        //   0o040000 = directory
-        //   0o020000 = char device  (skip)
-        //   0o010000 = FIFO        (skip)
         let mode = entry.mode;
         let file_type = mode & 0o170000;
 
