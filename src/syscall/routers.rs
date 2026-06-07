@@ -1,14 +1,4 @@
 //! Subsystem dispatch routers.
-//!
-//! Each function handles one logical group of syscalls and returns
-//! `Some(retval)` when it owns the nr, `None` otherwise.  The caller
-//! (`dispatch_with_rip`) tries each router in frequency order and the
-//! final catch-all in mod.rs returns ENOSYS for anything unrecognised.
-//!
-//! ## Adding a new syscall
-//! 1. Add the NR constant to `nr.rs`.
-//! 2. Find the correct router below and add a match arm.
-//! 3. No changes to `dispatch_with_rip` are required.
 
 #![allow(unused_variables)]
 
