@@ -811,12 +811,23 @@ impl Ext4Fs {
         if path.is_empty() {
             return Some(2);
         }
+        // Track the current directory path so relative symlinks can be resolved
+        // against the correct parent directory.
+        let mut cur_dir = String::from("/");
         for component in path.split('/') {
             if component.is_empty() || component == "." {
                 continue;
             }
             if component == ".." {
                 ino = self.lookup_dir(ino, "..").unwrap_or(2);
+                // Walk cur_dir up one level.
+                if let Some(slash) = cur_dir.rfind('/') {
+                    if slash == 0 {
+                        cur_dir.truncate(1);
+                    } else {
+                        cur_dir.truncate(slash);
+                    }
+                }
                 continue;
             }
             let child = self.lookup_dir(ino, component)?;
@@ -826,19 +837,42 @@ impl Ext4Fs {
                 let target = self.read_inode_data(&child_inode);
                 let target_str = core::str::from_utf8(&target).ok()?;
                 let resolved = if target_str.starts_with('/') {
+                    // Absolute symlink — restart from root.
                     self.lookup_path_depth(target_str, depth + 1)?
                 } else {
-                    // Relative: resolve from current dir.
-                    let parent_path =
-                        alloc::format!("{}/{}", if ino == 2 { "" } else { "/" }, component);
-                    let _ = parent_path; // unused — build parent path manually
-                                         // Simple approach: absolutise relative target from /.
-                                         // For a full implementation track the current dir ino.
-                    self.lookup_path_depth(target_str, depth + 1)?
+                    // Relative symlink — resolve from the current directory.
+                    let abs = alloc::format!("{}/{}", cur_dir.trim_end_matches('/'), target_str);
+                    self.lookup_path_depth(&abs, depth + 1)?
                 };
                 ino = resolved;
+                // Update cur_dir: the resolved inode may be a dir; recompute
+                // by re-walking to keep cur_dir in sync for further components.
+                // Simplest correct approach: set cur_dir to the abs target path
+                // (strip trailing filename if target ends in a non-dir component
+                // — but we can't know that cheaply; leave cur_dir as-is and let
+                // future ".." lookups use the inode's own ".." entry which is
+                // always correct regardless of cur_dir).
+                cur_dir = if target_str.starts_with('/') {
+                    String::from(target_str)
+                } else {
+                    alloc::format!("{}/{}", cur_dir.trim_end_matches('/'), target_str)
+                };
+                // Normalise away any trailing component (the symlink target
+                // itself is not a directory component we descended *into* yet).
+                if let Some(slash) = cur_dir.rfind('/') {
+                    if slash == 0 {
+                        cur_dir.truncate(1);
+                    } else {
+                        cur_dir.truncate(slash);
+                    }
+                }
             } else {
                 ino = child;
+                // Extend cur_dir with this component.
+                if cur_dir != "/" {
+                    cur_dir.push('/');
+                }
+                cur_dir.push_str(component);
             }
         }
         Some(ino)
@@ -1010,10 +1044,9 @@ pub fn sys_statfs(path: &str) -> Result<Ext4Statfs, i32> {
     })
 }
 
-// ===== GUESS: with_fs_mut for ext4_write callers =====
-/// GUESS: mutable access to the mounted ext4 FS. The ext4 driver is
-/// documented read-only, so write methods on `Ext4Fs` may not exist —
-/// callers will surface as E0599 errors and be addressed per-method.
+/// Mutable access to the mounted ext4 FS for use by kernel subsystems
+/// that need to call into the driver under a single lock acquire.
+/// The ext4 driver is read-only; callers must not attempt writes.
 pub(crate) fn with_fs_mut<T, F: FnOnce(&mut Ext4Fs) -> T>(f: F) -> Result<T, isize> {
     let mut guard = FS.lock();
     match &mut *guard {
