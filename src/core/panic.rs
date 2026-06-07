@@ -44,7 +44,7 @@ pub unsafe fn do_panic(ctx: &PanicContext<'_>) -> ! {
         EarlyWriter,
         "\n\n\
          ╔══════════════════════════════════════════════════════╗\n\
-         ║                  K E R N E L  P A N I C             ║\n\
+         ║                  K E R N E L  P A N I C              ║\n\
          ╚══════════════════════════════════════════════════════╝\n\
          Message : {}\n\
          Location: {}:{}:{}",
