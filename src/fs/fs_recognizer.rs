@@ -41,12 +41,7 @@ const ISO_MAGIC_OFF: usize = 0x8001; // sector 16, byte 1
 const ISO_MAGIC: &[u8] = b"CD001";
 
 /// Probe the first bytes of a block device image and return the detected
-/// `FsType`, or `None` if unrecognized.
-///
-/// `data` should be at least 65 KiB for reliable Btrfs detection,
-/// but 512 bytes is sufficient for FAT/exFAT/NTFS/ext detection.
 pub fn probe(data: &[u8]) -> Option<FsType> {
-    // exFAT — must be checked before NTFS/FAT because they share OEM field offset
     if data.len() > EXFAT_OEM_OFF + 8 {
         if &data[EXFAT_OEM_OFF..EXFAT_OEM_OFF + 8] == EXFAT_OEM {
             return Some(FsType::ExFat);
@@ -63,8 +58,6 @@ pub fn probe(data: &[u8]) -> Option<FsType> {
     // ext2 / ext3 / ext4 — all share the same superblock magic
     if data.len() > EXT_MAGIC_OFF + 2 {
         if data[EXT_MAGIC_OFF..EXT_MAGIC_OFF + 2] == EXT_MAGIC {
-            // Distinguish ext4 (has extent flag in features_incompat)
-            // Superblock at 0x400; features_incompat at 0x460 (offset 0x60 into SB)
             let incompat_off = 0x460usize;
             let is_ext4 = data.len() > incompat_off + 4 && {
                 let f = u32::from_le_bytes(
