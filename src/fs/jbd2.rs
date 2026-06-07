@@ -1,22 +1,4 @@
 //! JBD2 journal replay support for ext4.
-//!
-//! This module implements the on-disk JBD2 block parser and a physical redo
-//! replay pass for descriptor/data/revoke/commit transactions.  It is designed
-//! for ext4's internal journal blocks and works without heap-backed maps beyond
-//! `alloc::Vec`.
-//!
-//! Supported pieces:
-//! - journal superblock v1/v2 parsing
-//! - descriptor blocks with v1/v2/v3 checksum tails
-//! - commit blocks with checksum fields
-//! - revoke blocks, including checksum tails
-//! - escape handling for payload blocks whose first word is the JBD2 magic
-//! - sequence ordered replay: only committed transactions are applied
-//! - descriptor tag parsing for 32-bit and 64-bit block numbers
-//!
-//! The caller owns journal block mapping.  For ext4 this is usually the journal
-//! inode's block list or the superblock journal backup.  Replay mutates the
-//! supplied filesystem image in place.
 
 extern crate alloc;
 
