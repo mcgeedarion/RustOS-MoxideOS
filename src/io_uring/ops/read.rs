@@ -1,14 +1,4 @@
 // src/io_uring/ops/read.rs
-// IORING_OP_READ handler.
-// Reads up to `sqe.len` bytes from the file/socket described by `sqe.fd`
-// into the buffer at virtual address `sqe.addr`, starting at file offset
-// `sqe.off` (ignored for sockets/pipes).
-// Returns the number of bytes read on success, or a negated errno on failure.
-// This is intentionally written as a *synchronous* stub that the SQ dispatch
-// loop calls directly.  Actual async suspension is handled at the Future layer
-// (see the `IoRead` future below) — the opcode handler here does the real work
-// (or queues it to a driver), then the Future polls / re-polls using the CQE
-// result stored in the waker table.
 
 use crate::io_uring::{cqe::errno, sqe::Sqe};
 
@@ -58,12 +48,6 @@ use core::{
 };
 
 /// Async wrapper around IORING_OP_READ.
-///
-/// # Example
-/// ```rust,no_run
-/// let mut buf = [0u8; 4096];
-/// let n = IoRead::new(fd, &mut buf, 0, token).await?;
-/// ```
 pub struct IoRead<'a> {
     fd: i32,
     buf: &'a mut [u8],
