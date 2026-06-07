@@ -1,9 +1,5 @@
 //! Boot handoff data shared by every firmware and bare-metal entry path.
-//!
-//! The architecture stubs fill this structure with the immutable facts they
-//! learned from firmware before jumping into the common `kernel_main` symbol.
 
-/// Physical address/length pair for blobs handed to the kernel by firmware.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootRange {
@@ -82,16 +78,10 @@ impl FramebufferInfo {
 }
 
 /// Boot priority of the running architecture.
-///
-/// Determined at compile time from `target_arch`. The common kernel entry
-/// emits this in its banner so every boot log is self-documenting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum BootPriority {
-    /// x86_64 — default boot target.
     Primary = 1,
-    /// aarch64 — secondary boot target.
     Secondary = 2,
-    /// RISC-V — tertiary boot target.
     Tertiary = 3,
 }
 
