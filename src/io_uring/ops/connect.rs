@@ -1,14 +1,4 @@
 // src/io_uring/ops/connect.rs
-// IORING_OP_CONNECT handler.
-// Initiates a connection on socket `sqe.fd` to the address described by the
-// sockaddr at virtual address `sqe.addr` (length `sqe.len`).
-// CQE result:
-//   res == 0  → connected (or connection in progress for non-blocking sockets)
-//   res <  0  → negated errno
-//     -EINPROGRESS (-115): non-blocking connect is in flight (poll/epoll to
-// complete)     -ECONNREFUSED (-111): remote refused
-//     -ETIMEDOUT   (-110): connection timed out
-//     -EADDRINUSE  (-98):  local address already in use
 
 use crate::io_uring::{cqe::errno, sqe::Sqe};
 
@@ -51,15 +41,6 @@ use core::{
 };
 
 /// Async wrapper around IORING_OP_CONNECT.
-///
-/// Suspends the calling task until the connection is established or fails.
-///
-/// # Example
-/// ```rust,no_run
-/// let addr = SockaddrIn { sin_family: AF_INET, sin_port: 80u16.to_be(), sin_addr: ... };
-/// IoConnect::new(sock_fd, &addr as *const _ as u64, size_of::<SockaddrIn>() as u32, token)
-///     .await?;
-/// ```
 pub struct IoConnect {
     fd: i32,
     addr_va: u64,
