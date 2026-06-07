@@ -11,8 +11,8 @@
 //! Results for every test are streamed to the serial console as lines:
 //!
 //! ```text
-//! KMTEST  PASS  smoke_assert_true
-//! KMTEST  FAIL  smoke_assert_eq — assertion failed: 1 + 1 == 3
+//! KMTEST  PASS  mm_map_unmap
+//! KMTEST  FAIL  fs_write_read_roundtrip — readback mismatch
 //! KMTEST  DONE  2/2 passed
 //! ```
 //!
