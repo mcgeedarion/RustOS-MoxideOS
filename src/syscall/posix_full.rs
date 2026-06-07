@@ -2,11 +2,6 @@
 // not large enough to warrant their own module. (Included by
 // src/syscall/mod.rs.)
 
-// extern crate alloc; -- provided by parent (src/syscall/mod.rs via include!)
-// use alloc::string::String; -- provided by parent
-
-/// NR 97  getrlimit(resource, rlim_va)
-/// NR 162 getrlimit64 alias — same layout on x86-64.
 pub(super) fn sys_getrlimit_impl(resource: u32, rlim_va: usize) -> isize {
     const RLIM_INFINITY: u64 = u64::MAX;
     // Provide sane defaults that won't break typical userspace.
@@ -55,7 +50,6 @@ pub(super) fn sys_prlimit64_impl(_pid: u32, resource: u32, _new_va: usize, old_v
 
 /// NR 98  getrusage(who, usage_va) — return zeroed struct rusage.
 pub(super) fn sys_getrusage_impl(_who: i32, usage_va: usize) -> isize {
-    // struct rusage is 144 bytes on x86-64; zero-fill is valid.
     let buf = [0u8; 144];
     if crate::mm::uaccess::copy_to_user(usage_va, &buf).is_err() {
         return -14;
@@ -92,8 +86,6 @@ pub(super) fn sys_times_impl(tbuf_va: usize) -> isize {
 }
 
 /// NR 63  uname(uname_va)
-/// struct utsname: 6 × 65-byte fields (sysname, nodename, release, version,
-/// machine, domainname).
 pub(super) fn sys_uname_impl(uname_va: usize) -> isize {
     fn write_field(dst: &mut [u8; 65], s: &str) {
         let b = s.as_bytes();
@@ -226,9 +218,6 @@ pub(super) fn sys_ioperm_impl(_from: usize, _num: usize, _turn_on: i32) -> isize
 }
 
 /// NR 175  init_module — RustOS has no loadable kernel module subsystem.
-/// ENOSYS (not EPERM) so that modprobe / insmod fail with "Function not
-/// implemented" rather than "Operation not permitted", which is more accurate
-/// and easier to diagnose in build/test environments.
 pub(super) fn sys_init_module_impl(_mod: usize, _len: usize, _opts: usize) -> isize {
     -38
 }
