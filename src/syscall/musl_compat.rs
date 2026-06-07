@@ -1,23 +1,4 @@
 //! musl libc compatibility — syscalls exercised during musl startup.
-//!
-//! musl's `__libc_start_main` and related init routines call a small set
-//! of syscalls before `main()` is reached.  This module documents and
-//! implements every one of them so a statically-linked musl binary can
-//! boot to `main()` without hitting `ENOSYS`.
-//!
-//! ## Syscalls called by musl startup (in order)
-//!
-//! 1. `arch_prctl(ARCH_SET_FS, tls_base)`  — set FS.base for TLS (x86_64 only;
-//!    on riscv64 musl writes `tp` directly via inline asm)
-//! 2. `set_tid_address(&clear_child_tid)` — register clear-on-exit addr
-//! 3. `set_robust_list(head, sizeof)` — robust futex list head
-//! 4. `rt_sigprocmask(SIG_SETMASK, NULL, NULL, 8)` — query signal mask
-//! 5. `prlimit64(0, RLIMIT_STACK, NULL, &rlim)` — query stack limit
-//! 6. `mprotect(stack_guard_page, 4096, PROT_NONE)` — install guard page
-//! 7. `getrandom(buf, 16, 0)` — seed for internal PRNG (>= musl 1.2.1)
-//! 8. `mmap(NULL, tls_size, PROT_RW, MAP_ANON|MAP_PRIVATE, -1, 0)` — TLS
-//! 9. `clock_gettime(CLOCK_REALTIME, &ts)` — libc time initialisation
-//! 10. `futex(addr, FUTEX_WAIT, ...)` — threading (pthread_create path)
 
 use crate::arch;
 use crate::proc::scheduler;
@@ -28,9 +9,6 @@ pub const ARCH_GET_FS: u64 = 0x1003;
 pub const ARCH_GET_GS: u64 = 0x1004;
 
 /// `arch_prctl(code, addr)` — set/get FS.base or GS.base.
-///
-/// musl calls `ARCH_SET_FS` in `__init_tls` to point FS at the TLS block
-/// it just mmap-ed.  We write `IA32_FS_BASE` (MSR 0xC000_0100).
 #[cfg(target_arch = "x86_64")]
 pub fn sys_arch_prctl(code: u64, addr: u64) -> isize {
     match code {
@@ -114,8 +92,7 @@ pub fn sys_set_tid_address(tidptr: u64) -> isize {
 }
 
 /// `set_robust_list(head, len)` — register the robust futex list for this
-/// thread.  On thread exit the kernel walks the list and wakes waiters.
-/// We store the pointer in the PCB; the futex module consults it on exit.
+/// thread. 
 pub fn sys_set_robust_list(head: u64, len: usize) -> isize {
     if len != core::mem::size_of::<RobustListHead>() {
         return -(crate::syscall::errno::EINVAL as isize);
@@ -130,17 +107,13 @@ pub fn sys_set_robust_list(head: u64, len: usize) -> isize {
 /// Linux-ABI robust-list head (matches `struct robust_list_head`).
 #[repr(C)]
 pub struct RobustListHead {
-    /// Pointer to the first element of the robust list.
     pub list: u64,
-    /// Per-thread futex offset.
     pub futex_offset: i64,
-    /// List-op pending pointer.
     pub list_op_pending: u64,
 }
 
 /// `getrandom(buf, buflen, flags)` — fill `buf` with `buflen` random bytes.
-/// Delegates to `rand::rdrand64()` in a loop.  `GRND_NONBLOCK` (flag 0x1)
-/// and `GRND_RANDOM` (flag 0x2) are both honoured (RDRAND never blocks).
+/// Delegates to `rand::rdrand64()` in a loop.
 pub fn sys_getrandom(buf: *mut u8, buflen: usize, _flags: u32) -> isize {
     if buf.is_null() || buflen == 0 {
         return -(crate::syscall::errno::EINVAL as isize);
