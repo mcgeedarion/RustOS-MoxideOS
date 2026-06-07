@@ -1,19 +1,4 @@
 //! N_TTY line discipline.
-//!
-//! Sits between the raw byte stream (PTY master writes) and the
-//! application's `read(2)` on the slave side.  Implements:
-//!
-//!   - **Canonical mode** (`ICANON`): accumulates a line buffer; delivers a
-//!     complete line on `\n`, `EOF` (`^D`), or `EOL`/`EOL2`.  Supports ERASE
-//!     (`DEL`/`^H`), KILL (`^U`), WERASE (`^W`).
-//!   - **Raw / non-canonical mode**: passes bytes through immediately,
-//!     respecting `VMIN` and `VTIME`.
-//!   - **Signal generation** (`ISIG`): `VINTR` → `SIGINT` (2), `VQUIT` →
-//!     `SIGQUIT` (3), `VSUSP` → `SIGTSTP` (20).
-//!   - **Output processing** (`OPOST`): `ONLCR` (NL → CR+NL), `OCRNL` (CR →
-//!     NL).
-//!   - **Echo** back to the master's read side.
-//!   - **XON/XOFF** flow control (`IXON`).
 
 extern crate alloc;
 use crate::tty::termios::{self, cc, Termios};
@@ -31,31 +16,19 @@ pub const MAX_CANON: usize = 4096;
 /// Action returned by `process_input` for each input byte.
 #[derive(Debug)]
 pub enum LdiscAction {
-    /// Byte should be appended to the read buffer (raw) or line buffer
-    /// (canonical).
     Append(u8),
-    /// Canonical line is complete — deliver `Vec<u8>` to the reader.
     LineReady(Vec<u8>),
-    /// Erase the last byte from the line buffer.
     Erase,
-    /// Kill (erase) the entire line buffer.
     Kill,
-    /// Erase the last word from the line buffer.
     WerasWord,
-    /// Deliver signal to the foreground process group.
     Signal(u8),
-    /// XON — resume output.
     Xon,
-    /// XOFF — stop output.
     Xoff,
-    /// Byte was discarded (e.g. NUL in canonical, non-printing control).
     Discard,
 }
 
 /// Stateless input processor: given `termios` settings and one input byte,
 /// return the `LdiscAction` the line discipline should take.
-///
-/// The caller (PtySlave) maintains the actual line buffer and read queue.
 pub fn process_input(t: &Termios, byte: u8) -> LdiscAction {
     if t.is_isig() {
         if byte == t.c_cc[cc::VINTR] {
