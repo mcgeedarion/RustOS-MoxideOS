@@ -1,33 +1,4 @@
 //! Advisory file locking: `flock(2)` and `fcntl(F_SETLK/F_SETLKW/F_GETLK)`.
-//!
-//! ## What we implement
-//!
-//! - **BSD locks** (`flock(2)`): whole-file LOCK_SH, LOCK_EX, LOCK_UN,
-//!   optionally non-blocking (`LOCK_NB`).
-//! - **POSIX record locks** (`fcntl F_SETLK`, `F_SETLKW`, `F_GETLK`):
-//!   byte-range shared/exclusive locks identified by (pid, fd).
-//!
-//! ## RLIMIT_LOCKS enforcement
-//!
-//! The total number of **held** POSIX locks (flock + fcntl) for a process is
-//! charged against `RLIMIT_LOCKS`.  When the soft limit is exceeded,
-//! `ENOLCK` (-37) is returned.
-//!
-//! BSD `flock` locks are counted as one lock per fd.
-//! POSIX `fcntl` locks are counted individually.
-//!
-//! ## Storage
-//!
-//! All locks are stored in a single global `LOCK_TABLE` keyed by inode id.
-//! Each entry holds the list of current holders (shared) or the single
-//! exclusive holder.  No kernel memory is allocated per-lock beyond the
-//! `LockEntry` struct.
-//!
-//! ## Liveness / deadlock detection
-//!
-//! `F_SETLKW` spin-waits (yielding the CPU) until the lock is available.
-//! Deadlock detection is not yet implemented — a process can hang if it
-//! creates a circular wait.  This matches early-Linux behaviour.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
@@ -66,14 +37,10 @@ pub struct Flock {
 
 #[derive(Clone, Debug)]
 struct LockEntry {
-    /// Owner PID.
     pid: usize,
-    /// `F_RDLCK` or `F_WRLCK`.
     ltype: i16,
-    /// Byte range: [start, end).  For `flock` the range is [0, u64::MAX).
     start: u64,
     end: u64,
-    /// True if this came from `flock(2)` (whole-file BSD lock).
     is_bsd: bool,
 }
 
@@ -118,11 +85,10 @@ fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
 fn conflicts(entry: &LockEntry, pid: usize, ltype: i16, start: u64, end: u64) -> bool {
     if entry.pid == pid {
         return false;
-    } // same owner never conflicts
+    }
     if !ranges_overlap(entry.start, entry.end, start, end) {
         return false;
     }
-    // Two shared locks never conflict.
     if entry.ltype == F_RDLCK && ltype == F_RDLCK {
         return false;
     }
@@ -130,8 +96,6 @@ fn conflicts(entry: &LockEntry, pid: usize, ltype: i16, start: u64, end: u64) ->
 }
 
 /// `sys_flock(fd, operation)` — NR 73
-///
-/// `inode_id` must be resolved by the caller from the fd before calling here.
 pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
     let pid = current_pid();
     let nb = operation & LOCK_NB != 0;
@@ -153,8 +117,6 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
     };
 
     // Limit check.
-    // First release any existing BSD lock from this pid (upgrade/downgrade
-    // counts as one lock, not two).
     {
         let mut tbl = LOCK_TABLE.lock();
         if let Some(list) = tbl.get_mut(&inode_id) {
@@ -200,9 +162,6 @@ pub fn sys_flock(inode_id: u64, operation: i32) -> isize {
 }
 
 /// Handle `fcntl(fd, F_GETLK / F_SETLK / F_SETLKW, flock_ptr)`.
-///
-/// `inode_id` must be resolved by the caller.  `flock_uptr` is a userspace
-/// pointer to `struct flock`.
 pub fn sys_fcntl_lock(inode_id: u64, cmd: i32, flock_uptr: usize) -> isize {
     use crate::uaccess::{copy_from_user, copy_to_user};
     let pid = current_pid();
@@ -246,8 +205,6 @@ pub fn sys_fcntl_lock(inode_id: u64, cmd: i32, flock_uptr: usize) -> isize {
     }
 
     // F_SETLK / F_SETLKW: acquire.
-    // Check limit before trying (only for a brand-new lock — reuse of
-    // existing range by same pid is allowed without consuming quota).
     {
         let has_existing = {
             let tbl = LOCK_TABLE.lock();
@@ -292,7 +249,6 @@ pub fn sys_fcntl_lock(inode_id: u64, cmd: i32, flock_uptr: usize) -> isize {
 }
 
 /// Release **all** locks held by `pid` on **all** inodes.
-/// Called from `exit.rs` and `close()` (for BSD locks on the closed fd).
 pub fn release_all_locks(pid: usize) {
     let mut tbl = LOCK_TABLE.lock();
     for list in tbl.values_mut() {
@@ -309,8 +265,6 @@ pub fn release_bsd_lock(pid: usize, inode_id: u64) {
 }
 
 fn lock_range(fl: &Flock) -> (u64, u64) {
-    // For simplicity: treat l_whence=SEEK_SET (0) only.
-    // l_len == 0 means "to end of file" → we model as u64::MAX.
     let start = fl.l_start.max(0) as u64;
     let end = if fl.l_len == 0 {
         u64::MAX
