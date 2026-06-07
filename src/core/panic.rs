@@ -1,33 +1,14 @@
 //! Kernel panic handler.
-//!
-//! # Design
-//!
-//! * A single `kernel_panic!` macro is the **only** sanctioned way to trigger a
-//!   fatal kernel error.  It calls [`do_panic`] which:
-//!   1. disables interrupts on the current CPU,
-//!   2. prints a structured panic message over the early console,
-//!   3. dumps the optional register context if one was saved,
-//!   4. halts the CPU in a tight loop (`hlt` / `wfi`).
-//!
-//! * The Rust `#[panic_handler]` attribute is **not** placed here; it lives in
-//!   `src/arch/*/panic.rs` because the halt instruction is
-//!   architecture-specific.  That handler calls [`do_panic`].
-//!
-//! * This module is `no_std` — no heap allocations during a panic.
 
 use core::fmt;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Set to `true` the first time we enter a panic.  Used to detect
-/// double-panics and avoid infinite recursion.
 static IN_PANIC: AtomicBool = AtomicBool::new(false);
 
 /// A `fmt::Write` sink that routes characters to the early (UART) console
 /// without requiring the full console subsystem to be alive.
-///
-/// The implementation delegates to the arch-specific `early_putchar`
-/// function that must be provided by `src/arch/*/console.rs`.
 struct EarlyWriter;
 
 impl fmt::Write for EarlyWriter {
@@ -47,22 +28,14 @@ pub struct PanicContext<'a> {
     pub file: &'a str,
     pub line: u32,
     pub column: u32,
-    /// Optional saved register file (arch-defined; passed as raw bytes so
-    /// this module stays arch-agnostic).
     pub registers: Option<&'a [u8]>,
 }
 
-/// Core panic routine.  Architecture panic handlers and `kernel_panic!`
-/// both funnel through here.
-///
-/// # Safety
-///
 /// Caller must have already disabled interrupts on the local CPU.
 #[cold]
 #[inline(never)]
 pub unsafe fn do_panic(ctx: &PanicContext<'_>) -> ! {
     if IN_PANIC.swap(true, Ordering::SeqCst) {
-        // Double-panic: skip fancy formatting to avoid recursion.
         let _ = write!(EarlyWriter, "\n\n[DOUBLE PANIC — halting]\n");
         arch_halt();
     }
@@ -90,12 +63,7 @@ pub unsafe fn do_panic(ctx: &PanicContext<'_>) -> ! {
     arch_halt();
 }
 
-/// Trigger a kernel panic with a static message and optional register slice.
-///
-/// ```ignore
-/// kernel_panic!("scheduler invariant violated");
-/// kernel_panic!("unexpected trap", &trap_frame_bytes);
-/// ```
+/// 
 #[macro_export]
 macro_rules! kernel_panic {
     ($msg:expr) => {{
