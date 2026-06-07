@@ -1,10 +1,4 @@
 // src/io_uring/ops/write.rs
-// IORING_OP_WRITE handler.
-// Writes up to `sqe.len` bytes from the buffer at virtual address `sqe.addr`
-// to the file/socket described by `sqe.fd`, starting at file offset `sqe.off`
-// (ignored for sockets/pipes).
-// Returns the number of bytes written on success, or a negated errno on
-// failure.
 
 use crate::io_uring::{cqe::errno, sqe::Sqe};
 
@@ -49,11 +43,6 @@ use core::{
 };
 
 /// Async wrapper around IORING_OP_WRITE.
-///
-/// # Example
-/// ```rust,no_run
-/// let n = IoWrite::new(fd, b"hello\n", 0, token).await?;
-/// ```
 pub struct IoWrite<'a> {
     fd: i32,
     buf: &'a [u8],
