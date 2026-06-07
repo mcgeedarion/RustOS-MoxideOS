@@ -1,21 +1,4 @@
 //! Errno constants and conversion helpers for the syscall layer.
-//!
-//! The kernel is no_std and does not link libc, so we define the errno
-//! values used in the syscall dispatcher directly.  All constants are
-//! `i32` (the POSIX type) because that is what negative isize return
-//! values are derived from.
-//!
-//! ## Usage
-//!
-//! ```rust
-//! use crate::syscall::errno::{EINVAL, EFAULT, efault, einval};
-//!
-//! // As a literal:
-//! return -(EINVAL as isize);
-//!
-//! // Via the convenience helper (preferred in dispatch code):
-//! return efault();
-//! ```
 
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
