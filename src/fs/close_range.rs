@@ -1,8 +1,4 @@
 //! close_range(2) — close all open file descriptors in [first, last].
-//!
-//! ## Flags
-//!   CLOSE_RANGE_UNSHARE (1<<1) — unshare the fd table before closing (stub).
-//!   CLOSE_RANGE_CLOEXEC (1<<2) — set FD_CLOEXEC instead of closing.
 
 extern crate alloc;
 use crate::fs::fcntl::cloexec_range;
@@ -14,8 +10,6 @@ pub const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
 pub const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
 
 /// Kernel implementation of close_range(first, last, flags).
-///
-/// Returns 0 on success, -EINVAL (-22) if first > last or flags are unknown.
 pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
     if first > last {
         return -22; // EINVAL
