@@ -1,8 +1,4 @@
 // src/io_uring/cqe.rs
-// Completion Queue Entry (CQE).
-// Linux io_uring_cqe layout: { user_data: u64, res: i32, flags: u32 }
-// We carry that layout verbatim so it is compatible with any future
-// pass-through to a real kernel.
 
 use crate::io_uring::IoUringError;
 
@@ -10,22 +6,12 @@ use crate::io_uring::IoUringError;
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct Cqe {
-    /// Token echoed from the matching SQE — keys the waker table.
     pub user_data: u64,
-
-    /// Result of the operation.
-    ///
-    /// Non-negative → success, value is operation-specific (bytes
-    /// transferred, new fd from accept, 0 for connect/close, …).
-    /// Negative → negated errno (e.g. -EAGAIN = -11, -ECONNREFUSED = -111).
     pub res: i32,
-
-    /// CQE flags (IORING_CQE_F_*).  Currently unused; always 0.
     pub flags: u32,
 }
 
 impl Cqe {
-    /// Return a zero-initialised CQE (const so it can seed static arrays).
     #[inline]
     pub const fn zeroed() -> Self {
         Cqe {
@@ -53,7 +39,6 @@ impl Cqe {
     }
 
     /// True when the `res` field indicates the operation would block
-    /// (EAGAIN / EWOULDBLOCK = -11).
     #[inline]
     pub fn would_block(&self) -> bool {
         self.res == -11
