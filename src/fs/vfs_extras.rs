@@ -1,16 +1,11 @@
-//! VFS helper functions that extend the core VFS with operations that are
-//! too specific to belong in the main vfs.rs but are needed by multiple
-//! syscall implementations.
+//! VFS helper functions that extend the core VFS 
 //!
-
-//! Accepted and ignored (no readahead / eviction policy yet).
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use spin::Mutex as SpinMutex;
 
 /// Update the atime and/or mtime of the file at `path`.
-/// `None` means "leave this timestamp unchanged".
 pub fn set_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) {
     crate::fs::vfs::with_inode_mut(path, |inode| {
         if let Some(a) = atime_ns {
