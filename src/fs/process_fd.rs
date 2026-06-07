@@ -50,15 +50,10 @@ const RLIMIT_NOFILE: usize = 7;
 /// One entry in a process's fd table.
 #[derive(Clone, Debug)]
 pub struct FdEntry {
-    /// Kernel-internal backing fd (used with vfs/devfs/pipe/socket helpers).
     pub backing_fd: usize,
-    /// VFS path, if this is a path-backed file (regular, directory, procfs, …).
     pub path: Option<String>,
-    /// FD_CLOEXEC — closed across execve.
     pub cloexec: bool,
-    /// O_NONBLOCK
     pub nonblock: bool,
-    /// Open-file status flags (O_RDONLY / O_WRONLY / O_RDWR / O_APPEND).
     pub fl_flags: i32,
 }
 
@@ -270,25 +265,19 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
     }
 
     let (bfd, stored_path): (isize, Option<String>) =
-        // If the path looks like `scheme:rest` (no leading '/'), dispatch it
-        // through the registered scheme table instead of the POSIX VFS.  This
-        // is the core of Redox's "everything is a URL" model and lets drivers
-        // such as `tcp:`, `blk:`, `net:` be opened exactly like regular files.
+        
         if crate::fs::scheme_table::is_scheme_url(path) {
             use scheme_api::OpenFlags;
             let open_flags = OpenFlags::from_bits_truncate(flags);
             match crate::fs::scheme_table::SCHEME_TABLE.open(path, open_flags) {
                 Ok((scheme, fid)) => {
-                    // Allocate a synthetic backing-fd in the 0x8000_0000+ range
-                    // so it never collides with POSIX VFS inodes.
                     let bfd = crate::fs::scheme_fd::alloc_scheme_backing_fd();
                     crate::fs::scheme_fd::scheme_fd_register(
                         bfd,
                         scheme,
                         fid,
                     );
-                    // Tag with the original URL so /proc/<pid>/fd/<n> readlink
-                    // returns something human-readable (e.g. "tcp:127.0.0.1:80").
+                    
                     crate::fs::vfs::fd_set_debug_name(
                         bfd,
                         alloc::string::String::from(path),
@@ -314,8 +303,6 @@ pub fn proc_fd_open(pid: usize, path: &str, flags: u32, _mode: u32) -> isize {
             let fd = crate::fs::procfs::procfs_open(path, flags);
             (fd, Some(path.into()))
         } else if path.starts_with("/sys/fs/cgroup") {
-            // cgroupfs lives under /sys but is handled separately so it gets
-            // full read/write/mkdir/rmdir support.
             let fd = crate::fs::cgroupfs::cgroupfs_open(path);
             (fd, Some(path.into()))
         } else if path.starts_with("/sys") {
@@ -517,10 +504,6 @@ fn close_backing(bfd: usize) {
         crate::fs::pipe::sys_close_pipe(bfd);
     } else if crate::net::socket::is_socket_fd(bfd) {
         crate::net::socket::sys_close_socket(bfd);
-    // Backing fds in the 0x8000_0000+ range registered by proc_fd_open's
-    // scheme-URL arm are closed here, forwarding the close() to the driver
-    // via IpcProxyScheme.  Without this arm, closing a scheme fd was a no-op
-    // and the driver-side SchemeFileId was leaked forever.
     } else if crate::fs::scheme_fd::is_scheme_fd(bfd) {
         crate::fs::scheme_fd::scheme_fd_close(bfd);
     } else {
