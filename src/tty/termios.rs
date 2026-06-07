@@ -1,8 +1,4 @@
 //! `struct termios` and all associated constants.
-//!
-//! Matches the Linux x86_64 / riscv64 UAPI layout in <asm/termbits.h>.
-//! The struct is `repr(C)` so it can be passed directly through ioctl
-//! TCGETS / TCSETS without any translation.
 
 pub mod iflag {
     pub const IGNBRK: u32 = 0o000001;
