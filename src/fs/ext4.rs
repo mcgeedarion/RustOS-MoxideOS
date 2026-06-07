@@ -149,7 +149,7 @@ struct BgDesc32 {
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct BgDesc64 {
-    // low 32 bytes = same as BgDesc32
+    // Low 32 bytes = ext4's extended 32-byte descriptor layout.
     block_bitmap_lo: u32,
     inode_bitmap_lo: u32,
     inode_table_lo: u32,
@@ -157,15 +157,23 @@ struct BgDesc64 {
     free_inodes_lo: u16,
     used_dirs_lo: u16,
     flags: u16,
-    _reserved: [u32; 2],
-    inode_bitmap_hi: u32, // +0x20 (was _reserved[2] in 32-byte form)
-    inode_table_hi: u32,  // +0x24
-    free_blocks_hi: u16,  // +0x28
-    free_inodes_hi: u16,  // +0x2A
-    used_dirs_hi: u16,    // +0x2C
-    _pad: u16,
-    block_bitmap_hi: u32, // +0x30
-    _reserved2: [u32; 3],
+    exclude_bitmap_lo: u32,
+    block_bitmap_csum_lo: u16,
+    inode_bitmap_csum_lo: u16,
+    itable_unused_lo: u16,
+    checksum: u16,
+    // High halves added when the 64BIT incompat feature is enabled.
+    block_bitmap_hi: u32, // +0x20
+    inode_bitmap_hi: u32, // +0x24
+    inode_table_hi: u32,  // +0x28
+    free_blocks_hi: u16,  // +0x2C
+    free_inodes_hi: u16,  // +0x2E
+    used_dirs_hi: u16,    // +0x30
+    itable_unused_hi: u16,
+    exclude_bitmap_hi: u32,
+    block_bitmap_csum_hi: u16,
+    inode_bitmap_csum_hi: u16,
+    _reserved: u32,
 }
 
 /// Ext4 inode (256 bytes minimum on disk; may be larger for extra fields).
@@ -534,7 +542,7 @@ impl Ext4Fs {
         let off = self.bgd_offset(g)?;
         let lo = read_u32_le(&self.data, off)? as u64;
         if self.bgd_size >= 64 {
-            let hi = read_u32_le(&self.data, off.checked_add(0x30)?)? as u64;
+            let hi = read_u32_le(&self.data, off.checked_add(0x20)?)? as u64;
             Some(lo | (hi << 32))
         } else {
             Some(lo)
@@ -545,7 +553,7 @@ impl Ext4Fs {
         let off = self.bgd_offset(g)?;
         let lo = read_u32_le(&self.data, off.checked_add(4)?)? as u64;
         if self.bgd_size >= 64 {
-            let hi = read_u32_le(&self.data, off.checked_add(0x20)?)? as u64;
+            let hi = read_u32_le(&self.data, off.checked_add(0x24)?)? as u64;
             Some(lo | (hi << 32))
         } else {
             Some(lo)
@@ -556,7 +564,7 @@ impl Ext4Fs {
         let off = self.bgd_offset(g)?;
         let lo = read_u32_le(&self.data, off.checked_add(8)?)? as u64;
         if self.bgd_size >= 64 {
-            let hi = read_u32_le(&self.data, off.checked_add(0x24)?)? as u64;
+            let hi = read_u32_le(&self.data, off.checked_add(0x28)?)? as u64;
             Some(lo | (hi << 32))
         } else {
             Some(lo)
