@@ -193,9 +193,18 @@
 #define SYS_preadv2         327
 #define SYS_pwritev2        328
 
-/* RustOS private syscall extensions (>= 500) */
+/* RustOS private syscall extensions. */
 #define SYS_RUSTOS_VERSION       500  /* -> (major<<16)|minor */
 #define SYS_RUSTOS_DEBUG_PRINT   501  /* (const char *msg) -> 0 */
 #define SYS_RUSTOS_PERF_COUNTER  502  /* (u32 id, u64 *out) -> 0 */
+#define SYS_RUSTOS_DRIVER_BIND      0x70000000
+#define SYS_RUSTOS_DMA_ALLOC        0x70000001
+#define SYS_RUSTOS_IRQ_SUBSCRIBE    0x70000002
+#define SYS_RUSTOS_SCHEME_REGISTER  0x70000003
+#define SYS_RUSTOS_SCHEME_UNREGISTER 0x70000004
+#define SYS_RUSTOS_IPC_ENDPOINT_CREATE 0x70000005
+#define SYS_RUSTOS_IPC_RECV         0x70000006
+#define SYS_RUSTOS_IPC_SEND         0x70000007
+#define SYS_RUSTOS_IRQ_ACK          0x70000008
 
 #endif /* _BITS_RUSTOS_SYSCALL_H */

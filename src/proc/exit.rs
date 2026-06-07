@@ -123,6 +123,11 @@ pub fn do_exit(pid: usize, code: i32) {
     crate::syscall::proc_name_clear(pid);
     crate::proc::futex::futex_clear_pid(pid);
 
+    crate::init::service_manager::on_process_exit(pid, code);
+    crate::syscall::scheme::cleanup_pid(pid);
+    crate::syscall::driver::cleanup_pid(pid);
+    crate::ipc::endpoint_cleanup_pid(pid);
+
     crate::fs::process_fd::proc_fd_free(pid);
 
     crate::proc::cgroup::cgroup_exit(pid);
@@ -171,6 +176,10 @@ pub fn sys_exit_group(status: i32) -> isize {
         crate::proc::signal::altstack_clear_pid(sibling);
         crate::syscall::proc_name_clear(sibling);
         crate::proc::futex::futex_clear_pid(sibling);
+        crate::init::service_manager::on_process_exit(sibling, status);
+        crate::syscall::scheme::cleanup_pid(sibling);
+        crate::syscall::driver::cleanup_pid(sibling);
+        crate::ipc::endpoint_cleanup_pid(sibling);
         crate::fs::process_fd::proc_fd_free(sibling);
         crate::proc::cgroup::cgroup_exit(sibling); // ← cgroup hook
         let vfork_parent = zombify(sibling, status);

@@ -52,6 +52,55 @@ static inline int rustos_debug_print(const char *msg)
     return (int)syscall(501, msg);
 }
 
+/* ── Hybrid service-plane syscalls ───────────────────────────────────── */
+static inline long rustos_driver_bind(unsigned int bdf, unsigned int cap_flags)
+{
+    return syscall(SYS_RUSTOS_DRIVER_BIND, bdf, cap_flags);
+}
+
+static inline long rustos_dma_alloc(unsigned long handle, unsigned long size,
+                                    unsigned long align, unsigned long *phys_out)
+{
+    return syscall(SYS_RUSTOS_DMA_ALLOC, handle, size, align, phys_out);
+}
+
+static inline long rustos_irq_subscribe(unsigned long handle, unsigned int irq,
+                                        unsigned long endpoint)
+{
+    return syscall(SYS_RUSTOS_IRQ_SUBSCRIBE, handle, irq, endpoint);
+}
+
+static inline long rustos_irq_ack(unsigned long handle, unsigned int irq)
+{
+    return syscall(SYS_RUSTOS_IRQ_ACK, handle, irq);
+}
+
+static inline long rustos_scheme_register(const char *name, unsigned long len,
+                                          unsigned long endpoint)
+{
+    return syscall(SYS_RUSTOS_SCHEME_REGISTER, name, len, endpoint);
+}
+
+static inline long rustos_scheme_unregister(const char *name, unsigned long len)
+{
+    return syscall(SYS_RUSTOS_SCHEME_UNREGISTER, name, len);
+}
+
+static inline unsigned long rustos_ipc_endpoint_create(void)
+{
+    return (unsigned long)syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
+}
+
+static inline long rustos_ipc_recv(unsigned long endpoint, void *buf, unsigned long len)
+{
+    return syscall(SYS_RUSTOS_IPC_RECV, endpoint, buf, len);
+}
+
+static inline long rustos_ipc_send(unsigned long endpoint, const void *buf, unsigned long len)
+{
+    return syscall(SYS_RUSTOS_IPC_SEND, endpoint, buf, len);
+}
+
 #ifdef __cplusplus
 }
 #endif

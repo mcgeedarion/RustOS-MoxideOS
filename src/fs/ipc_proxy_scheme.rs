@@ -1,7 +1,7 @@
 //! IPC-proxy scheme — forwards `Scheme` trait calls to a userspace
 //! driver process over an `IpcEndpoint`.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use scheme_api::{
@@ -21,7 +21,13 @@ pub struct IpcProxyScheme {
 }
 
 impl IpcProxyScheme {
-    pub fn new(name: &str, endpoint: IpcEndpoint) -> Self {
+    /// Construct a placeholder proxy for schemes that are intentionally
+    /// unavailable until a userspace service registers a real endpoint.
+    pub fn new() -> Self {
+        Self::with_endpoint("ipc", IpcEndpoint(0))
+    }
+
+    pub fn with_endpoint(name: &str, endpoint: IpcEndpoint) -> Self {
         Self {
             name: alloc::string::String::from(name),
             endpoint,
@@ -92,7 +98,7 @@ impl Scheme for IpcProxyScheme {
         }
     }
 
-    fn seek(&self, fd: SchemeFileId, offset: i64, whence: u8) -> Result<i64, SchemeError> {
+    fn seek(&self, fd: SchemeFileId, offset: i64, whence: u8) -> Result<u64, SchemeError> {
         use scheme_api::SeekWhence;
         let whence = match whence {
             0 => SeekWhence::Start,
@@ -102,7 +108,8 @@ impl Scheme for IpcProxyScheme {
         };
         let req = SchemeRequest::Seek { fd, offset, whence };
         match self.call(req)? {
-            SchemeResponse::SeekPos(pos) => Ok(pos),
+            SchemeResponse::SeekPos(pos) if pos >= 0 => Ok(pos as u64),
+            SchemeResponse::SeekPos(_) => Err(SchemeError::InvalidArg),
             SchemeResponse::Err(e) => Err(e),
             _ => Err(SchemeError::Io),
         }

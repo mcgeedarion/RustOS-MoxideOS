@@ -18,3 +18,4 @@ pub mod crt;
 pub mod initramfs;
 pub mod loader;
 pub mod schemes;
+pub mod service_manager;
