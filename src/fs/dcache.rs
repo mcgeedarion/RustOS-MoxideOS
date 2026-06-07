@@ -1,14 +1,4 @@
 //! Dentry cache — maps (parent_inode, name) → child inode_id.
-//!
-//! A fast in-memory name-resolution layer that sits in front of the
-//! per-filesystem `lookup` path.  On a hit the VFS skips the on-disk
-//! directory scan entirely; on a miss it falls through to the FS driver
-//! and then inserts the result here.
-//!
-//! Implementation: spin-locked `BTreeMap` with an insertion-order `Vec`
-//! used for LRU eviction when the table reaches `DCACHE_MAX` entries.
-//! 1 024 entries is intentionally conservative for an embedded / test
-//! kernel; raise the constant as workloads grow.
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use spin::Mutex;
@@ -22,9 +12,7 @@ struct DKey {
 }
 
 struct DCache {
-    /// The actual mapping.
     map: BTreeMap<DKey, u64>,
-    /// Insertion-order list for O(1)-amortised LRU eviction.
     order: Vec<DKey>,
 }
 
@@ -74,7 +62,6 @@ impl DCache {
     }
 
     fn invalidate_inode(&mut self, inode: u64) {
-        // Collect all keys that map to this inode.
         let victims: Vec<DKey> = self
             .map
             .iter()
@@ -121,8 +108,6 @@ pub fn dcache_flush() {
 }
 
 // ===== GUESS: short alias for new callers =====
-/// GUESS: alias of `dcache_invalidate` accepting a full path. Splits at
-/// the last '/', uses parent inode 0 (unknown) — flushes by inode lookup.
 pub fn invalidate(path: &str) {
     // GUESS: without parent-inode resolution we can't target a single entry,
     // so do a full flush. Correctness > efficiency in early kernel bring-up.
