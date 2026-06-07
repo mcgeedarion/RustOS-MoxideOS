@@ -24,57 +24,32 @@ const NEWC_MAGIC: &[u8; 6] = b"070701";
 const HEADER_LEN: usize = 110;
 const TRAILER: &str = "TRAILER!!!";
 
-// We store the physical address and byte length in two static atomics so they
-// can be written once by the early boot code (before the allocator is up) and
-// read later by `load()`.
-
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 static INITRAMFS_PA: AtomicUsize = AtomicUsize::new(0);
 static INITRAMFS_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Called by the boot stub (FDT walker on RISC-V, multiboot2 tag parser on
-/// x86_64) to record where QEMU placed the initramfs image in physical memory.
-///
-/// Must be called **before** `heap::init()` and **before** `load()`.
+/// Called by the boot stub (FDT walker on RISC-V, multiboot2 tag parser 
 pub fn set_initramfs_range(phys_start: usize, byte_len: usize) {
     INITRAMFS_PA.store(phys_start, Ordering::Relaxed);
     INITRAMFS_LEN.store(byte_len, Ordering::Relaxed);
 }
 
-/// Borrowed view of the in-memory CPIO archive.  Returned by `load()`.
-///
-/// The underlying bytes are not copied — this is a zero-copy reference into
-/// the physical memory where QEMU (or the bootloader) placed the initrd image.
 pub struct InitramfsHandle<'a> {
     cpio: &'a [u8],
 }
 
 impl<'a> InitramfsHandle<'a> {
-    /// Return the raw file content bytes for `path`, or `None` if not found.
-    ///
-    /// Accepts paths with or without a leading `/` or `./` prefix:
-    /// `"/init"`, `"init"`, and `"./init"` all resolve to the same entry.
     pub fn file(&self, path: &str) -> Option<&'a [u8]> {
         find_file(self.cpio, path)
     }
 
-    /// Iterate every non-directory entry in the archive.
     pub fn entries(&self) -> CpioIter<'a> {
         iter(self.cpio)
     }
 }
 
 /// Obtain a zero-copy handle to the initramfs CPIO archive.
-///
-/// Panics (kernel panic via the `!` diverge) if `set_initramfs_range()` was
-/// never called (i.e. the boot stub forgot to record the initrd location).
-///
-/// # Safety
-/// The physical memory at `[pa, pa+len)` must be valid, readable, and must
-/// remain mapped for the lifetime of the returned handle.  On both RISC-V
-/// (Sv39 identity map) and x86_64 (direct-map region) this is guaranteed by
-/// the time `kernel_main` calls this function.
 pub fn load() -> InitramfsHandle<'static> {
     let pa = INITRAMFS_PA.load(Ordering::Relaxed);
     let len = INITRAMFS_LEN.load(Ordering::Relaxed);
@@ -117,21 +92,13 @@ pub fn load() -> InitramfsHandle<'static> {
 /// One file/directory entry inside the CPIO archive.
 #[derive(Debug, Clone, Copy)]
 pub struct CpioEntry<'a> {
-    /// File path, with leading `./` and `/` stripped.
     pub name: &'a str,
-    /// Raw file content (empty for directories / special files).
     pub data: &'a [u8],
-    /// Unix mode word (type + permission bits, e.g. `0o100755`).
     pub mode: u32,
-    /// File size in bytes — always `data.len()`.
     pub size: usize,
-    /// Unix UID (owner).
     pub uid: u32,
-    /// Unix GID (group).
     pub gid: u32,
-    /// Modification timestamp (seconds since epoch).
     pub mtime: u32,
-    /// Number of hard links.
     pub nlink: u32,
 }
 
