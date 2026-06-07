@@ -334,6 +334,19 @@ pub fn fanotify_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
 
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_fanotify(fdno: usize) {
+    if crate::fs::scheme_fd::is_scheme_fd(fdno) {
+        crate::fs::scheme_fd::scheme_fd_close(fdno);
+    } else {
+        fanotify_close(fdno);
+    }
+}
+
+/// Duplicate hook for process-local fd aliases. Fanotify state is shared by the
+/// backing fd.
+pub fn fanotify_dup(_fdno: usize) {}
+
 pub fn is_fanotify_fd(fdno: usize) -> bool {
     fdno >= FANOTIFY_FD_BASE && TABLE.lock().contains_key(&fdno)
 }

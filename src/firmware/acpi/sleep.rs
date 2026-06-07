@@ -14,7 +14,7 @@
 //! - A minimal resume stub that re-enables ACPI and signals completion
 
 use super::power::{enter_sleep_state, init as power_init};
-use crate::console::println;
+use crate::println;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[repr(C, packed)]

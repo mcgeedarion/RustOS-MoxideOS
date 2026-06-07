@@ -358,3 +358,16 @@ pub fn timerfd_poll(fdno: usize, events: u32) -> u32 {
 pub fn timerfd_close(fdno: usize) {
     TABLE.lock().remove(&fdno);
 }
+
+/// Compatibility close hook used by generic fd lifecycle code.
+pub fn sys_close_tfd(fdno: usize) {
+    if crate::fs::scheme_fd::is_scheme_fd(fdno) {
+        crate::fs::scheme_fd::scheme_fd_close(fdno);
+    } else {
+        timerfd_close(fdno);
+    }
+}
+
+/// Duplicate hook for process-local fd aliases. Timerfd state is shared by the
+/// backing fd.
+pub fn tfd_dup(_fdno: usize) {}

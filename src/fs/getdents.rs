@@ -72,37 +72,18 @@ fn gather_entries(fdno: usize, path: &str) -> Vec<Dent> {
         return out;
     }
 
-    if let Some(ino) = crate::fs::ext2::stat(path) {
-        if crate::fs::ext2::is_dir(path) {
-            if let Some(entries) = crate::fs::ext2::readdir(ino) {
-                for (child_ino, name, is_dir) in entries {
+    if let Ok(st) = crate::fs::vfs_ops::stat(path) {
+        if st.is_dir {
+            if let Ok(entries) = crate::fs::vfs_ops::readdir(path) {
+                for e in entries {
                     out.push(Dent {
-                        ino: child_ino as u64,
-                        name,
-                        dtype: if is_dir { DT_DIR } else { DT_REG },
+                        ino: e.ino,
+                        name: e.name,
+                        dtype: if e.is_dir { DT_DIR } else { DT_REG },
                     });
                 }
             }
             return out;
-        }
-    }
-
-    let prefix = if path == "/" {
-        alloc::string::String::new()
-    } else {
-        alloc::format!("{}/", path.trim_end_matches('/'))
-    };
-    if let Some(entries) = crate::fs::vfs::list_dir(fdno) {
-        for e in entries {
-            let leaf = e.name.strip_prefix(&*prefix).unwrap_or(&e.name).to_string();
-            if leaf.contains('/') {
-                continue;
-            }
-            out.push(Dent {
-                ino: 0,
-                name: leaf,
-                dtype: if e.is_dir { DT_DIR } else { DT_REG },
-            });
         }
     }
     out

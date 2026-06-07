@@ -16,7 +16,7 @@
 //! via the `update()` entry point below.
 
 use super::SdtHeader;
-use crate::console::println;
+use crate::println;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub const BST_DISCHARGING: u32 = 1 << 0;

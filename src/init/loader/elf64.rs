@@ -243,7 +243,29 @@ fn map_page_arch(satp_ppn: usize, va: usize, pa: usize, flags: u32) {
     }
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+#[cfg(target_arch = "aarch64")]
+fn map_page_arch(ttbr0: usize, va: usize, pa: usize, flags: u32) {
+    use crate::arch::aarch64::paging;
+    let mut pte_flags =
+        paging::PTE_NORMAL | paging::PTE_USER | paging::PTE_AF | paging::PTE_SH_INNER;
+    if flags & PF_W == 0 {
+        pte_flags &= !paging::PTE_USER;
+        pte_flags |= paging::PTE_USER_RO;
+    }
+    if flags & PF_X == 0 {
+        pte_flags |= paging::PTE_UXN;
+    }
+    pte_flags |= paging::PTE_PXN;
+    unsafe {
+        paging::map_page(ttbr0, va, pa, pte_flags);
+    }
+}
+
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+)))]
 fn map_page_arch(_cr3: usize, _va: usize, _pa: usize, _flags: u32) {
-    unimplemented!("map_page_arch not implemented for this architecture");
+    compile_error!("map_page_arch not implemented for this architecture");
 }

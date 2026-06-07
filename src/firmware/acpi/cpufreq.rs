@@ -17,7 +17,7 @@
 //! unconditionally; CPUID checks should be added before shipping.
 
 use super::SdtHeader;
-use crate::console::println;
+use crate::println;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 const MAX_PSTATES: usize = 16;

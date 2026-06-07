@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::fs::vfs;
+use crate::fs::{vfs, vfs_ops};
 use crate::initramfs;
 
 /// Set once `mount_initramfs()` completes successfully.
@@ -42,15 +42,15 @@ pub fn mount_initramfs() {
 
         match file_type {
             0o040000 => {
-                vfs::mkdir(&path);
+                let _ = vfs_ops::mkdir(&path);
             },
 
             0o100000 => {
                 // Ensure parent directory exists first.
                 if let Some(parent) = parent_of(&path) {
-                    vfs::mkdir(&parent);
+                    let _ = vfs_ops::mkdir(&parent);
                 }
-                vfs::create_file(&path, entry.data);
+                let _ = vfs::create_file(&path, entry.data);
             },
 
             0o120000 => {
@@ -68,7 +68,7 @@ pub fn mount_initramfs() {
                     // Without VFS symlink support, create a regular file
                     // containing the target path so at least readlink works.
                     #[cfg(not(feature = "vfs_symlink"))]
-                    vfs::create_file(&path, target_bytes);
+                    let _ = vfs::create_file(&path, target_bytes);
                 }
             },
 

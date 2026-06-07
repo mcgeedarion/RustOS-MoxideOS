@@ -58,7 +58,7 @@ use alloc::vec::Vec;
 
 #[inline(always)]
 fn cpid() -> usize {
-    crate::proc::scheduler::current_pid()
+    crate::proc::scheduler::current_pid() as usize
 }
 
 use spin::Mutex;
