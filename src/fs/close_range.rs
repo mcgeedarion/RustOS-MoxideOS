@@ -5,7 +5,7 @@
 //!   CLOSE_RANGE_CLOEXEC (1<<2) — set FD_CLOEXEC instead of closing.
 
 extern crate alloc;
-use crate::fs::fcntl::{cloexec_range, close_fd_meta, close_fd_no_meta};
+use crate::fs::fcntl::cloexec_range;
 use crate::fs::process_fd;
 use crate::proc::scheduler;
 use alloc::vec::Vec;
@@ -36,12 +36,11 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
         return 0;
     }
 
-    // Collect all open fds in [first, last] for this process.
+    // Collect all open process-local fds in [first, last].
     let pid = scheduler::current_pid();
     let fds_to_close: Vec<usize> = {
         let lo = first as usize;
         let hi = last as usize;
-        // Enumerate via process_fd table; fall back to all fds in range.
         process_fd::proc_fd_list(pid)
             .into_iter()
             .filter(|&fd| fd >= lo && fd <= hi)
@@ -49,8 +48,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
     };
 
     for fd in fds_to_close {
-        close_fd_meta(fd);
-        close_fd_no_meta(fd);
+        let _ = process_fd::proc_fd_close(pid, fd);
     }
 
     0
