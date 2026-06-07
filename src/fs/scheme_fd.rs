@@ -1,37 +1,4 @@
 //! SchemeFdStore — maps kernel backing-fd numbers to (Arc<dyn Scheme>,
-//! SchemeFileId) so that read / write / close / seek can dispatch without
-//! re-hitting the scheme table or re-parsing the URL.
-//!
-//! # Design
-//!
-//! When `proc_fd_open` resolves a scheme URL it:
-//! 1. Calls `SCHEME_TABLE.open(url, flags)` → `(Arc<dyn Scheme>,
-//!    SchemeFileId)`.
-//! 2. Calls `alloc_scheme_backing_fd()` to get a synthetic backing-fd number.
-//! 3. Inserts `(scheme, fid)` into `SCHEME_FD_STORE` keyed by that backing fd.
-//! 4. Stores the backing fd in the process `FdEntry` as usual.
-//!
-//! All subsequent I/O on the user-visible fd flows through
-//! `scheme_fd_read` / `scheme_fd_write` / `scheme_fd_seek` / `scheme_fd_ioctl`.
-//! `close_backing` calls `scheme_fd_close` which forwards to the scheme
-//! handler, removes the entry from the store, and *returns the fd to the free
-//! list*.
-//!
-//! # Backing-fd allocator
-//!
-//! Synthetic backing fds live in the 0x8000_0000…0xFFFF_FFFF range so they
-//! never collide with real VFS inode numbers (which start at 0).  A free list
-//! (`FREE_SCHEME_FDS`) is drained before bumping the atomic counter, so fd
-//! numbers are recycled under sustained open/close cycling (e.g. many short-
-//! lived `tcp:` connections) and the counter never overflows the range.
-//!
-//! # Thread-safety
-//!
-//! The store and free list are each protected by a `spin::Mutex`.  The I/O
-//! helpers clone the `Arc` and copy the `SchemeFileId` while the lock is held,
-//! then release it *before* calling into the scheme handler so that concurrent
-//! kernel threads are not serialised on a single global lock during potentially
-//! blocking driver IPC round-trips.
 
 extern crate alloc;
 use crate::core::fast_hash::KernelFastMap;
@@ -42,18 +9,11 @@ use spin::Mutex;
 use super::scheme_table::Scheme;
 use scheme_api::{SchemeError, SchemeFileId};
 
-// Fds are drawn from the 0x8000_0000…0xFFFF_FFFF range.  The free list is
-// checked first; only when it is empty does the counter increment.
-// `scheme_fd_close` returns the fd to the free list via
-// `free_scheme_backing_fd` so numbers are reused rather than lost.
-
+///
 static SCHEME_FD_COUNTER: AtomicUsize = AtomicUsize::new(0x8000_0000);
 static FREE_SCHEME_FDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Allocate a fresh synthetic backing-fd number for a scheme fd.
-///
-/// Prefers recycled numbers from the free list; falls back to the
-/// monotonically-increasing counter when the list is empty.
 pub fn alloc_scheme_backing_fd() -> usize {
     if let Some(fd) = FREE_SCHEME_FDS.lock().pop() {
         return fd;
@@ -62,10 +22,6 @@ pub fn alloc_scheme_backing_fd() -> usize {
 }
 
 /// Return a synthetic backing-fd to the free list.
-///
-/// Called automatically by `scheme_fd_close`.  May also be called directly
-/// if a backing fd is recycled via a code path that does not use
-/// `scheme_fd_close`.
 pub fn free_scheme_backing_fd(fd: usize) {
     FREE_SCHEME_FDS.lock().push(fd);
 }
@@ -118,8 +74,6 @@ impl SchemeFdStore {
 static SCHEME_FD_STORE: SchemeFdStore = SchemeFdStore::new();
 
 /// Register a newly-opened scheme fd.
-///
-/// Called from `proc_fd_open` after `SCHEME_TABLE.open` succeeds.
 pub fn scheme_fd_register(backing_fd: usize, scheme: Arc<dyn Scheme>, fid: SchemeFileId) {
     SCHEME_FD_STORE.insert(backing_fd, scheme, fid);
 }
@@ -130,8 +84,6 @@ pub fn is_scheme_fd(backing_fd: usize) -> bool {
 }
 
 /// Read up to `buf.len()` bytes from the scheme fd.
-///
-/// Returns the byte count on success, or a negative errno on error.
 pub fn scheme_fd_read(backing_fd: usize, buf: &mut [u8]) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
@@ -144,8 +96,6 @@ pub fn scheme_fd_read(backing_fd: usize, buf: &mut [u8]) -> isize {
 }
 
 /// Write `buf` to the scheme fd.
-///
-/// Returns bytes written on success, or a negative errno on error.
 pub fn scheme_fd_write(backing_fd: usize, buf: &[u8]) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
@@ -158,8 +108,6 @@ pub fn scheme_fd_write(backing_fd: usize, buf: &[u8]) -> isize {
 }
 
 /// Reposition the scheme fd's offset.
-///
-/// Returns the new absolute position on success, or a negative errno.
 pub fn scheme_fd_seek(backing_fd: usize, offset: i64, whence: u8) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
@@ -172,8 +120,6 @@ pub fn scheme_fd_seek(backing_fd: usize, offset: i64, whence: u8) -> isize {
 }
 
 /// Issue an ioctl on the scheme fd.
-///
-/// Returns the result value on success, or a negative errno.
 pub fn scheme_fd_ioctl(backing_fd: usize, cmd: u64, arg: usize) -> isize {
     let (scheme, fid) = match SCHEME_FD_STORE.get(backing_fd) {
         Some(pair) => pair,
@@ -186,16 +132,12 @@ pub fn scheme_fd_ioctl(backing_fd: usize, cmd: u64, arg: usize) -> isize {
 }
 
 /// Close a scheme fd — forwards to the scheme handler, removes the entry
-/// from the store, and **returns the backing fd to the free list**.
-///
-/// Called from `close_backing` in `process_fd.rs`.
 pub fn scheme_fd_close(backing_fd: usize) {
     if let Some((scheme, fid)) = SCHEME_FD_STORE.remove(backing_fd) {
         // Best-effort: log but do not panic if the driver is already gone.
         if let Err(e) = scheme.close(fid) {
             log::warn!("[scheme] close({:#x}) error: {:?}\n", backing_fd, e);
         }
-        // Return the fd number to the free list for reuse.
         free_scheme_backing_fd(backing_fd);
     }
 }
@@ -255,14 +197,11 @@ mod tests {
 
         scheme_fd_close(bfd);
         assert!(!is_scheme_fd(bfd));
-        // After close, read should return EBADF.
         assert_eq!(scheme_fd_read(bfd, &mut buf), -9);
     }
 
     #[test]
     fn fd_numbers_are_recycled_after_close() {
-        // Open two scheme fds and close them; the allocator must return the
-        // same numbers on the next two allocations (LIFO from the free list).
         let a = alloc_scheme_backing_fd();
         let b = alloc_scheme_backing_fd();
         assert_ne!(a, b, "each allocation must be unique");
