@@ -1,6 +1,5 @@
 //! VFS helpers required exclusively by io_uring.
 //!
-//! Split into a separate file to keep vfs.rs clean.
 
 extern crate alloc;
 use alloc::vec::Vec;
