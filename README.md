@@ -17,13 +17,7 @@ exported `kernel_main(boot_info)` symbol, and then dispatches once through
 
 ## Project Status
 
-RustOS is approaching production release. The following features are release-ready:
-
-- **x86_64**: Fully stable with UEFI and direct kernel boot paths
-- **RISC-V 64-bit**: Fully stable with SBI/FDT and UEFI boot paths
-- **AArch64**: Stable boot and core subsystems; signal delivery finalized
-
-All three architectures support the complete kernel feature set including process management, memory management, networking, filesystems, and device drivers.
+RustOS is under active build-graph stabilization. The architecture ports and subsystem implementations are represented in-tree, but current kernel checks still surface module-wiring and API-adapter work before the tree can be treated as release-ready. See `docs/code_review_wiring_audit.md` for the current prioritized audit.
 
 ---
 
@@ -32,7 +26,7 @@ All three architectures support the complete kernel feature set including proces
 Build and run the kernel on your default architecture:
 
 ```sh
-# Build a release RISC-V UEFI kernel
+# Build the default release x86_64 UEFI kernel
 cargo xtask build
 
 # Run on QEMU (x86_64, RISC-V, or AArch64)
@@ -54,12 +48,12 @@ cargo xtask smoke
 
 | Architecture | Boot paths represented in tree | Primary entry files | Status |
 |---|---|---|---|
-| `x86_64` | UEFI loader and direct kernel / Multiboot2-style path | `src/arch/x86_64/uefi_entry.rs`, `src/main.rs`, `src/arch/x86_64/kernel_main.rs` | Production Ready |
-| `riscv64` | SBI/FDT kernel path and UEFI loader target | `src/arch/riscv64/boot.rs`, `src/arch/riscv64/uefi_entry.rs`, `src/arch/riscv64/mod.rs` | Production Ready |
-| `aarch64` | UEFI loader and bare-metal kernel target | `src/arch/aarch64/uefi_entry.rs`, `src/arch/aarch64/mod.rs` | Production Ready |
+| `x86_64` | UEFI loader and direct kernel / Multiboot2-style path | `src/arch/x86_64/uefi_entry.rs`, `src/main.rs`, `src/arch/x86_64/kernel_main.rs` | Build wiring in progress |
+| `riscv64` | SBI/FDT kernel path and UEFI loader target | `src/arch/riscv64/boot.rs`, `src/arch/riscv64/uefi_entry.rs`, `src/arch/riscv64/mod.rs` | Build wiring in progress |
+| `aarch64` | UEFI loader and bare-metal kernel target | `src/arch/aarch64/uefi_entry.rs`, `src/arch/aarch64/mod.rs` | Build wiring in progress |
 
-Per-architecture linker scripts live at the repository root
-(`linker_x86_64.ld`, `linker_riscv.ld`, `linker_aarch64.ld`). Custom target
+Per-architecture linker scripts live under `linker/`
+(`linker/x86_64.ld`, `linker/riscv64.ld`, `linker/aarch64.ld`). Custom target
 specifications live in `targets/` and are split between kernel images
 (`*-kernel.json`) and UEFI loader images (`*-uefi-loader.json`).
 
@@ -268,8 +262,11 @@ namespace support, capability checks, and LSM-style hook scaffolding.
 
 Use `cargo xtask` for architecture-aware builds:
 
+Plain `cargo build` / `cargo check` uses the repository custom-target default and therefore needs nightly custom-target flags such as `-Zjson-target-spec` and, for kernel targets, `-Z build-std=core,alloc`. Prefer `cargo xtask` unless you are intentionally debugging raw Cargo invocations.
+
+
 ```sh
-# Defaults to a release RISC-V UEFI build according to xtask.
+# Defaults to a release x86_64 UEFI build according to xtask.
 cargo xtask build
 
 # x86_64 direct kernel ELF + flat kernel.bin

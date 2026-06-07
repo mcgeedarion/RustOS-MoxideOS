@@ -14,8 +14,15 @@
 
 pub mod block;
 pub mod gpu;
+// Compatibility re-exports for older call sites that imported GPU drivers
+// directly from `crate::drivers::*`.
+#[cfg(target_arch = "x86_64")]
+pub use gpu::vga;
+pub use gpu::{drm, gop, virtio_gpu};
 pub mod input;
 pub mod net;
+// Compatibility re-export for `crate::drivers::nic::*` callers.
+pub use net::nic;
 pub mod platform;
 // GUESS: callers use crate::drivers::pcie; canonical home is platform::pcie.
 pub use platform::pcie;

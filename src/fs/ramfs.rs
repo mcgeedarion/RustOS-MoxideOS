@@ -943,3 +943,27 @@ pub fn tmpfs_anon_stat(full_path: &str) -> Result<crate::fs::vfs_ops::KStat, isi
         is_dir: false,
     })
 }
+
+/// Placeholder scheme adapter used to keep boot-time scheme registration wired
+/// while the concrete `RamFs` URL dispatch is implemented.
+pub struct RamFs;
+
+impl RamFs {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for RamFs {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

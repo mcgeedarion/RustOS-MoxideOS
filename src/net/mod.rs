@@ -23,3 +23,26 @@ pub mod ipv6;
 pub mod socket;
 pub mod tcp;
 pub mod udp;
+
+/// Placeholder network control scheme adapter.
+pub struct NetScheme;
+
+impl NetScheme {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for NetScheme {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

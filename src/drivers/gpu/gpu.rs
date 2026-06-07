@@ -32,6 +32,7 @@ pub struct DisplayInfo {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Backend {
     VirtioGpu,
+    #[cfg(feature = "amdgpu")]
     AmdGpu,
     Vga,
     Gop,
@@ -45,6 +46,7 @@ pub fn init_virtio(mmio_base: u64) {
     *BACKEND.lock() = Backend::VirtioGpu;
 }
 
+#[cfg(feature = "amdgpu")]
 pub fn init_amdgpu(mmio_base: u64) {
     crate::drivers::gpu::amdgpu_gem::init(mmio_base);
     *BACKEND.lock() = Backend::AmdGpu;
@@ -67,6 +69,7 @@ pub fn is_initialised() -> bool {
 pub fn display_info() -> Option<DisplayInfo> {
     match *BACKEND.lock() {
         Backend::VirtioGpu => crate::drivers::gpu::virtio_gpu::display_info(),
+        #[cfg(feature = "amdgpu")]
         Backend::AmdGpu => crate::drivers::gpu::amdgpu_gem::display_info(),
         Backend::Vga => crate::drivers::gpu::vga::display_info(),
         Backend::Gop => crate::drivers::gpu::gop::display_info(),

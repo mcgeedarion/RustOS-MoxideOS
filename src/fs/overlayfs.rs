@@ -593,3 +593,27 @@ mod tests {
         assert_eq!(split_last("foo"), ("/", "foo"));
     }
 }
+
+/// Placeholder scheme adapter used to keep boot-time scheme registration wired
+/// while the concrete `OverlayFs` URL dispatch is implemented.
+pub struct OverlayFs;
+
+impl OverlayFs {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for OverlayFs {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

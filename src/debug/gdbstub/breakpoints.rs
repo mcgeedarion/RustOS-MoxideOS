@@ -346,9 +346,9 @@ impl WatchpointTable {
 const RISCV_TRIG_VIRT_OFFSET: usize = 0xFFFF_1000;
 const TDATA1_TYPE2: u64 = 2u64 << 60;
 const TDATA1_M_MODE: u64 = 1 << 6;
-const TDATA1_EXEC: u64 = 1 << 2;
-const TDATA1_STORE: u64 = 1 << 1;
-const TDATA1_LOAD: u64 = 1 << 0;
+pub const TDATA1_EXEC: u64 = 1 << 2;
+pub const TDATA1_STORE: u64 = 1 << 1;
+pub const TDATA1_LOAD: u64 = 1 << 0;
 
 fn read_riscv_triggers(target: &GdbTarget) -> [[u64; 2]; 4] {
     use crate::fs::proc_debug::{is_proc_debug_fd, proc_debug_read};

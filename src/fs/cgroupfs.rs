@@ -279,3 +279,27 @@ fn cgroup_children(cgid: cgroup::CgroupId) -> Vec<String> {
     }
     names
 }
+
+/// Placeholder scheme adapter used to keep boot-time scheme registration wired
+/// while the concrete `CgroupFs` URL dispatch is implemented.
+pub struct CgroupFs;
+
+impl CgroupFs {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for CgroupFs {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

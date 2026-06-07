@@ -22,6 +22,8 @@ pub mod key;
 pub mod mq;
 pub mod msg;
 pub mod pipe_scheme;
+// Compatibility alias: pipe fd helpers live in fs::pipe.
+pub use crate::fs::pipe;
 pub mod sem;
 pub mod shm;
 

@@ -169,7 +169,7 @@ pub fn init() {
 #[no_mangle]
 pub extern "C" fn ap_entry(cpu_id: u32) -> ! {
     // Per-CPU storage must be first.
-    percpu::init(cpu_id);
+    unsafe { percpu::init(cpu_id) };
 
     #[cfg(target_arch = "x86_64")]
     unsafe {

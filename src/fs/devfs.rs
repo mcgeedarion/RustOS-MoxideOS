@@ -90,7 +90,7 @@ pub fn init() {
         register_char_device(INPUT_MAJOR, minor, node);
         log::info!("devfs: registered /dev/input/event{}", minor);
     }
-    
+
     crate::fs::vfs::ensure_dir("/dev/input");
 }
 
@@ -107,4 +107,28 @@ pub fn stat(_path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
     // GUESS: cannot resolve without a devfs path map. Surface ENOENT
     // so VFS dispatchers fall through to the next FS.
     Err(-2)
+}
+
+/// Placeholder scheme adapter used to keep boot-time scheme registration wired
+/// while the concrete `DevFs` URL dispatch is implemented.
+pub struct DevFs;
+
+impl DevFs {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for DevFs {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
 }

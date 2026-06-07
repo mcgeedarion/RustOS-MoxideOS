@@ -4,6 +4,7 @@
 #![feature(alloc_error_handler)]
 #![feature(naked_functions)]
 #![feature(asm_const)]
+#![feature(thread_local)]
 // These lints are intentionally set at the crate root so they apply
 // globally.  They will surface the known high-complexity functions
 // (dispatch_with_rip, sys_ptrace_impl, sys_clone3, bpf_run) during
@@ -45,8 +46,8 @@ extern crate alloc;
 //   tty         — TTY/PTY subsystem (ldisc, termios, pts, serial COM1)
 //   input       — Input event subsystem  [cfg(feature = "input_events")]
 //   console     — Kernel console (printk destination)
-//   proc        — Process management (scheduler, exec, wait, signals, namespaces)
-//   syscall     — Syscall dispatch table
+//   proc        — Process management (scheduler, exec, wait, signals,
+// namespaces)   syscall     — Syscall dispatch table
 //   ipc         — IPC (pipes, FIFOs, System V IPC, POSIX MQ)
 //   io_uring    — io_uring async I/O ring
 //   time        — Timekeeping (clocksource, timerfd, itimers)
@@ -59,10 +60,10 @@ extern crate alloc;
 //   kernel      — Core kernel utilities (panic, rand, uaccess, utils)
 //   kmtest      — Kernel test harness  [cfg(feature = "kmtest")]
 
-pub mod core;
 pub mod arch;
 pub mod block;
 pub mod console;
+pub mod core;
 pub mod device;
 pub mod display;
 pub mod drivers;
@@ -100,6 +101,8 @@ pub mod input;
 
 #[cfg(feature = "gdbstub")]
 pub mod debug;
+#[cfg(feature = "gdbstub")]
+pub use debug::gdbstub;
 
 #[cfg(feature = "kmtest")]
 pub mod kmtest;

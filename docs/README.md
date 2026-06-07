@@ -14,6 +14,7 @@ model.
 | [`booting.md`](booting.md) | Practical build, image, QEMU, firmware, real-hardware, and debugging reference. |
 | [`arch_capability_matrix.md`](arch_capability_matrix.md) | Current x86_64, RISC-V, and AArch64 capability/status tracker. |
 | [`hybrid-kernel-architecture.md`](hybrid-kernel-architecture.md) | Kernel/userspace boundary rules for schemes, IPC, and userspace drivers. |
+| [`code_review_wiring_audit.md`](code_review_wiring_audit.md) | Build-blocker and module-wiring audit with prioritized follow-up fixes. |
 
 ## Source-of-truth files
 

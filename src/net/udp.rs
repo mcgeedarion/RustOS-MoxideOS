@@ -180,3 +180,26 @@ pub fn receive(src_ip: u32, pkt: &[u8]) {
     let data = &pkt[UDP_HDR_LEN..];
     demux_udp(src_ip, src_port, dst_port, data);
 }
+
+/// Placeholder transport scheme adapter for scheme-table registration.
+pub struct UdpScheme;
+
+impl UdpScheme {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for UdpScheme {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}

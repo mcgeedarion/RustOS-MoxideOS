@@ -52,6 +52,12 @@ default = ["input_events", "gdbstub"]
 # Evdev / virtio-input subsystem.
 input_events = []
 
+# Optional AMD GPU GEM backend.
+amdgpu = []
+
+# Optional cgroup security/resource modules.
+cgroups = []
+
 # GDB Remote Serial Protocol stub.
 gdbstub = []
 

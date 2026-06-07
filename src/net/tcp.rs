@@ -559,3 +559,26 @@ pub fn tick_retransmit() {
         }
     }
 }
+
+/// Placeholder transport scheme adapter for scheme-table registration.
+pub struct TcpScheme;
+
+impl TcpScheme {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl crate::fs::scheme_table::Scheme for TcpScheme {
+    fn open(
+        &self,
+        _path: &str,
+        _flags: scheme_api::OpenFlags,
+    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
+        Err(scheme_api::SchemeError::NoSuchScheme)
+    }
+
+    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
+        Ok(())
+    }
+}
