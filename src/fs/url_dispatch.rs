@@ -1,11 +1,18 @@
 //! Concrete URL dispatch adapters for filesystem-backed schemes.
 //!
 //! These adapters implement the `Scheme` trait for filesystems that already
-//! expose VFS-facing helpers but previously registered placeholder URL handlers.
+//! expose VFS-facing helpers but previously registered placeholder URL
+//! handlers.
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 
@@ -25,14 +32,18 @@ fn errno_to_scheme_error(errno: isize) -> SchemeError {
 
 #[inline]
 fn access_from_flags(flags: OpenFlags) -> (bool, bool) {
-    let writable = flags.intersects(
-        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND,
-    );
+    let writable = flags
+        .intersects(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND);
     let readable = flags.contains(OpenFlags::READ) || !writable;
     (readable, writable)
 }
 
-fn checked_seek(current: usize, size: usize, offset: i64, whence: u8) -> Result<usize, SchemeError> {
+fn checked_seek(
+    current: usize,
+    size: usize,
+    offset: i64,
+    whence: u8,
+) -> Result<usize, SchemeError> {
     let base = match whence {
         0 => 0i64,
         1 => current as i64,
@@ -360,7 +371,8 @@ impl Scheme for CgroupFs {
         }
 
         let full_path = cgroup_scheme_path(path);
-        let is_dir = crate::fs::cgroupfs::cgroupfs_exists(&full_path).ok_or(SchemeError::NotFound)?;
+        let is_dir =
+            crate::fs::cgroupfs::cgroupfs_exists(&full_path).ok_or(SchemeError::NotFound)?;
 
         if is_dir && flags.contains(OpenFlags::WRITE) {
             return Err(SchemeError::InvalidArg);
@@ -517,7 +529,11 @@ fn dev_read_dir(data: &[u8], offset: &mut usize, buf: &mut [u8]) -> usize {
     n
 }
 
-fn dev_read_input_event(minor: usize, nonblock: bool, buf: &mut [u8]) -> Result<usize, SchemeError> {
+fn dev_read_input_event(
+    minor: usize,
+    nonblock: bool,
+    buf: &mut [u8],
+) -> Result<usize, SchemeError> {
     const EV_SIZE: usize = core::mem::size_of::<crate::input::InputEvent>();
 
     if buf.len() < EV_SIZE {
@@ -568,7 +584,11 @@ fn dev_read_input_event(minor: usize, nonblock: bool, buf: &mut [u8]) -> Result<
             return Err(SchemeError::WouldBlock);
         }
 
-        dev.waitq.wait_until(|| dev.ring.is_readable());
+        let _ = dev.waitq.wait(
+            crate::fs::poll::POLLIN | crate::fs::poll::POLLRDNORM,
+            None,
+            None,
+        );
     }
 }
 
@@ -578,7 +598,9 @@ fn dev_ioctl_error(errno: i32) -> SchemeError {
 
 impl Scheme for DevFs {
     fn open(&self, path: &str, flags: OpenFlags) -> Result<SchemeFileId, SchemeError> {
-        if flags.intersects(OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND) {
+        if flags.intersects(
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::APPEND,
+        ) {
             return Err(SchemeError::PermissionDenied);
         }
 
@@ -831,8 +853,8 @@ impl Scheme for NfsScheme {
             return Err(SchemeError::InvalidArg);
         }
 
-        let written = crate::fs::nfs::write(&fh, offset as u64, buf)
-            .ok_or(SchemeError::Io)? as usize;
+        let written =
+            crate::fs::nfs::write(&fh, offset as u64, buf).ok_or(SchemeError::Io)? as usize;
 
         if written > 0 {
             if let Some(fd) = NFS_SCHEME_FDS.lock().get_mut(&fid.0) {

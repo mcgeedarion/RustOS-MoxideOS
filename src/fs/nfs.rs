@@ -822,26 +822,8 @@ pub fn root_fh() -> Option<Fh> {
     CLIENT.lock().as_ref().map(|c| c.root_fh.clone())
 }
 
-/// Placeholder scheme adapter used to keep boot-time scheme registration wired
-/// while the concrete `NfsScheme` URL dispatch is implemented.
-pub struct NfsScheme;
-
-impl NfsScheme {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl crate::fs::scheme_table::Scheme for NfsScheme {
-    fn open(
-        &self,
-        _path: &str,
-        _flags: scheme_api::OpenFlags,
-    ) -> Result<scheme_api::SchemeFileId, scheme_api::SchemeError> {
-        Err(scheme_api::SchemeError::NoSuchScheme)
-    }
-
-    fn close(&self, _fid: scheme_api::SchemeFileId) -> Result<(), scheme_api::SchemeError> {
-        Ok(())
-    }
-}
+/// Concrete `nfs:` scheme adapter.
+///
+/// The implementation lives in `url_dispatch` so all filesystem URL handlers
+/// share the same fd-table and flag-handling helpers.
+pub use crate::fs::url_dispatch::NfsScheme;
