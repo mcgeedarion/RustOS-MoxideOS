@@ -1,17 +1,5 @@
 //! GdbTarget — attaches to a stopped process via /proc/<pid>/mem|regs|ctl
 //! and provides typed memory/register read-write without touching ptrace.
-//!
-//! Usage:
-//! ```rust
-//! let mut t = GdbTarget::attach(pid);
-//! let regs  = t.read_regs();              // full user_regs_struct
-//! t.write_mem(rip, &[0xcc]);              // insert breakpoint
-//! t.ctl("step");                          // single-step
-//! let stop  = t.wait_stop();              // block until T<sig> on ctl fd
-//! ```
-//!
-//! All fd I/O goes through `proc_fd_open` / pread64 / pwrite64 so the
-//! GDB stub never references ptrace internals.
 
 extern crate alloc;
 use alloc::string::String;
