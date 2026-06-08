@@ -57,12 +57,6 @@ const SIGBUS: u32 = 7;
 const BUS_ADRERR: i32 = 2;
 
 /// Try to resolve a not-present user fault at `faulting_va`.
-///
-/// Returns `true` if the fault was handled and the instruction can be retried.
-/// Returns `false` if unresolvable; the appropriate signal is already queued.
-///
-/// Both x86_64 and RISC-V call this function from their respective trap
-/// handlers — no per-arch code is needed here.
 pub fn handle_demand_fault(faulting_va: usize) -> bool {
     let page_va = faulting_va & PAGE_MASK;
     let pid = scheduler::current_pid();
@@ -84,8 +78,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
     }
 
     // For PhysMap VMAs the allocated page is immediately returned to the PMM
-    // (we re-use the physical address in the VMA instead). For all other
-    // kinds we keep it.
     let pa = match alloc_page() {
         Some(p) => p,
         None => {
@@ -101,9 +93,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
             // alloc_page() guarantees a zero-filled page; nothing more needed.
         },
 
-        // This arm handles both x86_64 and RISC-V identically: `pread` is
-        // the shared arch-neutral VFS call and `map_page`/`flush_va` are
-        // Paging trait methods dispatched at compile time per arch.
         VmaKind::FileBacked(fd, base_offset) => {
             // Step A — pre-zero the full page so the suffix beyond EOF is
             // already clean before we issue the read.
@@ -112,17 +101,8 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
                 core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
             }
 
-            // Step B — compute the byte offset of this page in the file.
-            //   page_index = (page_va - vma.start) / PAGE_SIZE
-            //   file_off   = base_offset + page_index * PAGE_SIZE
-            // Cast to i64 for pread's offset argument.  The VMA can't start
-            // above i64::MAX (we'd have rejected the mmap), so this is safe.
             let page_index = (page_va - vma.start) / PAGE_SIZE;
             let file_off = (*base_offset + (page_index * PAGE_SIZE) as u64) as i64;
-
-            // Step C — kernel-internal positional read (no user-space copy).
-            // SAFETY: `pa as *mut u8` points to `PAGE_SIZE` bytes of valid
-            // kernel-mapped writable memory (the just-allocated page frame).
             let n = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_off);
 
             // Step D — classify the result.
@@ -174,11 +154,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
         },
     }
 
-    // prot_to_flags() derives PRESENT | USER | (WRITE if PROT_WRITE) |
-    // (NX if !PROT_EXEC) from the VMA's protection flags.  On RISC-V the
-    // Paging impl translates these to Sv39 PTE bits; on x86_64 it writes
-    // standard x86 PTE bits.  The TLB flush (INVLPG / SFENCE.VMA) is
-    // issued by flush_va() so the CPU immediately sees the new PTE.
     let flags = prot_to_flags(vma.prot);
     <Arch as Paging>::map_page(user_cr3, page_va, pa, flags);
     <Arch as Paging>::flush_va(page_va);
@@ -186,11 +161,6 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
 }
 
 /// Convert POSIX `prot` bits to arch page-table flags.
-///
-/// Shared by `handle_demand_fault` and `sys_mprotect` (via `mmap.rs`).
-/// The Paging trait's `map_page` interprets `PageFlags` per-arch:
-///   - x86_64: PRESENT=bit0, WRITE=bit1, USER=bit2, NX=bit63
-///   - RISC-V Sv39: VALID=bit0, READ=bit1, WRITE=bit2, EXEC=bit3, USER=bit4
 #[inline]
 fn prot_to_flags(prot: u32) -> PageFlags {
     let mut f = PageFlags::PRESENT | PageFlags::USER;
