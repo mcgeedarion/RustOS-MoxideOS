@@ -5,18 +5,11 @@ use crate::uaccess::{copy_from_user, copy_to_user};
 pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
     match req {
         TCGETS => {
-            // Return a sane default termios: ICRNL | OPOST | CS8 | CREAD | ISIG | ICANON |
-            // ECHO
             let mut t = [0u8; 60];
-            // c_iflag = ICRNL (0x0100)
             t[0..4].copy_from_slice(&0x0100u32.to_ne_bytes());
-            // c_oflag = OPOST (0x0001)
             t[4..8].copy_from_slice(&0x0001u32.to_ne_bytes());
-            // c_cflag = CS8|CREAD|HUPCL (0x0B00)
             t[8..12].copy_from_slice(&0x0B00u32.to_ne_bytes());
-            // c_lflag = ISIG|ICANON|ECHO|ECHOE|ECHOK (0x8A3B)
             t[12..16].copy_from_slice(&0x8A3Bu32.to_ne_bytes());
-            // c_cc[VMIN]=1, c_cc[VTIME]=0 at offsets 22, 23 within c_cc array (base 17)
             t[22] = 1;
             copy_to_user(arg, &t);
             0
@@ -29,7 +22,6 @@ pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
         },
         TIOCSPGRP => 0,
         TIOCGWINSZ => {
-            // struct winsize: ws_row(u16), ws_col(u16), ws_xpixel(u16), ws_ypixel(u16)
             let ws = [
                 25u16.to_ne_bytes(),
                 80u16.to_ne_bytes(),
