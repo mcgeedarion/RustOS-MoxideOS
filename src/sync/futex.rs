@@ -1,21 +1,4 @@
 //! Kernel futex wait-queue implementation.
-//!
-//! ## Design
-//!
-//! The table maps user virtual address -> Vec<FutexWaiter>.  Using the VA
-//! directly is correct for this kernel because:
-//!   - All user tasks share the same lower half of the address space (each has
-//!     its own CR3, but the futex word address is unique per-process).
-//!   - Private futexes (FUTEX_PRIVATE_FLAG) are per-process by definition;
-//!     shared futexes on a single-CPU cooperative kernel are handled
-//!     identically in practice.
-//!
-//! ## Race-freedom
-//!
-//! The table lock is held while we read *uaddr and insert the waiter.
-//! This closes the WAIT/WAKE race: if a WAKE arrives between the user's
-//! comparison and the kernel WAIT, the value will have changed and we
-//! return EAGAIN rather than sleeping forever.
 
 extern crate alloc;
 use alloc::collections::BTreeMap;
@@ -71,7 +54,6 @@ pub fn futex_wait(uaddr: usize, val: u32, bitset: u32, deadline_ns: u64) -> isiz
         };
 
         if woken || now >= deadline_ns {
-            // Remove our entry and clean up the queue.
             if let Some(queue) = tbl.get_mut(&uaddr) {
                 queue.retain(|w| w.pid != pid);
                 if queue.is_empty() {
@@ -142,8 +124,6 @@ pub fn futex_requeue(
     let mut requeued = 0u32;
 
     if let Some(queue) = tbl.get_mut(&uaddr) {
-        // Single O(n) pass: partition into wake / requeue / keep buckets.
-        // Avoids the O(n²) Vec::remove(i) shift of the previous loop.
         let mut to_wake: Vec<FutexWaiter> = Vec::new();
         let mut to_requeue: Vec<FutexWaiter> = Vec::new();
         let mut to_keep: Vec<FutexWaiter> = Vec::new();
@@ -228,9 +208,6 @@ pub fn futex_wake_op(uaddr: usize, wake_n: u32, uaddr2: usize, wake2_n: u32, val
     woken1 + woken2
 }
 
-/// Remove all waiter entries for `pid` from every queue in the table.
-/// Call this from do_exit to prevent leaks when a process exits while
-/// blocked on a futex (e.g. SIGKILL mid-wait).
 pub fn futex_clear_pid(pid: usize) {
     let mut tbl = FUTEX_TABLE.lock();
     tbl.retain(|_addr, queue| {
