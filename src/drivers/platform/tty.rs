@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 const BUF_CAP: usize = 4096;
+const SIGINT: i32 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TtyMode {
@@ -26,6 +27,12 @@ struct TtyState {
     mode: TtyMode,
     /// In canonical mode: number of complete lines (newline-terminated) in buf.
     lines: usize,
+    /// Foreground process group for terminal-generated signals.
+    ///
+    /// A value of 0 means no foreground process group has been explicitly set.
+    /// In that case, Ctrl-C falls back to the current process id so early
+    /// single-process shells still work before job-control ioctls are used.
+    foreground_pgid: usize,
 }
 
 impl TtyState {
@@ -34,6 +41,7 @@ impl TtyState {
             buf: Vec::new(),
             mode: TtyMode::Canonical,
             lines: 0,
+            foreground_pgid: 0,
         }
     }
 }
@@ -42,56 +50,91 @@ static TTY: Mutex<TtyState> = Mutex::new(TtyState::new());
 
 /// Feed a raw byte from the keyboard or serial port into the TTY.
 pub fn tty_input(byte: u8) {
-    let mut tty = TTY.lock();
-    match tty.mode {
-        TtyMode::Raw => {
-            if tty.buf.len() < BUF_CAP {
-                tty.buf.push(byte);
-            }
-        },
-        TtyMode::Canonical => {
-            match byte {
-                b'\r' | b'\n' => {
-                    if tty.buf.len() < BUF_CAP {
-                        tty.buf.push(b'\n');
-                        tty.lines += 1;
+    let sigint_pgid = {
+        let mut tty = TTY.lock();
+
+        match tty.mode {
+            TtyMode::Raw => {
+                if tty.buf.len() < BUF_CAP {
+                    tty.buf.push(byte);
+                }
+                None
+            },
+            TtyMode::Canonical => {
+                match byte {
+                    b'\r' | b'\n' => {
+                        if tty.buf.len() < BUF_CAP {
+                            tty.buf.push(b'\n');
+                            tty.lines += 1;
+                            crate::drivers::gpu::vga::print_char('\n');
+                        }
+                        None
+                    },
+                    // Backspace / DEL
+                    0x08 | 0x7F => {
+                        // Remove last byte up to (not including) a newline.
+                        if let Some(&last) = tty.buf.last() {
+                            if last != b'\n' {
+                                tty.buf.pop();
+                                crate::drivers::gpu::vga::print_char('\x08');
+                            }
+                        }
+                        None
+                    },
+                    // Ctrl-C
+                    0x03 => {
+                        tty.buf.clear();
+                        tty.lines = 0;
                         crate::drivers::gpu::vga::print_char('\n');
-                    }
-                },
-                // Backspace / DEL
-                0x08 | 0x7F => {
-                    // Remove last byte up to (not including) a newline.
-                    if let Some(&last) = tty.buf.last() {
-                        if last != b'\n' {
-                            tty.buf.pop();
-                            crate::drivers::gpu::vga::print_char('\x08');
+
+                        let pgid = if tty.foreground_pgid != 0 {
+                            tty.foreground_pgid
+                        } else {
+                            crate::proc::scheduler::current_pid()
+                        };
+
+                        Some(pgid)
+                    },
+                    // Ctrl-D (EOF)
+                    0x04 => {
+                        // Flush any partial line as an immediate EOF token.
+                        if tty.buf.len() < BUF_CAP {
+                            tty.buf.push(b'\x04');
+                            tty.lines += 1;
                         }
-                    }
-                },
-                // Ctrl-C
-                0x03 => {
-                    tty.buf.clear();
-                    tty.lines = 0;
-                    crate::drivers::gpu::vga::print_char('\n');
-                    // TODO: send SIGINT to foreground process group.
-                },
-                // Ctrl-D (EOF)
-                0x04 => {
-                    // Flush any partial line as an immediate EOF token.
-                    tty.buf.push(b'\x04');
-                    tty.lines += 1;
-                },
-                // Printable
-                _ => {
-                    if tty.buf.len() < BUF_CAP {
-                        tty.buf.push(byte);
-                        if byte.is_ascii() {
-                            crate::drivers::gpu::vga::print_char(byte as char);
+                        None
+                    },
+                    // Printable
+                    _ => {
+                        if tty.buf.len() < BUF_CAP {
+                            tty.buf.push(byte);
+                            if byte.is_ascii() {
+                                crate::drivers::gpu::vga::print_char(byte as char);
+                            }
                         }
-                    }
-                },
-            }
-        },
+                        None
+                    },
+                }
+            },
+        }
+    };
+
+    if let Some(pgid) = sigint_pgid {
+        send_signal_to_pgrp(pgid, SIGINT);
+    }
+}
+
+fn send_signal_to_pgrp(pgid: usize, sig: i32) {
+    let tgids = crate::proc::scheduler::with_procs_ro(|procs| {
+        procs
+            .iter()
+            .filter(|p| p.pgid == pgid && p.pid == p.tgid)
+            .map(|p| p.tgid)
+            .collect::<Vec<_>>()
+    });
+
+    for tgid in tgids {
+        crate::proc::signal::send_signal_group(tgid, sig);
     }
 }
 
@@ -118,7 +161,7 @@ pub fn tty_read(buf: &mut [u8]) -> usize {
                 },
                 TtyMode::Canonical => {
                     if tty.lines > 0 {
-                        // Find first newline.
+                        // Find first newline or EOF token.
                         if let Some(nl) = tty.buf.iter().position(|&b| b == b'\n' || b == b'\x04') {
                             let end = nl + 1;
                             let n = buf.len().min(end);
@@ -150,6 +193,24 @@ pub fn set_mode(mode: TtyMode) {
 
 pub fn get_mode() -> TtyMode {
     TTY.lock().mode
+}
+
+pub fn get_foreground_pgid() -> usize {
+    let tty = TTY.lock();
+    if tty.foreground_pgid != 0 {
+        tty.foreground_pgid
+    } else {
+        crate::proc::scheduler::current_pid()
+    }
+}
+
+pub fn set_foreground_pgid(pgid: usize) -> isize {
+    if pgid == 0 {
+        return -22; // EINVAL
+    }
+
+    TTY.lock().foreground_pgid = pgid;
+    0
 }
 
 /// Discard all buffered input and reset the line counter.
