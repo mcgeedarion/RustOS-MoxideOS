@@ -1,20 +1,4 @@
 //! Btrfs filesystem driver — submodule index.
-//!
-//! Layout:
-//!   superblock.rs — all on-disk structs, constants, block I/O helpers,
-//!                   and the lower impl BtrfsFs (btree search, chunk map,
-//!                   read path) — previously split out as tree_impl.rs
-//!   ops.rs        — upper impl BtrfsFs: readdir, create, unlink, rename …
-//!                   (previously fs_ops.rs)
-//!   inode.rs      — BtrfsInodeItem
-//!   extent.rs     — BtrfsFileExtentItem
-//!   directory.rs  — BtrfsDirItem
-//!   mount.rs      — mount-time setup
-//!   api.rs        — pub fn mount() + pub btrfs_* wrappers
-//!   checksum.rs   — crc32c stub
-//!   compression.rs— decompression stubs
-//!   transaction.rs— CoW write path re-export
-//!   allocator.rs  — bump allocator re-export
 
 pub mod allocator;
 pub mod api;
