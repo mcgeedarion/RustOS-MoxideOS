@@ -66,13 +66,8 @@ static CPUID1_ECX: AtomicU32 = AtomicU32::new(u32::MAX);
 /// use the cached helpers below instead.
 #[inline(always)]
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
-    let (eax, ebx, ecx, edx);
-    unsafe {
-        core::arch::asm!("cpuid",
-            inout("eax") leaf => eax, out("ebx") ebx,
-            out("ecx") ecx,  out("edx") edx, options(nostack));
-    }
-    (eax, ebx, ecx, edx)
+    let r = unsafe { core::arch::x86_64::__cpuid(leaf) };
+    (r.eax, r.ebx, r.ecx, r.edx)
 }
 
 /// Return the cached ECX value for `cpuid(1)`.

@@ -12,6 +12,7 @@
 pub mod cgroup;
 pub mod clone;
 pub mod context;
+pub mod creds;
 pub mod cwd;
 pub mod dynlink {
     extern crate alloc;
@@ -86,13 +87,38 @@ pub mod net_ns {
 }
 pub mod pid;
 pub mod proc_table;
+pub use proc_table as table;
 pub mod process;
 pub mod ptrace;
 pub mod rlimit;
 pub mod rusage;
 pub mod scheduler;
 pub mod signal;
+
+pub mod session {
+    pub fn set_pgid(pid: usize, pgid: usize) -> isize {
+        crate::proc::creds::sys_setpgid(pid as u32, pgid as u32)
+    }
+
+    pub fn get_pgid(pid: usize) -> isize {
+        let target = if pid == 0 {
+            crate::proc::scheduler::current_pid()
+        } else {
+            pid
+        };
+        crate::proc::scheduler::with_proc(target, |p| p.pgid as isize).unwrap_or(-3)
+    }
+
+    pub fn setsid() -> isize {
+        crate::proc::creds::sys_setsid()
+    }
+
+    pub fn get_sid(pid: usize) -> isize {
+        crate::proc::creds::sys_getsid(pid as u32)
+    }
+}
 pub mod task_types;
+pub use task_types as task;
 pub mod thread;
 pub mod time_ns;
 pub mod wait;

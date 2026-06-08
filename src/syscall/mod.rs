@@ -447,11 +447,7 @@ pub(crate) fn semop_dispatch(semid: i32, sops_va: usize, nsops: usize) -> isize 
 }
 
 pub(crate) fn semctl_dispatch(semid: i32, semnum: i32, cmd: i32, arg_va: usize) -> isize {
-    let arg = match cmd {
-        sem::SETVAL | sem::SETALL => Some(sem::SemctlArg::Val(arg_va as i32)),
-        _ => None,
-    };
-    match sem::semctl(semid, semnum, cmd, arg) {
+    match sem::semctl(semid, semnum, cmd, arg_va as u64) {
         Ok(v) => v as isize,
         Err(e) => e,
     }

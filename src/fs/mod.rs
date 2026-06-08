@@ -50,6 +50,7 @@ pub mod timerfd;
 pub mod tmpfs;
 pub mod url_dispatch;
 pub mod vfs;
+pub mod vfs_extras;
 
 // Compatibility aliases while call sites migrate to `crate::fs::vfs::ops`
 // and `crate::fs::vfs::uring`.

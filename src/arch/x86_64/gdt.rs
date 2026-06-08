@@ -307,20 +307,20 @@ unsafe fn write_trampoline_gdt(ptr: &GdtPointer) {
 /// shared-memory region so APs can use the same table descriptor.
 pub fn gdt_init() {
     let cpu_id: usize = 0; // BSP is always logical CPU 0.
-    let kstack_top = alloc_kstack();
+    let kstack_top = alloc_kstack().expect("gdt: failed to allocate kernel stack");
 
     // Allocate a dedicated IST1 emergency stack (8 KiB above the kernel stack).
     // This stack is ONLY used for #NMI / #DF / #MC; it must never be reused.
-    let ist1_top = alloc_kstack();
+    let ist1_top = alloc_kstack().expect("gdt: failed to allocate IST stack");
 
     unsafe {
         let slot = &mut PER_CPU_GDT[cpu_id];
         slot.used.store(true, Ordering::Relaxed);
 
         // Patch TSS stacks.
-        slot.tss.rsp0 = kstack_top as u64;
-        slot.tss.ist1 = ist1_top as u64;
-        slot.tss.ist2 = ist1_top as u64; // IST2 shares IST1 for now
+        slot.tss.rsp0 = kstack_top.top as u64;
+        slot.tss.ist1 = ist1_top.top as u64;
+        slot.tss.ist2 = ist1_top.top as u64; // IST2 shares IST1 for now
         slot.tss.iomap_base = core::mem::size_of::<Tss>() as u16;
 
         // Build the 7 GDT entries.
@@ -341,7 +341,7 @@ pub fn gdt_init() {
 
         // Init PerCpu struct.
         let pcpu = &mut PER_CPU_STRUCTS[cpu_id];
-        pcpu.kstack_rsp = kstack_top as u64;
+        pcpu.kstack_rsp = kstack_top.top as u64;
         pcpu.user_rsp_save = 0;
         pcpu.cpu_id = cpu_id as u32;
         pcpu.tss_rsp0_ptr = &slot.tss.rsp0 as *const u64 as u64;
@@ -364,15 +364,15 @@ pub unsafe fn init_ap(cpu_id: u32) {
         idx
     );
 
-    let kstack_top = alloc_kstack();
-    let ist1_top = alloc_kstack();
+    let kstack_top = alloc_kstack().expect("gdt: failed to allocate AP kernel stack");
+    let ist1_top = alloc_kstack().expect("gdt: failed to allocate AP IST stack");
 
     let slot = &mut PER_CPU_GDT[idx];
     slot.used.store(true, Ordering::Relaxed);
 
-    slot.tss.rsp0 = kstack_top as u64;
-    slot.tss.ist1 = ist1_top as u64;
-    slot.tss.ist2 = ist1_top as u64;
+    slot.tss.rsp0 = kstack_top.top as u64;
+    slot.tss.ist1 = ist1_top.top as u64;
+    slot.tss.ist2 = ist1_top.top as u64;
     slot.tss.iomap_base = core::mem::size_of::<Tss>() as u16;
 
     fill_gdt(&mut slot.gdt, &slot.tss as *const Tss);
@@ -384,7 +384,7 @@ pub unsafe fn init_ap(cpu_id: u32) {
     load_gdt(&ptr);
 
     let pcpu = &mut PER_CPU_STRUCTS[idx];
-    pcpu.kstack_rsp = kstack_top as u64;
+    pcpu.kstack_rsp = kstack_top.top as u64;
     pcpu.user_rsp_save = 0;
     pcpu.cpu_id = cpu_id;
     pcpu.tss_rsp0_ptr = &slot.tss.rsp0 as *const u64 as u64;
@@ -394,8 +394,8 @@ pub unsafe fn init_ap(cpu_id: u32) {
     log::debug!(
         "gdt: AP {} online kstack={:#x} ist1={:#x}",
         cpu_id,
-        kstack_top,
-        ist1_top
+        kstack_top.top,
+        ist1_top.top
     );
 }
 
