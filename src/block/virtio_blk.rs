@@ -1,24 +1,4 @@
 //! virtio-blk block device driver (MMIO transport).
-//!
-//! ## virtio-blk over MMIO
-//!   The device lives at a known physical address (typically 0x10001000 in
-//!   QEMU virt machine) and uses a single virtqueue (queue 0) with a
-//!   3-descriptor chain per request: header, data buffer, status byte.
-//!
-//! ## Request protocol
-//!   Each I/O is a 3-descriptor chain:
-//!     [0] struct virtio_blk_req header  (16 bytes, device-readable)
-//!     [1] data buffer                   (sector-sized, R or W)
-//!     [2] status byte                   (1 byte, device-writable)
-//!   The kernel writes the chain to the available ring, kicks the device
-//!   by writing 0 to the QueueNotify register, then polls the used ring.
-//!
-//! ## Sector size
-//!   512 bytes.  The driver issues 1-sector requests; callers that want
-//!   larger I/Os loop.
-//!
-//! ## Thread safety
-//!   Single-queue, spin-locked.  Adequate for a cooperative kernel.
 
 use core::cell::UnsafeCell;
 use spin::Mutex;
@@ -166,15 +146,10 @@ pub fn virtio_blk_init(mmio_pa: usize) {
             return; // not a block device
         }
 
-        // 2. Reset device.
         mmio_w32(MMIO_STATUS, 0);
-
-        // 3. Set ACKNOWLEDGE + DRIVER.
         mmio_w32(MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
-
-        // 4. Negotiate features (we want none beyond the baseline). Must select each
-        //    word before reading/writing per spec §4.2.2.
         mmio_w32(MMIO_DEVICE_FEAT_SEL, 0);
+        
         let _dev_feats_lo = mmio_r32(MMIO_DEVICE_FEAT);
         mmio_w32(MMIO_DEVICE_FEAT_SEL, 1);
         let _dev_feats_hi = mmio_r32(MMIO_DEVICE_FEAT);
@@ -193,7 +168,6 @@ pub fn virtio_blk_init(mmio_pa: usize) {
             return;
         }
 
-        // 5. Set up queue 0.
         mmio_w32(MMIO_QUEUE_SEL, 0);
         let qmax = mmio_r32(MMIO_QUEUE_NUM_MAX) as usize;
         if qmax < QUEUE_SIZE {
@@ -236,7 +210,6 @@ pub fn write_sector(lba: u64, buf: &[u8; SECTOR_SIZE]) -> bool {
 fn do_request(req_type: u32, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> bool {
     let _guard = LOCK.lock();
     unsafe {
-        // Fill request header.
         REQ_HDR.write(BlkReqHeader {
             type_: req_type,
             _reserved: 0,
