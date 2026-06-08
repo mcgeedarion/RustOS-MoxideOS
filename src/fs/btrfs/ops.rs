@@ -1,6 +1,5 @@
 //! Upper impl BtrfsFs: readdir, create, mkdir, unlink, rename, link, symlink,
-//! chmod, chown, set_times, truncate.
-//! Merged from ops.rs + fs_ops.rs
+
 extern crate alloc;
 use super::superblock::{
     btrfs_name_hash, BtrfsDirItem, BtrfsFs, BtrfsInodeItem, BtrfsKey, BTRFS_DIR_ITEM_KEY,
