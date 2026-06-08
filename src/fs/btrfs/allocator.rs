@@ -1,9 +1,4 @@
 //! Btrfs logical space allocator.
-//!
-//! This is intentionally simple: it is a monotonic bump allocator for the
-//! current in-kernel Btrfs write path. It does not yet implement the full Btrfs
-//! extent-tree free-space accounting model. Instead, it reserves logical ranges
-//! from already mapped chunks and advances `alloc_cursor`.
 
 pub use super::superblock::BtrfsFs;
 
