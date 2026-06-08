@@ -1,20 +1,4 @@
 //! GDB Remote Serial Protocol — x86-64 packet handler.
-//!
-//! Dispatches RSP packets received from GDB over the serial/TCP transport.
-//! All process inspection uses GdbTarget (proc_debug fds); no ptrace calls.
-//!
-//! ## Packets handled
-//!   `?`           → stop reason
-//!   `g`           → read all registers
-//!   `G<hex>`      → write all registers
-//!   `m<addr>,<len>` → read memory
-//!   `M<addr>,<len>:<hex>` → write memory
-//!   `c[addr]`     → continue
-//!   `s[addr]`     → single-step
-//!   `k`           → kill
-//!   `q*`          → qSupported / qAttached stubs
-//!   `Z<t>,<addr>,<len>` → insert breakpoint / watchpoint
-//!   `z<t>,<addr>,<len>` → remove breakpoint / watchpoint
 
 extern crate alloc;
 use alloc::string::String;
@@ -134,10 +118,6 @@ fn parse_zpacket(rest: &str) -> Option<(u8, u64, usize)> {
     Some((t, addr, len))
 }
 
-// `handle_packet` is stateless for every packet *except* Z/z which must
-// consult the per-session breakpoint tables.  Pass a `Session` alongside
-// the target so the tables survive across calls.
-
 pub struct Session {
     pub sw_bps: SwBreakpointTable,
     pub hw_bps: HwBreakpointTable,
@@ -161,10 +141,6 @@ impl Session {
     }
 }
 
-/// Process one RSP packet body (without the `$` prefix and `#XX` suffix).
-/// Returns the response string (already framed with `rsp_packet`), or an
-/// empty string for packets where GDB expects no reply until the next stop
-/// event (e.g. `c`, `s`).
 pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) -> String {
     if body.is_empty() {
         return rsp_packet("");
