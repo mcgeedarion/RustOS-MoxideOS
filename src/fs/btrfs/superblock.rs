@@ -21,10 +21,6 @@ use alloc::{
 };
 use spin::Mutex;
 
-// In RustOS the block layer is accessed through the virtio-blk driver.
-// We expose two thin wrappers here so the rest of the file never touches
-// hardware directly.
-
 /// Read `count` 512-byte sectors starting at `lba` from the primary disk.
 fn block_read(lba: u64, count: u32) -> Vec<u8> {
     let mut buf = vec![0u8; count as usize * 512];
@@ -240,9 +236,7 @@ pub struct BtrfsFileExtentItem {
     pub encryption: u8,
     pub other_encoding: u16,
     pub ty: u8,
-    // inline data (ty == INLINE)
     pub inline_data: Vec<u8>,
-    // regular/prealloc fields
     pub disk_bytenr: u64,
     pub disk_num_bytes: u64,
     pub extent_offset: u64,
@@ -301,7 +295,6 @@ pub struct BtrfsChunkItem {
     pub sector_size: u32,
     pub num_stripes: u16,
     pub sub_stripes: u16,
-    // first stripe
     pub dev_id: u64,
     pub offset: u64,
     pub dev_uuid: [u8; 16],
@@ -535,17 +528,11 @@ impl BtrfsKeyPtr {
 }
 
 pub struct BtrfsFs {
-    /// Parsed superblock.
     pub superblock: BtrfsSuperblock,
-    /// Logical → physical byte translation table built from chunk tree.
     chunk_map: Vec<(u64, u64, BtrfsChunkItem)>, // (logical_start, logical_end, chunk)
-    /// Root-tree root node logical byte offset.
     root_tree_root: u64,
-    /// FS-tree root node logical byte offset (default subvolume).
     fs_tree_root: u64,
-    /// Cache: path → inode number.
     path_cache: BTreeMap<String, u64>,
-    /// Next logical byte offset for CoW allocation (monotonically increasing).
     alloc_cursor: u64,
 }
 
