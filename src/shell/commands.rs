@@ -3,6 +3,9 @@ extern crate alloc;
 use alloc::format;
 use alloc::str::SplitWhitespace;
 
+const DUMP_MAX_LEN: usize = 1024;
+const PAGE_SIZE: usize = 4096;
+
 /// Entry point — call from your REPL loop after reading a line.
 pub fn dispatch(line: &str) {
     let mut parts = line.trim().split_whitespace();
@@ -73,7 +76,7 @@ fn cmd_bt() {
         crate::shell::tty::write(format!("  #{depth:02}  0x{ra:016x}\r\n").as_bytes());
         if pfp == fp {
             break;
-        } // guard against corrupt frames
+        }
         fp = pfp;
         depth += 1;
     }
@@ -93,33 +96,90 @@ fn cmd_dump(mut parts: SplitWhitespace) {
         return;
     };
 
-    // Clamp to a sane maximum to avoid locking the console.
-    let len = len.min(1024);
+    let len = len.min(DUMP_MAX_LEN);
+    if len == 0 {
+        return;
+    }
+
+    if let Err(reason) = validate_kernel_dump_range(addr, len) {
+        crate::shell::tty::write(
+            format!("dump: refusing unsafe range 0x{addr:016x}+0x{len:x}: {reason}\r\n").as_bytes(),
+        );
+        return;
+    }
+
     let rows = (len + 15) / 16;
 
     for row in 0..rows {
         let base = addr + row * 16;
         let cols = 16usize.min(len - row * 16);
-        let mut line = format!("{base:016x}: ");
+
+        // Read each byte exactly once after the full range has been validated.
+        let mut bytes = [0u8; 16];
         for i in 0..cols {
-            // Bounds-check: only access addresses we believe are mapped.
-            // TODO: validate against your kernel VA map before shipping.
-            let b = unsafe { *((base + i) as *const u8) };
+            bytes[i] = unsafe { core::ptr::read_volatile((base + i) as *const u8) };
+        }
+
+        let mut line = format!("{base:016x}: ");
+
+        for b in &bytes[..cols] {
             line.push_str(&format!("{b:02x} "));
         }
-        // ASCII column
+
+        for _ in cols..16 {
+            line.push_str("   ");
+        }
+
         line.push_str(" |");
-        for i in 0..cols {
-            let b = unsafe { *((base + i) as *const u8) };
-            line.push(if b.is_ascii_graphic() || b == b' ' {
-                b as char
+        for b in &bytes[..cols] {
+            line.push(if b.is_ascii_graphic() || *b == b' ' {
+                *b as char
             } else {
                 '.'
             });
         }
         line.push_str("|\r\n");
+
         crate::shell::tty::write(line.as_bytes());
     }
+}
+
+fn validate_kernel_dump_range(addr: usize, len: usize) -> Result<(), &'static str> {
+    let end_exclusive = addr.checked_add(len).ok_or("address overflow")?;
+    let last = end_exclusive.checked_sub(1).ok_or("empty range")?;
+
+    if !crate::arch::api::is_valid_addr(addr) || !crate::arch::api::is_valid_addr(last) {
+        return Err("non-canonical virtual address");
+    }
+
+    let kva = crate::arch::api::kernel_va_range();
+    if !kva.contains(&addr) || !kva.contains(&last) {
+        return Err("outside kernel virtual-address range");
+    }
+
+    let cr3 = <crate::arch::Arch as crate::arch::api::Paging>::kernel_cr3();
+
+    let mut page = align_down(addr, PAGE_SIZE);
+    let last_page = align_down(last, PAGE_SIZE);
+
+    loop {
+        if <crate::arch::Arch as crate::arch::api::Paging>::virt_to_phys(cr3, page).is_none() {
+            return Err("unmapped kernel virtual page");
+        }
+
+        if page == last_page {
+            break;
+        }
+
+        page = page.checked_add(PAGE_SIZE).ok_or("page walk overflow")?;
+    }
+
+    Ok(())
+}
+
+#[inline]
+const fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
 }
 
 fn print_help() {
