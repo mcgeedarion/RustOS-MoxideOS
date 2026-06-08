@@ -2,8 +2,9 @@
 xtask = "run --target x86_64-unknown-linux-gnu -p xtask --"
 
 # Default target is overridden per-invocation by xtask via --target.
-# This fallback keeps `cargo build` (without xtask) pointing at the
-# riscv64 UEFI loader so accidental bare builds don't silently use the
-# host triple.  Change to whichever arch you're actively working on.
+# This fallback keeps `cargo build` / `cargo check` (without xtask) on an
+# installed freestanding RISC-V target so plain Cargo invocations do not need
+# nightly custom-target flags just to load a target JSON.  Use `cargo xtask` or
+# pass `--target targets/<name>.json` explicitly for custom kernel/UEFI targets.
 [build]
-target = "targets/riscv64-uefi-loader.json"
+target = "riscv64gc-unknown-none-elf"
