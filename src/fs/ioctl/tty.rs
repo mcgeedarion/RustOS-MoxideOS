@@ -1,4 +1,5 @@
 //! TTY / termios ioctl handlers.
+
 use super::consts::*;
 use crate::uaccess::{copy_from_user, copy_to_user};
 
@@ -16,11 +17,17 @@ pub fn tty_ioctl(fd: usize, req: usize, arg: usize) -> isize {
         },
         TCSETS | TCSETSW | TCSETSF => 0,
         TIOCGPGRP => {
-            let pgid: u32 = crate::proc::scheduler::current_pid() as u32;
+            let pgid: u32 = crate::drivers::platform::tty::get_foreground_pgid() as u32;
             copy_to_user(arg, &pgid.to_ne_bytes());
             0
         },
-        TIOCSPGRP => 0,
+        TIOCSPGRP => {
+            let mut buf = [0u8; 4];
+            copy_from_user(arg, &mut buf);
+
+            let pgid = u32::from_ne_bytes(buf) as usize;
+            crate::drivers::platform::tty::set_foreground_pgid(pgid)
+        },
         TIOCGWINSZ => {
             let ws = [
                 25u16.to_ne_bytes(),
