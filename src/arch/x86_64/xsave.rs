@@ -102,35 +102,13 @@ pub unsafe fn xrstor_from(src: *const u8) {
 }
 
 fn cpuid_leaf1() -> (u32, u32) {
-    let ecx: u32;
-    let edx: u32;
-    unsafe {
-        core::arch::asm!(
-            "cpuid",
-            in("eax") 1u32,
-            lateout("ecx") ecx,
-            lateout("edx") edx,
-            lateout("ebx") _,
-            lateout("eax") _,
-        );
-    }
-    (ecx, edx)
+    let r = unsafe { core::arch::x86_64::__cpuid(1) };
+    (r.ecx, r.edx)
 }
 
 fn cpuid_xsave_size() -> u32 {
-    let ebx: u32;
-    unsafe {
-        core::arch::asm!(
-            "cpuid",
-            in("eax") 0xDu32,
-            in("ecx") 0u32,
-            lateout("ebx") ebx,
-            lateout("eax") _,
-            lateout("ecx") _,
-            lateout("edx") _,
-        );
-    }
-    ebx.max(512)
+    let r = unsafe { core::arch::x86_64::__cpuid_count(0xD, 0) };
+    r.ebx.max(512)
 }
 
 unsafe fn xgetbv(xcr: u32) -> u64 {

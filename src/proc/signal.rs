@@ -357,6 +357,7 @@ fn push_sigframe_x86(
 ///
 /// Called by `check_and_deliver_aarch64` when a signal is deliverable.
 /// Returns `true` on success, `false` if the user stack is not accessible.
+#[cfg(target_arch = "aarch64")]
 fn push_sigframe_aarch64(
     frame: &mut crate::arch::aarch64::interrupts::ExceptionFrame,
     sa: &SigAction,
@@ -490,6 +491,7 @@ pub fn sys_rt_sigreturn(frame: &mut crate::arch::x86_64::syscall::SyscallFrame) 
 /// Called by `aarch64_sync_handler` after every SVC (except rt_sigreturn).
 ///
 /// Mirrors `check_and_deliver` but operates on `ExceptionFrame`.
+#[cfg(target_arch = "aarch64")]
 pub fn check_and_deliver_aarch64(frame: &mut crate::arch::aarch64::interrupts::ExceptionFrame) {
     let tid = scheduler::current_pid();
     let tgid = scheduler::with_proc(tid, |p| p.tgid).unwrap_or(tid);
@@ -522,6 +524,7 @@ pub fn check_and_deliver_aarch64(frame: &mut crate::arch::aarch64::interrupts::E
 /// Called from `aarch64_sync_handler` when ESR_EC == SVC64 and x8 == 139
 /// (rt_sigreturn).  Restores the pre-signal `ExceptionFrame` from the user
 /// stack.
+#[cfg(target_arch = "aarch64")]
 pub fn sys_rt_sigreturn_aarch64(frame: &mut crate::arch::aarch64::interrupts::ExceptionFrame) {
     let sp = frame.sp_el0 as usize;
     let sf_size = core::mem::size_of::<SigFrameAarch64>();

@@ -64,19 +64,8 @@ impl Cpu for ArchImpl {
     fn id() -> u32 {
         // LAPIC ID from MSR IA32_TSC_AUX (set by gdt_init on each CPU)
         // Fall back to CPUID leaf 1 EBX[31:24] on BSP.
-        let ebx: u32;
-        unsafe {
-            core::arch::asm!(
-                "mov eax, 1",
-                "cpuid",
-                out("ebx") ebx,
-                out("eax") _,
-                out("ecx") _,
-                out("edx") _,
-                options(nostack)
-            );
-        }
-        ebx >> 24
+        let cpuid1 = unsafe { core::arch::x86_64::__cpuid(1) };
+        cpuid1.ebx >> 24
     }
     fn flags() -> usize {
         let rflags: usize;
@@ -183,7 +172,7 @@ impl Tlb for ArchImpl {
     }
     fn flush_asid(_asid: u16) {
         // x86-64 without PCID: flush all TLB entries.
-        Self::flush_all();
+        <ArchImpl as Tlb>::flush_all();
     }
 }
 

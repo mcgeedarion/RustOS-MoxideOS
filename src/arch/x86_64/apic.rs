@@ -107,13 +107,8 @@ unsafe fn icr_wait_idle() {
 /// Safe to call on BSP and each AP independently.
 unsafe fn enable_apic() {
     // CPUID leaf 1, ECX[21] = x2APIC support.
-    let ecx: u32;
-    core::arch::asm!("cpuid",
-        inout("eax") 1u32 => _,
-        out("ecx") ecx,
-        out("ebx") _, out("edx") _,
-        options(nostack, preserves_flags));
-    let has_x2 = (ecx >> 21) & 1 != 0;
+    let cpuid1 = core::arch::x86_64::__cpuid(1);
+    let has_x2 = (cpuid1.ecx >> 21) & 1 != 0;
 
     // Read IA32_APIC_BASE (MSR 0x1B).
     let (base_lo, base_hi): (u32, u32);

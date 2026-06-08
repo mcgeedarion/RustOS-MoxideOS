@@ -372,16 +372,6 @@ fn decode_name(pkt: &[u8], start: usize) -> Option<String> {
     Some(out)
 }
 
-/// `?`-able version of `skip_name` for use in parse_response.
-impl core::ops::Try for Option<usize> {
-    // We can't impl Try on Option in stable; use a helper instead.
-}
-
-// We can't implement std::ops::Try on Option in a no_std crate.
-// Replace the `?` on Option<usize> returns with an explicit match:
-// (The parse_response function already handles None via early-return pattern;
-//  skip_name returns Option<usize> and we match on it inline.)
-
 fn wait_reply(txid: u16, timeout_ms: u64) -> Option<Vec<u8>> {
     let deadline = crate::time::monotonic_ms() + timeout_ms;
     loop {

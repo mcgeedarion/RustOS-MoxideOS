@@ -100,7 +100,9 @@ pub const SYS_GETEUID: usize = 107;
 pub const SYS_GETEGID: usize = 108;
 pub const SYS_SETUID: usize = 105;
 pub const SYS_SETGID: usize = 106;
+pub const SYS_GETRESUID: usize = 118;
 pub const SYS_SETRESGID: usize = 119;
+pub const SYS_GETRESGID: usize = 120;
 
 pub const SYS_FUTEX: usize = 202;
 pub const SYS_TKILL: usize = 200;

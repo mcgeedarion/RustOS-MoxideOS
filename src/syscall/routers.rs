@@ -288,7 +288,7 @@ pub fn dispatch_process(ctx: &SyscallContext) -> Option<isize> {
             Some(crate::proc::scheduler::with_proc(pid, |p| p.cred.gid).unwrap_or(0) as isize)
         },
         SYS_SETUID | SYS_SETGID | SYS_SETRESGID => Some(0),
-        SYS_GETRESGID | SYS_GETRESGID32 => Some(crate::syscall::copy_gid_to_user(a, b, c)),
+        SYS_GETRESGID => Some(crate::syscall::copy_gid_to_user(a, b, c)),
         SYS_GETRESUID => Some(crate::syscall::copy_uid_to_user(a, b, c)),
         SYS_SETREUID => Some(crate::syscall::sys_setreuid_impl(a as u32, b as u32)),
         SYS_SETREGID => Some(crate::syscall::sys_setregid_impl(a as u32, b as u32)),
