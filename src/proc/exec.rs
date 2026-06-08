@@ -848,8 +848,35 @@ fn copy_strvec_from_user(vec_va: usize) -> Vec<String> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn alloc_map_stack(_cr3: usize, _stack_top: usize) -> usize {
-    // GUESS: temporary stub so the parser reaches EOF; real body written in a later
-    // commit.
-    unimplemented!("alloc_map_stack pending design - see sweep step 5")
+fn alloc_map_stack(cr3: usize, stack_top: usize) -> usize {
+    let stack_top = stack_top & !(PAGE - 1);
+    let stack_size = STACK_MIN.max(PAGE);
+    let stack_bottom = stack_top
+        .checked_sub(stack_size)
+        .expect("alloc_map_stack: stack_top underflow");
+
+    let flags = paging::PTE_WRITABLE | paging::PTE_USER | paging::PTE_NX;
+
+    let mut allocated: Vec<usize> = Vec::new();
+
+    for va in (stack_bottom..stack_top).step_by(PAGE) {
+        let pa = match pmm::alloc_page() {
+            Some(pa) => pa,
+            None => {
+                for pa in allocated {
+                    pmm::free_page(pa);
+                }
+                panic!("alloc_map_stack: out of physical memory");
+            },
+        };
+
+        unsafe {
+            core::ptr::write_bytes(pa as *mut u8, 0, PAGE);
+        }
+
+        paging::map_page(cr3, va, pa, flags);
+        allocated.push(pa);
+    }
+
+    stack_top
 }
