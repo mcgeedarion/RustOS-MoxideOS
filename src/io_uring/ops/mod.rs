@@ -48,17 +48,18 @@ pub fn dispatch(sqe: &Sqe) -> i32 {
 
 /// Close a file descriptor.
 ///
-/// Delegates to the VFS layer once that exists.  Currently a stub that
-/// validates the fd range and logs.
+/// Delegates through the normal syscall close path so process-local fd
+/// translation and backing-fd cleanup happen exactly once.
 fn handle_close(sqe: &Sqe) -> i32 {
     let fd = sqe.fd;
+
     if fd < 0 {
         log::warn!("[io_uring::close] invalid fd={}", fd);
         return errno::E_BADF;
     }
-    log::debug!("[io_uring::close] fd={}", fd);
 
-    // TODO: call vfs::close(fd) when VFS is implemented.
-    // For now, report success so the ring machinery can be exercised end-to-end.
-    0
+    let res = crate::fs::io_syscalls::sys_close(fd as usize) as i32;
+    log::debug!("[io_uring::close] fd={} res={}", fd, res);
+
+    res
 }
