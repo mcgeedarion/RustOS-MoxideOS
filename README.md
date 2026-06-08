@@ -262,7 +262,7 @@ namespace support, capability checks, and LSM-style hook scaffolding.
 
 Use `cargo xtask` for architecture-aware builds:
 
-Plain `cargo build` / `cargo check` uses the repository custom-target default and therefore needs nightly custom-target flags such as `-Zjson-target-spec` and, for kernel targets, `-Z build-std=core,alloc`. Prefer `cargo xtask` unless you are intentionally debugging raw Cargo invocations.
+Plain `cargo build` / `cargo check` defaults to the installed `riscv64gc-unknown-none-elf` target so Cargo can start checking without the nightly custom-target JSON flag. Prefer `cargo xtask` for real architecture-aware kernel and image builds; direct JSON-target builds still require `-Z json-target-spec` plus `-Z build-std=core,alloc,compiler_builtins`.
 
 
 ```sh
@@ -329,6 +329,7 @@ selected target. For example:
 
 ```sh
 cargo build --target targets/x86_64-kernel.json \
+  -Z json-target-spec \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem \
   --no-default-features --features kmtest
