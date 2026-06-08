@@ -529,11 +529,12 @@ impl BtrfsKeyPtr {
 
 pub struct BtrfsFs {
     pub superblock: BtrfsSuperblock,
-    chunk_map: Vec<(u64, u64, BtrfsChunkItem)>, // (logical_start, logical_end, chunk)
-    root_tree_root: u64,
-    fs_tree_root: u64,
-    path_cache: BTreeMap<String, u64>,
-    alloc_cursor: u64,
+    pub(super) chunk_map: Vec<(u64, u64, BtrfsChunkItem)>,
+    pub(super) root_tree_root: u64,
+    pub(super) fs_tree_root: u64,
+    pub(super) path_cache: BTreeMap<String, u64>,
+    pub(super) alloc_cursor: u64,
+
 }
 
 pub static BTRFS_MOUNTS: Mutex<BTreeMap<String, BtrfsFs>> = Mutex::new(BTreeMap::new());
