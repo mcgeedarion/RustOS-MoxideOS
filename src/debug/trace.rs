@@ -12,6 +12,9 @@
 //!
 //! // Drain from shell/procfs:
 //! trace::drain(|ev| serial_println!("{:?}", ev));
+//!
+//! // Drain only the last N events without advancing HEAD (e.g. from oops):
+//! trace::drain_last_n(32, |ev| serial_println!("{:?}", ev));
 //! ```
 //!
 //! Enabled only under `--features debug`.
@@ -104,6 +107,29 @@ pub fn drain(mut f: impl FnMut(&TraceEvent)) {
         }
     }
     HEAD.store(tail, Ordering::SeqCst);
+}
+
+/// Drain only the **last `n`** events without advancing `HEAD`.
+///
+/// Unlike [`drain`], this does not consume the pending events — a subsequent
+/// call to `drain` will still see the full unread window.  Intended for crash
+/// and oops paths where we want a look-back window without disturbing the
+/// normal consumer.
+///
+/// If fewer than `n` events are available, all available events are returned.
+pub fn drain_last_n(n: usize, mut f: impl FnMut(&TraceEvent)) {
+    let tail = TAIL.load(Ordering::SeqCst);
+    let head = HEAD.load(Ordering::SeqCst);
+    let available = tail.saturating_sub(head).min(RING_SIZE);
+    let count = available.min(n);
+    let start = tail.saturating_sub(count);
+    for i in start..tail {
+        // SAFETY: same invariant as drain() — we only read within [head..tail),
+        // and we do not advance HEAD so the consumer cursor is unmodified.
+        unsafe {
+            f(&*RING.0[i & (RING_SIZE - 1)].get());
+        }
+    }
 }
 
 /// Returns the number of events currently pending in the buffer.

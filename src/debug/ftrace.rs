@@ -22,7 +22,7 @@
 
 #[cfg(all(feature = "debug", feature = "trace"))]
 pub mod inner {
-    use super::super::trace::{emit, TraceEvent, TraceKind};
+    use super::super::trace::{drain_last_n as ring_drain_last_n, emit, TraceEvent, TraceKind};
     use core::sync::atomic::{AtomicBool, Ordering};
 
     /// Per-CPU recursion guard. We use a single global bool here; replace with
@@ -72,4 +72,30 @@ pub mod inner {
         });
         IN_HOOK.store(false, Ordering::Release);
     }
+
+    /// Drain the last `n` function-trace events (FuncEnter / FuncExit only),
+    /// calling `f` for each in chronological order.
+    ///
+    /// This is a filtered view over the shared trace ring — it does **not**
+    /// advance the consumer cursor, so `trace::drain` still sees all events.
+    /// Intended for crash/oops output to show the call history leading up to
+    /// the fault.
+    pub fn drain_last_n(n: usize, mut f: impl FnMut(&TraceEvent)) {
+        ring_drain_last_n(n, |ev| {
+            if matches!(ev.kind, TraceKind::FuncEnter | TraceKind::FuncExit) {
+                f(ev);
+            }
+        });
+    }
 }
+
+// Public re-exports: when the feature gate is active, expose inner::drain_last_n
+// at the module level so callers can write `crate::debug::ftrace::drain_last_n`.
+#[cfg(all(feature = "debug", feature = "trace"))]
+pub use inner::drain_last_n;
+
+/// Stub for builds without `debug` + `trace` features active, so call-sites in
+/// `oops.rs` compile unconditionally under `#[cfg(feature = "trace")]`.
+#[cfg(not(all(feature = "debug", feature = "trace")))]
+#[inline(always)]
+pub fn drain_last_n(_n: usize, _f: impl FnMut(&crate::debug::trace::TraceEvent)) {}
