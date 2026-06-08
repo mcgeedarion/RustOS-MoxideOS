@@ -1,7 +1,4 @@
 // GDB stub — canonical implementation lives here.
-// src/debug/gdbstub/ re-exports from this module via `pub use
-// crate::gdbstub::*` in the shim at src/debug/gdbstub/mod.rs (which is kept for
-// backward compat).
 
 pub mod breakpoints;
 pub mod rsp;
@@ -11,6 +8,8 @@ pub mod rsp_x86_64;
 pub mod serial;
 pub mod session;
 pub mod target;
+
+use spin::Mutex;
 
 /// Minimal trap-register marker used by architecture exception handlers.
 ///
@@ -22,9 +21,27 @@ pub struct SavedRegs {
     _private: [u8; 0],
 }
 
-/// Architecture trap handoff placeholder.
+/// Architecture-independent trap handoff hook.
 ///
-/// Breakpoint/watchpoint handling is still routed through the generic
-/// exception path elsewhere; this no-op keeps the build graph wired while the
-/// concrete GDB session integration is completed.
-pub fn gdb_trap(_regs: *mut SavedRegs, _pid: usize) {}
+/// Architecture trap code can call `gdb_trap(regs, pid)`. The active GDB
+/// session/debug target installs a hook with `set_trap_handler`; if no session
+/// is attached, the trap is ignored and normal exception routing can continue.
+pub type TrapHandler = fn(regs: *mut SavedRegs, pid: usize);
+
+static TRAP_HANDLER: Mutex<Option<TrapHandler>> = Mutex::new(None);
+
+pub fn set_trap_handler(handler: TrapHandler) {
+    *TRAP_HANDLER.lock() = Some(handler);
+}
+
+pub fn clear_trap_handler() {
+    *TRAP_HANDLER.lock() = None;
+}
+
+pub fn gdb_trap(regs: *mut SavedRegs, pid: usize) {
+    let handler = *TRAP_HANDLER.lock();
+
+    if let Some(handler) = handler {
+        handler(regs, pid);
+    }
+}
