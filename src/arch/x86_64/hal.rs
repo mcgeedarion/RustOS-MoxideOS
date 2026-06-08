@@ -1,7 +1,4 @@
 //! x86-64 HAL implementation — `arch::api` trait impls.
-//!
-//! Every trait defined in `arch::api` is implemented here on
-//! `ArchImpl`.  `arch::mod.rs` re-exports `ArchImpl` as `Arch`.
 
 use crate::arch::api::{
     ArchInit, ContextSwitch, Cpu, FpState, Interrupts, PageFlags, Paging, Serial, Syscall, Timer,
