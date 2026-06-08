@@ -668,23 +668,33 @@ fn schedule_early() {
 pub fn tick(cpu: u32) {
     let blk = unsafe { &mut crate::smp::percpu::PERCPU_BLOCKS[cpu as usize] };
     blk.runqueue.tick_count += 1;
+
     let now = crate::time::clock::monotonic_ns();
 
-    // Charge TICK_NS to the currently running task's process cpu_time_ns.
-    // This is the source read by CLOCK_PROCESS_CPUTIME_ID / getrusage.
+    // Charge TICK_NS to the currently running task and to its owning process.
+    //
+    // task.cpu_time_ns backs CLOCK_THREAD_CPUTIME_ID.
+    // Pcb cpu accounting backs CLOCK_PROCESS_CPUTIME_ID / getrusage.
     let curr = blk.current_task;
+
     if !curr.is_null() {
-        let pid = unsafe { (*curr).pid };
+        let task = unsafe { &mut *curr };
+
+        task.cpu_time_ns = task.cpu_time_ns.saturating_add(TICK_NS);
+
+        let pid = task.pid;
+
         if pid > 0 {
             if let Some(pl) = proc_table::find_proc_lock(pid as usize) {
                 if let Some(mut inner) = pl.inner.try_lock() {
                     // Route tick to utime or stime based on whether this CPU
-                    // is currently inside a syscall (in_syscall > 0 → kernel mode).
+                    // is currently inside a syscall.
                     if blk.in_syscall > 0 {
                         inner.stime_ns = inner.stime_ns.saturating_add(TICK_NS);
                     } else {
                         inner.utime_ns = inner.utime_ns.saturating_add(TICK_NS);
                     }
+
                     inner.cpu_time_ns = inner.utime_ns.saturating_add(inner.stime_ns);
                 }
             }
@@ -695,30 +705,40 @@ pub fn tick(cpu: u32) {
         for pl in pl_vec.iter() {
             let s = pl.load_state();
             let inner_opt = pl.inner.try_lock();
+
             if let Some(mut inner) = inner_opt {
                 if inner.sched.policy != SchedPolicy::Deadline {
                     continue;
                 }
+
                 if inner.sched.dl_remaining > 0 {
                     continue;
                 }
+
                 if now < inner.sched.dl_next_replenish {
                     continue;
                 }
+
                 let period = inner.sched.dl_period;
+
                 inner.sched.dl_remaining = inner.sched.dl_runtime;
                 inner.sched.dl_abs_deadline = now + inner.sched.dl_deadline;
                 inner.sched.dl_next_replenish = now + period;
+
                 if !inner.task.is_null() {
                     let t = unsafe { &mut *inner.task };
+
                     t.sched.dl_remaining = inner.sched.dl_remaining;
                     t.sched.dl_abs_deadline = inner.sched.dl_abs_deadline;
                     t.sched.dl_next_replenish = inner.sched.dl_next_replenish;
                 }
+
                 if s == State::Blocked {
                     pl.set_state(&mut inner, State::Ready);
+
                     let task = inner.task;
                     drop(inner);
+
                     if !task.is_null() {
                         blk.runqueue.enqueue(task);
                     }
@@ -728,21 +748,28 @@ pub fn tick(cpu: u32) {
     });
 
     let curr = blk.current_task;
+
     if !curr.is_null() {
         let t = unsafe { &mut *curr };
+
         if t.sched.policy == SchedPolicy::Rr {
             let elapsed = now.saturating_sub(blk.runqueue.curr_vruntime_start);
+
             if elapsed >= TICK_NS {
                 let pid = t.pid;
+
                 if let Some(pl) = proc_table::find_proc_lock(pid as usize) {
                     let mut inner = pl.inner.lock();
                     pl.set_state(&mut inner, State::Ready);
                     drop(inner);
                 }
+
                 blk.current_task = core::ptr::null_mut();
                 blk.runqueue.enqueue(curr);
+
                 drop(blk);
                 schedule();
+
                 return;
             }
         }
@@ -750,17 +777,22 @@ pub fn tick(cpu: u32) {
 
     if !curr.is_null() {
         let t = unsafe { &*curr };
+
         if matches!(t.sched.policy, SchedPolicy::Fifo | SchedPolicy::Rr) {
             if let Some(pl) = proc_table::find_proc_lock(t.pid as usize) {
                 let kill = {
                     let mut inner = pl.inner.lock();
+
                     inner.rt_cpu_time_us = inner.rt_cpu_time_us.saturating_add(TICK_NS / 1000);
+
                     let (soft, _) = crate::proc::rlimit::getrlimit_for(
                         t.pid as usize,
                         crate::proc::rlimit::RLIMIT_RTTIME,
                     );
+
                     soft != crate::proc::rlimit::RLIM_INFINITY && inner.rt_cpu_time_us >= soft
                 };
+
                 if kill {
                     crate::proc::signal::send_signal(t.pid as usize, 24);
                 }
