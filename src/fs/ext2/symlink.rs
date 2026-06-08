@@ -13,5 +13,4 @@ pub fn is_symlink_mode(mode: u16) -> bool {
 
 pub fn is_fast_symlink(size: u32, blocks_512: u32) -> bool {
     let len = size as usize;
-    len > 0 && len <= EXT2_FAST_SYMLINK_MAX_LEN && blocks_512 == 0
-}
+    len > 0 && len <= EXT2_FAST_SYMLINK_MAX_LEN
