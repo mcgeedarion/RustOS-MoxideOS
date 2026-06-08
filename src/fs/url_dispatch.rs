@@ -582,6 +582,7 @@ fn dev_read_input_event(
         }
 
         if written > 0 {
+            dev_clear_input_readiness_if_empty(dev);
             return Ok(written);
         }
 
@@ -598,6 +599,27 @@ fn dev_read_input_event(
         }
 
         let _ = dev.waitq.wait(READABLE_EVENTS, None, None);
+        dev_clear_input_readiness_if_empty(dev);
+        let _ = dev.waitq.wait(dev_input_ready_mask(), None, None);
+    }
+}
+
+fn dev_input_ready_mask() -> crate::sync::ReadyMask {
+    crate::fs::poll::POLLIN | crate::fs::poll::POLLRDNORM
+}
+
+fn dev_clear_input_readiness_if_empty(dev: &crate::input::InputDevice) {
+    let ready = dev_input_ready_mask();
+
+    if !dev.ring.is_readable() {
+        dev.waitq.clear(ready);
+
+        // Preserve readiness if a producer raced with the clear after our
+        // empty-ring check. Without re-publishing here, a wake that lands just
+        // before `clear` could be lost while data is already available.
+        if dev.ring.is_readable() {
+            dev.waitq.wake(ready);
+        }
     }
 }
 
