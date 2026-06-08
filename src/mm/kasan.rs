@@ -26,9 +26,6 @@ static HEAP_BASE: AtomicUsize = AtomicUsize::new(0);
 static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
 
 /// Initialise the shadow region for the heap virtual address window.
-///
-/// The region is backed by contiguous PMM pages and assumes an identity/HHDM
-/// mapping where physical memory is directly writable via its physical address.
 pub fn init(heap_base: usize, heap_size: usize) {
     if heap_base == 0 || heap_size == 0 {
         return;
