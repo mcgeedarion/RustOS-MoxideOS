@@ -1,5 +1,5 @@
 //! Btrfs mount logic, superblock parsing, chunk-tree bootstrap, and block I/O.
-//! Merged from mount.rs + io.rs
+
 extern crate alloc;
 use super::superblock::{BtrfsChunkItem, BtrfsFs, BtrfsKey, BtrfsSuperblock, BTRFS_MOUNTS};
 use alloc::{
@@ -11,7 +11,6 @@ use alloc::{
 use spin::Mutex;
 
 pub fn mount(subpath: &str, lba_start: u64) -> Result<(), &'static str> {
-    // Read superblock at byte offset 0x10_000 (64 KiB from partition start)
     let sb_lba = lba_start + 128;
     let raw = read_sectors_raw(sb_lba, 16);
     let sb = BtrfsSuperblock::from_bytes(&raw).ok_or("bad superblock")?;
