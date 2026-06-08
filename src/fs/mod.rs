@@ -48,6 +48,7 @@ pub mod stat_syscalls;
 pub mod sysfs;
 pub mod timerfd;
 pub mod tmpfs;
+pub mod url_dispatch;
 pub mod vfs;
 
 // Compatibility aliases while call sites migrate to `crate::fs::vfs::ops`

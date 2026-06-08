@@ -30,7 +30,7 @@ pub fn init() {
 
     // devfs must come before procfs/sysfs because /proc and /sys may emit
     // references to devices that userspace resolves through /dev.
-    SCHEME_TABLE.register("dev", Arc::new(crate::fs::devfs::DevFs::new()));
+    SCHEME_TABLE.register("dev", Arc::new(crate::fs::url_dispatch::DevFs::new()));
     SCHEME_TABLE.register("proc", Arc::new(crate::fs::procfs::ProcFs::new()));
     SCHEME_TABLE.register("sys", Arc::new(crate::fs::sysfs::SysFs::new()));
 
@@ -45,7 +45,7 @@ pub fn init() {
 
     // NFS client: registered after the network stack is online so that the
     // scheme constructor can probe the default NIC/route if needed.
-    SCHEME_TABLE.register("nfs", Arc::new(crate::fs::nfs::NfsScheme::new()));
+    SCHEME_TABLE.register("nfs", Arc::new(crate::fs::url_dispatch::NfsScheme::new()));
 
     // ipc_proxy_scheme provides the kernel-side endpoint for cross-process
     // message-passing; pipe is the simpler, anonymous half-duplex variant.
@@ -57,13 +57,13 @@ pub fn init() {
 
     // Registered after IPC because cgroup controllers may publish their state
     // via the IPC bus (e.g. memory-pressure notifications to userspace daemons).
-    SCHEME_TABLE.register("cgroup", Arc::new(crate::fs::cgroupfs::CgroupFs::new()));
+    SCHEME_TABLE.register("cgroup", Arc::new(crate::fs::url_dispatch::CgroupFs::new()));
 
     // overlayfs requires at least one lower layer already registered in the VFS
     // before it is useful; registering last ensures all lower-layer schemes are
     // in place so an early open_url("overlay:…") fails cleanly rather than
     // silently missing a dependency.
-    SCHEME_TABLE.register("overlay", Arc::new(crate::fs::overlayfs::OverlayFs::new()));
+    SCHEME_TABLE.register("overlay", Arc::new(crate::fs::url_dispatch::OverlayFs::new()));
 
     log::info!("[schemes] registered: {:?}", SCHEME_TABLE.list());
 }
