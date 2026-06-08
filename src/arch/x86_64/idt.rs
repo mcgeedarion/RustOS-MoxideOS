@@ -80,7 +80,7 @@
 //! ```
 
 use crate::sync::spinlock::SpinLock;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// CPU + GPR state at the time of an interrupt or exception.
 ///
@@ -179,6 +179,16 @@ macro_rules! pop_all {
 const GATE_INT: u8 = 0x8E; // Present | DPL=0 | 64-bit interrupt gate (IF cleared)
 const GATE_TRAP: u8 = 0x8F; // Present | DPL=0 | 64-bit trap gate     (IF preserved)
 
+const NMI_STATUS_PORT: u16 = 0x61;
+
+// PC/AT-compatible NMI status latch bits.
+const NMI_STATUS_IOCK: u8 = 1 << 6;
+const NMI_STATUS_ECC_OR_PARITY: u8 = 1 << 7;
+
+// Pulse these control bits to clear sticky status latches.
+const NMI_CLEAR_ECC_OR_PARITY: u8 = 1 << 2;
+const NMI_CLEAR_IOCK: u8 = 1 << 3;
+
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct IdtEntry {
@@ -221,10 +231,38 @@ struct IdtPointer {
     base: u64,
 }
 
+#[derive(Clone, Copy)]
+struct NmiStatus {
+    raw: u8,
+    ecc_or_parity: bool,
+    iock: bool,
+    watchdog_or_external: bool,
+}
+
+impl NmiStatus {
+    fn read() -> Self {
+        let raw = unsafe { inb(NMI_STATUS_PORT) };
+        let ecc_or_parity = raw & NMI_STATUS_ECC_OR_PARITY != 0;
+        let iock = raw & NMI_STATUS_IOCK != 0;
+
+        Self {
+            raw,
+            ecc_or_parity,
+            iock,
+            watchdog_or_external: !ecc_or_parity && !iock,
+        }
+    }
+
+    fn is_fatal_platform_error(self) -> bool {
+        self.ecc_or_parity || self.iock
+    }
+}
+
 // The IDT is shared across all CPUs — gate descriptors point to global stubs.
 // Per-CPU state lives in the TSS (stacks) and the handler registry.
 static mut IDT: [IdtEntry; 256] = [IdtEntry::zero(); 256];
 static IDT_LOADED: AtomicBool = AtomicBool::new(false);
+static NMI_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Build and load the IDT on the BSP.
 ///
@@ -556,8 +594,88 @@ pub extern "C" fn generic_exception_handler(frame: &mut InterruptFrame, vector: 
 
 #[no_mangle]
 pub extern "C" fn nmi_handler(frame: &mut InterruptFrame) {
-    crate::kprintln!("[NMI] rip={:#x} rsp={:#x}", frame.rip, frame.rsp);
-    // TODO: inspect NMI source (ECC, watchdog, IOCK#).
+    let count = NMI_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let status = NmiStatus::read();
+
+    crate::kprintln!(
+        "[NMI] count={} status={:#04x} rip={:#x} rsp={:#x} rflags={:#x}",
+        count,
+        status.raw,
+        frame.rip,
+        frame.rsp,
+        frame.rflags
+    );
+
+    if status.ecc_or_parity {
+        crate::kprintln!("[NMI] source=ECC/parity memory error");
+    }
+
+    if status.iock {
+        crate::kprintln!("[NMI] source=IOCK# / I/O channel check");
+    }
+
+    if status.watchdog_or_external {
+        crate::kprintln!(
+            "[NMI] source=watchdog/external/unknown (no PC/AT status latch bits set)"
+        );
+    }
+
+    clear_nmi_latches(status);
+
+    if status.is_fatal_platform_error() {
+        dump_registers(frame);
+
+        loop {
+            crate::arch::api::Cpu::halt();
+        }
+    }
+}
+
+fn clear_nmi_latches(status: NmiStatus) {
+    let mut clear_bits = 0u8;
+
+    if status.ecc_or_parity {
+        clear_bits |= NMI_CLEAR_ECC_OR_PARITY;
+    }
+
+    if status.iock {
+        clear_bits |= NMI_CLEAR_IOCK;
+    }
+
+    if clear_bits == 0 {
+        return;
+    }
+
+    // Preserve the writable low control bits and pulse the clear bits.
+    // The high status bits are read-only on PC/AT-compatible hardware.
+    let base = status.raw & 0x0f;
+
+    unsafe {
+        outb(NMI_STATUS_PORT, base | clear_bits);
+        outb(NMI_STATUS_PORT, base & !clear_bits);
+    }
+}
+
+#[inline]
+unsafe fn inb(port: u16) -> u8 {
+    let val: u8;
+    core::arch::asm!(
+        "in al, dx",
+        out("al") val,
+        in("dx") port,
+        options(nostack)
+    );
+    val
+}
+
+#[inline]
+unsafe fn outb(port: u16, val: u8) {
+    core::arch::asm!(
+        "out dx, al",
+        in("dx") port,
+        in("al") val,
+        options(nostack)
+    );
 }
 
 // ── #DB handler — single-step (RFLAGS.TF) and hardware breakpoints/watchpoints
