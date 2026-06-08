@@ -1,63 +1,68 @@
 //! GDB Remote Serial Protocol — x86-64 packet handler.
 //!
-//! Register serialisation is now entirely delegated to
-//! `arch::X86_64: GdbArch` (see `arch.rs`). This file retains:
+//! Register serialisation is delegated to `arch::X86_64: GdbArch`.
+//! Z/z breakpoint dispatch is delegated to `breakpoints::handle_z_packet`
+//! via the `ZSession` trait impl on `X86Session`.
 //!
-//! - The `GDB_TO_UREG` mapping and `build_gdb_regs` / `unpack_gdb_regs`
-//!   helpers used by `ptrace` (they work on `user_regs_struct`, not
-//!   `TrapFrame`, so they live here, not in the trait).
-//! - `step_set_tf` / `step_clear_tf` (x86-specific TF manipulation).
-//! - `X86Session` + `handle_packet` packet dispatch loop.
-//! - All `Z`/`z` breakpoint / watchpoint handling.
-//!
-//! `g`/`G`/`p`/`P` packets now call `arch::X86_64::read_regs` /
-//! `arch::X86_64::write_regs` through the `GdbArch` trait, eliminating the
-//! local hex helpers that have been moved to `arch.rs`.
+//! This file retains:
+//! - `GDB_TO_UREG` / `build_gdb_regs` / `unpack_gdb_regs` (ptrace path;
+//!   maps `user_regs_struct` indices — not `TrapFrame` — so out of scope for
+//!   `GdbArch`).
+//! - `step_set_tf` / `step_clear_tf` (x86-specific RFLAGS.TF manipulation).
+//! - `X86Session` + `handle_packet` packet dispatch.
 
 extern crate alloc;
 use alloc::string::String;
 
 use super::arch::{encode_hex_bytes, decode_hex_bytes, parse_hex_u64, GdbArch, X86_64};
-use super::breakpoints::{HwBreakpointTable, SwBreakpointTable, WatchKind, WatchpointTable};
+use super::breakpoints::{
+    handle_z_packet, HwBreakpointTable, SwBreakpointTable, WatchpointTable, ZSession,
+};
 use super::target::GdbTarget;
 use crate::proc::ptrace::UREG_COUNT;
 
 // ---------------------------------------------------------------------------
-// GDB register index → user_regs_struct index mapping (ptrace path)
+// GDB register index → user_regs_struct index (ptrace path only)
 // ---------------------------------------------------------------------------
 
 pub const X86_REG_COUNT: usize = 24;
 
 const GDB_TO_UREG: [usize; X86_REG_COUNT] = [
-    10, 5, 11, 12, 13, 14, 4, 19,  // rax rbx rcx rdx rsi rdi rbp rsp
-     9,  8,  7,  6,  3,  2,  1,  0, // r8-r15
-    16, 18, 17, 20, 23, 24, 25, 26, // rip eflags cs ss ds es fs gs
+    10, 5, 11, 12, 13, 14, 4, 19,
+     9,  8,  7,  6,  3,  2,  1,  0,
+    16, 18, 17, 20, 23, 24, 25, 26,
 ];
 
 pub fn build_gdb_regs(ureg: &[u64; UREG_COUNT]) -> [u64; X86_REG_COUNT] {
     let mut out = [0u64; X86_REG_COUNT];
-    for (gdb_idx, &ureg_idx) in GDB_TO_UREG.iter().enumerate() {
-        if ureg_idx < UREG_COUNT {
-            out[gdb_idx] = ureg[ureg_idx];
-        }
+    for (i, &ui) in GDB_TO_UREG.iter().enumerate() {
+        if ui < UREG_COUNT { out[i] = ureg[ui]; }
     }
     out
 }
 
-pub fn unpack_gdb_regs(gdb_regs: &[u64; X86_REG_COUNT], ureg: &mut [u64; UREG_COUNT]) {
-    for (gdb_idx, &ureg_idx) in GDB_TO_UREG.iter().enumerate() {
-        if ureg_idx < UREG_COUNT {
-            ureg[ureg_idx] = gdb_regs[gdb_idx];
-        }
+pub fn unpack_gdb_regs(gdb: &[u64; X86_REG_COUNT], ureg: &mut [u64; UREG_COUNT]) {
+    for (i, &ui) in GDB_TO_UREG.iter().enumerate() {
+        if ui < UREG_COUNT { ureg[ui] = gdb[i]; }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Single-step via RFLAGS.TF
 // ---------------------------------------------------------------------------
 
-fn u64_le_hex(v: u64) -> String {
-    encode_hex_bytes(&v.to_le_bytes())
+const RFLAGS_TF: u64 = 1 << 8;
+
+pub fn step_set_tf(target: &mut GdbTarget) {
+    let mut regs = target.read_regs();
+    regs[18] |= RFLAGS_TF;
+    target.write_regs(&regs);
+}
+
+pub fn step_clear_tf(target: &mut GdbTarget) {
+    let mut regs = target.read_regs();
+    regs[18] &= !RFLAGS_TF;
+    target.write_regs(&regs);
 }
 
 fn rsp_packet(body: &str) -> String {
@@ -66,27 +71,7 @@ fn rsp_packet(body: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Single-step: RFLAGS.TF
-// ---------------------------------------------------------------------------
-
-const RFLAGS_TF: u64 = 1 << 8;
-
-/// Set RFLAGS.TF so the CPU single-steps the next instruction.
-pub fn step_set_tf(target: &mut GdbTarget) {
-    let mut regs = target.read_regs();
-    regs[18] |= RFLAGS_TF; // ureg[18] = eflags
-    target.write_regs(&regs);
-}
-
-/// Clear RFLAGS.TF (call from the #DB / SIGTRAP handler).
-pub fn step_clear_tf(target: &mut GdbTarget) {
-    let mut regs = target.read_regs();
-    regs[18] &= !RFLAGS_TF;
-    target.write_regs(&regs);
-}
-
-// ---------------------------------------------------------------------------
-// Session state
+// Session
 // ---------------------------------------------------------------------------
 
 pub struct X86Session {
@@ -105,92 +90,73 @@ impl X86Session {
     }
 }
 
+impl ZSession for X86Session {
+    fn sw_bps(&mut self)  -> &mut SwBreakpointTable { &mut self.sw_bps  }
+    fn hw_bps(&mut self)  -> &mut HwBreakpointTable { &mut self.hw_bps  }
+    fn watches(&mut self) -> &mut WatchpointTable   { &mut self.watches }
+}
+
 // ---------------------------------------------------------------------------
 // Packet dispatch
 // ---------------------------------------------------------------------------
 
 pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut X86Session) -> String {
-    if body.is_empty() {
-        return rsp_packet("");
-    }
+    if body.is_empty() { return rsp_packet(""); }
     match body.as_bytes()[0] {
         b'?' => {
-            let status = target.poll_status();
-            rsp_packet(if status.starts_with('T') { &status } else { "T05" })
+            let s = target.poll_status();
+            rsp_packet(if s.starts_with('T') { &s } else { "T05" })
         },
-
-        // Read all registers via GdbArch trait
         b'g' => {
-            let trap = target.trap_frame();
             let mut buf = alloc::vec![0u8; X86_64::reg_buf_len()];
-            X86_64::read_regs(trap, &mut buf);
+            X86_64::read_regs(target.trap_frame(), &mut buf);
             rsp_packet(&encode_hex_bytes(&buf))
         },
-
-        // Write all registers via GdbArch trait
         b'G' => {
             let buf = decode_hex_bytes(&body[1..]);
-            if buf.len() < X86_64::reg_buf_len() {
-                return rsp_packet("E01");
-            }
-            let trap = target.trap_frame_mut();
-            X86_64::write_regs(trap, &buf);
+            if buf.len() < X86_64::reg_buf_len() { return rsp_packet("E01"); }
+            X86_64::write_regs(target.trap_frame_mut(), &buf);
             rsp_packet("OK")
         },
-
-        // Read single register 'p<regnum>'
         b'p' => {
             let idx = parse_hex_u64(&body[1..]) as usize;
-            if idx >= X86_REG_COUNT {
-                return rsp_packet("E01");
-            }
-            let trap = target.trap_frame();
+            if idx >= X86_REG_COUNT { return rsp_packet("E01"); }
             let mut buf = alloc::vec![0u8; X86_64::reg_buf_len()];
-            X86_64::read_regs(trap, &mut buf);
+            X86_64::read_regs(target.trap_frame(), &mut buf);
             rsp_packet(&encode_hex_bytes(&buf[idx * 8..(idx + 1) * 8]))
         },
-
-        // Write single register 'P<regnum>=<val>'
         b'P' => {
             let rest = &body[1..];
-            let eq = rest.find('=').unwrap_or(rest.len());
+            let eq  = rest.find('=').unwrap_or(rest.len());
             let idx = parse_hex_u64(&rest[..eq]) as usize;
-            if idx >= X86_REG_COUNT {
-                return rsp_packet("E01");
-            }
-            let val = parse_hex_u64(&rest[eq + 1..]);
+            if idx >= X86_REG_COUNT { return rsp_packet("E01"); }
+            let val  = parse_hex_u64(&rest[eq + 1..]);
             let trap = target.trap_frame_mut();
             let mut buf = alloc::vec![0u8; X86_64::reg_buf_len()];
-            X86_64::read_regs(trap, &mut buf); // read-modify-write
+            X86_64::read_regs(trap, &mut buf);
             buf[idx * 8..(idx + 1) * 8].copy_from_slice(&val.to_le_bytes());
             X86_64::write_regs(trap, &buf);
             rsp_packet("OK")
         },
-
         b'm' => {
             let rest = &body[1..];
-            let mut parts = rest.splitn(2, ',');
-            let addr = parse_hex_u64(parts.next().unwrap_or(""));
-            let len  = parse_hex_u64(parts.next().unwrap_or("")) as usize;
+            let mut p = rest.splitn(2, ',');
+            let addr = parse_hex_u64(p.next().unwrap_or(""));
+            let len  = parse_hex_u64(p.next().unwrap_or("")) as usize;
             rsp_packet(&encode_hex_bytes(&target.read_mem(addr, len)))
         },
-
         b'M' => {
-            let rest = &body[1..];
+            let rest  = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
             let addr  = parse_hex_u64(&rest[..rest.find(',').unwrap_or(colon)]);
             let data  = if colon < rest.len() { decode_hex_bytes(&rest[colon + 1..]) } else { alloc::vec![] };
             target.write_mem(addr, &data);
             rsp_packet("OK")
         },
-
         b'c' => { target.ctl("cont"); String::new() },
         b's' => { step_set_tf(target); target.ctl("cont"); String::new() },
-
         b'Z' | b'z' => handle_z_packet(body, target, session),
-
         b'k' => { crate::proc::signal::send_signal(target.pid, 9); rsp_packet("OK") },
-
         b'q' => {
             if body.starts_with("qSupported") {
                 rsp_packet("PacketSize=4000;swbreak+;hwbreak+;watchpoint+;vContSupported+")
@@ -200,33 +166,6 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut X86Sessio
                 rsp_packet("")
             }
         },
-
         _ => rsp_packet(""),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Z/z breakpoint / watchpoint handler
-// ---------------------------------------------------------------------------
-
-fn handle_z_packet(body: &str, target: &mut GdbTarget, session: &mut X86Session) -> String {
-    let insert = body.as_bytes()[0] == b'Z';
-    let rest = &body[1..];
-    let mut parts = rest.splitn(3, ',');
-    let kind  = parts.next().unwrap_or("");
-    let addr  = parse_hex_u64(parts.next().unwrap_or(""));
-    let _size = parse_hex_u64(parts.next().unwrap_or("")) as usize;
-
-    macro_rules! bp {
-        ($op:expr) => { if $op { rsp_packet("OK") } else { rsp_packet("E01") } };
-    }
-
-    match kind {
-        "0" => bp!(if insert { session.sw_bps.add(target, addr)       } else { session.sw_bps.remove(target, addr) }),
-        "1" => bp!(if insert { session.hw_bps.add_exec(target, addr)  } else { session.hw_bps.remove(target, addr) }),
-        "2" => bp!(if insert { session.watches.add(target, addr, _size, WatchKind::Write)  } else { session.watches.remove(target, addr) }),
-        "3" => bp!(if insert { session.watches.add(target, addr, _size, WatchKind::Read)   } else { session.watches.remove(target, addr) }),
-        "4" => bp!(if insert { session.watches.add(target, addr, _size, WatchKind::Access) } else { session.watches.remove(target, addr) }),
-        _   => rsp_packet(""),
     }
 }
