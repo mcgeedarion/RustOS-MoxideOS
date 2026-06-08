@@ -1,12 +1,5 @@
 // src/debug/gdbstub/serial.rs
 
-//! Bare-metal serial I/O for the GDB stub.
-//!
-//! Separate from the write-only console path because RSP needs bidirectional
-//! byte I/O over the same UART. This implementation uses local port-I/O helpers
-//! so the kernel does not need external `gdbstub` or `x86_64` crates just to
-//! expose COM1.
-
 use core::fmt;
 
 const COM1_BASE: u16 = 0x3F8;
