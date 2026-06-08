@@ -3,8 +3,6 @@
 //!
 //! ## Transport
 //!
-//! The GDB remote protocol framing is:
-//!
 //! ```
 //!   ACK:       '+'
 //!   NAK:       '-'
@@ -13,68 +11,50 @@
 //! ```
 //!
 //! After receiving a complete, valid packet the stub sends `+` (ACK) and
-//! then the response.  On checksum mismatch it sends `-` (NAK) so GDB retries.
+//! then the response. On checksum mismatch it sends `-` (NAK) so GDB retries.
 //!
-//! ## /dev/gdbstub char device
+//! ## vCont
 //!
-//! `session_start` registers a char device at `/dev/gdbstub` backed by
-//! COM1 via `devfs::register_char_dev`.  Userspace can then attach a GDB
-//! instance with:
+//! `vCont` packets are intercepted **before** `rsp::handle_packet` and
+//! routed to `rsp_vcont::handle_vcont`. The session owns an `RspState` that
+//! tracks the `halted` flag and optional `range_step` bounds.
 //!
-//! ```sh
-//! (gdb) target remote /dev/gdbstub
-//! ```
+//! `vCont?` capability queries return `vCont;c;s;t;r`.
 //!
-//! Kernel-side, `gdbstub_listen` spins in a kernel thread waiting for the
-//! first `+` or `$` byte from GDB before entering the packet loop.
-//!
-//! ## Attaching to a process
-//!
-//! The stub attaches to a PID by calling `GdbTarget::attach(pid)`.  The
-//! target must already be in `PtraceState::Stopped` (the caller sends
-//! SIGSTOP first, or the process hit a breakpoint / SIGTRAP).
-//!
-//! ## Stop-reply injection
-//!
-//! After `c` or `s` the session loop blocks on `target.wait_stop()`.  When
-//! the target stops again (SIGTRAP, SIGSEGV, …) the loop sends the
-//! `T<signal>` stop reply unprompted so GDB knows to re-query registers.
+//! Range-step (`vCont;r<s>,<e>`) arms hardware single-step and loops until
+//! `rsp_vcont::range_step_done` returns `true`, at which point a `T05` stop
+//! reply is sent.
 
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::rsp::{handle_packet, rsp_packet, Session};
+use super::rsp_vcont::{handle_vcont, range_step_done, RspState};
 use super::serial::SerialPort;
 use super::target::GdbTarget;
+use crate::debug::gdbstub::arch::GdbArch;
 
 /// Read one complete `$body#xx` packet from the serial port.
 /// Returns the packet body on success, or `None` if a 0x03 interrupt byte
 /// is received (GDB Ctrl-C).
-///
-/// Sends `+` ACK or `-` NAK to the host before returning.
 fn recv_packet(serial: &mut SerialPort) -> Option<String> {
     loop {
-        // Skip until '$'
         let b = unsafe { serial.read_byte() };
         match b {
-            0x03 => return None,     // Ctrl-C interrupt
-            b'+' | b'-' => continue, // stray ACK/NAK from previous exchange
-            b'$' => {},
-            _ => continue,
+            0x03     => return None,
+            b'+' | b'-' => continue,
+            b'$'     => {},
+            _        => continue,
         }
 
-        // Read body until '#'
         let mut body = Vec::with_capacity(64);
         loop {
             let c = unsafe { serial.read_byte() };
-            if c == b'#' {
-                break;
-            }
+            if c == b'#' { break; }
             body.push(c);
         }
 
-        // Read two checksum hex digits
         let hi = unsafe { serial.read_byte() };
         let lo = unsafe { serial.read_byte() };
         let expected: u8 = body.iter().fold(0u8, |a, &x| a.wrapping_add(x));
@@ -83,106 +63,124 @@ fn recv_packet(serial: &mut SerialPort) -> Option<String> {
         let got = (got_hi << 4) | got_lo;
 
         if got != expected {
-            // NAK — ask GDB to retransmit
             unsafe { serial.write_byte(b'-') };
             continue;
         }
-
-        // ACK
         unsafe { serial.write_byte(b'+') };
-
         return Some(String::from_utf8_lossy(&body).into_owned());
     }
 }
 
-/// Send an RSP response string verbatim (it is already framed by `rsp_packet`).
 fn send_response(serial: &mut SerialPort, resp: &str) {
     for b in resp.bytes() {
         unsafe { serial.write_byte(b) };
     }
 }
 
-/// Block until the target transitions out of the running state, then send
-/// the stop reply to GDB.  Called after `c` or `s` packets.
-fn wait_and_notify(serial: &mut SerialPort, target: &mut GdbTarget) {
-    // Spin-poll the ctl fd.  In a real kernel this would yield / sleep,
-    // but for the stub task this busy-wait is acceptable.
-    let stop_reply = loop {
-        let status = target.poll_status();
-        if status != "running" && !status.is_empty() && status != "none" {
-            break status;
-        }
-        // Yield to the scheduler so other tasks can run while we wait.
-        crate::proc::scheduler::yield_now();
-    };
+/// Block until the target stops, then send the stop reply.
+/// For range-step, re-arms single-step until PC leaves the range.
+fn wait_and_notify(
+    serial: &mut SerialPort,
+    target: &mut GdbTarget,
+    vcont_state: &mut RspState,
+) {
+    loop {
+        let status = loop {
+            let s = target.poll_status();
+            if s != "running" && !s.is_empty() && s != "none" {
+                break s;
+            }
+            crate::proc::scheduler::yield_now();
+        };
 
-    // Format as RSP stop reply if not already.
-    let reply = if stop_reply.starts_with('T') || stop_reply.starts_with('W') {
-        rsp_packet(&stop_reply)
-    } else {
-        rsp_packet("T05") // generic SIGTRAP
-    };
-    send_response(serial, &reply);
+        // Determine current PC via the arch-appropriate trait.
+        #[cfg(target_arch = "x86_64")]
+        let pc = crate::debug::gdbstub::arch::X86_64::pc(target.trap_frame());
+        #[cfg(target_arch = "riscv64")]
+        let pc = crate::debug::gdbstub::arch::RiscV64::pc(target.trap_frame());
+        #[cfg(target_arch = "aarch64")]
+        let pc = crate::debug::gdbstub::arch::AArch64::pc(target.trap_frame());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
+        let pc: u64 = 0;
+
+        if vcont_state.range_step.is_some() && !range_step_done(vcont_state, pc) {
+            // Still inside the range — re-arm single-step and continue.
+            target.ctl("step");
+            continue;
+        }
+
+        // Out of range or not a range-step: send stop reply.
+        vcont_state.halted = true;
+        vcont_state.range_step = None;
+
+        let reply = if status.starts_with('T') || status.starts_with('W') {
+            rsp_packet(&status)
+        } else {
+            rsp_packet("T05")
+        };
+        send_response(serial, &reply);
+        return;
+    }
 }
 
-/// Register `/dev/gdbstub` in devfs so GDB can open it as a serial device.
-///
-/// Must be called after devfs is mounted (i.e. after `init_mounts`).
+/// Register `/dev/gdbstub` in devfs.
 pub fn register_dev() {
-    // devfs::register_char_dev creates a char-device node with the given name,
-    // major, and minor.  We reuse the ttyS0 major (4) and pick minor 66 to
-    // avoid conflicting with existing ttyS* nodes (minor 64 = ttyS0, 65 = ttyS1).
     crate::fs::devfs::register_char_dev("gdbstub", 4, 66);
 }
 
 /// Attach to `pid` and drive the RSP loop until the debugger detaches or
-/// kills the target.  Returns when the session is done.
-///
-/// `serial` must already be initialised (call `serial.init()` once at boot).
+/// kills the target.
 pub fn run(serial: &mut SerialPort, pid: usize) {
-    // Stop the target so we can inspect it.
     crate::proc::signal::send_signal(pid, 19); // SIGSTOP
 
     let mut target = match GdbTarget::attach(pid) {
         Some(t) => t,
         None => {
-            let err = rsp_packet("E01");
-            send_response(serial, &err);
+            send_response(serial, &rsp_packet("E01"));
             return;
         },
     };
 
-    let mut session = Session::new();
+    let mut session     = Session::new();
+    let mut vcont_state = RspState::new();
 
-    // Send an initial stop reply so GDB sees the target as halted.
-    let initial = rsp_packet("T05");
-    send_response(serial, &initial);
+    // Initial stop reply.
+    send_response(serial, &rsp_packet("T05"));
 
     loop {
         match recv_packet(serial) {
             None => {
-                // 0x03 Ctrl-C: stop a running target
+                // Ctrl-C: stop a running target.
                 target.ctl("stop");
-                let stop = rsp_packet("T02"); // SIGINT
-                send_response(serial, &stop);
+                vcont_state.halted    = true;
+                vcont_state.range_step = None;
+                send_response(serial, &rsp_packet("T02")); // SIGINT
             },
+
             Some(body) => {
+                // --- vCont interception (before the generic handler) ---
+                if body.starts_with("vCont") {
+                    let reply = handle_vcont(&body, target.trap_frame_mut(), &mut vcont_state);
+                    if !reply.is_empty() {
+                        // Non-empty reply means immediate stop (vCont;t or vCont?).
+                        send_response(serial, &rsp_packet(&reply));
+                    } else if !vcont_state.halted {
+                        // Target is now running — wait for the next stop.
+                        wait_and_notify(serial, &mut target, &mut vcont_state);
+                    }
+                    continue;
+                }
+
+                // --- Generic RSP dispatch ---
                 let resp = handle_packet(&body, &mut target, &mut session);
 
-                // 'c' and 's' return an empty string — we must block until
-                // the target stops before sending the next stop reply.
                 if resp.is_empty() {
-                    // Check if this was a continue/step (not kill)
-                    if !body.is_empty()
-                        && (body.as_bytes()[0] == b'c' || body.as_bytes()[0] == b's')
-                    {
-                        wait_and_notify(serial, &mut target);
+                    // 'c' or 's' — wait for stop.
+                    if body.as_bytes().first().map_or(false, |&b| b == b'c' || b == b's') {
+                        wait_and_notify(serial, &mut target, &mut vcont_state);
                     }
-                    // 'k' sends "OK" then we're done — handled by the Ok branch
                 } else {
                     send_response(serial, &resp);
-
-                    // Detach on 'D' packet (explicit detach from GDB)
                     if body.as_bytes().first() == Some(&b'D') {
                         session.detach(&mut target);
                         break;
@@ -194,9 +192,6 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
 }
 
 /// Initialise the stub's serial port and register `/dev/gdbstub`.
-///
-/// Call once from the kernel init path, after devfs is mounted.
-/// After this, GDB can connect over the serial UART.
 ///
 /// # Safety
 /// Must be called exactly once; no concurrent users of COM1.
