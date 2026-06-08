@@ -34,8 +34,18 @@ pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
     crate::mm::init();
     crate::security::init();
 
-    #[cfg(feature = "debug_stub")]
-    crate::debug::init();
+    // Mirror the x86_64 pattern (kernel_main.rs:141): gate on `gdbstub`,
+    // not the stale `debug_stub` name, and call the real session init.
+    // `pub mod debug` in lib.rs is compiled only when `gdbstub` is active,
+    // so `crate::debug::init()` (which does not exist) would fail to compile.
+    #[cfg(feature = "gdbstub")]
+    {
+        static mut GDBSTUB_SERIAL: crate::debug::gdbstub::serial::SerialPort =
+            unsafe { crate::debug::gdbstub::serial::SerialPort::new() };
+        unsafe {
+            crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL);
+        }
+    }
 
     crate::display::framebuffer::init();
     crate::display::drm::init();
