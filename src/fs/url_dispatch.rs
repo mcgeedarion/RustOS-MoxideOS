@@ -535,6 +535,7 @@ fn dev_read_input_event(
     buf: &mut [u8],
 ) -> Result<usize, SchemeError> {
     const EV_SIZE: usize = core::mem::size_of::<crate::input::InputEvent>();
+    const READABLE_EVENTS: u32 = crate::fs::poll::POLLIN | crate::fs::poll::POLLRDNORM;
 
     if buf.len() < EV_SIZE {
         return Err(SchemeError::InvalidArg);
@@ -576,6 +577,10 @@ fn dev_read_input_event(
             written += EV_SIZE;
         }
 
+        if !dev.ring.is_readable() {
+            dev.waitq.clear(READABLE_EVENTS);
+        }
+
         if written > 0 {
             dev_clear_input_readiness_if_empty(dev);
             return Ok(written);
@@ -585,6 +590,15 @@ fn dev_read_input_event(
             return Err(SchemeError::WouldBlock);
         }
 
+        // `WaitQueue::wait` has a readiness-bit fast path.  Once this reader
+        // has drained the input ring, clear the consumed readability bits and
+        // re-check the ring before sleeping so stale readiness cannot turn a
+        // blocking read into a spin loop.
+        if dev.ring.is_readable() {
+            continue;
+        }
+
+        let _ = dev.waitq.wait(READABLE_EVENTS, None, None);
         dev_clear_input_readiness_if_empty(dev);
         let _ = dev.waitq.wait(dev_input_ready_mask(), None, None);
     }
