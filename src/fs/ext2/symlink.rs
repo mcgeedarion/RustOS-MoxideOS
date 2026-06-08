@@ -13,4 +13,4 @@ use alloc::{
 
 /// File type mask for an ext2 inode mode.
 const EXT2_S_IFMT: u16 = 0xF000;
-/// ext2 inode mode file-type
+///
