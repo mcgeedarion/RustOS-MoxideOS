@@ -1,42 +1,41 @@
-# ⚠️  CRITICAL: Keep this file synchronized with:
-#   - Dockerfile (ARG NIGHTLY_DATE)
-#   - flake.nix (rustToolchain = ...)
-# Mismatches will cause subtle build failures.
+# rust-toolchain.toml
 #
-# WHY NIGHTLY — unstable features in use:
-#   naked_functions      — zero-overhead asm entry points (boot, trap vectors,
-#                          syscall entry, AP trampoline).
-#                          Tracking: https://github.com/rust-lang/rust/issues/90957
-#   alloc_error_handler  — custom OOM handler in no_std heap.
-#                          Tracking: https://github.com/rust-lang/rust/issues/51540
-#   core_intrinsics      — memory barriers / compiler-fence in PMM + percpu paths.
-#   abi_x86_interrupt    — x86_64 interrupt calling convention for IDT handlers
-#                          (cfg(target_arch = "x86_64") only).
-#   -Z build-std         — cross-compile core/alloc/compiler_builtins for
-#                          riscv64-uefi.json and x86_64-unknown-none.
+# Pins the Rust toolchain used by this repository.
 #
-# UPGRADING:
-#   1. Update `channel` below (format: nightly-YYYY-MM-DD).
-#   2. Sync NIGHTLY_DATE in Dockerfile and flake.nix to the same date.
-#   3. Run `cargo build` for each target and fix any API churn.
-#   4. Update CHANGELOG with the new pin and reason.
-#   5. Verify all three files match before merging.
+# Keep this date synchronized with:
+#   - flake.nix: nightlyDate
 #
-# TODO: Track stabilization of required features to move to stable channel.
-# Current blockers: naked_functions (tracked above), abi_x86_interrupt
+# Why nightly is currently required:
+#   - The kernel crate uses nightly feature gates.
+#   - The build uses -Z build-std for freestanding/custom targets.
+#
+# When upgrading:
+#   1. Update `channel` below.
+#   2. Update `nightlyDate` in flake.nix to the same date.
+#   3. Run the normal build matrix:
+#        cargo build --target riscv64gc-unknown-none-elf --no-default-features
+#        cargo build --target x86_64-unknown-none --no-default-features
+#        cargo build --target targets/riscv64-uefi.json --features uefi_boot
+#        cargo build --target targets/aarch64-uefi-loader.json
+#   4. Run formatting and lint checks.
+#   5. Document the upgrade reason in CHANGELOG.md.
 
 [toolchain]
 channel = "nightly-2026-06-07"
 profile = "minimal"
+
 components = [
-  "rust-src",            # required by -Z build-std
-  "llvm-tools-preview",  # required by cargo-objcopy / llvm-strip
-  "rustfmt",             # enforced by fmt.yml CI
-  "clippy",              # optional: cargo clippy --target
+  "rust-src",            # Required by -Z build-std.
+  "llvm-tools-preview",  # Required by cargo-binutils / llvm tools.
+  "rustfmt",             # Required by cargo fmt / CI formatting checks.
+  "clippy",              # Required by cargo clippy / CI lint checks.
 ]
-# Targets pre-installed locally; CI installs only what it needs.
+
 targets = [
-  "riscv64gc-unknown-none-elf",  # SBI / bare RISC-V boot
-  "x86_64-unknown-none",         # x86_64 bare-metal
+  "riscv64gc-unknown-none-elf",  # RISC-V SBI / bare-metal target.
+  "x86_64-unknown-none",         # x86_64 bare-metal target.
 ]
-# Custom targets (riscv64-uefi.json, aarch64-uefi-loader.json) use --target <json> with -Z build-std
+
+# Custom JSON targets are not rustup-installed targets:
+#   - targets/riscv64-uefi.json
+#   - targets/aarch64-uefi-loader.json
