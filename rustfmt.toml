@@ -1,29 +1,18 @@
-max_width = 100
-tab_spaces = 4
+# rustfmt.toml
+# Keep this aligned with rust-toolchain.toml and CI.
+
+unstable_features = true
+
 edition = "2021"
+style_edition = "2021"
 
-# Function formatting
-fn_single_line = false
-fn_params_layout = "Tall"
-
-# Import organization
-reorder_imports = true
-reorder_modules = true
-
-# Trailing commas
-trailing_comma = "Vertical"
-
-# Comment formatting
-wrap_comments = true
-comment_width = 80
+max_width = 100
+newline_style = "Unix"
 
 # Match formatting
 match_block_trailing_comma = true
+
+# Comment formatting
+wrap_comments = true
+comment_width = 100
 normalize_comments = true
-
-# Spacing
-space_after_colon = true
-space_before_colon = false
-
-# Remove control
-remove_nested_parens = true
