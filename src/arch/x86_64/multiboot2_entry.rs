@@ -7,7 +7,7 @@
 //!
 //! `_start` saves EBX/EAX *before* touching the stack (the stack pointer is
 //! still undefined at that point), sets RSP, then tail-calls
-//! `multiboot2_start(magic, mbi_ptr)` which validates magic, records the MBI
+//! `multiboot2_entry(magic, mbi_ptr)` which validates magic, records the MBI
 //! pointer, and enters the common `kernel_main`.
 //!
 //! For the UEFI path see `uefi_entry.rs`.
@@ -16,7 +16,7 @@ use super::uefi_entry::RSDP_PHYS;
 use crate::init::boot_info::BootInfo;
 
 /// Physical address of the MBI passed by the boot loader.
-/// Written once by `multiboot2_start` before any other code runs.
+/// Written once by `multiboot2_entry` before any other code runs.
 pub static mut MBI_PTR: usize = 0;
 
 /// Multiboot2 / QEMU `-kernel` entry point.
@@ -24,7 +24,7 @@ pub static mut MBI_PTR: usize = 0;
 /// Naked so we control every register before `call`.  We must save EBX (MBI
 /// physical address) and EAX (magic) into callee-saved registers *before*
 /// establishing a stack, then set up RSP and forward them to
-/// `multiboot2_start`.
+/// `multiboot2_entry`.
 #[no_mangle]
 #[unsafe(naked)]
 pub unsafe extern "C" fn _start() -> ! {
@@ -39,11 +39,11 @@ pub unsafe extern "C" fn _start() -> ! {
         "xor  rbp, rbp",
         // No RSDP on this path.
         "mov  qword ptr [rip + {rsdp}], 0",
-        // Call multiboot2_start(magic: u32, mbi_ptr: usize).
+        // Call multiboot2_entry(magic: u32, mbi_ptr: usize).
         // System-V ABI: rdi = arg0, rsi = arg1.
         "mov  edi, r14d",
         "mov  rsi, r15",
-        "call multiboot2_start",
+        "call multiboot2_entry",
         // Should never return; halt if it does.
         "2:",
         "hlt",
@@ -58,7 +58,7 @@ pub unsafe extern "C" fn _start() -> ! {
 /// Validates magic, records `MBI_PTR` for later use by `parse_mbi`, then
 /// enters the common kernel entry point.
 #[no_mangle]
-pub unsafe extern "C" fn multiboot2_start(magic: u32, mbi_ptr: usize) -> ! {
+pub unsafe extern "C" fn multiboot2_entry(magic: u32, mbi_ptr: usize) -> ! {
     const MB2_MAGIC: u32 = 0x36d7_6289;
     if magic == MB2_MAGIC {
         MBI_PTR = mbi_ptr;
