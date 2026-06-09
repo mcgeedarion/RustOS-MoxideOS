@@ -27,10 +27,13 @@
 #[used]
 static MULTIBOOT2_HEADER: Multiboot2Header = Multiboot2Header::new();
 
-// Header total size = 16 (fixed) + 8 (end tag) + 12 (mmap request) + 20 (fb
-// tag) = 56 bytes. We also add a module request (type 3) so GRUB passes the
-// initrd as a module.
-const HEADER_LEN: u32 = 72; // 16 + 12 (info-req mmap) + 12 (info-req module) + 20 (fb) + 8 (end) + 4 pad
+// Header total size (bytes):
+//   Fixed part:          magic(4) + arch(4) + header_len(4) + checksum(4) = 16
+//   Tag 1 (info-req):   type(2) + flags(2) + size(4) + mmap(4) + mod(4)  = 16
+//   Tag 5 (framebuf):   type(2) + flags(2) + size(4) + w(4) + h(4) + d(4)= 20
+//   End tag:            type(2) + flags(2) + size(4)                       =  8
+//                                                                   Total  = 60
+const HEADER_LEN: u32 = 60;
 
 #[repr(C, align(8))]
 struct Multiboot2Header {
@@ -148,7 +151,7 @@ pub unsafe fn parse_mbi(mbi_ptr: usize) {
                             len,
                         );
                         // Record for initramfs::load().
-                        crate::initramfs::set_initramfs_range(mod_start, len);
+                        crate::fs::initramfs::set_initramfs_range(mod_start, len);
                         // Only use the first module as the initrd.
                         // If there are multiple modules, subsequent ones are
                         // ignored.

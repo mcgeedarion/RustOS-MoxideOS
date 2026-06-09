@@ -5,11 +5,13 @@
 //!   EAX = 0x36D76289  (Multiboot2 magic)
 //!   EBX = physical address of the MBI structure
 //!
-//! `_start` saves EBX/EAX *before* touching the stack (the stack pointer is
-//! still undefined at that point), sets RSP, then tail-calls
-//! `multiboot2_entry(magic, mbi_ptr)` which validates magic, records the MBI
-//! pointer, and enters the common `kernel_main`.
+//! `_start` is the naked assembly shim in `boot.s` which:
+//!   1. Stashes EBX/EAX into callee-saved registers.
+//!   2. Sets RSP to `__boot_stack_top` (the 32 KiB stack in the linker
+//!      script `.bss` section).
+//!   3. Calls `multiboot2_entry(magic, mbi_ptr)`.
 //!
+//! There is no separate boot stack in this file — `boot.s` owns the stack.
 //! For the UEFI path see `uefi_entry.rs`.
 
 use super::uefi_entry::RSDP_PHYS;
@@ -19,46 +21,17 @@ use crate::init::boot_info::BootInfo;
 /// Written once by `multiboot2_entry` before any other code runs.
 pub static mut MBI_PTR: usize = 0;
 
-/// Multiboot2 / QEMU `-kernel` entry point.
-///
-/// Naked so we control every register before `call`.  We must save EBX (MBI
-/// physical address) and EAX (magic) into callee-saved registers *before*
-/// establishing a stack, then set up RSP and forward them to
-/// `multiboot2_entry`.
-#[no_mangle]
-#[unsafe(naked)]
-pub unsafe extern "C" fn _start() -> ! {
-    core::arch::asm!(
-        // Save Multiboot2 arguments before RSP is valid.
-        // EBX = MBI ptr  →  r15 (callee-saved, survives the call)
-        // EAX = magic    →  r14
-        "mov  r15, rbx",
-        "mov  r14d, eax",
-        // Establish boot stack.
-        "lea  rsp, [rip + BOOT_STACK_TOP]",
-        "xor  rbp, rbp",
-        // No RSDP on this path.
-        "mov  qword ptr [rip + {rsdp}], 0",
-        // Call multiboot2_entry(magic: u32, mbi_ptr: usize).
-        // System-V ABI: rdi = arg0, rsi = arg1.
-        "mov  edi, r14d",
-        "mov  rsi, r15",
-        "call multiboot2_entry",
-        // Should never return; halt if it does.
-        "2:",
-        "hlt",
-        "jmp  2b",
-        rsdp = sym RSDP_PHYS,
-        options(noreturn)
-    );
-}
-
-/// Rust trampoline called from `_start` with the Multiboot2 magic and MBI ptr.
+/// Rust trampoline called from `_start` (boot.s) with the Multiboot2 magic
+/// and MBI ptr.
 ///
 /// Validates magic, records `MBI_PTR` for later use by `parse_mbi`, then
 /// enters the common kernel entry point.
 #[no_mangle]
 pub unsafe extern "C" fn multiboot2_entry(magic: u32, mbi_ptr: usize) -> ! {
+    // No RSDP on the Multiboot2 path — zero it with a plain Rust write
+    // rather than a sym operand in naked asm (which is fragile under PIE).
+    RSDP_PHYS = 0;
+
     const MB2_MAGIC: u32 = 0x36d7_6289;
     if magic == MB2_MAGIC {
         MBI_PTR = mbi_ptr;
@@ -70,18 +43,6 @@ pub unsafe extern "C" fn multiboot2_entry(magic: u32, mbi_ptr: usize) -> ! {
     }
     kernel_main(&BOOT_INFO)
 }
-
-/// 16 KiB boot stack used until `gdt::init()` allocates a proper per-CPU
-/// kstack.
-#[link_section = ".bss"]
-static mut BOOT_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
-
-/// Top-of-stack symbol — RSP is pointed here by `_start`.
-/// Linker places this immediately after `BOOT_STACK` in `.bss`; stack grows
-/// down.
-#[no_mangle]
-#[link_section = ".bss"]
-static BOOT_STACK_TOP: [u8; 0] = [];
 
 /// `BootInfo` for the bare-metal / Multiboot2 path.
 /// Fields that Multiboot2 doesn't provide (EFI map, framebuffer) stay zeroed;
