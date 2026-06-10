@@ -71,6 +71,8 @@ run_test() {
     local name="$1"
     local src="$2"
     local bin="${BUILD_DIR}/${name}"
+    local output=""
+    local exit_code=0
 
     printf 'Building %-30s ... ' "$name"
     if ! $CC $CFLAGS -o "$bin" "$src" -lpthread -lrt \
@@ -90,11 +92,22 @@ run_test() {
     fi
 
     printf 'Running  %-30s ... ' "$name"
+    set +e
     output=$("$bin" 2>/dev/null)
     exit_code=$?
+    set -e
 
     case "$output" in
-        *PASS*) echo "PASS"; PASS=$((PASS + 1)) ;;
+        *PASS*)
+            if [[ "$exit_code" -eq 0 ]]; then
+                echo "PASS"
+                PASS=$((PASS + 1))
+            else
+                echo "FAIL (exit=${exit_code}, emitted PASS)"
+                "$bin" 2>&1 || true
+                FAIL=$((FAIL + 1))
+            fi
+            ;;
         *SKIP*) echo "SKIP"; SKIP=$((SKIP + 1)) ;;
         *)
             echo "FAIL (exit=${exit_code})"

@@ -85,7 +85,7 @@ fn compile_crt(target_arch: &str) {
 /// targets, prefer Clang with an explicit target triple so host `cc` is not
 /// invoked with incompatible `-march`/`-mabi` flags.
 fn configure_crt_compiler(build: &mut cc::Build, target_arch: &str) {
-    if std::env::var_os("CC").is_some() || std::env::var_os("TARGET_CC").is_some() {
+    if explicit_cc_override_is_set(target_arch) {
         return;
     }
 
@@ -100,6 +100,27 @@ fn configure_crt_compiler(build: &mut cc::Build, target_arch: &str) {
         },
         _ => {},
     }
+}
+
+fn explicit_cc_override_is_set(target_arch: &str) -> bool {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let normalized_target = target.replace('-', "_");
+    let upper_target = normalized_target.to_ascii_uppercase();
+
+    let mut vars = vec![
+        "CC".to_string(),
+        "TARGET_CC".to_string(),
+        format!("CC_{target_arch}"),
+    ];
+
+    if !normalized_target.is_empty() {
+        vars.push(format!("CC_{normalized_target}"));
+    }
+    if !upper_target.is_empty() {
+        vars.push(format!("CC_{upper_target}"));
+    }
+
+    vars.into_iter().any(|var| std::env::var_os(var).is_some())
 }
 
 fn command_exists(name: &str) -> bool {
