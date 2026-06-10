@@ -15,28 +15,14 @@
 
   "executables": true,
 
-  /*
-   * Disable the red-zone: exception handlers on AArch64 can fire at any time
-   * and would corrupt a red-zone below SP.
-   */
   "disable-redzone": true,
 
   "panic-strategy": "abort",
 
   "relocation-model": "static",
 
-  /*
-   * "small" code model: all symbols within a 4 GiB range.
-   * Matches the static kernel image assumption in linker/aarch64.ld and
-   * consistent with aarch64-uefi-loader.json.
-   */
   "code-model": "small",
 
-  /*
-   * Disable NEON/FP entirely: the kernel must not touch the FP/SIMD register
-   * file because those registers are not saved on exception entry by default.
-   * +strict-align prevents unaligned accesses (required for device MMIO).
-   */
   "features": "-neon,-fp-armv8,+strict-align",
 
   "max-atomic-width": 128,
