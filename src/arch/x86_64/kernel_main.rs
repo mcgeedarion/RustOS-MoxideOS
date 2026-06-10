@@ -11,8 +11,7 @@
 //!   3. syscall_setup()               — SYSCALL/SYSRET MSRs
 //!   4. serial::init()                — full 16550 reinit
 //!   5. arch::x86_64::memory::discover() → pmm::init_from_regions()
-//!   5b. time::init()                  — TSC/HPET calibration (BEFORE
-//! apic_init)
+//!   5b. time::init()                  — TSC/HPET calibration (BEFORE apic_init)
 //!   6. xsave_init()                  — XSAVE/FXSAVE feature detection
 //!   7. acpi_init()                   — RSDP → MADT: CPU list, I/O APIC
 //!   8. pcie_init()                   — PCIe bus enumeration + BAR
@@ -43,9 +42,6 @@ use core::arch::asm;
 
 const VIRTIO_BLK_MMIO_BASE: usize = 0x1000_1000;
 
-// GDB stub uses its own SerialPort instance on COM1 (separate from the
-// console which is write-only).  Guarded so it isn't compiled in at all
-// unless the `gdbstub` feature is active.
 #[cfg(feature = "gdbstub")]
 static mut GDBSTUB_SERIAL: crate::debug::gdbstub::serial::SerialPort =
     unsafe { crate::debug::gdbstub::serial::SerialPort::new() };
@@ -86,7 +82,6 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
 
     crate::serial_println!("rustos: booting");
 
-    // 5. Arch-specific discovery → PMM.
     let regions = crate::arch::x86_64::memory::discover();
     unsafe {
         crate::mm::pmm::init_from_regions(&regions);
@@ -98,6 +93,7 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
 
     xsave_init();
 
+    // ACPI init — on multiboot path RSDP_PHYS is uninitialized (zero or garbage).
     let rsdp_pa = unsafe { crate::arch::x86_64::uefi_entry::RSDP_PHYS };
     crate::firmware::acpi::acpi_init(rsdp_pa);
     crate::serial_println!("acpi: {} CPU(s)", crate::firmware::acpi::cpu_count());
@@ -137,7 +133,6 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
         crate::serial_println!("block: no disk — ramfs only");
     }
 
-    // 12b. GDB stub — init after devfs is live (initramfs::mount sets up /dev).
     #[cfg(feature = "gdbstub")]
     unsafe {
         crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL);

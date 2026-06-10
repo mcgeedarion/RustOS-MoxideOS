@@ -184,13 +184,7 @@ case "$ARCH:$BOOT" in
   aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
 esac
 
-if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
-  if [[ "$BOOT" == "uefi" ]]; then
-    echo "[!] --test/--smoke currently require a direct -kernel boot mode, not UEFI" >&2
-    echo "[!] Use x86_64 --boot multiboot, riscv64 --boot sbi, or aarch64 --boot baremetal." >&2
-    exit 2
-  fi
-fi
+# smoke/test + UEFI guard removed — will attempt and fail at runtime.
 
 cleanup() {
   rm -rf "${KMTEST_STAGE:-}" "${SMOKE_STAGE:-}"
