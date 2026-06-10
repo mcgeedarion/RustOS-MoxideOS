@@ -17,11 +17,6 @@ const RISCV_LIB_NAME: &str = "libuentry_riscv64.a";
 const RISCV_FLAGS: &[&str] = &["-march=rv64gc", "-mabi=lp64d"];
 const RISCV_TRIPLE: &str = "riscv64-unknown-elf";
 
-const UEFI_OUTPUT_DIR: &str = "target/esp/EFI/BOOT";
-const UEFI_OUTPUT_FILE: &str = "BOOTX64.EFI";
-const UEFI_TARGET: &str = "efi-app-x86_64";
-const UEFI_SUBSYSTEM: &str = "10"; // EFI_APPLICATION
-
 const CRT_COMPILE_FLAGS: &[&str] = &[
     "-ffreestanding",
     "-nostdlib",
@@ -42,8 +37,11 @@ fn main() {
         assemble_riscv_uentry(&out);
     }
 
-    if target_arch == "x86_64" && std::env::var("CARGO_FEATURE_UEFI_BOOT").is_ok() {
-        produce_uefi_image(&out);
+    // UEFI image production is handled by `cargo xtask build/image` after Cargo
+    // has produced the final `rustos` ELF. Doing this from build.rs is too early
+    // in Cargo's build graph and previously used stale target paths.
+    if std::env::var("CARGO_FEATURE_UEFI_BOOT").is_ok() {
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UEFI_BOOT");
     }
 
     if std::env::var("CARGO_FEATURE_TRACE").is_ok() {
@@ -141,82 +139,6 @@ fn assemble_riscv_uentry(out: &PathBuf) {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=uentry_riscv64");
-}
-
-/// Convert the ELF kernel to a PE32+ UEFI application (BOOTX64.EFI).
-fn produce_uefi_image(_out: &PathBuf) {
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    let elf_path = PathBuf::from(format!("target/x86_64-unknown-none/{profile}/rustos"));
-
-    println!("cargo:rerun-if-changed={}", elf_path.display());
-
-    if !elf_path.exists() {
-        println!("cargo:warning=ELF not yet built; re-run `cargo build` to produce BOOTX64.EFI");
-        return;
-    }
-
-    let esp_dir = PathBuf::from(UEFI_OUTPUT_DIR);
-    let _ = std::fs::create_dir_all(&esp_dir);
-    let efi_path = esp_dir.join(UEFI_OUTPUT_FILE);
-
-    let objcopy_bin = locate_llvm_objcopy();
-
-    if !run_command(
-        {
-            let mut cmd = Command::new(&objcopy_bin);
-            cmd.args([
-                format!("--target={UEFI_TARGET}"),
-                format!("--subsystem={UEFI_SUBSYSTEM}"),
-            ])
-            .arg(elf_path.to_str().unwrap())
-            .arg(efi_path.to_str().unwrap());
-            cmd
-        },
-        "UEFI image conversion",
-    ) {
-        println!(
-            "cargo:warning=UEFI image conversion failed; \
-            ensure llvm-objcopy available via: rustup component add llvm-tools-preview"
-        );
-        return;
-    }
-
-    println!("cargo:warning=UEFI image produced: {}", efi_path.display());
-}
-
-/// Locate llvm-objcopy from the active rustup toolchain, falling back to PATH.
-fn locate_llvm_objcopy() -> String {
-    let sysroot = String::from_utf8_lossy(
-        &Command::new("rustc")
-            .args(["--print", "sysroot"])
-            .output()
-            .map(|o| o.stdout)
-            .unwrap_or_default(),
-    )
-    .trim()
-    .to_string();
-
-    let host_triple = String::from_utf8_lossy(
-        &Command::new("rustc")
-            .args(["-vV"])
-            .output()
-            .map(|o| o.stdout)
-            .unwrap_or_default(),
-    )
-    .lines()
-    .find(|l| l.starts_with("host:"))
-    .map(|l| l[5..].trim().to_string())
-    .unwrap_or_default();
-
-    let candidate = PathBuf::from(&sysroot)
-        .join("lib/rustlib")
-        .join(&host_triple)
-        .join("bin/llvm-objcopy");
-
-    candidate
-        .exists()
-        .then(|| candidate.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "llvm-objcopy".to_string())
 }
 
 fn run_command(mut cmd: Command, context: &str) -> bool {
