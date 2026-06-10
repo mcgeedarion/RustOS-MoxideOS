@@ -6,7 +6,7 @@
 #
 # Optional env:
 #   RELEASE    1 => --release  (default: 0)
-#   BOOT       uefi | multiboot | sbi  (default: uefi)
+#   BOOT       uefi | sbi | baremetal  (default: uefi)
 #   FEATURES   extra --features value appended verbatim
 #
 # Sets/exports on success:
@@ -59,9 +59,6 @@ case "$ARCH" in
     CARGO_TARGET="x86_64-unknown-none"
     KERNEL_ELF="target/${CARGO_TARGET}/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
     EXTRA_FLAGS=()
-    if [[ "$BOOT" == "multiboot" ]]; then
-      EXTRA_FLAGS+=(--no-default-features --features multiboot2_boot)
-    fi
     ;;
 esac
 

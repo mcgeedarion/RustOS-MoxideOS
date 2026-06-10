@@ -13,7 +13,7 @@ jobs:
       - name: Install host tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm llvm lld ripgrep musl-tools cpio mtools
+          sudo apt-get install -y llvm lld ripgrep musl-tools cpio mtools
       - name: Show pinned toolchain
         run: rustup show
       - name: Check formatting
@@ -44,14 +44,12 @@ jobs:
             boot: uefi
           - arch: x86_64
             boot: uefi
-          - arch: x86_64
-            boot: multiboot
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm llvm lld musl-tools cpio mtools gcc-riscv64-unknown-elf
+          sudo apt-get install -y llvm lld musl-tools cpio mtools gcc-riscv64-unknown-elf
       - name: Build ${{ matrix.arch }} ${{ matrix.boot }}
         run: cargo xtask build --arch ${{ matrix.arch }} --boot ${{ matrix.boot }}
 
@@ -63,8 +61,8 @@ jobs:
       - name: Install QEMU and userspace tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm llvm lld musl-tools cpio qemu-system-x86
-      - name: Run x86_64 multiboot smoke
-        run: ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot multiboot --smoke --timeout 60
-      - name: Run x86_64 multiboot kmtest
-        run: ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot multiboot --test --timeout 90
+          sudo apt-get install -y llvm lld musl-tools cpio mtools ovmf qemu-system-x86
+      - name: Run x86_64 UEFI smoke
+        run: ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot uefi --smoke --timeout 60
+      - name: Run x86_64 UEFI kmtest
+        run: ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot uefi --test --timeout 90

@@ -8,9 +8,9 @@
 //! `set_initramfs_range()` before the heap is initialised, so no allocation is
 //! needed.
 //!
-//! On **x86_64 / multiboot2**: the multiboot2 tag type 3 (module) carries the
-//! initrd start/end physical addresses.  The x86_64 boot stub calls
-//! `set_initramfs_range()` after parsing the multiboot2 header.
+//! On **x86_64 / UEFI**: the UEFI stub receives the initrd via the
+//! `LoadFile2` protocol and calls `set_initramfs_range()` with the physical
+//! address and byte length before jumping to `kernel_main`.
 //!
 //! ## Public API
 //!
@@ -29,7 +29,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 static INITRAMFS_PA: AtomicUsize = AtomicUsize::new(0);
 static INITRAMFS_LEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Called by the boot stub (FDT walker on RISC-V, multiboot2 tag parser 
+/// Called by the boot stub (FDT walker on RISC-V, UEFI stub on x86_64/aarch64)
+/// to register the initramfs physical range before heap init.
 pub fn set_initramfs_range(phys_start: usize, byte_len: usize) {
     INITRAMFS_PA.store(phys_start, Ordering::Relaxed);
     INITRAMFS_LEN.store(byte_len, Ordering::Relaxed);

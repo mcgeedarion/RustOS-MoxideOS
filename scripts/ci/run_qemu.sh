@@ -4,12 +4,12 @@
 # Canonical run contract:
 #   aarch64: uefi | baremetal
 #   riscv64: uefi | sbi
-#   x86_64:  uefi | multiboot
+#   x86_64:  uefi
 #
 # Canonical ESP path:
 #   target/esp/<arch>/EFI/BOOT/BOOT*.EFI
 #
-# Default ARCH is x86_64 (formerly run_qemu_x86_64.sh entry point).
+# Default ARCH is x86_64.
 # Override with:  ARCH=riscv64 ./scripts/ci/run_qemu.sh ...
 
 set -euo pipefail
@@ -33,7 +33,7 @@ Usage:
   ARCH=<aarch64|riscv64|x86_64> ./scripts/ci/run_qemu.sh [options] [disk.img]
 
 Options:
-  --boot <uefi|multiboot|sbi|baremetal>
+  --boot <uefi|sbi|baremetal>
   --release
   --gpu               x86_64 only
   --gdb               wait for GDB on :1234
@@ -72,12 +72,8 @@ case "$ARCH" in
   *) echo "[!] Unsupported ARCH='$ARCH'" >&2; exit 2 ;;
 esac
 
-if [[ "$ARCH" == "x86_64" && "$BOOT" == "qemu" ]]; then
-  BOOT="multiboot"
-fi
-
 case "$ARCH:$BOOT" in
-  aarch64:uefi|aarch64:baremetal|riscv64:uefi|riscv64:sbi|x86_64:uefi|x86_64:multiboot) ;;
+  aarch64:uefi|aarch64:baremetal|riscv64:uefi|riscv64:sbi|x86_64:uefi) ;;
   *) echo "[!] Unsupported run contract: ARCH=$ARCH --boot $BOOT" >&2; exit 2 ;;
 esac
 
@@ -85,20 +81,6 @@ esac
 [[ "$GDB_MODE" -eq 1 && ( "$SMOKE_MODE" -eq 1 || "$TEST_MODE" -eq 1 ) ]] && { echo "[!] --gdb cannot be combined with --smoke/--test" >&2; exit 2; }
 [[ "$GPU_MODE" -eq 1 && "$ARCH" != "x86_64" ]] && { echo "[!] --gpu is only supported on x86_64" >&2; exit 2; }
 [[ ! "$TIMEOUT_SECS" =~ ^[0-9]+$ || "$TIMEOUT_SECS" -eq 0 ]] && { echo "[!] --timeout requires a positive integer" >&2; exit 2; }
-
-# smoke/test require a direct -kernel boot mode so QEMU can load the initrd.
-# If the user passed --boot uefi (or left it as the default), silently
-# downgrade to the appropriate direct-kernel mode for this arch.
-if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
-  if [[ "$BOOT" == "uefi" ]]; then
-    case "$ARCH" in
-      aarch64) BOOT="baremetal" ;;
-      riscv64) BOOT="sbi" ;;
-      x86_64)  BOOT="multiboot" ;;
-    esac
-    echo "[*] smoke/test: auto-selected --boot ${BOOT} for ${ARCH}"
-  fi
-fi
 
 PROFILE=$([[ "$RELEASE_MODE" -eq 1 ]] && echo release || echo debug)
 ESP_ROOT="${ROOT_DIR}/target/esp/${ARCH}"
@@ -110,7 +92,6 @@ case "$ARCH:$BOOT" in
   riscv64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"; TARGET_DIR="riscv64-uefi-loader"; EFI_NAME="BOOTRISCV64.EFI" ;;
   riscv64:sbi) CARGO_TARGET="riscv64gc-unknown-none-elf"; TARGET_DIR="riscv64gc-unknown-none-elf" ;;
   x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"; TARGET_DIR="x86_64-kernel"; EFI_NAME="BOOTX64.EFI" ;;
-  x86_64:multiboot) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-multiboot.json"; TARGET_DIR="x86_64-multiboot" ;;
 esac
 
 KERNEL_ELF="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos"
@@ -195,7 +176,6 @@ case "$ARCH:$BOOT" in
   aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
   riscv64:sbi) QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
   x86_64:uefi) QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=${FW_CODE}" -drive "if=pflash,format=raw,file=${FW_VARS}" -drive "if=virtio,format=raw,file=fat:rw:${ESP_ROOT},label=ESP") ;;
-  x86_64:multiboot) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
 esac
 
 cleanup() {
