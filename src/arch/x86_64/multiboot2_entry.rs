@@ -14,7 +14,6 @@
 //! There is no separate boot stack in this file — `boot.s` owns the stack.
 //! For the UEFI path see `uefi_entry.rs`.
 
-use super::uefi_entry::RSDP_PHYS;
 use crate::init::boot_info::BootInfo;
 
 /// Physical address of the MBI passed by the boot loader.
@@ -24,20 +23,20 @@ pub static mut MBI_PTR: usize = 0;
 /// Rust trampoline called from `_start` (boot.s) with the Multiboot2 magic
 /// and MBI ptr.
 ///
-/// Validates magic, records `MBI_PTR` for later use by `parse_mbi`, then
-/// enters the common kernel entry point.
+/// Accepts any magic value: if the magic matches MB2, MBI_PTR is recorded
+/// and parse_mbi runs; otherwise we boot with no MBI (ACPI already handles
+/// a null RSDP gracefully — see firmware/acpi/mod.rs).
 #[no_mangle]
 pub unsafe extern "C" fn multiboot2_entry(magic: u32, mbi_ptr: usize) -> ! {
-    // No RSDP on the Multiboot2 path — zero it with a plain Rust write
-    // rather than a sym operand in naked asm (which is fragile under PIE).
-    RSDP_PHYS = 0;
-
+    // RSDP_PHYS is a static mut and is zero-initialised by the linker, so
+    // ACPI will see rsdp_phys==0 and skip table parsing — no explicit zero
+    // write needed here.
     const MB2_MAGIC: u32 = 0x36d7_6289;
     if magic == MB2_MAGIC {
         MBI_PTR = mbi_ptr;
+    } else {
+        crate::serial_println!("multiboot2: unexpected magic {:#x}, booting without MBI", magic);
     }
-    // parse_mbi must run before heap_init in kernel_main so the initramfs
-    // physical range is recorded before initramfs::load() runs.
     if MBI_PTR != 0 {
         crate::arch::x86_64::multiboot2::parse_mbi(MBI_PTR);
     }

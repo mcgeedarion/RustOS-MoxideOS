@@ -86,6 +86,20 @@ esac
 [[ "$GPU_MODE" -eq 1 && "$ARCH" != "x86_64" ]] && { echo "[!] --gpu is only supported on x86_64" >&2; exit 2; }
 [[ ! "$TIMEOUT_SECS" =~ ^[0-9]+$ || "$TIMEOUT_SECS" -eq 0 ]] && { echo "[!] --timeout requires a positive integer" >&2; exit 2; }
 
+# smoke/test require a direct -kernel boot mode so QEMU can load the initrd.
+# If the user passed --boot uefi (or left it as the default), silently
+# downgrade to the appropriate direct-kernel mode for this arch.
+if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
+  if [[ "$BOOT" == "uefi" ]]; then
+    case "$ARCH" in
+      x86_64)  BOOT="multiboot" ;;
+      riscv64) BOOT="sbi" ;;
+      aarch64) BOOT="baremetal" ;;
+    esac
+    echo "[*] smoke/test: auto-selected --boot ${BOOT} for ${ARCH}"
+  fi
+fi
+
 PROFILE=$([[ "$RELEASE_MODE" -eq 1 ]] && echo release || echo debug)
 ESP_ROOT="${ROOT_DIR}/target/esp/${ARCH}"
 ESP_BOOT_DIR="${ESP_ROOT}/EFI/BOOT"
@@ -183,14 +197,6 @@ case "$ARCH:$BOOT" in
   riscv64:sbi) QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
   aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
 esac
-
-if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
-  if [[ "$BOOT" == "uefi" ]]; then
-    echo "[!] --test/--smoke currently require a direct -kernel boot mode, not UEFI" >&2
-    echo "[!] Use x86_64 --boot multiboot, riscv64 --boot sbi, or aarch64 --boot baremetal." >&2
-    exit 2
-  fi
-fi
 
 cleanup() {
   rm -rf "${KMTEST_STAGE:-}" "${SMOKE_STAGE:-}"
