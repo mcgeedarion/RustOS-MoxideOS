@@ -5,11 +5,14 @@
 #   x86_64:  apt install musl-tools   # provides musl-gcc
 #   RISC-V:  build musl from source targeting riscv64-linux-musl
 #            or: apt install gcc-riscv64-linux-gnu musl-dev
+#   AArch64: build musl from source targeting aarch64-linux-musl
+#            or install/provide aarch64-linux-musl-gcc on PATH
 #
 # Usage:
-#   make              # build x86_64 binaries (default)
-#   make ARCH=riscv64 # build RISC-V binaries
-#   make help         # show available targets
+#   make               # build x86_64 binaries (default)
+#   make ARCH=riscv64  # build RISC-V binaries
+#   make ARCH=aarch64  # build AArch64 binaries
+#   make help          # show available targets
 #
 # Output layout (matches build_initramfs.sh staging expectations):
 #   build/<arch>/init               → staged as /init        (PID 1)
@@ -21,22 +24,26 @@
 ARCH       ?= x86_64
 BUILD_DIR  := build/$(ARCH)
 
+COMMON_CFLAGS := -static -O2 -Wall -Wextra -std=c11
+
 ifeq ($(ARCH),x86_64)
-  CC      := musl-gcc
-  CFLAGS  := -static -O2 -ffreestanding -fno-stack-protector \
-             -Wall -Wextra -std=c11
+  CC           := musl-gcc
+  ARCH_CFLAGS  := -ffreestanding
 else ifeq ($(ARCH),riscv64)
-  CC      := riscv64-linux-musl-gcc
-  CFLAGS  := -static -O2 -march=rv64gc -mabi=lp64d \
-             -fno-stack-protector -Wall -Wextra -std=c11
+  CC           := riscv64-linux-musl-gcc
+  ARCH_CFLAGS  := -march=rv64gc -mabi=lp64d
+else ifeq ($(ARCH),aarch64)
+  CC           := aarch64-linux-musl-gcc
+  ARCH_CFLAGS  := -march=armv8-a
 else
-  $(error Unsupported ARCH=$(ARCH). Use x86_64 or riscv64)
+  $(error Unsupported ARCH=$(ARCH). Use x86_64, riscv64, or aarch64)
 endif
+
+CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -fno-stack-protector
 
 # Wayland compositor requires special CFLAGS for security and compatibility.
 # See wayland target comments below for detailed rationale.
-WAYLAND_CFLAGS := -static -O2 -D_GNU_SOURCE -fstack-protector-strong \
-                  -Wall -Wextra -std=c11
+WAYLAND_CFLAGS := $(COMMON_CFLAGS) $(ARCH_CFLAGS) -D_GNU_SOURCE -fstack-protector-strong
 
 # List every subdirectory that contains a C program here.
 PROGRAMS := init hello smoke kmtest wayland
@@ -52,7 +59,7 @@ all: check-tools $(PROGRAMS)
 help:
 	@echo "RustOS Userspace Build System"
 	@echo ""
-	@echo "Usage: make [ARCH=x86_64|riscv64] [target]"
+	@echo "Usage: make [ARCH=x86_64|riscv64|aarch64] [target]"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  all      - Build all userspace binaries (default)"
@@ -63,6 +70,7 @@ help:
 	@echo "Examples:"
 	@echo "  make                              # Build x86_64 binaries"
 	@echo "  make ARCH=riscv64                 # Build RISC-V binaries"
+	@echo "  make ARCH=aarch64                 # Build AArch64 binaries"
 	@echo "  make install DESTDIR=/tmp/rootfs  # Install to custom location"
 
 check-tools:
@@ -70,6 +78,7 @@ check-tools:
 		echo "Error: $(CC) not found. Please install the required toolchain."; \
 		echo "For x86_64: apt install musl-tools"; \
 		echo "For RISC-V: Build musl from source or apt install gcc-riscv64-linux-gnu musl-dev"; \
+		echo "For AArch64: Build musl from source targeting aarch64-linux-musl or provide aarch64-linux-musl-gcc"; \
 		exit 1; \
 	}
 
@@ -104,7 +113,7 @@ $(BUILD_DIR)/smoke: smoke/smoke.c | $(BUILD_DIR)
 #   - exits non-zero on any failure, making it CI-friendly
 #   - _GNU_SOURCE required for snprintf in strict -std=c11 mode with musl
 $(BUILD_DIR)/kmtest: kmtest/kmtest.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ $<
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@	$<
 
 # The Wayland compositor is a privileged userspace process.
 # It is installed as /usr/bin/rustos-compositor in the initramfs.
