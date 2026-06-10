@@ -3,15 +3,10 @@
 # Drives kernel-test.yml (run_build: true) for every supported architecture.
 # All build logic lives in kernel-test.yml; add new architectures here only.
 #
-# Architecture matrix
-# ───────────────────
-#   arch     cargo-target                    boot-protocol
-#   x86_64   x86_64-unknown-none             UEFI / multiboot2
-#   aarch64  targets/aarch64-kernel.json     virt / cortex-a72
-#   riscv64  riscv64gc-unknown-none-elf       OpenSBI virt
-#
-# Adding an architecture: add a row under matrix.include and, if the
-# build diverges in a new way, add a guarded step in kernel-test.yml.
+# Architecture × boot-mode support:
+#   aarch64 — uefi, baremetal
+#   riscv64 — uefi, sbi
+#   x86_64  — uefi, multiboot
 
 name: Build
 
@@ -19,20 +14,17 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
-
-permissions:
-  contents: read
 
 jobs:
   build:
-    name: "build • ${{ matrix.arch }}"
+    name: Build (${{ matrix.arch }})
+    uses: ./.github/workflows/kernel-test.yml
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64, riscv64]
-
-    uses: ./.github/workflows/kernel-test.yml
+        arch: [aarch64, riscv64, x86_64]
     with:
       arch:      ${{ matrix.arch }}
       run_build: true
+      run_test:  false
+      run_qemu:  false
