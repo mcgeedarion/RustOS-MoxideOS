@@ -36,12 +36,10 @@ jobs:
         include:
           - arch: aarch64
             boot: uefi
-          - arch: aarch64
-            boot: baremetal
-          - arch: riscv64
-            boot: sbi
           - arch: riscv64
             boot: uefi
+          - arch: riscv64
+            boot: sbi
           - arch: x86_64
             boot: uefi
     steps:
