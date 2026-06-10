@@ -1,5 +1,5 @@
 //! Kernel entry point — called from uefi_start() (primary) or
-//! multiboot2_start() (legacy, feature = "multiboot2_boot") after the CPU is
+//! multiboot2_entry() (legacy, feature = "multiboot2_boot") after the CPU is
 //! in 64-bit long mode with interrupts disabled.
 //!
 //! ## Boot sequence
