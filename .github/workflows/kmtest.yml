@@ -7,9 +7,9 @@
 #
 # Architecture notes
 # ──────────────────────────────────────────────────────────────────────────
-#   x86_64   multiboot2 -kernel boot (faster than UEFI for CI), musl-tools
 #   aarch64  virt/cortex-a72 -kernel boot, aarch64 musl cross-compiler [NEW]
 #   riscv64  OpenSBI virt -kernel boot, riscv64 musl cross-compiler
+#   x86_64   multiboot2 -kernel boot (faster than UEFI for CI), musl-tools
 #
 # The parse-results logic (grep for PASS/FAIL/summary) is identical across
 # all architectures and lives once in kernel-test.yml.
@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64, riscv64]
+        arch: [aarch64, riscv64, x86_64]
 
     uses: ./.github/workflows/kernel-test.yml
     with:

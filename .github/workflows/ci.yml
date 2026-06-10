@@ -34,18 +34,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            boot: uefi
-          - arch: x86_64
-            boot: multiboot
-          - arch: riscv64
-            boot: sbi
-          - arch: riscv64
-            boot: uefi
           - arch: aarch64
             boot: uefi
           - arch: aarch64
             boot: baremetal
+          - arch: riscv64
+            boot: sbi
+          - arch: riscv64
+            boot: uefi
+          - arch: x86_64
+            boot: uefi
+          - arch: x86_64
+            boot: multiboot
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools

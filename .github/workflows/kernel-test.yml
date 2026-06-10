@@ -7,9 +7,9 @@
 # Supported architectures
 # ──────────────────────────────────────────────────────────────────────────────
 #   arch        cargo-target                      qemu-bin               boot
-#   x86_64      x86_64-unknown-none               qemu-system-x86_64     OVMF UEFI / multiboot2
 #   aarch64     targets/aarch64-kernel.json       qemu-system-aarch64    virt/cortex-a72
 #   riscv64     riscv64gc-unknown-none-elf         qemu-system-riscv64    OpenSBI virt
+#   x86_64      x86_64-unknown-none               qemu-system-x86_64     OVMF UEFI / multiboot2
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Adding a new architecture
@@ -25,7 +25,7 @@ on:
     inputs:
       # ── Required ────────────────────────────────────────────────────────────
       arch:
-        description: "Target architecture: x86_64 | aarch64 | riscv64"
+        description: "Target architecture: aarch64 | riscv64 | x86_64"
         required: true
         type: string
 
@@ -78,15 +78,15 @@ jobs:
           echo "CARGO_TARGET_DIR=${{ github.workspace }}/target" >> "$GITHUB_ENV"
           # Resolve the cargo --target flag for this arch.
           case "${{ inputs.arch }}" in
-            x86_64)  echo "CARGO_TARGET=x86_64-unknown-none"              >> "$GITHUB_ENV" ;;
             aarch64) echo "CARGO_TARGET=${{ github.workspace }}/targets/aarch64-kernel.json" >> "$GITHUB_ENV" ;;
             riscv64) echo "CARGO_TARGET=riscv64gc-unknown-none-elf"        >> "$GITHUB_ENV" ;;
+            x86_64)  echo "CARGO_TARGET=x86_64-unknown-none"              >> "$GITHUB_ENV" ;;
           esac
           # Short name used for artifact/log labelling (no path chars).
           case "${{ inputs.arch }}" in
-            x86_64)  echo "TARGET_SHORT=x86_64-unknown-none"              >> "$GITHUB_ENV" ;;
             aarch64) echo "TARGET_SHORT=aarch64-kernel"                    >> "$GITHUB_ENV" ;;
             riscv64) echo "TARGET_SHORT=riscv64gc-unknown-none-elf"        >> "$GITHUB_ENV" ;;
+            x86_64)  echo "TARGET_SHORT=x86_64-unknown-none"              >> "$GITHUB_ENV" ;;
           esac
 
       # ── Cargo cache (keyed by arch so caches never collide) ──────────────────
@@ -95,12 +95,6 @@ jobs:
           key: "${{ inputs.arch }}-${{ inputs.run_build && 'build' || inputs.run_smoke && 'smoke' || 'kmtest' }}-${{ hashFiles('rust-toolchain.toml') }}"
 
       # ── Arch-specific apt packages ────────────────────────────────────────────
-      - name: Install build tools (x86_64)
-        if: inputs.arch == 'x86_64'
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends clang nasm
-
       - name: Install build tools (aarch64)
         if: inputs.arch == 'aarch64'
         run: |
@@ -113,13 +107,13 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends clang lld
 
-      # ── QEMU + firmware (only for smoke / kmtest modes) ───────────────────────
-      - name: Install QEMU + firmware (x86_64)
-        if: (inputs.run_smoke || inputs.run_kmtest) && inputs.arch == 'x86_64'
+      - name: Install build tools (x86_64)
+        if: inputs.arch == 'x86_64'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+          sudo apt-get install -y --no-install-recommends clang nasm
 
+      # ── QEMU + firmware (only for smoke / kmtest modes) ───────────────────────
       - name: Install QEMU (aarch64)
         if: (inputs.run_smoke || inputs.run_kmtest) && inputs.arch == 'aarch64'
         run: |
@@ -132,12 +126,13 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends qemu-system-riscv64
 
-      # ── musl cross-compiler (kmtest userspace runner) ─────────────────────────
-      - name: Install musl cross-tools (x86_64)
-        if: inputs.run_kmtest && inputs.arch == 'x86_64'
+      - name: Install QEMU + firmware (x86_64)
+        if: (inputs.run_smoke || inputs.run_kmtest) && inputs.arch == 'x86_64'
         run: |
-          sudo apt-get install -y --no-install-recommends musl-tools
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
 
+      # ── musl cross-compiler (kmtest userspace runner) ─────────────────────────
       - name: Install musl cross-tools (aarch64)
         if: inputs.run_kmtest && inputs.arch == 'aarch64'
         run: |
@@ -150,6 +145,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             musl-tools gcc-riscv64-linux-gnu libc-dev-riscv64-cross || true
 
+      - name: Install musl cross-tools (x86_64)
+        if: inputs.run_kmtest && inputs.arch == 'x86_64'
+        run: |
+          sudo apt-get install -y --no-install-recommends musl-tools
+
       # ════════════════════════════════════════════════════════════════════════
       # BUILD MODE
       # ════════════════════════════════════════════════════════════════════════
@@ -160,10 +160,6 @@ jobs:
           # Base features are arch-neutral.  x86_64 needs no-default-features
           # because its default feature set pulls in riscv-only crates.
           case "${{ inputs.arch }}" in
-            x86_64)
-              echo "EXTRA_CARGO_FLAGS=--no-default-features" >> "$GITHUB_ENV"
-              echo "KMTEST_EXTRA_FEATURES=multiboot2_boot,sysv_ipc,namespaces" >> "$GITHUB_ENV"
-              ;;
             aarch64)
               echo "EXTRA_CARGO_FLAGS=" >> "$GITHUB_ENV"
               echo "KMTEST_EXTRA_FEATURES=" >> "$GITHUB_ENV"
@@ -171,6 +167,10 @@ jobs:
             riscv64)
               echo "EXTRA_CARGO_FLAGS=" >> "$GITHUB_ENV"
               echo "KMTEST_EXTRA_FEATURES=" >> "$GITHUB_ENV"
+              ;;
+            x86_64)
+              echo "EXTRA_CARGO_FLAGS=--no-default-features" >> "$GITHUB_ENV"
+              echo "KMTEST_EXTRA_FEATURES=multiboot2_boot,sysv_ipc,namespaces" >> "$GITHUB_ENV"
               ;;
           esac
 
@@ -212,24 +212,6 @@ jobs:
       # SMOKE MODE  — boot kernel, probe NIC, check serial markers
       # ════════════════════════════════════════════════════════════════════════
 
-      - name: QEMU smoke test (x86_64)
-        if: inputs.run_smoke && inputs.arch == 'x86_64'
-        run: |
-          mkdir -p logs/x86_64
-          cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
-          timeout 10 qemu-system-x86_64 \
-            -machine q35 \
-            -cpu qemu64 \
-            -m 256M \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
-            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
-            -kernel "${KERNEL_ELF}" \
-            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
-            -device virtio-net-pci,netdev=net0,id=nic0 \
-            -serial stdio -display none -no-reboot \
-            -d guest_errors,cpu_reset \
-            2>&1 | tee logs/x86_64/serial.log qemu-${{ inputs.arch }}.log || true
-
       - name: QEMU smoke test (aarch64)
         if: inputs.run_smoke && inputs.arch == 'aarch64'
         run: |
@@ -262,6 +244,24 @@ jobs:
             -d guest_errors,cpu_reset \
             2>&1 | tee logs/riscv64/serial.log qemu-${{ inputs.arch }}.log || true
 
+      - name: QEMU smoke test (x86_64)
+        if: inputs.run_smoke && inputs.arch == 'x86_64'
+        run: |
+          mkdir -p logs/x86_64
+          cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
+          timeout 10 qemu-system-x86_64 \
+            -machine q35 \
+            -cpu qemu64 \
+            -m 256M \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
+            -kernel "${KERNEL_ELF}" \
+            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
+            -device virtio-net-pci,netdev=net0,id=nic0 \
+            -serial stdio -display none -no-reboot \
+            -d guest_errors,cpu_reset \
+            2>&1 | tee logs/x86_64/serial.log qemu-${{ inputs.arch }}.log || true
+
       - name: Assert smoke markers
         if: inputs.run_smoke
         run: |
@@ -276,11 +276,11 @@ jobs:
 
           # Arch-specific NIC probe string differs (pci vs mmio driver).
           case "${{ inputs.arch }}" in
-            x86_64)
-              grep -q 'virtio_net: device ready'      "${LOG}" && pass "nic-probe" || fail "NIC probe missing"
-              ;;
             aarch64|riscv64)
               grep -q 'virtio_net_mmio: device ready' "${LOG}" && pass "nic-probe" || fail "NIC probe missing"
+              ;;
+            x86_64)
+              grep -q 'virtio_net: device ready'      "${LOG}" && pass "nic-probe" || fail "NIC probe missing"
               ;;
           esac
 
@@ -327,21 +327,6 @@ jobs:
           cp "userspace/build/${{ inputs.arch }}/kmtest" "${STAGING}/kmtest"
           chmod +x "${STAGING}/kmtest"
 
-      - name: QEMU kmtest boot (x86_64)
-        if: inputs.run_kmtest && inputs.arch == 'x86_64'
-        run: |
-          timeout 60 qemu-system-x86_64 \
-            -machine q35 \
-            -cpu qemu64,+xsave,+avx \
-            -m 256M \
-            -kernel "${KERNEL_ELF}" \
-            -initrd <(find "initramfs-kmtest-${{ inputs.arch }}" -mindepth 1 | \
-                      cpio -o -H newc --quiet) \
-            -append "init=/bin/kmtest" \
-            -serial stdio -display none -no-reboot \
-            -d guest_errors,cpu_reset \
-            2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
-
       - name: QEMU kmtest boot (aarch64)
         if: inputs.run_kmtest && inputs.arch == 'aarch64'
         run: |
@@ -365,6 +350,21 @@ jobs:
             -cpu rv64 \
             -m 256M \
             -bios default \
+            -kernel "${KERNEL_ELF}" \
+            -initrd <(find "initramfs-kmtest-${{ inputs.arch }}" -mindepth 1 | \
+                      cpio -o -H newc --quiet) \
+            -append "init=/bin/kmtest" \
+            -serial stdio -display none -no-reboot \
+            -d guest_errors,cpu_reset \
+            2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
+
+      - name: QEMU kmtest boot (x86_64)
+        if: inputs.run_kmtest && inputs.arch == 'x86_64'
+        run: |
+          timeout 60 qemu-system-x86_64 \
+            -machine q35 \
+            -cpu qemu64,+xsave,+avx \
+            -m 256M \
             -kernel "${KERNEL_ELF}" \
             -initrd <(find "initramfs-kmtest-${{ inputs.arch }}" -mindepth 1 | \
                       cpio -o -H newc --quiet) \
