@@ -27,7 +27,7 @@ repeating every low-level detail:
   alias used by non-architecture code.
 - `xtask/src/main.rs` is the preferred build/image/initramfs automation entry
   point.
-- `scripts/ci/qemu-run.sh` is the unified QEMU launcher for x86_64, RISC-V, and
+- `scripts/ci/run_qemu.sh` is the unified QEMU launcher for x86_64, RISC-V, and
   AArch64.
 - `src/kernel/architecture.rs`, `src/syscall/driver.rs`,
   `src/syscall/scheme.rs`, `src/fs/scheme_table.rs`, and
@@ -37,7 +37,7 @@ repeating every low-level detail:
 
 - Update `arch_capability_matrix.md` whenever an architecture gains or loses a
   boot mode, syscall ABI feature, interrupt path, SMP milestone, or test tier.
-- Update `booting.md` when `xtask` or `scripts/ci/qemu-run.sh` changes build
+- Update `booting.md` when `xtask` or `scripts/ci/run_qemu.sh` changes build
   flags, target JSON names, firmware paths, image names, or smoke/test markers.
 - Update `boot-architecture.md` when the `BootInfo` ABI or common entry sequence
   changes.

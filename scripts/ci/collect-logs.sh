@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/ci/collect-logs.sh — Validate serial log and run arch-specific tests.
 #
-# Called after qemu-run.sh has written logs/ARCH/serial.log.
+# Called after run_qemu.sh has written logs/ARCH/serial.log.
 #
 # Required env:
 #   ARCH    x86_64 | aarch64 | riscv64

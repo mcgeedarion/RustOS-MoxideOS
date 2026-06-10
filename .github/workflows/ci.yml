@@ -65,6 +65,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nasm llvm lld musl-tools cpio qemu-system-x86
       - name: Run x86_64 multiboot smoke
-        run: ARCH=x86_64 ./scripts/ci/qemu-run.sh --boot multiboot --smoke --timeout 60
+        run: ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot multiboot --smoke --timeout 60
       - name: Run x86_64 multiboot kmtest
-        run: ARCH=x86_64 ./scripts/ci/qemu-run.sh --boot multiboot --test --timeout 90
+        run: ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot multiboot --test --timeout 90

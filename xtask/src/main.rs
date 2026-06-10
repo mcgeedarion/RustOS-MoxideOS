@@ -462,7 +462,7 @@ fn image(root: &Path, opts: &BuildOpts) -> Result<()> {
 }
 
 fn smoke(root: &Path) -> Result<()> {
-    let script = root.join("scripts/ci/qemu-run.sh");
+    let script = root.join("scripts/ci/run_qemu.sh");
     if !script.exists() {
         bail!("QEMU runner not found at {}", script.display());
     }

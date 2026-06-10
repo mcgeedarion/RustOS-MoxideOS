@@ -10,7 +10,7 @@ RustOS supports a small explicit matrix of architecture and boot combinations.  
 
 Aliases:
 
-- `qemu` is accepted as a backwards-compatible alias for `x86_64 --boot multiboot` in `scripts/ci/qemu-run.sh` only.
+- `qemu` is accepted as a backwards-compatible alias for `x86_64 --boot multiboot` in `scripts/ci/run_qemu.sh` only.
 - Do not use `sbi` for x86_64 or AArch64.
 
 ## Canonical ESP path
@@ -43,10 +43,10 @@ cargo xtask build --arch aarch64 --boot baremetal
 QEMU smoke/kmtest currently use direct `-kernel` style boots only:
 
 ```bash
-ARCH=x86_64 ./scripts/ci/qemu-run.sh --boot multiboot --smoke
-ARCH=x86_64 ./scripts/ci/qemu-run.sh --boot multiboot --test
-ARCH=riscv64 ./scripts/ci/qemu-run.sh --boot sbi --smoke
-ARCH=riscv64 ./scripts/ci/qemu-run.sh --boot sbi --test
+ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot multiboot --smoke
+ARCH=x86_64 ./scripts/ci/run_qemu.sh --boot multiboot --test
+ARCH=riscv64 ./scripts/ci/run_qemu.sh --boot sbi --smoke
+ARCH=riscv64 ./scripts/ci/run_qemu.sh --boot sbi --test
 ```
 
 AArch64 initramfs, smoke, and kmtest paths are intentionally disabled until `userspace/Makefile` grows `ARCH=aarch64` support.
