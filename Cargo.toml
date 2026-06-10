@@ -20,6 +20,10 @@ repository = "https://github.com/mcgeedarion/RustOS-MoxideOS"
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+[[bin]]
+name = "rustos"
+path = "src/main.rs"
+
 [dependencies]
 kmtest = { path = "crates/kmtest", optional = true }
 scheme-api = { path = "crates/scheme-api" }
