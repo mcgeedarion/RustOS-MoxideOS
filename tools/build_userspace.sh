@@ -5,6 +5,7 @@
 # Usage:
 #   ./tools/build_userspace.sh              # x86_64 (default)
 #   ./tools/build_userspace.sh riscv64      # RISC-V
+#   ./tools/build_userspace.sh aarch64      # AArch64
 #   ./tools/build_userspace.sh x86_64 --clean  # Clean rebuild
 #
 # Environment Variables:
@@ -29,7 +30,7 @@ set -euo pipefail
 ARCH=${1:-x86_64}
 CLEAN_BUILD=${2:-}
 VERBOSE=${VERBOSE:-0}
-VALID_ARCHS=("x86_64" "riscv64")
+VALID_ARCHS=("x86_64" "riscv64" "aarch64")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
