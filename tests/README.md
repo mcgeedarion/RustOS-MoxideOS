@@ -1,6 +1,6 @@
 # tests/
 
-Unified multi-architecture test tree for MoxideOS.
+Unified multi-architecture test tree for RustOS.
 
 ## Layout
 
