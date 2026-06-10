@@ -7,7 +7,6 @@
 //! | aarch64 | UEFI                | `arch/aarch64/uefi_entry.rs`            |
 //! | riscv64 | SBI                 | `arch/riscv64/boot.rs`                  |
 //! | x86_64  | UEFI                | `arch/x86_64/uefi_entry.rs`             |
-//! | x86_64  | Multiboot2 / QEMU   | `arch/x86_64/multiboot2_entry.rs`       |
 //!
 //! Every path converges on `kernel_main()` in `kernel_main.rs`.
 
