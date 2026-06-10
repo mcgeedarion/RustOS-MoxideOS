@@ -11,7 +11,7 @@
 #
 # Options (all arches unless noted):
 #   --boot <mode>   Boot protocol.  Per-arch defaults and valid modes:
-#                     x86_64:  uefi (default) | multiboot
+#                     x86_64:  uefi (default) | multiboot | qemu
 #                     aarch64: uefi (default)
 #                     riscv64: uefi (default) | sbi
 #   --release       Build with --release (default: debug)
@@ -51,7 +51,7 @@
 #     /usr/local/share/qemu/edk2-riscv-code.fd
 #
 # GDB workflow:
-#   Terminal 1: ARCH=<arch> ./scripts/ci/qemu-run.sh --gdb [--boot sbi]
+#   Terminal 1: ARCH=<arch> ./scripts/ci/qemu-run.sh --gdb [--boot multiboot]
 #   Terminal 2: gdb-multiarch (see per-arch banner printed on launch)
 #
 # Networking: user-mode NAT (no root needed).
@@ -128,6 +128,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Alias `qemu` to the direct Multiboot2 `-kernel` flow for convenience.
+if [[ "$ARCH" == "x86_64" && "$BOOT" == "qemu" ]]; then
+  BOOT="multiboot"
+fi
+
 # Validate mode combinations.
 [[ "$SMOKE_MODE" -eq 1 && "$GDB_MODE" -eq 1 ]]  && { echo "[!] --smoke cannot be combined with --gdb" >&2; exit 2; }
 [[ "$TEST_MODE"  -eq 1 && "$GDB_MODE" -eq 1 ]]  && { echo "[!] --test cannot be combined with --gdb" >&2; exit 2; }
@@ -138,7 +143,7 @@ done
 case "$ARCH" in
   x86_64)
     [[ "$BOOT" == "uefi" || "$BOOT" == "multiboot" ]] || \
-      { echo "[!] x86_64 --boot must be 'uefi' or 'multiboot'" >&2; exit 2; } ;;
+      { echo "[!] x86_64 --boot must be 'uefi', 'multiboot', or 'qemu'" >&2; exit 2; } ;;
   aarch64)
     [[ "$BOOT" == "uefi" ]] || \
       { echo "[!] aarch64 only supports --boot uefi" >&2; exit 2; } ;;
@@ -158,12 +163,14 @@ cd "$ROOT_DIR"
 # Resolve cargo target and ELF path.
 case "$ARCH" in
   x86_64)
-    # Keep the smoke path focused on the single supported bring-up target:
-    # x86_64 UEFI.  Build a normal ELF first, then deterministically convert it
-    # into target/esp/EFI/BOOT/BOOTX64.EFI after cargo succeeds.
-    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"
+    if [[ "$BOOT" == "multiboot" ]]; then
+      CARGO_TARGET="${ROOT_DIR}/targets/x86_64-multiboot.json"
+      KERNEL_ELF="target/x86_64-multiboot/${PROFILE}/rustos"
+    else
+      CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"
+      KERNEL_ELF="target/x86_64-kernel/${PROFILE}/rustos"
+    fi
     CARGO_EXTRA_FLAGS=()
-    KERNEL_ELF="target/x86_64-kernel/${PROFILE}/rustos"
     QEMU_BIN="qemu-system-x86_64"
     ;;
   aarch64)
@@ -425,7 +432,11 @@ if [[ "$GDB_MODE" -eq 1 ]]; then
   QEMU_ARGS+=(-gdb tcp::1234 -S)
   case "$ARCH" in
     x86_64)
-      SYM_FILE="target/x86_64-unknown-none/${PROFILE}/rustos"
+      if [[ "$BOOT" == "multiboot" ]]; then
+        SYM_FILE="target/x86_64-multiboot/${PROFILE}/rustos"
+      else
+        SYM_FILE="target/x86_64-kernel/${PROFILE}/rustos"
+      fi
       GDB_ARCH_FLAG=""
       GDB_BIN="gdb"
       ;;
@@ -445,9 +456,9 @@ if [[ "$GDB_MODE" -eq 1 ]]; then
   ┌───────────────────────────────────────────────┐
   │ GDB mode: ${ARCH} kernel halted at entry.         │
   │ In another terminal:                              │
-  │   ${GDB_BIN} \\                                    │
-  │     ${GDB_ARCH_FLAG} \\                            │
-  │     -ex 'file ${SYM_FILE}' \\                     │
+  │   ${GDB_BIN} \                                    │
+  │     ${GDB_ARCH_FLAG} \                            │
+  │     -ex 'file ${SYM_FILE}' \                     │
   │     -ex 'target remote :1234'                     │
   └───────────────────────────────────────────────┘
 
