@@ -41,7 +41,7 @@ pub unsafe extern "C" fn multiboot2_entry(magic: u32, mbi_ptr: usize) -> ! {
     if MBI_PTR != 0 {
         crate::arch::x86_64::multiboot2::parse_mbi(MBI_PTR);
     }
-    kernel_main(&BOOT_INFO)
+    crate::kernel_main(&BOOT_INFO)
 }
 
 /// `BootInfo` for the bare-metal / Multiboot2 path.
