@@ -15,7 +15,7 @@ edition = "2021"
 authors = ["Darion McGee <mcgeedarion@example.com>"]
 description = "A Rust-based operating system kernel with UEFI and debugging support"
 license = "MIT"
-repository = "https://github.com/mcgeedarion/RustOS-MoxideOS"
+repository = "https://github.com/mcgeedarion/RustOS"
 
 [lib]
 crate-type = ["staticlib", "rlib"]
@@ -49,8 +49,7 @@ log = { version = "0.4", default-features = false }
 cc = "1"
 
 [features]
-# GUESS: callers reference crate::input and crate::debug unconditionally,
-# so the gating features must be on by default for a normal build.
+# Normal development build: input events and the lightweight GDB RSP stub.
 default = ["input_events", "gdbstub"]
 
 # Evdev / virtio-input subsystem.
@@ -70,11 +69,10 @@ uefi_boot = []
 
 # Full debug build: GDB RSP stub + rich oops/backtrace + trace drain.
 # Use `--features debug` as the single flag for a debug kernel.
-# `debugstub` and `trace` can still be enabled individually if needed.
-debug = ["debugstub", "trace"]
+debug = ["gdbstub", "trace"]
 
-# GDB Remote Serial Protocol stub only (no oops/trace overhead).
-debugstub = []
+# Backwards-compatible alias for builds that still request `debugstub`.
+debugstub = ["gdbstub"]
 
 # Ring-buffer trace event drain, flushed to serial on panic.
 trace = []

@@ -7,12 +7,18 @@
 # rustup-pinned local overrides
 /rust-toolchain
 
-# QEMU / EDK2 transient artifacts created by scripts/ci/qemu-run.sh
+# Legacy QEMU / EDK2 transient artifacts. Current scripts place VARS files under /target/.
 /edk2-aarch64-vars.fd
 /edk2-riscv-vars.fd
 
-# UEFI ESP staging directory created by build.rs::produce_uefi_image
+# Legacy UEFI ESP staging directory. Current scripts use /target/esp/<arch>/.
 /esp/
+
+# Disk images produced by cargo xtask image
+/boot-x86_64.img
+/boot-riscv64.img
+/boot-aarch64.img
+/boot.img
 
 # Editor / OS clutter
 *.swp
