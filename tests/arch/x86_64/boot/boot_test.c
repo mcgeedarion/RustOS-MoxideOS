@@ -1,49 +1,55 @@
-/* tests/arch/x86_64/boot/boot_test.c
- *
- * x86_64 boot validation.
+/*
+ * boot_test.c — x86_64 boot path smoke test.
  *
  * Checks that the kernel serial log contains the expected markers emitted
  * by the x86_64 boot path:
- *   BOOT_OK        – early UEFI/multiboot2 entry completed
+ *   BOOT_OK        – early UEFI entry completed
  *   GDT_OK         – GDT loaded, long-mode segments set
  *   IDT_OK         – IDT installed, exception stubs wired
  *   APIC_OK        – local APIC detected and mapped
- *
- * This test is compiled on the host and run by scripts/ci/collect-logs.sh
- * against logs/x86_64/serial.log produced by the QEMU run.
- *
- * Build: cc -o boot_test boot_test.c ../../../shared/test_helpers.h
  */
-#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../../../shared/test_helpers.h"
 
-static void check_marker(const char *log, const char *marker) {
-    if (!strstr(log, marker))
-        TEST_FAILF("missing boot marker: %s", marker);
-}
+static const char *EXPECTED[] = {
+    "BOOT_OK",
+    "GDT_OK",
+    "IDT_OK",
+    "APIC_OK",
+    NULL,
+};
 
-int main(int argc, char **argv) {
-    const char *log_path = argc > 1 ? argv[1] : "logs/x86_64/serial.log";
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <serial-log-file>\n", argv[0]);
+        return 1;
+    }
 
-    FILE *f = fopen(log_path, "r");
-    if (!f) TEST_FAILF("cannot open %s", log_path);
+    FILE *f = fopen(argv[1], "r");
+    if (!f) {
+        perror("fopen");
+        return 1;
+    }
 
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    rewind(f);
-    char *log = malloc(sz + 1);
-    fread(log, 1, sz, f);
-    log[sz] = '\0';
+    char line[512];
+    int found[4] = {0};
+    while (fgets(line, sizeof(line), f)) {
+        for (int i = 0; EXPECTED[i]; i++) {
+            if (strstr(line, EXPECTED[i])) found[i] = 1;
+        }
+    }
     fclose(f);
 
-    check_marker(log, "BOOT_OK");
-    check_marker(log, "GDT_OK");
-    check_marker(log, "IDT_OK");
-    check_marker(log, "APIC_OK");
+    int all_ok = 1;
+    for (int i = 0; EXPECTED[i]; i++) {
+        if (!found[i]) {
+            fprintf(stderr, "FAIL: missing marker %s\n", EXPECTED[i]);
+            all_ok = 0;
+        }
+    }
 
-    free(log);
-    TEST_PASS();
+    if (all_ok) printf("PASS\n");
+    return all_ok ? 0 : 1;
 }

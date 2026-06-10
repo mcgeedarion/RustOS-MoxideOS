@@ -1,7 +1,7 @@
 //! cargo xtask — build automation for RustOS.
 //!
 //! Canonical build/run contract:
-//!   x86_64:  uefi | multiboot
+//!   x86_64:  uefi
 //!   riscv64: uefi | sbi
 //!   aarch64: uefi | baremetal
 //!
@@ -45,7 +45,6 @@ enum Arch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Boot {
     Uefi,
-    Multiboot,
     Sbi,
     Baremetal,
 }
@@ -94,7 +93,6 @@ fn arch_str(arch: Arch) -> &'static str {
 fn boot_str(boot: Boot) -> &'static str {
     match boot {
         Boot::Uefi => "uefi",
-        Boot::Multiboot => "multiboot",
         Boot::Sbi => "sbi",
         Boot::Baremetal => "baremetal",
     }
@@ -102,7 +100,7 @@ fn boot_str(boot: Boot) -> &'static str {
 
 fn validate_contract(arch: Arch, boot: Boot) -> Result<()> {
     match (arch, boot) {
-        (Arch::X86_64, Boot::Uefi | Boot::Multiboot) => Ok(()),
+        (Arch::X86_64, Boot::Uefi) => Ok(()),
         (Arch::RiscV64, Boot::Uefi | Boot::Sbi) => Ok(()),
         (Arch::AArch64, Boot::Uefi | Boot::Baremetal) => Ok(()),
         _ => bail!(
@@ -116,7 +114,6 @@ fn validate_contract(arch: Arch, boot: Boot) -> Result<()> {
 fn target_json(root: &Path, arch: Arch, boot: Boot) -> PathBuf {
     match (arch, boot) {
         (Arch::X86_64, Boot::Uefi) => root.join("targets/x86_64-kernel.json"),
-        (Arch::X86_64, Boot::Multiboot) => root.join("targets/x86_64-multiboot.json"),
         (Arch::RiscV64, Boot::Uefi) => root.join("targets/riscv64-uefi-loader.json"),
         (Arch::RiscV64, Boot::Sbi) => PathBuf::from("riscv64gc-unknown-none-elf"),
         (Arch::AArch64, Boot::Uefi) => root.join("targets/aarch64-uefi-loader.json"),
@@ -128,7 +125,6 @@ fn target_json(root: &Path, arch: Arch, boot: Boot) -> PathBuf {
 fn target_dir_name(arch: Arch, boot: Boot) -> &'static str {
     match (arch, boot) {
         (Arch::X86_64, Boot::Uefi) => "x86_64-kernel",
-        (Arch::X86_64, Boot::Multiboot) => "x86_64-multiboot",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
         (Arch::RiscV64, Boot::Sbi) => "riscv64gc-unknown-none-elf",
         (Arch::AArch64, Boot::Uefi) => "aarch64-uefi-loader",
@@ -244,7 +240,6 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
                 i += 1;
                 opts.boot = match args.get(i).map(String::as_str) {
                     Some("uefi") => Boot::Uefi,
-                    Some("multiboot") | Some("qemu") => Boot::Multiboot,
                     Some("sbi") => Boot::Sbi,
                     Some("baremetal") | Some("bare-metal") => Boot::Baremetal,
                     other => {
@@ -570,12 +565,12 @@ Subcommands:\n\
   bench-kernel  Run baseline smoke flow and benchmark placeholders\n\n\
 Build options:\n\
   --arch <x86_64|riscv64|aarch64>\n\
-  --boot <uefi|multiboot|sbi|baremetal>\n\
+  --boot <uefi|sbi|baremetal>\n\
   --features <features>\n\
   --debug\n\
   --initrd\n\n\
 Valid build contracts:\n\
-  x86_64:  uefi | multiboot\n\
+  x86_64:  uefi\n\
   riscv64: uefi | sbi\n\
   aarch64: uefi | baremetal"
     );

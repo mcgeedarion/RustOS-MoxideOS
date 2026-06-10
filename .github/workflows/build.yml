@@ -6,7 +6,7 @@
 # Architecture × boot-mode support:
 #   aarch64 — uefi, baremetal
 #   riscv64 — uefi, sbi
-#   x86_64  — uefi, multiboot
+#   x86_64  — uefi
 
 name: Build
 

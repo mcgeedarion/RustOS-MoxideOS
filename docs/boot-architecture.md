@@ -41,7 +41,7 @@ policy.
 |---|---|---|---|
 | `aarch64` | `src/arch/aarch64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTAA64.EFI` | Bare-metal kernel target for board loaders/U-Boot-style flows | QEMU launcher currently supports `--boot uefi`; `xtask` can also build the bare-metal kernel target. |
 | `riscv64` | `src/arch/riscv64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTRISCV64.EFI` | SBI/OpenSBI + FDT path through the RISC-V kernel target | QEMU accepts `--boot uefi` or `--boot sbi`. |
-| `x86_64` | `src/arch/x86_64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTX64.EFI` | Direct-kernel / Multiboot2-style path through x86_64 kernel target | `cargo xtask build` defaults to `x86_64` + `uefi`; QEMU accepts `--boot uefi` or `--boot multiboot`. |
+| `x86_64` | `src/arch/x86_64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTX64.EFI` | — (multiboot2 path removed; OVMF UEFI is the sole boot method) | `cargo xtask build` defaults to `x86_64` + `uefi`; QEMU accepts `--boot uefi` only. |
 
 ---
 
