@@ -1,5 +1,4 @@
-//! Kernel entry point — called from uefi_start() (primary) or
-//! multiboot2_entry() (legacy, feature = "multiboot2_boot") after the CPU is
+//! Kernel entry point — called from uefi_start() after the CPU is
 //! in 64-bit long mode with interrupts disabled.
 //!
 //! ## Boot sequence
@@ -93,7 +92,6 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
 
     xsave_init();
 
-    // ACPI init — on multiboot path RSDP_PHYS is uninitialized (zero or garbage).
     let rsdp_pa = unsafe { crate::arch::x86_64::uefi_entry::RSDP_PHYS };
     crate::firmware::acpi::acpi_init(rsdp_pa);
     crate::serial_println!("acpi: {} CPU(s)", crate::firmware::acpi::cpu_count());
