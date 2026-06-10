@@ -4,7 +4,7 @@
 # Called after run_qemu.sh has written logs/ARCH/serial.log.
 #
 # Required env:
-#   ARCH    x86_64 | aarch64 | riscv64
+#   ARCH    aarch64 | riscv64 | x86_64
 #
 # Optional env:
 #   LOG_DIR    directory containing serial.log (default: logs/ARCH)
@@ -24,7 +24,7 @@ ARCH="${ARCH:-}"
 [[ -z "$ARCH" ]] && { echo "[!] ARCH is required" >&2; exit 2; }
 
 case "$ARCH" in
-  x86_64|aarch64|riscv64) ;;
+  aarch64|riscv64|x86_64) ;;
   *) echo "[!] Unsupported ARCH='${ARCH}'" >&2; exit 2 ;;
 esac
 
@@ -70,15 +70,6 @@ check_marker "PLATFORM_OK"
 
 echo "[collect] Checking arch-specific markers (${ARCH})..."
 case "$ARCH" in
-  x86_64)
-    check_marker "GDT_OK"
-    check_marker "IDT_OK"
-    check_marker "APIC_OK"
-    check_marker "SYSCALL_OK"
-    check_marker "VMM_OK"
-    check_marker "HPET_OK"
-    check_marker "ACPI_OK"
-    ;;
   aarch64)
     check_marker "MAIR_OK"
     check_marker "TTBR_OK"
@@ -96,6 +87,15 @@ case "$ARCH" in
     check_marker "ECALL_OK"
     check_marker "CLINT_OK"
     check_marker "FDT_OK"
+    ;;
+  x86_64)
+    check_marker "GDT_OK"
+    check_marker "IDT_OK"
+    check_marker "APIC_OK"
+    check_marker "SYSCALL_OK"
+    check_marker "VMM_OK"
+    check_marker "HPET_OK"
+    check_marker "ACPI_OK"
     ;;
 esac
 

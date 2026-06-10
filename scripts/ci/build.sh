@@ -2,7 +2,7 @@
 # scripts/ci/build.sh — Arch-aware kernel build for CI.
 #
 # Required env:
-#   ARCH    x86_64 | aarch64 | riscv64
+#   ARCH    aarch64 | riscv64 | x86_64
 #
 # Optional env:
 #   RELEASE    1 => --release  (default: 0)
@@ -27,10 +27,10 @@ cd "$ROOT_DIR"
 # ── Validate required inputs ────────────────────────────────────────────────
 
 ARCH="${ARCH:-}"
-[[ -z "$ARCH" ]] && { echo "[!] ARCH is required (x86_64|aarch64|riscv64)" >&2; exit 2; }
+[[ -z "$ARCH" ]] && { echo "[!] ARCH is required (aarch64|riscv64|x86_64)" >&2; exit 2; }
 
 case "$ARCH" in
-  x86_64|aarch64|riscv64) ;;
+  aarch64|riscv64|x86_64) ;;
   *) echo "[!] Unsupported ARCH='${ARCH}'" >&2; exit 2 ;;
 esac
 
@@ -41,14 +41,6 @@ FEATURES="${FEATURES:-}"
 # ── Per-arch target + ELF path ──────────────────────────────────────────────
 
 case "$ARCH" in
-  x86_64)
-    CARGO_TARGET="x86_64-unknown-none"
-    KERNEL_ELF="target/${CARGO_TARGET}/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
-    EXTRA_FLAGS=()
-    if [[ "$BOOT" == "multiboot" ]]; then
-      EXTRA_FLAGS+=(--no-default-features --features multiboot2_boot)
-    fi
-    ;;
   aarch64)
     CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"
     KERNEL_ELF="target/aarch64-kernel/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
@@ -62,6 +54,14 @@ case "$ARCH" in
     fi
     KERNEL_ELF="target/riscv64gc-unknown-none-elf/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
     EXTRA_FLAGS=()
+    ;;
+  x86_64)
+    CARGO_TARGET="x86_64-unknown-none"
+    KERNEL_ELF="target/${CARGO_TARGET}/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
+    EXTRA_FLAGS=()
+    if [[ "$BOOT" == "multiboot" ]]; then
+      EXTRA_FLAGS+=(--no-default-features --features multiboot2_boot)
+    fi
     ;;
 esac
 
