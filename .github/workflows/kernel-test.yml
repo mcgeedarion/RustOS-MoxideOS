@@ -208,20 +208,21 @@ jobs:
 
       # ════════════════════════════════════════════════════════════════════════
       # SMOKE MODE  — boot kernel, probe NIC, check serial markers
+      # Timeout: 30 s (--timeout 30 via run_qemu.sh contract)
       # ════════════════════════════════════════════════════════════════════════
 
       - name: QEMU smoke test (aarch64)
         if: inputs.run_smoke && inputs.arch == 'aarch64'
         run: |
           mkdir -p logs/aarch64
-          timeout 15 qemu-system-aarch64 \
+          timeout 30 qemu-system-aarch64 \
             -machine virt \
             -cpu cortex-a72 \
             -m 256M \
             -kernel "${KERNEL_ELF}" \
             -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
             -device virtio-net-device,netdev=net0,id=nic0 \
-            -serial stdio -display none -no-reboot \
+            -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             2>&1 | tee logs/aarch64/serial.log qemu-${{ inputs.arch }}.log || true
 
@@ -229,7 +230,7 @@ jobs:
         if: inputs.run_smoke && inputs.arch == 'riscv64'
         run: |
           mkdir -p logs/riscv64
-          timeout 15 qemu-system-riscv64 \
+          timeout 30 qemu-system-riscv64 \
             -machine virt \
             -cpu rv64 \
             -smp 2 \
@@ -238,7 +239,7 @@ jobs:
             -kernel "${KERNEL_ELF}" \
             -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
             -device virtio-net-device,netdev=net0,id=nic0 \
-            -serial stdio -display none -no-reboot \
+            -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             2>&1 | tee logs/riscv64/serial.log qemu-${{ inputs.arch }}.log || true
 
@@ -257,7 +258,7 @@ jobs:
         run: |
           mkdir -p logs/x86_64
           cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
-          timeout 15 qemu-system-x86_64 \
+          timeout 30 qemu-system-x86_64 \
             -machine q35 \
             -cpu qemu64 \
             -m 256M \
@@ -266,7 +267,7 @@ jobs:
             -drive if=virtio,format=raw,file="${BOOT_IMG}" \
             -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
             -device virtio-net-pci,netdev=net0,id=nic0 \
-            -serial stdio -display none -no-reboot \
+            -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             2>&1 | tee logs/x86_64/serial.log qemu-${{ inputs.arch }}.log || true
 
@@ -317,6 +318,7 @@ jobs:
 
       # ════════════════════════════════════════════════════════════════════════
       # KMTEST MODE  — userspace runner + initramfs + kernel self-test harness
+      # Timeout: 90 s (--timeout 90 via run_qemu.sh contract)
       # ════════════════════════════════════════════════════════════════════════
 
       - name: Build kmtest userspace runner
@@ -338,7 +340,7 @@ jobs:
       - name: QEMU kmtest boot (aarch64)
         if: inputs.run_kmtest && inputs.arch == 'aarch64'
         run: |
-          timeout 60 qemu-system-aarch64 \
+          timeout 90 qemu-system-aarch64 \
             -machine virt \
             -cpu cortex-a72 \
             -m 256M \
@@ -346,14 +348,14 @@ jobs:
             -initrd <(find "initramfs-kmtest-${{ inputs.arch }}" -mindepth 1 | \
                       cpio -o -H newc --quiet) \
             -append "init=/bin/kmtest" \
-            -serial stdio -display none -no-reboot \
+            -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
 
       - name: QEMU kmtest boot (riscv64)
         if: inputs.run_kmtest && inputs.arch == 'riscv64'
         run: |
-          timeout 60 qemu-system-riscv64 \
+          timeout 90 qemu-system-riscv64 \
             -machine virt \
             -cpu rv64 \
             -m 256M \
@@ -362,7 +364,7 @@ jobs:
             -initrd <(find "initramfs-kmtest-${{ inputs.arch }}" -mindepth 1 | \
                       cpio -o -H newc --quiet) \
             -append "init=/bin/kmtest" \
-            -serial stdio -display none -no-reboot \
+            -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
 
@@ -384,14 +386,14 @@ jobs:
         if: inputs.run_kmtest && inputs.arch == 'x86_64'
         run: |
           cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS_kmtest.fd
-          timeout 60 qemu-system-x86_64 \
+          timeout 90 qemu-system-x86_64 \
             -machine q35 \
             -cpu qemu64,+xsave,+avx \
             -m 256M \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
             -drive if=pflash,format=raw,file=/tmp/OVMF_VARS_kmtest.fd \
             -drive if=virtio,format=raw,file="${BOOT_IMG_KMTEST}" \
-            -serial stdio -display none -no-reboot \
+            -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
 

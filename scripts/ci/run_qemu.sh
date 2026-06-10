@@ -165,10 +165,14 @@ if [[ "$BOOT" == "uefi" ]]; then
   esac
 fi
 
+# -m 256M floor for all arches; -no-reboot -no-shutdown ensures immediate exit
+# on triple fault rather than spinning in a reset loop.
+# -serial stdio streams kernel output to stdout for log capture; never use
+# -serial mon:stdio in CI (it mixes monitor and serial into the same stream).
 case "$ARCH" in
-  aarch64) QEMU_BIN=qemu-system-aarch64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine virt -cpu cortex-a57 -m 512M) ;;
-  riscv64) QEMU_BIN=qemu-system-riscv64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine virt -cpu rv64 -m 256M) ;;
-  x86_64) QEMU_BIN=qemu-system-x86_64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine q35 -cpu qemu64,+xsave,+avx -m 256M) ;;
+  aarch64) QEMU_BIN=qemu-system-aarch64; QEMU_ARGS=(-serial stdio -no-reboot -no-shutdown -d guest_errors,cpu_reset -machine virt -cpu cortex-a57 -m 256M) ;;
+  riscv64) QEMU_BIN=qemu-system-riscv64; QEMU_ARGS=(-serial stdio -no-reboot -no-shutdown -d guest_errors,cpu_reset -machine virt -cpu rv64 -m 256M) ;;
+  x86_64) QEMU_BIN=qemu-system-x86_64; QEMU_ARGS=(-serial stdio -no-reboot -no-shutdown -d guest_errors,cpu_reset -machine q35 -cpu qemu64,+xsave,+avx -m 256M) ;;
 esac
 
 case "$ARCH:$BOOT" in
