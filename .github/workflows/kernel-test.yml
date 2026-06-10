@@ -9,7 +9,7 @@
 #   arch        cargo-target                      qemu-bin               boot
 #   aarch64     targets/aarch64-kernel.json       qemu-system-aarch64    virt/cortex-a72
 #   riscv64     riscv64gc-unknown-none-elf         qemu-system-riscv64    OpenSBI virt
-#   x86_64      x86_64-unknown-none               qemu-system-x86_64     OVMF UEFI / multiboot2
+#   x86_64      x86_64-unknown-none               qemu-system-x86_64     OVMF UEFI (FAT32 ESP image)
 # ──────────────────────────────────────────────────────────────────────────────
 #
 # Adding a new architecture
@@ -111,7 +111,7 @@ jobs:
         if: inputs.arch == 'x86_64'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends clang nasm
+          sudo apt-get install -y --no-install-recommends clang lld llvm
 
       # ── QEMU + firmware (only for smoke / kmtest modes) ───────────────────────
       - name: Install QEMU (aarch64)
@@ -130,7 +130,7 @@ jobs:
         if: (inputs.run_smoke || inputs.run_kmtest) && inputs.arch == 'x86_64'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf mtools
 
       # ── musl cross-compiler (kmtest userspace runner) ─────────────────────────
       - name: Install musl cross-tools (aarch64)
@@ -157,8 +157,6 @@ jobs:
       - name: Determine build features
         if: inputs.run_build || inputs.run_smoke || inputs.run_kmtest
         run: |
-          # Base features are arch-neutral.  x86_64 needs no-default-features
-          # because its default feature set pulls in riscv-only crates.
           case "${{ inputs.arch }}" in
             aarch64)
               echo "EXTRA_CARGO_FLAGS=" >> "$GITHUB_ENV"
@@ -170,7 +168,7 @@ jobs:
               ;;
             x86_64)
               echo "EXTRA_CARGO_FLAGS=--no-default-features" >> "$GITHUB_ENV"
-              echo "KMTEST_EXTRA_FEATURES=multiboot2_boot,sysv_ipc,namespaces" >> "$GITHUB_ENV"
+              echo "KMTEST_EXTRA_FEATURES=sysv_ipc,namespaces" >> "$GITHUB_ENV"
               ;;
           esac
 
@@ -244,18 +242,28 @@ jobs:
             -d guest_errors,cpu_reset \
             2>&1 | tee logs/riscv64/serial.log qemu-${{ inputs.arch }}.log || true
 
+      # x86_64: build a FAT32 ESP image via xtask, then boot with OVMF pflash.
+      # -kernel is intentionally NOT used — it bypasses UEFI entirely.
+      - name: Build x86_64 UEFI ESP image
+        if: inputs.run_smoke && inputs.arch == 'x86_64'
+        run: |
+          cargo xtask image --arch x86_64 --debug \
+            2>&1 | tee "build-x86_64-image.log"
+          test -f boot-x86_64.img || { echo "boot-x86_64.img not produced"; exit 1; }
+          echo "BOOT_IMG=boot-x86_64.img" >> "$GITHUB_ENV"
+
       - name: QEMU smoke test (x86_64)
         if: inputs.run_smoke && inputs.arch == 'x86_64'
         run: |
           mkdir -p logs/x86_64
           cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
-          timeout 10 qemu-system-x86_64 \
+          timeout 15 qemu-system-x86_64 \
             -machine q35 \
             -cpu qemu64 \
             -m 256M \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
             -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
-            -kernel "${KERNEL_ELF}" \
+            -drive if=virtio,format=raw,file="${BOOT_IMG}" \
             -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
             -device virtio-net-pci,netdev=net0,id=nic0 \
             -serial stdio -display none -no-reboot \
@@ -358,17 +366,31 @@ jobs:
             -d guest_errors,cpu_reset \
             2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
 
+      # x86_64 kmtest: build a UEFI ESP image that also contains the initramfs,
+      # then boot via OVMF — same as smoke, no -kernel shortcut.
+      - name: Build x86_64 UEFI ESP image (kmtest)
+        if: inputs.run_kmtest && inputs.arch == 'x86_64'
+        run: |
+          sudo apt-get install -y --no-install-recommends mtools
+          # Pack the kmtest initramfs so xtask can embed it.
+          find "initramfs-kmtest-x86_64" -mindepth 1 | \
+            cpio -o -H newc --quiet > initramfs.cpio
+          cargo xtask image --arch x86_64 --debug --initrd \
+            2>&1 | tee "build-x86_64-kmtest-image.log"
+          test -f boot-x86_64.img || { echo "boot-x86_64.img not produced"; exit 1; }
+          echo "BOOT_IMG_KMTEST=boot-x86_64.img" >> "$GITHUB_ENV"
+
       - name: QEMU kmtest boot (x86_64)
         if: inputs.run_kmtest && inputs.arch == 'x86_64'
         run: |
+          cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS_kmtest.fd
           timeout 60 qemu-system-x86_64 \
             -machine q35 \
             -cpu qemu64,+xsave,+avx \
             -m 256M \
-            -kernel "${KERNEL_ELF}" \
-            -initrd <(find "initramfs-kmtest-${{ inputs.arch }}" -mindepth 1 | \
-                      cpio -o -H newc --quiet) \
-            -append "init=/bin/kmtest" \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS_kmtest.fd \
+            -drive if=virtio,format=raw,file="${BOOT_IMG_KMTEST}" \
             -serial stdio -display none -no-reboot \
             -d guest_errors,cpu_reset \
             2>&1 | tee "qemu-kmtest-${{ inputs.arch }}.log" || true
@@ -422,6 +444,7 @@ jobs:
           name: "smoke-${{ inputs.arch }}"
           path: |
             build-${{ inputs.arch }}.log
+            build-${{ inputs.arch }}-image.log
             qemu-${{ inputs.arch }}.log
             logs/${{ inputs.arch }}/serial.log
             artifacts/${{ inputs.arch }}/test-report.txt
@@ -435,4 +458,5 @@ jobs:
           path: |
             build-${{ inputs.arch }}.log
             build-kmtest-runner-${{ inputs.arch }}.log
+            build-${{ inputs.arch }}-kmtest-image.log
             qemu-kmtest-${{ inputs.arch }}.log
