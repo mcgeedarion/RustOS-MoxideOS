@@ -88,33 +88,12 @@ ESP_ROOT="${ROOT_DIR}/target/esp/${ARCH}"
 ESP_BOOT_DIR="${ESP_ROOT}/EFI/BOOT"
 
 case "$ARCH:$BOOT" in
-  x86_64:uefi)
-    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"
-    TARGET_DIR="x86_64-kernel"
-    EFI_NAME="BOOTX64.EFI"
-    ;;
-  x86_64:multiboot)
-    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-multiboot.json"
-    TARGET_DIR="x86_64-multiboot"
-    ;;
-  riscv64:uefi)
-    CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"
-    TARGET_DIR="riscv64-uefi-loader"
-    EFI_NAME="BOOTRISCV64.EFI"
-    ;;
-  riscv64:sbi)
-    CARGO_TARGET="riscv64gc-unknown-none-elf"
-    TARGET_DIR="riscv64gc-unknown-none-elf"
-    ;;
-  aarch64:uefi)
-    CARGO_TARGET="${ROOT_DIR}/targets/aarch64-uefi-loader.json"
-    TARGET_DIR="aarch64-uefi-loader"
-    EFI_NAME="BOOTAA64.EFI"
-    ;;
-  aarch64:baremetal)
-    CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"
-    TARGET_DIR="aarch64-kernel"
-    ;;
+  x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"; TARGET_DIR="x86_64-kernel"; EFI_NAME="BOOTX64.EFI" ;;
+  x86_64:multiboot) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-multiboot.json"; TARGET_DIR="x86_64-multiboot" ;;
+  riscv64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"; TARGET_DIR="riscv64-uefi-loader"; EFI_NAME="BOOTRISCV64.EFI" ;;
+  riscv64:sbi) CARGO_TARGET="riscv64gc-unknown-none-elf"; TARGET_DIR="riscv64gc-unknown-none-elf" ;;
+  aarch64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/aarch64-uefi-loader.json"; TARGET_DIR="aarch64-uefi-loader"; EFI_NAME="BOOTAA64.EFI" ;;
+  aarch64:baremetal) CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"; TARGET_DIR="aarch64-kernel" ;;
 esac
 
 KERNEL_ELF="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos"
@@ -195,16 +174,11 @@ case "$ARCH" in
 esac
 
 case "$ARCH:$BOOT" in
-  x86_64:uefi)
-    QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=${FW_CODE}" -drive "if=pflash,format=raw,file=${FW_VARS}" -drive "if=virtio,format=raw,file=fat:rw:${ESP_ROOT},label=ESP") ;;
-  x86_64:multiboot)
-    QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
-  riscv64:uefi|aarch64:uefi)
-    QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio") ;;
-  riscv64:sbi)
-    QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
-  aarch64:baremetal)
-    QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
+  x86_64:uefi) QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=${FW_CODE}" -drive "if=pflash,format=raw,file=${FW_VARS}" -drive "if=virtio,format=raw,file=fat:rw:${ESP_ROOT},label=ESP") ;;
+  x86_64:multiboot) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
+  riscv64:uefi|aarch64:uefi) QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio") ;;
+  riscv64:sbi) QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
+  aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
 esac
 
 if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
@@ -215,21 +189,31 @@ if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
   fi
 fi
 
+cleanup() {
+  rm -rf "${KMTEST_STAGE:-}" "${SMOKE_STAGE:-}"
+  rm -f "${KMTEST_CPIO:-}" "${SMOKE_CPIO:-}" "${LOG_FILE:-}"
+}
+trap cleanup EXIT
+
 if [[ "$TEST_MODE" -eq 1 ]]; then
   echo "[*] Building kmtest userspace runner (${ARCH})..."
   (cd "${ROOT_DIR}/userspace" && make ARCH="${ARCH}" kmtest)
+  KMTEST_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/rustos-kmtest-${ARCH}.XXXXXX")"
   KMTEST_CPIO="$(mktemp "${TMPDIR:-/tmp}/rustos-kmtest-${ARCH}.XXXXXX.cpio")"
-  trap 'rm -f "${KMTEST_CPIO:-}" "${SMOKE_CPIO:-}" "${LOG_FILE:-}"' EXIT
-  find "${ROOT_DIR}/userspace/build/${ARCH}" -mindepth 1 | cpio -o -H newc --quiet > "$KMTEST_CPIO"
+  mkdir -p "$KMTEST_STAGE/bin"
+  cp "${ROOT_DIR}/userspace/build/${ARCH}/kmtest" "$KMTEST_STAGE/bin/kmtest"
+  (cd "$KMTEST_STAGE" && find . | sort | cpio -o -H newc --quiet > "$KMTEST_CPIO")
   QEMU_ARGS+=(-initrd "$KMTEST_CPIO" -append "init=/bin/kmtest")
 fi
 
 if [[ "$SMOKE_MODE" -eq 1 ]]; then
   echo "[*] Building smoke userspace runner (${ARCH})..."
   (cd "${ROOT_DIR}/userspace" && make ARCH="${ARCH}" smoke)
+  SMOKE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/rustos-smoke-${ARCH}.XXXXXX")"
   SMOKE_CPIO="$(mktemp "${TMPDIR:-/tmp}/rustos-smoke-${ARCH}.XXXXXX.cpio")"
-  trap 'rm -f "${KMTEST_CPIO:-}" "${SMOKE_CPIO:-}" "${LOG_FILE:-}"' EXIT
-  (cd "${ROOT_DIR}/userspace/build/${ARCH}" && printf './bin\n./bin/smoke\n' | cpio -o -H newc --quiet > "$SMOKE_CPIO")
+  mkdir -p "$SMOKE_STAGE/bin"
+  cp "${ROOT_DIR}/userspace/build/${ARCH}/smoke" "$SMOKE_STAGE/bin/smoke"
+  (cd "$SMOKE_STAGE" && find . | sort | cpio -o -H newc --quiet > "$SMOKE_CPIO")
   QEMU_ARGS+=(-initrd "$SMOKE_CPIO" -append "init=/bin/smoke")
 fi
 
@@ -256,7 +240,6 @@ fi
 
 if [[ "$SMOKE_MODE" -eq 1 || "$TEST_MODE" -eq 1 ]]; then
   LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/rustos-${ARCH}.XXXXXX.log")"
-  trap 'rm -f "${KMTEST_CPIO:-}" "${SMOKE_CPIO:-}" "${LOG_FILE:-}"' EXIT
   set +e
   timeout "$TIMEOUT_SECS" "$QEMU_BIN" "${QEMU_ARGS[@]}" >"$LOG_FILE" 2>&1
   QEMU_STATUS=$?
