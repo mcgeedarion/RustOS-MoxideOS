@@ -6,13 +6,13 @@
 # Usage:
 #   ARCH=<arch> ./tests/shared/run_tests.sh
 #
-#   arch values: x86_64 | aarch64 | riscv64
+#   arch values: aarch64 | riscv64 | x86_64
 #   (defaults to x86_64 if ARCH is unset)
 #
 # Cross-compiler selection (overridable via env):
-#   x86_64   MUSL_GCC   musl-gcc
 #   aarch64  CC_AARCH64 aarch64-linux-gnu-gcc  -static-pie or musl cross
 #   riscv64  CC_RISCV64 riscv64-linux-gnu-gcc
+#   x86_64   MUSL_GCC   musl-gcc
 #
 # Each test binary is compiled and executed on the host for fast build
 # verification, then the same binaries are dropped into the kernel
@@ -26,17 +26,13 @@ set -euo pipefail
 ARCH="${ARCH:-x86_64}"
 
 case "$ARCH" in
-  x86_64|aarch64|riscv64) ;;
-  *) echo "[!] Unsupported ARCH='${ARCH}'. Use: x86_64 aarch64 riscv64" >&2; exit 2 ;;
+  aarch64|riscv64|x86_64) ;;
+  *) echo "[!] Unsupported ARCH='${ARCH}'. Use: aarch64 riscv64 x86_64" >&2; exit 2 ;;
 esac
 
 # ── Compiler selection ────────────────────────────────────────────────────
 
 case "$ARCH" in
-  x86_64)
-    CC="${MUSL_GCC:-musl-gcc}"
-    CFLAGS_EXTRA=""
-    ;;
   aarch64)
     CC="${CC_AARCH64:-aarch64-linux-gnu-gcc}"
     CFLAGS_EXTRA="--sysroot=/usr/aarch64-linux-gnu -static"
@@ -44,6 +40,10 @@ case "$ARCH" in
   riscv64)
     CC="${CC_RISCV64:-riscv64-linux-gnu-gcc}"
     CFLAGS_EXTRA="--sysroot=/usr/riscv64-linux-gnu -static"
+    ;;
+  x86_64)
+    CC="${MUSL_GCC:-musl-gcc}"
+    CFLAGS_EXTRA=""
     ;;
 esac
 
@@ -122,7 +122,7 @@ echo
 
 # ── Test list (shared — all architectures) ────────────────────────────────
 # These tests exercise syscall-level behaviour that must work identically
-# on x86_64, AArch64, and RISC-V.  The source lives in tests/shared/.
+# on AArch64, RISC-V, and x86_64.  The source lives in tests/shared/.
 # Arch-specific tests live in tests/arch/<arch>/ and are not run here.
 
 SHARED="${SCRIPT_DIR}"

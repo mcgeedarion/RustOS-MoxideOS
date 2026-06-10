@@ -8,7 +8,7 @@
 #   1. apt install  (Debian/Ubuntu CI runners)
 #   2. Build musl from source into PREFIX (default: /opt/musl/<arch>)
 #
-# Supported ARCH values: x86_64  riscv64  aarch64
+# Supported ARCH values: aarch64  riscv64  x86_64
 #
 # Environment variables (all optional):
 #   ARCH          Target arch (default: aarch64)
@@ -31,20 +31,20 @@ JOBS="${JOBS:-$(nproc)}"
 
 # Derive toolchain triplet and apt package name per arch.
 case "$ARCH" in
-  x86_64)
-    TRIPLET="x86_64-linux-musl"
-    CC_BIN="musl-gcc"
-    APT_PKG="musl-tools"
+  aarch64)
+    TRIPLET="aarch64-linux-musl"
+    CC_BIN="aarch64-linux-musl-gcc"
+    APT_PKG="gcc-aarch64-linux-gnu"
     ;;
   riscv64)
     TRIPLET="riscv64-linux-musl"
     CC_BIN="riscv64-linux-musl-gcc"
     APT_PKG="gcc-riscv64-linux-gnu"
     ;;
-  aarch64)
-    TRIPLET="aarch64-linux-musl"
-    CC_BIN="aarch64-linux-musl-gcc"
-    APT_PKG="gcc-aarch64-linux-gnu"
+  x86_64)
+    TRIPLET="x86_64-linux-musl"
+    CC_BIN="musl-gcc"
+    APT_PKG="musl-tools"
     ;;
   *)
     echo "[!] Unsupported ARCH='${ARCH}'" >&2

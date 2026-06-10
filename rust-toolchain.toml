@@ -13,10 +13,10 @@
 #   1. Update `channel` below.
 #   2. Update `nightlyDate` in flake.nix to the same date.
 #   3. Run the normal build matrix:
-#        cargo build --target riscv64gc-unknown-none-elf --no-default-features
-#        cargo build --target x86_64-unknown-none --no-default-features
-#        cargo build --target targets/riscv64-uefi.json --features uefi_boot
 #        cargo build --target targets/aarch64-uefi-loader.json
+#        cargo build --target riscv64gc-unknown-none-elf --no-default-features
+#        cargo build --target targets/riscv64-uefi.json --features uefi_boot
+#        cargo build --target x86_64-unknown-none --no-default-features
 #   4. Run formatting and lint checks.
 #   5. Document the upgrade reason in CHANGELOG.md.
 
@@ -37,5 +37,5 @@ targets = [
 ]
 
 # Custom JSON targets are not rustup-installed targets:
-#   - targets/riscv64-uefi.json
 #   - targets/aarch64-uefi-loader.json
+#   - targets/riscv64-uefi.json

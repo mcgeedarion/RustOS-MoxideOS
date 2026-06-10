@@ -13,9 +13,9 @@ set -euo pipefail
 ARCH="${ARCH:-x86_64}"
 
 case "$ARCH" in
-  x86_64)  CC="${MUSL_GCC:-musl-gcc}" ;;
   aarch64) CC="${CC_AARCH64:-aarch64-linux-gnu-gcc}" ;;
   riscv64) CC="${CC_RISCV64:-riscv64-linux-gnu-gcc}" ;;
+  x86_64)  CC="${MUSL_GCC:-musl-gcc}" ;;
   *)       echo "[!] Unsupported ARCH='${ARCH}'" >&2; exit 2 ;;
 esac
 

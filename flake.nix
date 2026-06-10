@@ -1,5 +1,5 @@
 {
-  description = "rustos — Rust bare-metal OS (x86_64 + RISC-V + ARM64)";
+  description = "rustos — Rust bare-metal OS (AArch64 + RISC-V + x86_64)";
 
   # IMPORTANT: keep the nightly date here in sync with:
   #   rust-toolchain.toml  (channel = "nightly-YYYY-MM-DD")
@@ -38,7 +38,7 @@
           targets = [
             "riscv64gc-unknown-none-elf"
             "x86_64-unknown-none"
-            # riscv64-uefi.json and aarch64-uefi-loader.json are custom JSON targets; not rustup targets.
+            # aarch64-uefi-loader.json and riscv64-uefi.json are custom JSON targets; not rustup targets.
           ];
         };
 
@@ -148,14 +148,14 @@
               ovmfX86_64Path = getOvmfFirmware { ovmf = ovmfX86_64; arch = "x86_64"; };
               rustcVersion = "$(rustc --version)";
               commands = [
+                "Build (ARM64 UEFI):  cargo build --target targets/aarch64-uefi-loader.json"
+                "                         -Z build-std=core,alloc,compiler_builtins"
+                "                         -Z build-std-features=compiler-builtins-mem"
                 "Build (RISC-V UEFI): cargo build"
                 "Build (RISC-V SBI):  cargo build --target riscv64gc-unknown-none-elf --no-default-features"
                 "                         -Z build-std=core,alloc,compiler_builtins"
                 "                         -Z build-std-features=compiler-builtins-mem"
                 "Build (x86_64):      cargo build --target x86_64-unknown-none --no-default-features"
-                "Build (ARM64 UEFI):  cargo build --target targets/aarch64-uefi-loader.json"
-                "                         -Z build-std=core,alloc,compiler_builtins"
-                "                         -Z build-std-features=compiler-builtins-mem"
                 "Run QEMU:            ./run_qemu_x86_64.sh"
                 "Run QEMU (RISC-V):   ./run_qemu_riscv.sh"
                 "Debug (GDB):         qemu-system-x86_64 -s -S ... then gdb-multiarch"

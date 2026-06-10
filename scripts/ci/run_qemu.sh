@@ -2,9 +2,9 @@
 # scripts/ci/run_qemu.sh — Unified QEMU launcher for RustOS.
 #
 # Canonical run contract:
-#   x86_64:  uefi | multiboot
-#   riscv64: uefi | sbi
 #   aarch64: uefi | baremetal
+#   riscv64: uefi | sbi
+#   x86_64:  uefi | multiboot
 #
 # Canonical ESP path:
 #   target/esp/<arch>/EFI/BOOT/BOOT*.EFI
@@ -30,7 +30,7 @@ DISK=""
 usage() {
   cat <<'USAGE'
 Usage:
-  ARCH=<x86_64|riscv64|aarch64> ./scripts/ci/run_qemu.sh [options] [disk.img]
+  ARCH=<aarch64|riscv64|x86_64> ./scripts/ci/run_qemu.sh [options] [disk.img]
 
 Options:
   --boot <uefi|multiboot|sbi|baremetal>
@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$ARCH" in
-  x86_64|riscv64|aarch64) ;;
+  aarch64|riscv64|x86_64) ;;
   *) echo "[!] Unsupported ARCH='$ARCH'" >&2; exit 2 ;;
 esac
 
@@ -77,7 +77,7 @@ if [[ "$ARCH" == "x86_64" && "$BOOT" == "qemu" ]]; then
 fi
 
 case "$ARCH:$BOOT" in
-  x86_64:uefi|x86_64:multiboot|riscv64:uefi|riscv64:sbi|aarch64:uefi|aarch64:baremetal) ;;
+  aarch64:uefi|aarch64:baremetal|riscv64:uefi|riscv64:sbi|x86_64:uefi|x86_64:multiboot) ;;
   *) echo "[!] Unsupported run contract: ARCH=$ARCH --boot $BOOT" >&2; exit 2 ;;
 esac
 
@@ -92,9 +92,9 @@ esac
 if [[ "$TEST_MODE" -eq 1 || "$SMOKE_MODE" -eq 1 ]]; then
   if [[ "$BOOT" == "uefi" ]]; then
     case "$ARCH" in
-      x86_64)  BOOT="multiboot" ;;
-      riscv64) BOOT="sbi" ;;
       aarch64) BOOT="baremetal" ;;
+      riscv64) BOOT="sbi" ;;
+      x86_64)  BOOT="multiboot" ;;
     esac
     echo "[*] smoke/test: auto-selected --boot ${BOOT} for ${ARCH}"
   fi
@@ -105,12 +105,12 @@ ESP_ROOT="${ROOT_DIR}/target/esp/${ARCH}"
 ESP_BOOT_DIR="${ESP_ROOT}/EFI/BOOT"
 
 case "$ARCH:$BOOT" in
-  x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"; TARGET_DIR="x86_64-kernel"; EFI_NAME="BOOTX64.EFI" ;;
-  x86_64:multiboot) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-multiboot.json"; TARGET_DIR="x86_64-multiboot" ;;
-  riscv64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"; TARGET_DIR="riscv64-uefi-loader"; EFI_NAME="BOOTRISCV64.EFI" ;;
-  riscv64:sbi) CARGO_TARGET="riscv64gc-unknown-none-elf"; TARGET_DIR="riscv64gc-unknown-none-elf" ;;
   aarch64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/aarch64-uefi-loader.json"; TARGET_DIR="aarch64-uefi-loader"; EFI_NAME="BOOTAA64.EFI" ;;
   aarch64:baremetal) CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"; TARGET_DIR="aarch64-kernel" ;;
+  riscv64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"; TARGET_DIR="riscv64-uefi-loader"; EFI_NAME="BOOTRISCV64.EFI" ;;
+  riscv64:sbi) CARGO_TARGET="riscv64gc-unknown-none-elf"; TARGET_DIR="riscv64gc-unknown-none-elf" ;;
+  x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"; TARGET_DIR="x86_64-kernel"; EFI_NAME="BOOTX64.EFI" ;;
+  x86_64:multiboot) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-multiboot.json"; TARGET_DIR="x86_64-multiboot" ;;
 esac
 
 KERNEL_ELF="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos"
@@ -160,6 +160,16 @@ FW_CODE=""
 FW_VARS=""
 if [[ "$BOOT" == "uefi" ]]; then
   case "$ARCH" in
+    aarch64)
+      FW_CODE="$(find_existing_file /usr/share/qemu-efi-aarch64/QEMU_EFI.fd /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/qemu/edk2-aarch64-code.fd /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/local/share/qemu/edk2-aarch64-code.fd)" || { echo "[!] AArch64 EDK2 not found" >&2; exit 1; }
+      FW_VARS="${ROOT_DIR}/target/edk2-aarch64-vars.fd"
+      [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+      ;;
+    riscv64)
+      FW_CODE="$(find_existing_file /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd /usr/share/qemu/edk2-riscv-code.fd /opt/homebrew/share/qemu/edk2-riscv-code.fd /usr/local/share/qemu/edk2-riscv-code.fd)" || { echo "[!] RISC-V EDK2 not found" >&2; exit 1; }
+      FW_VARS="${ROOT_DIR}/target/edk2-riscv-vars.fd"
+      [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+      ;;
     x86_64)
       if [[ -f /usr/share/OVMF/OVMF_CODE.fd ]]; then
         FW_CODE=/usr/share/OVMF/OVMF_CODE.fd
@@ -171,31 +181,21 @@ if [[ "$BOOT" == "uefi" ]]; then
         [[ -f "$FW_VARS" ]] || FW_VARS="$FW_CODE"
       fi
       ;;
-    aarch64)
-      FW_CODE="$(find_existing_file /usr/share/qemu-efi-aarch64/QEMU_EFI.fd /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/qemu/edk2-aarch64-code.fd /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/local/share/qemu/edk2-aarch64-code.fd)" || { echo "[!] AArch64 EDK2 not found" >&2; exit 1; }
-      FW_VARS="${ROOT_DIR}/target/edk2-aarch64-vars.fd"
-      [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
-      ;;
-    riscv64)
-      FW_CODE="$(find_existing_file /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd /usr/share/qemu/edk2-riscv-code.fd /opt/homebrew/share/qemu/edk2-riscv-code.fd /usr/local/share/qemu/edk2-riscv-code.fd)" || { echo "[!] RISC-V EDK2 not found" >&2; exit 1; }
-      FW_VARS="${ROOT_DIR}/target/edk2-riscv-vars.fd"
-      [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
-      ;;
   esac
 fi
 
 case "$ARCH" in
-  x86_64) QEMU_BIN=qemu-system-x86_64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine q35 -cpu qemu64,+xsave,+avx -m 256M) ;;
   aarch64) QEMU_BIN=qemu-system-aarch64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine virt -cpu cortex-a57 -m 512M) ;;
   riscv64) QEMU_BIN=qemu-system-riscv64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine virt -cpu rv64 -m 256M) ;;
+  x86_64) QEMU_BIN=qemu-system-x86_64; QEMU_ARGS=(-serial stdio -no-reboot -d guest_errors,cpu_reset -machine q35 -cpu qemu64,+xsave,+avx -m 256M) ;;
 esac
 
 case "$ARCH:$BOOT" in
+  aarch64:uefi|riscv64:uefi) QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio") ;;
+  aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
+  riscv64:sbi) QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
   x86_64:uefi) QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=${FW_CODE}" -drive "if=pflash,format=raw,file=${FW_VARS}" -drive "if=virtio,format=raw,file=fat:rw:${ESP_ROOT},label=ESP") ;;
   x86_64:multiboot) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
-  riscv64:uefi|aarch64:uefi) QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio") ;;
-  riscv64:sbi) QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
-  aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
 esac
 
 cleanup() {

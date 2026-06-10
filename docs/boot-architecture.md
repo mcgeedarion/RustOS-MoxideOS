@@ -39,9 +39,9 @@ policy.
 
 | Architecture | UEFI path | Direct / firmware-specific path | Default helper behavior |
 |---|---|---|---|
-| `x86_64` | `src/arch/x86_64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTX64.EFI` | Direct-kernel / Multiboot2-style path through x86_64 kernel target | `cargo xtask build` defaults to `x86_64` + `uefi`; QEMU accepts `--boot uefi` or `--boot multiboot`. |
-| `riscv64` | `src/arch/riscv64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTRISCV64.EFI` | SBI/OpenSBI + FDT path through the RISC-V kernel target | QEMU accepts `--boot uefi` or `--boot sbi`. |
 | `aarch64` | `src/arch/aarch64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTAA64.EFI` | Bare-metal kernel target for board loaders/U-Boot-style flows | QEMU launcher currently supports `--boot uefi`; `xtask` can also build the bare-metal kernel target. |
+| `riscv64` | `src/arch/riscv64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTRISCV64.EFI` | SBI/OpenSBI + FDT path through the RISC-V kernel target | QEMU accepts `--boot uefi` or `--boot sbi`. |
+| `x86_64` | `src/arch/x86_64/uefi_entry.rs`; removable path `EFI/BOOT/BOOTX64.EFI` | Direct-kernel / Multiboot2-style path through x86_64 kernel target | `cargo xtask build` defaults to `x86_64` + `uefi`; QEMU accepts `--boot uefi` or `--boot multiboot`. |
 
 ---
 
@@ -144,9 +144,9 @@ Architecture-specific code must remain under:
 
 ```text
 src/arch/
-├── x86_64/
 ├── aarch64/
-└── riscv64/
+├── riscv64/
+└── x86_64/
 ```
 
 Architecture-specific responsibilities include:
@@ -158,8 +158,8 @@ Architecture-specific responsibilities include:
 - Architecture timer and SMP hooks.
 
 Common code should use `crate::arch::Arch` and types/traits from
-`crate::arch::api` instead of importing `arch::x86_64`, `arch::riscv64`, or
-`arch::aarch64` directly.
+`crate::arch::api` instead of importing `arch::aarch64`, `arch::riscv64`, or
+`arch::x86_64` directly.
 
 ---
 
@@ -167,7 +167,7 @@ Common code should use `crate::arch::Arch` and types/traits from
 
 Drivers must not depend on the boot method.  A driver can depend on hardware
 facts exposed by the device, bus, firmware table, or kernel abstractions, but it
-should not branch on “booted via UEFI” versus “booted via SBI”.
+should not branch on "booted via UEFI" versus "booted via SBI".
 
 ```rust
 // Avoid boot-policy checks inside drivers.
