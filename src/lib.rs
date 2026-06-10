@@ -56,7 +56,7 @@ extern crate alloc;
 //   shell       — Built-in kernel debug shell
 //   init        — Early-boot: initramfs, ELF loader, crt0
 //   exec        — Executable format parsers (ELF-64)
-//   debug       — Debugging infrastructure  [cfg(feature = "gdbstub")]
+//   debug       — Debugging infrastructure  [cfg(gdbstub | debug | trace)]
 //   kernel      — Core kernel utilities (panic, rand, uaccess, utils)
 //   kmtest      — Kernel test harness  [cfg(feature = "kmtest")]
 
@@ -71,8 +71,8 @@ pub mod exec;
 pub mod firmware;
 pub mod fs;
 pub mod init;
-pub use init::initramfs;
 pub use exec::elf;
+pub use init::initramfs;
 pub use kernel::rand;
 pub use kernel::uaccess;
 pub use mm::allocator;
@@ -95,7 +95,7 @@ pub mod tty;
 #[cfg(feature = "input_events")]
 pub mod input;
 
-#[cfg(feature = "gdbstub")]
+#[cfg(any(feature = "gdbstub", feature = "debug", feature = "trace"))]
 pub mod debug;
 #[cfg(feature = "gdbstub")]
 pub use debug::gdbstub;
