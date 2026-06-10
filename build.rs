@@ -12,10 +12,6 @@ const CRT_SOURCES: &[&str] = &[
     "memset.c",
 ];
 
-const X86_BOOT_ASM_SRC: &str = "src/arch/x86_64/boot.s";
-const X86_BOOT_OBJ_NAME: &str = "boot_x86_64.o";
-const X86_BOOT_LIB_NAME: &str = "libboot_x86_64.a";
-
 const RISCV_ASM_SRC: &str = "src/arch/riscv64/uentry.S";
 const RISCV_OBJ_NAME: &str = "uentry_riscv64.o";
 const RISCV_LIB_NAME: &str = "libuentry_riscv64.a";
@@ -34,16 +30,10 @@ const CRT_COMPILE_FLAGS: &[&str] = &[
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let uefi_boot = std::env::var("CARGO_FEATURE_UEFI_BOOT").is_ok();
 
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_UEFI_BOOT");
 
     compile_crt(&target_arch);
-
-    if target_arch == "x86_64" && !uefi_boot {
-        assemble_x86_boot(&out);
-    }
 
     if target_arch == "riscv64" {
         assemble_riscv_uentry(&out);
@@ -137,48 +127,6 @@ fn which_first(names: &[&str]) -> Option<String> {
         .iter()
         .find(|name| command_exists(name))
         .map(|name| (*name).to_string())
-}
-
-/// Assemble the x86_64 Multiboot2 entry shim and link it into the kernel ELF.
-fn assemble_x86_boot(out: &PathBuf) {
-    println!("cargo:rerun-if-changed={X86_BOOT_ASM_SRC}");
-
-    let nasm = which_first(&["nasm"]).unwrap_or_else(|| {
-        panic!(
-            "x86_64 Multiboot/QEMU -kernel builds require nasm; install it with: apt install nasm"
-        )
-    });
-    let ar = which_first(&["llvm-ar", "ar"]).unwrap_or_else(|| {
-        panic!(
-            "x86_64 Multiboot/QEMU -kernel builds require llvm-ar or ar; install LLVM or binutils"
-        )
-    });
-
-    let obj = out.join(X86_BOOT_OBJ_NAME);
-    let lib = out.join(X86_BOOT_LIB_NAME);
-
-    must_run(
-        {
-            let mut cmd = Command::new(&nasm);
-            cmd.args(["-f", "elf64", "-o"])
-                .arg(&obj)
-                .arg(X86_BOOT_ASM_SRC);
-            cmd
-        },
-        "x86_64 boot.s assembly",
-    );
-
-    must_run(
-        {
-            let mut cmd = Command::new(&ar);
-            cmd.args(["crs"]).arg(&lib).arg(&obj);
-            cmd
-        },
-        "x86_64 boot archive",
-    );
-
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=boot_x86_64");
 }
 
 /// Assemble the RISC-V uentry trampoline and archive it as a static library.
