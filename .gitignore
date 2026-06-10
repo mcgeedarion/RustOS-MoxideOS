@@ -15,10 +15,10 @@
 /esp/
 
 # Disk images produced by cargo xtask image
-/boot-x86_64.img
-/boot-riscv64.img
 /boot-aarch64.img
+/boot-riscv64.img
 /boot.img
+/boot-x86_64.img
 
 # Editor / OS clutter
 *.swp
