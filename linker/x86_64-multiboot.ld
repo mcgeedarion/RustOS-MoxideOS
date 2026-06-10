@@ -5,6 +5,7 @@ OUTPUT_ARCH(i386:x86-64)
  * Multiboot2 / QEMU -kernel entry. UEFI builds keep using x86_64.ld with
  * ENTRY(uefi_start); this script is selected only by x86_64-multiboot.json.
  */
+EXTERN(_start)
 ENTRY(_start)
 
 /*
