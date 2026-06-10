@@ -129,7 +129,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="$REPO_ROOT/userspace/build/$ARCH"
-TEST_BIN_DIR="$REPO_ROOT/build_tests"
+TEST_BIN_DIR="$REPO_ROOT/build_tests/$ARCH"
 OUTPUT="$REPO_ROOT/initramfs.cpio"
 
 log_info "Architecture: $ARCH"
@@ -200,8 +200,9 @@ log_info "Staged: hello"
 
 # ── Test binaries (optional) ─────────────────────────────────────────────────
 #
-# If build_tests/ exists (produced by tests/run_tests.sh) copy every binary
-# into /bin/ so they can be exec'd directly inside the kernel under QEMU.
+# If build_tests/<arch>/ exists (produced by tests/shared/run_tests.sh), copy
+# every executable test binary into /bin/ so it can be exec'd directly inside
+# the kernel under QEMU.
 # Also copy tests/run_tests.sh as /bin/run_tests so the full suite can be
 # driven from a serial console or an automated expect script.
 
@@ -255,7 +256,7 @@ if [ -d "$TEST_BIN_DIR" ]; then
     fi
 else
     log_info "NOTE: Test binaries directory not found: $TEST_BIN_DIR"
-    log_info "      To include test binaries, run tests/run_tests.sh first"
+    log_info "      To include test binaries, run tests/shared/run_tests.sh first"
 fi
 
 # ── Pack CPIO archive ────────────────────────────────────────────────────────
