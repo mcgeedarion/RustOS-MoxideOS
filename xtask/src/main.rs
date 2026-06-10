@@ -37,9 +37,9 @@ const INITRAMFS_DIRS: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arch {
-    X86_64,
-    RiscV64,
     AArch64,
+    RiscV64,
+    X86_64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +84,9 @@ fn log_section(tag: &str, msg: impl AsRef<str>) {
 
 fn arch_str(arch: Arch) -> &'static str {
     match arch {
-        Arch::X86_64 => "x86_64",
-        Arch::RiscV64 => "riscv64",
         Arch::AArch64 => "aarch64",
+        Arch::RiscV64 => "riscv64",
+        Arch::X86_64 => "x86_64",
     }
 }
 
@@ -100,9 +100,9 @@ fn boot_str(boot: Boot) -> &'static str {
 
 fn validate_contract(arch: Arch, boot: Boot) -> Result<()> {
     match (arch, boot) {
-        (Arch::X86_64, Boot::Uefi) => Ok(()),
-        (Arch::RiscV64, Boot::Uefi | Boot::Sbi) => Ok(()),
         (Arch::AArch64, Boot::Uefi | Boot::Baremetal) => Ok(()),
+        (Arch::RiscV64, Boot::Uefi | Boot::Sbi) => Ok(()),
+        (Arch::X86_64, Boot::Uefi) => Ok(()),
         _ => bail!(
             "unsupported build contract: {} --boot {}",
             arch_str(arch),
@@ -113,39 +113,39 @@ fn validate_contract(arch: Arch, boot: Boot) -> Result<()> {
 
 fn target_json(root: &Path, arch: Arch, boot: Boot) -> PathBuf {
     match (arch, boot) {
-        (Arch::X86_64, Boot::Uefi) => root.join("targets/x86_64-kernel.json"),
-        (Arch::RiscV64, Boot::Uefi) => root.join("targets/riscv64-uefi-loader.json"),
-        (Arch::RiscV64, Boot::Sbi) => PathBuf::from("riscv64gc-unknown-none-elf"),
         (Arch::AArch64, Boot::Uefi) => root.join("targets/aarch64-uefi-loader.json"),
         (Arch::AArch64, Boot::Baremetal) => root.join("targets/aarch64-kernel.json"),
+        (Arch::RiscV64, Boot::Uefi) => root.join("targets/riscv64-uefi-loader.json"),
+        (Arch::RiscV64, Boot::Sbi) => PathBuf::from("riscv64gc-unknown-none-elf"),
+        (Arch::X86_64, Boot::Uefi) => root.join("targets/x86_64-kernel.json"),
         _ => unreachable!("validate_contract must run before target_json"),
     }
 }
 
 fn target_dir_name(arch: Arch, boot: Boot) -> &'static str {
     match (arch, boot) {
-        (Arch::X86_64, Boot::Uefi) => "x86_64-kernel",
-        (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
-        (Arch::RiscV64, Boot::Sbi) => "riscv64gc-unknown-none-elf",
         (Arch::AArch64, Boot::Uefi) => "aarch64-uefi-loader",
         (Arch::AArch64, Boot::Baremetal) => "aarch64-kernel",
+        (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
+        (Arch::RiscV64, Boot::Sbi) => "riscv64gc-unknown-none-elf",
+        (Arch::X86_64, Boot::Uefi) => "x86_64-kernel",
         _ => unreachable!("validate_contract must run before target_dir_name"),
     }
 }
 
 fn efi_boot_filename(arch: Arch) -> &'static str {
     match arch {
-        Arch::X86_64 => "BOOTX64.EFI",
-        Arch::RiscV64 => "BOOTRISCV64.EFI",
         Arch::AArch64 => "BOOTAA64.EFI",
+        Arch::RiscV64 => "BOOTRISCV64.EFI",
+        Arch::X86_64 => "BOOTX64.EFI",
     }
 }
 
 fn image_name(arch: Arch) -> &'static str {
     match arch {
-        Arch::X86_64 => "boot-x86_64.img",
-        Arch::RiscV64 => "boot-riscv64.img",
         Arch::AArch64 => "boot-aarch64.img",
+        Arch::RiscV64 => "boot-riscv64.img",
+        Arch::X86_64 => "boot-x86_64.img",
     }
 }
 
@@ -227,9 +227,9 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
             "--arch" => {
                 i += 1;
                 opts.arch = match args.get(i).map(String::as_str) {
-                    Some("x86_64") => Arch::X86_64,
-                    Some("riscv64") => Arch::RiscV64,
                     Some("aarch64") => Arch::AArch64,
+                    Some("riscv64") => Arch::RiscV64,
+                    Some("x86_64") => Arch::X86_64,
                     other => {
                         eprintln!("[xtask] unknown --arch: {:?}", other);
                         exit(1);
