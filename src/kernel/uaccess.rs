@@ -12,26 +12,34 @@
 //! fault will produce `EFAULT` rather than a kernel panic.
 //!
 //! # Architecture notes
+//! * **aarch64** — ARM64 user access is controlled by PAN (Privileged Access
+//!   Never).  The initial AArch64 bring-up keeps this path explicit until
+//!   exception-table fault fixups land.
+//! * **riscv64** — `sstatus.SUM` is cleared during normal kernel execution. Each
+//!   access bracket sets `SUM=1`, performs the copy, then clears it again. The
+//!   `stvec` fault handler translates load/store page-faults into `EFAULT`.
 //! * **x86_64** — SMAP (`CR4.SMAP`) is assumed to be enabled.  Every access
 //!   bracket wraps the copy loop between `STAC` / `CLAC` to temporarily allow
 //!   supervisor access to user pages.  SMEP prevents execution from user pages
 //!   regardless.
-//! * **RISC-V** — `sstatus.SUM` is cleared during normal kernel execution. Each
-//!   access bracket sets `SUM=1`, performs the copy, then clears it again. The
-//!   `stvec` fault handler translates load/store page-faults into `EFAULT`.
 
 use core::mem;
 use core::ptr;
 
-/// Upper bound (exclusive) of the user virtual address space on x86_64
-/// (canonical 48-bit, top half reserved for kernel).
-#[cfg(target_arch = "x86_64")]
+/// Upper bound (exclusive) of the user virtual address space on aarch64
+/// (48-bit VA, top half reserved for kernel).
+#[cfg(target_arch = "aarch64")]
 const USER_ADDR_MAX: usize = 0x0000_8000_0000_0000;
 
 /// Upper bound (exclusive) of the user virtual address space on RISC-V Sv39.
 /// 512 GiB: bits [38:0] are valid user bits.
 #[cfg(target_arch = "riscv64")]
 const USER_ADDR_MAX: usize = 0x0000_0040_0000_0000;
+
+/// Upper bound (exclusive) of the user virtual address space on x86_64
+/// (canonical 48-bit, top half reserved for kernel).
+#[cfg(target_arch = "x86_64")]
+const USER_ADDR_MAX: usize = 0x0000_8000_0000_0000;
 
 /// Errors returned by uaccess operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,9 +112,10 @@ pub unsafe fn copy_from_user_raw(dst: *mut u8, src: *const u8, len: usize) -> us
 
 /// Executes `f` inside an architecture-specific "user access window".
 ///
+/// On aarch64 this is controlled by PAN (Privileged Access Never).
+/// On riscv64 this sets `sstatus.SUM=1` before the closure and clears it afterward.
 /// On x86_64 this is a `STAC … CLAC` bracket (enables supervisor access to
-/// user pages when `CR4.SMAP` is set).  On RISC-V it sets `sstatus.SUM=1`
-/// before the closure and clears it afterward.
+/// user pages when `CR4.SMAP` is set).
 ///
 /// The closure `f` is expected to do raw pointer reads/writes.  If a page
 /// fault occurs inside `f` the architecture's trap handler will set a
@@ -121,28 +130,90 @@ unsafe fn run_in_user_access<F, T>(f: F) -> UaccessResult<T>
 where
     F: FnOnce() -> T,
 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        arch_x86_64::with_user_access_enabled(f)
-    }
-    #[cfg(target_arch = "riscv64")]
-    {
-        arch_riscv64::with_user_access_enabled(f)
-    }
     #[cfg(target_arch = "aarch64")]
     {
         // ARM64 user access is controlled by PAN. The initial ARM64 bring-up
         // keeps this path explicit until exception-table fault fixups land.
         Ok(f())
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch_riscv64::with_user_access_enabled(f)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        arch_x86_64::with_user_access_enabled(f)
+    }
     #[cfg(not(any(
-        target_arch = "x86_64",
+        target_arch = "aarch64",
         target_arch = "riscv64",
-        target_arch = "aarch64"
+        target_arch = "x86_64",
     )))]
     {
         let _ = f;
         Err(UaccessError::Fault)
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+mod arch_riscv64 {
+    use super::UaccessError;
+    use super::UaccessResult;
+
+    /// `sstatus.SUM` bit — Supervisor User Memory access.
+    const SSTATUS_SUM: usize = 1 << 18;
+
+    /// Per-hart flag set by the kernel's `stvec` S-mode trap handler when a
+    /// load/store page-fault fires inside a user-access window.
+    #[thread_local]
+    static mut USER_FAULT_OCCURRED: bool = false;
+
+    /// Called from the `stvec` trap handler for cause 13 (load page-fault) and
+    /// cause 15 (store page-fault) when the fault PC is inside a `sum_set`
+    /// region.
+    pub unsafe fn signal_user_fault() {
+        USER_FAULT_OCCURRED = true;
+    }
+
+    #[inline]
+    unsafe fn clear_fault_flag() {
+        USER_FAULT_OCCURRED = false;
+    }
+
+    #[inline]
+    unsafe fn fault_occurred() -> bool {
+        USER_FAULT_OCCURRED
+    }
+
+    /// Sets `sstatus.SUM`, runs `f`, then clears `sstatus.SUM`.
+    #[inline]
+    pub unsafe fn with_user_access_enabled<F, T>(f: F) -> UaccessResult<T>
+    where
+        F: FnOnce() -> T,
+    {
+        clear_fault_flag();
+
+        // Set SUM bit to allow S-mode access to U-mode pages.
+        core::arch::asm!(
+            "csrrs zero, sstatus, {sum}",
+            sum = in(reg) SSTATUS_SUM,
+            options(nostack)
+        );
+
+        let result = f();
+
+        // Clear SUM to re-engage user-page protection.
+        core::arch::asm!(
+            "csrrc zero, sstatus, {sum}",
+            sum = in(reg) SSTATUS_SUM,
+            options(nostack)
+        );
+
+        if fault_occurred() {
+            Err(UaccessError::Fault)
+        } else {
+            Ok(result)
+        }
     }
 }
 
@@ -200,68 +271,6 @@ mod arch_x86_64 {
 
         // CLAC — restore SMAP protection.
         core::arch::asm!("clac", options(nostack, preserves_flags));
-
-        if fault_occurred() {
-            Err(UaccessError::Fault)
-        } else {
-            Ok(result)
-        }
-    }
-}
-
-#[cfg(target_arch = "riscv64")]
-mod arch_riscv64 {
-    use super::UaccessError;
-    use super::UaccessResult;
-
-    /// `sstatus.SUM` bit — Supervisor User Memory access.
-    const SSTATUS_SUM: usize = 1 << 18;
-
-    /// Per-hart flag set by the kernel's `stvec` S-mode trap handler when a
-    /// load/store page-fault fires inside a user-access window.
-    #[thread_local]
-    static mut USER_FAULT_OCCURRED: bool = false;
-
-    /// Called from the `stvec` trap handler for cause 13 (load page-fault) and
-    /// cause 15 (store page-fault) when the fault PC is inside a `sum_set`
-    /// region.
-    pub unsafe fn signal_user_fault() {
-        USER_FAULT_OCCURRED = true;
-    }
-
-    #[inline]
-    unsafe fn clear_fault_flag() {
-        USER_FAULT_OCCURRED = false;
-    }
-
-    #[inline]
-    unsafe fn fault_occurred() -> bool {
-        USER_FAULT_OCCURRED
-    }
-
-    /// Sets `sstatus.SUM`, runs `f`, then clears `sstatus.SUM`.
-    #[inline]
-    pub unsafe fn with_user_access_enabled<F, T>(f: F) -> UaccessResult<T>
-    where
-        F: FnOnce() -> T,
-    {
-        clear_fault_flag();
-
-        // Set SUM bit to allow S-mode access to U-mode pages.
-        core::arch::asm!(
-            "csrrs zero, sstatus, {sum}",
-            sum = in(reg) SSTATUS_SUM,
-            options(nostack)
-        );
-
-        let result = f();
-
-        // Clear SUM to re-engage user-page protection.
-        core::arch::asm!(
-            "csrrc zero, sstatus, {sum}",
-            sum = in(reg) SSTATUS_SUM,
-            options(nostack)
-        );
 
         if fault_occurred() {
             Err(UaccessError::Fault)
@@ -374,7 +383,7 @@ pub fn put_user<T: Copy>(user_addr: usize, val: T) -> UaccessResult {
 ///
 /// `UserPtr<T>` carries only an address; it does not dereference the pointer
 /// directly.  All reads and writes go through [`get_user`] / [`put_user`] so
-/// SMAP/SUM protection is always applied.
+/// SMAP/SUM/PAN protection is always applied.
 ///
 /// ```no_run
 /// let p: UserPtr<u64> = UserPtr::new(syscall_arg as usize);

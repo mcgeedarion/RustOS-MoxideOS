@@ -3,10 +3,10 @@
 # One-shot: build all userspace binaries and pack them into initramfs.cpio.
 #
 # Usage:
-#   ./tools/build_userspace.sh              # x86_64 (default)
+#   ./tools/build_userspace.sh              # aarch64 (default)
 #   ./tools/build_userspace.sh riscv64      # RISC-V
-#   ./tools/build_userspace.sh aarch64      # AArch64
-#   ./tools/build_userspace.sh x86_64 --clean  # Clean rebuild
+#   ./tools/build_userspace.sh x86_64       # x86_64
+#   ./tools/build_userspace.sh aarch64 --clean  # Clean rebuild
 #
 # Environment Variables:
 #   VERBOSE=1       Enable verbose output
@@ -27,10 +27,10 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-ARCH=${1:-x86_64}
+ARCH=${1:-aarch64}
 CLEAN_BUILD=${2:-}
 VERBOSE=${VERBOSE:-0}
-VALID_ARCHS=("x86_64" "riscv64" "aarch64")
+VALID_ARCHS=("aarch64" "riscv64" "x86_64")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
