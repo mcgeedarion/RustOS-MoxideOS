@@ -13,4 +13,8 @@
 
 #![no_std]
 #![no_main]
-extern crate rustos;
+
+// Pull the kernel library crate into the final executable so its exported boot
+// symbols (`uefi_start`, `kernel_main`, architecture modules, panic handler, and
+// allocator hooks) are linked into the artifact that xtask converts to EFI.
+extern crate rustos_kernel;
