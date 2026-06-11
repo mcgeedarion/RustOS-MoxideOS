@@ -8,26 +8,37 @@
 //!
 //! This module extends that scheme by letting the kernel heap grow on demand:
 //!
-//!   1. `init_heap_tracking(start, initial_pages)` — called once from the
-//!      arch-level kernel init.  Sets `HEAP_BYTES` to
-//!      `initial_pages * PAGE_SIZE`.
+//!   1. `heap_init()` — called once from the arch-level kernel init (step 0c,
+//!      before GDT/IDT/PMM).  Hands the statically-allocated `BOOT_HEAP` pool
+//!      to `ALLOCATOR.lock().init()` and records accounting via
+//!      `init_heap_tracking()`.  Idempotent.
 //!
-//!   2. `grow(pages)` — called from the global allocator's OOM handler (or any
+//!   2. `init_heap_tracking(start, initial_pages)` — lower-level hook for
+//!      arch code that wants to prime the allocator with a custom VA/size.
+//!      Records `HEAP_BYTES` and `HEAP_PAGES` for `/proc/meminfo`.
+//!
+//!   3. `grow(pages)` — called from the global allocator's OOM handler (or any
 //!      kernel path that needs more heap).  Allocates `pages` physical pages
 //!      from the PMM, derives their kernel-virtual addresses through the
 //!      architecture's direct physmap, and hands that region to the
 //!      linked_list_allocator via `add_free_region`.
 //!
-//!   3. On both supported architectures the kernel direct map covers the entire
+//!   4. On both supported architectures the kernel direct map covers the entire
 //!      physical address space in the higher half (x86-64: `PHYS_OFFSET + pa`;
 //!      RISC-V: `KERNEL_PHYS_BASE + pa`).  Newly allocated pages are therefore
 //!      immediately addressable without any additional `map_page()` call.
 //!
+//! ## Boot pool
+//! `BOOT_HEAP` is a `static mut [u8; BOOT_HEAP_SIZE]` baked into the kernel
+//! BSS.  It is the only heap available between `heap_init()` and the first
+//! `grow()` call after the PMM comes up.  Size is `BOOT_HEAP_PAGES * PAGE_SIZE`
+//! (default: 256 pages / 1 MiB).
+//!
 //! ## Safety invariants
 //! * `HEAP_BYTES` tracks the total number of bytes committed to the heap for
 //!   `/proc/meminfo` accounting. It is NOT a virtual address watermark.
-//! * `HEAP_BYTES` and `HEAP_PAGES` are protected by atomics; concurrent grow
-//!   calls are safe provided the PMM is independently thread-safe.
+//! * `HEAP_BYTES` and `HEAP_PAGES` are updated with `Ordering::Relaxed` — they
+//!   are purely informational counters with no ordering dependency.
 //! * We never shrink the kernel heap — `free` returns pages to the allocator
 //!   free list but they stay mapped.
 //! * Maximum kernel heap is bounded by the PMM free list — asking for more
@@ -39,6 +50,7 @@
 extern crate alloc;
 
 use core::alloc::Layout;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -96,6 +108,29 @@ fn phys_to_kernel_virt(pa: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Boot heap pool — statically allocated in BSS, used before the PMM is up.
+// ---------------------------------------------------------------------------
+
+/// Number of pages in the static boot heap pool.
+/// Sized to comfortably cover early kernel allocations before PMM init.
+const BOOT_HEAP_PAGES: usize = 256; // 1 MiB at 4 KiB granule
+const BOOT_HEAP_SIZE: usize = BOOT_HEAP_PAGES * PAGE_SIZE;
+
+/// The static boot heap pool. Lives in BSS (zero-initialised by the loader).
+///
+/// # Safety
+/// Only `heap_init()` may write to this array, and only once, before any
+/// allocation is attempted. After `heap_init()` returns it is exclusively
+/// owned by the linked_list_allocator.
+#[repr(align(4096))]
+struct BootHeapPool([u8; BOOT_HEAP_SIZE]);
+
+static mut BOOT_HEAP: BootHeapPool = BootHeapPool([0u8; BOOT_HEAP_SIZE]);
+
+/// Guards `heap_init()` idempotency. Set to `true` after the first call.
+static HEAP_INITIALISED: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
 // Maximum frames that can be requested in a single grow() call.
 // This caps the fixed-size stack array used to collect PMM frames without
 // calling the global allocator (which would risk re-entrant deadlock).
@@ -108,8 +143,8 @@ const MAX_GROW_PAGES: usize = 512;
 
 /// Total bytes currently committed to the kernel heap (for /proc/meminfo).
 ///
-/// This is a simple sum of `pages * PAGE_SIZE` across all `grow` calls.
-/// It is NOT a virtual address watermark — PMM frames may be non-contiguous.
+/// This is a simple sum of `pages * PAGE_SIZE` across all `grow` calls plus
+/// the initial boot pool.
 ///
 /// `Ordering::Relaxed` is sufficient here because HEAP_BYTES is used only for
 /// informational accounting (e.g., /proc/meminfo reads). No other memory
@@ -133,18 +168,53 @@ static GROW_LOCK: Mutex<()> = Mutex::new(());
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Called once at boot after the linked_list_allocator has been initialised.
+/// Top-level heap initialisation — called from the per-arch `kernel_main` at
+/// boot step 0c, **before** GDT, IDT, and the PMM are initialised.
+///
+/// Hands the statically-allocated `BOOT_HEAP` pool to
+/// `ALLOCATOR.lock().init()`, making the global Rust allocator operational.
+/// Then records the initial accounting via `init_heap_tracking()`.
+///
+/// Idempotent: safe to call more than once (subsequent calls are no-ops).
+/// Must only be called from a single CPU with interrupts disabled.
+pub fn heap_init() {
+    // CAS false → true so that a second call from any CPU is a no-op.
+    if HEAP_INITIALISED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    // SAFETY:
+    // * We just won the CAS — no other call can reach this point.
+    // * BOOT_HEAP is in BSS, zero-filled by the loader, and not yet aliased
+    //   by any Rust reference.
+    // * The pointer/size passed to init() are valid for the lifetime of the
+    //   kernel — BOOT_HEAP is a 'static.
+    let (start, size) = unsafe {
+        let ptr = BOOT_HEAP.0.as_mut_ptr();
+        (ptr as usize, BOOT_HEAP_SIZE)
+    };
+
+    unsafe {
+        crate::ALLOCATOR.lock().init(start, size);
+    }
+
+    init_heap_tracking(start, BOOT_HEAP_PAGES);
+}
+
+/// Called once at boot after the linked_list_allocator has been initialised
+/// with a custom pool (arch code that manages its own VA layout).
 /// Records the initial heap size for accounting purposes.
 ///
-/// `_heap_virt_start` is accepted for API compatibility but is not stored —
-/// the accounting is byte-based, not watermark-based.
-pub fn init_heap_tracking(_heap_virt_start: usize, initial_pages: usize) {
+/// `heap_virt_start` is the virtual address handed to `ALLOCATOR.lock().init()`;
+/// `initial_pages` is how many pages were given.
+pub fn init_heap_tracking(heap_virt_start: usize, initial_pages: usize) {
+    let _ = heap_virt_start; // retained for API symmetry; accounting is byte-based
     // Relaxed: called from a single CPU before SMP is brought up.
-    HEAP_PAGES.store(initial_pages, core::sync::atomic::Ordering::Relaxed);
-    HEAP_BYTES.store(
-        initial_pages * PAGE_SIZE,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    HEAP_PAGES.store(initial_pages, Ordering::Relaxed);
+    HEAP_BYTES.store(initial_pages * PAGE_SIZE, Ordering::Relaxed);
 }
 
 /// Grow the kernel heap by `pages` pages.
@@ -156,8 +226,7 @@ pub fn init_heap_tracking(_heap_virt_start: usize, initial_pages: usize) {
 /// Returns the kernel-virtual address of the first new byte on success.
 /// Returns `None` on PMM exhaustion or if `pages` exceeds `MAX_GROW_PAGES`.
 ///
-/// Passing `pages == 0` is a no-op and returns `None` (callers must not rely
-/// on a meaningful address for a zero-page grow).
+/// Passing `pages == 0` is a no-op and returns `None`.
 ///
 /// # Safety contract
 /// Each frame is freshly allocated from the PMM, zero-filled, and not aliased
@@ -215,20 +284,20 @@ pub fn grow(pages: usize) -> Option<usize> {
     }
 
     // Relaxed: purely informational counters, see HEAP_BYTES/HEAP_PAGES docs.
-    HEAP_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
-    HEAP_BYTES.fetch_add(pages * PAGE_SIZE, core::sync::atomic::Ordering::Relaxed);
+    HEAP_PAGES.fetch_add(pages, Ordering::Relaxed);
+    HEAP_BYTES.fetch_add(pages * PAGE_SIZE, Ordering::Relaxed);
 
     Some(first_virt)
 }
 
 /// Returns the current kernel heap size in pages.
 pub fn committed_pages() -> usize {
-    HEAP_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+    HEAP_PAGES.load(Ordering::Relaxed)
 }
 
 /// Returns the total bytes committed to the kernel heap.
 pub fn committed_bytes() -> usize {
-    HEAP_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+    HEAP_BYTES.load(Ordering::Relaxed)
 }
 
 /// Called by the custom `#[global_allocator]` OOM handler before panicking.
