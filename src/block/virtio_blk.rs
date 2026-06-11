@@ -1,6 +1,7 @@
 //! virtio-blk block device driver (MMIO transport).
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 // From virtio spec 4.2.2
@@ -44,6 +45,15 @@ const QUEUE_SIZE: usize = 8; // power of 2; must be <= QueueNumMax
 
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2; // device writes to this buffer
+
+/// Set to `true` only after `virtio_blk_init` completes successfully.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` if `virtio_blk_init` has completed successfully.
+#[inline]
+pub fn is_present() -> bool {
+    INITIALIZED.load(Ordering::Acquire)
+}
 
 #[repr(C, align(16))]
 struct VirtqDesc {
@@ -131,6 +141,8 @@ static mut LAST_USED_IDX: u16 = 0;
 
 /// Initialise the virtio-blk device at `mmio_pa`.
 /// Call after PMM is up; `mmio_pa` must be identity-mapped.
+/// Sets `INITIALIZED` to `true` on success; is_present() returns false
+/// for any early-return failure path.
 pub fn virtio_blk_init(mmio_pa: usize) {
     unsafe {
         MMIO_BASE = mmio_pa;
@@ -149,7 +161,7 @@ pub fn virtio_blk_init(mmio_pa: usize) {
         mmio_w32(MMIO_STATUS, 0);
         mmio_w32(MMIO_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
         mmio_w32(MMIO_DEVICE_FEAT_SEL, 0);
-        
+
         let _dev_feats_lo = mmio_r32(MMIO_DEVICE_FEAT);
         mmio_w32(MMIO_DEVICE_FEAT_SEL, 1);
         let _dev_feats_hi = mmio_r32(MMIO_DEVICE_FEAT);
@@ -192,6 +204,9 @@ pub fn virtio_blk_init(mmio_pa: usize) {
             MMIO_STATUS,
             STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
         );
+
+        // All init paths that could fail are above. Mark driver as present.
+        INITIALIZED.store(true, Ordering::Release);
     }
 }
 
