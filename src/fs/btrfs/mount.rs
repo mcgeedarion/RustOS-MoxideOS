@@ -12,7 +12,7 @@ use spin::Mutex;
 
 pub fn mount(subpath: &str, lba_start: u64) -> Result<(), &'static str> {
     let sb_lba = lba_start + 128;
-    let raw = read_sectors_raw(sb_lba, 16);
+    let raw = read_sectors_raw(sb_lba, 16).ok_or("failed to read btrfs superblock")?;
     let sb = BtrfsSuperblock::from_bytes(&raw).ok_or("bad superblock")?;
     let chunk_map = parse_sys_chunk_array(&sb).ok_or("empty chunk array")?;
     let root_tree_root = sb.root;
@@ -59,32 +59,39 @@ fn resolve_fs_tree_root(fs: &BtrfsFs) -> Option<u64> {
     Some(BtrfsRootItem::from_bytes(&data)?.bytenr)
 }
 
-pub(crate) fn read_sectors_raw(lba: u64, count: u32) -> Vec<u8> {
+/// Read `count` sectors from `lba` into a new buffer.
+/// Returns `None` on I/O failure or overflow.
+pub(crate) fn read_sectors_raw(lba: u64, count: u32) -> Option<Vec<u8>> {
     crate::drivers::block::read_sectors_vec(lba, count)
 }
 
-pub(crate) fn write_sectors_raw(lba: u64, data: &[u8]) {
-    debug_assert!(data.len() % 512 == 0);
-    crate::drivers::block::write_sectors(lba, data);
+/// Write a sector-aligned byte slice to disk at `lba`.
+/// Returns `Err` on alignment violation or I/O failure.
+pub(crate) fn write_sectors_raw(lba: u64, data: &[u8]) -> Result<(), &'static str> {
+    crate::drivers::block::write_sectors_raw(lba, data)
 }
 
+/// Read `byte_len` bytes from the logical address space of `fs`.
 pub(crate) fn read_logical(fs: &BtrfsFs, logical: u64, byte_len: usize) -> Option<Vec<u8>> {
     let phys = fs.logical_to_physical(logical)?;
     let nsecs = ((byte_len + 511) / 512) as u32;
-    let raw = read_sectors_raw(phys / 512, nsecs);
+    let raw = read_sectors_raw(phys / 512, nsecs)?;
+
     if raw.len() < byte_len {
         return None;
     }
+
     Some(raw[..byte_len].to_vec())
 }
 
+/// Write `data` to the logical address space of `fs`.
 pub(crate) fn write_logical(fs: &BtrfsFs, logical: u64, data: &[u8]) -> Result<(), &'static str> {
     let phys = fs
         .logical_to_physical(logical)
         .ok_or("unmapped logical addr")?;
     let mut aligned = vec![0u8; (data.len() + 511) & !511];
     aligned[..data.len()].copy_from_slice(data);
-    write_sectors_raw(phys / 512, &aligned);
+    write_sectors_raw(phys / 512, &aligned)?;
     Ok(())
 }
 

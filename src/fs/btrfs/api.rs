@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 pub fn mount(subpath: &str) -> Option<()> {
     // Read superblock at offset 0x10000 (sector 128)
-    let raw = crate::drivers::block::read_sectors_vec(128, 8);
+    let raw = crate::drivers::block::read_sectors_vec(128, 8)?;
     let sb = BtrfsSuperblock::from_bytes(&raw)?;
 
     // Parse sys_chunk_array to bootstrap the chunk map

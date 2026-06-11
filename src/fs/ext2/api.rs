@@ -7,21 +7,31 @@ use alloc::{string::String, vec::Vec};
 
 pub fn mount() -> bool {
     // Read superblock from sector 2 (offset 1024 bytes)
-    let raw = crate::drivers::block::read_sectors_vec(2, 2);
+    let Some(raw) = crate::drivers::block::read_sectors_vec(2, 2) else {
+        return false;
+    };
+
     let sb = match Superblock::from_bytes(&raw) {
         Some(s) => s,
         None => return false,
     };
+
     let block_size = sb.block_size();
     let lba_offset = 0u64;
+
     // Read block group descriptor table
     let bgdt_block = sb.first_data_block + 1;
     let n_groups = ((sb.blocks_count + sb.blocks_per_group - 1) / sb.blocks_per_group) as usize;
     let gd_per_block = block_size / 32;
     let bgdt_blocks = (n_groups + gd_per_block - 1) / gd_per_block;
     let lba_bgdt = lba_offset + (bgdt_block as u64 * block_size as u64 / 512);
-    let raw_bgdt =
-        crate::drivers::block::read_sectors_vec(lba_bgdt, (bgdt_blocks * block_size / 512) as u32);
+
+    let Some(raw_bgdt) =
+        crate::drivers::block::read_sectors_vec(lba_bgdt, (bgdt_blocks * block_size / 512) as u32)
+    else {
+        return false;
+    };
+
     let mut group_descs = Vec::new();
     for i in 0..n_groups {
         let off = i * 32;
@@ -30,12 +40,14 @@ pub fn mount() -> bool {
         }
         group_descs.push(BgDesc::from_bytes(&raw_bgdt[off..off + 32]));
     }
+
     *FS.lock() = Some(Ext2Fs {
         sb,
         group_descs,
         block_size,
         lba_offset,
     });
+
     true
 }
 
@@ -175,8 +187,8 @@ pub fn create_file(path: &str, mode: u16) -> Result<(), i32> {
         .unwrap_or(Err(-2))
         .map_err(|e| e as i32)
 }
-// ===== GUESS: short alias =====
-/// GUESS: alias of `sys_stat` for callers using `ext2::stat`.
+
+/// Alias of `sys_stat` for callers using `ext2::stat`.
 #[inline]
 pub fn stat(path: &str) -> Result<Ext2Stat, i32> {
     sys_stat(path)
