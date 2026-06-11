@@ -178,6 +178,12 @@ struct CqRingHdr {
 const _: () = assert!(core::mem::size_of::<SqRingHdr>() <= RING_HDR_SIZE);
 const _: () = assert!(core::mem::size_of::<CqRingHdr>() <= RING_HDR_SIZE);
 
+// Layout compatibility assertions for CqRingHeadTail in ring_pub.rs.
+// CqRingHeadTail is a prefix overlay of CqRingHdr; these assert the
+// two share the same field offsets for head and tail.
+const _: () = assert!(core::mem::offset_of!(CqRingHdr, head) == 0);
+const _: () = assert!(core::mem::offset_of!(CqRingHdr, tail) == 4);
+
 /// Kernel-side descriptor for one io_uring instance.
 pub struct IoUringRing {
     /// Owner PID.
