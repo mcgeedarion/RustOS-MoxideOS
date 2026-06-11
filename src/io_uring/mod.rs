@@ -10,11 +10,12 @@ pub mod ops;
 pub mod ring;
 pub mod ring_buf;
 pub mod ring_pub;
+pub mod scheduler_integration;
 pub mod sqe;
 pub mod syscall;
 
 pub use ring::{
-    alloc_ring, cq_wq_for, free_ring, ring_idx_for_fd, with_ring, with_ring_mut, IoUringCqe,
+    alloc_ring, cq_wq_for, free_ring, init, ring_idx_for_fd, with_ring, with_ring_mut, IoUringCqe,
     IoUringParams, IoUringRing, IoUringSqe,
 };
 
