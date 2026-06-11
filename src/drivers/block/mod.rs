@@ -1,13 +1,15 @@
 //! Block and storage drivers.
 //!
 //! ## Modules
-//!   ahci       — AHCI SATA controller
-//!   nvme       — NVMe host controller
-//!   virtio_blk — VirtIO block device
+//!   ahci — AHCI SATA controller
+//!   nvme — NVMe host controller
+//!
+//! For the VirtIO block device, use `crate::block::virtio_blk` directly
+//! or the multi-sector helpers (`read_sectors`, `write_sectors`,
+//! `read_sectors_vec`, `write_sectors_raw`) exported from this module.
 
 pub mod ahci;
 pub mod nvme;
-pub mod virtio_blk;
 
 extern crate alloc;
 
