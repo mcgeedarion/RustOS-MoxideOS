@@ -10,16 +10,8 @@ use crate::mm::pmm;
 use crate::proc::scheduler;
 
 const PAGE_SIZE: usize = 4096;
-
-// A completely-zeroed PTE is non-present on all three architectures and
-// therefore acts as a safe sentinel value: any CPU that reads it while we
-// are resolving the fault will re-fault immediately and find the finished
-// RW mapping on the second attempt.
 const SENTINEL_PTE: u64 = 0;
 
-// Physical frames must be accessed through the kernel's physmap window.
-// Passing a raw physical address to copy_nonoverlapping() would fault or
-// alias an unrelated mapping.
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
@@ -61,56 +53,6 @@ pub fn clone_for_fork(parent_pid: usize, child_pid: usize, parent_cr3: usize) ->
     child_cr3
 }
 
-/// Handle a write fault that may be a CoW page.
-/// Returns true if resolved; false if genuine access violation.
-///
-/// ## `error_code` encoding (arch-specific)
-///
-/// **x86-64** (hardware-defined, passed directly from the IDT stub):
-///   bit 0 (P)   = 1  → page was Present
-///   bit 1 (W)   = 1  → fault was caused by a Write
-///   bit 2 (U)   = 1  → fault occurred in User mode
-///   A CoW fault always has P|W|U = 0x7.
-///
-/// **RISC-V** (synthesised by our trap handler in src/arch/riscv64/trap.rs):
-///   bit 0       = 0  (unused; store-vs-load encoded in bit 1)
-///   bit 1 (W)   = 1  → Store/AMO page fault (mcause 15)
-///   bit 3 (U)   = 1  → fault occurred in U-mode (sstatus.SPP == 0)
-///   A CoW fault has W|U = 0b1010 = 0xA.
-///   (We do not check bit 0 / Present on RISC-V because the hardware does
-///   not expose that information in a single fault-error word the same way
-///   x86 does; the PTE walk below confirms the mapping exists.)
-///
-/// ## SMP race elimination (CAS sentinel)
-///
-/// Two threads (or two fork children) sharing a CoW frame can both take a
-/// write fault before either has resolved it.  Without a lock, both would
-/// pass the COW_BIT check, both allocate a new page, both copy old_pa,
-/// and both call put_page(old_pa) — the second decrement reaches zero and
-/// returns old_pa to the buddy while the first thread already holds the
-/// new mapping.  That is a double-free of old_pa.
-///
-/// We close the race with a compare_exchange on the raw PTE slot:
-///   1. Atomically swap the CoW PTE with SENTINEL_PTE (0 = non-present).
-///   2. Only the winner proceeds to alloc/copy/map; the loser finds the
-///      COW_BIT clear on its next read and returns Ok(()), then re-faults
-///      into the winner's freshly written RW PTE.
-///   3. put_page is called exactly once per CoW PTE.
-///
-/// ## SMP TLB shootdown protocol
-///
-/// After mapping the new private copy and replacing the PTE, we must
-/// invalidate the old mapping on ALL CPUs before releasing our reference
-/// to `old_pa`.  The sequence is:
-///
-///   1. map_page()      — replace the PTE in this process's page tables
-///   2. flush_va()      — invalidate local TLB entry
-///   3. tlb_shootdown() — send TLB-shootdown IPIs to all other CPUs and WAIT
-///      for their acknowledgment (blocking)
-///   4. put_page()      — decrement the refcount; buddy_free_page is called
-///      only when the count reaches zero, which is safe when multiple fork
-///      children share the same frame.
-///
 /// Skipping step 3 on a multi-processor system would allow another CPU
 /// that held this process's address space loaded to dereference the freed
 /// page via its stale TLB entry, causing a use-after-free.
@@ -239,9 +181,6 @@ const PAGE_SIZE_BIT: u64 = 1 << 7;
 
 /// Return the *physical address* of the leaf PTE slot for `va`, or None if
 /// the walk terminates early (not mapped, large page, etc.).
-///
-/// The caller may then cast `to_virt(pte_pa)` to `*const AtomicU64` for
-/// a lock-free CAS.
 unsafe fn pte_addr(cr3: usize, va: usize) -> Option<usize> {
     pte_addr_impl(cr3, va)
 }
