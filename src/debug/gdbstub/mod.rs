@@ -1,5 +1,6 @@
 // GDB stub — canonical implementation lives here.
 
+pub mod arch;
 pub mod breakpoints;
 pub mod rsp;
 pub mod rsp_aarch64;
