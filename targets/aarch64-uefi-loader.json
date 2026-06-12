@@ -8,6 +8,7 @@
   "os": "uefi",
   "env": "",
   "vendor": "rustos",
+  "is-like-windows": true,
   "linker-flavor": "lld-link",
   "lld-flavor": "link",
   "linker": "rust-lld",
