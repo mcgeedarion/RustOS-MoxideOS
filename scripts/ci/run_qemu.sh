@@ -26,6 +26,7 @@ TEST_MODE=0
 TIMEOUT_SECS=60
 SMOKE_MARKER="SMOKE OK: userspace_smoke"
 DISK=""
+INITRD=""
 
 usage() {
   cat <<'USAGE'
@@ -38,6 +39,7 @@ Options:
   --gpu               x86_64 only
   --gdb               wait for GDB on :1234
   --no-net
+  --initrd <file>     attach an initramfs CPIO archive
   --smoke             headless smoke run; waits for smoke marker
   --test              headless kmtest run; parses PASS/FAIL summary
   --timeout <seconds>
@@ -53,6 +55,8 @@ while [[ $# -gt 0 ]]; do
     --gdb) GDB_MODE=1; shift ;;
     --gpu) GPU_MODE=1; shift ;;
     --no-net) NET_MODE=0; shift ;;
+    --initrd) INITRD="${2:?--initrd requires a file}"; shift 2 ;;
+    --initrd=*) INITRD="${1#--initrd=}"; shift ;;
     --smoke) SMOKE_MODE=1; NET_MODE=0; GPU_MODE=0; shift ;;
     --test) TEST_MODE=1; NET_MODE=0; GPU_MODE=0; shift ;;
     --timeout) TIMEOUT_SECS="${2:?--timeout requires seconds}"; shift 2 ;;
@@ -79,8 +83,10 @@ esac
 
 [[ "$SMOKE_MODE" -eq 1 && "$TEST_MODE" -eq 1 ]] && { echo "[!] --smoke and --test are mutually exclusive" >&2; exit 2; }
 [[ "$GDB_MODE" -eq 1 && ( "$SMOKE_MODE" -eq 1 || "$TEST_MODE" -eq 1 ) ]] && { echo "[!] --gdb cannot be combined with --smoke/--test" >&2; exit 2; }
+[[ -n "$INITRD" && ( "$SMOKE_MODE" -eq 1 || "$TEST_MODE" -eq 1 ) ]] && { echo "[!] --initrd cannot be combined with --smoke/--test; those modes generate their own initrd" >&2; exit 2; }
 [[ "$GPU_MODE" -eq 1 && "$ARCH" != "x86_64" ]] && { echo "[!] --gpu is only supported on x86_64" >&2; exit 2; }
 [[ ! "$TIMEOUT_SECS" =~ ^[0-9]+$ || "$TIMEOUT_SECS" -eq 0 ]] && { echo "[!] --timeout requires a positive integer" >&2; exit 2; }
+[[ -n "$INITRD" && ! -f "$INITRD" ]] && { echo "[!] initrd not found: $INITRD" >&2; exit 2; }
 
 PROFILE=$([[ "$RELEASE_MODE" -eq 1 ]] && echo release || echo debug)
 ESP_ROOT="${ROOT_DIR}/target/esp/${ARCH}"
@@ -256,6 +262,10 @@ if [[ "$SMOKE_MODE" -eq 1 ]]; then
   cp "${ROOT_DIR}/userspace/build/${ARCH}/smoke" "$SMOKE_STAGE/bin/smoke"
   (cd "$SMOKE_STAGE" && find . | sort | cpio -o -H newc --quiet > "$SMOKE_CPIO")
   QEMU_ARGS+=(-initrd "$SMOKE_CPIO" -append "init=/bin/smoke")
+fi
+
+if [[ -n "$INITRD" ]]; then
+  QEMU_ARGS+=(-initrd "$INITRD")
 fi
 
 if [[ "$NET_MODE" -eq 1 ]]; then
