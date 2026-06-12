@@ -14,8 +14,16 @@ const CRT_SOURCES: &[&str] = &[
 const RISCV_ASM_SRC: &str = "src/arch/riscv64/uentry.S";
 const RISCV_OBJ_NAME: &str = "uentry_riscv64.o";
 const RISCV_LIB_NAME: &str = "libuentry_riscv64.a";
-const RISCV_FLAGS: &[&str] = &["-march=rv64gc", "-mabi=lp64d"];
-const RISCV_TRIPLE: &str = "riscv64-unknown-elf";
+const RISCV_CLANG_TARGET: &str = "riscv64-unknown-elf";
+const RISCV_CLANG_FLAGS: &[&str] = &[
+    "-c",
+    "-x",
+    "assembler-with-cpp",
+    "-ffreestanding",
+    "-march=rv64gc",
+    "-mabi=lp64d",
+    "-mno-relax",
+];
 
 const CRT_COMPILE_FLAGS: &[&str] = &[
     "-ffreestanding",
@@ -129,28 +137,57 @@ fn which_first(names: &[&str]) -> Option<String> {
 }
 
 /// Assemble the RISC-V uentry trampoline and archive it as a static library.
+///
+/// Uses LLVM-provided tooling (`clang` as the assembler driver and `llvm-ar`
+/// from `llvm-tools-preview` / a host `llvm` install) rather than the GNU
+/// `riscv64-unknown-elf-{as,ar}` binutils. This removes the need for a
+/// cross binutils package on CI hosts when only the Rust + LLVM toolchain
+/// is available.
 fn assemble_riscv_uentry(out: &PathBuf) {
     println!("cargo:rerun-if-changed={RISCV_ASM_SRC}");
 
+    if !std::path::Path::new(RISCV_ASM_SRC).exists() {
+        // No user-entry trampoline source in this tree; nothing to assemble.
+        return;
+    }
+
     let obj = out.join(RISCV_OBJ_NAME);
     let lib = out.join(RISCV_LIB_NAME);
-    let as_bin = format!("{RISCV_TRIPLE}-as");
+
+    // Assembler: prefer clang (with explicit cross target) over a GNU
+    // riscv64-unknown-elf-as. clang ships with rustup's `llvm-tools-preview`
+    // and is otherwise readily available on CI runners.
+    let Some(asm_driver) = which_first(&["clang", "clang-19", "clang-18", "clang-17"]) else {
+        println!(
+            "cargo:warning=RISC-V assembly skipped; no clang available to assemble {RISCV_ASM_SRC}"
+        );
+        return;
+    };
+
     if !run_command(
         {
-            let mut cmd = Command::new(&as_bin);
-            cmd.args(RISCV_FLAGS)
-                .args(["-o"])
+            let mut cmd = Command::new(&asm_driver);
+            cmd.args(["--target", RISCV_CLANG_TARGET])
+                .args(RISCV_CLANG_FLAGS)
+                .arg("-o")
                 .arg(&obj)
                 .arg(RISCV_ASM_SRC);
             cmd
         },
-        &format!("{as_bin} assembly"),
+        &format!("{asm_driver} assembly"),
     ) {
-        println!("cargo:warning=RISC-V assembly skipped; {as_bin} not available");
+        println!("cargo:warning=RISC-V assembly skipped; {asm_driver} failed on {RISCV_ASM_SRC}");
         return;
     }
 
-    let ar_bin = format!("{RISCV_TRIPLE}-ar");
+    // Archiver: prefer llvm-ar (host install, rustup component, or versioned
+    // binary) over the GNU riscv64-unknown-elf-ar. llvm-ar is target-agnostic.
+    let Some(ar_bin) = which_first(&["llvm-ar", "llvm-ar-19", "llvm-ar-18", "llvm-ar-17", "ar"])
+    else {
+        println!("cargo:warning=RISC-V archival skipped; no llvm-ar/ar available");
+        return;
+    };
+
     if !run_command(
         {
             let mut cmd = Command::new(&ar_bin);
