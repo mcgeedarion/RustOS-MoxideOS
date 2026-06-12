@@ -91,24 +91,19 @@ case "$ARCH:$BOOT" in
   aarch64:baremetal) CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"; TARGET_DIR="aarch64-kernel" ;;
   riscv64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"; TARGET_DIR="riscv64-uefi-loader"; EFI_NAME="BOOTRISCV64.EFI" ;;
   riscv64:sbi) CARGO_TARGET="riscv64gc-unknown-none-elf"; TARGET_DIR="riscv64gc-unknown-none-elf" ;;
-  x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"; TARGET_DIR="x86_64-kernel"; EFI_NAME="BOOTX64.EFI" ;;
+  x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-uefi-loader.json"; TARGET_DIR="x86_64-uefi-loader"; EFI_NAME="BOOTX64.EFI" ;;
 esac
 
 pick_kernel_artifact() {
   local base="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos"
 
-  if [[ "$BOOT" == "uefi" && "$ARCH" != "x86_64" && -f "${base}.efi" ]]; then
+  if [[ "$BOOT" == "uefi" && -f "${base}.efi" ]]; then
     echo "${base}.efi"
     return 0
   fi
 
   if [[ -f "$base" ]]; then
     echo "$base"
-    return 0
-  fi
-
-  if [[ -f "${base}.efi" ]]; then
-    echo "${base}.efi"
     return 0
   fi
 
@@ -131,23 +126,10 @@ KERNEL_ELF="$(pick_kernel_artifact)" || {
   exit 1
 }
 
-find_objcopy() {
-  if [[ -n "${OBJCOPY:-}" ]]; then echo "$OBJCOPY"; return 0; fi
-  for tool in llvm-objcopy rust-objcopy objcopy; do
-    command -v "$tool" >/dev/null 2>&1 && { echo "$tool"; return 0; }
-  done
-  return 1
-}
-
 if [[ "$BOOT" == "uefi" ]]; then
   mkdir -p "$ESP_BOOT_DIR"
   EFI_IMAGE="${ESP_BOOT_DIR}/${EFI_NAME}"
-  if [[ "$ARCH" == "x86_64" ]]; then
-    OBJCOPY_BIN="$(find_objcopy)" || { echo "[!] objcopy is required for x86_64 UEFI" >&2; exit 1; }
-    "$OBJCOPY_BIN" --target=efi-app-x86_64 --subsystem=10 "$KERNEL_ELF" "$EFI_IMAGE"
-  else
-    cp "$KERNEL_ELF" "$EFI_IMAGE"
-  fi
+  cp "$KERNEL_ELF" "$EFI_IMAGE"
   echo "[*] ESP: ${EFI_IMAGE}"
 fi
 
