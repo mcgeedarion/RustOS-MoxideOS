@@ -136,7 +136,14 @@ pub fn init(_boot_info: &'static BootInfo) -> ! {
         crate::debug::gdbstub::session::init(&mut GDBSTUB_SERIAL);
     }
 
-    const INITS: &[&str] = &["/sbin/init", "/bin/sh", "/init", "/bin/bash"];
+    const INITS: &[&str] = &[
+        "/init",
+        "/sbin/init",
+        "/bin/sh",
+        "/bin/smoke",
+        "/bin/kmtest",
+        "/bin/bash",
+    ];
     let mut spawned = false;
     for path in INITS {
         if spawn_user_process(path, &[path], &[]) {
