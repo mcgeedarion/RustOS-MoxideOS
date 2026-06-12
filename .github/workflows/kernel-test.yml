@@ -214,7 +214,7 @@ jobs:
       - name: Skip kmtest without musl cross toolchain
         if: inputs.run_kmtest && inputs.arch != 'x86_64'
         run: |
-          echo "kmtest for ${{ inputs.arch }} requires a ${ { inputs.arch } }-linux-musl-gcc toolchain that is not provided by Ubuntu by default."
+          echo "kmtest for ${{ inputs.arch }} requires a Linux-musl cross compiler that is not provided by Ubuntu by default."
           echo "Skipping until the CI image provides the matching musl cross compiler."
 
       - name: Upload build artifacts
