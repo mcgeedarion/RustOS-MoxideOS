@@ -5,7 +5,7 @@
 //! | Arch    | Boot mechanism      | Entry file                              |
 //! |---------|---------------------|-----------------------------------------|
 //! | aarch64 | UEFI                | `arch/aarch64/uefi_entry.rs`            |
-//! | riscv64 | SBI                 | `arch/riscv64/boot.rs`                  |
+//! | riscv64 | UEFI                | `arch/riscv64/uefi_entey.rs`                  |
 //! | x86_64  | UEFI                | `arch/x86_64/uefi_entry.rs`             |
 //!
 //! Every path converges on `kernel_main()` in `kernel_main.rs`.
