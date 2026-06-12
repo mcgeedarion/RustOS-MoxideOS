@@ -40,7 +40,7 @@ struct BuildOpts {
 impl Default for BuildOpts {
     fn default() -> Self {
         Self {
-            arch: Arch::AArch64,
+            arch: Arch::X86_64,
             boot: Boot::Uefi,
             debug: false,
             initrd: false,
