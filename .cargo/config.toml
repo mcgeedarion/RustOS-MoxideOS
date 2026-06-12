@@ -12,4 +12,4 @@ target = "targets/x86_64-kernel.json"
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
-json-target-spec = true
+target-spec-json = true
