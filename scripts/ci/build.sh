@@ -10,13 +10,14 @@
 #   FEATURES   extra --features value appended verbatim
 #
 # Sets/exports on success:
-#   KERNEL_ELF   path to the built kernel ELF
+#   KERNEL_ELF   path to the built kernel artifact. For non-x86 UEFI targets,
+#                the toolchain may emit rustos.efi instead of rustos.
 #   CARGO_TARGET Rust target triple / JSON path used
 #   PROFILE      debug | release
 #
 # Exit codes:
 #   0  success
-#   1  build failed or ELF not found
+#   1  build failed or artifact not found
 #   2  bad arguments
 
 set -euo pipefail
@@ -43,7 +44,7 @@ case "$ARCH:$BOOT" in
   *) echo "[!] Unsupported build contract: ARCH=${ARCH} BOOT=${BOOT}" >&2; exit 2 ;;
 esac
 
-# ── Per-arch target + ELF path ──────────────────────────────────────────────
+# ── Per-arch target + artifact path ─────────────────────────────────────────
 
 case "$ARCH:$BOOT" in
   aarch64:uefi)
@@ -69,8 +70,28 @@ case "$ARCH:$BOOT" in
 esac
 
 PROFILE=$([ "$RELEASE" = 1 ] && echo release || echo debug)
-KERNEL_ELF="target/${TARGET_DIR}/${PROFILE}/rustos"
 EXTRA_FLAGS=()
+
+pick_kernel_artifact() {
+  local base="target/${TARGET_DIR}/${PROFILE}/rustos"
+
+  if [[ "$BOOT" == "uefi" && "$ARCH" != "x86_64" && -f "${base}.efi" ]]; then
+    echo "${base}.efi"
+    return 0
+  fi
+
+  if [[ -f "$base" ]]; then
+    echo "$base"
+    return 0
+  fi
+
+  if [[ -f "${base}.efi" ]]; then
+    echo "${base}.efi"
+    return 0
+  fi
+
+  return 1
+}
 
 # ── Append optional extra features ─────────────────────────────────────────
 
@@ -90,8 +111,9 @@ cargo build \
 
 # ── Verify output ───────────────────────────────────────────────────────────
 
-if [[ ! -f "$KERNEL_ELF" ]]; then
-  echo "[!] ELF not found: ${KERNEL_ELF}" >&2
+KERNEL_ELF="$(pick_kernel_artifact || true)"
+if [[ -z "$KERNEL_ELF" ]]; then
+  echo "[!] Kernel artifact not found under target/${TARGET_DIR}/${PROFILE}/" >&2
   exit 1
 fi
 
