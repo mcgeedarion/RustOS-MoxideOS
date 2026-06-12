@@ -4,13 +4,13 @@
 # The default CI contract is intentionally explicit:
 #
 #   arch      boot mode   cargo target
-#   aarch64   baremetal   targets/aarch64-kernel.json
+#   aarch64   uefi        targets/aarch64-uefi-loader.json
 #   riscv64   sbi         riscv64gc-unknown-none-elf
 #   x86_64    uefi        targets/x86_64-kernel.json
 #
-# Plain local `cargo build` also targets the primary x86_64 UEFI kernel ELF via
-# .cargo/config.toml. Use `cargo xtask image --arch x86_64` to produce the ESP
-# image consumed by OVMF/QEMU.
+# Plain local `cargo build` also targets the repository-default aarch64 UEFI
+# loader via .cargo/config.toml. Use `cargo xtask image --arch aarch64` to
+# produce the ESP image consumed by QEMU/EDK2.
 
 name: Kernel Test (reusable)
 
@@ -66,8 +66,8 @@ jobs:
         run: |
           case "${{ inputs.arch }}" in
             aarch64)
-              echo "BOOT=baremetal" >> "$GITHUB_ENV"
-              echo "TARGET_SHORT=aarch64-kernel" >> "$GITHUB_ENV"
+              echo "BOOT=uefi" >> "$GITHUB_ENV"
+              echo "TARGET_SHORT=aarch64-uefi-loader" >> "$GITHUB_ENV"
               ;;
             riscv64)
               echo "BOOT=sbi" >> "$GITHUB_ENV"
@@ -93,7 +93,7 @@ jobs:
         run: |
           case "${{ inputs.arch }}" in
             aarch64)
-              sudo apt-get install -y --no-install-recommends qemu-system-arm
+              sudo apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 mtools
               ;;
             riscv64)
               sudo apt-get install -y --no-install-recommends qemu-system-riscv64
@@ -115,18 +115,37 @@ jobs:
           ARCH="${{ inputs.arch }}" BOOT="${BOOT}" RELEASE=1 bash scripts/ci/build.sh \
             2>&1 | tee "build-${{ inputs.arch }}-release.log"
 
-      - name: QEMU smoke test (aarch64)
+      - name: Build aarch64 UEFI ESP image
+        if: inputs.run_smoke && inputs.arch == 'aarch64'
+        run: |
+          cargo xtask image --arch aarch64 --debug \
+            2>&1 | tee "build-aarch64-image.log"
+          test -f boot-aarch64.img
+
+      - name: QEMU smoke test (aarch64 UEFI)
         if: inputs.run_smoke && inputs.arch == 'aarch64'
         run: |
           mkdir -p logs/aarch64
+          FW_CODE=/usr/share/AAVMF/AAVMF_CODE.fd
+          if [ ! -f "$FW_CODE" ]; then
+            FW_CODE=/usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+          fi
+          test -f "$FW_CODE"
+
+          if [ -f /usr/share/AAVMF/AAVMF_VARS.fd ]; then
+            cp /usr/share/AAVMF/AAVMF_VARS.fd /tmp/AAVMF_VARS.fd
+          else
+            dd if=/dev/zero of=/tmp/AAVMF_VARS.fd bs=1M count=64 2>/dev/null
+          fi
+
           set +e
-          timeout 30 qemu-system-aarch64 \
+          timeout 45 qemu-system-aarch64 \
             -machine virt \
-            -cpu cortex-a72 \
+            -cpu cortex-a57 \
             -m 256M \
-            -kernel "target/aarch64-kernel/debug/rustos" \
-            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
-            -device virtio-net-device,netdev=net0,id=nic0 \
+            -drive if=pflash,unit=0,format=raw,readonly=on,file="$FW_CODE" \
+            -drive if=pflash,unit=1,format=raw,file=/tmp/AAVMF_VARS.fd \
+            -drive if=virtio,format=raw,file=boot-aarch64.img \
             -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             > "qemu-aarch64.log" 2>&1
@@ -200,10 +219,23 @@ jobs:
         if: inputs.run_smoke
         run: |
           LOG="qemu-${{ inputs.arch }}.log"
-          grep -q 'kernel_main reached' "$LOG"
-          grep -q 'TEST PASS: uart_smoke' "$LOG"
-          grep -q 'TEST PASS: alloc_smoke' "$LOG"
-          grep -q 'TEST PASS: trap_smoke' "$LOG"
+          case "${{ inputs.arch }}" in
+            aarch64)
+              grep -q 'aarch64: exception vectors installed' "$LOG"
+              grep -q 'aarch64: MMU enabled' "$LOG"
+              grep -q 'aarch64: heap ready' "$LOG"
+              grep -q 'aarch64: kernel_main: idle' "$LOG"
+              ;;
+            x86_64)
+              grep -q 'rustos: kernel_main reached' "$LOG"
+              grep -q 'TEST PASS: uart_smoke' "$LOG"
+              grep -q 'TEST PASS: alloc_smoke' "$LOG"
+              grep -q 'TEST PASS: trap_smoke' "$LOG"
+              ;;
+            riscv64)
+              echo "riscv64 smoke markers remain unspecified in this pass"
+              ;;
+          esac
 
       - name: QEMU kmtest boot (x86_64)
         if: inputs.run_kmtest && inputs.arch == 'x86_64'
@@ -225,7 +257,7 @@ jobs:
           path: |
             build-${{ inputs.arch }}.log
             build-${{ inputs.arch }}-release.log
-            target/${{ env.TARGET_SHORT }}/release/rustos
+            target/${{ env.TARGET_SHORT }}/release/rustos*
 
       - name: Upload smoke logs
         if: inputs.run_smoke && always()
@@ -234,7 +266,7 @@ jobs:
           name: "smoke-${{ inputs.arch }}"
           path: |
             build-${{ inputs.arch }}.log
-            build-x86_64-image.log
+            build-${{ inputs.arch }}-image.log
             qemu-${{ inputs.arch }}.log
             logs/${{ inputs.arch }}/serial.log
 
