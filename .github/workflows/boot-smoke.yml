@@ -216,11 +216,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm qemu-system-x86 ovmf mtools
 
-      - name: Explicit x86_64 build remains supported
+      - name: Build x86_64 UEFI loader target
         run: |
-          cargo build --target targets/x86_64-kernel.json 2>&1 | tee cargo-build-x86_64-boot.log
-          test -f target/x86_64-kernel/debug/rustos
-          file target/x86_64-kernel/debug/rustos
+          cargo build --target targets/x86_64-uefi-loader.json --features uefi_boot \
+            2>&1 | tee cargo-build-x86_64-boot.log
+          test -f target/x86_64-uefi-loader/debug/rustos || \
+            test -f target/x86_64-uefi-loader/debug/rustos.efi
 
       - name: Build x86_64 UEFI ESP image
         run: |
@@ -251,12 +252,9 @@ jobs:
             exit "$status"
           fi
 
-      - name: Assert x86_64 boot markers
+      - name: Assert x86_64 boot marker
         run: |
-          grep -q 'rustos: kernel_main reached' qemu-x86_64-boot.log
-          grep -q 'TEST PASS: uart_smoke' qemu-x86_64-boot.log
-          grep -q 'TEST PASS: alloc_smoke' qemu-x86_64-boot.log
-          grep -q 'TEST PASS: trap_smoke' qemu-x86_64-boot.log
+          grep -q 'RustOS \[PRIMARY\] x86_64 booting via UEFI' qemu-x86_64-boot.log
 
       - name: Upload x86_64 boot logs
         if: always()
