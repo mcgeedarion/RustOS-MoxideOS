@@ -1,5 +1,4 @@
-//! VFS helper functions that extend the core VFS 
-//!
+//! VFS helper functions that extend the core VFS
 
 extern crate alloc;
 use alloc::collections::BTreeMap;

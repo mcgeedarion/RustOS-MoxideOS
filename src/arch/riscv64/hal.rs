@@ -5,8 +5,8 @@
 //!
 //! * **SBI ecall wrappers** — Timer, Console, IPI, HSM, SRST, RFENCE (new-style
 //!   + legacy fallback).
-//! * **CSR read/write helpers** — `sstatus`, `sie`, `sip`, `sepc`, `scause`,
-//!   `stval`, `sscratch`, `satp`, `stvec`, `time`, `cycle`, `instret`.
+//! * **CSR read/write helpers** — `sstatus`, `sie`, `sip`, `sepc`, `scause`, `stval`, `sscratch`,
+//!   `satp`, `stvec`, `time`, `cycle`, `instret`.
 //! * **Interrupt control** — enable/disable/`without_interrupts`.
 //! * **TLB management** — local `sfence.vma` variants; remote via SBI RFENCE.
 //! * **Paging** — Sv39/Sv48/BARE `satp` helpers.
@@ -14,8 +14,8 @@
 //! * **SMP** — hart start/stop via SBI HSM; IPI dispatch.
 //! * **Timer** — `time` CSR read; `set_timer` / `clear_timer` via SBI.
 //! * **GDB stub** — single-step flag consumed by the trap handler.
-//! * **Early console** — SBI legacy putchar/getchar (used before the UART
-//!   driver is up, and by the GDB RSP transport).
+//! * **Early console** — SBI legacy putchar/getchar (used before the UART driver is up, and by the
+//!   GDB RSP transport).
 //! * **Platform init** — `early_init` (boot hart) / `secondary_init` (APs).
 //! * **Shutdown / reboot** — SBI SRST with legacy fallback.
 
@@ -966,8 +966,8 @@ pub fn wait_for_interrupt() {
 /// Standard RISC-V does not expose `dcsr.step` from S-mode, so the GDB stub
 /// emulates single-step by:
 ///   1. Setting this flag and installing a temporary `EBREAK` at the next PC.
-///   2. On the resulting breakpoint trap the handler checks this flag, restores
-///      the patched instruction, and reports a SIGTRAP to the stub.
+///   2. On the resulting breakpoint trap the handler checks this flag, restores the patched
+///      instruction, and reports a SIGTRAP to the stub.
 ///
 /// On cores that implement the Ssdext extension this flag can instead gate a
 /// CSR write to `dcsr.step` — see the gdbstub module for the dispatch.
@@ -1184,9 +1184,9 @@ pub fn reboot() -> ! {
 /// Steps
 /// ------
 /// 1. Store `boot_hartid` in `sscratch` and the `BOOT_HART_ID` global.
-/// 2. Install a temporary null trap vector (DIRECT, address 0) so any early
-///    fault produces a visible hang rather than a silent loop.  The real trap
-///    handler is installed by `trap::init()`.
+/// 2. Install a temporary null trap vector (DIRECT, address 0) so any early fault produces a
+///    visible hang rather than a silent loop.  The real trap handler is installed by
+///    `trap::init()`.
 /// 3. Enable the FPU (`sstatus.FS = Initial`).
 /// 4. Enable all supervisor interrupt sources (`sie = SSI|STI|SEI`).
 /// 5. Print the SBI spec version to the console in debug builds.
@@ -1197,15 +1197,15 @@ pub unsafe fn early_init(boot_hartid: usize) {
     // 1. Hart ID.
     init_hart_id(boot_hartid);
 
-    // 2. Temporary trap vector (DIRECT, zeroed — causes a clean hang on fault).
-    //    Overwritten by trap::init() before interrupts are enabled.
+    // 2. Temporary trap vector (DIRECT, zeroed — causes a clean hang on fault). Overwritten by
+    //    trap::init() before interrupts are enabled.
     csr_write!("stvec", 0usize);
 
     // 3. FPU.
     enable_fpu();
 
-    // 4. Interrupt sources (but not global enable — keep sstatus.SIE = 0 for now;
-    //    trap::init() calls enable_interrupts() after installing stvec).
+    // 4. Interrupt sources (but not global enable — keep sstatus.SIE = 0 for now; trap::init()
+    //    calls enable_interrupts() after installing stvec).
     enable_all_interrupt_sources();
 
     // 5. SBI version banner (debug only).

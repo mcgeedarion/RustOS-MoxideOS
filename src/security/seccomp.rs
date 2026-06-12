@@ -565,12 +565,12 @@ pub fn sys_seccomp(operation: u32, flags: u32, args_va: usize) -> isize {
     // Previously any process could call sys_seccomp freely, meaning a
     // sandboxed process could self-install a permissive filter to escape
     // its own seccomp jail.  Now we check:
-    //   - If the process already has a filter chain (i.e. it is sandboxed), it may
-    //     only install *more restrictive* filters — enforced by the chain
-    //     evaluation semantics (most-restrictive wins).  The call is allowed so
-    //     that stacking works, but it cannot remove existing filters.
-    //   - If the process has no filter yet, it must hold CAP_SYS_ADMIN or have
-    //     called prctl(PR_SET_NO_NEW_PRIVS, 1) (nnp flag on Pcb).
+    //   - If the process already has a filter chain (i.e. it is sandboxed), it may only install
+    //     *more restrictive* filters — enforced by the chain evaluation semantics (most-restrictive
+    //     wins).  The call is allowed so that stacking works, but it cannot remove existing
+    //     filters.
+    //   - If the process has no filter yet, it must hold CAP_SYS_ADMIN or have called
+    //     prctl(PR_SET_NO_NEW_PRIVS, 1) (nnp flag on Pcb).
     let pid = crate::proc::scheduler::current_pid();
     if pid == 0 {
         return -(EPERM as isize);

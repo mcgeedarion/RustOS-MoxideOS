@@ -2,15 +2,15 @@
 //!
 //! ## What this does
 //!
-//! - Marks VMA ranges as `MAP_LOCKED` so the pager never evicts them. (We have
-//!   no swapper yet, so the only real effect is accounting.)
-//! - Charges / refunds the per-process **locked-bytes** counter against
-//!   `RLIMIT_MEMLOCK`.  The counter is stored in `Pcb::locked_bytes`.
+//! - Marks VMA ranges as `MAP_LOCKED` so the pager never evicts them. (We have no swapper yet, so
+//!   the only real effect is accounting.)
+//! - Charges / refunds the per-process **locked-bytes** counter against `RLIMIT_MEMLOCK`.  The
+//!   counter is stored in `Pcb::locked_bytes`.
 //!
 //! ## Linux semantics mirrored
 //!
-//! - `mlock(addr, len)` — rounds `addr` down to page boundary, `len` up. Only
-//!   pages not already locked are counted toward the limit.
+//! - `mlock(addr, len)` — rounds `addr` down to page boundary, `len` up. Only pages not already
+//!   locked are counted toward the limit.
 //! - `munlock(addr, len)` — unlocks matching pages; refunds the counter.
 //! - `mlockall(MCL_CURRENT)` — locks all current VMAs.
 //! - `mlockall(MCL_FUTURE)` — sets a flag; subsequent `mmap` calls auto-lock.

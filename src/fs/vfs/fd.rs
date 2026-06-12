@@ -1,5 +1,4 @@
 //! VFS kernel-internal helpers.
-//!
 
 extern crate alloc;
 use crate::core::fast_hash::KernelFastMap;

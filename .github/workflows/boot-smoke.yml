@@ -109,7 +109,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
-            clang lld llvm qemu-system-misc qemu-efi-riscv64 u-boot-qemu mtools
+            clang lld llvm qemu-system-misc qemu-efi-riscv64 u-boot-qemu mtools \
+            binutils-riscv64-unknown-elf
 
       - name: Build riscv64 UEFI target
         run: |
@@ -218,10 +219,9 @@ jobs:
 
       - name: Build x86_64 UEFI loader target
         run: |
-          cargo build --target targets/x86_64-uefi-loader.json --features uefi_boot \
+          cargo build --target x86_64-unknown-uefi --features uefi_boot \
             2>&1 | tee cargo-build-x86_64-boot.log
-          test -f target/x86_64-uefi-loader/debug/rustos || \
-            test -f target/x86_64-uefi-loader/debug/rustos.efi
+          test -f target/x86_64-unknown-uefi/debug/rustos.efi
 
       - name: Build x86_64 UEFI ESP image
         run: |

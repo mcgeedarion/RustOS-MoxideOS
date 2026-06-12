@@ -3,8 +3,7 @@
 //! ## Pending-packet queue
 //!
 //! When `resolve(ip)` is called and the MAC is not yet in the cache, it:
-//!   1. Enqueues the fully-built IP packet in `PENDING_PKTS` (keyed by next-hop
-//!      IP).
+//!   1. Enqueues the fully-built IP packet in `PENDING_PKTS` (keyed by next-hop IP).
 //!   2. Sends an ARP request.
 //!   3. Returns `None` so the caller does *not* drop the packet.
 //!
@@ -15,8 +14,8 @@
 //! Queue limits:
 //!   - At most `PENDING_PER_IP` (4) packets are held per destination IP.
 //!   - At most `PENDING_TOTAL` (32) slots exist across all destinations.
-//!   - If either limit is reached the oldest same-IP entry is evicted
-//!     (tail-drop on the per-IP queue).
+//!   - If either limit is reached the oldest same-IP entry is evicted (tail-drop on the per-IP
+//!     queue).
 //!
 //! ## Cache
 //!
@@ -165,10 +164,9 @@ static PENDING: Mutex<PendingQueue> = Mutex::new(PendingQueue::new());
 /// Resolve `ip` to a MAC address.
 ///
 /// * If the MAC is already cached, return it immediately.
-/// * If `pkt` is provided (always the case from `ip::send`), enqueue it for
-///   deferred delivery and send an ARP request.  Returns `None` so the caller
-///   must NOT also transmit the packet — it will be sent when the reply
-///   arrives.
+/// * If `pkt` is provided (always the case from `ip::send`), enqueue it for deferred delivery and
+///   send an ARP request.  Returns `None` so the caller must NOT also transmit the packet — it will
+///   be sent when the reply arrives.
 /// * Directed / subnet broadcast always resolves to ff:ff:ff:ff:ff:ff.
 pub fn resolve(ip: u32) -> Option<[u8; 6]> {
     if ip == 0xFFFF_FFFF {

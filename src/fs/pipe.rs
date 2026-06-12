@@ -53,12 +53,10 @@
 //!
 //! ## POSIX guarantees
 //!
-//! - Writes ≤ PIPE_BUF (4096) are atomic: the mutex is held for the entire
-//!   write so no other writer can interleave.
-//! - `pipe_write` delivers SIGPIPE + returns -EPIPE when all readers have
-//!   closed.
-//! - `pipe_read` returns 0 (EOF) when all writers have closed and the buffer is
-//!   empty.
+//! - Writes ≤ PIPE_BUF (4096) are atomic: the mutex is held for the entire write so no other writer
+//!   can interleave.
+//! - `pipe_write` delivers SIGPIPE + returns -EPIPE when all readers have closed.
+//! - `pipe_read` returns 0 (EOF) when all writers have closed and the buffer is empty.
 //! - `pipe2` honours O_CLOEXEC and O_NONBLOCK.
 //!
 //! ## Poll / select / epoll readiness

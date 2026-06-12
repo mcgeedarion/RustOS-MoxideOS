@@ -2,25 +2,23 @@
 //!
 //! ## Scheduling classes (priority order)
 //!
-//! 1. **`SCHED_DEADLINE`** — Earliest-Deadline-First (EDF) with CBS budget.
-//!    Exhausted tasks sleep until their next replenishment window.
+//! 1. **`SCHED_DEADLINE`** — Earliest-Deadline-First (EDF) with CBS budget. Exhausted tasks sleep
+//!    until their next replenishment window.
 //!
-//! 2. **`SCHED_FIFO` / `SCHED_RR`** — real-time FIFO queue.  Tasks are ordered
-//!    by `rt_priority` (highest first); equal-priority tasks are served in FIFO
-//!    arrival order via a monotone `enqueue_seq` counter. Dequeue is O(log n)
-//!    via `BinaryHeap<RtEntry>`.
+//! 2. **`SCHED_FIFO` / `SCHED_RR`** — real-time FIFO queue.  Tasks are ordered by `rt_priority`
+//!    (highest first); equal-priority tasks are served in FIFO arrival order via a monotone
+//!    `enqueue_seq` counter. Dequeue is O(log n) via `BinaryHeap<RtEntry>`.
 //!
 //! 3. **`SCHED_NORMAL`** — CFS-inspired vruntime min-heap.
 //!
-//! 4. **`SCHED_BATCH`** — like Normal but deprioritised below all Normal tasks.
-//!    Uses the same vruntime accounting as Normal so it self-balances among
-//!    batch peers, but the batch_heap is only drained when the CFS heap is
-//!    empty.  Intended for CPU-bound background work (compilation,
-//!    checksumming, etc.) that should not steal latency from interactive tasks.
+//! 4. **`SCHED_BATCH`** — like Normal but deprioritised below all Normal tasks. Uses the same
+//!    vruntime accounting as Normal so it self-balances among batch peers, but the batch_heap is
+//!    only drained when the CFS heap is empty.  Intended for CPU-bound background work
+//!    (compilation, checksumming, etc.) that should not steal latency from interactive tasks.
 //!
-//! 5. **`SCHED_IDLE`** — lowest possible priority.  Weight is fixed at 1
-//!    regardless of nice value.  Only runs when *all* other queues are empty.
-//!    Analogous to Linux `SCHED_IDLE` (not the per-CPU idle thread).
+//! 5. **`SCHED_IDLE`** — lowest possible priority.  Weight is fixed at 1 regardless of nice value.
+//!    Only runs when *all* other queues are empty. Analogous to Linux `SCHED_IDLE` (not the per-CPU
+//!    idle thread).
 //!
 //! ## RT queue ordering
 //!

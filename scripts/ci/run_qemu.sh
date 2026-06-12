@@ -97,7 +97,7 @@ case "$ARCH:$BOOT" in
   aarch64:baremetal) CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"; TARGET_DIR="aarch64-kernel" ;;
   riscv64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"; TARGET_DIR="riscv64-uefi-loader"; EFI_NAME="BOOTRISCV64.EFI" ;;
   riscv64:sbi) CARGO_TARGET="riscv64gc-unknown-none-elf"; TARGET_DIR="riscv64gc-unknown-none-elf" ;;
-  x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-uefi-loader.json"; TARGET_DIR="x86_64-uefi-loader"; EFI_NAME="BOOTX64.EFI" ;;
+  x86_64:uefi) CARGO_TARGET="x86_64-unknown-uefi"; TARGET_DIR="x86_64-unknown-uefi"; EFI_NAME="BOOTX64.EFI" ;;
 esac
 
 pick_kernel_artifact() {

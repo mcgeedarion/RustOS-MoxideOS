@@ -88,8 +88,7 @@ pub fn wait_any(
         }
     }
 
-    // 2. Build one shared aggregate WaitQueue. All source WaitQueues forward their
-    //    wakeups here.
+    // 2. Build one shared aggregate WaitQueue. All source WaitQueues forward their wakeups here.
     let agg = WaitQueue::new();
 
     // 3. Register forwarder on every source's WaitQueue.

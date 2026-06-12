@@ -47,8 +47,8 @@ pub fn init() {
     {
         use crate::device::pci;
 
-        // 1. Intel e1000e — BAR0 is a 64-bit MMIO BAR. PCI spec: bits[2:1] == 0b10 for
-        //    64-bit; base = bar0 & !0xF combined with bar1 as the high 32 bits.
+        // 1. Intel e1000e — BAR0 is a 64-bit MMIO BAR. PCI spec: bits[2:1] == 0b10 for 64-bit; base
+        //    = bar0 & !0xF combined with bar1 as the high 32 bits.
         let e1000e_ids = [DEV_E1000E_82574L, DEV_E1000E_82574L2, DEV_E1000E_82583V];
         for &dev_id in &e1000e_ids {
             if let Some(dev) = pci::find(VENDOR_INTEL, dev_id) {
@@ -70,8 +70,7 @@ pub fn init() {
             }
         }
 
-        // 2. virtio-net — BAR0 is a legacy I/O port BAR. PCI spec: bit0=1 (I/O); base =
-        //    bar0 & !0x3
+        // 2. virtio-net — BAR0 is a legacy I/O port BAR. PCI spec: bit0=1 (I/O); base = bar0 & !0x3
         let vnet_ids = [DEV_VIRTIO_NET_LEG, DEV_VIRTIO_NET_T];
         for &dev_id in &vnet_ids {
             if let Some(dev) = pci::find(VENDOR_VIRTIO, dev_id) {

@@ -2,15 +2,13 @@
 //!
 //! ## Calibration strategy
 //!
-//! 1. Check CPUID leaf 0x15 (`TSC / Core Crystal Clock ratio`).  If the
-//!    denominator is non-zero, use the hardware-reported frequency directly.
-//!    This is guaranteed accurate on Skylake+.
+//! 1. Check CPUID leaf 0x15 (`TSC / Core Crystal Clock ratio`).  If the denominator is non-zero,
+//!    use the hardware-reported frequency directly. This is guaranteed accurate on Skylake+.
 //!
-//! 2. Fall back to CPUID leaf 0x16 (CPU/Bus/Reference MHz) — available on
-//!    Broadwell+.
+//! 2. Fall back to CPUID leaf 0x16 (CPU/Bus/Reference MHz) — available on Broadwell+.
 //!
-//! 3. Final fall-back: use the legacy PIT (8253) channel 2 to gate-count TSC
-//!    ticks over a ~10 ms window, giving ~1% accuracy.
+//! 3. Final fall-back: use the legacy PIT (8253) channel 2 to gate-count TSC ticks over a ~10 ms
+//!    window, giving ~1% accuracy.
 //!
 //! ## Invariant TSC check
 //!

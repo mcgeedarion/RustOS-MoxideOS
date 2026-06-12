@@ -63,7 +63,7 @@ pub unsafe fn do_panic(ctx: &PanicContext<'_>) -> ! {
     arch_halt();
 }
 
-/// 
+///
 #[macro_export]
 macro_rules! kernel_panic {
     ($msg:expr) => {{

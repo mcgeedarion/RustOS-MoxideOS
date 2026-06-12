@@ -140,10 +140,9 @@ fn send_signal_to_pgrp(pgid: usize, sig: i32) {
 
 /// Read up to `buf.len()` bytes from the TTY into `buf`.
 ///
-/// - Canonical mode: blocks until at least one complete line is available, then
-///   drains up to the first newline (inclusive).
-/// - Raw mode: blocks until at least one byte is available, then drains up to
-///   `buf.len()` bytes.
+/// - Canonical mode: blocks until at least one complete line is available, then drains up to the
+///   first newline (inclusive).
+/// - Raw mode: blocks until at least one byte is available, then drains up to `buf.len()` bytes.
 ///
 /// Returns the number of bytes written into `buf`.
 pub fn tty_read(buf: &mut [u8]) -> usize {

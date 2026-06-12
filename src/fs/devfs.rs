@@ -1,13 +1,12 @@
 //! Minimal devfs implementation.
 //!
 //! Provides:
-//! - A static major/minor dispatch table (`DEVFS_TABLE`) mapping `(major,
-//!   minor)` to `Arc<dyn FileOps>`.
-//! - `register_char_device(major, minor, ops)` — called by subsystems to
-//!   publish their devices.
+//! - A static major/minor dispatch table (`DEVFS_TABLE`) mapping `(major, minor)` to `Arc<dyn
+//!   FileOps>`.
+//! - `register_char_device(major, minor, ops)` — called by subsystems to publish their devices.
 //! - `devfs_open(path)` — resolves a `/dev/…` path to a `FileOps`.
-//! - `init_devfs()` — creates `/dev/input/` VFS entries and registers
-//!   `EventNode`s for every device in `InputDeviceRegistry`.
+//! - `init_devfs()` — creates `/dev/input/` VFS entries and registers `EventNode`s for every device
+//!   in `InputDeviceRegistry`.
 //!
 //! # Major numbers used
 //!

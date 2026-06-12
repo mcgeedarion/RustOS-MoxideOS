@@ -87,7 +87,10 @@ struct PmFreeGuard {
 
 impl PmFreeGuard {
     fn new() -> Self {
-        Self { frames: [0; 3], len: 0 }
+        Self {
+            frames: [0; 3],
+            len: 0,
+        }
     }
 
     fn push(&mut self, pa: usize) {
@@ -174,12 +177,9 @@ pub fn alloc_kstack() -> Option<KstackInfo> {
 
     // Guard page: PageFlags::empty() → not-present → overflow faults immediately.
     // map_page errors are treated as fatal OOM: return None and roll back frames.
-    <Arch as Paging>::map_page(cr3, va_guard, pa_guard, PageFlags::empty())
-        .ok()?;
-    <Arch as Paging>::map_page(cr3, va0, pa0, KSTACK_FLAGS)
-        .ok()?;
-    <Arch as Paging>::map_page(cr3, va1, pa1, KSTACK_FLAGS)
-        .ok()?;
+    <Arch as Paging>::map_page(cr3, va_guard, pa_guard, PageFlags::empty()).ok()?;
+    <Arch as Paging>::map_page(cr3, va0, pa0, KSTACK_FLAGS).ok()?;
+    <Arch as Paging>::map_page(cr3, va1, pa1, KSTACK_FLAGS).ok()?;
 
     // All mappings succeeded — disarm the rollback guard.
     guard.forget();

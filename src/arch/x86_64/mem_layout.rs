@@ -14,8 +14,7 @@
 //!   - [`ioapic`]     — I/O APIC default MMIO base
 //!   - [`vga`]        — Legacy VGA text-mode buffer
 //!   - [`gdt_layout`] — GDT selector indices
-//!   - [`trampoline`] — AP shared-memory slot offsets within the trampoline
-//!     page
+//!   - [`trampoline`] — AP shared-memory slot offsets within the trampoline page
 
 pub mod page {
     pub const SIZE: usize = 4096;

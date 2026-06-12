@@ -29,10 +29,10 @@
 //! `Pcb::mm_lock` is a `spin::RwLock<()>` that guards the virtual-memory
 //! state of the process (`vmas`, `user_satp`, `brk`).  Two rules apply:
 //!
-//!   - **Writers** (`munmap`, `mmap`, `brk`, `exec`) take the write side before
-//!     modifying `vmas` or remapping pages.
-//!   - **Readers** (`uaccess::copy_from_user`, `copy_to_user`, `read_path`)
-//!     take the read side across the entire validate+copy sequence.
+//!   - **Writers** (`munmap`, `mmap`, `brk`, `exec`) take the write side before modifying `vmas` or
+//!     remapping pages.
+//!   - **Readers** (`uaccess::copy_from_user`, `copy_to_user`, `read_path`) take the read side
+//!     across the entire validate+copy sequence.
 //!
 //! This closes the TOCTOU window where a concurrent `munmap` could unmap
 //! pages between the `pages_mapped` and the actual memory copy.

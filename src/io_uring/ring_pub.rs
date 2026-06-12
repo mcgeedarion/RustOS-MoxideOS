@@ -38,4 +38,5 @@ impl CqRingHeadTail {
 }
 
 const _: () = assert!(core::mem::size_of::<CqRingHeadTail>() == 8);
-const _: () = assert!(core::mem::align_of::<CqRingHeadTail>() == core::mem::align_of::<AtomicU32>());
+const _: () =
+    assert!(core::mem::align_of::<CqRingHeadTail>() == core::mem::align_of::<AtomicU32>());

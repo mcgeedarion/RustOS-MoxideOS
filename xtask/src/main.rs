@@ -9,7 +9,11 @@
 //!   target/esp/<arch>/EFI/BOOT/BOOT*.EFI
 
 use anyhow::{bail, Context, Result};
-use std::{env, fs, path::{Path, PathBuf}, process::{exit, Command}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::{exit, Command},
+};
 
 const OS_RELEASE_CONTENT: &[u8] =
     b"NAME=RustOS\nID=rustos\nVERSION=0.1.0\nPRETTY_NAME=\"RustOS 0.1.0\"\n";
@@ -74,7 +78,11 @@ fn validate_contract(arch: Arch, boot: Boot) -> Result<()> {
         (Arch::AArch64, Boot::Uefi | Boot::Baremetal) => Ok(()),
         (Arch::RiscV64, Boot::Uefi | Boot::Sbi) => Ok(()),
         (Arch::X86_64, Boot::Uefi) => Ok(()),
-        _ => bail!("unsupported build contract: {} --boot {}", arch_str(arch), boot_str(boot)),
+        _ => bail!(
+            "unsupported build contract: {} --boot {}",
+            arch_str(arch),
+            boot_str(boot)
+        ),
     }
 }
 
@@ -84,7 +92,10 @@ fn target_json(root: &Path, arch: Arch, boot: Boot) -> PathBuf {
         (Arch::AArch64, Boot::Baremetal) => root.join("targets/aarch64-kernel.json"),
         (Arch::RiscV64, Boot::Uefi) => root.join("targets/riscv64-uefi-loader.json"),
         (Arch::RiscV64, Boot::Sbi) => PathBuf::from("riscv64gc-unknown-none-elf"),
-        (Arch::X86_64, Boot::Uefi) => root.join("targets/x86_64-uefi-loader.json"),
+        // Use the upstream built-in target. The custom JSON spec (with
+        // `is-like-windows`/`is-like-msvc`) triggers `compiler_builtins`
+        // assembly errors under current nightly.
+        (Arch::X86_64, Boot::Uefi) => PathBuf::from("x86_64-unknown-uefi"),
         _ => unreachable!("validate_contract must run before target_json"),
     }
 }
@@ -95,7 +106,7 @@ fn target_dir_name(arch: Arch, boot: Boot) -> &'static str {
         (Arch::AArch64, Boot::Baremetal) => "aarch64-kernel",
         (Arch::RiscV64, Boot::Uefi) => "riscv64-uefi-loader",
         (Arch::RiscV64, Boot::Sbi) => "riscv64gc-unknown-none-elf",
-        (Arch::X86_64, Boot::Uefi) => "x86_64-uefi-loader",
+        (Arch::X86_64, Boot::Uefi) => "x86_64-unknown-uefi",
         _ => unreachable!("validate_contract must run before target_dir_name"),
     }
 }
@@ -124,11 +135,17 @@ fn workspace_root() -> PathBuf {
 }
 
 fn profile(opts: &BuildOpts) -> &'static str {
-    if opts.debug { "debug" } else { "release" }
+    if opts.debug {
+        "debug"
+    } else {
+        "release"
+    }
 }
 
 fn build_output_path(root: &Path, opts: &BuildOpts) -> PathBuf {
-    root.join("target").join(target_dir_name(opts.arch, opts.boot)).join(profile(opts))
+    root.join("target")
+        .join(target_dir_name(opts.arch, opts.boot))
+        .join(profile(opts))
 }
 
 fn artifact_path(root: &Path, opts: &BuildOpts) -> Option<PathBuf> {
@@ -144,7 +161,9 @@ fn artifact_path(root: &Path, opts: &BuildOpts) -> Option<PathBuf> {
 }
 
 fn esp_boot_dir(root: &Path, arch: Arch) -> PathBuf {
-    root.join("target/esp").join(arch_str(arch)).join("EFI/BOOT")
+    root.join("target/esp")
+        .join(arch_str(arch))
+        .join("EFI/BOOT")
 }
 
 fn cargo() -> Command {
@@ -226,9 +245,12 @@ fn parse_build_args(args: &[String]) -> BuildOpts {
 
 fn add_build_std_flags(cmd: &mut Command) {
     cmd.args([
-        "-Z", "build-std=core,alloc,compiler_builtins",
-        "-Z", "build-std-features=compiler-builtins-mem",
-        "-Z", "json-target-spec",
+        "-Z",
+        "build-std=core,alloc,compiler_builtins",
+        "-Z",
+        "build-std-features=compiler-builtins-mem",
+        "-Z",
+        "json-target-spec",
     ]);
 }
 
@@ -236,7 +258,9 @@ fn build_kernel(root: &Path, opts: &BuildOpts) -> Result<()> {
     validate_contract(opts.arch, opts.boot)?;
 
     let mut cmd = cargo();
-    cmd.current_dir(root).args(["build", "--target"]).arg(target_json(root, opts.arch, opts.boot));
+    cmd.current_dir(root)
+        .args(["build", "--target"])
+        .arg(target_json(root, opts.arch, opts.boot));
     add_build_std_flags(&mut cmd);
     if !opts.debug {
         cmd.arg("--release");
@@ -258,13 +282,22 @@ fn build_kernel(root: &Path, opts: &BuildOpts) -> Result<()> {
     if opts.initrd {
         mkinitramfs(root, opts.arch)?;
     }
-    log(format!("built {} {} {}", arch_str(opts.arch), boot_str(opts.boot), profile(opts)));
+    log(format!(
+        "built {} {} {}",
+        arch_str(opts.arch),
+        boot_str(opts.boot),
+        profile(opts)
+    ));
     Ok(())
 }
 
 fn install_efi(root: &Path, opts: &BuildOpts) -> Result<()> {
-    let src = artifact_path(root, opts)
-        .with_context(|| format!("UEFI artifact not found under {}", build_output_path(root, opts).display()))?;
+    let src = artifact_path(root, opts).with_context(|| {
+        format!(
+            "UEFI artifact not found under {}",
+            build_output_path(root, opts).display()
+        )
+    })?;
     let dest_dir = esp_boot_dir(root, opts.arch);
     fs::create_dir_all(&dest_dir).context("create ESP boot directory")?;
     let dest = dest_dir.join(efi_boot_filename(opts.arch));
@@ -280,7 +313,9 @@ fn require_initramfs_tools(arch: Arch) -> Result<()> {
             &["riscv64-linux-musl-gcc", "riscv64-unknown-linux-musl-gcc"],
             "install a riscv64 musl cross compiler",
         ),
-        Arch::AArch64 => bail!("aarch64 initramfs is disabled until userspace/Makefile supports ARCH=aarch64"),
+        Arch::AArch64 => {
+            bail!("aarch64 initramfs is disabled until userspace/Makefile supports ARCH=aarch64")
+        },
     }
     require_tool(&["cpio"], "apt install cpio");
     require_tool(&["find"], "coreutils should provide find");
@@ -294,17 +329,27 @@ fn mkinitramfs(root: &Path, arch: Arch) -> Result<()> {
     if staging.exists() {
         fs::remove_dir_all(&staging).context("remove old initramfs staging dir")?;
     }
-    for dir in ["", "bin", "sbin", "usr/bin", "usr/sbin", "lib", "etc", "dev", "proc", "sys", "tmp", "run"] {
+    for dir in [
+        "", "bin", "sbin", "usr/bin", "usr/sbin", "lib", "etc", "dev", "proc", "sys", "tmp", "run",
+    ] {
         fs::create_dir_all(staging.join(dir)).context("create initramfs subdir")?;
     }
     run(Command::new("make")
         .current_dir(root.join("userspace"))
-        .args(["-j4", &format!("ARCH={arch_name}"), &format!("DESTDIR={}", staging.display()), "install"]))?;
+        .args([
+            "-j4",
+            &format!("ARCH={arch_name}"),
+            &format!("DESTDIR={}", staging.display()),
+            "install",
+        ]))?;
     fs::write(staging.join("etc/os-release"), OS_RELEASE_CONTENT).context("write os-release")?;
     let cpio_out = root.join("initramfs.cpio");
     run(Command::new("sh").current_dir(&staging).args([
         "-c",
-        &format!("find . | sort | cpio --create --format=newc --quiet > {}", cpio_out.display()),
+        &format!(
+            "find . | sort | cpio --create --format=newc --quiet > {}",
+            cpio_out.display()
+        ),
     ]))?;
     Ok(())
 }
@@ -324,9 +369,19 @@ fn image(root: &Path, opts: &BuildOpts) -> Result<()> {
         bail!("EFI binary not found at {}", efi_path.display());
     }
     let img_path = root.join(image_name(opts.arch));
-    run(Command::new("mformat").args(["-C", "-F", "-h", "64", "-s", "32", "-t", "64", "-i"]).arg(&img_path).arg("::"))?;
-    run(Command::new("mmd").args(["-i"]).arg(&img_path).args(["::/EFI", "::/EFI/BOOT"]))?;
-    run(Command::new("mcopy").args(["-i"]).arg(&img_path).arg(&efi_path).arg(format!("::/EFI/BOOT/{efi_name}")))?;
+    run(Command::new("mformat")
+        .args(["-C", "-F", "-h", "64", "-s", "32", "-t", "64", "-i"])
+        .arg(&img_path)
+        .arg("::"))?;
+    run(Command::new("mmd")
+        .args(["-i"])
+        .arg(&img_path)
+        .args(["::/EFI", "::/EFI/BOOT"]))?;
+    run(Command::new("mcopy")
+        .args(["-i"])
+        .arg(&img_path)
+        .arg(&efi_path)
+        .arg(format!("::/EFI/BOOT/{efi_name}")))?;
     log(format!("image ready: {}", img_path.display()));
     Ok(())
 }
@@ -336,7 +391,11 @@ fn smoke(root: &Path) -> Result<()> {
     if !script.exists() {
         bail!("QEMU runner not found at {}", script.display());
     }
-    run(Command::new(&script).current_dir(root).env("ARCH", "x86_64").arg("--boot").arg("uefi"))
+    run(Command::new(&script)
+        .current_dir(root)
+        .env("ARCH", "x86_64")
+        .arg("--boot")
+        .arg("uefi"))
 }
 
 fn print_help() {

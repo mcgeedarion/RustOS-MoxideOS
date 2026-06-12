@@ -14,8 +14,8 @@
 //! ## Boot sequence
 //!
 //!   1. Call [`io_uring::ring::init`] after the allocator is up.
-//!   2. The idle loop no longer needs to call [`scheduler_tick`], but may still
-//!      do so — it is now a no-op.
+//!   2. The idle loop no longer needs to call [`scheduler_tick`], but may still do so — it is now a
+//!      no-op.
 //!
 //! ## IRQ-driven completions
 //!

@@ -17,11 +17,11 @@
 //!
 //! # Safety contract
 //!
-//! * `CpuLocal::get()` is `unsafe` — the caller must guarantee that preemption
-//!   is disabled (interrupts off or a preemption guard held) for the duration
-//!   of the access, or that `T` is `Sync + Copy`.
-//! * The per-CPU pointer **must** be initialised by SMP code before any `get()`
-//!   call.  Calling `get()` before init is undefined behaviour.
+//! * `CpuLocal::get()` is `unsafe` — the caller must guarantee that preemption is disabled
+//!   (interrupts off or a preemption guard held) for the duration of the access, or that `T` is
+//!   `Sync + Copy`.
+//! * The per-CPU pointer **must** be initialised by SMP code before any `get()` call.  Calling
+//!   `get()` before init is undefined behaviour.
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;

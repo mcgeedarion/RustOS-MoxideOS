@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 use super::arch::{decode_hex_bytes, encode_hex_bytes, parse_hex_u64};
 use super::breakpoints::{
-    handle_z_packet, SwBreakpointTable, HwBreakpointTable, WatchpointTable, ZSession,
+    handle_z_packet, HwBreakpointTable, SwBreakpointTable, WatchpointTable, ZSession,
 };
 use super::target::GdbTarget;
 
@@ -27,10 +27,17 @@ pub fn rsp_packet(body: &str) -> String {
 // Register count per arch (for bounds-checking p/P)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "x86_64")]  const ARCH_REG_COUNT: usize = 24;
-#[cfg(target_arch = "riscv64")] const ARCH_REG_COUNT: usize = 33; // 32 GPR + pc
-#[cfg(target_arch = "aarch64")] const ARCH_REG_COUNT: usize = 34; // x0-x30 + sp + pc + pstate
-#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
+#[cfg(target_arch = "x86_64")]
+const ARCH_REG_COUNT: usize = 24;
+#[cfg(target_arch = "riscv64")]
+const ARCH_REG_COUNT: usize = 33; // 32 GPR + pc
+#[cfg(target_arch = "aarch64")]
+const ARCH_REG_COUNT: usize = 34; // x0-x30 + sp + pc + pstate
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "riscv64",
+    target_arch = "aarch64"
+)))]
 const ARCH_REG_COUNT: usize = 32;
 
 // ---------------------------------------------------------------------------
@@ -38,27 +45,72 @@ const ARCH_REG_COUNT: usize = 32;
 // ---------------------------------------------------------------------------
 
 fn arch_reg_buf_len() -> usize {
-    #[cfg(target_arch = "x86_64")]  { crate::debug::gdbstub::arch::X86_64::reg_buf_len()  }
-    #[cfg(target_arch = "riscv64")] { crate::debug::gdbstub::arch::RiscV64::reg_buf_len() }
-    #[cfg(target_arch = "aarch64")] { crate::debug::gdbstub::arch::AArch64::reg_buf_len() }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
-    { ARCH_REG_COUNT * 8 }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::debug::gdbstub::arch::X86_64::reg_buf_len()
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::debug::gdbstub::arch::RiscV64::reg_buf_len()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::debug::gdbstub::arch::AArch64::reg_buf_len()
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )))]
+    {
+        ARCH_REG_COUNT * 8
+    }
 }
 
 fn arch_read_regs(trap: &crate::debug::AnyTrapFrame, buf: &mut [u8]) {
-    #[cfg(target_arch = "x86_64")]  { crate::debug::gdbstub::arch::X86_64::read_regs(trap, buf);  }
-    #[cfg(target_arch = "riscv64")] { crate::debug::gdbstub::arch::RiscV64::read_regs(trap, buf); }
-    #[cfg(target_arch = "aarch64")] { crate::debug::gdbstub::arch::AArch64::read_regs(trap, buf); }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
-    { let _ = (trap, buf); }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::debug::gdbstub::arch::X86_64::read_regs(trap, buf);
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::debug::gdbstub::arch::RiscV64::read_regs(trap, buf);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::debug::gdbstub::arch::AArch64::read_regs(trap, buf);
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )))]
+    {
+        let _ = (trap, buf);
+    }
 }
 
 fn arch_write_regs(trap: &mut crate::debug::AnyTrapFrame, buf: &[u8]) {
-    #[cfg(target_arch = "x86_64")]  { crate::debug::gdbstub::arch::X86_64::write_regs(trap, buf);  }
-    #[cfg(target_arch = "riscv64")] { crate::debug::gdbstub::arch::RiscV64::write_regs(trap, buf); }
-    #[cfg(target_arch = "aarch64")] { crate::debug::gdbstub::arch::AArch64::write_regs(trap, buf); }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
-    { let _ = (trap, buf); }
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::debug::gdbstub::arch::X86_64::write_regs(trap, buf);
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        crate::debug::gdbstub::arch::RiscV64::write_regs(trap, buf);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::debug::gdbstub::arch::AArch64::write_regs(trap, buf);
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "riscv64",
+        target_arch = "aarch64"
+    )))]
+    {
+        let _ = (trap, buf);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -66,16 +118,16 @@ fn arch_write_regs(trap: &mut crate::debug::AnyTrapFrame, buf: &[u8]) {
 // ---------------------------------------------------------------------------
 
 pub struct Session {
-    pub sw_bps:  SwBreakpointTable,
-    pub hw_bps:  HwBreakpointTable,
+    pub sw_bps: SwBreakpointTable,
+    pub hw_bps: HwBreakpointTable,
     pub watches: WatchpointTable,
 }
 
 impl Session {
     pub fn new() -> Self {
         Session {
-            sw_bps:  SwBreakpointTable::new(),
-            hw_bps:  HwBreakpointTable::new(),
+            sw_bps: SwBreakpointTable::new(),
+            hw_bps: HwBreakpointTable::new(),
             watches: WatchpointTable::new(),
         }
     }
@@ -88,9 +140,15 @@ impl Session {
 }
 
 impl ZSession for Session {
-    fn sw_bps(&mut self)  -> &mut SwBreakpointTable { &mut self.sw_bps  }
-    fn hw_bps(&mut self)  -> &mut HwBreakpointTable { &mut self.hw_bps  }
-    fn watches(&mut self) -> &mut WatchpointTable   { &mut self.watches }
+    fn sw_bps(&mut self) -> &mut SwBreakpointTable {
+        &mut self.sw_bps
+    }
+    fn hw_bps(&mut self) -> &mut HwBreakpointTable {
+        &mut self.hw_bps
+    }
+    fn watches(&mut self) -> &mut WatchpointTable {
+        &mut self.watches
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +163,11 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
     match body.as_bytes()[0] {
         b'?' => {
             let status = target.poll_status();
-            rsp_packet(if status.starts_with('T') { &status } else { "T05" })
+            rsp_packet(if status.starts_with('T') {
+                &status
+            } else {
+                "T05"
+            })
         },
 
         // Read all registers
@@ -140,7 +202,7 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
         // Write single register
         b'P' => {
             let rest = &body[1..];
-            let eq  = rest.find('=').unwrap_or(rest.len());
+            let eq = rest.find('=').unwrap_or(rest.len());
             let idx = parse_hex_u64(&rest[..eq]) as usize;
             if idx >= ARCH_REG_COUNT {
                 return rsp_packet("E01");
@@ -158,15 +220,19 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut Session) 
             let rest = &body[1..];
             let mut parts = rest.splitn(2, ',');
             let addr = parse_hex_u64(parts.next().unwrap_or(""));
-            let len  = parse_hex_u64(parts.next().unwrap_or("")) as usize;
+            let len = parse_hex_u64(parts.next().unwrap_or("")) as usize;
             rsp_packet(&encode_hex_bytes(&target.read_mem(addr, len)))
         },
 
         b'M' => {
-            let rest  = &body[1..];
+            let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
-            let addr  = parse_hex_u64(&rest[..rest.find(',').unwrap_or(colon)]);
-            let data  = if colon < rest.len() { decode_hex_bytes(&rest[colon + 1..]) } else { Vec::new() };
+            let addr = parse_hex_u64(&rest[..rest.find(',').unwrap_or(colon)]);
+            let data = if colon < rest.len() {
+                decode_hex_bytes(&rest[colon + 1..])
+            } else {
+                Vec::new()
+            };
             target.write_mem(addr, &data);
             rsp_packet("OK")
         },

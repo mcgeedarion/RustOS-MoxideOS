@@ -2,16 +2,16 @@
 //!
 //! ## Tables used
 //!
-//! - **SRAT** (System Resource Affinity Table, ACPI 6.5 §5.2.16) Maps CPUs
-//!   (LAPIC / x2APIC) and memory ranges to proximity domains (NUMA nodes).
-//! - **SLIT** (System Locality Information Table, ACPI 6.5 §5.2.17) Provides a
-//!   symmetric distance matrix between all NUMA nodes.
+//! - **SRAT** (System Resource Affinity Table, ACPI 6.5 §5.2.16) Maps CPUs (LAPIC / x2APIC) and
+//!   memory ranges to proximity domains (NUMA nodes).
+//! - **SLIT** (System Locality Information Table, ACPI 6.5 §5.2.17) Provides a symmetric distance
+//!   matrix between all NUMA nodes.
 //!
 //! ## Topology model
 //!
 //! We expose:
-//! - `MAX_NODES` proximity domains, each with a list of associated memory
-//!   ranges and a bitmask of LAPIC IDs.
+//! - `MAX_NODES` proximity domains, each with a list of associated memory ranges and a bitmask of
+//!   LAPIC IDs.
 //! - A flat distance matrix indexed `[from][to]` where 10 = local access.
 
 use super::SdtHeader;

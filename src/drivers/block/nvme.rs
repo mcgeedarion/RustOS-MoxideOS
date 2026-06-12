@@ -6,8 +6,7 @@
 //!   - READ / WRITE
 //!   - MSI-X interrupt wiring (vectors 0 = Admin CQ, 1 = IO CQ)
 //!   - Hybrid completion: IRQ fast-path + polled fallback
-//!   - PRP list support (transfers > 8 KiB, up to one 4 KiB PRP-list page = 511
-//!     entries = ~2 MiB)
+//!   - PRP list support (transfers > 8 KiB, up to one 4 KiB PRP-list page = 511 entries = ~2 MiB)
 //!   - Proper CQ phase handling
 //!   - Admin timeout handling
 //!   - Correct IDENTIFY namespace parsing

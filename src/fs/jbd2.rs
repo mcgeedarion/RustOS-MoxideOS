@@ -180,7 +180,11 @@ fn unsupported_incompat(features: JournalFeatures) -> u32 {
     features.incompat & !supported
 }
 
-fn block_by_journal_index<'a>(journal: &'a [u8], block_size: usize, idx: usize) -> Option<&'a [u8]> {
+fn block_by_journal_index<'a>(
+    journal: &'a [u8],
+    block_size: usize,
+    idx: usize,
+) -> Option<&'a [u8]> {
     let off = idx.checked_mul(block_size)?;
     journal.get(off..off + block_size)
 }
@@ -251,7 +255,10 @@ fn parse_revoke(block: &[u8], sb: &JournalSuperblock, seq: u32) -> Vec<RevokeRec
         } else {
             be32(block, off).unwrap_or(0) as u64
         };
-        out.push(RevokeRecord { sequence: seq, fs_block });
+        out.push(RevokeRecord {
+            sequence: seq,
+            fs_block,
+        });
         off += rec_len;
     }
     out
@@ -294,7 +301,10 @@ fn apply_txn(fs_image: &mut [u8], block_size: usize, txn: &PendingTxn) -> usize 
 ///
 /// `journal` must begin with a JBD2 superblock.  The caller is responsible for
 /// translating ext4's journal inode mapping into this contiguous byte image.
-pub fn replay_journal_image(fs_image: &mut [u8], journal: &[u8]) -> Result<ReplayReport, ReplayError> {
+pub fn replay_journal_image(
+    fs_image: &mut [u8],
+    journal: &[u8],
+) -> Result<ReplayReport, ReplayError> {
     let sb_block = journal.get(..1024).ok_or(ReplayError::EmptyJournal)?;
     let sb = parse_superblock(sb_block).ok_or(ReplayError::BadSuperblock)?;
     if sb.block_size == 0 || sb.block_size > 65536 {
@@ -306,13 +316,21 @@ pub fn replay_journal_image(fs_image: &mut [u8], journal: &[u8]) -> Result<Repla
     }
 
     let mut report = ReplayReport::default();
-    let mut idx = if sb.start == 0 { sb.first as usize } else { sb.start as usize };
+    let mut idx = if sb.start == 0 {
+        sb.first as usize
+    } else {
+        sb.start as usize
+    };
     if idx == 0 {
         idx = 1;
     }
 
     let max_len = sb.max_len as usize;
-    if max_len == 0 || max_len.checked_mul(sb.block_size).map_or(true, |n| n > journal.len()) {
+    if max_len == 0
+        || max_len
+            .checked_mul(sb.block_size)
+            .map_or(true, |n| n > journal.len())
+    {
         return Err(ReplayError::OutOfBounds);
     }
 
@@ -335,7 +353,7 @@ pub fn replay_journal_image(fs_image: &mut [u8], journal: &[u8]) -> Result<Repla
                 }
                 blocks_scanned += 1;
                 continue;
-            }
+            },
         };
 
         match ty {
@@ -348,14 +366,14 @@ pub fn replay_journal_image(fs_image: &mut [u8], journal: &[u8]) -> Result<Repla
                     revokes: Vec::new(),
                 });
                 report.transactions_seen += 1;
-            }
+            },
             JBD2_REVOKE_BLOCK => {
                 let revokes = parse_revoke(block, &sb, seq);
                 report.revoke_records += revokes.len();
                 if let Some(txn) = current.as_mut() {
                     txn.revokes.extend(revokes);
                 }
-            }
+            },
             JBD2_COMMIT_BLOCK => {
                 if let Some(txn) = current.take() {
                     if txn.sequence == seq {
@@ -364,13 +382,13 @@ pub fn replay_journal_image(fs_image: &mut [u8], journal: &[u8]) -> Result<Repla
                         report.transactions_replayed += 1;
                     }
                 }
-            }
-            JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2 => {}
+            },
+            JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2 => {},
             _ => {
                 if ty == JBD2_FEATURE_INCOMPAT_FAST_COMMIT {
                     report.unsupported_fast_commit_blocks += 1;
                 }
-            }
+            },
         }
 
         idx += 1;
@@ -395,8 +413,12 @@ pub fn replay_from_block_list(
     }
     let mut journal = Vec::with_capacity(journal_blocks.len() * fs_block_size);
     for &blk in journal_blocks {
-        let off = (blk as usize).checked_mul(fs_block_size).ok_or(ReplayError::OutOfBounds)?;
-        let src = fs_image.get(off..off + fs_block_size).ok_or(ReplayError::OutOfBounds)?;
+        let off = (blk as usize)
+            .checked_mul(fs_block_size)
+            .ok_or(ReplayError::OutOfBounds)?;
+        let src = fs_image
+            .get(off..off + fs_block_size)
+            .ok_or(ReplayError::OutOfBounds)?;
         journal.extend_from_slice(src);
     }
     replay_journal_image(fs_image, &journal)

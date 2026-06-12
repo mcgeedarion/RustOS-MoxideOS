@@ -4,19 +4,18 @@
 //!
 //! Syscall dispatch is split into three layers:
 //!
-//!   1. `dispatch_with_rip` (this file) — seccomp pre-check + router calls
-//!      only. This function must stay thin.  No match arms live here.
+//!   1. `dispatch_with_rip` (this file) — seccomp pre-check + router calls only. This function must
+//!      stay thin.  No match arms live here.
 //!
-//!   2. `routers.rs` — five subsystem routers, each owning one logical group:
-//!      dispatch_filesystem  fs I/O, stat, sockets, io_uring, pipes, epoll …
-//!      dispatch_process     fork/exec/wait, signals, uid/gid, futex, prctl …
-//!      dispatch_memory      mmap, mprotect, munmap, brk, madvise, pkey_* …
-//!      dispatch_ipc         SysV shm/sem/msg, POSIX mq dispatch_time clock_*,
-//!      timers, getitimer, times dispatch_kmtest      SYS_KMTEST_LIST /
-//!      SYS_KMTEST_RUN (kmtest feature only)
+//!   2. `routers.rs` — five subsystem routers, each owning one logical group: dispatch_filesystem
+//!      fs I/O, stat, sockets, io_uring, pipes, epoll … dispatch_process     fork/exec/wait,
+//!      signals, uid/gid, futex, prctl … dispatch_memory      mmap, mprotect, munmap, brk, madvise,
+//!      pkey_* … dispatch_ipc         SysV shm/sem/msg, POSIX mq dispatch_time clock_*, timers,
+//!      getitimer, times dispatch_kmtest      SYS_KMTEST_LIST / SYS_KMTEST_RUN (kmtest feature
+//!      only)
 //!
-//!   3. Implementation modules — the actual syscall logic lives in the
-//!      subsystem modules (fs::*, proc::*, mm::*, ipc::*, …).
+//!   3. Implementation modules — the actual syscall logic lives in the subsystem modules (fs::*,
+//!      proc::*, mm::*, ipc::*, …).
 //!
 //! ## Adding a new syscall
 //!   1. Add the NR constant to `nr.rs`.

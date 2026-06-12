@@ -112,7 +112,6 @@ impl WaitQueue {
         let task_id = crate::proc::scheduler::current_pid();
         let full_interest = interest | WAKE_TIMEOUT | WAKE_CANCEL;
 
-
         let timer_id: Option<u64> = deadline.map(|dl| {
             let ptr = self as *const WaitQueue as usize;
             crate::time::timer::add_oneshot(dl, move |_| {
@@ -200,7 +199,6 @@ impl WaitQueue {
         }
     }
 }
-
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

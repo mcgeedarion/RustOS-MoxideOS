@@ -1,10 +1,10 @@
 //! VFS mutation / query operations — dispatched through the mount table.
 //!
 //! Every function here:
-//!   1. For stat/lstat: checks dcache first; on miss calls mount::resolve +
-//!      backend, then populates the cache.
-//!   2. For write-side ops: calls the backend, then invalidates the dcache
-//!      entry so subsequent stat calls see fresh data.
+//!   1. For stat/lstat: checks dcache first; on miss calls mount::resolve + backend, then populates
+//!      the cache.
+//!   2. For write-side ops: calls the backend, then invalidates the dcache entry so subsequent stat
+//!      calls see fresh data.
 //!   3. Returns the standard POSIX errno-compatible isize / Result
 //!
 //! ## Backends wired

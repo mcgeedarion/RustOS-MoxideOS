@@ -61,10 +61,7 @@ pub fn alloc_pty() -> Result<(u32, Arc<PtyPair>), isize> {
     let pair = Arc::new(PtyPair::new(idx));
 
     let mut reg = REGISTRY.lock();
-    reg.as_mut()
-        .ok_or(-1isize)?
-        .pairs
-        .insert(idx, pair.clone());
+    reg.as_mut().ok_or(-1isize)?.pairs.insert(idx, pair.clone());
 
     pts_fs::register_slave(idx);
     Ok((idx, pair))

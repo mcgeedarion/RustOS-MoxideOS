@@ -9,15 +9,13 @@
 //!
 //! The kernel retains only two thin responsibilities:
 //!
-//!   1. `wl_surface_commit_kernel` — called by the DRM ioctl handler when the
-//!      compositor userspace process issues `DRM_IOCTL_MODE_PAGE_FLIP` or
-//!      `DRM_IOCTL_MODE_ATOMIC`.  This is the *only* path that writes to the
-//!      physical framebuffer from kernel space, and it only does so through the
-//!      already-audited `drm::page_flip` codepath.
+//!   1. `wl_surface_commit_kernel` — called by the DRM ioctl handler when the compositor userspace
+//!      process issues `DRM_IOCTL_MODE_PAGE_FLIP` or `DRM_IOCTL_MODE_ATOMIC`.  This is the *only*
+//!      path that writes to the physical framebuffer from kernel space, and it only does so through
+//!      the already-audited `drm::page_flip` codepath.
 //!
-//!   2. `vblank_notify` — invoked from the DRM vblank ISR to wake the
-//!      compositor process (which is blocked in `DRM_IOCTL_WAIT_VBLANK` via the
-//!      normal DRM eventfd delivery path).
+//!   2. `vblank_notify` — invoked from the DRM vblank ISR to wake the compositor process (which is
+//!      blocked in `DRM_IOCTL_WAIT_VBLANK` via the normal DRM eventfd delivery path).
 //!
 //! All other compositor state — client connections, object tables, surface
 //! trees, damage tracking — is owned by the userspace compositor process.

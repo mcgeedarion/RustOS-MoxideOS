@@ -37,12 +37,12 @@
 
 use crate::arch::hal::serial_write;
 
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86_64::trap::TrapFrame as AnyTrapFrame;
-#[cfg(target_arch = "riscv64")]
-use crate::arch::riscv64::trap::TrapFrame as AnyTrapFrame;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::trap::TrapFrame as AnyTrapFrame;
+#[cfg(target_arch = "riscv64")]
+use crate::arch::riscv64::trap::TrapFrame as AnyTrapFrame;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86_64::trap::TrapFrame as AnyTrapFrame;
 
 /// Emit a full oops report: register dump (if a trap frame is available),
 /// frame-pointer backtrace, and (if built with `--features trace`) the
@@ -171,7 +171,11 @@ fn dump_registers(f: &AnyTrapFrame) {
             "   sp={:#018x}   pc={:#018x}  pstate={:#018x}\n",
             "  esr={:#018x}  far={:#018x}\n",
         ),
-        f.sp, f.pc, f.pstate, f.esr, f.far,
+        f.sp,
+        f.pc,
+        f.pstate,
+        f.esr,
+        f.far,
     ));
 }
 

@@ -78,9 +78,7 @@ impl BtrfsFs {
             floor = self.superblock.bytes_used;
         }
 
-        let logical = self
-            .find_alloc_candidate(floor, len, align)
-            .ok_or(ENOSPC)?;
+        let logical = self.find_alloc_candidate(floor, len, align).ok_or(ENOSPC)?;
 
         self.alloc_cursor = logical.checked_add(len).ok_or(ENOSPC)?;
 

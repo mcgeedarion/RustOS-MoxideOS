@@ -116,15 +116,15 @@ struct EfiBootServices {
     _check_event: *mut core::ffi::c_void,    // 0x078
 
     // Protocol Handler Services
-    _install_protocol_interface: *mut core::ffi::c_void,   // 0x080
+    _install_protocol_interface: *mut core::ffi::c_void, // 0x080
     _reinstall_protocol_interface: *mut core::ffi::c_void, // 0x088
     _uninstall_protocol_interface: *mut core::ffi::c_void, // 0x090
-    handle_protocol: HandleProtocolFn,                     // 0x098
-    _reserved: *mut core::ffi::c_void,                      // 0x0A0
-    _register_protocol_notify: *mut core::ffi::c_void,      // 0x0A8
-    _locate_handle: *mut core::ffi::c_void,                 // 0x0B0
-    _locate_device_path: *mut core::ffi::c_void,            // 0x0B8
-    _install_configuration_table: *mut core::ffi::c_void,   // 0x0C0
+    handle_protocol: HandleProtocolFn,                   // 0x098
+    _reserved: *mut core::ffi::c_void,                   // 0x0A0
+    _register_protocol_notify: *mut core::ffi::c_void,   // 0x0A8
+    _locate_handle: *mut core::ffi::c_void,              // 0x0B0
+    _locate_device_path: *mut core::ffi::c_void,         // 0x0B8
+    _install_configuration_table: *mut core::ffi::c_void, // 0x0C0
 
     // Image Services
     _load_image: *mut core::ffi::c_void,    // 0x0C8
@@ -139,12 +139,12 @@ struct EfiBootServices {
     _set_watchdog_timer: *mut core::ffi::c_void,       // 0x100
 
     // Driver Support Services
-    _connect_controller: *mut core::ffi::c_void,    // 0x108
+    _connect_controller: *mut core::ffi::c_void, // 0x108
     _disconnect_controller: *mut core::ffi::c_void, // 0x110
 
     // Open and Close Protocol Services
-    _open_protocol: *mut core::ffi::c_void,             // 0x118
-    _close_protocol: *mut core::ffi::c_void,            // 0x120
+    _open_protocol: *mut core::ffi::c_void,  // 0x118
+    _close_protocol: *mut core::ffi::c_void, // 0x120
     _open_protocol_information: *mut core::ffi::c_void, // 0x128
 
     // Library Services

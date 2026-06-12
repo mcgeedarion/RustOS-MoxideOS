@@ -397,7 +397,11 @@ fn is_between(lo: u32, x: u32, hi: u32) -> bool {
 
 /// Start an active TCP connection and return the TCP connection id.
 pub fn connect(local_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) -> u64 {
-    let our_ip = if local_ip == 0 { ip::our_ip() } else { local_ip };
+    let our_ip = if local_ip == 0 {
+        ip::our_ip()
+    } else {
+        local_ip
+    };
     let isn = crate::rand::rand32();
 
     let mut c = TcpConn::new();
@@ -410,17 +414,7 @@ pub fn connect(local_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16) -> u64 
     c.snd_nxt = isn.wrapping_add(1);
     c.snd_una = isn;
 
-    send_segment(
-        our_ip,
-        src_port,
-        dst_ip,
-        dst_port,
-        isn,
-        0,
-        SYN,
-        65535,
-        &[],
-    );
+    send_segment(our_ip, src_port, dst_ip, dst_port, isn, 0, SYN, 65535, &[]);
 
     let mut conns = TCP_CONNS.lock();
     let idx = alloc_tcp_slot(&mut conns);
@@ -804,12 +798,8 @@ impl crate::fs::scheme_table::Scheme for TcpScheme {
         } else {
             let mut parts = target.rsplitn(3, ':');
 
-            let maybe_src_or_dst = parts
-                .next()
-                .ok_or(scheme_api::SchemeError::InvalidArg)?;
-            let maybe_dst = parts
-                .next()
-                .ok_or(scheme_api::SchemeError::InvalidArg)?;
+            let maybe_src_or_dst = parts.next().ok_or(scheme_api::SchemeError::InvalidArg)?;
+            let maybe_dst = parts.next().ok_or(scheme_api::SchemeError::InvalidArg)?;
             let maybe_ip = parts.next();
 
             match maybe_ip {

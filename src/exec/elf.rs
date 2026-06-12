@@ -3,12 +3,11 @@
 // Parses an ELF image, validates it, maps PT_LOAD segments into the
 // virtual address space, and returns the entry-point address.
 // Assumes:
-//   - The binary blob is already in kernel memory (e.g. loaded from a ramdisk
-//     or passed by the bootloader).
+//   - The binary blob is already in kernel memory (e.g. loaded from a ramdisk or passed by the
+//     bootloader).
 //   - `memory::vmm::map_page` handles page-table insertion.
 //   - `memory::pmm::alloc_frame` returns a free 4 KiB physical frame.
-//   - The kernel runs in the higher half; user segments go below
-//     USER_SPACE_END.
+//   - The kernel runs in the higher half; user segments go below USER_SPACE_END.
 
 use core::mem;
 

@@ -2,8 +2,7 @@
 //!
 //! Two entry paths:
 //!   - UEFI:       `efi_main` in `uefi_entry.rs` (EDK2 calls this directly).
-//!   - Bare-metal: `_start` below (linked into `.text.boot` by
-//!     linker_aarch64.ld).
+//!   - Bare-metal: `_start` below (linked into `.text.boot` by linker_aarch64.ld).
 //!
 //! The bare-metal path is used with the `aarch64-kernel` target JSON and is
 //! intended for future bring-up without UEFI (e.g. U-Boot, custom firmware).

@@ -276,7 +276,7 @@ impl ExfatVol {
                 None => {
                     free_allocated_clusters(self, &new_clusters);
                     return Err(-28);
-                }
+                },
             }
         }
 
@@ -426,13 +426,13 @@ fn parse_dir_entries(data: &[u8], parent_cluster: u32) -> Vec<DirEntry> {
                             first_cluster = u32::from_le_bytes(
                                 data[i + 20..i + 24].try_into().unwrap_or([0; 4]),
                             );
-                        }
+                        },
 
                         DENTRY_FILE_NAME => {
                             name_data.extend_from_slice(&data[i + 2..i + 32]);
-                        }
+                        },
 
-                        _ => {}
+                        _ => {},
                     }
 
                     i += DENTRY_SIZE;
@@ -451,11 +451,11 @@ fn parse_dir_entries(data: &[u8], parent_cluster: u32) -> Vec<DirEntry> {
                         parent_cluster,
                     });
                 }
-            }
+            },
 
             _ => {
                 i += DENTRY_SIZE;
-            }
+            },
         }
     }
 
@@ -478,14 +478,13 @@ fn discover_metadata(vol: &mut ExfatVol) {
                     let first_cluster =
                         u32::from_le_bytes(data[i + 20..i + 24].try_into().unwrap_or([0; 4]));
 
-                    let len =
-                        u64::from_le_bytes(data[i + 24..i + 32].try_into().unwrap_or([0; 8]));
+                    let len = u64::from_le_bytes(data[i + 24..i + 32].try_into().unwrap_or([0; 8]));
 
                     vol.bitmap = Some(ClusteredExtent { first_cluster, len });
                 }
 
                 i += DENTRY_SIZE;
-            }
+            },
 
             DENTRY_UPCASE_TABLE => {
                 let first_cluster =
@@ -496,16 +495,16 @@ fn discover_metadata(vol: &mut ExfatVol) {
                 vol.upcase = Some(ClusteredExtent { first_cluster, len });
 
                 i += DENTRY_SIZE;
-            }
+            },
 
             DENTRY_FILE => {
                 let secondary_count = data[i + 1] as usize;
                 i += DENTRY_SIZE * (1 + secondary_count);
-            }
+            },
 
             _ => {
                 i += DENTRY_SIZE;
-            }
+            },
         }
     }
 }
@@ -583,7 +582,7 @@ fn utf16_name_units(name: &str) -> Result<Vec<u16>, isize> {
 
         match ch {
             '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|' => return Err(-22),
-            _ => {}
+            _ => {},
         }
     }
 
@@ -656,7 +655,8 @@ fn build_dentries(
     entries[stream_off] = DENTRY_STREAM_EXT;
     entries[stream_off + 1] = 0x01;
     entries[stream_off + 3] = name_units.len() as u8;
-    entries[stream_off + 4..stream_off + 6].copy_from_slice(&name_hash(vol, &name_units).to_le_bytes());
+    entries[stream_off + 4..stream_off + 6]
+        .copy_from_slice(&name_hash(vol, &name_units).to_le_bytes());
     entries[stream_off + 8..stream_off + 16].copy_from_slice(&valid_data_len.to_le_bytes());
     entries[stream_off + 20..stream_off + 24].copy_from_slice(&first_cluster.to_le_bytes());
     entries[stream_off + 24..stream_off + 32].copy_from_slice(&data_len.to_le_bytes());
@@ -862,7 +862,8 @@ fn recompute_entry_checksum(
     primary_off: usize,
     entry_count: usize,
 ) {
-    let Some(bytes) = read_dentry_set_bytes(vol, dir_first_cluster, primary_off, entry_count) else {
+    let Some(bytes) = read_dentry_set_bytes(vol, dir_first_cluster, primary_off, entry_count)
+    else {
         return;
     };
 
@@ -1137,7 +1138,7 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), isize> {
             None => {
                 free_allocated_clusters(vol, &chain);
                 return Err(-28);
-            }
+            },
         }
     }
 
@@ -1165,17 +1166,17 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), isize> {
     let first_cluster = chain.first().copied().unwrap_or(0);
     let dentries = build_file_dentries(vol, name, first_cluster, contents.len() as u64)?;
 
-    let old_first_cluster = existing
-        .as_ref()
-        .and_then(|entry| if entry.first_cluster >= 2 { Some(entry.first_cluster) } else { None });
+    let old_first_cluster = existing.as_ref().and_then(|entry| {
+        if entry.first_cluster >= 2 {
+            Some(entry.first_cluster)
+        } else {
+            None
+        }
+    });
 
-    if let Err(err) = insert_or_replace_dentries(
-        vol,
-        &parent_entry,
-        name,
-        &dentries,
-        old_first_cluster,
-    ) {
+    if let Err(err) =
+        insert_or_replace_dentries(vol, &parent_entry, name, &dentries, old_first_cluster)
+    {
         free_allocated_clusters(vol, &chain);
         return Err(err);
     }

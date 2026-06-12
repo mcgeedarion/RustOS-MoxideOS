@@ -2,21 +2,19 @@
 //!
 //! ## Design
 //!
-//! * Sends a single UDP query to the DNS server obtained from the DHCP lease
-//!   (port 53) and busy-waits up to 2 s for a reply.  Retries up to 3 times.
+//! * Sends a single UDP query to the DNS server obtained from the DHCP lease (port 53) and
+//!   busy-waits up to 2 s for a reply.  Retries up to 3 times.
 //!
-//! * Only the first A record (IPv4) or AAAA record (IPv6, returned as u128) in
-//!   the answer section is returned; CNAME chains are followed for up to 8
-//!   hops.
+//! * Only the first A record (IPv4) or AAAA record (IPv6, returned as u128) in the answer section
+//!   is returned; CNAME chains are followed for up to 8 hops.
 //!
-//! * A simple fixed-size cache (`DNS_CACHE`, 64 entries, LRU-by-insertion)
-//!   avoids repeated queries for the same name.  TTL is stored but the cache
-//!   does not actively expire entries; it acts as a best-effort hint store.
+//! * A simple fixed-size cache (`DNS_CACHE`, 64 entries, LRU-by-insertion) avoids repeated queries
+//!   for the same name.  TTL is stored but the cache does not actively expire entries; it acts as a
+//!   best-effort hint store.
 //!
-//! * The receive path (`receive`) is called by the UDP demux when a packet
-//!   arrives on port 53 (← wait, DNS *replies* come to the *source* ephemeral
-//!   port we sent from).  We therefore register a temporary UDP socket slot via
-//!   `udp::register_port` before the query and unregister it after.
+//! * The receive path (`receive`) is called by the UDP demux when a packet arrives on port 53 (←
+//!   wait, DNS *replies* come to the *source* ephemeral port we sent from).  We therefore register
+//!   a temporary UDP socket slot via `udp::register_port` before the query and unregister it after.
 //!
 //! ## Thread safety
 //!

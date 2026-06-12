@@ -4,17 +4,17 @@
 //!
 //! PCIe native hot-plug is signalled through two channels:
 //!
-//! 1. **PCIe Hot-Plug Interrupts** (native HP) — the PCIe slot capability
-//!    registers fire an MSI/INTx; handled in `src/drivers/pcie/hotplug.rs`.
+//! 1. **PCIe Hot-Plug Interrupts** (native HP) — the PCIe slot capability registers fire an
+//!    MSI/INTx; handled in `src/drivers/pcie/hotplug.rs`.
 //!
-//! 2. **ACPI-mediated hot-plug** — firmware owns the HP interrupt; it fires a
-//!    GPE, runs AML, then issues `Notify(device, 0x01|0x03)` to signal
-//!    bus-check or eject-request.  *This* file handles path 2.
+//! 2. **ACPI-mediated hot-plug** — firmware owns the HP interrupt; it fires a GPE, runs AML, then
+//!    issues `Notify(device, 0x01|0x03)` to signal bus-check or eject-request.  *This* file handles
+//!    path 2.
 //!
 //! ## What we do
 //!
-//! - Discover the PCIe root bridge device in the DSDT (heuristic: look for the
-//!   `_HID` / `_CID` of `PNP0A08` or `PNP0A03`).
+//! - Discover the PCIe root bridge device in the DSDT (heuristic: look for the `_HID` / `_CID` of
+//!   `PNP0A08` or `PNP0A03`).
 //! - Register a GPE handler for the GPE block + bit published by the FADT.
 //! - When a Notify(0x01 Bus-Check) fires, re-enumerate the PCIe segment.
 //! - When a Notify(0x03 Eject-Request) fires, quiesce the device and remove it.

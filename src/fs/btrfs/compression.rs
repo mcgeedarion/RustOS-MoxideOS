@@ -92,20 +92,19 @@ mod zlib {
     use alloc::{vec, vec::Vec};
 
     const LENGTH_BASE: [usize; 29] = [
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83,
-        99, 115, 131, 163, 195, 227, 258,
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
+        131, 163, 195, 227, 258,
     ];
     const LENGTH_EXTRA: [u8; 29] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5,
-        5, 5, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
     ];
     const DIST_BASE: [usize; 30] = [
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
-        1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
     ];
     const DIST_EXTRA: [u8; 30] = [
-        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11,
-        11, 12, 12, 13, 13,
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
+        13, 13,
     ];
 
     pub fn decompress(data: &[u8], expected: usize) -> Result<Vec<u8>, DecompressError> {
@@ -149,11 +148,11 @@ mod zlib {
                 1 => {
                     let (litlen, dist) = fixed_tables()?;
                     read_compressed_block(&mut reader, &mut out, expected, &litlen, &dist)?;
-                }
+                },
                 2 => {
                     let (litlen, dist) = dynamic_tables(&mut reader)?;
                     read_compressed_block(&mut reader, &mut out, expected, &litlen, &dist)?;
-                }
+                },
                 _ => return Err(DecompressError::InvalidHeader),
             }
 
@@ -200,16 +199,13 @@ mod zlib {
                     let length = length_for_symbol(sym, reader)?;
                     let distance = distance_for_symbol(dist.decode(reader)?, reader)?;
                     copy_match(out, distance, length, expected)?;
-                }
+                },
                 _ => return Err(DecompressError::InvalidHuffmanCode),
             }
         }
     }
 
-    fn length_for_symbol(
-        sym: u16,
-        reader: &mut BitReader<'_>,
-    ) -> Result<usize, DecompressError> {
+    fn length_for_symbol(sym: u16, reader: &mut BitReader<'_>) -> Result<usize, DecompressError> {
         let idx = sym as usize - 257;
         if idx >= LENGTH_BASE.len() {
             return Err(DecompressError::InvalidHuffmanCode);
@@ -217,10 +213,7 @@ mod zlib {
         Ok(LENGTH_BASE[idx] + reader.read_bits(LENGTH_EXTRA[idx])? as usize)
     }
 
-    fn distance_for_symbol(
-        sym: u16,
-        reader: &mut BitReader<'_>,
-    ) -> Result<usize, DecompressError> {
+    fn distance_for_symbol(sym: u16, reader: &mut BitReader<'_>) -> Result<usize, DecompressError> {
         let idx = sym as usize;
         if idx >= DIST_BASE.len() {
             return Err(DecompressError::InvalidHuffmanCode);
@@ -254,7 +247,9 @@ mod zlib {
         let hlit = reader.read_bits(5)? as usize + 257;
         let hdist = reader.read_bits(5)? as usize + 1;
         let hclen = reader.read_bits(4)? as usize + 4;
-        let order = [16u8, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+        let order = [
+            16u8, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+        ];
         let mut code_lengths = [0u8; 19];
 
         for idx in order.iter().take(hclen) {
@@ -334,7 +329,10 @@ mod zlib {
 
         fn read_bit(&mut self) -> Result<u8, DecompressError> {
             if self.bit_left == 0 {
-                self.bit_buf = *self.data.get(self.byte_pos).ok_or(DecompressError::UnexpectedEof)?;
+                self.bit_buf = *self
+                    .data
+                    .get(self.byte_pos)
+                    .ok_or(DecompressError::UnexpectedEof)?;
                 self.byte_pos += 1;
                 self.bit_left = 8;
             }
@@ -362,7 +360,10 @@ mod zlib {
             if self.bit_left != 0 {
                 return Err(DecompressError::InvalidHeader);
             }
-            let byte = *self.data.get(self.byte_pos).ok_or(DecompressError::UnexpectedEof)?;
+            let byte = *self
+                .data
+                .get(self.byte_pos)
+                .ok_or(DecompressError::UnexpectedEof)?;
             self.byte_pos += 1;
             Ok(byte)
         }
@@ -452,7 +453,7 @@ mod zlib {
 }
 
 mod lzo {
-    use super::{copy_match, push_capped, BTRFS_LZO_SECTOR_SIZE, DecompressError};
+    use super::{copy_match, push_capped, DecompressError, BTRFS_LZO_SECTOR_SIZE};
     use alloc::vec::Vec;
 
     pub fn decompress(data: &[u8], expected: usize) -> Result<Vec<u8>, DecompressError> {
@@ -623,9 +624,7 @@ mod lzo {
         let bytes = data
             .get(pos..pos + 4)
             .ok_or(DecompressError::UnexpectedEof)?;
-        Ok(u32::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]))
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     struct LzoInput<'a> {

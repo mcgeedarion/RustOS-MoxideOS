@@ -1,17 +1,15 @@
 //! stat / path syscalls.
 //!
 //! ## Fixes in this revision
-//!   - sys_fstat, sys_fchmod, sys_fchown: translate user fd → backing fd via
-//!     proc_fd_backing() before passing to is_pipe / vfs::fd_path /
-//!     vfs::file_size.  Previously a user pipe fd like 4 was never recognised
-//!     as a pipe (is_pipe checks the backing-fd range 0x8000_0000+) so fstat on
-//!     a pipe returned S_IFREG instead of S_IFIFO.
-//!   - sys_fstat: handle socket, eventfd, timerfd, signalfd with proper
-//!     S_IFSOCK / S_IFCHR synthetic stats.
-//!   - fill_stat: call vfs_ops::lstat (follow=false) when lstat=true so
-//!     symlinks are reported as S_IFLNK instead of the target S_IFREG.
-//!   - sys_chdir / sys_fchdir: now validate + commit to Pcb::cwd instead of
-//!     silently returning 0.
+//!   - sys_fstat, sys_fchmod, sys_fchown: translate user fd → backing fd via proc_fd_backing()
+//!     before passing to is_pipe / vfs::fd_path / vfs::file_size.  Previously a user pipe fd like 4
+//!     was never recognised as a pipe (is_pipe checks the backing-fd range 0x8000_0000+) so fstat
+//!     on a pipe returned S_IFREG instead of S_IFIFO.
+//!   - sys_fstat: handle socket, eventfd, timerfd, signalfd with proper S_IFSOCK / S_IFCHR
+//!     synthetic stats.
+//!   - fill_stat: call vfs_ops::lstat (follow=false) when lstat=true so symlinks are reported as
+//!     S_IFLNK instead of the target S_IFREG.
+//!   - sys_chdir / sys_fchdir: now validate + commit to Pcb::cwd instead of silently returning 0.
 //!   - sys_getcwd: copies the real per-process cwd instead of hardcoded "/".
 
 extern crate alloc;

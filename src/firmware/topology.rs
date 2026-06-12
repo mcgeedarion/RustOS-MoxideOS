@@ -1,8 +1,8 @@
 //! Platform CPU topology: returns the list of secondary CPU MPIDR values.
 //!
 //! On AArch64 the CPU topology is discovered from either:
-//!   1. ACPI MADT  — GIC CPU Interface entries (type 0x0B for GICv2, type 0x0C
-//!      for GICv3 redistributor)
+//!   1. ACPI MADT  — GIC CPU Interface entries (type 0x0B for GICv2, type 0x0C for GICv3
+//!      redistributor)
 //!   2. Device Tree — `cpu` nodes under `/cpus` with `reg` property
 //!
 //! We support MADT first (UEFI path), then fall back to a hard-coded

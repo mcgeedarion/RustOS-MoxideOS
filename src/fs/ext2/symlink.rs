@@ -28,10 +28,8 @@ pub fn is_fast_symlink(size: u64, blocks_512: u32) -> bool {
         return false;
     }
 
-    /*
-     * ext2 fast symlinks store the target bytes in i_block and allocate no
-     * data blocks. Some images may leave i_blocks as 0 for these.
-     */
+    // ext2 fast symlinks store the target bytes in i_block and allocate no
+    // data blocks. Some images may leave i_blocks as 0 for these.
     blocks_512 == 0
 }
 
@@ -69,12 +67,7 @@ pub fn encode_fast_symlink_target(target: &[u8]) -> Option<[u32; 15]> {
 
     for i in 0..15 {
         let off = i * 4;
-        out[i] = u32::from_le_bytes([
-            raw[off],
-            raw[off + 1],
-            raw[off + 2],
-            raw[off + 3],
-        ]);
+        out[i] = u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
     }
 
     Some(out)

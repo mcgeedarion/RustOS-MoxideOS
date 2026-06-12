@@ -37,8 +37,7 @@ impl SignalHandlers {
     /// POSIX / Linux rule:
     ///   - SIG_IGN (handler == 1) survives exec.
     ///   - SIG_DFL (handler == 0) survives exec.
-    ///   - User handler VAs are reset to SIG_DFL (the VA is invalid in the new
-    ///     address space).
+    ///   - User handler VAs are reset to SIG_DFL (the VA is invalid in the new address space).
     ///   - sa_flags and sa_restorer are cleared for reset signals.
     pub fn exec_reset(&self) -> Self {
         let mut new = Self::default();

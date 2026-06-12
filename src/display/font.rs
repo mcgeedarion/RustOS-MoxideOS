@@ -114,11 +114,11 @@ impl<'a> Psf2Font<'a> {
     /// `(dst_x, dst_y)` into a 32-bpp `XRGB8888` pixel buffer.
     ///
     /// * `pixels`  — mutable slice of `u32` covering the full framebuffer.
-    /// * `pitch`   — number of `u32` elements per horizontal scan line (i.e.
-    ///   `fb_width` or `fb_pitch / 4`).
+    /// * `pitch`   — number of `u32` elements per horizontal scan line (i.e. `fb_width` or
+    ///   `fb_pitch / 4`).
     /// * `fg`      — foreground colour as `0x00RRGGBB`.
-    /// * `bg`      — background colour; pass `None` to skip background pixels
-    ///   (transparent blending).
+    /// * `bg`      — background colour; pass `None` to skip background pixels (transparent
+    ///   blending).
     pub fn draw_glyph(
         &self,
         ch: u8,
