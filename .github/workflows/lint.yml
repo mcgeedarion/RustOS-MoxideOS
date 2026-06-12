@@ -12,9 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          rustflags: ""
           components: rustfmt, clippy
 
       - name: Check formatting
