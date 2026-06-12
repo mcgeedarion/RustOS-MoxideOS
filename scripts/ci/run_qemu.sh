@@ -10,7 +10,7 @@
 #   target/esp/<arch>/EFI/BOOT/BOOT*.EFI
 #
 # Default ARCH is x86_64.
-# Override with:  ARCH=riscv64 ./scripts/ci/run_qemu.sh ...
+# Override with:  ARCH=aarch64 ./scripts/ci/run_qemu.sh --boot uefi ...
 
 set -euo pipefail
 
@@ -94,7 +94,27 @@ case "$ARCH:$BOOT" in
   x86_64:uefi) CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"; TARGET_DIR="x86_64-kernel"; EFI_NAME="BOOTX64.EFI" ;;
 esac
 
-KERNEL_ELF="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos"
+pick_kernel_artifact() {
+  local base="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos"
+
+  if [[ "$BOOT" == "uefi" && "$ARCH" != "x86_64" && -f "${base}.efi" ]]; then
+    echo "${base}.efi"
+    return 0
+  fi
+
+  if [[ -f "$base" ]]; then
+    echo "$base"
+    return 0
+  fi
+
+  if [[ -f "${base}.efi" ]]; then
+    echo "${base}.efi"
+    return 0
+  fi
+
+  return 1
+}
+
 CARGO_FLAGS=(build --target "$CARGO_TARGET" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem -Z json-target-spec)
 [[ "$RELEASE_MODE" -eq 1 ]] && CARGO_FLAGS+=(--release)
 if [[ "$TEST_MODE" -eq 1 ]]; then
@@ -106,7 +126,10 @@ fi
 cd "$ROOT_DIR"
 echo "[*] Building rustos (${ARCH}, ${BOOT}, ${PROFILE})..."
 cargo "${CARGO_FLAGS[@]}"
-[[ -f "$KERNEL_ELF" ]] || { echo "[!] ELF not found at ${KERNEL_ELF}" >&2; exit 1; }
+KERNEL_ELF="$(pick_kernel_artifact)" || {
+  echo "[!] Kernel artifact not found under ${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}" >&2
+  exit 1
+}
 
 find_objcopy() {
   if [[ -n "${OBJCOPY:-}" ]]; then echo "$OBJCOPY"; return 0; fi
@@ -123,9 +146,7 @@ if [[ "$BOOT" == "uefi" ]]; then
     OBJCOPY_BIN="$(find_objcopy)" || { echo "[!] objcopy is required for x86_64 UEFI" >&2; exit 1; }
     "$OBJCOPY_BIN" --target=efi-app-x86_64 --subsystem=10 "$KERNEL_ELF" "$EFI_IMAGE"
   else
-    EFI_SOURCE="${ROOT_DIR}/target/${TARGET_DIR}/${PROFILE}/rustos.efi"
-    [[ -f "$EFI_SOURCE" ]] || EFI_SOURCE="$KERNEL_ELF"
-    cp "$EFI_SOURCE" "$EFI_IMAGE"
+    cp "$KERNEL_ELF" "$EFI_IMAGE"
   fi
   echo "[*] ESP: ${EFI_IMAGE}"
 fi
@@ -142,9 +163,23 @@ FW_VARS=""
 if [[ "$BOOT" == "uefi" ]]; then
   case "$ARCH" in
     aarch64)
-      FW_CODE="$(find_existing_file /usr/share/qemu-efi-aarch64/QEMU_EFI.fd /usr/share/edk2/aarch64/QEMU_EFI.fd /usr/share/qemu/edk2-aarch64-code.fd /opt/homebrew/share/qemu/edk2-aarch64-code.fd /usr/local/share/qemu/edk2-aarch64-code.fd)" || { echo "[!] AArch64 EDK2 not found" >&2; exit 1; }
+      FW_CODE="$(find_existing_file \
+        /usr/share/AAVMF/AAVMF_CODE.fd \
+        /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+        /usr/share/edk2/aarch64/QEMU_EFI.fd \
+        /usr/share/qemu/edk2-aarch64-code.fd \
+        /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+        /usr/local/share/qemu/edk2-aarch64-code.fd)" || {
+        echo "[!] AArch64 EDK2 not found" >&2
+        exit 1
+      }
       FW_VARS="${ROOT_DIR}/target/edk2-aarch64-vars.fd"
-      [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+      AARCH64_VARS_TEMPLATE="$(find_existing_file /usr/share/AAVMF/AAVMF_VARS.fd || true)"
+      if [[ -n "$AARCH64_VARS_TEMPLATE" ]]; then
+        [[ -f "$FW_VARS" ]] || cp "$AARCH64_VARS_TEMPLATE" "$FW_VARS"
+      else
+        [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+      fi
       ;;
     riscv64)
       FW_CODE="$(find_existing_file /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd /usr/share/qemu/edk2-riscv-code.fd /opt/homebrew/share/qemu/edk2-riscv-code.fd /usr/local/share/qemu/edk2-riscv-code.fd)" || { echo "[!] RISC-V EDK2 not found" >&2; exit 1; }
