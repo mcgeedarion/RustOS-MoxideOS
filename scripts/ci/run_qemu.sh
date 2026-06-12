@@ -250,7 +250,8 @@ if [[ "$TEST_MODE" -eq 1 ]]; then
   mkdir -p "$KMTEST_STAGE/bin"
   cp "${ROOT_DIR}/userspace/build/${ARCH}/kmtest" "$KMTEST_STAGE/bin/kmtest"
   (cd "$KMTEST_STAGE" && find . | sort | cpio -o -H newc --quiet > "$KMTEST_CPIO")
-  QEMU_ARGS+=(-initrd "$KMTEST_CPIO" -append "init=/bin/kmtest")
+  QEMU_ARGS+=(-initrd "$KMTEST_CPIO")
+  [[ "$BOOT" != "uefi" ]] && QEMU_ARGS+=(-append "init=/bin/kmtest")
 fi
 
 if [[ "$SMOKE_MODE" -eq 1 ]]; then
@@ -261,7 +262,8 @@ if [[ "$SMOKE_MODE" -eq 1 ]]; then
   mkdir -p "$SMOKE_STAGE/bin"
   cp "${ROOT_DIR}/userspace/build/${ARCH}/smoke" "$SMOKE_STAGE/bin/smoke"
   (cd "$SMOKE_STAGE" && find . | sort | cpio -o -H newc --quiet > "$SMOKE_CPIO")
-  QEMU_ARGS+=(-initrd "$SMOKE_CPIO" -append "init=/bin/smoke")
+  QEMU_ARGS+=(-initrd "$SMOKE_CPIO")
+  [[ "$BOOT" != "uefi" ]] && QEMU_ARGS+=(-append "init=/bin/smoke")
 fi
 
 if [[ -n "$INITRD" ]]; then
