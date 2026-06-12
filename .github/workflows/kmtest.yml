@@ -1,18 +1,15 @@
 # kmtest workflow — matrix caller.
 #
 # Drives kernel-test.yml (run_kmtest: true) for every supported architecture.
-# Builds the kernel with --features kmtest, compiles the userspace runner via
-# `make ARCH=<arch> kmtest`, stages it into a cpio initramfs, boots under
-# QEMU with init=/bin/kmtest, and asserts the kmtest summary line.
+# x86_64 runs under QEMU/OVMF using the host musl-tools package. aarch64 and
+# riscv64 are currently skipped inside the reusable workflow until the CI image
+# provides aarch64-linux-musl-gcc and riscv64-linux-musl-gcc.
 #
 # Architecture notes
 # ──────────────────────────────────────────────────────────────────────────
-#   aarch64  virt/cortex-a72 -kernel boot, aarch64 musl cross-compiler
-#   riscv64  OpenSBI virt -kernel boot, riscv64 musl cross-compiler
+#   aarch64  requires aarch64-linux-musl-gcc before kmtest can run
+#   riscv64  requires riscv64-linux-musl-gcc before kmtest can run
 #   x86_64   OVMF UEFI boot, musl-tools
-#
-# The parse-results logic (grep for PASS/FAIL/summary) is identical across
-# all architectures and lives once in kernel-test.yml.
 
 name: kmtest
 
@@ -36,5 +33,5 @@ jobs:
 
     uses: ./.github/workflows/kernel-test.yml
     with:
-      arch:       ${{ matrix.arch }}
+      arch: ${{ matrix.arch }}
       run_kmtest: true
