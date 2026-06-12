@@ -38,7 +38,7 @@
           targets = [
             "riscv64gc-unknown-none-elf"
             "x86_64-unknown-none"
-            # aarch64-uefi-loader.json and riscv64-uefi.json are custom JSON targets; not rustup targets.
+            # UEFI/kernel JSON targets are local target specs, not rustup targets.
           ];
         };
 
@@ -77,7 +77,7 @@
           pkgsCross.riscv64-embedded.buildPackages.binutils
           qemu
 
-          # ---- per-arch OVMF (replaces the previous single ovmf entry) -----------
+          # ---- per-arch OVMF ---------------------------------------------------
           ovmfRiscV
           ovmfX86_64
 
@@ -122,7 +122,8 @@
                 ${pkgs.lib.optionalString (features != "") "--features ${features}"} \
                 ${extraBuildFlags} \
                 -Z build-std=core,alloc,compiler_builtins \
-                -Z build-std-features=compiler-builtins-mem
+                -Z build-std-features=compiler-builtins-mem \
+                -Z json-target-spec
             '';
 
             doCheck = false;
@@ -148,20 +149,17 @@
               ovmfX86_64Path = getOvmfFirmware { ovmf = ovmfX86_64; arch = "x86_64"; };
               rustcVersion = "$(rustc --version)";
               commands = [
-                "Build (ARM64 UEFI):  cargo build --target targets/aarch64-uefi-loader.json"
-                "                         -Z build-std=core,alloc,compiler_builtins"
-                "                         -Z build-std-features=compiler-builtins-mem"
-                "Build (RISC-V UEFI): cargo build"
-                "Build (RISC-V SBI):  cargo build --target riscv64gc-unknown-none-elf --no-default-features"
-                "                         -Z build-std=core,alloc,compiler_builtins"
-                "                         -Z build-std-features=compiler-builtins-mem"
-                "Build (x86_64):      cargo build --target x86_64-unknown-none --no-default-features"
-                "Run QEMU:            ./run_qemu_x86_64.sh"
-                "Run QEMU (RISC-V):   ./run_qemu_riscv.sh"
-                "Debug (GDB):         qemu-system-x86_64 -s -S ... then gdb-multiarch"
-                "Inspect binary:      rust-objdump -d target/.../rustos"
-                "Kernel docs:         mdbook serve docs/"
-                "Format this flake:   nix fmt"
+                "Build default boot ELF: cargo build"
+                "Build x86_64 UEFI img: cargo xtask image --arch x86_64 --debug"
+                "Build ARM64 UEFI:      cargo build --target targets/aarch64-uefi-loader.json"
+                "Build RISC-V UEFI:     cargo build --target targets/riscv64-uefi-loader.json --features uefi_boot"
+                "Build RISC-V SBI:      cargo build --target riscv64gc-unknown-none-elf --no-default-features"
+                "Run QEMU:              ./scripts/ci/run_qemu.sh"
+                "Run QEMU (RISC-V):     ARCH=riscv64 ./scripts/ci/run_qemu.sh --boot sbi"
+                "Debug (GDB):           qemu-system-x86_64 -s -S ... then gdb-multiarch"
+                "Inspect binary:        rust-objdump -d target/.../rustos"
+                "Kernel docs:           mdbook serve docs/"
+                "Format this flake:     nix fmt"
               ];
             in
             ''
@@ -202,16 +200,20 @@
         # Packages
         # ---------------------------------------------------------------------------
 
-        # `nix build` — RISC-V UEFI image (default, unchanged behaviour)
+        # `nix build` — RISC-V UEFI image (default)
         packages.default = (mkRustosPackage {
           pname = "rustos-riscv-uefi";
-          target = "riscv64-uefi.json";
+          target = "targets/riscv64-uefi-loader.json";
           features = "uefi_boot";
           extraBuildFlags = "";
         }).overrideAttrs (oldAttrs: {
           installPhase = ''
             mkdir -p $out/boot
-            cp target/riscv64-uefi/release/rustos.efi $out/boot/rustos-riscv.efi
+            if [ -f target/riscv64-uefi-loader/release/rustos.efi ]; then
+              cp target/riscv64-uefi-loader/release/rustos.efi $out/boot/rustos-riscv.efi
+            else
+              cp target/riscv64-uefi-loader/release/rustos $out/boot/rustos-riscv.efi
+            fi
 
             # Embed the correct OVMF blob alongside the image so run scripts
             # have a single store path to reference.
@@ -222,13 +224,15 @@
         # `nix build .#x86_64-uefi` — x86_64 UEFI image
         packages.x86_64-uefi = (mkRustosPackage {
           pname = "rustos-x86_64-uefi";
-          target = "x86_64-unknown-none";
+          target = "targets/x86_64-kernel.json";
           features = "uefi_boot";
-          extraBuildFlags = "--no-default-features";
+          extraBuildFlags = "";
         }).overrideAttrs (oldAttrs: {
           installPhase = ''
             mkdir -p $out/boot
-            cp target/x86_64-unknown-none/release/rustos.efi $out/boot/rustos-x86_64.efi
+            rust-objcopy --target=efi-app-x86_64 --subsystem=10 \
+              target/x86_64-kernel/release/rustos \
+              $out/boot/rustos-x86_64.efi
 
             # Embed the correct OVMF blob alongside the image.
             cp ${getOvmfFirmware { ovmf = ovmfX86_64; arch = "x86_64"; }} $out/boot/OVMF_X86_64.fd
