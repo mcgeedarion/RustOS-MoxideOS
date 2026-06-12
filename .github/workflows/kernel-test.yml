@@ -6,11 +6,11 @@
 #   arch      boot mode   cargo target
 #   aarch64   uefi        targets/aarch64-uefi-loader.json
 #   riscv64   uefi        targets/riscv64-uefi-loader.json
-#   x86_64    uefi        targets/x86_64-kernel.json
+#   x86_64    uefi        targets/x86_64-uefi-loader.json
 #
 # Plain local `cargo build` targets the repository-default aarch64 UEFI loader
-# via .cargo/config.toml. RISC-V UEFI is built explicitly through
-# `cargo xtask image --arch riscv64` or `ARCH=riscv64 ./scripts/ci/run_qemu.sh`.
+# via .cargo/config.toml. RISC-V and x86_64 UEFI are built explicitly through
+# `cargo xtask image --arch <arch>` or `ARCH=<arch> ./scripts/ci/run_qemu.sh`.
 
 name: Kernel Test (reusable)
 
@@ -75,7 +75,7 @@ jobs:
               ;;
             x86_64)
               echo "BOOT=uefi" >> "$GITHUB_ENV"
-              echo "TARGET_SHORT=x86_64-kernel" >> "$GITHUB_ENV"
+              echo "TARGET_SHORT=x86_64-uefi-loader" >> "$GITHUB_ENV"
               ;;
             *)
               echo "Unsupported arch: ${{ inputs.arch }}" >&2
@@ -274,10 +274,7 @@ jobs:
               grep -q 'RustOS (RISC-V) booting via UEFI' "$LOG"
               ;;
             x86_64)
-              grep -q 'rustos: kernel_main reached' "$LOG"
-              grep -q 'TEST PASS: uart_smoke' "$LOG"
-              grep -q 'TEST PASS: alloc_smoke' "$LOG"
-              grep -q 'TEST PASS: trap_smoke' "$LOG"
+              grep -q 'RustOS \[PRIMARY\] x86_64 booting via UEFI' "$LOG"
               ;;
           esac
 
