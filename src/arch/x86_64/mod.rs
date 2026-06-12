@@ -12,6 +12,8 @@ pub mod pci;
 pub mod power;
 pub mod serial;
 pub mod syscall;
+#[cfg(target_os = "uefi")]
+pub mod uefi_boot_stack;
 pub mod uefi_entry;
 pub mod uentry;
 pub mod xsave;
