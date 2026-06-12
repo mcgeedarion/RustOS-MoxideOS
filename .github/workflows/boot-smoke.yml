@@ -91,6 +91,111 @@ jobs:
             build-aarch64-image.log
             qemu-aarch64-boot.log
 
+  riscv64-uefi:
+    name: riscv64 UEFI boot smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: file
+          components: rust-src, llvm-tools-preview
+
+      - name: Install boot tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm qemu-system-misc qemu-efi-riscv64 u-boot-qemu mtools
+
+      - name: Build riscv64 UEFI target
+        run: |
+          cargo build --target targets/riscv64-uefi-loader.json --features uefi_boot \
+            2>&1 | tee cargo-build-riscv64-boot.log
+          test -f target/riscv64-uefi-loader/debug/rustos || \
+            test -f target/riscv64-uefi-loader/debug/rustos.efi
+
+      - name: Build riscv64 UEFI ESP image
+        run: |
+          cargo xtask image --arch riscv64 --debug 2>&1 | tee build-riscv64-image.log
+          test -f boot-riscv64.img
+
+      - name: Boot image in QEMU with EDK2 or U-Boot
+        run: |
+          find_existing_file() {
+            for path in "$@"; do
+              [ -f "$path" ] && { echo "$path"; return 0; }
+            done
+            return 1
+          }
+
+          FW_KIND=""
+          FW_CODE=""
+          FW_VARS=""
+          if FW_CODE=$(find_existing_file \
+              /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd \
+              /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd \
+              /usr/share/qemu/edk2-riscv-code.fd \
+              /usr/share/qemu/edk2-riscv64-code.fd); then
+            FW_KIND="edk2"
+            FW_VARS=/tmp/RISCV_VIRT_VARS.fd
+            dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+          elif FW_CODE=$(find_existing_file \
+              /usr/lib/u-boot/qemu-riscv64_smode/uboot.elf \
+              /usr/lib/u-boot/qemu-riscv64/uboot.elf \
+              /usr/share/u-boot/qemu-riscv64_smode/uboot.elf \
+              /usr/share/u-boot/qemu-riscv64/uboot.elf); then
+            FW_KIND="uboot"
+          else
+            echo "RISC-V UEFI firmware not found" >&2
+            exit 1
+          fi
+
+          QEMU_FW_ARGS=()
+          if [ "$FW_KIND" = "edk2" ]; then
+            QEMU_FW_ARGS+=(
+              -drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on"
+              -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}"
+            )
+          else
+            QEMU_FW_ARGS+=(-bios "$FW_CODE")
+          fi
+
+          set +e
+          timeout 60 qemu-system-riscv64 \
+            -machine virt \
+            -cpu rv64 \
+            -m 256M \
+            "${QEMU_FW_ARGS[@]}" \
+            -drive if=virtio,format=raw,file=boot-riscv64.img \
+            -serial stdio -display none -no-reboot -no-shutdown \
+            -d guest_errors,cpu_reset \
+            > qemu-riscv64-boot.log 2>&1
+          status=$?
+          set -e
+          cat qemu-riscv64-boot.log
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            echo "QEMU exited unexpectedly with status $status" >&2
+            exit "$status"
+          fi
+
+      - name: Assert riscv64 UEFI marker
+        run: |
+          grep -q 'RustOS (RISC-V) booting via UEFI' qemu-riscv64-boot.log
+
+      - name: Upload riscv64 boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-boot-smoke
+          path: |
+            cargo-build-riscv64-boot.log
+            build-riscv64-image.log
+            qemu-riscv64-boot.log
+
   x86_64-uefi:
     name: x86_64 UEFI boot smoke
     runs-on: ubuntu-latest
