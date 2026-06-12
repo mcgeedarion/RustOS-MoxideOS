@@ -10,6 +10,87 @@ permissions:
   contents: read
 
 jobs:
+  aarch64-uefi:
+    name: aarch64 UEFI boot smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: file
+          components: rust-src, llvm-tools-preview
+
+      - name: Install boot tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm qemu-system-arm qemu-efi-aarch64 mtools
+
+      - name: Plain cargo build uses repo default aarch64 UEFI target
+        run: |
+          cargo build 2>&1 | tee cargo-build-aarch64-boot.log
+          test -f target/aarch64-uefi-loader/debug/rustos || \
+            test -f target/aarch64-uefi-loader/debug/rustos.efi
+
+      - name: Build aarch64 UEFI ESP image
+        run: |
+          cargo xtask image --arch aarch64 --debug 2>&1 | tee build-aarch64-image.log
+          test -f boot-aarch64.img
+
+      - name: Boot image in QEMU/EDK2
+        run: |
+          FW_CODE=/usr/share/AAVMF/AAVMF_CODE.fd
+          if [ ! -f "$FW_CODE" ]; then
+            FW_CODE=/usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+          fi
+          test -f "$FW_CODE"
+
+          if [ -f /usr/share/AAVMF/AAVMF_VARS.fd ]; then
+            cp /usr/share/AAVMF/AAVMF_VARS.fd /tmp/AAVMF_VARS.fd
+          else
+            dd if=/dev/zero of=/tmp/AAVMF_VARS.fd bs=1M count=64 2>/dev/null
+          fi
+
+          set +e
+          timeout 45 qemu-system-aarch64 \
+            -machine virt \
+            -cpu cortex-a57 \
+            -m 256M \
+            -drive if=pflash,unit=0,format=raw,readonly=on,file="$FW_CODE" \
+            -drive if=pflash,unit=1,format=raw,file=/tmp/AAVMF_VARS.fd \
+            -drive if=virtio,format=raw,file=boot-aarch64.img \
+            -serial stdio -display none -no-reboot -no-shutdown \
+            -d guest_errors,cpu_reset \
+            > qemu-aarch64-boot.log 2>&1
+          status=$?
+          set -e
+          cat qemu-aarch64-boot.log
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            echo "QEMU exited unexpectedly with status $status" >&2
+            exit "$status"
+          fi
+
+      - name: Assert aarch64 boot markers
+        run: |
+          grep -q 'aarch64: exception vectors installed' qemu-aarch64-boot.log
+          grep -q 'aarch64: MMU enabled' qemu-aarch64-boot.log
+          grep -q 'aarch64: heap ready' qemu-aarch64-boot.log
+          grep -q 'aarch64: kernel_main: idle' qemu-aarch64-boot.log
+
+      - name: Upload aarch64 boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-boot-smoke
+          path: |
+            cargo-build-aarch64-boot.log
+            build-aarch64-image.log
+            qemu-aarch64-boot.log
+
   x86_64-uefi:
     name: x86_64 UEFI boot smoke
     runs-on: ubuntu-latest
@@ -30,9 +111,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm qemu-system-x86 ovmf mtools
 
-      - name: Plain cargo build uses primary boot target
+      - name: Explicit x86_64 build remains supported
         run: |
-          cargo build 2>&1 | tee cargo-build-x86_64-boot.log
+          cargo build --target targets/x86_64-kernel.json 2>&1 | tee cargo-build-x86_64-boot.log
           test -f target/x86_64-kernel/debug/rustos
           file target/x86_64-kernel/debug/rustos
 
@@ -65,14 +146,14 @@ jobs:
             exit "$status"
           fi
 
-      - name: Assert boot markers
+      - name: Assert x86_64 boot markers
         run: |
-          grep -q 'kernel_main reached' qemu-x86_64-boot.log
+          grep -q 'rustos: kernel_main reached' qemu-x86_64-boot.log
           grep -q 'TEST PASS: uart_smoke' qemu-x86_64-boot.log
           grep -q 'TEST PASS: alloc_smoke' qemu-x86_64-boot.log
           grep -q 'TEST PASS: trap_smoke' qemu-x86_64-boot.log
 
-      - name: Upload boot logs
+      - name: Upload x86_64 boot logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
