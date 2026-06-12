@@ -14,10 +14,11 @@
 #   2. Update `nightlyDate` in flake.nix to the same date.
 #   3. Run the normal build matrix:
 #        cargo build
-#        cargo build --target targets/aarch64-uefi-loader.json
+#        cargo xtask image --arch aarch64 --debug
+#        cargo build --target targets/x86_64-kernel.json
+#        cargo xtask image --arch x86_64 --debug
 #        cargo build --target riscv64gc-unknown-none-elf --no-default-features
 #        cargo build --target targets/riscv64-uefi-loader.json --features uefi_boot
-#        cargo xtask image --arch x86_64 --debug
 #   4. Run formatting and lint checks.
 #   5. Document the upgrade reason in CHANGELOG.md.
 
