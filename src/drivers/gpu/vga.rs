@@ -1,10 +1,10 @@
 //! VGA / VESA framebuffer driver.
 //!
 //! Two modes are supported:
-//!   1. **VGA text mode** (80×25, mode 3)   — available immediately after boot
-//!      on x86; writes characters to the 0xB8000 buffer.
-//!   2. **VESA LFB** (linear framebuffer)    — set up by the bootloader via
-//!      VESA BIOS INT 10h / VBE mode set; base address passed via boot info.
+//!   1. **VGA text mode** (80×25, mode 3)   — available immediately after boot on x86; writes
+//!      characters to the 0xB8000 buffer.
+//!   2. **VESA LFB** (linear framebuffer)    — set up by the bootloader via VESA BIOS INT 10h / VBE
+//!      mode set; base address passed via boot info.
 //!
 //! If an LFB is available it is used; otherwise text mode is used as fallback.
 

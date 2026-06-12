@@ -92,7 +92,6 @@ impl<T: Linkable> IntrusiveList<T> {
         }
         self.len -= 1;
 
-    
         Some(unsafe { NonNull::new_unchecked(T::from_node(first_ptr)) })
     }
 }
@@ -119,7 +118,6 @@ unsafe impl<T: Send> Send for RingBuf<T> {}
 unsafe impl<T: Send> Sync for RingBuf<T> {}
 
 impl<T> RingBuf<T> {
-
     /// # Safety
     /// `buf` must remain valid for the lifetime of this `RingBuf`.
     pub unsafe fn from_raw(buf: &'static mut [core::mem::MaybeUninit<T>]) -> Self {

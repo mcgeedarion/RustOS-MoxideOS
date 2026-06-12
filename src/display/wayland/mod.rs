@@ -8,8 +8,8 @@
 //! privileged userspace process (`/usr/bin/rustos-compositor`). The kernel
 //! retains only:
 //!
-//!   - `compositor::vblank_notify` — vblank ISR pass-through to the compositor
-//!     process via `crate::drivers::drm::deliver_vblank_event`.
+//!   - `compositor::vblank_notify` — vblank ISR pass-through to the compositor process via
+//!     `crate::drivers::drm::deliver_vblank_event`.
 //!   - `server` — architecture documentation; no public API.
 
 pub mod compositor;

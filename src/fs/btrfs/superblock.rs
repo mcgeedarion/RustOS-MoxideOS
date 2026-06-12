@@ -534,7 +534,6 @@ pub struct BtrfsFs {
     pub(super) fs_tree_root: u64,
     pub(super) path_cache: BTreeMap<String, u64>,
     pub(super) alloc_cursor: u64,
-
 }
 
 pub static BTRFS_MOUNTS: Mutex<BTreeMap<String, BtrfsFs>> = Mutex::new(BTreeMap::new());

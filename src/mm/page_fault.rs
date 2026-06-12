@@ -14,8 +14,7 @@
 //!
 //!   1. Allocates a fresh physical page from the PMM.
 //!   2. Zero-initialises the entire page so any unread suffix is clean.
-//!   3. Issues a `vfs::pread` for exactly PAGE_SIZE bytes at the correct file
-//!      offset.
+//!   3. Issues a `vfs::pread` for exactly PAGE_SIZE bytes at the correct file offset.
 //!   4. Classifies the result:
 //!
 //!      ```

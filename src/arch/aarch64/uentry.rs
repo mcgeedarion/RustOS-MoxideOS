@@ -14,8 +14,7 @@
 //!   - `entry` is a valid mapped EL0 virtual address.
 //!   - `user_sp` points to a writable mapped user stack page.
 //!   - `ttbr0` is the physical address of the process L0 page table.
-//!   - Interrupts are disabled on entry (they re-enable when SPSR.I = 0 is
-//!     restored by eret).
+//!   - Interrupts are disabled on entry (they re-enable when SPSR.I = 0 is restored by eret).
 //!   - This function never returns to the caller.
 
 use crate::mm::pmm;

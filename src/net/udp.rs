@@ -4,13 +4,12 @@
 //!
 //! Two kinds of port registrations are supported:
 //!
-//!   - `register_port(port, sock_idx)` — binds a user-space socket slot to a
-//!     well-known or explicitly bound port. Used by `sys_bind` and `UdpScheme`.
+//!   - `register_port(port, sock_idx)` — binds a user-space socket slot to a well-known or
+//!     explicitly bound port. Used by `sys_bind` and `UdpScheme`.
 //!
-//!   - `register_ephemeral(port)` / `unregister_ephemeral(port)` — temporary
-//!     registrations for kernel-internal UDP clients (DHCP on port 68, DNS
-//!     query source ports). Packets arriving on these ports are routed to the
-//!     appropriate kernel module by `demux_udp`.
+//!   - `register_ephemeral(port)` / `unregister_ephemeral(port)` — temporary registrations for
+//!     kernel-internal UDP clients (DHCP on port 68, DNS query source ports). Packets arriving on
+//!     these ports are routed to the appropriate kernel module by `demux_udp`.
 
 extern crate alloc;
 use alloc::vec;
@@ -122,8 +121,7 @@ pub fn lookup_port(port: u16) -> Option<usize> {
 pub fn is_ephemeral(port: u16) -> bool {
     let reg = PORT_REGISTRY.lock();
 
-    reg.iter()
-        .any(|e| e.valid && e.ephemeral && e.port == port)
+    reg.iter().any(|e| e.valid && e.ephemeral && e.port == port)
 }
 
 fn udp_checksum(src_ip: u32, dst_ip: u32, payload_and_hdr: &[u8]) -> u16 {
@@ -249,9 +247,7 @@ fn alloc_udp_socket(
     local_port: Option<u16>,
     peer: Option<(u32, u16)>,
 ) -> Result<usize, scheme_api::SchemeError> {
-    use crate::net::socket::{
-        SockAddr, SocketState, AF_INET, IPPROTO_UDP, SOCKETS, SOCK_DGRAM,
-    };
+    use crate::net::socket::{SockAddr, SocketState, AF_INET, IPPROTO_UDP, SOCKETS, SOCK_DGRAM};
 
     let mut sockets = SOCKETS.lock();
 
@@ -344,12 +340,8 @@ impl crate::fs::scheme_table::Scheme for UdpScheme {
         } else {
             let mut parts = target.rsplitn(3, ':');
 
-            let maybe_src_or_dst = parts
-                .next()
-                .ok_or(scheme_api::SchemeError::InvalidArg)?;
-            let maybe_dst = parts
-                .next()
-                .ok_or(scheme_api::SchemeError::InvalidArg)?;
+            let maybe_src_or_dst = parts.next().ok_or(scheme_api::SchemeError::InvalidArg)?;
+            let maybe_dst = parts.next().ok_or(scheme_api::SchemeError::InvalidArg)?;
             let maybe_ip = parts.next();
 
             match maybe_ip {
@@ -358,11 +350,7 @@ impl crate::fs::scheme_table::Scheme for UdpScheme {
                     parse_port(maybe_dst)?,
                     Some(parse_port(maybe_src_or_dst)?),
                 ),
-                None => (
-                    parse_ipv4(maybe_dst)?,
-                    parse_port(maybe_src_or_dst)?,
-                    None,
-                ),
+                None => (parse_ipv4(maybe_dst)?, parse_port(maybe_src_or_dst)?, None),
             }
         };
 

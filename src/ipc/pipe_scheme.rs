@@ -169,10 +169,10 @@ impl Scheme for PipeScheme {
 
     /// Close one end of the pipe.
     ///
-    /// * **Write end** (even fid): decrement `writers`.  Buffer stays alive
-    ///   until the read end also closes so pending bytes can be drained.
-    /// * **Read end** (odd fid): remove the buffer entirely.  Any subsequent
-    ///   write to the write end will receive `SchemeError::Io` (EPIPE).
+    /// * **Write end** (even fid): decrement `writers`.  Buffer stays alive until the read end also
+    ///   closes so pending bytes can be drained.
+    /// * **Read end** (odd fid): remove the buffer entirely.  Any subsequent write to the write end
+    ///   will receive `SchemeError::Io` (EPIPE).
     fn close(&self, fid: SchemeFileId) -> Result<(), SchemeError> {
         let id = fid.0 as u32;
         let is_write_end = id % 2 == 0;

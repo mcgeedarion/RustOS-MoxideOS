@@ -1,12 +1,9 @@
 //! Address Space Layout Randomisation (ASLR).
 //!
 //! Produces per-process random offsets for:
-//!   - stack base     (`aslr_stack_offset`)  — randomised in full [STACK_MIN,
-//!     STACK_TOP)
-//!   - heap base      (`aslr_heap_base`)     — randomised in [HEAP_MIN,
-//!     HEAP_MAX)
-//!   - mmap region    (`aslr_mmap_base`)     — randomised in [MMAP_MIN,
-//!     MMAP_MAX)
+//!   - stack base     (`aslr_stack_offset`)  — randomised in full [STACK_MIN, STACK_TOP)
+//!   - heap base      (`aslr_heap_base`)     — randomised in [HEAP_MIN, HEAP_MAX)
+//!   - mmap region    (`aslr_mmap_base`)     — randomised in [MMAP_MIN, MMAP_MAX)
 //!   - vDSO / vvar    (`aslr_vdso_base`)     — 1-page slot inside mmap window
 //!
 //! ## Entropy

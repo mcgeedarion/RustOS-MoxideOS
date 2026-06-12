@@ -20,29 +20,37 @@ fn rsp_packet(body: &str) -> String {
 }
 
 pub struct AArch64Session {
-    pub sw_bps:  SwBreakpointTable,
-    pub hw_bps:  HwBreakpointTable,
+    pub sw_bps: SwBreakpointTable,
+    pub hw_bps: HwBreakpointTable,
     pub watches: WatchpointTable,
 }
 
 impl AArch64Session {
     pub fn new() -> Self {
         AArch64Session {
-            sw_bps:  SwBreakpointTable::new(),
-            hw_bps:  HwBreakpointTable::new(),
+            sw_bps: SwBreakpointTable::new(),
+            hw_bps: HwBreakpointTable::new(),
             watches: WatchpointTable::new(),
         }
     }
 }
 
 impl ZSession for AArch64Session {
-    fn sw_bps(&mut self)  -> &mut SwBreakpointTable { &mut self.sw_bps  }
-    fn hw_bps(&mut self)  -> &mut HwBreakpointTable { &mut self.hw_bps  }
-    fn watches(&mut self) -> &mut WatchpointTable   { &mut self.watches }
+    fn sw_bps(&mut self) -> &mut SwBreakpointTable {
+        &mut self.sw_bps
+    }
+    fn hw_bps(&mut self) -> &mut HwBreakpointTable {
+        &mut self.hw_bps
+    }
+    fn watches(&mut self) -> &mut WatchpointTable {
+        &mut self.watches
+    }
 }
 
 pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut AArch64Session) -> String {
-    if body.is_empty() { return rsp_packet(""); }
+    if body.is_empty() {
+        return rsp_packet("");
+    }
     match body.as_bytes()[0] {
         b'?' => {
             let s = target.poll_status();
@@ -55,23 +63,29 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut AArch64Se
         },
         b'G' => {
             let buf = decode_hex_bytes(&body[1..]);
-            if buf.len() < AArch64::reg_buf_len() { return rsp_packet("E01"); }
+            if buf.len() < AArch64::reg_buf_len() {
+                return rsp_packet("E01");
+            }
             AArch64::write_regs(target.trap_frame_mut(), &buf);
             rsp_packet("OK")
         },
         b'p' => {
             let idx = parse_hex_u64(&body[1..]) as usize;
-            if idx >= AARCH64_REG_COUNT { return rsp_packet("E01"); }
+            if idx >= AARCH64_REG_COUNT {
+                return rsp_packet("E01");
+            }
             let mut buf = alloc::vec![0u8; AArch64::reg_buf_len()];
             AArch64::read_regs(target.trap_frame(), &mut buf);
             rsp_packet(&encode_hex_bytes(&buf[idx * 8..(idx + 1) * 8]))
         },
         b'P' => {
             let rest = &body[1..];
-            let eq  = rest.find('=').unwrap_or(rest.len());
+            let eq = rest.find('=').unwrap_or(rest.len());
             let idx = parse_hex_u64(&rest[..eq]) as usize;
-            if idx >= AARCH64_REG_COUNT { return rsp_packet("E01"); }
-            let val  = parse_hex_u64(&rest[eq + 1..]);
+            if idx >= AARCH64_REG_COUNT {
+                return rsp_packet("E01");
+            }
+            let val = parse_hex_u64(&rest[eq + 1..]);
             let trap = target.trap_frame_mut();
             let mut buf = alloc::vec![0u8; AArch64::reg_buf_len()];
             AArch64::read_regs(trap, &mut buf);
@@ -82,21 +96,34 @@ pub fn handle_packet(body: &str, target: &mut GdbTarget, session: &mut AArch64Se
         b'm' => {
             let mut p = body[1..].splitn(2, ',');
             let addr = parse_hex_u64(p.next().unwrap_or(""));
-            let len  = parse_hex_u64(p.next().unwrap_or("")) as usize;
+            let len = parse_hex_u64(p.next().unwrap_or("")) as usize;
             rsp_packet(&encode_hex_bytes(&target.read_mem(addr, len)))
         },
         b'M' => {
-            let rest  = &body[1..];
+            let rest = &body[1..];
             let colon = rest.find(':').unwrap_or(rest.len());
-            let addr  = parse_hex_u64(&rest[..rest.find(',').unwrap_or(colon)]);
-            let data  = if colon < rest.len() { decode_hex_bytes(&rest[colon + 1..]) } else { alloc::vec![] };
+            let addr = parse_hex_u64(&rest[..rest.find(',').unwrap_or(colon)]);
+            let data = if colon < rest.len() {
+                decode_hex_bytes(&rest[colon + 1..])
+            } else {
+                alloc::vec![]
+            };
             target.write_mem(addr, &data);
             rsp_packet("OK")
         },
-        b'c' => { target.ctl("cont"); String::new() },
-        b's' => { target.ctl("step"); String::new() },
+        b'c' => {
+            target.ctl("cont");
+            String::new()
+        },
+        b's' => {
+            target.ctl("step");
+            String::new()
+        },
         b'Z' | b'z' => handle_z_packet(body, target, session),
-        b'k' => { crate::proc::signal::send_signal(target.pid, 9); rsp_packet("OK") },
+        b'k' => {
+            crate::proc::signal::send_signal(target.pid, 9);
+            rsp_packet("OK")
+        },
         b'q' => {
             if body.starts_with("qSupported") {
                 rsp_packet("PacketSize=4000;swbreak+;hwbreak+;watchpoint+;vContSupported+")

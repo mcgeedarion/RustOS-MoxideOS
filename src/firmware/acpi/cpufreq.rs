@@ -5,8 +5,8 @@
 //!
 //! ACPI defines **P-states** (performance states) in the DSDT/SSDT via:
 //! - `_PCT`  — control/status register addresses (MSR or I/O)
-//! - `_PSS`  — list of (freq_MHz, power_mW, latency_us, bus_latency_us,
-//!   control, status) tuples, sorted highest→lowest performance
+//! - `_PSS`  — list of (freq_MHz, power_mW, latency_us, bus_latency_us, control, status) tuples,
+//!   sorted highest→lowest performance
 //! - `_PPC`  — highest P-state the platform currently allows
 //!
 //! Because we do not have a full AML interpreter, we perform a *byte-pattern

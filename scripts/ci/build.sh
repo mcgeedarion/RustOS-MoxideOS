@@ -64,8 +64,8 @@ case "$ARCH:$BOOT" in
     TARGET_DIR="riscv64gc-unknown-none-elf"
     ;;
   x86_64:uefi)
-    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-uefi-loader.json"
-    TARGET_DIR="x86_64-uefi-loader"
+    CARGO_TARGET="x86_64-unknown-uefi"
+    TARGET_DIR="x86_64-unknown-uefi"
     ;;
 esac
 

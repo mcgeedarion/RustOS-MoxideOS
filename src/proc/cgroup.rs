@@ -19,8 +19,8 @@
 //! ## Lifecycle hooks
 //!
 //! - `cgroup_fork(parent_pid, child_pid)` — child inherits parent's cgroup.
-//! - `cgroup_exit(pid)`                  — remove PID from its cgroup; if the
-//!   cgroup is empty and marked for removal, free it.
+//! - `cgroup_exit(pid)`                  — remove PID from its cgroup; if the cgroup is empty and
+//!   marked for removal, free it.
 //!
 //! ## cgroupfs integration
 //!
@@ -141,11 +141,10 @@ static CGROUPS: Mutex<CgroupTable> = Mutex::new(CgroupTable::new());
 /// `CgroupTable::new()`, so this function's job is purely to:
 ///
 /// 1. Assert the root node is healthy (debug sanity check).
-/// 2. Register the cgroup v2 unified-hierarchy mount with the kernel mount
-///    table (via `fs::mount::kernel_mount`) so that `/sys/fs/cgroup` resolves
-///    to `FsType::Cgroupfs` before pid-1 runs.  The `init_mounts()` call in the
-///    initramfs path already does this for the normal boot path; calling
-///    `kernel_mount` here is a no-op (`-EBUSY`) if the entry already exists,
+/// 2. Register the cgroup v2 unified-hierarchy mount with the kernel mount table (via
+///    `fs::mount::kernel_mount`) so that `/sys/fs/cgroup` resolves to `FsType::Cgroupfs` before
+///    pid-1 runs.  The `init_mounts()` call in the initramfs path already does this for the normal
+///    boot path; calling `kernel_mount` here is a no-op (`-EBUSY`) if the entry already exists,
 ///    which is safe to ignore.
 /// 3. Emit a boot log line so the init sequence is traceable.
 pub fn init() {

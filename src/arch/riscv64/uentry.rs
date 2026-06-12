@@ -7,8 +7,8 @@
 //!   1. Allocate and map the per-process trapframe page + trampoline page.
 //!   2. Prime the trapframe's save area with kernel bootstrap values.
 //!   3. Set `stvec = uservec` (trampoline entry), `sscratch = TRAPFRAME_VADDR`.
-//!   4. Load sepc / sstatus and jump to `userret` in the trampoline. `userret`
-//!      switches `satp`, restores GPRs, and executes `sret`.
+//!   4. Load sepc / sstatus and jump to `userret` in the trampoline. `userret` switches `satp`,
+//!      restores GPRs, and executes `sret`.
 
 use crate::arch::riscv64::mem_layout::{page, satp as SATP_MODE, sv39 as SV};
 use crate::arch::riscv64::paging::{self, PTE_R, PTE_U, PTE_W};

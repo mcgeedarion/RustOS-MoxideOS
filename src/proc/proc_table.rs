@@ -7,11 +7,11 @@
 //! process table on every scheduler tick, signal delivery, fork, wait, and
 //! ioctl call.  Under SMP this caused:
 //!
-//!   - `check_and_deliver` (signal path) and `tick` (scheduler) contending on
-//!     the same lock simultaneously across CPUs.
+//!   - `check_and_deliver` (signal path) and `tick` (scheduler) contending on the same lock
+//!     simultaneously across CPUs.
 //!   - `load_balance` in `tick` re-locking after a partial release.
-//!   - `with_proc_mut` inside `do_exit` holding PROCS while calling
-//!     `free_kstack`, which may trigger an allocator lock.
+//!   - `with_proc_mut` inside `do_exit` holding PROCS while calling `free_kstack`, which may
+//!     trigger an allocator lock.
 //!
 //! The new design:
 //!
@@ -28,14 +28,12 @@
 //!   ```
 //!
 //! Rules:
-//!   1. Take `PROC_TABLE` only to find + clone an `Arc<ProcLock>`, then drop
-//!      it.
+//!   1. Take `PROC_TABLE` only to find + clone an `Arc<ProcLock>`, then drop it.
 //!   2. Never hold `PROC_TABLE` while locking `ProcLock::inner`.
-//!   3. Never hold two `ProcLock::inner` locks simultaneously (prevents
-//!      lock-order inversions across fork/signal/wait paths).
-//!   4. The scheduler hot path (`schedule`, `tick`, `load_balance`) reads
-//!      `ProcLock::state_atom` (AtomicU8) and works through `*mut Task`
-//!      pointers — it never locks `PROC_TABLE`.
+//!   3. Never hold two `ProcLock::inner` locks simultaneously (prevents lock-order inversions
+//!      across fork/signal/wait paths).
+//!   4. The scheduler hot path (`schedule`, `tick`, `load_balance`) reads `ProcLock::state_atom`
+//!      (AtomicU8) and works through `*mut Task` pointers — it never locks `PROC_TABLE`.
 
 extern crate alloc;
 use crate::proc::process::{Pcb, ProcLock, State};

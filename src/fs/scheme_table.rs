@@ -136,8 +136,8 @@ impl SchemeTable {
     ///
     /// # Errors
     ///
-    /// * `SchemeError::NoSuchScheme` — no colon in `url`, or no handler
-    ///   registered under the extracted scheme name.
+    /// * `SchemeError::NoSuchScheme` — no colon in `url`, or no handler registered under the
+    ///   extracted scheme name.
     /// * Any error forwarded from `handler.open()`.
     ///
     /// # Example

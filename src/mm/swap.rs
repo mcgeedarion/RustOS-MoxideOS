@@ -106,7 +106,8 @@ impl SwapSlot {
     /// now non-overlapping for the full u32 slot range.
     #[inline]
     pub fn encode_pte(self) -> usize {
-        ((self.slot as usize) << 24) | ((self.dev as usize) << 16) | 0xAB // swap-type marker; bit 0 (PRESENT/VALID) = 0
+        ((self.slot as usize) << 24) | ((self.dev as usize) << 16) | 0xAB // swap-type marker; bit 0
+                                                                          // (PRESENT/VALID) = 0
     }
 
     /// Decode a not-present PTE back to a `SwapSlot`.

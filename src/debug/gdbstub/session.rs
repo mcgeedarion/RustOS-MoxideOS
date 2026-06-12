@@ -42,16 +42,18 @@ fn recv_packet(serial: &mut SerialPort) -> Option<String> {
     loop {
         let b = unsafe { serial.read_byte() };
         match b {
-            0x03     => return None,
+            0x03 => return None,
             b'+' | b'-' => continue,
-            b'$'     => {},
-            _        => continue,
+            b'$' => {},
+            _ => continue,
         }
 
         let mut body = Vec::with_capacity(64);
         loop {
             let c = unsafe { serial.read_byte() };
-            if c == b'#' { break; }
+            if c == b'#' {
+                break;
+            }
             body.push(c);
         }
 
@@ -79,11 +81,7 @@ fn send_response(serial: &mut SerialPort, resp: &str) {
 
 /// Block until the target stops, then send the stop reply.
 /// For range-step, re-arms single-step until PC leaves the range.
-fn wait_and_notify(
-    serial: &mut SerialPort,
-    target: &mut GdbTarget,
-    vcont_state: &mut RspState,
-) {
+fn wait_and_notify(serial: &mut SerialPort, target: &mut GdbTarget, vcont_state: &mut RspState) {
     loop {
         let status = loop {
             let s = target.poll_status();
@@ -100,7 +98,11 @@ fn wait_and_notify(
         let pc = crate::debug::gdbstub::arch::RiscV64::pc(target.trap_frame());
         #[cfg(target_arch = "aarch64")]
         let pc = crate::debug::gdbstub::arch::AArch64::pc(target.trap_frame());
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64", target_arch = "aarch64")))]
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "riscv64",
+            target_arch = "aarch64"
+        )))]
         let pc: u64 = 0;
 
         if vcont_state.range_step.is_some() && !range_step_done(vcont_state, pc) {
@@ -141,7 +143,7 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
         },
     };
 
-    let mut session     = Session::new();
+    let mut session = Session::new();
     let mut vcont_state = RspState::new();
 
     // Initial stop reply.
@@ -152,7 +154,7 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
             None => {
                 // Ctrl-C: stop a running target.
                 target.ctl("stop");
-                vcont_state.halted    = true;
+                vcont_state.halted = true;
                 vcont_state.range_step = None;
                 send_response(serial, &rsp_packet("T02")); // SIGINT
             },
@@ -176,7 +178,11 @@ pub fn run(serial: &mut SerialPort, pid: usize) {
 
                 if resp.is_empty() {
                     // 'c' or 's' — wait for stop.
-                    if body.as_bytes().first().map_or(false, |&b| b == b'c' || b == b's') {
+                    if body
+                        .as_bytes()
+                        .first()
+                        .map_or(false, |&b| b == b'c' || b == b's')
+                    {
                         wait_and_notify(serial, &mut target, &mut vcont_state);
                     }
                 } else {

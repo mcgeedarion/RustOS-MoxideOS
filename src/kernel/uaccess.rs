@@ -12,16 +12,14 @@
 //! fault will produce `EFAULT` rather than a kernel panic.
 //!
 //! # Architecture notes
-//! * **aarch64** — ARM64 user access is controlled by PAN (Privileged Access
-//!   Never).  The initial AArch64 bring-up keeps this path explicit until
-//!   exception-table fault fixups land.
-//! * **riscv64** — `sstatus.SUM` is cleared during normal kernel execution. Each
-//!   access bracket sets `SUM=1`, performs the copy, then clears it again. The
-//!   `stvec` fault handler translates load/store page-faults into `EFAULT`.
-//! * **x86_64** — SMAP (`CR4.SMAP`) is assumed to be enabled.  Every access
-//!   bracket wraps the copy loop between `STAC` / `CLAC` to temporarily allow
-//!   supervisor access to user pages.  SMEP prevents execution from user pages
-//!   regardless.
+//! * **aarch64** — ARM64 user access is controlled by PAN (Privileged Access Never).  The initial
+//!   AArch64 bring-up keeps this path explicit until exception-table fault fixups land.
+//! * **riscv64** — `sstatus.SUM` is cleared during normal kernel execution. Each access bracket
+//!   sets `SUM=1`, performs the copy, then clears it again. The `stvec` fault handler translates
+//!   load/store page-faults into `EFAULT`.
+//! * **x86_64** — SMAP (`CR4.SMAP`) is assumed to be enabled.  Every access bracket wraps the copy
+//!   loop between `STAC` / `CLAC` to temporarily allow supervisor access to user pages.  SMEP
+//!   prevents execution from user pages regardless.
 
 use core::mem;
 use core::ptr;

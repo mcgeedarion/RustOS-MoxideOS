@@ -2,8 +2,8 @@
 //!
 //! Provides the POSIX canonical (cooked) read path:
 //!   - Characters accumulate in a line buffer until '\n' or '\r'.
-//!   - Backspace (0x7F / 0x08) erases the previous character and echoes the
-//!     erase sequence "\x08 \x08" (backspace, space, backspace).
+//!   - Backspace (0x7F / 0x08) erases the previous character and echoes the erase sequence "\x08
+//!     \x08" (backspace, space, backspace).
 //!   - ^C (0x03) sends SIGINT to the foreground process group.
 //!   - ^D (0x04) at the start of a line signals EOF (returns 0).
 //!   - ^Z (0x1A) sends SIGTSTP (ignored for now, mapped to SIGSTOP).

@@ -51,8 +51,8 @@ pub fn sys_getegid() -> isize {
 //   - The saved-set-user-ID is set to the new euid if:
 //       * ruid != -1, OR
 //       * euid != -1 and euid != old ruid
-//   - Unprivileged (euid != 0): new ruid must be old ruid, euid, or suid; new
-//     euid must be old ruid, euid, or suid.
+//   - Unprivileged (euid != 0): new ruid must be old ruid, euid, or suid; new euid must be old
+//     ruid, euid, or suid.
 // We are a single-user-root kernel so euid==0 is always privileged.
 
 pub fn sys_setreuid(ruid: u32, euid: u32) -> isize {

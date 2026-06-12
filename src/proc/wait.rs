@@ -9,13 +9,13 @@
 //!
 //! ## Locking notes (post-S2)
 //!
-//!   - `with_procs_ro` returns a snapshot `Vec<Arc<ProcLock>>`. `ProcLock`
-//!     exposes `pid` and `tgid` directly.  `ppid`, `pgid`, `state`,
-//!     `exit_code`, `cpu_time_ns` require locking `ProcLock::inner`.
-//!   - The scan loop takes each inner lock once per iteration.  There is no
-//!     try_lock pre-filter (that pattern caused TOCTOU double-lock on SMP).
-//!   - `with_procs_mut` is used only for structural mutations (reap/state
-//!     change) and is held for the minimum time.
+//!   - `with_procs_ro` returns a snapshot `Vec<Arc<ProcLock>>`. `ProcLock` exposes `pid` and `tgid`
+//!     directly.  `ppid`, `pgid`, `state`, `exit_code`, `cpu_time_ns` require locking
+//!     `ProcLock::inner`.
+//!   - The scan loop takes each inner lock once per iteration.  There is no try_lock pre-filter
+//!     (that pattern caused TOCTOU double-lock on SMP).
+//!   - `with_procs_mut` is used only for structural mutations (reap/state change) and is held for
+//!     the minimum time.
 
 use crate::proc::process::State;
 use crate::proc::scheduler;

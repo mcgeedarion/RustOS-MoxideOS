@@ -23,8 +23,8 @@
 //!   2. `kernel_main` calls `plic::init()` after fdt::init_from_fdt().
 //!   3. Each driver registers its IRQ with `plic::enable_irq(irq, handler)`.
 //!   4. APs call `plic::init_context(ctx)` during their own bringup.
-//!   5. The trap handler calls `plic::handle_irq()` on every supervisor
-//!      external interrupt (scause code 9) on any hart.
+//!   5. The trap handler calls `plic::handle_irq()` on every supervisor external interrupt (scause
+//!      code 9) on any hart.
 
 use spin::Mutex;
 

@@ -6,7 +6,7 @@
 #   arch      boot mode   cargo target
 #   aarch64   uefi        targets/aarch64-uefi-loader.json
 #   riscv64   uefi        targets/riscv64-uefi-loader.json
-#   x86_64    uefi        targets/x86_64-uefi-loader.json
+#   x86_64    uefi        x86_64-unknown-uefi (built-in)
 #
 # Plain local `cargo build` targets the repository-default aarch64 UEFI loader
 # via .cargo/config.toml. RISC-V and x86_64 UEFI are built explicitly through
@@ -75,7 +75,7 @@ jobs:
               ;;
             x86_64)
               echo "BOOT=uefi" >> "$GITHUB_ENV"
-              echo "TARGET_SHORT=x86_64-uefi-loader" >> "$GITHUB_ENV"
+              echo "TARGET_SHORT=x86_64-unknown-uefi" >> "$GITHUB_ENV"
               ;;
             *)
               echo "Unsupported arch: ${{ inputs.arch }}" >&2

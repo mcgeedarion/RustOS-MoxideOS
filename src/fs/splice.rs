@@ -2,8 +2,8 @@
 //!
 //! Implements the full splice(2) contract:
 //!   - fd_in xor fd_out must be a pipe
-//!   - non-pipe end uses pread/pwrite so the file offset advances correctly (or
-//!     stays fixed if the caller supplied a non-NULL off_in/off_out)
+//!   - non-pipe end uses pread/pwrite so the file offset advances correctly (or stays fixed if the
+//!     caller supplied a non-NULL off_in/off_out)
 //!   - flags: SPLICE_F_NONBLOCK honoured (returns EAGAIN instead of spinning)
 //!   - SPLICE_F_MORE / SPLICE_F_MOVE are accepted but ignored (hint only)
 

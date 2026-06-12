@@ -18,13 +18,13 @@
 //!
 //! ## Send protocol
 //!   1. Set target's `ipi_pending` bit(s) with `fetch_or(..., Release)`.
-//!   2. Call `send(target_cpu, kind)` which invokes the arch-specific mechanism
-//!      (x86: APIC ICR write; RISC-V: SBI SEND_IPI ecall).
+//!   2. Call `send(target_cpu, kind)` which invokes the arch-specific mechanism (x86: APIC ICR
+//!      write; RISC-V: SBI SEND_IPI ecall).
 //!
 //! ## Receive protocol (RISC-V, trap handler scause code 1)
 //!   1. Clear SIP.SSIP to acknowledge the interrupt.
-//!   2. Call `ipi::dispatch(cpu_id)` — reads & clears `ipi_pending` atomically
-//!      then dispatches each set bit.
+//!   2. Call `ipi::dispatch(cpu_id)` — reads & clears `ipi_pending` atomically then dispatches each
+//!      set bit.
 //!
 //! ## `schedule_on(task, cpu)` integration
 //!   When the scheduler pins a task to a specific remote CPU via

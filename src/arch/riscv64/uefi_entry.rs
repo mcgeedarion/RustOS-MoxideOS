@@ -55,11 +55,8 @@ type LocateHandleBufferFn = unsafe extern "efiapi" fn(
     *mut *mut EfiHandle,
 ) -> EfiStatus;
 
-type HandleProtocolFn = unsafe extern "efiapi" fn(
-    EfiHandle,
-    *const [u64; 2],
-    *mut *mut core::ffi::c_void,
-) -> EfiStatus;
+type HandleProtocolFn =
+    unsafe extern "efiapi" fn(EfiHandle, *const [u64; 2], *mut *mut core::ffi::c_void) -> EfiStatus;
 
 type ExitBootServicesFn = unsafe extern "efiapi" fn(EfiHandle, usize) -> EfiStatus;
 

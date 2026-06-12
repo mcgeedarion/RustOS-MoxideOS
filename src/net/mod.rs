@@ -180,7 +180,9 @@ impl crate::fs::scheme_table::Scheme for NetScheme {
             return Err(scheme_api::SchemeError::InvalidArg);
         };
 
-        let n = buf.len().min(handle.data.len().saturating_sub(handle.offset));
+        let n = buf
+            .len()
+            .min(handle.data.len().saturating_sub(handle.offset));
         if n > 0 {
             buf[..n].copy_from_slice(&handle.data[handle.offset..handle.offset + n]);
             handle.offset += n;

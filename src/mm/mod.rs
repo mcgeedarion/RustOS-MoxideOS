@@ -42,11 +42,11 @@ pub mod swap;
 /// Initialise memory subsystems that require explicit boot-time setup.
 ///
 /// Call order (enforced by kernel_main):
-///   1. pmm::init() / pmm::pmm_add_efi_map() / memmap::memmap_init() — physical
-///      frames must be available before slab can grow.
+///   1. pmm::init() / pmm::pmm_add_efi_map() / memmap::memmap_init() — physical frames must be
+///      available before slab can grow.
 ///   2. heap::init_heap_tracking()  — linked_list_allocator bootstrap.
-///   3. mm::init()                  — THIS function; pre-warms slab caches and
-///      initialises the swap subsystem.
+///   3. mm::init()                  — THIS function; pre-warms slab caches and initialises the swap
+///      subsystem.
 ///
 /// After this returns, `slab::slab_alloc`, `slab::slab_free`,
 /// `slab::slab_shrink`, `slab::slab_stats`, and all `swap::` functions

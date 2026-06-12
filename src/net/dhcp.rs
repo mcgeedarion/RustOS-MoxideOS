@@ -2,24 +2,23 @@
 //!
 //! ## Design
 //!
-//! * Sends/receives raw UDP on ports 68 (client) / 67 (server) via the kernel
-//!   UDP layer.  Before a lease is obtained `our_ip()` returns 0.0.0.0 so we
-//!   set the IP source to 0 and destination to the broadcast address
-//!   (255.255.255.255), which is RFC-correct for the initial exchange.
+//! * Sends/receives raw UDP on ports 68 (client) / 67 (server) via the kernel UDP layer.  Before a
+//!   lease is obtained `our_ip()` returns 0.0.0.0 so we set the IP source to 0 and destination to
+//!   the broadcast address (255.255.255.255), which is RFC-correct for the initial exchange.
 //!
-//! * A minimal fixed-format BOOTP/DHCP packet is used (no PRL, no hostname).
-//!   The only options emitted are:
+//! * A minimal fixed-format BOOTP/DHCP packet is used (no PRL, no hostname). The only options
+//!   emitted are:
 //!     - 53 (DHCP Message Type)
 //!     - 54 (Server Identifier)  — only in REQUEST
 //!     - 55 (Parameter Request List) — requests subnet mask, router, DNS
 //!     - 255 (End)
 //!
-//! * After a successful ACK the leased addresses are pushed into `ip::set_ip`,
-//!   `ip::set_gw`, `ip::set_mask`.  A background renewal task is not yet
-//!   implemented; `init()` re-runs the full handshake if called again.
+//! * After a successful ACK the leased addresses are pushed into `ip::set_ip`, `ip::set_gw`,
+//!   `ip::set_mask`.  A background renewal task is not yet implemented; `init()` re-runs the full
+//!   handshake if called again.
 //!
-//! * The receive path hooks into `net::socket::demux_udp`, which calls
-//!   `dhcp::receive` when a packet arrives on port 68.
+//! * The receive path hooks into `net::socket::demux_udp`, which calls `dhcp::receive` when a
+//!   packet arrives on port 68.
 //!
 //! ## Thread safety
 //!

@@ -167,12 +167,7 @@ impl<'a> BtrfsTransaction<'a> {
     }
 
     /// Transaction-aware timestamp update wrapper.
-    pub fn set_times(
-        &mut self,
-        path: &str,
-        atime_sec: u64,
-        mtime_sec: u64,
-    ) -> Result<(), isize> {
+    pub fn set_times(&mut self, path: &str, atime_sec: u64, mtime_sec: u64) -> Result<(), isize> {
         self.fs.set_times(path, atime_sec, mtime_sec)?;
         self.dirty = true;
         Ok(())

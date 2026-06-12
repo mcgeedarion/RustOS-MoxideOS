@@ -2,11 +2,11 @@
 //!
 //! ## How it works
 //!
-//! 1. Before entering S3 we save the AP wakeup vector into the FACS
-//!    `FirmwareWakingVector` field so firmware knows where to jump on resume.
+//! 1. Before entering S3 we save the AP wakeup vector into the FACS `FirmwareWakingVector` field so
+//!    firmware knows where to jump on resume.
 //! 2. The BSP issues the PM1a/PM1b sleep transition.
-//! 3. On resume, real-mode trampoline code (not here) reloads the GDT/IDT and
-//!    jumps to `resume_entry` which restores saved registers and returns.
+//! 3. On resume, real-mode trampoline code (not here) reloads the GDT/IDT and jumps to
+//!    `resume_entry` which restores saved registers and returns.
 //!
 //! This file owns:
 //! - FACS discovery and wakeup-vector installation

@@ -4,8 +4,7 @@
 //!
 //! ACPI exposes battery state through two AML control methods:
 //! - `_BIF` (Battery Information) — static data: capacity, voltage, chemistry.
-//! - `_BST` (Battery Status)      — dynamic data: state, rate, remaining
-//!   capacity.
+//! - `_BST` (Battery Status)      — dynamic data: state, rate, remaining capacity.
 //!
 //! Because we lack a full AML interpreter, we scan the DSDT for the well-known
 //! byte patterns produced by virtually every firmware that implements these

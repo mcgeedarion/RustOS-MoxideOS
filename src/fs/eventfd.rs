@@ -2,16 +2,14 @@
 //!
 //! ## Kernel-side contract
 //!
-//! * **`eventfd_register(fd, initval, flags)`** — called right after an
-//!   anonymous VFS fd is allocated to attach the counter state.
-//! * **`eventfd_read(fd, buf)`** — the VFS `read` path delegates here when
-//!   `is_eventfd(fd)` is true.  `buf` must be ≥ 8 bytes; returns 8 on success
-//!   or a negative errno.
+//! * **`eventfd_register(fd, initval, flags)`** — called right after an anonymous VFS fd is
+//!   allocated to attach the counter state.
+//! * **`eventfd_read(fd, buf)`** — the VFS `read` path delegates here when `is_eventfd(fd)` is
+//!   true.  `buf` must be ≥ 8 bytes; returns 8 on success or a negative errno.
 //! * **`eventfd_write(fd, buf)`** — same for the `write` path.
-//! * **`eventfd_poll(fd)`** — returns a bitmask of POLLIN (0x001) / POLLOUT
-//!   (0x004) for use by the poll / epoll machinery.
-//! * **`eventfd_close(fd)`** — removes state; must be called from the VFS close
-//!   path.
+//! * **`eventfd_poll(fd)`** — returns a bitmask of POLLIN (0x001) / POLLOUT (0x004) for use by the
+//!   poll / epoll machinery.
+//! * **`eventfd_close(fd)`** — removes state; must be called from the VFS close path.
 //!
 //! ## Flags
 //!

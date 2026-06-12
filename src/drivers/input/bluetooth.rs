@@ -5,8 +5,8 @@
 //!   - Reset the controller (HCI_Reset)
 //!   - Read the local BD_ADDR (HCI_Read_BD_ADDR)
 //!   - Configure LE scan parameters and start passive LE advertising scan
-//!   - Receive HCI Event / LE Meta Event packets and forward key / button
-//!     events from connected HID-over-GATT peripherals to evdev
+//!   - Receive HCI Event / LE Meta Event packets and forward key / button events from connected
+//!     HID-over-GATT peripherals to evdev
 //!
 //! ## H4 framing
 //!   Each packet starts with a 1-byte indicator:

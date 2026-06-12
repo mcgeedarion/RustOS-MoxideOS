@@ -290,15 +290,14 @@ pub unsafe fn switch(
 /// dummy `Context` on the stack.  Instead it branches directly into the
 /// arch first-time-entry path:
 ///
-/// - **x86_64**: loads `Pcb::ctx` which was set up by `clone` to point `rsp` at
-///   the syscall frame and `rip` at `sysret_trampoline`.  We call `switch_to`
-///   with a dummy that is stack-allocated but whose save half is intentionally
-///   discarded (the scheduler never uses the `prev` of a `Cold → Live`
-///   transition again).
+/// - **x86_64**: loads `Pcb::ctx` which was set up by `clone` to point `rsp` at the syscall frame
+///   and `rip` at `sysret_trampoline`.  We call `switch_to` with a dummy that is stack-allocated
+///   but whose save half is intentionally discarded (the scheduler never uses the `prev` of a `Cold
+///   → Live` transition again).
 ///
-/// - **RISC-V**: loads `Pcb::ctx.{ra=task_entry_trampoline, sp=kstack-tf}` via
-///   `switch_riscv` with a dummy old-context, then `ret` in the naked stub
-///   jumps to `task_entry_trampoline` → `trap_return` → `sret`.
+/// - **RISC-V**: loads `Pcb::ctx.{ra=task_entry_trampoline, sp=kstack-tf}` via `switch_riscv` with
+///   a dummy old-context, then `ret` in the naked stub jumps to `task_entry_trampoline` →
+///   `trap_return` → `sret`.
 ///
 /// # Safety
 /// Task pointer must be valid.  Interrupts must be disabled.

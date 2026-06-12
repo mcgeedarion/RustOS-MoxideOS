@@ -431,7 +431,11 @@ pub fn sys_dup3(oldfd: usize, newfd: usize, flags: i32) -> isize {
     }
     let r = sys_dup2(oldfd, newfd);
     if r >= 0 && flags & O_CLOEXEC != 0 {
-        crate::fs::process_fd::proc_fd_set_cloexec(crate::proc::scheduler::current_pid(), newfd, true);
+        crate::fs::process_fd::proc_fd_set_cloexec(
+            crate::proc::scheduler::current_pid(),
+            newfd,
+            true,
+        );
     }
     r
 }

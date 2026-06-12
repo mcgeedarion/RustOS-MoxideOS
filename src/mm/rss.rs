@@ -14,10 +14,10 @@
 //!
 //! ## Integration points
 //!
-//! - `mm/mmap.rs` — call `rss_charge(pid, pages)` after a new anonymous mapping
-//!   is backed by physical frames; `rss_discharge(pid, pages)` on `munmap`.
-//! - `mm/page_fault.rs` — call `rss_charge(pid, 1)` each time a demand-zero
-//!   fault allocates a new frame.
+//! - `mm/mmap.rs` — call `rss_charge(pid, pages)` after a new anonymous mapping is backed by
+//!   physical frames; `rss_discharge(pid, pages)` on `munmap`.
+//! - `mm/page_fault.rs` — call `rss_charge(pid, 1)` each time a demand-zero fault allocates a new
+//!   frame.
 //! - `proc/exit.rs` — call `rss_reset(pid)` on process exit.
 
 use crate::proc::rlimit::{RLIMIT_RSS, RLIM_INFINITY};

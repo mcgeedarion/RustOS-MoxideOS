@@ -12,7 +12,6 @@ use crate::proc::scheduler;
 const PAGE_SIZE: usize = 4096;
 const SENTINEL_PTE: u64 = 0;
 
-
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn to_virt(pa: usize) -> usize {
@@ -106,7 +105,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
         }
 
         match atomic_pte.compare_exchange(cur, SENTINEL_PTE, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(prev) => break prev, // we won the race
+            Ok(prev) => break prev,            // we won the race
             Err(_) => core::hint::spin_loop(), // lost; retry
         }
     };
@@ -117,7 +116,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
             // Restore the PTE so the page is not permanently unmapped.
             atomic_pte.store(old_pte_val, Ordering::Release);
             return false;
-        }
+        },
     };
 
     let new_pa = match pmm::alloc_page() {
@@ -126,7 +125,7 @@ pub fn handle_cow_fault(faulting_va: usize, error_code: u64) -> bool {
             // OOM — restore the CoW PTE so a future fault can retry.
             atomic_pte.store(old_pte_val, Ordering::Release);
             return false;
-        }
+        },
     };
 
     // Copy through the physmap window — never dereference a raw PA directly.
@@ -189,22 +188,32 @@ unsafe fn pte_addr(cr3: usize, va: usize) -> Option<usize> {
 unsafe fn pte_addr_impl(cr3: usize, va: usize) -> Option<usize> {
     let pml4i = (va >> 39) & 0x1FF;
     let pdpti = (va >> 30) & 0x1FF;
-    let pdi   = (va >> 21) & 0x1FF;
-    let pti   = (va >> 12) & 0x1FF;
+    let pdi = (va >> 21) & 0x1FF;
+    let pti = (va >> 12) & 0x1FF;
 
     let pml4_base = to_virt(cr3);
     let pml4e = *((pml4_base + pml4i * 8) as *const u64);
-    if pml4e & PRESENT == 0 { return None; }
+    if pml4e & PRESENT == 0 {
+        return None;
+    }
 
     let pdpt_base = to_virt((pml4e & ADDR_MASK) as usize);
     let pdpte = *((pdpt_base + pdpti * 8) as *const u64);
-    if pdpte & PRESENT == 0 { return None; }
-    if pdpte & PAGE_SIZE_BIT != 0 { return None; } // 1 GiB large page
+    if pdpte & PRESENT == 0 {
+        return None;
+    }
+    if pdpte & PAGE_SIZE_BIT != 0 {
+        return None;
+    } // 1 GiB large page
 
     let pd_base = to_virt((pdpte & ADDR_MASK) as usize);
     let pde = *((pd_base + pdi * 8) as *const u64);
-    if pde & PRESENT == 0 { return None; }
-    if pde & PAGE_SIZE_BIT != 0 { return None; } // 2 MiB large page
+    if pde & PRESENT == 0 {
+        return None;
+    }
+    if pde & PAGE_SIZE_BIT != 0 {
+        return None;
+    } // 2 MiB large page
 
     let pt_phys = (pde & ADDR_MASK) as usize;
     Some(pt_phys + pti * 8)
@@ -237,13 +246,21 @@ unsafe fn pte_addr_impl(satp_pa: usize, va: usize) -> Option<usize> {
 
     let pgd_base = to_virt(satp_pa);
     let pgde = *((pgd_base + vpn2 * 8) as *const u64);
-    if pgde & RV_PTE_VALID == 0 { return None; }
-    if pgde & RV_PTE_RWX_MASK != 0 { return None; } // 1 GiB leaf
+    if pgde & RV_PTE_VALID == 0 {
+        return None;
+    }
+    if pgde & RV_PTE_RWX_MASK != 0 {
+        return None;
+    } // 1 GiB leaf
 
     let pmd_base = to_virt(rv_pte_to_pa(pgde));
     let pmde = *((pmd_base + vpn1 * 8) as *const u64);
-    if pmde & RV_PTE_VALID == 0 { return None; }
-    if pmde & RV_PTE_RWX_MASK != 0 { return None; } // 2 MiB leaf
+    if pmde & RV_PTE_VALID == 0 {
+        return None;
+    }
+    if pmde & RV_PTE_RWX_MASK != 0 {
+        return None;
+    } // 2 MiB leaf
 
     let pt_phys = rv_pte_to_pa(pmde);
     Some(pt_phys + vpn0 * 8)
@@ -268,21 +285,29 @@ unsafe fn pte_addr_impl(ttbr_pa: usize, va: usize) -> Option<usize> {
     //   bits[1:0] == 0b01         → block descriptor (large page) at L1/L2
     //   bits[1:0] == 0b11         → table descriptor at L0/L1/L2,
     //                               page descriptor at L3
-    const VALID:  u64 = 1;       // bit 0
-    const TABLE:  u64 = 1 << 1;  // bit 1: 1 = table/page, 0 = block/invalid
-    const ADDR:   u64 = 0x0000_ffff_ffff_f000;
+    const VALID: u64 = 1; // bit 0
+    const TABLE: u64 = 1 << 1; // bit 1: 1 = table/page, 0 = block/invalid
+    const ADDR: u64 = 0x0000_ffff_ffff_f000;
 
     // L0 — only table descriptors are valid here.
     let l0_base = to_virt(ttbr_pa);
     let l0e = *((l0_base + l0i * 8) as *const u64);
-    if l0e & VALID == 0 { return None; }
-    if l0e & TABLE == 0 { return None; } // block at L0 is architecturally reserved
+    if l0e & VALID == 0 {
+        return None;
+    }
+    if l0e & TABLE == 0 {
+        return None;
+    } // block at L0 is architecturally reserved
 
     // L1 — table or 1 GiB block.
     let l1_base = to_virt((l0e & ADDR) as usize);
     let l1e = *((l1_base + l1i * 8) as *const u64);
-    if l1e & VALID == 0 { return None; }
-    if l1e & TABLE == 0 { return None; } // 1 GiB block — not CoW-eligible
+    if l1e & VALID == 0 {
+        return None;
+    }
+    if l1e & TABLE == 0 {
+        return None;
+    } // 1 GiB block — not CoW-eligible
 
     // L2 — table or 2 MiB block.
     // BUG FIX: the previous code only checked TABLE == 0 which is correct for
@@ -293,16 +318,24 @@ unsafe fn pte_addr_impl(ttbr_pa: usize, va: usize) -> Option<usize> {
     // flags to the CoW handler.
     let l2_base = to_virt((l1e & ADDR) as usize);
     let l2e = *((l2_base + l2i * 8) as *const u64);
-    if l2e & VALID == 0 { return None; }
-    if l2e & TABLE == 0 { return None; } // 2 MiB block — not CoW-eligible
+    if l2e & VALID == 0 {
+        return None;
+    }
+    if l2e & TABLE == 0 {
+        return None;
+    } // 2 MiB block — not CoW-eligible
 
     // L3 — must be a page descriptor (bits[1:0] == 0b11).  A value of
     // 0b01 at L3 is architecturally UNPREDICTABLE; treat as not mapped.
     let l3_phys = (l2e & ADDR) as usize;
     let l3_slot_phys = l3_phys + l3i * 8;
     let l3e = *(to_virt(l3_slot_phys) as *const u64);
-    if l3e & VALID == 0 { return None; }
-    if l3e & TABLE == 0 { return None; } // not a page descriptor
+    if l3e & VALID == 0 {
+        return None;
+    }
+    if l3e & TABLE == 0 {
+        return None;
+    } // not a page descriptor
 
     Some(l3_slot_phys)
 }

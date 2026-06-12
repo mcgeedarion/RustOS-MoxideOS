@@ -453,8 +453,8 @@ impl FileOps for EventNode {
     /// Behaviour:
     /// - If events are available, copies them out and returns the byte count.
     /// - If none are available and `O_NONBLOCK` is set, returns `EAGAIN`.
-    /// - If none are available and the fd is blocking, sleeps on the device
-    ///   wait-queue until the next `push_event` / `wake_all`.
+    /// - If none are available and the fd is blocking, sleeps on the device wait-queue until the
+    ///   next `push_event` / `wake_all`.
     fn read(&self, buf: &mut UserBuffer, flags: u32) -> Result<usize, i32> {
         const EAGAIN: i32 = 11;
         const O_NONBLOCK: u32 = 0o4000;

@@ -615,9 +615,7 @@ pub extern "C" fn nmi_handler(frame: &mut InterruptFrame) {
     }
 
     if status.watchdog_or_external {
-        crate::kprintln!(
-            "[NMI] source=watchdog/external/unknown (no PC/AT status latch bits set)"
-        );
+        crate::kprintln!("[NMI] source=watchdog/external/unknown (no PC/AT status latch bits set)");
     }
 
     clear_nmi_latches(status);
@@ -699,9 +697,9 @@ pub unsafe extern "C" fn db_handler(frame: *mut InterruptFrame) {
         // 1. Clear TF in the saved RFLAGS so it is not re-armed after iretq.
         f.rflags &= !RFLAGS_TF;
 
-        // 2. Clear DR6 (debug status) to avoid stale bits on the next #DB. We write
-        //    zero directly rather than going through proc_debug so this works even
-        //    before the GDB session is fully attached.
+        // 2. Clear DR6 (debug status) to avoid stale bits on the next #DB. We write zero directly
+        //    rather than going through proc_debug so this works even before the GDB session is
+        //    fully attached.
         core::arch::asm!("mov dr6, {z}", z = in(reg) 0u64, options(nostack, nomem));
 
         // 3. Hand control to the GDB stop-reply loop.

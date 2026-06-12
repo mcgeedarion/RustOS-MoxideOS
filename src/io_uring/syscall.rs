@@ -151,8 +151,7 @@ pub fn sys_io_uring_setup(entries: u32, params_va: usize) -> isize {
 ///
 /// Phase 1: drain and execute SQEs.
 /// Phase 2 (GETEVENTS): sleep on `cq_wq` until `min_complete` CQEs are ready.
-///   - Wakes on each `post_cqe()` call; re-checks count; sleeps again if
-///     needed.
+///   - Wakes on each `post_cqe()` call; re-checks count; sleeps again if needed.
 ///   - Returns `-EINTR` (-4) if a signal cancels the wait.
 pub fn sys_io_uring_enter(
     fd: usize,
