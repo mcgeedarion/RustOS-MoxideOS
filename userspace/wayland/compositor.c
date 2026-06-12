@@ -12,16 +12,27 @@
  *      — xdg_wm_base.ping → pong keepalive
  *   6. wl_keyboard.keymap — minimal XKB keymap in a memfd, delivered
  *      via SCM_RIGHTS so GTK/Qt/SDL2 do not stall on keyboard init
+ *      — wl_keyboard.repeat_info sent so clients handle key-repeat
  *   7. Damage-region partial scanout: only dirty rectangles are repainted
  *      into the DRM back buffer before page-flip.
  *   8. wl_subsurface — sub-surface positioning, sync/desync, Z-order
  *      (place_above / place_below relative to parent).
+ *      NOTE: sibling Z-ordering is simplified (above=1/0 only); a full
+ *      ordered Z-list per-parent is a TODO.
  *   9. zwlr_layer_shell_v1 — BACKGROUND / BOTTOM / TOP / OVERLAY layers
  *      with anchor bitfield, exclusive-zone, margin; surfaces are
  *      composited in layer order below and above regular windows.
  *  10. Server-side decorations (SSD) — title-bar + border painted
  *      directly into the DRM back buffer for xdg_toplevel windows that
  *      have not opted into client-side decorations.
+ *
+ * Missing / TODO:
+ *   - seccomp allowlist filter (headers included but prctl not called)
+ *   - wl_pointer motion/button/axis event dispatch
+ *   - wl_keyboard.enter / wl_keyboard.leave on focus change
+ *   - xdg_wm_base.ping periodic keepalive sending
+ *   - Full subsurface sibling Z-ordering (ordered list per parent)
+ *   - Privilege drop after DRM/input fd acquisition
  *
  * Build:
  *   musl-gcc -static -O2 -D_GNU_SOURCE -fstack-protector-strong \
@@ -76,6 +87,9 @@
 #define RX_BUF_SIZE         (64 * 1024)
 #define WAYLAND_SOCKET_PATH "/run/wayland-0"
 
+/* Bytes per pixel — all buffers are 32-bit ARGB/XRGB */
+#define BPP 4
+
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001u
 #endif
@@ -102,8 +116,10 @@
 #endif
 #if defined(__GNUC__)
 #define MAYBE_UNUSED __attribute__((unused))
+#define NORETURN     __attribute__((noreturn))
 #else
 #define MAYBE_UNUSED
+#define NORETURN
 #endif
 
 /* SSD geometry */
@@ -113,111 +129,61 @@
 #define SSD_BORDER_COLOR    0xFF606060u
 #define SSD_FOCUSED_COLOR   0xFF2255AAu  /* blue titlebar when focused */
 
-/* ── DRM globals ───────────────────────────────────────────────────────── */
-static int      drm_fd          = -1;
-static MAYBE_UNUSED int input_fd        = -1;
-static MAYBE_UNUSED int epoll_fd        = -1;
-static MAYBE_UNUSED int listen_fd       = -1;
+/* Physical display size in mm (used in wl_output.geometry) */
+#define OUTPUT_PHYS_W_MM    270
+#define OUTPUT_PHYS_H_MM    202
 
-static uint32_t screen_width    = 1024;
-static uint32_t screen_height   = 768;
-static uint32_t screen_stride   = 0;
-static uint32_t primary_crtc_id = 0;
+/* ── Fatal error helper ─────────────────────────────────────────────────── */
+static NORETURN void compositor_fatal(const char *msg) {
+    fprintf(stderr, "compositor: fatal: %s (errno=%d)\n", msg, errno);
+    _exit(1);
+}
 
-typedef struct {
+/* ── Rect type ──────────────────────────────────────────────────────────── */
+typedef struct { int32_t x, y, w, h; } Rect;
+
+/* ── CompositorState ────────────────────────────────────────────────────── */
+/*
+ * All compositor globals are consolidated here.  A single static instance
+ * `g` is used throughout.  This makes unit testing individual subsystems
+ * straightforward and clearly marks threading hazards.
+ */
+typedef struct DrmBuf_s {
     uint32_t handle;
     uint32_t fb_id;
     uint64_t size;
     void    *map;
 } DrmBuf;
 
-static DrmBuf fb[2];
-static int    back_idx = 1;
+/* Forward-declare Client so CompositorState can embed the array. */
+typedef struct Client_s Client;
 
-/*
- * Damage accumulator for the back buffer.
- * Each rect: [x, y, w, h] in screen-space pixels.
- * full_damage=1 means skip rect tracking and repaint everything.
- */
-#define MAX_SCREEN_DAMAGE 64
-typedef struct { int32_t x, y, w, h; } Rect;
-static Rect   screen_damage[MAX_SCREEN_DAMAGE];
-static int    n_screen_damage = 0;
-static int    full_damage     = 1;   /* start with full repaint */
+typedef struct {
+    int          epoll_fd;
+    int          listen_fd;
+    int          drm_fd;
+    int          input_fd;   /* TODO: wire up evdev input dispatch */
 
-static inline void damage_add(int32_t x, int32_t y, int32_t w, int32_t h) {
-    if (full_damage) return;
-    /* clamp to screen */
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > (int32_t)screen_width)  w = (int32_t)screen_width  - x;
-    if (y + h > (int32_t)screen_height) h = (int32_t)screen_height - y;
-    if (w <= 0 || h <= 0) return;
-    if (n_screen_damage >= MAX_SCREEN_DAMAGE) { full_damage = 1; return; }
-    screen_damage[n_screen_damage++] = (Rect){x, y, w, h};
-}
+    uint32_t     screen_width;
+    uint32_t     screen_height;
+    uint32_t     screen_stride;
+    uint32_t     primary_crtc_id;
 
-static inline void damage_clear(void) {
-    n_screen_damage = 0;
-    full_damage     = 0;
-}
+    DrmBuf       fb[2];
+    int          back_idx;
+    int          flip_pending; /* 1 = DRM page-flip in flight; guard back_idx */
 
-/*
- * rect_intersects — true if the blit area [bx,by,bw,bh] overlaps
- * damage rect d.  Used for partial-repaint culling.
- */
-static inline int rect_intersects(const Rect *d,
-                                   int32_t bx, int32_t by,
-                                   int32_t bw, int32_t bh) {
-    return !(bx >= d->x + d->w || bx + bw <= d->x ||
-             by >= d->y + d->h || by + bh <= d->y);
-}
+    /* Screen-space damage accumulator for the back buffer */
+    Rect         screen_damage[64];
+    int          n_screen_damage;
+    int          full_damage;  /* 1 = repaint everything */
 
-/* ── Keymap ────────────────────────────────────────────────────────────── */
-static const char KEYMAP_STRING[] =
-    "xkb_keymap {\n"
-    "  xkb_keycodes  \"evdev+aliases(qwerty)\" {};\n"
-    "  xkb_types     \"complete\" {};\n"
-    "  xkb_compat    \"complete\" {};\n"
-    "  xkb_symbols   \"pc+us+inet(evdev)\" {};\n"
-    "  xkb_geometry  \"pc(pc105)\" {};\n"
-    "};\n";
+    Client      *clients;      /* points to clients_storage below */
+    int          n_clients;
+    int          focused_client;
 
-static int set_cloexec(int fd) {
-    int flags = fcntl(fd, F_GETFD);
-    if (flags < 0) return -1;
-    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-}
-
-static int write_all(int fd, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    while (len) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int keymap_create_memfd(void) {
-    int fd = (int)syscall(SYS_memfd_create, "xkb-keymap",
-                          MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    if (fd < 0) return -1;
-    size_t len = sizeof(KEYMAP_STRING);
-    if (write_all(fd, KEYMAP_STRING, len) < 0 ||
-        lseek(fd, 0, SEEK_SET) < 0) {
-        close(fd);
-        return -1;
-    }
-    (void)fcntl(fd, F_ADD_SEALS,
-                F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
-    return fd;
-}
+    uint32_t     serial_counter;
+} CompositorState;
 
 /* ── Object tables ─────────────────────────────────────────────────────── */
 
@@ -244,7 +210,7 @@ typedef struct {
     uint32_t  attached_buffer_id;
     int32_t   x, y;                  /* screen position (root surfaces) */
     int32_t   blit_w, blit_h;
-    uint32_t  damage[MAX_DAMAGE_RECTS][4]; /* pending surface-space damage */
+    Rect      damage[MAX_DAMAGE_RECTS]; /* pending surface-space damage */
     int       n_damage;
     uint32_t  frame_cb_id;
     int       committed;
@@ -260,6 +226,9 @@ typedef struct {
  * Position is relative to the parent's top-left corner.
  * sync=1 means pending state is committed together with the parent;
  * sync=0 (desync) means commits take effect immediately.
+ *
+ * TODO: replace above/below bool with an ordered Z-list per parent to
+ * correctly implement place_above(sibling) / place_below(sibling).
  */
 typedef struct {
     uint32_t id;               /* wl_subsurface object id, 0 = free */
@@ -307,7 +276,7 @@ typedef struct {
     int      has_csd;          /* client declared client-side decorations */
 } XdgToplevel;
 
-typedef struct {
+struct Client_s {
     int       fd;
     int       alive;
 
@@ -336,14 +305,119 @@ typedef struct {
     LayerSurface  layer_surfaces[MAX_LAYER_SURFACES];
     XdgSurface    xdg_surfaces[MAX_XDG_SURFACES];
     XdgToplevel   xdg_toplevels[MAX_XDG_TOPLEVELS];
-} Client;
+};
 
-static Client clients[MAX_CLIENTS];
-static int    n_clients      = 0;
-static int    focused_client = -1;
+/* ── Global state instance ──────────────────────────────────────────────── */
+static Client clients_storage[MAX_CLIENTS];
 
-static uint32_t serial_counter = 1;
-static inline uint32_t next_serial(void) { return serial_counter++; }
+static CompositorState g = {
+    .epoll_fd       = -1,
+    .listen_fd      = -1,
+    .drm_fd         = -1,
+    .input_fd       = -1,
+    .screen_width   = 1024,
+    .screen_height  = 768,
+    .back_idx       = 1,
+    .flip_pending   = 0,
+    .full_damage    = 1,
+    .focused_client = -1,
+    .serial_counter = 1,
+};
+
+static inline uint32_t next_serial(void) { return g.serial_counter++; }
+
+/* ── Keymap ────────────────────────────────────────────────────────────── */
+static const char KEYMAP_STRING[] =
+    "xkb_keymap {\n"
+    "  xkb_keycodes  \"evdev+aliases(qwerty)\" {};\n"
+    "  xkb_types     \"complete\" {};\n"
+    "  xkb_compat    \"complete\" {};\n"
+    "  xkb_symbols   \"pc+us+inet(evdev)\" {};\n"
+    "  xkb_geometry  \"pc(pc105)\" {};\n"
+    "};\n";
+
+static int set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static int write_all(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int keymap_create_memfd(void) {
+    int fd = (int)syscall(SYS_memfd_create, "xkb-keymap",
+                          MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) return -1;
+    size_t len = sizeof(KEYMAP_STRING);
+    if (write_all(fd, KEYMAP_STRING, len) < 0 ||
+        lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    (void)fcntl(fd, F_ADD_SEALS,
+                F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE);
+    return fd;
+}
+
+/* ── Damage helpers ─────────────────────────────────────────────────────── */
+
+static inline void damage_add(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (g.full_damage) return;
+    /* clamp to screen */
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int32_t)g.screen_width)  w = (int32_t)g.screen_width  - x;
+    if (y + h > (int32_t)g.screen_height) h = (int32_t)g.screen_height - y;
+    if (w <= 0 || h <= 0) return;
+    if (g.n_screen_damage >= 64) { g.full_damage = 1; return; }
+    g.screen_damage[g.n_screen_damage++] = (Rect){x, y, w, h};
+}
+
+static inline void damage_clear(void) {
+    g.n_screen_damage = 0;
+    g.full_damage     = 0;
+}
+
+static inline int rect_intersects(const Rect *d,
+                                   int32_t bx, int32_t by,
+                                   int32_t bw, int32_t bh) {
+    return !(bx >= d->x + d->w || bx + bw <= d->x ||
+             by >= d->y + d->h || by + bh <= d->y);
+}
+
+static void damage_surface_bounds(int32_t x, int32_t y, int32_t w, int32_t h) {
+    damage_add(x, y, w, h);
+}
+
+static void mark_surface_damage(Surface *s, int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!s || w <= 0 || h <= 0) return;
+    if (s->n_damage >= MAX_DAMAGE_RECTS) {
+        /* Overflow: collapse to full surface bounds, clamped to screen */
+        s->n_damage = 1;
+        s->damage[0] = (Rect){
+            0, 0,
+            s->blit_w > 0 ? s->blit_w : (int32_t)g.screen_width,
+            s->blit_h > 0 ? s->blit_h : (int32_t)g.screen_height
+        };
+        return;
+    }
+    s->damage[s->n_damage++] = (Rect){x, y, w, h};
+}
+
+/* ── Error / validation helpers ─────────────────────────────────────────── */
 
 static void post_error(Client *c, uint32_t bad_obj, uint32_t code, const char *msg) {
     if (!c || c->fd < 0) return;
@@ -373,25 +447,9 @@ static int valid_shm_format(uint32_t format) {
            format == WL_SHM_FORMAT_XRGB8888;
 }
 
-static void damage_surface_bounds(int32_t x, int32_t y, int32_t w, int32_t h) {
-    damage_add(x, y, w, h);
-}
-
-static void mark_surface_damage(Surface *s, int32_t x, int32_t y, int32_t w, int32_t h) {
-    if (!s || w <= 0 || h <= 0) return;
-    if (s->n_damage >= MAX_DAMAGE_RECTS) {
-        s->n_damage = 1;
-        s->damage[0][0] = 0;
-        s->damage[0][1] = 0;
-        s->damage[0][2] = (uint32_t)(s->blit_w > 0 ? s->blit_w : INT_MAX / 4);
-        s->damage[0][3] = (uint32_t)(s->blit_h > 0 ? s->blit_h : INT_MAX / 4);
-        return;
-    }
-    s->damage[s->n_damage][0] = (uint32_t)x;
-    s->damage[s->n_damage][1] = (uint32_t)y;
-    s->damage[s->n_damage][2] = (uint32_t)w;
-    s->damage[s->n_damage][3] = (uint32_t)h;
-    s->n_damage++;
+/* ── send wl_display.delete_id ───────────────────────────────────────────── */
+static void send_delete_id(Client *c, uint32_t id) {
+    wl_send(c->fd, WL_DISPLAY_ID, WL_DISPLAY_EVT_DELETE_ID, &id, 4);
 }
 
 /* ── DRM helpers ───────────────────────────────────────────────────────── */
@@ -400,12 +458,12 @@ static void drm_destroy_buf(DrmBuf *b) {
     if (!b) return;
     if (b->fb_id) {
         uint32_t fb_id = b->fb_id;
-        (void)ioctl(drm_fd, DRM_IOCTL_MODE_RMFB, &fb_id);
+        (void)ioctl(g.drm_fd, DRM_IOCTL_MODE_RMFB, &fb_id);
     }
     if (b->map) munmap(b->map, (size_t)b->size);
     if (b->handle) {
         struct drm_mode_destroy_dumb dd = { .handle = b->handle };
-        (void)ioctl(drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+        (void)ioctl(g.drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
     }
     memset(b, 0, sizeof(*b));
 }
@@ -413,18 +471,19 @@ static void drm_destroy_buf(DrmBuf *b) {
 static int drm_alloc_buf(DrmBuf *b, uint32_t w, uint32_t h, uint32_t stride) {
     memset(b, 0, sizeof(*b));
     struct drm_mode_create_dumb cd = { .height = h, .width = w, .bpp = 32 };
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) return -1;
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) return -1;
     b->handle = cd.handle;
     b->size   = cd.size;
-    if (!stride) screen_stride = cd.pitch;
+    /* Always use the pitch returned by the kernel */
+    if (!stride) g.screen_stride = cd.pitch;
 
     struct drm_mode_map_dumb md = { .handle = b->handle };
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &md) < 0) {
         drm_destroy_buf(b);
         return -1;
     }
     b->map = mmap(NULL, (size_t)b->size, PROT_READ|PROT_WRITE,
-                  MAP_SHARED, drm_fd, (off_t)md.offset);
+                  MAP_SHARED, g.drm_fd, (off_t)md.offset);
     if (b->map == MAP_FAILED) {
         b->map = NULL;
         drm_destroy_buf(b);
@@ -437,7 +496,7 @@ static int drm_alloc_buf(DrmBuf *b, uint32_t w, uint32_t h, uint32_t stride) {
         .pitch = cd.pitch, .bpp = 32, .depth = 24,
         .handle = b->handle,
     };
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_ADDFB, &fc) < 0) {
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_ADDFB, &fc) < 0) {
         drm_destroy_buf(b);
         return -1;
     }
@@ -447,14 +506,14 @@ static int drm_alloc_buf(DrmBuf *b, uint32_t w, uint32_t h, uint32_t stride) {
 
 static MAYBE_UNUSED int drm_setup(void) {
     struct drm_mode_card_res res = {0};
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
 
     uint32_t conn_ids[8] = {0}, crtc_ids[8] = {0};
     res.connector_id_ptr = (uintptr_t)conn_ids;
     res.crtc_id_ptr      = (uintptr_t)crtc_ids;
     res.count_connectors = res.count_connectors < 8 ? res.count_connectors : 8;
     res.count_crtcs      = res.count_crtcs      < 8 ? res.count_crtcs      : 8;
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
     if (res.count_connectors == 0 || res.count_crtcs == 0) return -1;
 
     struct drm_mode_get_connector conn = {0};
@@ -462,7 +521,7 @@ static MAYBE_UNUSED int drm_setup(void) {
     for (uint32_t i = 0; i < res.count_connectors; i++) {
         memset(&conn, 0, sizeof(conn));
         conn.connector_id = conn_ids[i];
-        if (ioctl(drm_fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) continue;
+        if (ioctl(g.drm_fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) continue;
         if (conn.connection == DRM_MODE_CONNECTED && conn.count_modes > 0) {
             connector_id = conn_ids[i];
             break;
@@ -474,54 +533,70 @@ static MAYBE_UNUSED int drm_setup(void) {
     conn.connector_id = connector_id;
     conn.modes_ptr   = (uintptr_t)modes;
     conn.count_modes = conn.count_modes < 4 ? conn.count_modes : 4;
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) return -1;
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0) return -1;
 
-    screen_width    = modes[0].hdisplay;
-    screen_height   = modes[0].vdisplay;
-    primary_crtc_id = crtc_ids[0];
+    g.screen_width    = modes[0].hdisplay;
+    g.screen_height   = modes[0].vdisplay;
+    g.primary_crtc_id = crtc_ids[0];
 
-    if (drm_alloc_buf(&fb[0], screen_width, screen_height, 0) < 0) return -1;
-    if (drm_alloc_buf(&fb[1], screen_width, screen_height, screen_stride) < 0) {
-        drm_destroy_buf(&fb[0]);
+    if (drm_alloc_buf(&g.fb[0], g.screen_width, g.screen_height, 0) < 0) return -1;
+    if (drm_alloc_buf(&g.fb[1], g.screen_width, g.screen_height, g.screen_stride) < 0) {
+        drm_destroy_buf(&g.fb[0]);
         return -1;
     }
 
     struct drm_mode_crtc crtc = {
-        .crtc_id            = primary_crtc_id,
-        .fb_id              = fb[0].fb_id,
+        .crtc_id            = g.primary_crtc_id,
+        .fb_id              = g.fb[0].fb_id,
         .set_connectors_ptr = (uintptr_t)&connector_id,
         .count_connectors   = 1,
         .mode               = modes[0],
         .mode_valid         = 1,
     };
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc) < 0) {
-        drm_destroy_buf(&fb[1]);
-        drm_destroy_buf(&fb[0]);
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc) < 0) {
+        drm_destroy_buf(&g.fb[1]);
+        drm_destroy_buf(&g.fb[0]);
         return -1;
     }
     return 0;
 }
 
+/*
+ * drm_flip — issue an async page-flip ioctl.
+ * back_idx is NOT toggled here; it must be toggled only when the
+ * DRM_EVENT_FLIP_COMPLETE event is received, to avoid writing into
+ * the buffer currently being scanned out.
+ */
 static void drm_flip(void) {
+    if (g.flip_pending) return; /* previous flip not yet acknowledged */
     struct drm_mode_crtc_page_flip pf = {
-        .crtc_id   = primary_crtc_id,
-        .fb_id     = fb[back_idx].fb_id,
+        .crtc_id   = g.primary_crtc_id,
+        .fb_id     = g.fb[g.back_idx].fb_id,
         .flags     = DRM_MODE_PAGE_FLIP_EVENT,
         .user_data = 0,
     };
-    if (ioctl(drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf) == 0)
-        back_idx ^= 1;
+    if (ioctl(g.drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf) == 0)
+        g.flip_pending = 1;
+        /* back_idx toggled in drm_flip_complete() on DRM_EVENT_FLIP_COMPLETE */
+}
+
+/*
+ * drm_flip_complete — call from the DRM event handler when
+ * DRM_EVENT_FLIP_COMPLETE fires.  Toggles back_idx so the compositor
+ * writes to the correct (non-displayed) buffer.
+ */
+static void drm_flip_complete(void) {
+    if (g.flip_pending) {
+        g.back_idx ^= 1;
+        g.flip_pending = 0;
+    }
 }
 
 /* ── Layer layout ──────────────────────────────────────────────────────── */
-/*
- * Compute the screen-space geometry for a layer surface from its anchor
- * bitfield, requested size, exclusive-zone and margins.
- * Results are written back into ls->x/y/w/h.
- */
+
 static void layer_surface_layout(LayerSurface *ls) {
-    int32_t sw = (int32_t)screen_width;
-    int32_t sh = (int32_t)screen_height;
+    int32_t sw = (int32_t)g.screen_width;
+    int32_t sh = (int32_t)g.screen_height;
     int32_t x = ls->margin_left;
     int32_t y = ls->margin_top;
     int32_t usable_w = sw - ls->margin_left - ls->margin_right;
@@ -540,7 +615,6 @@ static void layer_surface_layout(LayerSurface *ls) {
     if (w < 0) w = 0;
     if (h < 0) h = 0;
 
-    /* Single-edge anchors: pin to that edge */
     if ((a & ZWL_ANCHOR_RIGHT) && !(a & ZWL_ANCHOR_LEFT))
         x = sw - w - ls->margin_right;
     if ((a & ZWL_ANCHOR_BOTTOM) && !(a & ZWL_ANCHOR_TOP))
@@ -553,12 +627,9 @@ static void layer_surface_layout(LayerSurface *ls) {
     ls->prev_w = w; ls->prev_h = h;
     ls->has_prev = 1;
     if (ls->exclusive_zone != 0)
-        full_damage = 1; /* exclusive-zone changes can affect the whole desktop */
+        g.full_damage = 1;
 }
 
-/*
- * layer_surface_configure — send zwlr_layer_surface_v1.configure(serial, w, h)
- */
 static void layer_surface_configure(Client *c, LayerSurface *ls) {
     layer_surface_layout(ls);
     uint8_t payload[12];
@@ -602,7 +673,8 @@ static void send_output_info(Client *c) {
     if (!oid) return;
 
     uint8_t geom[256]; size_t gsz = 0;
-    int32_t zeroi = 0, pw = 270, ph = 202;
+    int32_t zeroi = 0;
+    int32_t pw = OUTPUT_PHYS_W_MM, ph = OUTPUT_PHYS_H_MM;
     int32_t sub  = (int32_t)WL_OUTPUT_SUBPIXEL_UNKNOWN;
     int32_t xfrm = (int32_t)WL_OUTPUT_TRANSFORM_NORMAL;
     memcpy(geom + gsz, &zeroi, 4); gsz += 4;
@@ -618,10 +690,10 @@ static void send_output_info(Client *c) {
     uint8_t mode[16]; size_t msz = 0;
     uint32_t flags   = WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED;
     int32_t  refresh = 60000;
-    memcpy(mode + msz, &flags,         4); msz += 4;
-    memcpy(mode + msz, &screen_width,  4); msz += 4;
-    memcpy(mode + msz, &screen_height, 4); msz += 4;
-    memcpy(mode + msz, &refresh,       4); msz += 4;
+    memcpy(mode + msz, &flags,           4); msz += 4;
+    memcpy(mode + msz, &g.screen_width,  4); msz += 4;
+    memcpy(mode + msz, &g.screen_height, 4); msz += 4;
+    memcpy(mode + msz, &refresh,         4); msz += 4;
     wl_send(c->fd, oid, WL_OUTPUT_EVT_MODE, mode, (uint16_t)msz);
     wl_send(c->fd, oid, WL_OUTPUT_EVT_DONE, NULL, 0);
 }
@@ -646,6 +718,14 @@ static void send_xdg_configure(Client *c, XdgSurface *xs, XdgToplevel *xt) {
 
 /* ── Keymap delivery ───────────────────────────────────────────────────── */
 
+/*
+ * WL_KEYBOARD_EVT_REPEAT_INFO — opcode 6, payload: rate(int32) delay(int32).
+ * Sending this prevents GTK4/Qt clients from stalling on key-hold.
+ */
+#ifndef WL_KEYBOARD_EVT_REPEAT_INFO
+#define WL_KEYBOARD_EVT_REPEAT_INFO 6u
+#endif
+
 static void send_keymap(Client *c) {
     if (!c->keyboard_id) return;
     int kfd = keymap_create_memfd();
@@ -660,36 +740,35 @@ static void send_keymap(Client *c) {
                     WL_KEYBOARD_EVT_KEYMAP,
                     payload, 8, kfd);
     close(kfd);
+
+    /* Send repeat_info: 25 keys/sec, 600 ms initial delay */
+    uint8_t ri[8];
+    int32_t rate  = 25;
+    int32_t delay = 600;
+    memcpy(ri,   &rate,  4);
+    memcpy(ri+4, &delay, 4);
+    wl_send(c->fd, c->keyboard_id, WL_KEYBOARD_EVT_REPEAT_INFO, ri, 8);
 }
 
 /* ── SSD helpers ───────────────────────────────────────────────────────── */
 
-/*
- * ssd_fill_rect — paint a solid color rectangle into the DRM back buffer.
- * Clips to screen bounds automatically.
- */
 static void ssd_fill_rect(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
                            uint32_t color) {
-    if (!fb[back_idx].map) return;
+    if (!g.fb[g.back_idx].map) return;
     if (rx < 0) { rw += rx; rx = 0; }
     if (ry < 0) { rh += ry; ry = 0; }
-    if (rx + rw > (int32_t)screen_width)  rw = (int32_t)screen_width  - rx;
-    if (ry + rh > (int32_t)screen_height) rh = (int32_t)screen_height - ry;
+    if (rx + rw > (int32_t)g.screen_width)  rw = (int32_t)g.screen_width  - rx;
+    if (ry + rh > (int32_t)g.screen_height) rh = (int32_t)g.screen_height - ry;
     if (rw <= 0 || rh <= 0) return;
 
-    uint32_t *dst = (uint32_t *)fb[back_idx].map;
+    uint32_t *dst = (uint32_t *)g.fb[g.back_idx].map;
     for (int32_t row = 0; row < rh; row++) {
-        uint32_t *line = dst + (uint32_t)(ry + row) * (screen_stride / 4) + (uint32_t)rx;
+        uint32_t *line = dst + (uint32_t)(ry + row) * (g.screen_stride / BPP) + (uint32_t)rx;
         for (int32_t col = 0; col < rw; col++)
             line[col] = color;
     }
 }
 
-/*
- * ssd_draw_decorations — paint title bar + borders for an xdg_toplevel
- * surface at (sx, sy) with content size (sw, sh).
- * focused=1 uses the highlight title-bar colour.
- */
 static void ssd_draw_decorations(int32_t sx, int32_t sy, int32_t sw, int32_t sh,
                                   int focused) {
     uint32_t tbar_col = focused ? SSD_FOCUSED_COLOR : SSD_TITLEBAR_COLOR;
@@ -697,31 +776,21 @@ static void ssd_draw_decorations(int32_t sx, int32_t sy, int32_t sw, int32_t sh,
     int32_t  full_y   = sy - SSD_TITLEBAR_H - SSD_BORDER_W;
     int32_t  full_w   = sw + SSD_BORDER_W * 2;
 
-    /* Top border + title bar */
     ssd_fill_rect(full_x, full_y, full_w, SSD_BORDER_W,    SSD_BORDER_COLOR);
     ssd_fill_rect(full_x, full_y + SSD_BORDER_W, full_w,
                   SSD_TITLEBAR_H, tbar_col);
-    /* Left border */
     ssd_fill_rect(full_x, sy, SSD_BORDER_W, sh, SSD_BORDER_COLOR);
-    /* Right border */
     ssd_fill_rect(sx + sw, sy, SSD_BORDER_W, sh, SSD_BORDER_COLOR);
-    /* Bottom border */
     ssd_fill_rect(full_x, sy + sh, full_w, SSD_BORDER_W, SSD_BORDER_COLOR);
 }
 
 /* ── Blit helper ───────────────────────────────────────────────────────── */
 
-/*
- * blit_buffer — copy pixels from a wl_buffer into the DRM back buffer
- * at screen position (dx, dy).  Only rows/columns that intersect at
- * least one of the active damage rectangles (or the entire screen when
- * full_damage is set) are written.  Returns 1 if any pixels were copied.
- */
 static int blit_buffer(const WlBuffer *wb, int32_t dx, int32_t dy) {
-    if (!fb[back_idx].map || !wb || !wb->shm_map) return 0;
+    if (!g.fb[g.back_idx].map || !wb || !wb->shm_map) return 0;
 
     const uint8_t *src_base = (const uint8_t *)wb->shm_map + wb->offset;
-    uint8_t       *dst_base = (uint8_t *)fb[back_idx].map;
+    uint8_t       *dst_base = (uint8_t *)g.fb[g.back_idx].map;
 
     int32_t bw = wb->width, bh = wb->height, bs = wb->stride;
     int32_t src_col = 0, src_row = 0;
@@ -729,18 +798,17 @@ static int blit_buffer(const WlBuffer *wb, int32_t dx, int32_t dy) {
     if (dy < 0) { src_row = -dy; dy = 0; }
     int32_t copy_w = bw - src_col;
     int32_t copy_h = bh - src_row;
-    if (dx + copy_w > (int32_t)screen_width)  copy_w = (int32_t)screen_width  - dx;
-    if (dy + copy_h > (int32_t)screen_height) copy_h = (int32_t)screen_height - dy;
+    if (dx + copy_w > (int32_t)g.screen_width)  copy_w = (int32_t)g.screen_width  - dx;
+    if (dy + copy_h > (int32_t)g.screen_height) copy_h = (int32_t)g.screen_height - dy;
     if (copy_w <= 0 || copy_h <= 0) return 0;
 
     int copied = 0;
     for (int32_t row = 0; row < copy_h; row++) {
         int32_t screen_row = dy + row;
-        /* Row culling: skip if no damage rect covers this row */
-        if (!full_damage) {
+        if (!g.full_damage) {
             int hit = 0;
-            for (int di = 0; di < n_screen_damage; di++) {
-                const Rect *d = &screen_damage[di];
+            for (int di = 0; di < g.n_screen_damage; di++) {
+                const Rect *d = &g.screen_damage[di];
                 if (screen_row >= d->y && screen_row < d->y + d->h &&
                     rect_intersects(d, dx, dy, copy_w, copy_h)) {
                     hit = 1; break;
@@ -749,11 +817,11 @@ static int blit_buffer(const WlBuffer *wb, int32_t dx, int32_t dy) {
             if (!hit) continue;
         }
         const uint32_t *src = (const uint32_t *)(const void *)
-            (src_base + (src_row + row) * bs + src_col * 4);
+            (src_base + (src_row + row) * bs + src_col * BPP);
         uint32_t *dst = (uint32_t *)(void *)
-            (dst_base + (uint32_t)screen_row * screen_stride + (uint32_t)dx * 4);
+            (dst_base + (uint32_t)screen_row * g.screen_stride + (uint32_t)dx * BPP);
         if (wb->format == WL_SHM_FORMAT_XRGB8888) {
-            memcpy(dst, src, (size_t)copy_w * 4);
+            memcpy(dst, src, (size_t)copy_w * BPP);
         } else {
             for (int32_t col = 0; col < copy_w; col++) {
                 uint32_t sp = src[col];
@@ -765,9 +833,9 @@ static int blit_buffer(const WlBuffer *wb, int32_t dx, int32_t dy) {
                     uint32_t inv = 255u - a;
                     uint32_t rb = (((sp & 0x00FF00FFu) * a) +
                                    ((dp & 0x00FF00FFu) * inv)) >> 8;
-                    uint32_t g  = (((sp & 0x0000FF00u) * a) +
-                                   ((dp & 0x0000FF00u) * inv)) >> 8;
-                    dst[col] = 0xFF000000u | (rb & 0x00FF00FFu) | (g & 0x0000FF00u);
+                    uint32_t g_ch = (((sp & 0x0000FF00u) * a) +
+                                    ((dp & 0x0000FF00u) * inv)) >> 8;
+                    dst[col] = 0xFF000000u | (rb & 0x00FF00FFu) | (g_ch & 0x0000FF00u);
                 }
             }
         }
@@ -790,9 +858,11 @@ static WlBuffer *find_buffer(Client *c, uint32_t id) {
     return NULL;
 }
 
-static void destroy_buffer(WlBuffer *b) {
+static void destroy_buffer(Client *c, WlBuffer *b) {
     if (!b || !b->id) return;
+    uint32_t id = b->id;
     memset(b, 0, sizeof(*b));
+    send_delete_id(c, id);
 }
 
 static void destroy_pool(WlPool *p) {
@@ -823,7 +893,9 @@ static void destroy_surface(Client *c, Surface *s) {
                     memset(&c->xdg_toplevels[ti], 0, sizeof(c->xdg_toplevels[ti]));
         }
     damage_surface_bounds(s->x, s->y, s->blit_w, s->blit_h);
+    uint32_t id = s->id;
     memset(s, 0, sizeof(*s));
+    send_delete_id(c, id);
 }
 
 static Surface *alloc_surface(Client *c, uint32_t id) {
@@ -843,7 +915,7 @@ static MAYBE_UNUSED void destroy_client_resources(Client *c) {
     for (int i = 0; i < c->n_pending_fds; i++)
         if (c->pending_fds[i] >= 0) close(c->pending_fds[i]);
     c->n_pending_fds = 0;
-    for (int i = 0; i < MAX_BUFFERS; i++) destroy_buffer(&c->buffers[i]);
+    for (int i = 0; i < MAX_BUFFERS; i++) destroy_buffer(c, &c->buffers[i]);
     for (int i = 0; i < MAX_POOLS; i++) destroy_pool(&c->pools[i]);
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
@@ -853,16 +925,14 @@ static MAYBE_UNUSED void destroy_client_resources(Client *c) {
 /* ── Compositing ───────────────────────────────────────────────────────── */
 
 /*
- * blit_surface_tree — blit a root surface and then all desync subsurfaces
- * that are children of it (respecting above/below Z ordering).
- * Returns the number of subsurfaces that have their own damage and were
- * blitted; also merges their surface-space damage into the screen damage
- * accumulator.
+ * blit_surface_tree — blit a root surface and all subsurfaces.
+ * Subsurfaces with above=0 are painted below the parent; above=1 above it.
+ * TODO: replace above/below bool with a proper ordered Z-list per parent.
  */
-static void blit_surface_tree(Client *c, Surface *s, int ci) {
+static void blit_surface_tree(Client *c, Surface *s) {
     WlBuffer *wb = find_buffer(c, s->attached_buffer_id);
 
-    /* Blit children that should appear BELOW the parent */
+    /* Blit children BELOW the parent */
     for (int si = 0; si < MAX_SUBSURFACES; si++) {
         Subsurface *sub = &c->subsurfaces[si];
         if (!sub->id || sub->parent_id != s->id || sub->above) continue;
@@ -873,10 +943,10 @@ static void blit_surface_tree(Client *c, Surface *s, int ci) {
         WlBuffer *cwb = find_buffer(c, csub->attached_buffer_id);
         if (cwb) {
             for (int di = 0; di < csub->n_damage; di++)
-                damage_add(abs_x + (int32_t)csub->damage[di][0],
-                           abs_y + (int32_t)csub->damage[di][1],
-                           (int32_t)csub->damage[di][2],
-                           (int32_t)csub->damage[di][3]);
+                damage_add(abs_x + csub->damage[di].x,
+                           abs_y + csub->damage[di].y,
+                           csub->damage[di].w,
+                           csub->damage[di].h);
             blit_buffer(cwb, abs_x, abs_y);
             csub->n_damage = 0;
         }
@@ -885,7 +955,7 @@ static void blit_surface_tree(Client *c, Surface *s, int ci) {
     /* Blit parent surface */
     if (wb) blit_buffer(wb, s->x, s->y);
 
-    /* Blit children that should appear ABOVE the parent */
+    /* Blit children ABOVE the parent */
     for (int si = 0; si < MAX_SUBSURFACES; si++) {
         Subsurface *sub = &c->subsurfaces[si];
         if (!sub->id || sub->parent_id != s->id || !sub->above) continue;
@@ -896,26 +966,24 @@ static void blit_surface_tree(Client *c, Surface *s, int ci) {
         WlBuffer *cwb = find_buffer(c, csub->attached_buffer_id);
         if (cwb) {
             for (int di = 0; di < csub->n_damage; di++)
-                damage_add(abs_x + (int32_t)csub->damage[di][0],
-                           abs_y + (int32_t)csub->damage[di][1],
-                           (int32_t)csub->damage[di][2],
-                           (int32_t)csub->damage[di][3]);
+                damage_add(abs_x + csub->damage[di].x,
+                           abs_y + csub->damage[di].y,
+                           csub->damage[di].w,
+                           csub->damage[di].h);
             blit_buffer(cwb, abs_x, abs_y);
             csub->n_damage = 0;
         }
     }
 
-    /* Send wl_buffer.release for the parent buffer */
     if (wb)
         wl_send(c->fd, wb->id, WL_BUFFER_EVT_RELEASE, NULL, 0);
 
-    /* Send wl_surface.enter on first commit */
+    /* TODO: send wl_keyboard.enter/leave when focused_client changes */
     if (!s->enter_sent && c->output_id) {
         wl_send(c->fd, s->id, WL_SURFACE_EVT_ENTER, &c->output_id, 4);
         s->enter_sent = 1;
     }
     s->n_damage = 0;
-    (void)ci;
 }
 
 /*
@@ -924,30 +992,28 @@ static void blit_surface_tree(Client *c, Surface *s, int ci) {
  * Pipeline:
  *   1. Collect all pending surface damage into the screen damage accumulator.
  *   2. If full_damage, clear the back buffer to black first.
- *      Otherwise skip the clear — only damaged regions will be overwritten.
- *   3. Paint layer surfaces in order: BACKGROUND → BOTTOM.
+ *   3. Paint layer surfaces: BACKGROUND → BOTTOM.
  *   4. Paint regular xdg_toplevel surfaces (with SSD if applicable).
  *   5. Paint layer surfaces: TOP → OVERLAY.
- *   6. Page-flip.
+ *   6. Page-flip (async; back_idx toggled on DRM_EVENT_FLIP_COMPLETE).
  *   7. Reset damage accumulator.
  */
 static void composite_and_flip(void) {
-    if (!fb[back_idx].map) return;
+    if (!g.fb[g.back_idx].map) return;
 
-    /* ── Step 1: collect surface damage into screen damage ── */
-    for (int ci = 0; ci < n_clients; ci++) {
-        Client *c = &clients[ci];
+    /* Step 1: collect surface damage */
+    for (int ci = 0; ci < g.n_clients; ci++) {
+        Client *c = &g.clients[ci];
         if (!c->alive) continue;
         for (int si = 0; si < MAX_SURFACES; si++) {
             Surface *s = &c->surfaces[si];
             if (!s->id || !s->committed || s->parent_surface_id) continue;
             for (int di = 0; di < s->n_damage; di++)
-                damage_add(s->x + (int32_t)s->damage[di][0],
-                           s->y + (int32_t)s->damage[di][1],
-                           (int32_t)s->damage[di][2],
-                           (int32_t)s->damage[di][3]);
+                damage_add(s->x + s->damage[di].x,
+                           s->y + s->damage[di].y,
+                           s->damage[di].w,
+                           s->damage[di].h);
         }
-        /* layer surfaces always mark their whole area dirty on commit */
         for (int li = 0; li < MAX_LAYER_SURFACES; li++) {
             LayerSurface *ls = &c->layer_surfaces[li];
             if (!ls->id || !ls->configured) continue;
@@ -957,28 +1023,27 @@ static void composite_and_flip(void) {
         }
     }
 
-    if (n_screen_damage == 0 && !full_damage) return; /* nothing to do */
+    if (g.n_screen_damage == 0 && !g.full_damage) return;
 
-    /* ── Step 2: clear only damaged regions (or full buffer) ── */
-    if (full_damage) {
-        memset(fb[back_idx].map, 0, (size_t)fb[back_idx].size);
+    /* Step 2: clear damaged regions */
+    if (g.full_damage) {
+        memset(g.fb[g.back_idx].map, 0, (size_t)g.fb[g.back_idx].size);
     } else {
-        uint8_t *base = (uint8_t *)fb[back_idx].map;
-        for (int di = 0; di < n_screen_damage; di++) {
-            const Rect *d = &screen_damage[di];
+        uint8_t *base = (uint8_t *)g.fb[g.back_idx].map;
+        for (int di = 0; di < g.n_screen_damage; di++) {
+            const Rect *d = &g.screen_damage[di];
             for (int32_t row = 0; row < d->h; row++) {
                 uint8_t *line = base
-                    + (uint32_t)(d->y + row) * screen_stride
-                    + (uint32_t)d->x * 4;
-                memset(line, 0, (size_t)d->w * 4);
+                    + (uint32_t)(d->y + row) * g.screen_stride
+                    + (uint32_t)d->x * BPP;
+                memset(line, 0, (size_t)d->w * BPP);
             }
         }
     }
 
-    /* ── Macro: blit a layer at the given ZWL_LAYER_* enum value ── */
 #define BLIT_LAYER(layer_enum) \
-    for (int ci = 0; ci < n_clients; ci++) { \
-        Client *c = &clients[ci]; \
+    for (int ci = 0; ci < g.n_clients; ci++) { \
+        Client *c = &g.clients[ci]; \
         if (!c->alive) continue; \
         for (int li = 0; li < MAX_LAYER_SURFACES; li++) { \
             LayerSurface *ls = &c->layer_surfaces[li]; \
@@ -986,29 +1051,26 @@ static void composite_and_flip(void) {
             Surface *s = find_surface(c, ls->surface_id); \
             if (!s || !s->committed) continue; \
             s->x = ls->x; s->y = ls->y; \
-            blit_surface_tree(c, s, ci); \
+            blit_surface_tree(c, s); \
         } \
     }
 
-    /* ── Steps 3-5: paint in Z order ── */
     BLIT_LAYER(ZWL_LAYER_BACKGROUND)
     BLIT_LAYER(ZWL_LAYER_BOTTOM)
 
     /* Regular xdg_toplevel surfaces */
-    for (int ci = 0; ci < n_clients; ci++) {
-        Client *c = &clients[ci];
+    for (int ci = 0; ci < g.n_clients; ci++) {
+        Client *c = &g.clients[ci];
         if (!c->alive) continue;
         for (int si = 0; si < MAX_SURFACES; si++) {
             Surface *s = &c->surfaces[si];
             if (!s->id || !s->committed || s->parent_surface_id) continue;
-            /* Skip surfaces owned by a layer shell */
             int is_layer = 0;
             for (int li = 0; li < MAX_LAYER_SURFACES; li++)
                 if (c->layer_surfaces[li].id &&
                     c->layer_surfaces[li].surface_id == s->id) { is_layer = 1; break; }
             if (is_layer) continue;
 
-            /* Identify the xdg_toplevel for SSD */
             XdgToplevel *xt = NULL;
             for (int xi = 0; xi < MAX_XDG_SURFACES; xi++) {
                 XdgSurface *xs = &c->xdg_surfaces[xi];
@@ -1022,19 +1084,16 @@ static void composite_and_flip(void) {
 
             WlBuffer *wb = find_buffer(c, s->attached_buffer_id);
             if (xt && !xt->has_csd) {
-                /* Draw SSD — must happen before blitting client content
-                 * so the titlebar doesn't overdraw the client pixels. */
-                int is_focused = (focused_client == ci);
+                int is_focused = (g.focused_client == ci);
                 int32_t cw = wb ? wb->width  : 0;
                 int32_t ch = wb ? wb->height : 0;
-                /* Mark SSD area dirty */
                 damage_add(s->x - SSD_BORDER_W,
                            s->y - SSD_TITLEBAR_H - SSD_BORDER_W,
                            cw + SSD_BORDER_W * 2,
                            ch + SSD_TITLEBAR_H + SSD_BORDER_W * 2);
                 ssd_draw_decorations(s->x, s->y, cw, ch, is_focused);
             }
-            blit_surface_tree(c, s, ci);
+            blit_surface_tree(c, s);
         }
     }
 
@@ -1042,10 +1101,10 @@ static void composite_and_flip(void) {
     BLIT_LAYER(ZWL_LAYER_OVERLAY)
 #undef BLIT_LAYER
 
-    /* ── Step 6: flip ── */
+    /* Step 6: flip (async; back_idx toggled on DRM_EVENT_FLIP_COMPLETE) */
     drm_flip();
 
-    /* ── Step 7: reset damage ── */
+    /* Step 7: reset damage */
     damage_clear();
 }
 
@@ -1131,10 +1190,6 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
     /* ── wl_subcompositor ────────────────────────────────────────────── */
     if (obj == c->subcompositor_id) {
         if (op == WL_SUBCOMPOSITOR_REQ_GET_SUBSURFACE) {
-            /*
-             * get_subsurface(id: new_id, surface: wl_surface,
-             *                parent: wl_surface)
-             */
             if (!require_len(c, obj, op, dlen, 12)) return;
             uint32_t new_id    = wl_read_u32(data, 0);
             uint32_t surf_id   = wl_read_u32(data, 4);
@@ -1145,14 +1200,13 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             }
             for (int i = 0; i < MAX_SUBSURFACES; i++) {
                 if (c->subsurfaces[i].id == 0) {
-                    c->subsurfaces[i].id        = new_id;
+                    c->subsurfaces[i].id         = new_id;
                     c->subsurfaces[i].surface_id = surf_id;
                     c->subsurfaces[i].parent_id  = parent_id;
                     c->subsurfaces[i].rel_x      = 0;
                     c->subsurfaces[i].rel_y      = 0;
-                    c->subsurfaces[i].sync        = 1; /* default: sync */
-                    c->subsurfaces[i].above       = 1; /* default: above parent */
-                    /* Mark the child surface as owned by a parent */
+                    c->subsurfaces[i].sync        = 1;
+                    c->subsurfaces[i].above       = 1;
                     Surface *cs = find_surface(c, surf_id);
                     if (cs) cs->parent_surface_id = parent_id;
                     break;
@@ -1168,20 +1222,22 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         if (sub->id != obj) continue;
         switch (op) {
         case WL_SUBSURFACE_REQ_DESTROY:
-            /* Unlink the child surface from its parent */
             {
                 Surface *cs = find_surface(c, sub->surface_id);
                 if (cs) cs->parent_surface_id = 0;
             }
-            sub->id = 0;
+            {
+                uint32_t id = sub->id;
+                sub->id = 0;
+                send_delete_id(c, id);
+            }
             break;
         case WL_SUBSURFACE_REQ_SET_POSITION:
             if (!require_len(c, obj, op, dlen, 8)) return;
-            int32_t old_x = sub->rel_x, old_y = sub->rel_y;
-            sub->rel_x = wl_read_i32(data, 0);
-            sub->rel_y = wl_read_i32(data, 4);
-            /* Mark the parent surface damaged so the subsurface moves */
             {
+                int32_t old_x = sub->rel_x, old_y = sub->rel_y;
+                sub->rel_x = wl_read_i32(data, 0);
+                sub->rel_y = wl_read_i32(data, 4);
                 Surface *ps = find_surface(c, sub->parent_id);
                 Surface *cs = find_surface(c, sub->surface_id);
                 if (ps && cs) {
@@ -1196,17 +1252,18 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         case WL_SUBSURFACE_REQ_PLACE_ABOVE:
             if (!require_len(c, obj, op, dlen, 4)) return;
             /*
-             * place_above(sibling: wl_surface)
-             * For MVP: if the sibling IS the parent, treat as above=1.
-             * A full implementation would maintain an ordered Z-list.
+             * TODO: proper sibling Z-list. For now, place_above any sibling
+             * sets above=1 unconditionally; this satisfies most toolkits but
+             * does not preserve inter-sibling ordering.
              */
             sub->above = 1;
-            full_damage = 1;
+            g.full_damage = 1;
             break;
         case WL_SUBSURFACE_REQ_PLACE_BELOW:
             if (!require_len(c, obj, op, dlen, 4)) return;
+            /* TODO: same as above */
             sub->above = 0;
-            full_damage = 1;
+            g.full_damage = 1;
             break;
         case WL_SUBSURFACE_REQ_SET_SYNC:
             sub->sync = 1;
@@ -1221,21 +1278,14 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
     /* ── zwlr_layer_shell_v1 ─────────────────────────────────────────── */
     if (obj == c->layer_shell_id) {
         if (op == ZWL_LAYER_SHELL_REQ_GET_LAYER_SURFACE) {
-            /*
-             * get_layer_surface(id: new_id, surface: wl_surface,
-             *                   output: wl_output | 0,
-             *                   layer: uint32, namespace: string)
-             */
             if (!require_len(c, obj, op, dlen, 16)) return;
             uint32_t new_id  = wl_read_u32(data, 0);
             uint32_t surf_id = wl_read_u32(data, 4);
-            /* output (4 bytes) — ignored: we have only one output */
             uint32_t layer   = wl_read_u32(data, 12);
             if (!find_surface(c, surf_id)) {
                 post_error(c, obj, WL_DISPLAY_ERROR_INVALID_OBJECT, "bad layer surface id");
                 return;
             }
-            /* namespace string follows at offset 16 — not stored */
             for (int li = 0; li < MAX_LAYER_SURFACES; li++) {
                 if (c->layer_surfaces[li].id == 0) {
                     LayerSurface *ls = &c->layer_surfaces[li];
@@ -1243,7 +1293,6 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
                     ls->id         = new_id;
                     ls->surface_id = surf_id;
                     ls->layer      = valid_layer(layer) ? layer : ZWL_LAYER_TOP;
-                    /* Send initial configure so the client knows the size */
                     layer_surface_configure(c, ls);
                     break;
                 }
@@ -1283,7 +1332,6 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             break;
         case ZWL_LAYER_SURFACE_REQ_SET_KEYBOARD_INTERACTIVITY:
             if (!require_len(c, obj, op, dlen, 4)) return;
-            /* Noted but keyboard routing is unchanged for now */
             break;
         case ZWL_LAYER_SURFACE_REQ_ACK_CONFIGURE:
             if (!require_len(c, obj, op, dlen, 4)) return;
@@ -1292,16 +1340,22 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             break;
         case ZWL_LAYER_SURFACE_REQ_SET_LAYER:
             if (!require_len(c, obj, op, dlen, 4)) return;
-            uint32_t new_layer = wl_read_u32(data, 0);
-            if (!valid_layer(new_layer)) {
-                post_error(c, obj, WL_DISPLAY_ERROR_BAD_VALUE, "bad layer enum");
-                return;
+            {
+                uint32_t new_layer = wl_read_u32(data, 0);
+                if (!valid_layer(new_layer)) {
+                    post_error(c, obj, WL_DISPLAY_ERROR_BAD_VALUE, "bad layer enum");
+                    return;
+                }
+                ls->layer = new_layer;
+                layer_surface_configure(c, ls);
             }
-            ls->layer = new_layer;
-            layer_surface_configure(c, ls);
             break;
         case ZWL_LAYER_SURFACE_REQ_DESTROY:
-            ls->id = 0;
+            {
+                uint32_t id = ls->id;
+                ls->id = 0;
+                send_delete_id(c, id);
+            }
             break;
         default:
             post_error(c, obj, WL_DISPLAY_ERROR_INVALID_METHOD, "unsupported layer-surface request");
@@ -1366,7 +1420,7 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             int32_t height = wl_read_i32(data, 12);
             int32_t stride = wl_read_i32(data, 16);
             uint32_t format = wl_read_u32(data, 20);
-            int64_t min_stride = (int64_t)width * 4;
+            int64_t min_stride = (int64_t)width * BPP;
             int64_t last_byte = (int64_t)offset + (int64_t)(height - 1) * stride + min_stride;
             if (offset < 0 || width <= 0 || height <= 0 || stride < min_stride ||
                 !valid_shm_format(format) || last_byte > pool->size) {
@@ -1394,13 +1448,18 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         case WL_SHM_POOL_REQ_DESTROY:
             for (int bi = 0; bi < MAX_BUFFERS; bi++)
                 if (c->buffers[bi].id && c->buffers[bi].shm_fd == pool->shm_fd)
-                    destroy_buffer(&c->buffers[bi]);
+                    destroy_buffer(c, &c->buffers[bi]);
             destroy_pool(pool);
             break;
         case WL_SHM_POOL_REQ_RESIZE: {
             if (!require_len(c, obj, op, dlen, 4)) return;
             int32_t new_size = wl_read_i32(data, 0);
-            if (new_size <= pool->size) break;
+            if (new_size <= pool->size) {
+                /* Spec: shrinking a pool is a protocol error */
+                post_error(c, obj, WL_DISPLAY_ERROR_BAD_VALUE,
+                           "wl_shm_pool.resize must not shrink the pool");
+                return;
+            }
             void *new_map = mmap(NULL, (size_t)new_size, PROT_READ, MAP_SHARED, pool->shm_fd, 0);
             if (new_map == MAP_FAILED) {
                 post_error(c, obj, WL_DISPLAY_ERROR_BAD_VALUE, "wl_shm pool resize mmap failed");
@@ -1409,6 +1468,11 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             if (pool->map) munmap(pool->map, (size_t)pool->size);
             pool->map = new_map;
             pool->size = new_size;
+            /*
+             * NOTE: updating shm_map on all buffers here is safe only because
+             * the compositor is single-threaded.  If a threaded repaint loop is
+             * added, this must be protected or done via a generation counter.
+             */
             for (int bi = 0; bi < MAX_BUFFERS; bi++)
                 if (c->buffers[bi].id && c->buffers[bi].shm_fd == pool->shm_fd)
                     c->buffers[bi].shm_map = new_map;
@@ -1426,7 +1490,7 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         WlBuffer *b = &c->buffers[bi];
         if (b->id != obj) continue;
         if (op == WL_BUFFER_REQ_DESTROY)
-            destroy_buffer(b);
+            destroy_buffer(c, b);
         else
             post_error(c, obj, WL_DISPLAY_ERROR_INVALID_METHOD, "unsupported wl_buffer request");
         return;
@@ -1507,6 +1571,7 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         if (op == WL_SEAT_REQ_GET_POINTER) {
             if (!require_len(c, obj, op, dlen, 4)) return;
             c->pointer_id = wl_read_u32(data, 0);
+            /* TODO: dispatch wl_pointer enter/leave/motion/button/axis events */
         } else if (op == WL_SEAT_REQ_GET_KEYBOARD) {
             if (!require_len(c, obj, op, dlen, 4)) return;
             c->keyboard_id = wl_read_u32(data, 0);
@@ -1539,9 +1604,10 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
             slot->wl_surface_id = surf_id;
         } else if (op == XDG_WM_BASE_REQ_PONG) {
             if (!require_len(c, obj, op, dlen, 4)) return;
+            /* TODO: send periodic XDG_WM_BASE_EVT_PING to detect hung clients */
         } else if (op == XDG_WM_BASE_REQ_CREATE_POSITIONER) {
             if (!require_len(c, obj, op, dlen, 4)) return;
-            /* Positioner objects are accepted but not modeled until popups are implemented. */
+            /* Positioner objects accepted but not modelled until popups are implemented */
         } else if (op == XDG_WM_BASE_REQ_DESTROY) {
             c->xdg_wm_base_id = 0;
         } else {
@@ -1555,7 +1621,11 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         if (xs->id != obj) continue;
         switch (op) {
         case XDG_SURFACE_REQ_DESTROY:
-            memset(xs, 0, sizeof(*xs));
+            {
+                uint32_t id = xs->id;
+                memset(xs, 0, sizeof(*xs));
+                send_delete_id(c, id);
+            }
             break;
         case XDG_SURFACE_REQ_GET_TOPLEVEL: {
             if (!require_len(c, obj, op, dlen, 4)) return;
@@ -1593,7 +1663,11 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
         if (xt->id != obj) continue;
         switch (op) {
         case XDG_TOPLEVEL_REQ_DESTROY:
-            memset(xt, 0, sizeof(*xt));
+            {
+                uint32_t id = xt->id;
+                memset(xt, 0, sizeof(*xt));
+                send_delete_id(c, id);
+            }
             break;
         case XDG_TOPLEVEL_REQ_SET_TITLE:
         case XDG_TOPLEVEL_REQ_SET_APP_ID: {
@@ -1642,45 +1716,67 @@ static MAYBE_UNUSED void dispatch_message(Client *c, uint32_t obj, uint16_t op,
 }
 
 #ifdef COMPOSITOR_SELFTEST
+static int selftest_ok = 1;
+#define SELFTEST_ASSERT(expr) \
+    do { if (!(expr)) { fprintf(stderr, "FAIL: %s\n", #expr); selftest_ok = 0; } } while (0)
+
 static void compositor_selftest_damage(void) {
-    full_damage = 0;
-    n_screen_damage = 0;
-    screen_width = 100;
-    screen_height = 80;
+    g.full_damage = 0;
+    g.n_screen_damage = 0;
+    g.screen_width = 100;
+    g.screen_height = 80;
     damage_add(-10, -5, 25, 20);
-    assert(n_screen_damage == 1);
-    assert(screen_damage[0].x == 0);
-    assert(screen_damage[0].y == 0);
-    assert(screen_damage[0].w == 15);
-    assert(screen_damage[0].h == 15);
+    SELFTEST_ASSERT(g.n_screen_damage == 1);
+    SELFTEST_ASSERT(g.screen_damage[0].x == 0);
+    SELFTEST_ASSERT(g.screen_damage[0].y == 0);
+    SELFTEST_ASSERT(g.screen_damage[0].w == 15);
+    SELFTEST_ASSERT(g.screen_damage[0].h == 15);
 }
 
 static void compositor_selftest_formats(void) {
-    assert(valid_shm_format(WL_SHM_FORMAT_ARGB8888));
-    assert(valid_shm_format(WL_SHM_FORMAT_XRGB8888));
-    assert(!valid_shm_format(0xDEADBEEFu));
+    SELFTEST_ASSERT(valid_shm_format(WL_SHM_FORMAT_ARGB8888));
+    SELFTEST_ASSERT(valid_shm_format(WL_SHM_FORMAT_XRGB8888));
+    SELFTEST_ASSERT(!valid_shm_format(0xDEADBEEFu));
 }
 
 static void compositor_selftest_layer_layout(void) {
     LayerSurface ls;
     memset(&ls, 0, sizeof(ls));
-    screen_width = 1920;
-    screen_height = 1080;
+    g.screen_width = 1920;
+    g.screen_height = 1080;
     ls.anchor = ZWL_ANCHOR_TOP | ZWL_ANCHOR_LEFT | ZWL_ANCHOR_RIGHT;
     ls.req_height = 32;
     ls.margin_left = 4;
     ls.margin_right = 6;
     layer_surface_layout(&ls);
-    assert(ls.x == 4);
-    assert(ls.y == 0);
-    assert(ls.w == 1910);
-    assert(ls.h == 32);
+    SELFTEST_ASSERT(ls.x == 4);
+    SELFTEST_ASSERT(ls.y == 0);
+    SELFTEST_ASSERT(ls.w == 1910);
+    SELFTEST_ASSERT(ls.h == 32);
+}
+
+static void compositor_selftest_damage_rect(void) {
+    /* Verify mark_surface_damage fallback uses screen bounds, not INT_MAX/4 */
+    Surface s;
+    memset(&s, 0, sizeof(s));
+    g.screen_width  = 800;
+    g.screen_height = 600;
+    s.blit_w = 0; s.blit_h = 0;
+    s.n_damage = MAX_DAMAGE_RECTS; /* trigger overflow path */
+    mark_surface_damage(&s, 0, 0, 1, 1);
+    SELFTEST_ASSERT(s.n_damage == 1);
+    SELFTEST_ASSERT(s.damage[0].w == (int32_t)g.screen_width);
+    SELFTEST_ASSERT(s.damage[0].h == (int32_t)g.screen_height);
 }
 
 int main(void) {
+    g.clients = clients_storage;
     compositor_selftest_damage();
     compositor_selftest_formats();
     compositor_selftest_layer_layout();
-    return 0;
+    compositor_selftest_damage_rect();
+    if (selftest_ok)
+        fprintf(stderr, "compositor selftest: all passed\n");
+    return selftest_ok ? 0 : 1;
 }
-#endif
+#endif /* COMPOSITOR_SELFTEST */
