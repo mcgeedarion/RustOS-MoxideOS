@@ -7,7 +7,7 @@
 # Architecture notes
 # ──────────────────────────────────────────────────────────────────────────
 #   aarch64  UEFI pflash on QEMU virt with AAVMF/QEMU_EFI firmware and an ESP image
-#   riscv64  OpenSBI virt, -smp 2, virtio-net-device
+#   riscv64  UEFI on QEMU virt with EDK2 or U-Boot firmware and an ESP image
 #   x86_64   OVMF UEFI pflash, q35, FAT32 ESP image, virtio-net-pci
 
 name: QEMU Smoke
