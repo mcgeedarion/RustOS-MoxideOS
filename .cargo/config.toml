@@ -1,10 +1,15 @@
 [alias]
 xtask = "run --target x86_64-unknown-linux-gnu -p xtask --"
 
-# Default target is overridden per-invocation by xtask via --target.
-# This fallback keeps `cargo build` / `cargo check` (without xtask) on an
-# installed freestanding RISC-V target so plain Cargo invocations do not need
-# nightly custom-target flags just to load a target JSON.  Use `cargo xtask` or
-# pass `--target targets/<name>.json` explicitly for custom kernel/UEFI targets.
+# Plain `cargo build` now builds the primary boot artifact: the x86_64 UEFI
+# kernel ELF. Use `cargo xtask image --arch x86_64` when you need the FAT32 ESP
+# image containing EFI/BOOT/BOOTX64.EFI for firmware/QEMU boot.
 [build]
-target = "riscv64gc-unknown-none-elf"
+target = "targets/x86_64-kernel.json"
+
+# Required for the freestanding kernel target. Keeping this in Cargo config makes
+# the default command path explicit instead of hiding it in scripts only.
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
