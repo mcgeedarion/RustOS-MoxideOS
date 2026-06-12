@@ -10,8 +10,8 @@
 #   FEATURES   extra --features value appended verbatim
 #
 # Sets/exports on success:
-#   KERNEL_ELF   path to the built kernel artifact. For non-x86 UEFI targets,
-#                the toolchain may emit rustos.efi instead of rustos.
+#   KERNEL_ELF   path to the built kernel artifact. UEFI targets may emit
+#                rustos.efi instead of rustos.
 #   CARGO_TARGET Rust target triple / JSON path used
 #   PROFILE      debug | release
 #
@@ -64,8 +64,8 @@ case "$ARCH:$BOOT" in
     TARGET_DIR="riscv64gc-unknown-none-elf"
     ;;
   x86_64:uefi)
-    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"
-    TARGET_DIR="x86_64-kernel"
+    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-uefi-loader.json"
+    TARGET_DIR="x86_64-uefi-loader"
     ;;
 esac
 
@@ -75,18 +75,13 @@ EXTRA_FLAGS=()
 pick_kernel_artifact() {
   local base="target/${TARGET_DIR}/${PROFILE}/rustos"
 
-  if [[ "$BOOT" == "uefi" && "$ARCH" != "x86_64" && -f "${base}.efi" ]]; then
+  if [[ "$BOOT" == "uefi" && -f "${base}.efi" ]]; then
     echo "${base}.efi"
     return 0
   fi
 
   if [[ -f "$base" ]]; then
     echo "$base"
-    return 0
-  fi
-
-  if [[ -f "${base}.efi" ]]; then
-    echo "${base}.efi"
     return 0
   fi
 
