@@ -16,6 +16,12 @@ pub fn mount_initramfs() {
         return;
     }
 
+    if !initramfs::has_initramfs_range() {
+        crate::kprintln!("initramfs: none provided — continuing with ramfs only");
+        MOUNTED.store(true, Ordering::Release);
+        return;
+    }
+
     let handle = initramfs::load();
 
     for entry in handle.entries() {
