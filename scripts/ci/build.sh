@@ -85,7 +85,7 @@ cargo build \
   "${EXTRA_FLAGS[@]}" \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem \
-  -Z target-spec-json \
+  -Z json-target-spec \
   $([ "$RELEASE" = 1 ] && echo --release)
 
 # ── Verify output ───────────────────────────────────────────────────────────
