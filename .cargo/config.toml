@@ -1,11 +1,16 @@
 [alias]
 xtask = "run --target x86_64-unknown-linux-gnu -p xtask --"
 
-# Plain `cargo build` now builds the primary boot artifact: the x86_64 UEFI
-# kernel ELF. Use `cargo xtask image --arch x86_64` when you need the FAT32 ESP
-# image containing EFI/BOOT/BOOTX64.EFI for firmware/QEMU boot.
+# Plain `cargo build` now builds the repository-default boot artifact: the
+# aarch64 UEFI loader/application. Use `cargo xtask image --arch aarch64` when
+# you need the FAT ESP image containing EFI/BOOT/BOOTAA64.EFI for firmware/QEMU
+# boot.
+#
+# x86_64 and riscv64 remain explicit targets:
+#   cargo build --target targets/x86_64-kernel.json
+#   cargo build --target riscv64gc-unknown-none-elf --no-default-features
 [build]
-target = "targets/x86_64-kernel.json"
+target = "targets/aarch64-uefi-loader.json"
 
 # Required for the freestanding kernel target. Keeping this in Cargo config makes
 # the default command path explicit instead of hiding it in scripts only.
