@@ -141,6 +141,9 @@ static DISKS: Mutex<Vec<DiskInfo>> = Mutex::new(Vec::new());
 
 pub fn init(bar0_phys: u64) {
     unsafe { _init(bar0_phys) }
+    // MSI-X wiring relies on x86 APIC/IDT; on other architectures the
+    // controller remains in polling mode until a portable IRQ binding lands.
+    #[cfg(target_arch = "x86_64")]
     wire_nvme_msix();
 }
 
@@ -212,6 +215,7 @@ impl crate::block::BlockDev for NvmeBlockDev {
 ///
 /// Safe to call when no MSI-X capability is present — returns early and
 /// the driver remains in polling mode.
+#[cfg(target_arch = "x86_64")]
 fn wire_nvme_msix() {
     use crate::arch::x86_64::{apic, idt};
     use crate::device::pci;

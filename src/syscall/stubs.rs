@@ -5,7 +5,10 @@ use crate::fs::path::resolve_path;
 use crate::proc::scheduler;
 
 // Named errno helpers — all sourced from the shared errno module.
-use crate::syscall::errno::{ebadf, enotsup, erange, esrch};
+// Note: `enotsup` is already imported by `p0_gaps.rs`, which is `include!`'d
+// into the same module scope (`crate::syscall`), so we must not re-import it
+// here. See `src/syscall/mod.rs` for the include chain.
+use crate::syscall::errno::{ebadf, erange, esrch};
 
 // Named signal numbers.
 use crate::syscall::signal_nr::{SIGKILL, SIGSTOP};

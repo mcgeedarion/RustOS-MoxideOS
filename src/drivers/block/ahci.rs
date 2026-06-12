@@ -133,7 +133,12 @@ static PORTS: Mutex<Vec<AhciPort>> = Mutex::new(Vec::new());
 /// wire one MSI-X vector for interrupt-driven completion.
 pub fn ahci_init(bar5_virt: usize) {
     unsafe { _init(bar5_virt) }
+    // MSI-X wiring relies on x86 APIC/IDT; on other architectures the AHCI
+    // controller drops back to polling mode silently.
+    #[cfg(target_arch = "x86_64")]
     wire_msix(bar5_virt);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = bar5_virt;
 }
 
 /// Number of ready SATA ports found after `ahci_init`.
@@ -185,6 +190,7 @@ impl crate::block::BlockDev for AhciBlockDev {
 ///
 /// Safe to call when no MSI-X capability is present — returns early and
 /// the driver remains in polling mode.
+#[cfg(target_arch = "x86_64")]
 fn wire_msix(bar5_virt: usize) {
     use crate::arch::x86_64::{apic, idt};
     use crate::device::pci;

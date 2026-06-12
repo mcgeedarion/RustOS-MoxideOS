@@ -12,9 +12,15 @@ pub mod trap;
 pub mod uefi_entry;
 pub mod uentry;
 
+// Canonical home for the RISC-V PLIC driver is `crate::irq::riscv64::plic`.
+// Re-export it here so call sites that use the `arch::riscv64::plic` path
+// (FDT walker, kernel init, etc.) keep working without a flag day.
+pub use crate::irq::riscv64::plic;
+
 /// RISC-V early/kernel boot hook used by the common entry point.
 pub fn init(boot_info: &'static crate::init::boot_info::BootInfo) -> ! {
-    use crate::arch::riscv64::{fdt, plic, trap};
+    use crate::arch::riscv64::{fdt, trap};
+    use crate::irq::riscv64::plic;
 
     let fdt_ptr = boot_info.fdt.start;
     trap::trap_init();
