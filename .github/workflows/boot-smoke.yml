@@ -1,0 +1,83 @@
+name: Boot Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  x86_64-uefi:
+    name: x86_64 UEFI boot smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: file
+          components: rust-src, llvm-tools-preview
+
+      - name: Install boot tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm qemu-system-x86 ovmf mtools
+
+      - name: Plain cargo build uses primary boot target
+        run: |
+          cargo build 2>&1 | tee cargo-build-x86_64-boot.log
+          test -f target/x86_64-kernel/debug/rustos
+          file target/x86_64-kernel/debug/rustos
+
+      - name: Build x86_64 UEFI ESP image
+        run: |
+          cargo xtask image --arch x86_64 --debug 2>&1 | tee build-x86_64-image.log
+          test -f boot-x86_64.img
+
+      - name: Boot image in QEMU/OVMF
+        run: |
+          cp /usr/share/OVMF/OVMF_VARS.fd /tmp/OVMF_VARS.fd
+          set +e
+          timeout 30 qemu-system-x86_64 \
+            -machine q35 \
+            -cpu qemu64,+xsave,+avx \
+            -m 256M \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
+            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
+            -drive if=virtio,format=raw,file=boot-x86_64.img \
+            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
+            -device virtio-net-pci,netdev=net0,id=nic0 \
+            -serial stdio -display none -no-reboot -no-shutdown \
+            -d guest_errors,cpu_reset \
+            > qemu-x86_64-boot.log 2>&1
+          status=$?
+          set -e
+          cat qemu-x86_64-boot.log
+          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
+            echo "QEMU exited unexpectedly with status $status" >&2
+            exit "$status"
+          fi
+
+      - name: Assert boot markers
+        run: |
+          grep -q 'kernel_main reached' qemu-x86_64-boot.log
+          grep -q 'TEST PASS: uart_smoke' qemu-x86_64-boot.log
+          grep -q 'TEST PASS: alloc_smoke' qemu-x86_64-boot.log
+          grep -q 'TEST PASS: trap_smoke' qemu-x86_64-boot.log
+
+      - name: Upload boot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-boot-smoke
+          path: |
+            cargo-build-x86_64-boot.log
+            build-x86_64-image.log
+            qemu-x86_64-boot.log
