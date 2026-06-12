@@ -1,12 +1,12 @@
 # QEMU Smoke workflow — matrix caller.
 #
 # Drives kernel-test.yml (run_smoke: true) for every supported architecture.
-# Boots the kernel under QEMU and asserts the shared early serial boot markers:
-# kernel_main reached, uart_smoke, alloc_smoke, and trap_smoke.
+# Boots the kernel under QEMU and asserts architecture-specific early serial
+# boot markers.
 #
 # Architecture notes
 # ──────────────────────────────────────────────────────────────────────────
-#   aarch64  bare-metal QEMU virt/cortex-a72, virtio-net-device
+#   aarch64  UEFI pflash on QEMU virt with AAVMF/QEMU_EFI firmware and an ESP image
 #   riscv64  OpenSBI virt, -smp 2, virtio-net-device
 #   x86_64   OVMF UEFI pflash, q35, FAT32 ESP image, virtio-net-pci
 
