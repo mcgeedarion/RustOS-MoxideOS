@@ -38,31 +38,39 @@ RELEASE="${RELEASE:-0}"
 BOOT="${BOOT:-uefi}"
 FEATURES="${FEATURES:-}"
 
+case "$ARCH:$BOOT" in
+  aarch64:uefi|aarch64:baremetal|riscv64:uefi|riscv64:sbi|x86_64:uefi) ;;
+  *) echo "[!] Unsupported build contract: ARCH=${ARCH} BOOT=${BOOT}" >&2; exit 2 ;;
+esac
+
 # ── Per-arch target + ELF path ──────────────────────────────────────────────
 
-case "$ARCH" in
-  aarch64)
+case "$ARCH:$BOOT" in
+  aarch64:uefi)
+    CARGO_TARGET="${ROOT_DIR}/targets/aarch64-uefi-loader.json"
+    TARGET_DIR="aarch64-uefi-loader"
+    ;;
+  aarch64:baremetal)
     CARGO_TARGET="${ROOT_DIR}/targets/aarch64-kernel.json"
-    KERNEL_ELF="target/aarch64-kernel/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
-    EXTRA_FLAGS=()
+    TARGET_DIR="aarch64-kernel"
     ;;
-  riscv64)
-    if [[ "$BOOT" == "sbi" ]]; then
-      CARGO_TARGET="riscv64gc-unknown-none-elf"
-    else
-      CARGO_TARGET="${ROOT_DIR}/targets/riscv64-kernel.json"
-    fi
-    KERNEL_ELF="target/riscv64gc-unknown-none-elf/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
-    EXTRA_FLAGS=()
+  riscv64:uefi)
+    CARGO_TARGET="${ROOT_DIR}/targets/riscv64-uefi-loader.json"
+    TARGET_DIR="riscv64-uefi-loader"
     ;;
-  x86_64)
-    CARGO_TARGET="x86_64-unknown-none"
-    KERNEL_ELF="target/${CARGO_TARGET}/$([ "$RELEASE" = 1 ] && echo release || echo debug)/rustos"
-    EXTRA_FLAGS=()
+  riscv64:sbi)
+    CARGO_TARGET="riscv64gc-unknown-none-elf"
+    TARGET_DIR="riscv64gc-unknown-none-elf"
+    ;;
+  x86_64:uefi)
+    CARGO_TARGET="${ROOT_DIR}/targets/x86_64-kernel.json"
+    TARGET_DIR="x86_64-kernel"
     ;;
 esac
 
 PROFILE=$([ "$RELEASE" = 1 ] && echo release || echo debug)
+KERNEL_ELF="target/${TARGET_DIR}/${PROFILE}/rustos"
+EXTRA_FLAGS=()
 
 # ── Append optional extra features ─────────────────────────────────────────
 
@@ -77,6 +85,7 @@ cargo build \
   "${EXTRA_FLAGS[@]}" \
   -Z build-std=core,alloc,compiler_builtins \
   -Z build-std-features=compiler-builtins-mem \
+  -Z json-target-spec \
   $([ "$RELEASE" = 1 ] && echo --release)
 
 # ── Verify output ───────────────────────────────────────────────────────────
