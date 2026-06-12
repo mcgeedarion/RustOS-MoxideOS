@@ -12,7 +12,7 @@ resolver = "2"
 name = "rustos-kernel"
 version = "0.1.0"
 edition = "2021"
-authors = ["Darion McGee <mcgeedarion@example.com>"]
+authors = ["Darion McGee"]
 description = "A Rust-based operating system kernel with UEFI and debugging support"
 license = "MIT"
 repository = "https://github.com/mcgeedarion/RustOS"
@@ -49,9 +49,9 @@ log = { version = "0.4", default-features = false }
 cc = "1"
 
 [features]
-# Normal development build: x86_64 UEFI boot kernel plus input events and the
-# lightweight GDB RSP stub. Plain `cargo build` uses `.cargo/config.toml` to
-# select `targets/x86_64-kernel.json`.
+# Normal development build: keep the UEFI path enabled for the repository
+# default aarch64 target, while also supporting explicit x86_64 and riscv64
+# UEFI/SBI builds through their target-specific commands.
 default = ["uefi_boot", "input_events", "gdbstub"]
 
 # Evdev / virtio-input subsystem.
@@ -79,7 +79,8 @@ debugstub = ["gdbstub"]
 # Ring-buffer trace event drain, flushed to serial on panic.
 trace = []
 
-# Enable in-kernel test harness. Build with:
+# Enable in-kernel test harness. Build with, for example:
+#   cargo build --features kmtest --target targets/aarch64-uefi-loader.json
 #   cargo build --features kmtest --target targets/x86_64-kernel.json
 kmtest = ["dep:kmtest"]
 
