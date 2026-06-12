@@ -14,6 +14,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y llvm lld ripgrep musl-tools cpio mtools
+      - name: Check invalid Rust whitespace
+        run: |
+          if rg -n --glob '*.rs' $'\xC2\xA0' .; then
+            echo "ERROR: U+00A0 non-breaking space found in Rust source." >&2
+            exit 1
+          fi
+          if rg -n --glob '*.rs' '\\[[:blank:]]' .; then
+            echo "ERROR: backslash followed by space/tab found in Rust source." >&2
+            exit 1
+          fi
       - name: Show pinned toolchain
         run: rustup show
       - name: Check formatting
