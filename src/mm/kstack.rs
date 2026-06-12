@@ -36,7 +36,10 @@ use crate::arch::{
 
 // Use the arch-provided page size so this compiles correctly if a future
 // target uses 16 KiB pages (e.g., AArch64 with 16K granule).
-use crate::arch::api::PAGE_SIZE;
+//
+// `crate::arch::api::page_size()` is a `const fn`, which means we can bind it
+// to a `const` here and keep the same syntactic shape downstream.
+const PAGE_SIZE: usize = crate::arch::api::page_size();
 
 // ---------------------------------------------------------------------------
 // Architecture-specific physmap translation

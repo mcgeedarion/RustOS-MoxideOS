@@ -17,6 +17,10 @@
 
 use crate::arch::riscv64::csr::*;
 use crate::arch::riscv64::mem_layout::{scause as SC, sie as SIE, sstatus as SS, trap as TF};
+// `csrr!`/`csrw!` are declared with `#[macro_export]` in `csr.rs`, which places
+// them at the crate root; a `use crate::arch::riscv64::csr::*` glob does not
+// import macros, so we bring them in explicitly here.
+use crate::{csrr, csrw};
 use crate::mm::mmap::{VmaKind, PROT_EXEC, PROT_READ, PROT_WRITE};
 use core::arch::asm;
 
@@ -73,6 +77,50 @@ pub const TRAP_FRAME_SIZE: usize = TF::FRAME_SIZE;
 // Re-export for consumers that use these directly.
 pub use crate::arch::riscv64::mem_layout::sstatus::SPIE as SSTATUS_SPIE;
 pub use crate::arch::riscv64::mem_layout::sstatus::SPP as SSTATUS_SPP;
+
+/// Build a trap frame at the top of a fresh kernel stack so that the first
+/// `sret` out of `riscv_trap_entry` lands in user mode at `entry_pc` with
+/// stack pointer `user_sp`.
+///
+/// Layout: the frame sits at `kstack_top - TRAP_FRAME_SIZE`, matching
+/// `proc::context::task_entry_trampoline`, which loads `sp` from that address
+/// and jumps to the trap-exit restore path.
+///
+/// # Parameters
+/// - `kstack_top`  : virtual address one byte above the kernel stack top
+///                   (the frame is built immediately below this).
+/// - `entry_pc`    : userspace PC to load into `sepc`.
+/// - `user_sp`     : initial userspace stack pointer.
+/// - `arg0`        : value to place in `a0` (typically 0; auxv setup is
+///                   done in the caller by writing directly to `user_sp`).
+///
+/// # Safety
+/// `kstack_top` must point at least `TRAP_FRAME_SIZE` bytes of writable,
+/// mapped kernel stack. The caller is responsible for ensuring no live
+/// frame already occupies that range.
+pub fn rebuild_trap_frame_riscv(
+    kstack_top: usize,
+    entry_pc: usize,
+    user_sp: usize,
+    arg0: usize,
+) {
+    let frame_pa = kstack_top - TRAP_FRAME_SIZE;
+    // SAFETY: caller guarantees `frame_pa..frame_pa + TRAP_FRAME_SIZE` is a
+    // valid, exclusively-owned slice of kernel stack memory.
+    let frame = unsafe { &mut *(frame_pa as *mut TrapFrame) };
+    *frame = TrapFrame {
+        ra: 0, sp: user_sp, gp: 0, tp: 0,
+        t0: 0, t1: 0, t2: 0,
+        s0: 0, s1: 0,
+        a0: arg0, a1: 0, a2: 0, a3: 0, a4: 0, a5: 0, a6: 0, a7: 0,
+        s2: 0, s3: 0, s4: 0, s5: 0, s6: 0, s7: 0,
+        s8: 0, s9: 0, s10: 0, s11: 0,
+        t3: 0, t4: 0, t5: 0, t6: 0,
+        sepc: entry_pc,
+        // SPP = 0 (return to U-mode), SPIE = 1 (re-enable interrupts on sret).
+        sstatus: SSTATUS_SPIE,
+    };
+}
 
 #[unsafe(naked)]
 #[no_mangle]
@@ -195,7 +243,7 @@ fn handle_interrupt(frame: &mut TrapFrame, code: usize) {
             crate::proc::signal::check_and_deliver(frame);
         },
         SC::INT_S_EXTERNAL => {
-            crate::drivers::plic::handle_irq();
+            crate::irq::riscv64::plic::handle_irq();
         },
         _ => {},
     }
