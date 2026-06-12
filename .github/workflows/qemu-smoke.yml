@@ -1,16 +1,14 @@
 # QEMU Smoke workflow — matrix caller.
 #
 # Drives kernel-test.yml (run_smoke: true) for every supported architecture.
-# Boots the kernel under QEMU, probes the VirtIO NIC, and asserts serial
-# markers for boot, NIC registration, and arch-specific subsystems (SMP/PLIC
-# on riscv64).  The CL self-test markers (alloc_smoke, trap_smoke,
-# uart_smoke) are also validated on every arch.
+# Boots the kernel under QEMU and asserts the shared early serial boot markers:
+# kernel_main reached, uart_smoke, alloc_smoke, and trap_smoke.
 #
 # Architecture notes
 # ──────────────────────────────────────────────────────────────────────────
-#   aarch64  virt/cortex-a72, virtio-net-device (MMIO)  [NEW]
-#   riscv64  OpenSBI virt, -smp 2, virtio-net-device (MMIO), PLIC + SMP checks
-#   x86_64   OVMF UEFI pflash, q35, virtio-net-pci
+#   aarch64  bare-metal QEMU virt/cortex-a72, virtio-net-device
+#   riscv64  OpenSBI virt, -smp 2, virtio-net-device
+#   x86_64   OVMF UEFI pflash, q35, FAT32 ESP image, virtio-net-pci
 
 name: QEMU Smoke
 
@@ -33,5 +31,5 @@ jobs:
 
     uses: ./.github/workflows/kernel-test.yml
     with:
-      arch:      ${{ matrix.arch }}
+      arch: ${{ matrix.arch }}
       run_smoke: true
