@@ -36,6 +36,11 @@ pub fn set_initramfs_range(phys_start: usize, byte_len: usize) {
     INITRAMFS_LEN.store(byte_len, Ordering::Relaxed);
 }
 
+/// Return true when firmware or the boot stub registered an initramfs range.
+pub fn has_initramfs_range() -> bool {
+    INITRAMFS_PA.load(Ordering::Relaxed) != 0 && INITRAMFS_LEN.load(Ordering::Relaxed) != 0
+}
+
 pub struct InitramfsHandle<'a> {
     cpio: &'a [u8],
 }
@@ -90,7 +95,7 @@ pub fn load() -> InitramfsHandle<'static> {
     InitramfsHandle { cpio }
 }
 
-/// One file/directory entry inside the CPIO archive.
+/// One file/directory entry inside a CPIO archive.
 #[derive(Debug, Clone, Copy)]
 pub struct CpioEntry<'a> {
     pub name: &'a str,
