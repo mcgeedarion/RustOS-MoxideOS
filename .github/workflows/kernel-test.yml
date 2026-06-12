@@ -5,12 +5,12 @@
 #
 #   arch      boot mode   cargo target
 #   aarch64   uefi        targets/aarch64-uefi-loader.json
-#   riscv64   sbi         riscv64gc-unknown-none-elf
+#   riscv64   uefi        targets/riscv64-uefi-loader.json
 #   x86_64    uefi        targets/x86_64-kernel.json
 #
-# Plain local `cargo build` also targets the repository-default aarch64 UEFI
-# loader via .cargo/config.toml. Use `cargo xtask image --arch aarch64` to
-# produce the ESP image consumed by QEMU/EDK2.
+# Plain local `cargo build` targets the repository-default aarch64 UEFI loader
+# via .cargo/config.toml. RISC-V UEFI is built explicitly through
+# `cargo xtask image --arch riscv64` or `ARCH=riscv64 ./scripts/ci/run_qemu.sh`.
 
 name: Kernel Test (reusable)
 
@@ -70,8 +70,8 @@ jobs:
               echo "TARGET_SHORT=aarch64-uefi-loader" >> "$GITHUB_ENV"
               ;;
             riscv64)
-              echo "BOOT=sbi" >> "$GITHUB_ENV"
-              echo "TARGET_SHORT=riscv64gc-unknown-none-elf" >> "$GITHUB_ENV"
+              echo "BOOT=uefi" >> "$GITHUB_ENV"
+              echo "TARGET_SHORT=riscv64-uefi-loader" >> "$GITHUB_ENV"
               ;;
             x86_64)
               echo "BOOT=uefi" >> "$GITHUB_ENV"
@@ -96,7 +96,7 @@ jobs:
               sudo apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 mtools
               ;;
             riscv64)
-              sudo apt-get install -y --no-install-recommends qemu-system-riscv64
+              sudo apt-get install -y --no-install-recommends qemu-system-misc qemu-efi-riscv64 u-boot-qemu mtools
               ;;
             x86_64)
               sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf mtools musl-tools
@@ -157,20 +157,64 @@ jobs:
             exit "$status"
           fi
 
-      - name: QEMU smoke test (riscv64)
+      - name: Build riscv64 UEFI ESP image
+        if: inputs.run_smoke && inputs.arch == 'riscv64'
+        run: |
+          cargo xtask image --arch riscv64 --debug \
+            2>&1 | tee "build-riscv64-image.log"
+          test -f boot-riscv64.img
+
+      - name: QEMU smoke test (riscv64 UEFI)
         if: inputs.run_smoke && inputs.arch == 'riscv64'
         run: |
           mkdir -p logs/riscv64
+
+          find_existing_file() {
+            for path in "$@"; do
+              [ -f "$path" ] && { echo "$path"; return 0; }
+            done
+            return 1
+          }
+
+          FW_KIND=""
+          FW_CODE=""
+          FW_VARS=""
+          if FW_CODE=$(find_existing_file \
+              /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd \
+              /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd \
+              /usr/share/qemu/edk2-riscv-code.fd \
+              /usr/share/qemu/edk2-riscv64-code.fd); then
+            FW_KIND="edk2"
+            FW_VARS=/tmp/RISCV_VIRT_VARS.fd
+            dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+          elif FW_CODE=$(find_existing_file \
+              /usr/lib/u-boot/qemu-riscv64_smode/uboot.elf \
+              /usr/lib/u-boot/qemu-riscv64/uboot.elf \
+              /usr/share/u-boot/qemu-riscv64_smode/uboot.elf \
+              /usr/share/u-boot/qemu-riscv64/uboot.elf); then
+            FW_KIND="uboot"
+          else
+            echo "RISC-V UEFI firmware not found" >&2
+            exit 1
+          fi
+
+          QEMU_FW_ARGS=()
+          if [ "$FW_KIND" = "edk2" ]; then
+            QEMU_FW_ARGS+=(
+              -drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on"
+              -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}"
+            )
+          else
+            QEMU_FW_ARGS+=(-bios "$FW_CODE")
+          fi
+
           set +e
-          timeout 30 qemu-system-riscv64 \
+          timeout 60 qemu-system-riscv64 \
             -machine virt \
             -cpu rv64 \
-            -smp 2 \
             -m 256M \
-            -bios default \
-            -kernel "target/riscv64gc-unknown-none-elf/debug/rustos" \
-            -netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15 \
-            -device virtio-net-device,netdev=net0,id=nic0 \
+            "${QEMU_FW_ARGS[@]}" \
+            -drive if=virtio,format=raw,file=boot-riscv64.img \
             -serial stdio -display none -no-reboot -no-shutdown \
             -d guest_errors,cpu_reset \
             > "qemu-riscv64.log" 2>&1
@@ -226,14 +270,14 @@ jobs:
               grep -q 'aarch64: heap ready' "$LOG"
               grep -q 'aarch64: kernel_main: idle' "$LOG"
               ;;
+            riscv64)
+              grep -q 'RustOS (RISC-V) booting via UEFI' "$LOG"
+              ;;
             x86_64)
               grep -q 'rustos: kernel_main reached' "$LOG"
               grep -q 'TEST PASS: uart_smoke' "$LOG"
               grep -q 'TEST PASS: alloc_smoke' "$LOG"
               grep -q 'TEST PASS: trap_smoke' "$LOG"
-              ;;
-            riscv64)
-              echo "riscv64 smoke markers remain unspecified in this pass"
               ;;
           esac
 
