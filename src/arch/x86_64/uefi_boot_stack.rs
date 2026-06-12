@@ -1,4 +1,6 @@
 #![cfg(target_os = "uefi")]
+#![allow(dead_code)]
+#![allow(non_upper_case_globals)]
 
 #[repr(align(16))]
 struct BootStackStorage([u8; 32768]);
