@@ -10,7 +10,7 @@
 #   target/esp/<arch>/EFI/BOOT/BOOT*.EFI
 #
 # Default ARCH is x86_64.
-# Override with:  ARCH=aarch64 ./scripts/ci/run_qemu.sh --boot uefi ...
+# Override with:  ARCH=riscv64 ./scripts/ci/run_qemu.sh --boot uefi ...
 
 set -euo pipefail
 
@@ -160,9 +160,11 @@ find_existing_file() {
 
 FW_CODE=""
 FW_VARS=""
+FW_KIND=""
 if [[ "$BOOT" == "uefi" ]]; then
   case "$ARCH" in
     aarch64)
+      FW_KIND="edk2"
       FW_CODE="$(find_existing_file \
         /usr/share/AAVMF/AAVMF_CODE.fd \
         /usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
@@ -182,11 +184,31 @@ if [[ "$BOOT" == "uefi" ]]; then
       fi
       ;;
     riscv64)
-      FW_CODE="$(find_existing_file /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd /usr/share/qemu/edk2-riscv-code.fd /opt/homebrew/share/qemu/edk2-riscv-code.fd /usr/local/share/qemu/edk2-riscv-code.fd)" || { echo "[!] RISC-V EDK2 not found" >&2; exit 1; }
-      FW_VARS="${ROOT_DIR}/target/edk2-riscv-vars.fd"
-      [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+      if FW_CODE="$(find_existing_file \
+        /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd \
+        /usr/share/edk2/riscv64/RISCV_VIRT_CODE.fd \
+        /usr/share/qemu/edk2-riscv-code.fd \
+        /usr/share/qemu/edk2-riscv64-code.fd \
+        /opt/homebrew/share/qemu/edk2-riscv-code.fd \
+        /usr/local/share/qemu/edk2-riscv-code.fd)"; then
+        FW_KIND="edk2"
+        FW_VARS="${ROOT_DIR}/target/edk2-riscv-vars.fd"
+        [[ -f "$FW_VARS" ]] || dd if=/dev/zero of="$FW_VARS" bs=1M count=64 2>/dev/null
+      elif FW_CODE="$(find_existing_file \
+        /usr/lib/u-boot/qemu-riscv64_smode/uboot.elf \
+        /usr/lib/u-boot/qemu-riscv64/uboot.elf \
+        /usr/share/u-boot/qemu-riscv64_smode/uboot.elf \
+        /usr/share/u-boot/qemu-riscv64/uboot.elf \
+        /usr/lib/u-boot/qemu-riscv64_smode/u-boot.bin \
+        /usr/share/u-boot/qemu-riscv64_smode/u-boot.bin)"; then
+        FW_KIND="uboot"
+      else
+        echo "[!] RISC-V UEFI firmware not found. Install qemu-efi-riscv64 or u-boot-qemu." >&2
+        exit 1
+      fi
       ;;
     x86_64)
+      FW_KIND="edk2"
       if [[ -f /usr/share/OVMF/OVMF_CODE.fd ]]; then
         FW_CODE=/usr/share/OVMF/OVMF_CODE.fd
         FW_VARS=/tmp/OVMF_VARS_${ARCH}.fd
@@ -211,7 +233,16 @@ case "$ARCH" in
 esac
 
 case "$ARCH:$BOOT" in
-  aarch64:uefi|riscv64:uefi) QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio") ;;
+  aarch64:uefi)
+    QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio")
+    ;;
+  riscv64:uefi)
+    if [[ "$FW_KIND" == "edk2" ]]; then
+      QEMU_ARGS+=(-drive "if=pflash,unit=0,format=raw,file=${FW_CODE},readonly=on" -drive "if=pflash,unit=1,format=raw,file=${FW_VARS}" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio")
+    else
+      QEMU_ARGS+=(-bios "$FW_CODE" -drive "file=fat:rw:${ESP_ROOT},format=raw,if=virtio")
+    fi
+    ;;
   aarch64:baremetal) QEMU_ARGS+=(-kernel "$KERNEL_ELF") ;;
   riscv64:sbi) QEMU_ARGS+=(-bios default -kernel "$KERNEL_ELF") ;;
   x86_64:uefi) QEMU_ARGS+=(-drive "if=pflash,format=raw,readonly=on,file=${FW_CODE}" -drive "if=pflash,format=raw,file=${FW_VARS}" -drive "if=virtio,format=raw,file=fat:rw:${ESP_ROOT},label=ESP") ;;
@@ -290,5 +321,5 @@ if [[ "$SMOKE_MODE" -eq 1 || "$TEST_MODE" -eq 1 ]]; then
   exit 2
 fi
 
-echo "[*] Starting ${QEMU_BIN} (${ARCH}, ${BOOT}, ${PROFILE})..."
+echo "[*] Starting ${QEMU_BIN} (${ARCH}, ${BOOT}, ${PROFILE}, firmware=${FW_KIND:-none})..."
 exec "$QEMU_BIN" "${QEMU_ARGS[@]}"
