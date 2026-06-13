@@ -6,7 +6,6 @@
 #
 # Usage:
 #   ARCH=aarch64 ./scripts/ci/build-userspace.sh
-#   ARCH=aarch64 ./scripts/ci/build-userspace.sh smoke   # single target
 #
 # Environment variables:
 #   ARCH          x86_64 | riscv64 | aarch64  (default: x86_64)
