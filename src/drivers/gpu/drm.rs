@@ -225,6 +225,18 @@ pub fn is_initialised() -> bool {
     DRM.lock().is_some()
 }
 
+/// Initialise display heads. Idempotent wrapper around `init()`.
+pub fn init_heads() {
+    if !is_initialised() {
+        init();
+    }
+}
+
+/// Number of active display heads (CRTCs).
+pub fn num_heads() -> usize {
+    DRM.lock().as_ref().map(|d| d.crtcs.len()).unwrap_or(0)
+}
+
 /// Allocate a GEM buffer object.  Returns handle or None on OOM.
 pub fn gem_alloc(width: u32, height: u32, format: PixelFormat) -> Option<u32> {
     let bpp = format.bytes_per_pixel() as u32;
@@ -256,7 +268,7 @@ pub fn gem_free(handle: u32) {
     }
 }
 
-/// Get a reference to a GEM BO’s physical address and pitch.
+/// Get a reference to a GEM BO's physical address and pitch.
 pub fn gem_info(handle: u32) -> Option<GemBo> {
     DRM.lock()
         .as_ref()?

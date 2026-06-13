@@ -80,6 +80,13 @@ pub fn fb_phys() -> Option<u64> {
     GOP.lock().as_ref().map(|g| g.fb.phys)
 }
 
+/// Capture the boot-services GOP framebuffer before ExitBootServices.
+/// Called by UEFI loader paths that snapshot the firmware mode early.
+/// Returns `Some(Framebuffer)` if GOP is already initialised, else `None`.
+pub fn capture_from_boot_services() -> Option<Framebuffer> {
+    GOP.lock().as_ref().map(|g| g.fb.clone())
+}
+
 #[inline]
 fn argb_to_gopfmt(argb: u32, fmt: GopPixelFormat) -> u32 {
     // Input: 0xAARRGGBB

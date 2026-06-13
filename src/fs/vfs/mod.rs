@@ -18,6 +18,21 @@ pub fn create_file(path: &str, data: &[u8]) -> Result<(), isize> {
     ops::write_all(path, data)
 }
 
+/// Ensure a directory exists, creating it (and any missing parents) if needed.
+/// Silently succeeds if the directory already exists (EEXIST is not an error).
+pub fn ensure_dir(path: &str) {
+    // Walk each prefix component and mkdir; ignore EEXIST (-17) and EROFS (-30).
+    let mut current = alloc::string::String::new();
+    for part in path.split('/').filter(|s| !s.is_empty()) {
+        current.push('/');
+        current.push_str(part);
+        match ops::mkdir(&current) {
+            Ok(()) | Err(-17) | Err(-30) => {},
+            Err(_) => {}, // best-effort: ignore other errors (e.g. Tmpfs not yet mounted)
+        }
+    }
+}
+
 fn errno_to_scheme_error(errno: isize) -> scheme_api::SchemeError {
     match errno {
         -2 => scheme_api::SchemeError::NotFound,
