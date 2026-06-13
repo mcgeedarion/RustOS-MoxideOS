@@ -47,13 +47,12 @@ extern crate alloc;
 //   input       — Input event subsystem  [cfg(feature = "input_events")]
 //   console     — Kernel console (printk destination)
 //   proc        — Process management (scheduler, exec, wait, signals,
-// namespaces)   syscall     — Syscall dispatch table
+//   namespaces)   syscall     — Syscall dispatch table
 //   ipc         — IPC (pipes, FIFOs, System V IPC, POSIX MQ)
 //   io_uring    — io_uring async I/O ring
 //   time        — Timekeeping (clocksource, timerfd, itimers)
 //   smp         — SMP / multi-core bringup
-//   security    — Security hardening (ASLR, stack canaries, seccomp, cgroups)
-//   shell       — Built-in kernel debug shell
+//   security   — Security hardening (ASLR, stack canaries, seccomp, cgroups)
 //   init        — Early-boot: initramfs, ELF loader, crt0
 //   exec        — Executable format parsers (ELF-64)
 //   debug       — Debugging infrastructure  [cfg(gdbstub | debug | trace)]
@@ -84,7 +83,6 @@ pub mod mm;
 pub mod net;
 pub mod proc;
 pub mod security;
-pub mod shell;
 pub mod smp;
 pub mod sync;
 pub mod syscall;
