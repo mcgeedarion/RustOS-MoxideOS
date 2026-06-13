@@ -6,7 +6,7 @@
 //!        │   write(master, input_bytes)        │
 //!        │ ─────────────────────────────────►  │ ldisc processes → read(slave)
 //!        │                                     │
-//!        │   read(master, output_bytes)         │
+//!        │   read(master, output_bytes)        │
 //!        │ ◄─────────────────────────────────  │ write(slave) → opost → master buf
 //! ```
 //!
