@@ -3,8 +3,6 @@ members = [
     ".",
     "xtask",
     "crates/scheme-api",
-    "crates/kmtest",
-    "crates/kmtest-macros",
 ]
 resolver = "2"
 
@@ -25,7 +23,6 @@ name = "rustos"
 path = "src/main.rs"
 
 [dependencies]
-kmtest = { path = "crates/kmtest", optional = true }
 scheme-api = { path = "crates/scheme-api" }
 
 # Synchronisation primitives. `crate::sync::mutex` re-exports `spin::Mutex`,
@@ -78,11 +75,6 @@ debugstub = ["gdbstub"]
 
 # Ring-buffer trace event drain, flushed to serial on panic.
 trace = []
-
-# Enable in-kernel test harness. Build with, for example:
-#   cargo build --features kmtest --target targets/aarch64-uefi-loader.json
-#   cargo build --features kmtest --target targets/x86_64-kernel.json
-kmtest = ["dep:kmtest"]
 
 [profile.release]
 opt-level = 3
