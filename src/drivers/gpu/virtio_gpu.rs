@@ -229,6 +229,12 @@ pub fn is_initialised() -> bool {
     GPU.lock().is_some()
 }
 
+/// Returns the number of active scanouts (displays).
+/// Always 1 when initialised (single-head virtio-gpu).
+pub fn num_scanouts() -> usize {
+    if is_initialised() { 1 } else { 0 }
+}
+
 pub fn display_info() -> Option<DisplayInfo> {
     GPU.lock().as_ref().map(|g| DisplayInfo {
         width: g.width,
@@ -324,7 +330,7 @@ unsafe fn get_display_info(base: usize, _vq: &Vq) -> (u32, u32) {
         hdr_type: CMD_GET_DISPLAY_INFO,
         ..Default::default()
     };
-    // In a full driver we’d submit to controlq and poll; here we default.
+    // In a full driver we'd submit to controlq and poll; here we default.
     let _ = cmd_phys;
     (1024, 768)
 }

@@ -108,6 +108,33 @@ pub fn stat(_path: &str) -> Result<crate::fs::vfs_ops::KStat, isize> {
     Err(-2)
 }
 
+/// Read all bytes from a devfs path. Character devices do not expose
+/// bulk reads this way; return empty to satisfy the VFS dispatch table
+/// without error so callers get a valid (empty) response.
+pub fn read_all(_path: &str) -> Result<alloc::vec::Vec<u8>, isize> {
+    Ok(alloc::vec::Vec::new())
+}
+
+/// List directory entries under a devfs path.
+/// Returns synthesised entries for the known input device nodes.
+pub fn readdir(path: &str) -> Result<alloc::vec::Vec<crate::fs::vfs::ops::DirEntry>, isize> {
+    if path == "/dev/input" || path == "input" || path.is_empty() {
+        let count = crate::input::device_count();
+        let entries = (0..count)
+            .map(|i| crate::fs::vfs::ops::DirEntry {
+                name: alloc::format!("event{}", i),
+                ino: (INPUT_MAJOR * MAX_MINOR + i) as u64,
+                is_dir: false,
+                mode: 0o020600,
+                size: 0,
+            })
+            .collect();
+        Ok(entries)
+    } else {
+        Err(-2)
+    }
+}
+
 /// Concrete `dev:` scheme adapter.
 ///
 /// The implementation lives in `url_dispatch` so all filesystem URL handlers
