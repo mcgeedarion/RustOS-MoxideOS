@@ -1,7 +1,5 @@
 //! Subsystem dispatch routers.
 
-#![allow(unused_variables)]
-
 use crate::syscall::dispatcher_context::SyscallContext;
 use crate::syscall::errno::{efault, einval, emsgsize, enosys};
 use crate::syscall::nr::*;
@@ -80,8 +78,12 @@ pub fn dispatch_filesystem(ctx: &SyscallContext) -> Option<isize> {
         SYS_MKNODAT => Some(crate::syscall::sys_mknodat_impl(
             a as i32, b, c as u32, d as u64,
         )),
-        #[allow(clippy::match_same_arms)] // stub: both arms are no-op until permission enforcement lands
-        SYS_FCHOWNAT | SYS_FCHMODAT => Some(0), // ownership/permissions not enforced
+        SYS_FCHOWNAT => Some(crate::syscall::sys_fchownat_impl(
+            a as i32, b, c as u32, d as u32, e as i32,
+        )),
+        SYS_FCHMODAT => Some(crate::syscall::sys_fchmodat_impl(
+            a as i32, b, c as u32,
+        )),
         SYS_FUTIMESAT => Some(crate::syscall::sys_futimesat_impl(a as i32, b, c)),
         SYS_NEWFSTATAT => Some(crate::syscall::sys_newfstatat_impl(
             a as i32, b, c, d as u32,

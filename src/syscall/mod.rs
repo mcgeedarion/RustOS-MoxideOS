@@ -38,7 +38,9 @@
 //! => syscall::kmtest::sys_kmtest_list   0x8000_0001  kmtest_run
 //! => syscall::kmtest::sys_kmtest_run
 
-#![allow(unused_variables, unused_imports)]
+// unused_imports: included files (posix_full.rs, stubs.rs, p0_gaps.rs) consume
+// imports declared in this file; the compiler cannot see through include!().
+#![allow(unused_imports)]
 extern crate alloc;
 use crate::fs::fcntl;
 use crate::fs::vfs;
