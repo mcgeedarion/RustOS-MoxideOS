@@ -4,7 +4,7 @@ OUTPUT_ARCH(aarch64)
  * Primary entry: efi_main (UEFI application, called by EDK2 firmware).
  * For a future bare-metal path, replace with _start and set . accordingly.
  */
-ENTRY(efi_main)
+ENTRY(uefi_main)
 
 /*
  * Kernel virtual base — must match va48::KERNEL_BASE in mem_layout.rs.
