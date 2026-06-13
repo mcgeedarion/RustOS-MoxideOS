@@ -45,7 +45,7 @@
 //! released before the new parameters are admitted, so the counters
 //! always reflect the live set of admitted tasks.
 
-use super::errno::{eacces, ebusy, efault, einval, enosys, esrch};
+use super::errno::{eacces, ebusy, efault, einval, esrch};
 use crate::proc::rlimit::{RLIMIT_NICE, RLIMIT_RTPRIO, RLIM_INFINITY};
 use crate::proc::sched_helpers::{cbs_admit, cbs_release};
 use crate::proc::scheduler::{SchedEntity, SchedPolicy, CPUMASK_ALL};

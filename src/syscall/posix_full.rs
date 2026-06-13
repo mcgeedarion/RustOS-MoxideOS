@@ -314,7 +314,11 @@ pub(super) fn sys_nice_impl(_inc: i32) -> isize {
 }
 
 /// NR 125/126  capget/capset — report full capabilities (we run as root).
-pub(super) fn sys_capget_impl(hdr_va: usize, data_va: usize) -> isize {
+///
+/// `_hdr_va`: header pointer is accepted but not yet parsed; capabilities
+/// are reported unconditionally as a full set until per-thread cap tracking
+/// is implemented.
+pub(super) fn sys_capget_impl(_hdr_va: usize, data_va: usize) -> isize {
     // struct __user_cap_data_struct: two u32 effective/permitted/inheritable pairs.
     if data_va != 0 {
         let full = [0xFFu8; 24]; // all caps set in effective + permitted
