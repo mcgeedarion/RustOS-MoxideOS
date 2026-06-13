@@ -1,7 +1,7 @@
 OUTPUT_FORMAT("elf64-littleaarch64")
 OUTPUT_ARCH(aarch64)
 /*
- * Primary entry: efi_main (UEFI application, called by EDK2 firmware).
+ * Primary entry: uefi_main (UEFI application, called by EDK2 firmware).
  * For a future bare-metal path, replace with _start and set . accordingly.
  */
 ENTRY(uefi_main)
