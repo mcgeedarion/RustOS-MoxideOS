@@ -27,8 +27,6 @@
 //!      The key correctness rule: **only a negative return is an error**.
 //!      A short-but-non-negative read means the file ended inside this page,
 //!      which is normal and correct — the caller sees zeroes beyond the file.
-//!      The old code treated `n < PAGE_SIZE` as an error, which caused SIGBUS
-//!      on every ELF whose last segment page is not exactly 4 KiB-aligned.
 //!
 //! ## Return convention
 //!
@@ -47,6 +45,7 @@ use crate::mm::mmap::{find_vma, VmaKind, PROT_EXEC, PROT_WRITE};
 use crate::mm::pmm::{alloc_page, free_page};
 use crate::proc::scheduler;
 use crate::proc::signal::{send_signal, send_signal_info, send_sigsegv, SigInfo};
+use crate::mm::phys::phys_to_virt;
 
 const PAGE_SIZE: usize = 4096;
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
@@ -94,15 +93,21 @@ pub fn handle_demand_fault(faulting_va: usize) -> bool {
 
         VmaKind::FileBacked(fd, base_offset) => {
             // Step A — pre-zero the full page so the suffix beyond EOF is
-            // already clean before we issue the read.
-            // SAFETY: `pa` is a freshly allocated kernel-owned page frame.
+            // already clean before we issue the read.  Convert the physical
+            // address into a kernel virtual address in the direct map before
+            // dereferencing it.  Dereferencing a raw physical address directly
+            // would fault on systems without an identity mapping.
+            let va = phys_to_virt(pa);
+            // SAFETY: `va` points to a freshly allocated kernel-owned page frame.
             unsafe {
-                core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
+                core::ptr::write_bytes(va as *mut u8, 0, PAGE_SIZE);
             }
 
             let page_index = (page_va - vma.start) / PAGE_SIZE;
             let file_off = (*base_offset + (page_index * PAGE_SIZE) as u64) as i64;
-            let n = crate::fs::vfs::pread(*fd, pa as *mut u8, PAGE_SIZE, file_off);
+            // Use the kernel virtual address for the I/O operation.  The VFS expects
+            // a virtual pointer, not a raw physical address.
+            let n = crate::fs::vfs::pread(*fd, va as *mut u8, PAGE_SIZE, file_off);
 
             // Step D — classify the result.
             // IMPORTANT: check `n < 0` before casting to usize. A negative
