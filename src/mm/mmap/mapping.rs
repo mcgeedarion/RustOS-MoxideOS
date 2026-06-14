@@ -40,6 +40,7 @@ pub fn sys_mmap(
     let is_fixed = flags & MAP_FIXED != 0;
     let is_fixed_noreplace = flags & MAP_FIXED_NOREPLACE != 0;
 
+    // Validate fixed-address constraints and detect collisions.
     if is_fixed || is_fixed_noreplace {
         if addr == 0 || addr & (PAGE - 1) != 0 {
             return -22;
@@ -55,6 +56,7 @@ pub fn sys_mmap(
         }
     }
 
+    // Special-case framebuffer mappings via the GOP driver.
     if flags & MAP_ANON == 0 && crate::drivers::gop::is_fb_fd(fd) {
         if let Some(info) = crate::drivers::gop::get() {
             let fb_phys = info.fb_phys as usize;
@@ -69,8 +71,12 @@ pub fn sys_mmap(
         }
     }
 
+    // Allocate a virtual address region.  For MAP_FIXED/NOREPLACE we reuse the user-supplied
+    // address; for anonymous hints we bump next_va.
     let (va, user_cr3) = with_mm_write(pid, |p| {
         let va = if is_fixed || is_fixed_noreplace {
+            // On MAP_FIXED (but not noreplace) remove existing VMAs in the range.  We
+            // intentionally do not free pages here; removal will be handled below.
             if !is_fixed_noreplace {
                 let end = va_end_of(addr, len);
                 remove_vma_inner(p, addr, end);
@@ -97,24 +103,8 @@ pub fn sys_mmap(
     let pte_flags = prot_to_flags(prot);
 
     if is_anon {
-        let mut mapped = 0usize;
-        for page_va in (va..va + len).step_by(PAGE) {
-            match crate::mm::pmm::alloc_page() {
-                Some(pa) => {
-                    <Arch as Paging>::map_page(user_cr3, page_va, pa, pte_flags);
-                    mapped += 1;
-                },
-                None => {
-                    for rollback_va in (va..va + mapped * PAGE).step_by(PAGE) {
-                        if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, rollback_va) {
-                            <Arch as Paging>::unmap_page(rollback_va);
-                            crate::mm::pmm::free_page(pa);
-                        }
-                    }
-                    return -12;
-                },
-            }
-        }
+        // Insert the VMA before mapping pages to avoid races on overlapping MAP_FIXED
+        // operations (see bug #10).
         let kind = if is_growsdown {
             VmaKind::Stack
         } else {
@@ -132,7 +122,31 @@ pub fn sys_mmap(
                 locked: false,
             },
         );
+        // Map each page; on failure roll back and remove the VMA.
+        let mut mapped = 0usize;
+        for page_va in (va..va + len).step_by(PAGE) {
+            match crate::mm::pmm::alloc_page() {
+                Some(pa) => {
+                    <Arch as Paging>::map_page(user_cr3, page_va, pa, pte_flags);
+                    mapped += 1;
+                },
+                None => {
+                    // Roll back partially mapped pages.
+                    for rollback_va in (va..va + mapped * PAGE).step_by(PAGE) {
+                        if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, rollback_va) {
+                            <Arch as Paging>::unmap_page(user_cr3, rollback_va);
+                            crate::mm::pmm::free_page(pa);
+                        }
+                    }
+                    // Remove the inserted VMA and shoot down TLB entries.
+                    remove_vma(pid, va, len);
+                    return -12;
+                },
+            }
+        }
     } else {
+        // File-backed or device mappings: just record the VMA.  Pages will be populated on
+        // demand.
         insert_vma(
             pid,
             Vma {
@@ -154,7 +168,35 @@ fn va_end_of(va: usize, len: usize) -> usize {
     va.saturating_add(len)
 }
 
+// Remove VMAs in the range [addr, end) and unmap/free their pages.  This helper
+// previously only adjusted the VMA list; it now also unmaps page tables and
+// frees underlying physical frames for non-PhysMap mappings (bug #2).
 fn remove_vma_inner(p: &mut crate::proc::process::Pcb, addr: usize, end: usize) {
+    let user_cr3 = p.user_satp;
+    // Collect pages to free after TLB shootdown.
+    let mut to_free: Vec<usize> = Vec::new();
+    for page_va in (addr..end).step_by(PAGE) {
+        if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, page_va) {
+            // Check if this page belongs to a PhysMap VMA before removal.
+            let is_phys = p
+                .vmas
+                .iter()
+                .any(|v| page_va >= v.start && page_va < v.end && matches!(v.kind, VmaKind::PhysMap(_)));
+            // Unmap the page from the old address space.
+            <Arch as Paging>::unmap_page(user_cr3, page_va);
+            if !is_phys {
+                to_free.push(pa);
+            }
+        }
+    }
+    // Flush TLBs on all CPUs for the removed range.
+    crate::smp::ipi::tlb_shootdown(addr as u64, end as u64, 0);
+    // Free collected pages after TLB invalidation.
+    for pa in to_free {
+        crate::mm::pmm::free_page(pa);
+    }
+
+    // Now update the VMA list to remove or trim entries.
     let mut i = 0;
     while i < p.vmas.len() {
         let vstart = p.vmas[i].start;
