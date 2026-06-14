@@ -19,20 +19,43 @@ pub fn sys_munmap(addr: usize, length: usize) -> isize {
         return -14;
     }
 
+    // Collect PhysMap ranges once to avoid repeated VMA scans (see bug #19).
+    let phys_ranges: Vec<(usize, usize)> = scheduler::with_proc(pid, |p| {
+        p.vmas
+            .iter()
+            .filter_map(|v| match v.kind {
+                VmaKind::PhysMap(_) => Some((v.start, v.end)),
+                _ => None,
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    // Collect physical pages to free after TLB shootdown.
+    let mut to_free: Vec<usize> = Vec::new();
+    // Unmap each page in the range and decide whether to free it.
     for page_va in (addr..addr + len).step_by(PAGE) {
         if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, page_va) {
-            <Arch as Paging>::unmap_page(page_va);
-            let is_phys = scheduler::with_proc(pid, |p| {
-                p.vmas.iter().any(|v| {
-                    v.start <= page_va && v.end > page_va && matches!(v.kind, VmaKind::PhysMap(_))
-                })
-            })
-            .unwrap_or(false);
+            // Unmap the page in the target address space. Pass the user CR3 so the
+            // correct page-table is manipulated.
+            <Arch as Paging>::unmap_page(user_cr3, page_va);
+            // Determine if this VA belongs to a PhysMap VMA. PhysMap frames must
+            // remain mapped and are not freed.
+            let is_phys = phys_ranges
+                .iter()
+                .any(|&(start, end)| page_va >= start && page_va < end);
             if !is_phys {
-                crate::mm::pmm::free_page(pa);
+                to_free.push(pa);
             }
         }
     }
+    // Issue a TLB shootdown for the unmapped range. Use ASID 0 (conservative)
+    // for now; per bug #1/#22 this should ideally use the process's actual ASID.
+    crate::smp::ipi::tlb_shootdown(addr as u64, (addr + len) as u64, 0);
+    // Free collected pages after all CPUs have invalidated their TLB entries.
+    for pa in to_free {
+        crate::mm::pmm::free_page(pa);
+    }
+    // Remove the VMA records for the unmapped range.
     remove_vma(pid, addr, len);
     0
 }
@@ -76,11 +99,18 @@ pub fn sys_brk(addr: usize) -> isize {
         }
         super::anonymous::coalesce_or_insert_heap_vma(pid, brk_base, new_brk);
     } else if new_brk < cur_brk {
+        // Shrinking the brk region: unmap pages and defer freeing until after TLB shootdown.
+        let mut to_free: Vec<usize> = Vec::new();
         for page_va in (new_brk..cur_brk).step_by(PAGE) {
             if let Some(pa) = <Arch as Paging>::virt_to_phys(user_cr3, page_va) {
-                <Arch as Paging>::unmap_page(page_va);
-                crate::mm::pmm::free_page(pa);
+                <Arch as Paging>::unmap_page(user_cr3, page_va);
+                to_free.push(pa);
             }
+        }
+        // Shoot down TLB entries for the shrunk region before freeing frames.
+        crate::smp::ipi::tlb_shootdown(new_brk as u64, cur_brk as u64, 0);
+        for pa in to_free {
+            crate::mm::pmm::free_page(pa);
         }
         super::anonymous::trim_heap_vma(pid, brk_base, new_brk);
     }
